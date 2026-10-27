@@ -586,6 +586,16 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     }
   }, 30_000);
 
+  it("still coalesces a same-scope nested-only wake whose issue row does not exist", async () => {
+    await seedRun("queued", { taskId: "same-scope" });
+    const wakeResult = await heartbeatService(db).wakeup(ASSIGNEE, {
+      source: "automation", triggerDetail: "system", reason: "queued_scope_refresh",
+      contextSnapshot: { taskId: "same-scope", paperclipIssue: { id: randomUUID() } },
+    });
+    expect(wakeResult?.id).toBe(RUN);
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+  }, 30_000);
+
   it("keeps the self-declared assignee/status gate ahead of its run insert after restore's final read", async () => {
     await db.update(agents).set({ runtimeConfig: { workDelivery: "external_pull" } }).where(eq(agents.id, ASSIGNEE));
     await seedRun("failed", { issueId: ISSUE });

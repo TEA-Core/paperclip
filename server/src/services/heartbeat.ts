@@ -32921,11 +32921,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             )).for("update");
             const state = parseObject(lockedIssue?.executionState);
             const participant = parseObject(state.currentParticipant);
-            if (!lockedIssue || (
+            if (lockedIssue &&
               state.status === "pending" &&
               lockedIssue.assigneeAgentId !== agentId &&
               !(participant.type === "agent" && participant.agentId === agentId)
-            )) return null;
+            ) return null;
             return persistCoalescedWake(tx as unknown as Db);
           })
         : await persistCoalescedWake(db);
