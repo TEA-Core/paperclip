@@ -78,3 +78,11 @@ Release assurance (RA) gets its own approval seat and a distinct `release-assura
 - `executionPolicy.approvalAuthority: "release_assurance"` is accepted by the schema but refused by `normalizeIssueExecutionPolicy` unless a trusted caller passes `allowReleaseAssuranceAuthority`, so no issue create or PATCH can select it. Even then the policy must be exactly one `approval` stage with exactly one `agent` participant; any other shape is 422. `buildReleaseAssurancePolicy` is the one-stage `approval` template (only the RA seat); it is not installed yet.
 
 Not in this slice: issuer-signature verification and key registry, the `tea-core` publisher and required `release-assurance/go` check, rulesets, repository webhooks, installing the policy on a card, the approval-versus-close separation and decomposed-parent shape, and the exclusion of RA cards from the normal publisher. Those are the later rollout steps and need their own approvals.
+
+The CI consumer is prepared for the future RA alternative, but the shadow
+publisher's planned `targetUrl` currently lacks the exact decision/PR/head
+metadata required by the consumer. No RA status is published in shadow mode.
+Activation must align the live publisher with the bound target contract in
+[branch protection](branch-protection.md#the-consume-contract-pinned) and
+enable the separate App-pinned veto; this consumer change alone admits no RA
+card.
