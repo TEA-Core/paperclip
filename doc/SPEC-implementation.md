@@ -346,8 +346,12 @@ a stale scheduler snapshot cannot insert a former-owner run after restoration.
 A hand-run operator `heartbeat_runs` SQL insert is the named residual
 race: it bypasses issue-row admission after restore's final read, and this
 operation installs no trigger, revokes no write privileges, and promises no
-exclusivity against it or arbitrary future writers. The observed interleavings
-and admission limits are recorded in `doc/restore-participant-assurance.md`.
+exclusivity against that SQL session, unbound runs, or unsupported binding
+formats. An application insert of a live run, or another grant of this
+restore, that skips the issue lock fails the source census in
+`server/src/__tests__/restore-live-run-admission-lock-census.test.ts`.
+The observed interleavings and admission limits are recorded in
+`doc/restore-participant-assurance.md`.
 
 The operation changes only the agent assignee (and `updatedAt`) and logs the
 before/after assignment

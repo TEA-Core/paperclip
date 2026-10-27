@@ -62,6 +62,83 @@ const WAKE_BUDGET_MS = 5_000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function hasLockTimeout(error: unknown): boolean {
+  for (
+    let cause: unknown = error;
+    cause && typeof cause === "object";
+    cause = "cause" in cause ? cause.cause : null
+  ) {
+    if ("code" in cause && typeof cause.code === "string" && cause.code === "55P03") return true;
+  }
+  return false;
+}
+
+// The nested-only issue lock has to still be held when the receipt insert runs.
+// A lock that committed in an earlier statement lets this probe take the row.
+async function assertNestedIssueLockHeldThroughInsert(
+  setupDb: ReturnType<typeof createDb>,
+  agentId: string,
+  issueId: string,
+) {
+  const heartbeat = heartbeatService(setupDb);
+  await setupDb.execute(sql`
+    CREATE OR REPLACE FUNCTION pause_admission_lock_witness() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.reason = 'admission_lock_witness' THEN
+        PERFORM pg_sleep(1.5);
+      END IF;
+      RETURN NEW;
+    END $$
+  `);
+  await setupDb.execute(sql`DROP TRIGGER IF EXISTS pause_admission_lock_witness ON agent_wakeup_requests`);
+  await setupDb.execute(sql`
+    CREATE TRIGGER pause_admission_lock_witness BEFORE INSERT ON agent_wakeup_requests
+    FOR EACH ROW EXECUTE FUNCTION pause_admission_lock_witness()
+  `);
+  let wakeFinished = false;
+  const waking = heartbeat.wakeup(agentId, {
+    source: "assignment",
+    triggerDetail: "system",
+    reason: "admission_lock_witness",
+    contextSnapshot: { paperclipIssue: { id: issueId } },
+  }).finally(() => { wakeFinished = true; });
+  try {
+    let paused = false;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const [row] = await setupDb.execute<{ paused: boolean }>(sql`
+        SELECT EXISTS (
+          SELECT 1 FROM pg_stat_activity
+          WHERE datname = current_database() AND pid <> pg_backend_pid()
+            AND wait_event = 'PgSleep' AND query ILIKE '%agent_wakeup_requests%'
+        ) AS paused
+      `);
+      if (row?.paused) { paused = true; break; }
+      await sleep(20);
+    }
+    expect(paused).toBe(true);
+    expect(wakeFinished).toBe(false);
+    let lockHeld = false;
+    try {
+      await setupDb.transaction(async (tx) => {
+        await tx.execute(sql`select set_config('lock_timeout', '400', true)`);
+        await tx.execute(sql`select id from issues where id = ${issueId} for update`);
+      });
+    } catch (error) {
+      lockHeld = hasLockTimeout(error);
+    }
+    expect(lockHeld).toBe(true);
+    const run = await waking;
+    expect(run).toMatchObject({ id: expect.any(String), status: "queued" });
+    const [queued] = await setupDb.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
+    expect(queued?.contextSnapshot).toMatchObject({ paperclipIssue: { id: issueId } });
+    expect(queued?.contextSnapshot).not.toHaveProperty("issueId");
+  } finally {
+    await waking.catch(() => null);
+    await setupDb.execute(sql`DROP TRIGGER IF EXISTS pause_admission_lock_witness ON agent_wakeup_requests`);
+    await setupDb.execute(sql`DROP FUNCTION IF EXISTS pause_admission_lock_witness()`);
+  }
+}
+
 describe("wake admission never needs a second pool connection (SUP-17978)", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let setupDb: ReturnType<typeof createDb>;
@@ -217,6 +294,9 @@ describe("wake admission never needs a second pool connection (SUP-17978)", () =
       expect(queued?.contextSnapshot).not.toHaveProperty("issueId");
       expect(queued?.contextSnapshot).not.toHaveProperty("taskKey");
     }
+    const witness = await seedAgent("placement");
+    const witnessIssueId = await seedIssue(witness);
+    await assertNestedIssueLockHeldThroughInsert(setupDb, witness.agentId, witnessIssueId);
   }, 120_000);
 
   it("admits twenty nested-only wakes after an actual restore releases the issue row", async () => {
@@ -291,19 +371,32 @@ describe("wake admission never needs a second pool connection (SUP-17978)", () =
           await sleep(5);
         }
         if (restorePid) {
+          // Restore also locks the pending participant's agent row. A wait on
+          // that row still happens if the issue FOR UPDATE is removed.
           waking = wake(participantId, {
             source: "assignment", triggerDetail: "system", reason: "issue_assigned",
             contextSnapshot: { paperclipIssue: { id: issueId } },
           });
-          for (let poll = 0; poll < 80; poll += 1) {
-            const [row] = await setupDb.execute<{ waiting: boolean }>(sql`
-              select exists (
-                select 1 from pg_stat_activity
-                where datname = current_database() and pid <> pg_backend_pid()
-                  and ${restorePid} = any(pg_blocking_pids(pid))
-              ) as waiting
+          for (let poll = 0; poll < 40; poll += 1) {
+            const [row] = await setupDb.execute<{ waitingOnIssue: boolean; waitingOnAgent: boolean }>(sql`
+              select
+                exists (
+                  select 1 from pg_stat_activity
+                  where datname = current_database() and pid <> pg_backend_pid()
+                    and ${restorePid} = any(pg_blocking_pids(pid))
+                    and query ~* 'from[[:space:]]+"?issues"?'
+                    and query ~* 'for update'
+                ) as "waitingOnIssue",
+                exists (
+                  select 1 from pg_stat_activity
+                  where datname = current_database() and pid <> pg_backend_pid()
+                    and ${restorePid} = any(pg_blocking_pids(pid))
+                    and query ~* 'from[[:space:]]+"?agents"?'
+                    and query ~* 'for update'
+                ) as "waitingOnAgent"
             `);
-            if (row?.waiting) { waitedForRestore = true; break; }
+            if (row?.waitingOnIssue) { waitedForRestore = true; break; }
+            if (row?.waitingOnAgent) break;
             await sleep(5);
           }
           queuedBeforeRelease = (await setupDb.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
@@ -326,6 +419,9 @@ describe("wake admission never needs a second pool connection (SUP-17978)", () =
       expect(queued?.contextSnapshot).not.toHaveProperty("taskKey");
       await drainHeartbeatRunsToQuiescence(db, heartbeat);
     }
+    const witness = await seedAgent("restore-placement");
+    const witnessIssueId = await seedIssue(witness);
+    await assertNestedIssueLockHeldThroughInsert(setupDb, witness.agentId, witnessIssueId);
   }, 120_000);
 
   it("keeps a nested-only wake with a non-UUID id unscoped and admits it", async () => {
