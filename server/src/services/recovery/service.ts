@@ -4758,7 +4758,20 @@ export function recoveryService(
           scheduledRun = enqueuedRun ?? (await findScheduledRun());
           created = Boolean(enqueuedRun);
         } else {
-          scheduledRun = await db.transaction(async (tx) => {
+          const deferredRun = await db.transaction(async (tx) => {
+            // Match restore's issue lock through both receipt and run insertion.
+            // The sweep's earlier snapshot can become stale while restore commits.
+            const [currentIssue] = await tx
+              .select({ assigneeAgentId: issues.assigneeAgentId, status: issues.status })
+              .from(issues)
+              .where(and(eq(issues.companyId, input.issue.companyId), eq(issues.id, input.issue.id)))
+              .for("update");
+            if (
+              !currentIssue ||
+              currentIssue.assigneeAgentId !== agentId ||
+              currentIssue.status === "done" ||
+              currentIssue.status === "cancelled"
+            ) return null;
             const wakeup = await tx
               .insert(agentWakeupRequests)
               .values({
@@ -4810,6 +4823,8 @@ export function recoveryService(
               .where(eq(agentWakeupRequests.id, wakeup.id));
             return run;
           });
+          if (!deferredRun) return null;
+          scheduledRun = deferredRun;
           created = true;
         }
       } catch (error) {
@@ -11607,6 +11622,7 @@ export function recoveryService(
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
     escalateStrandedAssignedIssue,
+    scheduleDispositionRepairAttempt,
     recordWatchdogDecision,
     scanSilentActiveRuns,
     scanTerminableSilentActiveRuns,

@@ -4015,8 +4015,10 @@ registry.registerPath({
     "details.retryable=true, and Retry-After: 1. Nested-only paperclipIssue.id heartbeat wakes stay " +
     "unscoped but acquire the issue-row lock for queued-run admission, same-scope coalescing and bounded " +
     "retry scheduling, and a former owner is refused once the pending stage belongs to another participant. " +
-    "Raw serving-role SQL inserts may still race after the final live-run check; " +
-    "see doc/restore-participant-assurance.md for the writer census. " +
+    "Delayed disposition retries also lock the source issue through their receipt/run insert and recheck the current assignee. " +
+    "A database trigger serializes direct serving-role SQL live-run inserts and binding changes for valid native, top-level, " +
+    "or nested issue UUIDs, rejecting a former owner after the pending participant becomes assignee; see " +
+    "doc/restore-participant-assurance.md for the scoped writer census. " +
     "Self-declared runs first change status/assignee under an issue-row update predicate, excluding " +
     "eligible restore in either order, but do not hold a continuous issue-row lock through run insertion. " +
     "This is not an exhaustive writer guarantee. Only the assignee and updatedAt change; status, " +
