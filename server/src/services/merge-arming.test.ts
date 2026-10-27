@@ -3487,6 +3487,36 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
             expect(enforcer(githubStatuses())).toBe(0);
           });
 
+          it("a PR closed before the take-back lands ends the record and closes the gate, so a reopened head passes the enforcer", async () => {
+            const issueId = await armUnderBothRefusals();
+            armGateFake.answer = armGateFake.created;
+            mockGhFetch.mockImplementation(async (url: string) => { if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`); return refusal(422, "Pull request is closed")(); });
+
+            const summary = await retryPendingAutoMergeDisarms(db);
+
+            expect(summary).toMatchObject({ checked: 1 });
+            expect(await disarmRecord(issueId)).toBeUndefined();
+            expect(armGateFake.writes.at(-1)).toMatchObject({ context: "paperclip/arm-gate", state: "success", accepted: true });
+            expect(enforcer(githubStatuses())).toBe(0);
+          });
+
+          it("keeps the record marked gateClosing when the closing write for a closed PR is refused, and the sweep closes it later", async () => {
+            const issueId = await armUnderBothRefusals();
+            refuseFrom("success");
+            mockGhFetch.mockImplementation(async (url: string) => { if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`); return refusal(422, "Pull request is closed")(); });
+
+            await retryPendingAutoMergeDisarms(db);
+
+            expect(await disarmRecord(issueId)).toMatchObject({ gateClosing: true, state: "pending" });
+            expect(enforcer(githubStatuses())).not.toBe(0);
+
+            armGateFake.answer = armGateFake.created;
+            await retryPendingAutoMergeDisarms(db);
+
+            expect(await disarmRecord(issueId)).toBeUndefined();
+            expect(enforcer(githubStatuses())).toBe(0);
+          });
+
           it("an arm that stands with its authority closes the gate; if the closing write is refused the record stays and the sweep closes it", async () => {
             const { issueId } = await seedAuthorityCard();
             refuseFrom("success");

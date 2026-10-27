@@ -135,6 +135,15 @@ async function attemptDisarm(
   }
   // The PR is gone from the open set: there is nothing left to turn off, and what happened is stated.
   const moot = /\b(merged|closed)\b/i.test(error);
+  // Closed without merging: the PR can be reopened on this head, so the gate the arm opened is closed before the record goes (a merged PR needs none).
+  if (moot && !/\bmerged\b/i.test(error)) {
+    const closed = await writeArmGate(tokens, record, "closed");
+    if (!closed.written) {
+      await recordPendingAutoMergeDisarm(db, row.companyId, row.id, { ...record, attempts, lastError: closed.error, lastAttemptAt: new Date().toISOString(), gateClosing: true, reason: "the PR is closed; the arm gate is still open" });
+      logger.error({ ...where, error: closed.error }, "pending auto-merge disarm: the PR is closed but the arm gate could not be closed; the head stays unmergeable until it is");
+      return "still-armed";
+    }
+  }
   // Past `disarmEscalation.afterMs` the card needs a human: marked once, alerted once, and every control-plane arm of it is refused.
   const escalating = !moot && !record.escalatedAt && disarmRecordEscalated(record);
   // The second route (see fenceRevokedHead): while GitHub will not turn auto-merge off, the head's paperclip/approved is set to
