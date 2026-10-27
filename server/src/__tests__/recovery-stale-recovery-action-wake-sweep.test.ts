@@ -48,7 +48,13 @@ describeEmbeddedPostgres("reconcileStaleRecoveryActionWakes", () => {
     await db.delete(companies);
   });
 
-  async function seedCompany() {
+  async function seedCompany(
+    sourceIssue: {
+      status?: string;
+      assigneeAgentId?: string | null;
+      assigneeUserId?: string | null;
+    } = {},
+  ) {
     const companyId = randomUUID();
     const managerId = randomUUID();
     const coderId = randomUUID();
@@ -89,9 +95,12 @@ describeEmbeddedPostgres("reconcileStaleRecoveryActionWakes", () => {
       id: sourceIssueId,
       companyId,
       title: "Implement backend recovery",
-      status: "in_progress",
+      status: sourceIssue.status ?? "in_progress",
       priority: "medium",
-      assigneeAgentId: coderId,
+      ...(sourceIssue.assigneeAgentId === null
+        ? {}
+        : { assigneeAgentId: sourceIssue.assigneeAgentId ?? coderId }),
+      ...(sourceIssue.assigneeUserId ? { assigneeUserId: sourceIssue.assigneeUserId } : {}),
       issueNumber: 1,
       identifier: `${prefix}-1`,
     });
@@ -378,6 +387,74 @@ describeEmbeddedPostgres("reconcileStaleRecoveryActionWakes", () => {
     expect(sourceIssue.monitorScheduledBy).toBe("board");
     expect(exhaustionComment!.body).toContain("Board decision item:");
   });
+
+  it.each([
+    { label: "todo status", sourceIssue: { status: "todo" } },
+    { label: "unassigned", sourceIssue: { assigneeAgentId: null } },
+    { label: "user assignee", sourceIssue: { assigneeUserId: "board-user-1" } },
+  ])(
+    "SUP-21344: exhaustion on a non-monitor-dispatchable source ($label) arms no fake monitor",
+    async ({ sourceIssue }) => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany(sourceIssue);
+
+      const staleAt = new Date(Date.now() - 10 * 60_000);
+      const action = await insertRecoveryAction({
+        companyId,
+        sourceIssueId,
+        ownerAgentId: coderId,
+        cause: "stranded_assigned_issue",
+        attemptCount: 5,
+        maxAttempts: null,
+        lastAttemptAt: staleAt,
+        status: "active",
+        wakePolicy: { type: "wake_owner" },
+      });
+
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60_000 });
+
+      expect(result.maxAttemptsReached).toBe(1);
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+
+      const [updated] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(updated.status).toBe("escalated");
+      expect(updated.outcome).toBe("exhausted");
+      expect(updated.ownerType).toBe("board");
+
+      // No fireable-wake claim: the scheduler requires an agent assignee in
+      // in_progress/in_review/blocked, so no monitor columns may be written.
+      const [issue] = await db
+        .select({
+          monitorNextCheckAt: issues.monitorNextCheckAt,
+          monitorScheduledBy: issues.monitorScheduledBy,
+          executionPolicy: issues.executionPolicy,
+        })
+        .from(issues)
+        .where(eq(issues.id, sourceIssueId));
+      expect(issue.monitorNextCheckAt).toBeNull();
+      expect(issue.monitorScheduledBy).toBeNull();
+      expect((issue.executionPolicy as { monitor?: unknown } | null)?.monitor).toBeUndefined();
+
+      // The dispatchable artifact is the escalated board-owned action itself,
+      // and the comment must not claim a scheduled board check.
+      const comments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, sourceIssueId));
+      const exhaustionComment = comments.find((c) =>
+        (c.body ?? "").includes("exhausted its attempt ceiling"),
+      );
+      expect(exhaustionComment).toBeDefined();
+      expect(exhaustionComment!.body).toContain(`Board decision item: recovery_action:${action.id}`);
+      expect(exhaustionComment!.body).toContain("not monitor-dispatchable");
+      expect(exhaustionComment!.body).not.toContain("next board check at");
+    },
+  );
 
   it("does not re-fire for actions that are not stale", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();

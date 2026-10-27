@@ -1778,6 +1778,51 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(row?.status).toBe("blocked");
   });
 
+  it("SUP-21344: exhausted drain on a blocked card with no agent assignee arms no fake monitor", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked behind an exhausted recovery action, unassigned",
+      status: "blocked",
+      priority: "high",
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+    expect(result.exhaustedRecoverySuppressed).toBe(1);
+    expect(await countSuppressionRows(issueId)).toBe(1);
+
+    // The scheduler can never fire a monitor without an agent assignee, so
+    // the drain must not write monitor columns claiming a live wake; the
+    // escalated board-owned action is the board decision item.
+    const [drainedIssue] = await db
+      .select({
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        monitorScheduledBy: issues.monitorScheduledBy,
+        executionPolicy: issues.executionPolicy,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(drainedIssue.monitorNextCheckAt).toBeNull();
+    expect(drainedIssue.monitorScheduledBy).toBeNull();
+    expect((drainedIssue.executionPolicy as { monitor?: unknown } | null)?.monitor).toBeUndefined();
+
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const drainComment = comments.find((c) => (c.body ?? "").includes("Board decision item:"));
+    expect(drainComment).toBeDefined();
+    expect(drainComment!.body).toContain("not monitor-dispatchable");
+    expect(drainComment!.body).not.toContain("board check armed for");
+  });
+
   it("flag ON + replacement exhausted recovery action (different id) — writes a fresh suppression row (SUP-14244)", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     await enableBlockedWithoutBlockersAutoHeal();

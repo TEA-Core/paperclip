@@ -138,6 +138,7 @@ import {
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../issue-execution-policy.js";
+import { isMonitorableIssueShape } from "./host-restart-strand-sweep.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeIdempotencyKey,
@@ -8963,6 +8964,68 @@ export function recoveryService(
   // SUP-21344: board monitor interval for exhausted actions.
   const EXHAUSTED_BOARD_MONITOR_INTERVAL_MS = 60 * 60 * 1000;
 
+  // SUP-21344: arm an exhausted-action board monitor only when the source is
+  // scheduler-dispatchable (agent assignee, no user assignee, monitorable
+  // status — the heartbeat claim predicate). Otherwise the flat
+  // monitorNextCheckAt columns would claim a live wake the scheduler can
+  // never fire; the escalated board-owned recovery action already projects
+  // as the board attention/decision-queue item, so the stranded card's
+  // dispatchable artifact is that item until an operator assigns an owner.
+  // Returns the armed check time, or null when no monitor was armed.
+  async function armExhaustedBoardMonitor(input: {
+    issue: typeof issues.$inferSelect;
+    recoveryActionId: string;
+    nextCheckAt: Date;
+    notes: string;
+  }): Promise<Date | null> {
+    if (
+      !isMonitorableIssueShape({
+        status: input.issue.status,
+        assigneeAgentId: input.issue.assigneeAgentId,
+        assigneeUserId: input.issue.assigneeUserId,
+      })
+    ) {
+      return null;
+    }
+    const normalized = input.issue.executionPolicy
+      ? (normalizeIssueExecutionPolicy(input.issue.executionPolicy) ?? undefined)
+      : undefined;
+    const policy = {
+      ...(normalized ?? { mode: "normal" as const, commentRequired: true, stages: [] }),
+      monitor: {
+        nextCheckAt: input.nextCheckAt.toISOString(),
+        notes: input.notes,
+        scheduledBy: "board" as const,
+        kind: null,
+        serviceName: null,
+        externalRef: null,
+        timeoutAt: null,
+        maxAttempts: null,
+        recoveryPolicy: null,
+      },
+    };
+    const transition = applyIssueMonitorPolicyTransition({
+      issue: input.issue,
+      policy,
+      previousPolicy: normalized,
+      requestedStatus: input.issue.status,
+      requestedAssigneePatch: {},
+      actor: { agentId: null, userId: null },
+      monitorExplicitlyUpdated: true,
+    });
+    // Never claim a wake from flat columns the transition did not schedule:
+    // if the policy module did not write a monitor check time, nothing was armed.
+    if (transition.patch.monitorNextCheckAt === undefined || transition.patch.monitorNextCheckAt === null) {
+      logger.warn(
+        { issueId: input.issue.id, recoveryActionId: input.recoveryActionId },
+        "exhausted recovery monitor transition scheduled no check; board action remains the decision item",
+      );
+      return null;
+    }
+    await issuesSvc.update(input.issue.id, { ...transition.patch, executionPolicy: policy });
+    return input.nextCheckAt;
+  }
+
   async function reconcileBlockedWithoutBlockers(opts?: {
     runId?: string | null;
     companyId?: string | null;
@@ -9111,45 +9174,12 @@ export function recoveryService(
               .where(eq(issues.id, candidate.id))
               .then((rows) => rows[0] ?? null);
             if (currentIssue) {
-              const normalized = currentIssue.executionPolicy
-                ? (normalizeIssueExecutionPolicy(currentIssue.executionPolicy) ?? undefined)
-                : undefined;
-              const policy = {
-                ...(normalized ?? { mode: "normal" as const, commentRequired: true, stages: [] }),
-                monitor: {
-                  nextCheckAt: drainNextCheckAt.toISOString(),
-                  notes: `Board decision required: recovery action ${existingAction!.id} exhausted. Assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.`,
-                  scheduledBy: "board" as const,
-                  kind: null,
-                  serviceName: null,
-                  externalRef: null,
-                  timeoutAt: null,
-                  maxAttempts: null,
-                  recoveryPolicy: null,
-                },
-              };
-              try {
-                const transition = applyIssueMonitorPolicyTransition({
-                  issue: currentIssue,
-                  policy,
-                  previousPolicy: normalized,
-                  requestedStatus: currentIssue.status,
-                  requestedAssigneePatch: {},
-                  actor: { agentId: null, userId: null },
-                  monitorExplicitlyUpdated: true,
-                });
-                await issuesSvc.update(candidate.id, { ...transition.patch, executionPolicy: policy });
-              } catch {
-                await db
-                  .update(issues)
-                  .set({
-                    monitorNextCheckAt: drainNextCheckAt,
-                    monitorScheduledBy: "board",
-                    monitorNotes: `Board decision required: recovery action ${existingAction!.id} exhausted.`,
-                    updatedAt: now,
-                  })
-                  .where(eq(issues.id, candidate.id));
-              }
+              const armedAt = await armExhaustedBoardMonitor({
+                issue: currentIssue,
+                recoveryActionId: existingAction!.id,
+                nextCheckAt: drainNextCheckAt,
+                notes: `Board decision required: recovery action ${existingAction!.id} exhausted. Assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.`,
+              });
               // Dedupe by recovery action: once the armed monitor has fired
               // (monitorNextCheckAt cleared), a later pass re-arms it; without
               // this check every re-arm would post another identical comment
@@ -9169,7 +9199,9 @@ export function recoveryService(
               if (!alreadyCommented) {
                 await issuesSvc.addComment(
                   candidate.id,
-                  `Board decision item: ${drainMarker} — recovery action exhausted; board check armed for ${drainNextCheckAt.toISOString()}.`,
+                  armedAt
+                    ? `Board decision item: ${drainMarker} — recovery action exhausted; board check armed for ${drainNextCheckAt.toISOString()}.`
+                    : `Board decision item: ${drainMarker} — recovery action exhausted; the source is not monitor-dispatchable (status ${currentIssue.status}, agent assignee ${currentIssue.assigneeAgentId ? "present" : "absent"}), so no monitor was armed. Assign an invokable agent owner to arm a board check.`,
                   {},
                   { authorType: "system" },
                 );
@@ -10766,55 +10798,14 @@ export function recoveryService(
     const boardNextCheckAt = hasExistingFutureMonitor
       ? new Date(sourceIssue.monitorNextCheckAt!)
       : new Date(now.getTime() + EXHAUSTED_BOARD_MONITOR_INTERVAL_MS);
+    let armedBoardCheckAt: Date | null = hasExistingFutureMonitor ? boardNextCheckAt : null;
     if (!hasExistingFutureMonitor) {
-      const previousPolicy = sourceIssue.executionPolicy
-        ? (normalizeIssueExecutionPolicy(sourceIssue.executionPolicy) ?? undefined)
-        : undefined;
-      const policy = {
-        ...(previousPolicy ?? {
-          mode: "normal" as const,
-          commentRequired: true,
-          stages: [],
-        }),
-        monitor: {
-          nextCheckAt: boardNextCheckAt.toISOString(),
-          notes: `Board decision required: recovery action ${action.id} exhausted (${action.attemptCount}/${effectiveMaxAttempts}). Assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.`,
-          scheduledBy: "board" as const,
-          kind: null,
-          serviceName: null,
-          externalRef: null,
-          timeoutAt: null,
-          maxAttempts: null,
-          recoveryPolicy: null,
-        },
-      };
-      try {
-        const transition = applyIssueMonitorPolicyTransition({
-          issue: sourceIssue,
-          policy,
-          previousPolicy,
-          requestedStatus: sourceIssue.status,
-          requestedAssigneePatch: {},
-          actor: { agentId: null, userId: null },
-          monitorExplicitlyUpdated: true,
-        });
-        await issuesSvc.update(sourceIssue.id, {
-          ...transition.patch,
-          executionPolicy: policy,
-        });
-      } catch {
-        // Policy module refused the monitor (e.g. no assignee): still arm the
-        // flat columns so the board decision item remains fireable.
-        await db
-          .update(issues)
-          .set({
-            monitorNextCheckAt: boardNextCheckAt,
-            monitorScheduledBy: "board",
-            monitorNotes: `Board decision required: recovery action ${action.id} exhausted.`,
-            updatedAt: now,
-          })
-          .where(eq(issues.id, sourceIssue.id));
-      }
+      armedBoardCheckAt = await armExhaustedBoardMonitor({
+        issue: sourceIssue,
+        recoveryActionId: action.id,
+        nextCheckAt: boardNextCheckAt,
+        notes: `Board decision required: recovery action ${action.id} exhausted (${action.attemptCount}/${effectiveMaxAttempts}). Assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.`,
+      });
     }
 
     await issuesSvc.addComment(
@@ -10822,7 +10813,9 @@ export function recoveryService(
       `Recovery action \`${action.id}\` exhausted its attempt ceiling (${action.attemptCount}/${effectiveMaxAttempts}). ` +
         "The recovery action is escalated to the board; the source issue status was left untouched. " +
         "A board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.\n\n" +
-        `Board decision item: recovery_action:${action.id} — next board check at ${boardNextCheckAt.toISOString()}.`,
+        (armedBoardCheckAt
+          ? `Board decision item: recovery_action:${action.id} — next board check at ${armedBoardCheckAt.toISOString()}.`
+          : `Board decision item: recovery_action:${action.id} — the source is not monitor-dispatchable (status ${sourceIssue.status}, agent assignee ${sourceIssue.assigneeAgentId ? "present" : "absent"}), so no monitor was armed; the board decision item is the escalation itself. Assign an invokable agent owner to arm a board check.`),
       {},
       { authorType: "system" },
     );
@@ -10842,7 +10835,8 @@ export function recoveryService(
         recoveryActionId: action.id,
         attemptCount: action.attemptCount,
         maxAttempts: effectiveMaxAttempts,
-        boardMonitorNextCheckAt: boardNextCheckAt.toISOString(),
+        boardMonitorNextCheckAt: armedBoardCheckAt?.toISOString() ?? null,
+        boardMonitorDispatchable: armedBoardCheckAt !== null,
       },
     });
   }
