@@ -12,6 +12,10 @@ import {
   countLadderedChildren,
   evaluateDoneTransitionGuard,
   evaluateDoneTierDeclaration,
+  DONE_TIER_STRUCTURED_FORMS,
+  DONE_TIER_TIER1_DELEGATED_JSON,
+  DONE_TIER_TIER1_LANDED_JSON,
+  DONE_TIER_TIER2_JSON,
   renderDoneTierDeclaration,
   TIER1_FORM,
   GitHubAuthError,
@@ -5523,7 +5527,7 @@ describe("evaluateDoneTierDeclaration", () => {
 
     it("feeds the Tier 1 remedy form through the landing-token pre-check", async () => {
       ghFetchMock.mockClear();
-      const remedyForm = TIER1_FORM.slice(1, -1);
+      const remedyForm = TIER1_FORM.split('" or "')[1]!.replace(/^"|"$/g, "");
       const result = await evaluateDoneTierDeclaration(
         mockDb,
         tierIssue,
@@ -5534,6 +5538,58 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.reason).not.toContain("missing a landing-state token");
       expect(result.reason).toContain("must name a linked PR");
       expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("SUP-21328: accepted Tier 1 forms advertise both landed-at-tip and landing-delegated", () => {
+      expect(TIER1_FORM).toContain("landed-at-tip <sha>");
+      expect(TIER1_FORM).toContain("landing-delegated PR #<N>");
+      expect(TIER1_FORM).toContain("done-close-landing-backstop");
+    });
+
+    it("SUP-21328: each advertised Tier 1 prose form reaches the landing-token pre-check", async () => {
+      const forms = TIER1_FORM.split('" or "').map((form) => form.replace(/^"|"$/g, ""));
+      expect(forms).toHaveLength(2);
+      for (const form of forms) {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          tierIssue,
+          form,
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.reason).not.toContain("missing a landing-state token");
+      }
+    });
+
+    it("SUP-21328: missing-tier remedy names structured doneTier with an exact JSON form per tier", async () => {
+      expect(DONE_TIER_STRUCTURED_FORMS).toContain("doneTier");
+      expect(DONE_TIER_TIER2_JSON).toBe(
+        'doneTier: { "tier": "tier2", "probeEvidence": "<consumer-surface probe output>" }',
+      );
+      expect(DONE_TIER_TIER1_LANDED_JSON).toBe(
+        'doneTier: { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landedAtTip", "mergeCommit": "<sha>" } }',
+      );
+      expect(DONE_TIER_TIER1_DELEGATED_JSON).toBe(
+        'doneTier: { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landingDelegated", "prNumber": <N>, "carrier": "done-close-landing-backstop" } }',
+      );
+      expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER2_JSON);
+      expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_LANDED_JSON);
+      expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_DELEGATED_JSON);
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Fixed the bug, no tiers here.",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("landed-at-tip <sha>");
+      expect(result.reason).toContain("landing-delegated PR #<N>");
+
+      const route = readFileSync(new URL("../routes/issues.ts", import.meta.url), "utf8");
+      expect(route).toContain("DONE_TIER_STRUCTURED_FORMS");
+      expect(route).toContain("structured doneTier field");
     });
 
     it("rejects Tier 1 substitution with empty reason", async () => {

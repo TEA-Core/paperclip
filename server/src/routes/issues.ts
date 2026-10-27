@@ -253,6 +253,7 @@ import {
   countLadderedChildren,
   evaluateDoneTransitionGuard,
   evaluateDoneTierDeclaration,
+  DONE_TIER_STRUCTURED_FORMS,
   findMissingAdr072CloseLadderStages,
   renderDoneTierDeclaration,
   TIER1_FORM,
@@ -5200,7 +5201,9 @@ export function issueRoutes(
       // a Tier-1 substitution always writable, so a missing declaration is a 422,
       // never a deadlock.
       const remedy =
-        "Include a done-tier declaration in the close comment: " +
+        "Provide a done-tier declaration, preferably as the structured doneTier field in this same request body: " +
+        `${DONE_TIER_STRUCTURED_FORMS}` +
+        `. Alternatively, include a done-tier declaration in the close comment: ` +
         `"Closed at Tier 2 (live): <probe evidence>"` +
         ` or ${TIER1_FORM.slice(1, -1)}` +
         ` — per SUP-12693.`;

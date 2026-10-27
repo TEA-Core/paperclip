@@ -86,9 +86,21 @@ const TIER_1_SUFFIX = "Liveness unverified.";
 // 422 remedy and the parser always agree on the exact literal (SUP-15787).
 const TIER2_FORM = '"Closed at Tier 2 (live): <probe evidence>"';
 export const TIER1_FORM =
-  '"Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
+  '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."' +
+  ' or "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
   'landing obligation transferred to done-close-landing-backstop, not yet discharged; ' +
   '<why Tier 2 was not probed>. Liveness unverified."';
+// Structured `doneTier` forms (SUP-21328): the second accepted close form on both
+// agent-writable close doors. The missing-tier remedy names these verbatim so the
+// 422 remedy and the structured parser always agree (SUP-15787 invariant).
+export const DONE_TIER_TIER2_JSON =
+  'doneTier: { "tier": "tier2", "probeEvidence": "<consumer-surface probe output>" }';
+export const DONE_TIER_TIER1_LANDED_JSON =
+  'doneTier: { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landedAtTip", "mergeCommit": "<sha>" } }';
+export const DONE_TIER_TIER1_DELEGATED_JSON =
+  'doneTier: { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landingDelegated", "prNumber": <N>, "carrier": "done-close-landing-backstop" } }';
+export const DONE_TIER_STRUCTURED_FORMS =
+  `${DONE_TIER_TIER2_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
 
 export function renderDoneTierDeclaration(
   body: string | null | undefined,
