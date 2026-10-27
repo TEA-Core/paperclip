@@ -32,7 +32,13 @@ import {
   armMergeOnApproval,
   createAuthorityGuard,
   disarmBacklog,
+  disarmEscalation,
+  openArmInFlight,
+  openArmRecord,
   disableAutoMerge,
+  enableAutoMerge,
+  ENABLE_ATTEMPT_TIMEOUT_MS,
+  ENABLE_WORST_CASE_MS,
   fetchBranchHeadSha,
   fetchGitHubNodeId,
   fetchHeadApprovedStatusViaTokenCandidates,
@@ -3000,8 +3006,8 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           }
         });
 
-        for (const [label, revoke] of [["takes the arm back when the authority changed", true], ["only drops the record when the authority still holds", false]] as const) {
-          it(`keeps the record when GitHub gives no answer, and the sweep ${label}`, async () => {
+        for (const [label, revoke] of [["the authority changed", true], ["the authority still holds", false]] as const) {
+          it(`keeps the record when GitHub gives no answer, and the sweep takes the arm back when ${label}`, async () => {
             disarmTiming.inFlightGraceMs = 0;
             const { issueId, reviewerId } = await seedAuthorityCard();
             mockGhFetch.mockImplementation(async () => { throw new TypeError("fetch failed: ECONNRESET"); });
@@ -3014,27 +3020,58 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
 
             const summary = await retryPendingAutoMergeDisarms(db);
 
-            expect(summary).toMatchObject(revoke ? { checked: 1, disabled: 1 } : { checked: 0, disabled: 0 });
-            expect(disables()).toHaveLength(revoke ? 1 : 0);
+            expect(summary).toMatchObject({ checked: 1, disabled: 1 });
+            expect(disables()).toHaveLength(1);
             expect(await disarmRecord(issueId)).toBeUndefined();
           });
         }
 
-        it("takes back an arm a previous process left in flight when the authority changed, and leaves a young record alone", async () => {
+        it("takes back an arm a previous process left in flight whatever the authority is now, and leaves a young record alone", async () => {
           const old = await seedAuthorityCard("SUP-952");
           const young = await seedAuthorityCard("SUP-953");
+          const unchanged = await seedAuthorityCard("SUP-954");
           await inFlightRecord(old.issueId, new Date(Date.now() - 10 * 60_000).toISOString());
           await inFlightRecord(young.issueId, new Date().toISOString());
+          await inFlightRecord(unchanged.issueId, new Date(Date.now() - 10 * 60_000).toISOString());
           await revocations[0]![1]({ issueId: old.issueId, reviewerId: old.reviewerId });
           await revocations[0]![1]({ issueId: young.issueId, reviewerId: young.reviewerId });
           mockGhFetch.mockImplementation(async (url: string) => { if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`); return disableOk(); });
 
           const summary = await retryPendingAutoMergeDisarms(db);
 
-          expect(summary).toMatchObject({ checked: 1, disabled: 1 });
-          expect(disables()).toHaveLength(1);
+          expect(summary).toMatchObject({ checked: 2, disabled: 2 });
+          expect(disables()).toHaveLength(2);
           expect(await disarmRecord(old.issueId)).toBeUndefined();
+          expect(await disarmRecord(unchanged.issueId)).toBeUndefined();
           expect(await disarmRecord(young.issueId)).toMatchObject({ state: "in_flight" });
+        });
+
+        for (const [label, result] of [
+          ["timed out", { success: false, error: "timeout after 10000ms", status: 0 }],
+          ["failed on the network", { success: false, error: "network_error", status: 0 }],
+          ["got a 502", { success: false, error: "HTTP 502", status: 502 }],
+        ] as const) {
+          it(`keeps the record when the enable call ${label}: the arm may be in force`, async () => {
+            const { issueId } = await seedAuthorityCard();
+            const guard = await createAuthorityGuard(db, companyId, issueId, { requireApprovedLadder: true, headSha: AUTH_HEAD });
+            const opening = await openArmRecord(db, companyId, issueId, { owner: OWNER, repo: REPO, number: 125 }, "test", "PR_node_125", AUTH_HEAD, guard);
+            if (!opening.ok) throw new Error(opening.message);
+
+            await opening.settleEnable(result);
+
+            expect(await disarmRecord(issueId)).toMatchObject({ state: "in_flight" });
+          });
+        }
+
+        it("drops the record when GitHub refused the enable call", async () => {
+          const { issueId } = await seedAuthorityCard();
+          const guard = await createAuthorityGuard(db, companyId, issueId, { requireApprovedLadder: true, headSha: AUTH_HEAD });
+          const opening = await openArmRecord(db, companyId, issueId, { owner: OWNER, repo: REPO, number: 125 }, "test", "PR_node_125", AUTH_HEAD, guard);
+          if (!opening.ok) throw new Error(opening.message);
+
+          await opening.settleEnable({ success: false, error: "Resource not accessible", status: 403 });
+
+          expect(await disarmRecord(issueId)).toBeUndefined();
         });
 
         it("refuses a second arm while the card holds a record", async () => {
@@ -3075,6 +3112,90 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           for (const id of waiting) expect(await disarmRecord(id)).toBeUndefined();
         });
 
+        it("holds the cap under concurrent admissions and a default sweep tries every record at it", async () => {
+          disarmBacklog.cap = 7;
+          const cards: string[] = [];
+          for (let i = 0; i < 20; i++) cards.push((await seedAuthorityCard(`SUP-${1100 + i}`)).issueId);
+          const opened = await Promise.all(cards.map((issueId, i) => openArmInFlight(db, companyId, issueId, {
+            owner: OWNER, repo: REPO, number: 500 + i, nodeId: `PR_node_${500 + i}`, headSha: AUTH_HEAD, reason: "arm in flight",
+            since: new Date().toISOString(), attempts: 0, lastError: null, state: "in_flight", token: `t${i}`,
+          })));
+          expect(opened.filter((r) => r === "recorded")).toHaveLength(7);
+          expect(opened.filter((r) => r === "full")).toHaveLength(13);
+          disarmTiming.inFlightGraceMs = 0;
+          mockGhFetch.mockImplementation(async (url: string) => { if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`); return disableOk(); });
+
+          const summary = await retryPendingAutoMergeDisarms(db);
+
+          expect(summary).toMatchObject({ checked: 7, disabled: 7, pending: 7 });
+          for (const id of cards) expect(await disarmRecord(id)).toBeUndefined();
+        });
+
+        describe("a take-back GitHub never confirms", () => {
+          afterEach(() => { disarmEscalation.afterMs = 15 * 60_000; });
+          const refuse = () => mockGhFetch.mockImplementation(async (url: string) => {
+            if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`);
+            return { ok: false, status: 403, json: async () => ({ errors: [{ message: "Resource not accessible" }] }) } as unknown as Response;
+          });
+
+          it("is escalated once past the deadline, by the sweep, and no control-plane arm gets through meanwhile", async () => {
+            disarmEscalation.afterMs = 60_000;
+            const { issueId } = await seedAuthorityCard();
+            await recordPendingAutoMergeDisarm(db, companyId, issueId, {
+              owner: OWNER, repo: REPO, number: 125, nodeId: "PR_node_125", headSha: AUTH_HEAD, reason: "authority revoked",
+              since: new Date(Date.now() - 10 * 60_000).toISOString(), attempts: 5, lastError: "x", lastAttemptAt: new Date().toISOString(), state: "pending",
+            });
+            refuse();
+
+            await retryPendingAutoMergeDisarms(db);
+            await retryPendingAutoMergeDisarms(db);
+
+            expect(await disarmRecord(issueId)).toMatchObject({ state: "pending", attempts: 7, escalatedAt: expect.any(String) });
+            const rows = await db.select({ action: activityLog.action, details: activityLog.details }).from(activityLog).where(eq(activityLog.action, "issue.merge_disarm_escalated"));
+            expect(rows).toHaveLength(1);
+            expect(rows[0]!.details).toMatchObject({ needsHuman: true });
+            mockGhFetch.mockClear();
+            const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certified(), { expectedHeadOid: AUTH_HEAD });
+            expect(outcome.kind).toBe("failed");
+            expect(outcome.message).toContain("failed:disarm-escalated");
+            expect(enables()).toHaveLength(0);
+          });
+
+          it("refuses every arm past the deadline with no sweep having run at all, and is cleared by a confirmed disable", async () => {
+            disarmEscalation.afterMs = 60_000;
+            const { issueId } = await seedAuthorityCard();
+            await recordPendingAutoMergeDisarm(db, companyId, issueId, {
+              owner: OWNER, repo: REPO, number: 125, nodeId: "PR_node_125", headSha: AUTH_HEAD, reason: "authority revoked",
+              since: new Date(Date.now() - 10 * 60_000).toISOString(), attempts: 1, lastError: "x", lastAttemptAt: new Date().toISOString(), state: "pending",
+            });
+            mockGhFetch.mockImplementation(async () => okBody());
+
+            const outcome = await armMergeOnApproval(db, companyId, issueId, decide, certified(), { expectedHeadOid: AUTH_HEAD });
+
+            expect(outcome.message).toContain("failed:disarm-escalated");
+            expect(enables()).toHaveLength(0);
+            mockGhFetch.mockReset();
+            mockGhFetch.mockImplementation(async (url: string) => { if (url !== GRAPHQL_URL) throw new Error(`unexpected ghFetch URL: ${url}`); return disableOk(); });
+            await retryPendingAutoMergeDisarms(db);
+            expect(await disarmRecord(issueId)).toBeUndefined();
+          });
+
+          it("is not escalated before the deadline", async () => {
+            const { issueId } = await seedAuthorityCard();
+            await recordPendingAutoMergeDisarm(db, companyId, issueId, {
+              owner: OWNER, repo: REPO, number: 125, nodeId: "PR_node_125", headSha: AUTH_HEAD, reason: "authority revoked",
+              since: new Date(Date.now() - 60_000).toISOString(), attempts: 1, lastError: "x", lastAttemptAt: new Date().toISOString(), state: "pending",
+            });
+            refuse();
+
+            await retryPendingAutoMergeDisarms(db);
+
+            expect((await disarmRecord(issueId))?.escalatedAt).toBeFalsy();
+            const rows = await db.select({ id: activityLog.id }).from(activityLog).where(eq(activityLog.action, "issue.merge_disarm_escalated"));
+            expect(rows).toHaveLength(0);
+          });
+        });
+
         it("a restart resumes the take-backs the last process left, at once and then with the prompt retries", async () => {
           disarmTiming.promptDelaysMs = [30, 30, 30];
           const now = await seedAuthorityCard("SUP-980");
@@ -3112,7 +3233,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
 
       // Round 13 (R10-AUTH-DISABLE): how long an accepted arm whose authority was revoked at the enable stays in force
       // before the inline take-back reaches the provider, against a provider that merges D ms after it accepts the arm.
-      // GitHub has no authority or head compare-and-set, so a merge that comes first cannot be prevented; this measures
+      // GitHub has no compare-and-set on the application's authority, so a merge that comes first cannot be prevented; this measures
       // it. Real database and real arming code; the provider is a fake with a stated round-trip time per call.
       describe("the window from the provider accepting an arm to the take-back reaching it", () => {
         const evidence: Array<Record<string, unknown>> = [];
@@ -3221,7 +3342,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         expect(second.checked).toBe(2);
       });
 
-      it("writes an activity row for a record GitHub keeps refusing only on its first rounds and then about hourly", async () => {
+      it("writes an activity row for a record GitHub keeps refusing only for its first three attempts and then every 12th", async () => {
         const { issueId } = await seedAuthorityCard();
         await recordPendingAutoMergeDisarm(db, companyId, issueId, {
           owner: OWNER, repo: REPO, number: 125, nodeId: "PR_node_125", headSha: AUTH_HEAD, reason: "test",
@@ -4707,6 +4828,40 @@ describeGuardRoute(
   },
 );
 
+
+describe("enableAutoMerge deadline (SUP-20772 round 14)", () => {
+  beforeEach(() => { mockGhFetch.mockReset(); });
+
+  it("gives up on a request that never answers, aborts it, and reports no answer (status 0, so the take-back record stays)", async () => {
+    const signals: AbortSignal[] = [];
+    mockGhFetch.mockImplementation((_url: string, init?: RequestInit) => { signals.push(init!.signal as AbortSignal); return new Promise(() => {}); });
+    const started = Date.now();
+
+    const result = await enableAutoMerge("t", "PR_node_1", { attemptTimeoutMs: 60, maxAttempts: 3, retryDelayMs: 5 });
+
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(result).toMatchObject({ success: false, status: 0 });
+    expect(result.error).toContain("timeout");
+    expect(signals).toHaveLength(1);
+    expect(signals[0]!.aborted).toBe(true);
+  });
+
+  it("applies its default deadline when no option is given", async () => {
+    vi.useFakeTimers();
+    try {
+      mockGhFetch.mockImplementation(() => new Promise(() => {}));
+      const pending = enableAutoMerge("t", "PR_node_1");
+      await vi.advanceTimersByTimeAsync(ENABLE_ATTEMPT_TIMEOUT_MS + 1);
+      await expect(pending).resolves.toMatchObject({ success: false, status: 0, error: `timeout after ${ENABLE_ATTEMPT_TIMEOUT_MS}ms` });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("is over, in the worst case, well before the in-flight record is settled", () => {
+    expect(ENABLE_WORST_CASE_MS).toBeLessThan(disarmTiming.inFlightGraceMs / 2);
+  });
+});
 
 describe("disableAutoMerge (SUP-20772 round 10)", () => {
   const NODE = "PR_node_1";

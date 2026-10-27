@@ -317,8 +317,9 @@ both waivers, but only when the PR author is a person (`user.type == User`),
 `github-actions[bot]` or the control-plane App `tea-core[bot]` (the identity the
 lockfile refresh opens its PR as); any other App-authored PR cannot self-waive. The variable
 ships **unset** so merging the change cannot freeze a merge before the release route
-is deployed: deploy the control plane, confirm the route answers, then set the
-variable. Unsetting it is the rollback.
+is deployed. Deploying the control plane and confirming the route answers is necessary,
+not sufficient: do not set the variable until the known residual bypass below is closed.
+Unsetting it is the rollback.
 
 **A board release counts in CI only with its confirmation marker (SUP-20772).**
 The control plane writes a release as `paperclip/approved` = success with a description
