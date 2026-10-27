@@ -4106,7 +4106,7 @@ registry.registerPath({
     "Raw operator SQL live-run inserts are the named residual race; see doc/restore-participant-assurance.md for the writer census. " +
     "Self-declared runs first change status/assignee under an issue-row update predicate, excluding " +
     "eligible restore in either order, but do not hold a continuous issue-row lock through run insertion. " +
-    "The build census fails an application live-run insert or restore grant that skips the issue lock; raw SQL, unbound runs, and unsupported bindings remain outside it. Only the assignee and updatedAt change; status, " +
+    "Nothing enforces the issue lock for a future application live-run insert or restore grant (a typed-lock guard is tracked as a follow-up design), and raw SQL, unbound runs, and unsupported bindings remain outside it. Only the assignee and updatedAt change; status, " +
     "statusVersion, executionState, decision history and pendingSince remain unchanged. " +
     "Does not wake or re-arm the stage.",
   request: {
