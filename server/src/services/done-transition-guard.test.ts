@@ -5592,6 +5592,23 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(route).toContain("structured doneTier field");
     });
 
+    it("SUP-21474: routes remedy interpolates TIER1_FORM un-cut so both Tier 1 forms keep balanced quotes", () => {
+      const route = readFileSync(new URL("../routes/issues.ts", import.meta.url), "utf8");
+      expect(route).not.toContain("TIER1_FORM.slice(1, -1)");
+      expect(route).toContain("` or ${TIER1_FORM}`");
+
+      const tier2Form = '"Closed at Tier 2 (live): <probe evidence>"';
+      const remedy = `${tier2Form} or ${TIER1_FORM} — per SUP-12693.`;
+      expect(remedy).toContain(
+        '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."',
+      );
+      expect(remedy).toContain(
+        '"Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; landing obligation transferred to done-close-landing-backstop, not yet discharged; <why Tier 2 was not probed>. Liveness unverified."',
+      );
+      expect(TIER1_FORM.startsWith('"')).toBe(true);
+      expect(TIER1_FORM.endsWith('"')).toBe(true);
+    });
+
     it("rejects Tier 1 substitution with empty reason", async () => {
       const result = await evaluateDoneTierDeclaration(
         mockDb,
