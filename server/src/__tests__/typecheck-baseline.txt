@@ -816,12 +816,6 @@ server/src/__tests__/issue-comment-reopen-routes.test.ts(911,49): TS2339
 server/src/__tests__/issue-comment-reopen-routes.test.ts(936,45): TS2493
 server/src/__tests__/issue-comment-reopen-routes.test.ts(936,49): TS2339
 server/src/__tests__/issue-comment-reopen-routes.test.ts(951,51): TS2345
-server/src/__tests__/issue-continuation-path.test.ts(64,8): TS2322
-server/src/__tests__/issue-continuation-path.test.ts(66,9): TS2322
-server/src/__tests__/issue-continuation-path.test.ts(69,8): TS2322
-server/src/__tests__/issue-continuation-path.test.ts(70,8): TS2322
-server/src/__tests__/issue-continuation-path.test.ts(71,8): TS2322
-server/src/__tests__/issue-continuation-path.test.ts(72,8): TS2322
 server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(587,52): TS2345
 server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(617,54): TS2345
 server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(638,52): TS2345
