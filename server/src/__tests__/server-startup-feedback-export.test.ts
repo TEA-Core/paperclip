@@ -107,6 +107,17 @@ const {
     reconcileBlockedWithoutBlockers: vi.fn(async () => ({ escalated: 0, healed: 0 })),
     reconcilePendingReviewRearm: vi.fn(async () => ({ reArmed: 0, checked: 0 })),
     reconcileStaleRecoveryActionWakes: vi.fn(async () => ({ reFired: 0, rerouted: 0, maxAttemptsReached: 0 })),
+    // SUP-21344: index.ts invokes the exhausted-recovery drain at startup and
+    // on the periodic tick; the neutral result keeps CI off the crash that
+    // fired when the delegate was missing from this mock.
+    reconcileExhaustedRecoveryDrain: vi.fn(async () => ({
+      checked: 0,
+      monitorArmed: 0,
+      recoveryIssueMinted: 0,
+      alreadyLive: 0,
+      noInvokableOwner: 0,
+      candidateLimitSkipped: 0,
+    })),
     reconcileUnfinalizableWorkspaceBarriers: vi.fn(async () => ({ reported: 0 })),
     ingestStaleInReviewChildIssues: vi.fn(async () => ({ archived: 0 })),
     sweepPendingCleanupLeases: vi.fn(async () => ({ swept: 0, destroyed: 0, capped: 0 })),

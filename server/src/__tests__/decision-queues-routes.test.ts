@@ -421,19 +421,63 @@ describeEmbeddedPostgres("decision queue routes", () => {
     }
   });
 
-  it("SUP-21344: retains a same-company recovery_rate_alert sidecar for board actors only", async () => {
+  it("SUP-21344: retains a same-company recovery_rate_alert sidecar for board actors only when the breach is live", async () => {
     const { companyId, agentId } = await seed();
-    const alertKey = `recovery_rate_alert:${companyId}:2026-07-06`;
+    // Live breach: the week containing 2026-07-06 (a Monday) carries 3 recovery
+    // actions against 10 heartbeat runs (30% > 2% threshold). The report window
+    // (current week + 7 prior weeks) is anchored at `now`, not at the fixture
+    // date, so seed it dynamically relative to the most recent completed week:
+    // 21 days ago is always inside the trailing 8-week window and in a week
+    // that has fully elapsed.
+    const breachDate = new Date(Date.now() - 21 * 24 * 60 * 60 * 1000);
+    const breachRuns = await Promise.all(
+      Array.from({ length: 10 }, async (_, index) =>
+        db.insert(heartbeatRuns).values({
+          companyId,
+          agentId,
+          status: "failed",
+          contextSnapshot: {},
+          createdAt: new Date(breachDate.getTime() + index * 1000),
+        }).returning(),
+      ),
+    );
+    for (let index = 0; index < 3; index += 1) {
+      const breachIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: breachIssueId,
+        companyId,
+        identifier: `DQC-B${index + 1}`,
+        title: `Breached week source ${index + 1}`,
+        status: "todo",
+      });
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId: breachIssueId,
+        kind: "missing_disposition",
+        cause: "review_path_lost",
+        fingerprint: randomUUID(),
+        nextAction: "Inspect",
+        createdAt: new Date(breachDate.getTime() + 60_000 + index * 1000),
+      });
+    }
+    expect(breachRuns).toHaveLength(10);
+    const alertWeekStart = new Date(breachDate);
+    alertWeekStart.setUTCDate(alertWeekStart.getUTCDate() - ((alertWeekStart.getUTCDay() + 6) % 7));
+    const alertKey = `recovery_rate_alert:${companyId}:${alertWeekStart.toISOString().slice(0, 10)}`;
+    // A same-company key naming a week with no live breach must not be retained.
+    const clearedAlertKey = `recovery_rate_alert:${companyId}:2020-01-06`;
     const foreignAlertKey = `recovery_rate_alert:${randomUUID()}:2026-07-06`;
     const [queue] = await db.insert(decisionQueues).values({
       companyId, key: "alerts", title: "Alerts", createdByType: "system",
     }).returning();
     await db.insert(decisionQueueItems).values([
       { companyId, queueId: queue!.id, sourceKind: "recovery_rate_alert" as const, sourceId: alertKey, addedByType: "system" as const },
+      { companyId, queueId: queue!.id, sourceKind: "recovery_rate_alert" as const, sourceId: clearedAlertKey, addedByType: "system" as const },
       { companyId, queueId: queue!.id, sourceKind: "recovery_rate_alert" as const, sourceId: foreignAlertKey, addedByType: "system" as const },
     ]);
     const service = decisionQueueService(db);
     expect(await canReadDecisionSource(db, boardActor(companyId), companyId, "recovery_rate_alert", alertKey)).toBe(true);
+    expect(await canReadDecisionSource(db, boardActor(companyId), companyId, "recovery_rate_alert", clearedAlertKey)).toBe(false);
     expect(await canReadDecisionSource(db, boardActor(companyId), companyId, "recovery_rate_alert", foreignAlertKey)).toBe(false);
     expect(await canReadDecisionSource(db, agentActor(companyId, agentId), companyId, "recovery_rate_alert", alertKey)).toBe(false);
     expect((await service.listItems(companyId, "alerts", boardActor(companyId))).map((item) => item.sourceId))
@@ -500,6 +544,9 @@ describeEmbeddedPostgres("decision queue routes", () => {
     const [queue] = await db.insert(decisionQueues).values({
       companyId, key: "foreign-project", title: "Foreign project", createdByType: "system",
     }).returning();
+    // SUP-21344: this test uses "recovery_rate_alert:nonexistent" (a malformed
+    // key with no live artifact) specifically to assert that non-live keys are
+    // hidden; no breach needs to be seeded for that expectation.
     await db.insert(decisionQueueItems).values(ATTENTION_SOURCE_KINDS.map((sourceKind) => ({
       companyId, queueId: queue!.id, sourceKind, sourceId: sourceIds[sourceKind], addedByType: "system" as const,
     })));

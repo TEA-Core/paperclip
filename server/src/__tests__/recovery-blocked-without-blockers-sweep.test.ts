@@ -1978,6 +1978,94 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(recoveryIssues).toHaveLength(1);
   });
 
+  it("SUP-21344-review: reused exhausted recovery issue re-enqueues the owner wake when no live wake remains", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Todo behind an exhausted recovery action, reused recovery issue",
+      status: "todo",
+      priority: "high",
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    const heartbeat = heartbeatService(db);
+    const first = await heartbeat.reconcileExhaustedRecoveryDrain();
+    expect(first.recoveryIssueMinted).toBe(1);
+    const [action] = await db
+      .select({ recoveryIssueId: issueRecoveryActions.recoveryIssueId })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action.recoveryIssueId).not.toBeNull();
+
+    // Simulate the first owner wake having been consumed without producing a
+    // disposition: a reused recovery issue must not stay a silent terminal sink.
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "cancelled" })
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    await drainAgentRuns(agentId);
+    const wakesBeforeReuse = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+
+    const second = await heartbeat.reconcileExhaustedRecoveryDrain();
+    expect(second.recoveryIssueMinted).toBe(0);
+    expect(second.alreadyLive).toBe(1);
+
+    const wakesAfterReuse = await db
+      .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status, payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakesAfterReuse.length).toBeGreaterThan(wakesBeforeReuse.length);
+    expect(wakesAfterReuse.some((wake) => {
+      const payload = wake.payload as { issueId?: unknown } | null;
+      return payload?.issueId === action.recoveryIssueId;
+    })).toBe(true);
+  });
+
+  it("SUP-21344-review: concurrent exhausted drains mint at most one recovery issue per source", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Todo behind an exhausted recovery action, concurrent drains",
+      status: "todo",
+      priority: "high",
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    const heartbeat = heartbeatService(db);
+    const results = await Promise.all([
+      heartbeat.reconcileExhaustedRecoveryDrain(),
+      heartbeat.reconcileExhaustedRecoveryDrain(),
+    ]);
+    expect(results.every((result) => result.checked >= 1)).toBe(true);
+
+    const recoveryIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(recoveryIssues).toHaveLength(1);
+
+    const [action] = await db
+      .select({ recoveryIssueId: issueRecoveryActions.recoveryIssueId })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action.recoveryIssueId).toBe(recoveryIssues[0]?.id);
+  });
+
   it("flag ON + replacement exhausted recovery action (different id) — writes a fresh suppression row (SUP-14244)", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     await enableBlockedWithoutBlockersAutoHeal();

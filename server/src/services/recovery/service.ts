@@ -9159,50 +9159,97 @@ export function recoveryService(
   }): Promise<string | null> {
     if (isStrandedIssueRecoveryIssue(input.issue)) return null;
 
-    if (input.existingRecoveryIssueId) {
-      const [existing] = await db
-        .select({ id: issues.id, status: issues.status })
+    const findOpenRecoveryIssue = async () => {
+      if (input.existingRecoveryIssueId) {
+        const [existing] = await db
+          .select()
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, input.issue.companyId),
+              eq(issues.id, input.existingRecoveryIssueId),
+              visibleIssueCondition(),
+            ),
+          )
+          .limit(1);
+        if (existing && existing.status !== "done" && existing.status !== "cancelled") {
+          return existing;
+        }
+      }
+
+      return db
+        .select()
         .from(issues)
         .where(
           and(
             eq(issues.companyId, input.issue.companyId),
-            eq(issues.id, input.existingRecoveryIssueId),
+            eq(issues.originKind, RECOVERY_ORIGIN_KINDS.strandedIssueRecovery),
+            eq(issues.originId, input.issue.id),
             visibleIssueCondition(),
+            notInArray(issues.status, ["done", "cancelled"]),
           ),
         )
-        .limit(1);
-      if (existing && existing.status !== "done" && existing.status !== "cancelled") {
-        return existing.id;
-      }
-    }
+        .orderBy(desc(issues.createdAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+    };
 
-    const openRecoveryIssue = await db
-      .select()
-      .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, input.issue.companyId),
-          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.strandedIssueRecovery),
-          eq(issues.originId, input.issue.id),
-          visibleIssueCondition(),
-          notInArray(issues.status, ["done", "cancelled"]),
+    const linkRecoveryIssue = async (recoveryIssueId: string) => {
+      await db
+        .update(issueRecoveryActions)
+        .set({ recoveryIssueId, updatedAt: new Date() })
+        .where(
+          and(
+            eq(issueRecoveryActions.id, input.recoveryActionId),
+            eq(issueRecoveryActions.companyId, input.issue.companyId),
+          ),
+        );
+    };
+
+    const enqueueRecoveryIssueWake = async (
+      recoveryIssue: typeof issues.$inferSelect,
+    ): Promise<boolean> => {
+      const ownerAgentId = recoveryIssue.assigneeAgentId;
+      if (!ownerAgentId || recoveryIssue.assigneeUserId) return false;
+      if (await hasLiveIssueWake(input.issue.companyId, recoveryIssue.id, ownerAgentId)) {
+        return false;
+      }
+
+      await deps.enqueueWakeup(ownerAgentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "exhausted_recovery_issue",
+        idempotencyKey: `exhausted-recovery-issue:${input.recoveryActionId}:${recoveryIssue.id}`,
+        payload: withRecoveryContext(
+          { issueId: recoveryIssue.id, sourceIssueId: input.issue.id, recoveryActionId: input.recoveryActionId },
+          "status_only",
         ),
-      )
-      .orderBy(desc(issues.createdAt))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: withRecoveryContext(
+          {
+            issueId: recoveryIssue.id,
+            sourceIssueId: input.issue.id,
+            source: "recovery.exhausted_recovery_issue",
+            wakeReason: "exhausted_recovery_issue",
+            recoveryActionId: input.recoveryActionId,
+          },
+          "status_only",
+        ),
+      });
+      return true;
+    };
+
+    const openRecoveryIssue = await findOpenRecoveryIssue();
     if (openRecoveryIssue) {
       if (openRecoveryIssue.id !== input.existingRecoveryIssueId) {
-        await db
-          .update(issueRecoveryActions)
-          .set({ recoveryIssueId: openRecoveryIssue.id, updatedAt: new Date() })
-          .where(
-            and(
-              eq(issueRecoveryActions.id, input.recoveryActionId),
-              eq(issueRecoveryActions.companyId, input.issue.companyId),
-            ),
-          );
+        await linkRecoveryIssue(openRecoveryIssue.id);
       }
+      // A reused issue is not necessarily a live issue: its original wake may
+      // have failed, completed without disposition, or been skipped before the
+      // link was persisted. Re-drive only when no live wake remains so normal
+      // idempotent drain passes do not spam the owner.
+      await enqueueRecoveryIssueWake(openRecoveryIssue);
       return openRecoveryIssue.id;
     }
 
@@ -9210,59 +9257,39 @@ export function recoveryService(
     if (!ownerAgentId) return null;
 
     const titleSource = input.issue.identifier ?? input.issue.title;
-    const recoveryIssue = await issuesSvc.create(input.issue.companyId, {
-      title: `Recover exhausted recovery for ${titleSource}`,
-      description: [
-        `Recovery action \`${input.recoveryActionId}\` on ${titleSource} exhausted its attempt ceiling and was escalated to the board, but the source issue is not monitor-dispatchable (status ${input.issue.status}; agent assignee ${input.issue.assigneeAgentId ? "present" : "absent"}${input.issue.assigneeUserId ? "; user assignee present" : ""}), so no board monitor could be armed on it.`,
-        "",
-        "Next action: assign an invokable recovery owner to the source issue, fix the agent/runtime state, or record an intentional manual resolution on the source issue. Then mark this recovery issue done (or cancelled if the source was resolved another way).",
-        "",
-        `Board decision item: recovery_action:${input.recoveryActionId}`,
-      ].join("\n"),
-      status: "todo",
-      priority: "high",
-      parentId: input.issue.id,
-      projectId: input.issue.projectId,
-      goalId: input.issue.goalId,
-      assigneeAgentId: ownerAgentId,
-      originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
-      originId: input.issue.id,
-      originFingerprint: `exhausted_recovery:${input.recoveryActionId}`,
-      billingCode: input.issue.billingCode,
-    });
+    let recoveryIssue: typeof issues.$inferSelect;
+    try {
+      recoveryIssue = await issuesSvc.create(input.issue.companyId, {
+        title: `Recover exhausted recovery for ${titleSource}`,
+        description: [
+          `Recovery action \`${input.recoveryActionId}\` on ${titleSource} exhausted its attempt ceiling and was escalated to the board, but the source issue is not monitor-dispatchable (status ${input.issue.status}; agent assignee ${input.issue.assigneeAgentId ? "present" : "absent"}${input.issue.assigneeUserId ? "; user assignee present" : ""}), so no board monitor could be armed on it.`,
+          "",
+          "Next action: assign an invokable recovery owner to the source issue, fix the agent/runtime state, or record an intentional manual resolution on the source issue. Then mark this recovery issue done (or cancelled if the source was resolved another way).",
+          "",
+          `Board decision item: recovery_action:${input.recoveryActionId}`,
+        ].join("\n"),
+        status: "todo",
+        priority: "high",
+        parentId: input.issue.id,
+        projectId: input.issue.projectId,
+        goalId: input.issue.goalId,
+        assigneeAgentId: ownerAgentId,
+        originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
+        originId: input.issue.id,
+        originFingerprint: `exhausted_recovery:${input.recoveryActionId}`,
+        billingCode: input.issue.billingCode,
+      });
+    } catch (error) {
+      if (!isUniqueViolation(error, "issues_active_stranded_issue_recovery_uq")) throw error;
+      const winningIssue = await findOpenRecoveryIssue();
+      if (!winningIssue) throw error;
+      if (winningIssue.id !== input.existingRecoveryIssueId) await linkRecoveryIssue(winningIssue.id);
+      await enqueueRecoveryIssueWake(winningIssue);
+      return winningIssue.id;
+    }
 
-    await db
-      .update(issueRecoveryActions)
-      .set({ recoveryIssueId: recoveryIssue.id, updatedAt: new Date() })
-      .where(
-        and(
-          eq(issueRecoveryActions.id, input.recoveryActionId),
-          eq(issueRecoveryActions.companyId, input.issue.companyId),
-        ),
-      );
-
-    await deps.enqueueWakeup(ownerAgentId, {
-      source: "automation",
-      triggerDetail: "system",
-      reason: "exhausted_recovery_issue",
-      idempotencyKey: `exhausted-recovery-issue:${input.recoveryActionId}:${recoveryIssue.id}`,
-      payload: withRecoveryContext(
-        { issueId: recoveryIssue.id, sourceIssueId: input.issue.id, recoveryActionId: input.recoveryActionId },
-        "status_only",
-      ),
-      requestedByActorType: "system",
-      requestedByActorId: null,
-      contextSnapshot: withRecoveryContext(
-        {
-          issueId: recoveryIssue.id,
-          sourceIssueId: input.issue.id,
-          source: "recovery.exhausted_recovery_issue",
-          wakeReason: "exhausted_recovery_issue",
-          recoveryActionId: input.recoveryActionId,
-        },
-        "status_only",
-      ),
-    });
+    await linkRecoveryIssue(recoveryIssue.id);
+    await enqueueRecoveryIssueWake(recoveryIssue);
 
     logger.info(
       {

@@ -28,6 +28,7 @@ import type {
 } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
 import { logActivityInTransaction } from "./activity-log.js";
+import { recoveryObservabilityService } from "./recovery-observability.js";
 import {
   authorizationService,
   createAuthorizationMemoContext,
@@ -289,9 +290,15 @@ async function sourceIssueId(
     case "recovery_rate_alert": {
       // SUP-21344: this kind is a synthetic attention artifact keyed by
       // `recovery_rate_alert:<companyId>:<weekStart>`, not a stored row.
-      // There is nothing to look up; it exists only when its key names this
-      // company, and it carries no issue to authorize against.
-      return { exists: sourceId.startsWith(`recovery_rate_alert:${companyId}:`), issueId: null };
+      // It exists only while the key is the company's currently-breaching
+      // artifact (the trailing 8-week window in the live report); once the
+      // breach clears, the key must stop authorizing board triage of a
+      // stale alert. It carries no issue to authorize against.
+      if (!sourceId.startsWith(`recovery_rate_alert:${companyId}:`)) {
+        return { exists: false, issueId: null };
+      }
+      const report = await recoveryObservabilityService(db).report(companyId);
+      return { exists: report.alertArtifactKey === sourceId, issueId: null };
     }
   }
 }
@@ -418,6 +425,13 @@ async function readableQueueItems(
     .orderBy(desc(decisionQueueItems.createdAt), desc(decisionQueueItems.id));
 
   if (rows.length === 0) return [];
+  // SUP-21344: validate every synthetic recovery-rate alert key once per
+  // listing against the company's currently-breaching artifact, so a cleared
+  // alert is never retained — no matter how many stale keys were sidecarred.
+  const hasRecoveryRateAlert = rows.some((row) => row.item.sourceKind === "recovery_rate_alert");
+  const liveRecoveryRateAlertKey = hasRecoveryRateAlert
+    ? (await recoveryObservabilityService(db).report(companyId)).alertArtifactKey
+    : null;
   const issueIdFor = (row: typeof rows[number]) => {
     switch (row.item.sourceKind) {
       case "approval": return row.approvalId ? row.approvalIssueId : undefined;
@@ -434,9 +448,9 @@ async function readableQueueItems(
       case "join_request": return row.joinId ? null : undefined;
       case "budget_alert": return row.budgetId ? null : undefined;
       // SUP-21344: synthetic alert key, not a stored row. It exists (as a
-      // non-issue source) only when its key names this company.
+      // non-issue source) only while it is the company's live breach key.
       case "recovery_rate_alert":
-        return row.item.sourceId.startsWith(`recovery_rate_alert:${companyId}:`) ? null : undefined;
+        return liveRecoveryRateAlertKey !== null && row.item.sourceId === liveRecoveryRateAlertKey ? null : undefined;
     }
   };
   const issueIds = [...new Set(rows.map(issueIdFor).filter((id): id is string => typeof id === "string" && UUID_RE.test(id)))];

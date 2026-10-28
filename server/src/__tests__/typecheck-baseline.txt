@@ -1,15 +1,13 @@
-# Recorded type errors for server/src/__tests__/tsconfig.json (baseline).
 #
-# Each line is `<file>(<line>,<column>): <TS code>` with the diagnostic
-# message stripped, so the baseline reacts to an error appearing, moving or
-# disappearing, not to a reworded message.
-#
-# These are pre-existing upstream test-type errors, not fork regressions;
-# see SUP-16604. Any error that is NOT listed here fails
-# `pnpm run check:server-test-typecheck`.
-#
-# Regenerate from the repository root:
 #   node scripts/check-server-test-typecheck.mjs --update
+# Each line is `<file>(<line>,<column>): <TS code>` with the diagnostic
+# Recorded type errors for server/src/__tests__/tsconfig.json (baseline).
+# Regenerate from the repository root:
+# These are pre-existing upstream test-type errors, not fork regressions;
+# `pnpm run check:server-test-typecheck`.
+# disappearing, not to a reworded message.
+# message stripped, so the baseline reacts to an error appearing, moving or
+# see SUP-16604. Any error that is NOT listed here fails
 packages/paperclip-runner/src/contracts/native-execution.test.ts(172,20): TS2352
 packages/paperclip-runner/src/contracts/native-execution.test.ts(309,20): TS2352
 packages/paperclip-runner/src/contracts/native-execution.test.ts(79,90): TS2345
@@ -369,7 +367,7 @@ server/src/__tests__/company-search-rate-limit-routes.test.ts(47,7): TS2741
 server/src/__tests__/company-search-rate-limit-routes.test.ts(79,7): TS2741
 server/src/__tests__/company-skill-policy-routes.test.ts(68,7): TS2322
 server/src/__tests__/context-snapshot-bound.test.ts(61,34): TS2339
-server/src/__tests__/decision-queues-routes.test.ts(637,7): TS2740
+server/src/__tests__/decision-queues-routes.test.ts(684,7): TS2740
 server/src/__tests__/decisions-service.test.ts(326,54): TS2322
 server/src/__tests__/dev-runner-native-binary.test.ts(9,8): TS7016
 server/src/__tests__/dev-runner-output.test.ts(2,72): TS7016
@@ -1308,14 +1306,14 @@ server/src/__tests__/secrets-service.test.ts(2338,12): TS18047
 server/src/__tests__/secrets-service.test.ts(2339,12): TS18047
 server/src/__tests__/secrets-service.test.ts(2614,13): TS2352
 server/src/__tests__/sentry.test.ts(660,13): TS2352
-server/src/__tests__/server-startup-feedback-export.test.ts(1004,7): TS2345
-server/src/__tests__/server-startup-feedback-export.test.ts(1026,42): TS2493
-server/src/__tests__/server-startup-feedback-export.test.ts(302,14): TS2683
-server/src/__tests__/server-startup-feedback-export.test.ts(654,42): TS2493
-server/src/__tests__/server-startup-feedback-export.test.ts(680,7): TS2349
-server/src/__tests__/server-startup-feedback-export.test.ts(758,7): TS2322
-server/src/__tests__/server-startup-feedback-export.test.ts(778,7): TS2349
-server/src/__tests__/server-startup-feedback-export.test.ts(817,7): TS2349
+server/src/__tests__/server-startup-feedback-export.test.ts(1015,7): TS2345
+server/src/__tests__/server-startup-feedback-export.test.ts(1037,42): TS2493
+server/src/__tests__/server-startup-feedback-export.test.ts(313,14): TS2683
+server/src/__tests__/server-startup-feedback-export.test.ts(665,42): TS2493
+server/src/__tests__/server-startup-feedback-export.test.ts(691,7): TS2349
+server/src/__tests__/server-startup-feedback-export.test.ts(769,7): TS2322
+server/src/__tests__/server-startup-feedback-export.test.ts(789,7): TS2349
+server/src/__tests__/server-startup-feedback-export.test.ts(828,7): TS2349
 server/src/__tests__/shared-group-ownership.test.ts(692,58): TS2556
 server/src/__tests__/shared-group-ownership.test.ts(693,66): TS2556
 server/src/__tests__/status-cards.test.ts(134,49): TS2322
