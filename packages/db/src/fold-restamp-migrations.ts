@@ -103,11 +103,15 @@ import { basename, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { ensureSnapshotChain } from "./check-migration-numbering.js";
 
-const migrationsDir = fileURLToPath(new URL("./migrations", import.meta.url));
+const migrationsRootDir = process.env.PAPERCLIP_FOLD_RESTAMP_MIGRATIONS_DIR
+  ? fileURLToPath(process.env.PAPERCLIP_FOLD_RESTAMP_MIGRATIONS_DIR)
+  : fileURLToPath(new URL("./migrations", import.meta.url));
+const journalRepoPathEnv = process.env.PAPERCLIP_FOLD_RESTAMP_JOURNAL_REPO_PATH;
+const migrationsDir = migrationsRootDir;
 const schemaDir = fileURLToPath(new URL("./schema", import.meta.url));
 const metaDir = join(migrationsDir, "meta");
 const journalPath = join(metaDir, "_journal.json");
-const journalRepoPath = "packages/db/src/migrations/meta/_journal.json";
+const journalRepoPath = journalRepoPathEnv ?? "packages/db/src/migrations/meta/_journal.json";
 
 export type JournalEntry = { idx: number; version: string; when: number; tag: string; breakpoints?: boolean };
 export type Journal = { version: string; dialect: string; entries: JournalEntry[] };

@@ -1,8 +1,9 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { ensureMonotonicWhen } from "./check-migration-numbering.js";
 import {
@@ -382,6 +383,86 @@ describe("re-pointing source references", () => {
       await repointMigrationReferences([reference("c.test.ts", "0232_gone", "0247_gone")], root),
     ).toEqual([]);
     expect(await readFile(join(root, "c.test.ts"), "utf8")).toBe('readMigration("0300_unrelated.sql");');
+  });
+});
+
+describe("fold re-stamp CLI apply path", () => {
+  it("fails on a broken chain tail and leaves migrations, journal and meta byte-identical", async () => {
+    const srcDir = dirname(fileURLToPath(import.meta.url));
+    const toolPath = join(srcDir, "fold-restamp-migrations.ts");
+    const tsxBin = join(srcDir, "..", "node_modules", ".bin", "tsx");
+    const root = await mkdtemp(join(tmpdir(), "fold-cli-"));
+    const journalRepoPath = "packages/db/src/migrations/meta/_journal.json";
+    const migrationsDir = join(root, "packages/db/src/migrations");
+    const metaDir = join(migrationsDir, "meta");
+    await mkdir(metaDir, { recursive: true });
+
+    const write = async (path: string, body: string) => {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, body, "utf8");
+    };
+    const run = (args: string[]) => execFileSync("git", args, { cwd: root, stdio: "pipe" });
+    run(["init", "-q", "-b", "main"]);
+    run(["config", "user.email", "cli@fixture.local"]);
+    run(["config", "user.name", "cli fixture"]);
+
+    // Base branch: fork line only (idx 0..2, previous snapshot 0002).
+    const baseJournalBody = `${JSON.stringify(baseJournal, null, 2)}\n`;
+    await write(join(metaDir, "_journal.json"), baseJournalBody);
+    const snap = (id: string, prevId: string) => `${JSON.stringify({ id, prevId }, null, 2)}\n`;
+    await write(join(metaDir, "0000_snapshot.json"), snap("id-0", "id-none"));
+    await write(join(metaDir, "0001_snapshot.json"), snap("id-1", "id-0"));
+    await write(join(metaDir, "0002_snapshot.json"), snap("id-2", "id-1"));
+    await write(join(metaDir, "0003_snapshot.json"), snap("id-3", "id-2"));
+    await write(join(migrationsDir, "0189_merge_arming_enabled.sql"), "-- fork tip\n");
+    run(["add", "-A"]);
+    run(["commit", "-qm", "base"]);
+
+    // Folded journal: adds 0184 + 0192 above the fork line. A stray snapshot
+    // (0002_stray) sorts between the previous snapshot (0002) and the next one
+    // (0004, idx after appending 2 folded entries), breaking the chain tail.
+    const foldedBody = `${JSON.stringify(foldedJournal, null, 2)}\n`;
+    await write(join(metaDir, "_journal.json"), foldedBody);
+    await write(join(metaDir, "0002_stray_snapshot.json"), snap("id-stray", "id-2"));
+    await write(join(migrationsDir, "0184_routable_blocked.sql"), "-- folded a\n");
+    await write(join(migrationsDir, "0192_task_watchdog_stop_snapshots.sql"), "-- folded b\n");
+    await write(join(migrationsDir, "0187_deploy_slot_locks.sql"), "-- fork 0187\n");
+    await write(join(migrationsDir, "0188_run_budget_snapshot.sql"), "-- fork 0188\n");
+    run(["add", "-A"]);
+    run(["commit", "-qm", "fold"]);
+    run(["branch", "foldbase", "HEAD~1"]);
+
+    async function treeBytes(): Promise<Map<string, string>> {
+      const map = new Map<string, string>();
+      for (const dir of [migrationsDir, metaDir]) {
+        for (const file of (await readdir(dir)).sort()) {
+          const full = join(dir, file);
+          if (!full.endsWith(".json") && !full.endsWith(".sql")) continue;
+          map.set(full.slice(root.length + 1), await readFile(full, "utf8"));
+        }
+      }
+      return map;
+    }
+
+    const before = await treeBytes();
+    expect(before.size).toBeGreaterThan(0);
+
+    const result = spawnSync(tsxBin, [toolPath, "--base", "foldbase", "--apply"], {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PAPERCLIP_FOLD_RESTAMP_MIGRATIONS_DIR: pathToFileURL(`${migrationsDir}/`).href,
+        PAPERCLIP_FOLD_RESTAMP_JOURNAL_REPO_PATH: journalRepoPath,
+      },
+    });
+
+    const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+    expect(output, output).toContain("Snapshot chain tail mismatch");
+    expect(result.status, output).not.toBe(0);
+    const after = await treeBytes();
+    expect([...after.keys()].sort()).toEqual([...before.keys()].sort());
+    for (const [key, bytes] of before) expect(after.get(key), key).toBe(bytes);
   });
 });
 
