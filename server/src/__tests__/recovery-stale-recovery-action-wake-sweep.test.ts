@@ -48,7 +48,13 @@ describeEmbeddedPostgres("reconcileStaleRecoveryActionWakes", () => {
     await db.delete(companies);
   });
 
-  async function seedCompany() {
+  async function seedCompany(
+    sourceIssue: {
+      status?: string;
+      assigneeAgentId?: string | null;
+      assigneeUserId?: string | null;
+    } = {},
+  ) {
     const companyId = randomUUID();
     const managerId = randomUUID();
     const coderId = randomUUID();
@@ -89,9 +95,12 @@ describeEmbeddedPostgres("reconcileStaleRecoveryActionWakes", () => {
       id: sourceIssueId,
       companyId,
       title: "Implement backend recovery",
-      status: "in_progress",
+      status: sourceIssue.status ?? "in_progress",
       priority: "medium",
-      assigneeAgentId: coderId,
+      ...(sourceIssue.assigneeAgentId === null
+        ? {}
+        : { assigneeAgentId: sourceIssue.assigneeAgentId ?? coderId }),
+      ...(sourceIssue.assigneeUserId ? { assigneeUserId: sourceIssue.assigneeUserId } : {}),
       issueNumber: 1,
       identifier: `${prefix}-1`,
     });
@@ -366,7 +375,138 @@ describeEmbeddedPostgres("reconcileStaleRecoveryActionWakes", () => {
     );
     expect(exhaustionComment).toBeDefined();
     expect(exhaustionComment!.body).toContain(`(${action.attemptCount}/${updated.maxAttempts})`);
+
+    // SUP-21344: exhaustion must leave the board a concrete artefact the monitor
+    // claimer can fire (an armed board decision monitor), not a passive comment.
+    const [sourceIssue] = await db
+      .select({ monitorNextCheckAt: issues.monitorNextCheckAt, monitorScheduledBy: issues.monitorScheduledBy })
+      .from(issues)
+      .where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue.monitorNextCheckAt).not.toBeNull();
+    expect(sourceIssue.monitorNextCheckAt!.getTime()).toBeGreaterThan(Date.now());
+    expect(sourceIssue.monitorScheduledBy).toBe("board");
+    expect(exhaustionComment!.body).toContain("Board decision item:");
   });
+
+  it.each([
+    { label: "todo status", sourceIssue: { status: "todo" } },
+    { label: "unassigned", sourceIssue: { assigneeAgentId: null } },
+    { label: "user assignee", sourceIssue: { assigneeUserId: "board-user-1" } },
+  ])(
+    "SUP-21344: exhaustion on a non-monitor-dispatchable source ($label) arms no fake monitor but mints an owned recovery issue",
+    async ({ sourceIssue }) => {
+      const { companyId, coderId, managerId, sourceIssueId } = await seedCompany(sourceIssue);
+
+      const staleAt = new Date(Date.now() - 10 * 60_000);
+      const action = await insertRecoveryAction({
+        companyId,
+        sourceIssueId,
+        ownerAgentId: coderId,
+        cause: "stranded_assigned_issue",
+        attemptCount: 5,
+        maxAttempts: null,
+        lastAttemptAt: staleAt,
+        status: "active",
+        wakePolicy: { type: "wake_owner" },
+      });
+
+      const wakeCalls: unknown[][] = [];
+      const enqueueWakeup = vi.fn((...args: unknown[]) => {
+        wakeCalls.push(args);
+        return Promise.resolve(null);
+      });
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60_000 });
+
+      expect(result.maxAttemptsReached).toBe(1);
+      // The only wake is the recovery-issue owner's, not a source re-fire.
+      expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+
+      const [updated] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(updated.status).toBe("escalated");
+      expect(updated.outcome).toBe("exhausted");
+      expect(updated.ownerType).toBe("board");
+      expect(updated.recoveryIssueId).not.toBeNull();
+
+      const [wakeAgentId, wakeOpts] = wakeCalls[0]!;
+      expect(wakeAgentId).toBe(managerId);
+      const opts = wakeOpts as {
+        reason: string;
+        idempotencyKey: string;
+        payload: { sourceIssueId: string; recoveryActionId: string };
+      };
+      expect(opts.reason).toBe("exhausted_recovery_issue");
+      expect(opts.idempotencyKey).toBe(
+        `exhausted-recovery-issue:${action.id}:${updated.recoveryIssueId}`,
+      );
+      expect(opts.payload.sourceIssueId).toBe(sourceIssueId);
+      expect(opts.payload.recoveryActionId).toBe(action.id);
+
+      // The linked recovery issue is a durable, non-terminal, agent-owned card.
+      const [recoveryIssue] = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, updated.recoveryIssueId!));
+      expect(recoveryIssue).toBeDefined();
+      expect(recoveryIssue.status).toBe("todo");
+      expect(recoveryIssue.assigneeAgentId).toBe(managerId);
+      expect(recoveryIssue.originKind).toBe("stranded_issue_recovery");
+      expect(recoveryIssue.originId).toBe(sourceIssueId);
+      expect(recoveryIssue.parentId).toBe(sourceIssueId);
+
+      // No fireable-wake claim on the source: the scheduler requires an agent
+      // assignee in in_progress/in_review/blocked, so no monitor columns may
+      // be written on the source row.
+      const [issue] = await db
+        .select({
+          monitorNextCheckAt: issues.monitorNextCheckAt,
+          monitorScheduledBy: issues.monitorScheduledBy,
+          executionPolicy: issues.executionPolicy,
+        })
+        .from(issues)
+        .where(eq(issues.id, sourceIssueId));
+      expect(issue.monitorNextCheckAt).toBeNull();
+      expect(issue.monitorScheduledBy).toBeNull();
+      expect((issue.executionPolicy as { monitor?: unknown } | null)?.monitor).toBeUndefined();
+
+      // The comment names the recovery issue and must not claim a scheduled
+      // board check on the source.
+      const comments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, sourceIssueId));
+      const exhaustionComment = comments.find((c) =>
+        (c.body ?? "").includes("exhausted its attempt ceiling"),
+      );
+      expect(exhaustionComment).toBeDefined();
+      expect(exhaustionComment!.body).toContain(`Board decision item: recovery_action:${action.id}`);
+      expect(exhaustionComment!.body).toContain("not monitor-dispatchable");
+      expect(exhaustionComment!.body).toContain(updated.recoveryIssueId!);
+      expect(exhaustionComment!.body).not.toContain("next board check at");
+
+      // Idempotency: a second sweep must not mint a duplicate recovery issue
+      // or re-wake (the action is escalated now, so it is no longer a stale
+      // `active` candidate at all).
+      const second = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60_000 });
+      expect(second.maxAttemptsReached).toBe(0);
+      expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+      const recoveryIssues = await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, companyId),
+            eq(issues.originKind, "stranded_issue_recovery"),
+            eq(issues.originId, sourceIssueId),
+          ),
+        );
+      expect(recoveryIssues).toHaveLength(1);
+    },
+  );
 
   it("does not re-fire for actions that are not stale", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();

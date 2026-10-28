@@ -18,6 +18,9 @@ export const ATTENTION_SOURCE_KINDS = [
   "failed_run",
   "budget_alert",
   "agent_error_alert",
+  // SUP-21344: the recovery-rate alert materialises as a named attention item
+  // when a week breaches the threshold (see recoveryRateAlertArtifactKey).
+  "recovery_rate_alert",
 ] as const;
 
 export type AttentionSourceKind = (typeof ATTENTION_SOURCE_KINDS)[number];

@@ -147,6 +147,7 @@ import {
   normalizeIssueExecutionPolicy,
   resolveProjectDefaultIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
+import { isTerminalRecoveryAction as isTerminalRecoveryActionShared } from "./issue-continuation-path.js";
 import {
   buildUndischargeableLadderEdgeConflict,
   evaluateUndischargeableLadderEdge,
@@ -3840,12 +3841,9 @@ function lowTrustBoundaryIssueCondition(
 
 const BLOCKER_ATTENTION_OPEN_RECOVERY_TERMINAL_STATUSES = ["done", "cancelled"];
 
-function isTerminalRecoveryAction(action: {
-  status: string;
-  outcome?: string | null;
-}): boolean {
-  return action.outcome === "exhausted";
-}
+// SUP-21344: delegate to the shared cross-lane predicate (stricter:
+// escalated + exhausted) so this lane cannot drift from the §2a lanes.
+const isTerminalRecoveryAction = isTerminalRecoveryActionShared;
 
 export const BLOCKER_ATTENTION_MAX_DEPTH = 8;
 export const BLOCKER_ATTENTION_MAX_NODES = 2000;

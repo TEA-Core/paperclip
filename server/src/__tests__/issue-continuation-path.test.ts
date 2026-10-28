@@ -3,6 +3,7 @@ import {
   buildTimerDispatchSuppressionDetails,
   evaluateIssueContinuationPath,
   IN_PROGRESS_SETTLE_WINDOW_MS,
+  isTerminalRecoveryAction,
   isTimerCandidateActionable,
   shouldEmitTimerDispatchSuppression,
   TIMER_DISPATCH_SUPPRESSED_ACTION,
@@ -19,7 +20,9 @@ import {
 const NOW = new Date("2026-09-03T12:00:00.000Z");
 const OLD_ACTIVITY = new Date("2026-09-03T11:40:00.000Z"); // 20 min ago -> outside settle window
 
-function emptyEvidence(overrides: Record<string, unknown> = {}) {
+type Evidence = Parameters<typeof evaluateIssueContinuationPath>[0];
+
+function emptyEvidence(overrides: Partial<Evidence> = {}): Evidence {
   return {
     activeRun: false,
     monitorNextCheckAt: null,
@@ -60,7 +63,14 @@ describe("evaluateIssueContinuationPath (§2a predicate, behavior-preserving)", 
   });
 
   it("is ok via each §2a disjunct in isolation (bullet 2)", () => {
-    const perDisjunct: Array<["disjunct", Record<string, unknown>]> = [
+    type DisjunctName =
+      | "activeRun"
+      | "monitorNextCheckAtInFuture"
+      | "watchdog"
+      | "scheduledRetry"
+      | "activeRecoveryAction"
+      | "successfulRunHandoffLive";
+    const perDisjunct: Array<[DisjunctName, Partial<Evidence>]> = [
       ["activeRun", { activeRun: true }],
       [
         "monitorNextCheckAtInFuture",
@@ -78,6 +88,17 @@ describe("evaluateIssueContinuationPath (§2a predicate, behavior-preserving)", 
       expect(result.disjuncts[key], `${name} disjunct flag`).toBe(true);
       expect(result.settledWithinWindow).toBe(false);
     }
+  });
+
+  it("SUP-21344: a terminal (exhausted) recovery action satisfies no §2a disjunct", () => {
+    const terminal = { id: "recovery-1", status: "escalated", outcome: "exhausted" };
+    expect(isTerminalRecoveryAction(terminal)).toBe(true);
+    expect(isTerminalRecoveryAction({ status: "escalated", outcome: null })).toBe(false);
+    expect(isTerminalRecoveryAction({ status: "active", outcome: "exhausted" })).toBe(false);
+    expect(isTerminalRecoveryAction(null)).toBe(false);
+    const result = evaluateIssueContinuationPath(emptyEvidence({ activeRecoveryAction: terminal }), { now: NOW });
+    expect(result.ok).toBe(false);
+    expect(result.disjuncts.activeRecoveryAction).toBe(false);
   });
 
   it("is ok when lastActivityAt falls inside the settle window even with no disjunct", () => {
