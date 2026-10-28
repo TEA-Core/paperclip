@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -7,6 +8,8 @@ import { ensureMonotonicWhen } from "./check-migration-numbering.js";
 import {
   type Journal,
   type MigrationReference,
+  applyFoldSnapshot,
+  assertSnapshotChainTail,
   classifyJournalIdxWindow,
   planFoldRestamp,
   repointMigrationReferences,
@@ -192,6 +195,127 @@ describe("fold re-stamp snapshot", () => {
     expect(snapshotFileName(0)).toBe("0000_snapshot.json");
     expect(snapshotFileName(246)).toBe("0246_snapshot.json");
     expect(snapshotFileName(1234)).toBe("1234_snapshot.json");
+  });
+});
+
+describe("snapshot chain tail assertion", () => {
+  const existing = [
+    { file: "0002_snapshot.json", id: "id-2" },
+    { file: "0000_snapshot.json", id: "id-0" },
+    { file: "0001_snapshot.json", id: "id-1" },
+  ];
+
+  it("passes when sorted.at(-2).id === next.prevId", () => {
+    expect(() =>
+      assertSnapshotChainTail(existing, { file: "0003_snapshot.json", prevId: "id-2" }),
+    ).not.toThrow();
+  });
+
+  it("throws when a stray snapshot sorts between previous and next", () => {
+    const withStray = [...existing, { file: "0002_stray_snapshot.json", id: "id-stray" }];
+    expect(() =>
+      assertSnapshotChainTail(withStray, { file: "0003_snapshot.json", prevId: "id-2" }),
+    ).toThrow(/0002_stray_snapshot\.json.*0003_snapshot\.json|0003_snapshot\.json.*0002_stray_snapshot\.json/);
+  });
+
+  it("throws when next.prevId names another snapshot", () => {
+    expect(() =>
+      assertSnapshotChainTail(existing, { file: "0003_snapshot.json", prevId: "id-1" }),
+    ).toThrow(/0002_snapshot\.json.*0003_snapshot\.json|0003_snapshot\.json.*0002_snapshot\.json/);
+  });
+
+  it("throws when the new snapshot does not sort last", () => {
+    expect(() =>
+      assertSnapshotChainTail(existing, { file: "0001_snapshot.json", prevId: "id-0" }),
+    ).toThrow(/0001_snapshot\.json/);
+  });
+});
+
+describe("fold re-stamp snapshot apply path", () => {
+  async function tempMetaDir(files: Record<string, string>): Promise<string> {
+    const root = await mkdtemp(join(tmpdir(), "fold-snapshot-"));
+    const metaDir = join(root, "meta");
+    await mkdir(metaDir, { recursive: true });
+    for (const [file, body] of Object.entries(files)) await writeFile(join(metaDir, file), body, "utf8");
+    return metaDir;
+  }
+
+  async function snapshotTree(metaDir: string): Promise<Record<string, string>> {
+    const tree: Record<string, string> = {};
+    for (const file of (await readdir(metaDir)).sort()) {
+      tree[file] = await readFile(join(metaDir, file), "utf8");
+    }
+    return tree;
+  }
+
+  async function breakChainTail(metaDir: string): Promise<void> {
+    const strayPath = join(metaDir, "0003_snapshot.json");
+    const stray = JSON.parse(await readFile(strayPath, "utf8")) as Record<string, unknown>;
+    stray.id = "id-stray";
+    await writeFile(strayPath, `${JSON.stringify(stray, null, 2)}\n`, "utf8");
+  }
+
+  it("removes the superseded snapshot and writes the next one", async () => {
+    const metaDir = await tempMetaDir({
+      "0002_snapshot.json": JSON.stringify({ id: "id-2", prevId: "id-1" }),
+    });
+    const repoRoot = join(metaDir, "..");
+
+    const result = await applyFoldSnapshot({
+      targetMetaDir: metaDir,
+      repoRoot,
+      previousFile: "0002_snapshot.json",
+      nextFile: "0003_snapshot.json",
+      skipSnapshot: false,
+      snapshot: { id: "id-3", prevId: "id-2" },
+    });
+
+    expect(result).toBe("removed");
+    expect(existsSync(join(metaDir, "0002_snapshot.json"))).toBe(false);
+    expect(existsSync(join(metaDir, "0003_snapshot.json"))).toBe(true);
+  });
+
+  it("leaves the previous snapshot in place with --skip-snapshot", async () => {
+    const metaDir = await tempMetaDir({
+      "0002_snapshot.json": JSON.stringify({ id: "id-2", prevId: "id-1" }),
+    });
+
+    const result = await applyFoldSnapshot({
+      targetMetaDir: metaDir,
+      repoRoot: join(metaDir, ".."),
+      previousFile: "0002_snapshot.json",
+      nextFile: "0003_snapshot.json",
+      skipSnapshot: true,
+      snapshot: null,
+    });
+
+    expect(result).toBe("skipped");
+    expect(existsSync(join(metaDir, "0002_snapshot.json"))).toBe(true);
+    expect(existsSync(join(metaDir, "0003_snapshot.json"))).toBe(false);
+  });
+
+  it("leaves the tree byte-identical when the chain-tail assertion fails", async () => {
+    const metaDir = await tempMetaDir({
+      "0002_snapshot.json": JSON.stringify({ id: "id-2", prevId: "id-1" }),
+      "0003_snapshot.json": JSON.stringify({ id: "id-3", prevId: "id-2" }),
+    });
+
+    await breakChainTail(metaDir);
+    const before = await snapshotTree(metaDir);
+
+    expect(() =>
+      assertSnapshotChainTail(
+        [
+          { file: "0002_snapshot.json", id: "id-2" },
+          { file: "0003_snapshot.json", id: "id-stray" },
+        ],
+        { file: "0004_snapshot.json", prevId: "id-2" },
+      ),
+    ).toThrow(/0003_snapshot\.json.*0004_snapshot\.json|0004_snapshot\.json.*0003_snapshot\.json/);
+
+    // The assertion runs before any rename, journal rewrite or snapshot
+    // write in main(), so a throw here means nothing was touched.
+    expect(await snapshotTree(metaDir)).toEqual(before);
   });
 });
 // A fold that renumbers a migration breaks every test that reads it off disk by

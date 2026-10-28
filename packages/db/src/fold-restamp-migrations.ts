@@ -25,7 +25,9 @@
  *    are already applied on the deployed instance, and raising their `when`
  *    would make drizzle re-run them.
  *
- * 2. It emits `meta/NNNN_snapshot.json` for the journal's new newest `idx`.
+ * 2. It emits `meta/NNNN_snapshot.json` for the journal's new newest `idx`
+ *    and removes the snapshot that idx supersedes, because the drift test
+ *    reads only the newest idx.
  *    `migration-snapshot-drift.test.ts` resolves the snapshot it diffs the
  *    schema against by journal **idx**, not by tag
  *    (`String(newest.idx).padStart(4, "0") + "_snapshot.json"`), and snapshots
@@ -96,9 +98,10 @@
  *                     then has to be produced by hand before CI goes green.
  */
 import { execFileSync } from "node:child_process";
-import { readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { ensureSnapshotChain } from "./check-migration-numbering.js";
 
 const migrationsDir = fileURLToPath(new URL("./migrations", import.meta.url));
 const schemaDir = fileURLToPath(new URL("./schema", import.meta.url));
@@ -165,6 +168,65 @@ function renumber(tag: string, next: number): string {
  */
 export function snapshotFileName(idx: number): string {
   return `${String(idx).padStart(4, "0")}_snapshot.json`;
+}
+
+/**
+ * The new snapshot must chain onto the LAST snapshot already on disk, and be
+ * the last one itself. Sort every existing snapshot plus the new one by file
+ * name, then require the file just before the new snapshot to be the one its
+ * `prevId` names. A stray snapshot sorting between them, or a `prevId` that
+ * names anything other than the immediate predecessor, would leave
+ * drizzle-kit to resolve a forked tail on the next generate.
+ */
+export function assertSnapshotChainTail(
+  existing: Array<{ file: string; id: string }>,
+  next: { file: string; prevId: string },
+): void {
+  const sorted = [...existing, { file: next.file }].sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+  const predecessor = sorted.at(-2);
+  const predecessorId = predecessor
+    ? existing.find((snapshot) => snapshot.file === predecessor.file)?.id
+    : undefined;
+  const last = sorted.at(-1);
+  if (last?.file !== next.file || !predecessor || predecessorId !== next.prevId) {
+    throw new Error(
+      `Snapshot chain tail mismatch: ${next.file} declares prevId ${next.prevId}, which must be the id of ${
+        predecessor ? `${predecessor.file} (id ${predecessorId ?? "unknown"})` : "no preceding snapshot"
+      }, the snapshot sorting immediately before ${next.file} (last by filename is ${last?.file ?? "none"}). ` +
+        "A stray snapshot sorting between them, or a prevId naming another snapshot, would leave the chain tail wrong.",
+    );
+  }
+}
+
+export type SnapshotChainEntry = { file: string; id: string; prevId: string };
+
+/**
+ * Apply the fold plan to a meta directory: write the new snapshot, then remove
+ * the snapshot it supersedes. The file operations take their directory so a
+ * test can run them against a temp meta dir. Nothing is removed with
+ * `skip-snapshot`, when no snapshot was written, or when the journal did not
+ * move (previousFile === nextFile). Removal mirrors the rename loop: `git rm`
+ * first, plain removal when the file is untracked.
+ */
+export async function applyFoldSnapshot(args: {
+  targetMetaDir: string;
+  repoRoot: string;
+  previousFile: string;
+  nextFile: string;
+  skipSnapshot: boolean;
+  snapshot: Record<string, unknown> | null;
+}): Promise<"removed" | "skipped"> {
+  const { targetMetaDir, repoRoot, previousFile, nextFile, skipSnapshot, snapshot } = args;
+  if (skipSnapshot || !snapshot) return "skipped";
+  await writeFile(join(targetMetaDir, nextFile), `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+  if (previousFile === nextFile) return "skipped";
+  const previousPath = join(targetMetaDir, previousFile);
+  try {
+    git(["rm", "-q", previousPath], repoRoot);
+  } catch {
+    await rm(previousPath, { force: true });
+  }
+  return "removed";
 }
 
 /**
@@ -524,7 +586,45 @@ async function main() {
     );
   }
 
+  // Before any rename, journal write or snapshot write, assert the snapshot
+  // chain tail: the new snapshot must chain onto the last snapshot on disk
+  // and be the last one itself. Read-only, so a dry run checks the same way.
+  const existingSnapshots: Array<SnapshotChainEntry & { snapshot: Record<string, unknown> }> = [];
+  for (const file of (await readdir(metaDir)).filter((entry) => entry.endsWith("_snapshot.json")).sort()) {
+    const parsed = JSON.parse(await readFile(join(metaDir, file), "utf8")) as Record<string, unknown>;
+    if (typeof parsed.id !== "string" || typeof parsed.prevId !== "string") {
+      throw new Error(`Snapshot ${file} is missing a string "id" or "prevId"`);
+    }
+    existingSnapshots.push({ file, id: parsed.id, prevId: parsed.prevId, snapshot: parsed });
+  }
+
+  if (skipSnapshot || plan.snapshot.previousFile === plan.snapshot.nextFile) {
+    // No snapshot will be written, so there is no new tail to assert; the
+    // on-disk chain must still be intact on its own.
+    ensureSnapshotChain(existingSnapshots);
+  } else {
+    const previous = existingSnapshots.find((snapshot) => snapshot.file === plan.snapshot.previousFile);
+    if (!previous) {
+      throw new Error(
+        `Cannot chain the new snapshot: ${plan.snapshot.previousFile} is missing from meta/. ` +
+          "It is the state the pre-fold journal's newest idx resolved to, so the tree was already " +
+          "failing migration-snapshot-drift before this fold. Fix that first, or pass --skip-snapshot.",
+      );
+    }
+    const nextPrevId = previous.id;
+    assertSnapshotChainTail(existingSnapshots, { file: plan.snapshot.nextFile, prevId: nextPrevId });
+    // drizzle-kit only mints the new snapshot's id at generation time, so use
+    // a sentinel id here that cannot collide with an id already on disk.
+    ensureSnapshotChain([
+      ...existingSnapshots,
+      { file: plan.snapshot.nextFile, id: "<new snapshot id>", prevId: nextPrevId },
+    ]);
+  }
+
   if (!apply) {
+    if (!skipSnapshot && plan.snapshot.previousFile !== plan.snapshot.nextFile) {
+      console.log(`would remove meta/${plan.snapshot.previousFile}`);
+    }
     console.log("\nDry run. Re-run with --apply to rename the files, rewrite the journal and write the snapshot.");
     return;
   }
@@ -550,8 +650,16 @@ async function main() {
   console.log(`\nRewrote ${journalRepoPath}: ${merged.length} entries, last ${merged[merged.length - 1].tag} @ ${merged[merged.length - 1].when}.`);
 
   if (snapshot) {
-    await writeFile(join(metaDir, plan.snapshot.nextFile), `${JSON.stringify(snapshot.snapshot, null, 2)}\n`, "utf8");
+    const removal = await applyFoldSnapshot({
+      targetMetaDir: metaDir,
+      repoRoot,
+      previousFile: plan.snapshot.previousFile,
+      nextFile: plan.snapshot.nextFile,
+      skipSnapshot,
+      snapshot: snapshot.snapshot,
+    });
     console.log(`Wrote meta/${plan.snapshot.nextFile}, prevId chained onto ${plan.snapshot.previousFile}.`);
+    if (removal === "removed") console.log(`Removed meta/${plan.snapshot.previousFile}.`);
     console.log(
       `\n${plan.snapshot.previousFile} -> merged schema is ${snapshot.statements.length} statement(s). ` +
         "Every one must trace to a folded migration; anything that does not is real drift\n" +
