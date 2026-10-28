@@ -19535,6 +19535,7 @@ export function issueRoutes(
     // A run release can change updatedAt before the write transaction. Do not
     // certify the issue until that request-owned mutation has finished.
     let deferFinalDeliveryPrefetch = false;
+    let doneOverrideAccepted = false;
     let originalDeliveryBinding: string | null = null;
     // Refuse before evaluateDoneTransitionGuards. That guard writes
     // issue.done_tier_declaration_skipped, and the later side-effect reject
@@ -19567,6 +19568,7 @@ export function issueRoutes(
         res.status(outcome.status).json(outcome.body);
         return;
       }
+      doneOverrideAccepted = outcome.overrideAccepted === true;
       if (terminalApprovalNeedsPreflight && outcome.overrideAccepted !== true) {
         deferFinalDeliveryPrefetch = Boolean(existing.assigneeAgentId && (assigneeWillChange || terminalizingIssue));
         if (deferFinalDeliveryPrefetch) {
@@ -19714,7 +19716,7 @@ export function issueRoutes(
         updateFields,
         transition.decision,
         nextExecutionPolicy,
-        { prefetched: finalDeliveryPrefetch },
+        { overrideAccepted: doneOverrideAccepted, prefetched: finalDeliveryPrefetch },
       );
     }
     const nextParentId = updateFields.parentId === undefined
@@ -20148,6 +20150,7 @@ export function issueRoutes(
                   : { ...lockedIssue, deliveryRequirement: effectiveDeliveryRequirement };
               const lockedPrefetch = finalDeliveryPrefetch ?? await prefetchFinalDelivery(effectiveLockedIssue);
               await preflightTerminalApproval(effectiveLockedIssue, updateFields, transition.decision, nextExecutionPolicy, {
+                overrideAccepted: doneOverrideAccepted,
                 locked: { prefetch: lockedPrefetch, tx: tx as unknown as Db },
               });
             }
