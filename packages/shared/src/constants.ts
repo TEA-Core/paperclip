@@ -402,6 +402,7 @@ export const ISSUE_RECOVERY_ACTION_KINDS = [
   "no_live_path_owner_unavailable",
   "pending_review_rearm_cap_exhausted",
   "undispatchable_assignee",
+  "close_arm_failed",
 ] as const;
 export type IssueRecoveryActionKind = (typeof ISSUE_RECOVERY_ACTION_KINDS)[number];
 

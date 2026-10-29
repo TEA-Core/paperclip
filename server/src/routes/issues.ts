@@ -4965,6 +4965,39 @@ export function issueRoutes(
           );
         }
 
+        if (closingTransition && (armingOutcome.kind === "failed" || armingOutcome.kind === "errored")) {
+          try {
+            const headIdentity =
+              /^[0-9a-f]{40}$/.test(statusOutcome.headSha ?? "")
+                ? (statusOutcome.headSha as string)
+                : "unresolved-head";
+            await recoveryActionsSvc.upsertSourceScoped({
+              companyId: issue.companyId,
+              sourceIssueId: issue.id,
+              kind: "close_arm_failed",
+              ownerType: "board",
+              cause: armingOutcome.message,
+              fingerprint: `close_arm_failed:${issue.companyId}:${issue.id}:${headIdentity}`,
+              evidence: {
+                identifier: issue.identifier ?? null,
+                headSha: statusOutcome.headSha ?? null,
+                outcomeKind: armingOutcome.kind,
+                outcomeMessage: armingOutcome.message,
+                decisionOutcome: decision?.outcome ?? null,
+              },
+              nextAction:
+                "Inspect the merge-arming failure, then enable repository auto-merge or land the certified pull request manually before resolving this recovery action.",
+              wakePolicy: null,
+              maxAttempts: 5,
+            });
+          } catch (recoveryErr) {
+            logger.error(
+              { err: recoveryErr, issueId: issue.id, companyId: issue.companyId },
+              "failed to create close-time merge-arm recovery action",
+            );
+          }
+        }
+
         // SUP-15394: a CLOSING transition whose ARMING refused (armingOutcome.kind ===
         // "skipped" — no-pr, unowned-branch, not-pr-owner, owner-not-approved, …)
         // means the publisher DID stamp a PR (statusOutcome was "armed", the only
@@ -6290,6 +6323,7 @@ export function issueRoutes(
     blockedToTodoRecovery?: boolean;
   }): Promise<string | null> {
     const { issue } = input;
+    if (input.activeRecoveryAction?.kind === "close_arm_failed") return null;
     if (issue.status === "done" || issue.status === "cancelled") {
       return `Recovery action became stale because the source issue reached ${issue.status}.`;
     }

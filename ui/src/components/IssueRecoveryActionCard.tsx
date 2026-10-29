@@ -142,6 +142,7 @@ const KIND_LABEL: Record<IssueRecoveryActionKind, string> = {
   blocked_without_blockers: "Blocked Without Blockers",
   pending_review_rearm_cap_exhausted: "Review Re-arm Cap Exhausted",
   undispatchable_assignee: "Undispatchable Assignee",
+  close_arm_failed: "Close-time Merge Arm Failed",
 };
 
 const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
@@ -171,6 +172,8 @@ const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
     "This task's review has been re-surfaced the maximum number of times without a decision.",
   undispatchable_assignee:
     "This task's assigned agent can never be dispatched to (pull-only). A human needs to reassign it to a dispatchable agent or take it over.",
+  close_arm_failed:
+    "This task was closed, but its pull request could not be queued for merge. The board owns the next step — enable repository auto-merge or land the pull request manually.",
 };
 
 /** Shared shell for the retry-timing pill so every timing state reads as the same control. */
