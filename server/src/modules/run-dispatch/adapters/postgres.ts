@@ -32,6 +32,7 @@ import {
   getIssueContinuationSummaryDocument,
 } from "../../../services/issue-continuation-summary.js";
 import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
+import { resolveLiveExecutionLeases } from "../../../services/issue-execution-lease.js";
 import { decideQueuedRunStaleness, decideScheduledRetryGate } from "../domain/policy.js";
 import type {
   QueuedRunFacts,
@@ -84,6 +85,8 @@ type LoadStalenessFactsInput = {
   companyId: string;
   agentId: string;
   issueId: string;
+  runStatus: string;
+  scheduledRetryAt: Date | null;
   contextSnapshot: Record<string, unknown>;
   scheduledRetryReason: string | null;
   runCreatedAt?: Date | null;
@@ -579,12 +582,19 @@ export function createPostgresRunDispatchAdapter(
     const readiness = issue && retryReasonKind === "native_safe_replacement"
       ? (await issueService(dbOrTx).listDependencyReadiness(input.companyId, [issueId])).get(issueId)
       : null;
+    const liveLease = issue
+      ? (await resolveLiveExecutionLeases(dbOrTx, input.companyId, [issueId], { excludeRunId: input.runId })).get(issueId)
+      : undefined;
     return {
       runId: input.runId,
+      runStatus: input.runStatus,
+      scheduledRetryAt: input.scheduledRetryAt,
       runAgentId: input.agentId,
       issueId,
       runCreatedAt: input.runCreatedAt ?? null,
       worktreeExecutionCutoff: input.worktreeExecutionCutoff ?? null,
+      hasActiveExecutionLease: Boolean(liveLease && issue?.executionRunId === liveLease.runId),
+      hasActiveCheckoutLease: Boolean(liveLease && issue?.checkoutRunId === liveLease.runId),
       retryReasonKind,
       dependenciesBlocked: readiness && !readiness.isDependencyReady ? {
         unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
@@ -987,6 +997,8 @@ export function createPostgresRunDispatchAdapter(
         companyId: run.companyId,
         agentId: run.agentId,
         issueId,
+        runStatus: run.status,
+        scheduledRetryAt: run.scheduledRetryAt,
         contextSnapshot,
         scheduledRetryReason: run.scheduledRetryReason,
         runCreatedAt: run.createdAt,
