@@ -1911,6 +1911,131 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(commentsAfterSecondPass).toHaveLength(commentsAfterFirstPass.length);
   });
 
+  it("SUP-21344-review: a due self-armed board monitor is claimed by the monitor tick, not re-armed by the drain", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "In review behind an exhausted recovery action, monitor due",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    const heartbeat = heartbeatService(db);
+    const armed = await heartbeat.reconcileExhaustedRecoveryDrain();
+    expect(armed.monitorArmed).toBe(1);
+
+    const [armedIssue] = await db
+      .select({
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        monitorScheduledBy: issues.monitorScheduledBy,
+        monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
+        executionPolicy: issues.executionPolicy,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(armedIssue.monitorScheduledBy).toBe("board");
+    expect(armedIssue.monitorWakeRequestedAt).toBeNull();
+    // The board monitor carries a finite attempt cap, not null (uncapped).
+    expect(
+      (armedIssue.executionPolicy as { monitor?: { maxAttempts?: unknown } } | null)?.monitor?.maxAttempts,
+    ).toBe(3);
+    const armedCheckAt = armedIssue.monitorNextCheckAt!;
+    expect(armedCheckAt.getTime()).toBeGreaterThan(Date.now());
+
+    // Make the armed check due, as the live fleet's hourly checks become due.
+    const dueCheckAt = new Date(Date.now() - 1000);
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: dueCheckAt })
+      .where(eq(issues.id, issueId));
+
+    // The drain must leave a due self-armed board monitor for the claim path:
+    // no re-arm (+1h), no claim stamp consumed by the drain itself.
+    const drainAtDue = await heartbeat.reconcileExhaustedRecoveryDrain();
+    expect(drainAtDue.monitorArmed).toBe(0);
+    expect(drainAtDue.monitorDueAwaitingClaim).toBe(1);
+    const [afterDrain] = await db
+      .select({
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
+        monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
+        monitorAttemptCount: issues.monitorAttemptCount,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(afterDrain.monitorNextCheckAt?.getTime()).toBe(dueCheckAt.getTime());
+    expect(afterDrain.monitorWakeRequestedAt).toBeNull();
+    expect(afterDrain.monitorLastTriggeredAt).toBeNull();
+
+    // The monitor tick claims and fires it: a delivered issue_monitor_due wake.
+    await heartbeat.tickTimers(new Date());
+    const wakes = await db
+      .select({ reason: agentWakeupRequests.reason, payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.some((wake) => wake.reason === "issue_monitor_due")).toBe(true);
+
+    const [afterTick] = await db
+      .select({
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
+        monitorAttemptCount: issues.monitorAttemptCount,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(afterTick.monitorNextCheckAt).toBeNull();
+    expect(afterTick.monitorLastTriggeredAt).not.toBeNull();
+    expect(afterTick.monitorAttemptCount).toBe(1);
+    await drainAgentRuns(agentId);
+  });
+
+  it("SUP-21344-review: board monitor clears instead of re-firing once its attempt cap is reached", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "In review behind an exhausted recovery action, monitor capped",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    const heartbeat = heartbeatService(db);
+    const armed = await heartbeat.reconcileExhaustedRecoveryDrain();
+    expect(armed.monitorArmed).toBe(1);
+
+    // Simulate the cap having been consumed by prior fires, then make it due.
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date(Date.now() - 1000), monitorAttemptCount: 3 })
+      .where(eq(issues.id, issueId));
+
+    await heartbeat.tickTimers(new Date());
+    const [afterTick] = await db
+      .select({
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    // Cleared, not re-armed +1h and not left due for endless claim retries.
+    expect(afterTick.monitorNextCheckAt).toBeNull();
+    const wakes = await db
+      .select({ reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.some((wake) => wake.reason === "issue_monitor_due")).toBe(false);
+    await drainAgentRuns(agentId);
+  });
+
   it("SUP-21344: baseline drain mints an owned recovery issue for an exhausted todo source with no agent assignee", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
     const issueId = randomUUID();

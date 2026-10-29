@@ -8963,6 +8963,38 @@ export function recoveryService(
 
   // SUP-21344: board monitor interval for exhausted actions.
   const EXHAUSTED_BOARD_MONITOR_INTERVAL_MS = 60 * 60 * 1000;
+  // SUP-21344 (post-merge review): a board monitor must be claimable by
+  // tickDueIssueMonitors, not re-armed forever by the drain. Cap the number
+  // of monitor fires; on exhaustion dispatch clears the monitor and runs the
+  // default wake_owner recovery (an assignee wake), so the card leaves the
+  // scheduled state instead of advancing +1h indefinitely.
+  const EXHAUSTED_BOARD_MONITOR_MAX_ATTEMPTS = 3;
+
+  // A monitor (re)arm inside a drain pass must never be stamped already-due:
+  // the drain shares the 30s scheduler tick with tickDueIssueMonitors, and a
+  // check time at/before "now" lets the same pass (or the next drain pass)
+  // treat the monitor as not-future and re-arm it before the claim query
+  // (monitorNextCheckAt <= now, monitorWakeRequestedAt null) ever wins.
+  // Floor every newly armed check strictly into the future.
+  function exhaustedBoardMonitorNextCheckAt(now: Date, requested?: Date | null): Date {
+    const floor = new Date(now.getTime() + EXHAUSTED_BOARD_MONITOR_INTERVAL_MS);
+    if (!requested) return floor;
+    return requested.getTime() > now.getTime() ? requested : floor;
+  }
+
+  // True when the drain itself armed the current board monitor and its check
+  // is due (or already claimed): the drain must leave such a row for
+  // tickDueIssueMonitors to claim/fire instead of re-arming over it.
+  function isDueSelfArmedBoardMonitor(issue: {
+    monitorNextCheckAt: Date | string | null | undefined;
+    monitorScheduledBy: string | null | undefined;
+    monitorWakeRequestedAt: Date | string | null | undefined;
+  }, now: Date): boolean {
+    if (issue.monitorScheduledBy !== "board") return false;
+    if (issue.monitorWakeRequestedAt) return true;
+    if (!issue.monitorNextCheckAt) return false;
+    return new Date(issue.monitorNextCheckAt).getTime() <= now.getTime();
+  }
 
   // SUP-21344: arm an exhausted-action board monitor only when the source is
   // scheduler-dispatchable (agent assignee, no user assignee, monitorable
@@ -9000,7 +9032,7 @@ export function recoveryService(
         serviceName: null,
         externalRef: null,
         timeoutAt: null,
-        maxAttempts: null,
+        maxAttempts: EXHAUSTED_BOARD_MONITOR_MAX_ATTEMPTS,
         recoveryPolicy: null,
       },
     };
@@ -9063,6 +9095,7 @@ export function recoveryService(
       monitorArmed: 0,
       recoveryIssueMinted: 0,
       alreadyLive: 0,
+      monitorDueAwaitingClaim: 0,
       noInvokableOwner: 0,
       candidateLimitSkipped: 0,
       issueIds: [] as string[],
@@ -9110,10 +9143,21 @@ export function recoveryService(
           result.alreadyLive++;
           continue;
         }
+        // SUP-21344 (post-merge review): a due/claimed board monitor armed by
+        // this drain belongs to tickDueIssueMonitors. Re-arming here — the
+        // old behaviour — phase-locked with the 30s scheduler tick and
+        // advanced monitorNextCheckAt +1h forever: 43/43 cards kept a future
+        // check with monitorWakeRequestedAt null and zero delivered wakes.
+        // Leave the row untouched so the claim query fires it.
+        if (isDueSelfArmedBoardMonitor(issue, now)) {
+          result.monitorDueAwaitingClaim++;
+          result.alreadyLive++;
+          continue;
+        }
         const armedAt = await armExhaustedBoardMonitor({
           issue,
           recoveryActionId: action.id,
-          nextCheckAt: new Date(now.getTime() + EXHAUSTED_BOARD_MONITOR_INTERVAL_MS),
+          nextCheckAt: exhaustedBoardMonitorNextCheckAt(now),
           notes: `Board decision required: recovery action ${action.id} exhausted. Assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.`,
         });
         if (armedAt) {
@@ -9350,6 +9394,8 @@ export function recoveryService(
         executionWorkspaceId: issues.executionWorkspaceId,
         executionWorkspacePreference: issues.executionWorkspacePreference,
         monitorNextCheckAt: issues.monitorNextCheckAt,
+        monitorScheduledBy: issues.monitorScheduledBy,
+        monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
         unblockDescriptor: issues.unblockDescriptor,
         totalCount: sql<number>`count(*) over()::int`,
       })
@@ -9446,8 +9492,11 @@ export function recoveryService(
           // SUP-21344 drain for baseline cards parked before the exhaustion
           // path armed a board monitor: arm one now so this card gains a live
           // wake source (future monitorNextCheckAt) instead of only a counter.
-          if (!hasFutureMonitorCheck(candidate.monitorNextCheckAt)) {
-            const drainNextCheckAt = new Date(now.getTime() + EXHAUSTED_BOARD_MONITOR_INTERVAL_MS);
+          if (
+            !hasFutureMonitorCheck(candidate.monitorNextCheckAt) &&
+            !isDueSelfArmedBoardMonitor(candidate, now)
+          ) {
+            const drainNextCheckAt = exhaustedBoardMonitorNextCheckAt(now);
             const currentIssue = await db
               .select()
               .from(issues)
@@ -11088,11 +11137,16 @@ export function recoveryService(
     // acts (assigns an invokable owner / records a manual resolution) it
     // clears or supersedes the monitor.
     const hasExistingFutureMonitor = hasFutureMonitorCheck(sourceIssue.monitorNextCheckAt);
+    const dueSelfArmedBoardMonitor = isDueSelfArmedBoardMonitor(sourceIssue, now);
     const boardNextCheckAt = hasExistingFutureMonitor
       ? new Date(sourceIssue.monitorNextCheckAt!)
-      : new Date(now.getTime() + EXHAUSTED_BOARD_MONITOR_INTERVAL_MS);
-    let armedBoardCheckAt: Date | null = hasExistingFutureMonitor ? boardNextCheckAt : null;
-    if (!hasExistingFutureMonitor) {
+      : exhaustedBoardMonitorNextCheckAt(now);
+    let armedBoardCheckAt: Date | null = hasExistingFutureMonitor
+      ? boardNextCheckAt
+      : dueSelfArmedBoardMonitor && sourceIssue.monitorNextCheckAt
+        ? new Date(sourceIssue.monitorNextCheckAt)
+        : null;
+    if (!hasExistingFutureMonitor && !dueSelfArmedBoardMonitor) {
       armedBoardCheckAt = await armExhaustedBoardMonitor({
         issue: sourceIssue,
         recoveryActionId: action.id,
