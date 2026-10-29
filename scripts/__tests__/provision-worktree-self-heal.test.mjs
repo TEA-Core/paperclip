@@ -96,6 +96,10 @@ if (cliArgs[0] === "worktree" && cliArgs[1] === "ensure-seeded") {
       console.error("Explicit source Paperclip config must be a canonical path and cannot use a symlink alias.");
       process.exit(1);
     }
+    if (sourceCanonical === fs.realpathSync(".paperclip/config.json")) {
+      console.error("Source and target Paperclip configs are the same canonical file.");
+      process.exit(1);
+    }
   }
   if (${ensureExit} !== 0) {
     console.error("fake worktree ensure-seeded failure");
@@ -148,7 +152,7 @@ function runProvision(baseCwd, { pathPrefix, setupWorktree, existingWorktree } =
   return { result, worktreeCwd, worktreesHome, paperclipHome };
 }
 
-function runRuntimeProvision(baseCwd, worktreeCwd) {
+function runRuntimeProvision(baseCwd, worktreeCwd, { paperclipConfig } = {}) {
   const worktreesHome = makeTempDir("paperclip-provision-runtime-home-");
   const paperclipHome = makeInstanceHome();
   return spawnSync("bash", [runtimeScript], {
@@ -162,6 +166,7 @@ function runRuntimeProvision(baseCwd, worktreeCwd) {
       PAPERCLIP_WORKSPACE_BRANCH: "feature/provision-runtime-test",
       PAPERCLIP_WORKTREES_DIR: worktreesHome,
       PAPERCLIP_HOME: paperclipHome,
+      ...(paperclipConfig ? { PAPERCLIP_CONFIG: paperclipConfig } : {}),
       PAPERCLIP_PROJECT_WORKSPACE_ID: "project-workspace-1",
       PAPERCLIP_COMPANY_ID: "company-1",
     },
@@ -555,6 +560,30 @@ test("runtime provisioning omits the source override when the base config exists
   );
   assert.ok(ensureCall, "expected the runtime provisioner to invoke ensure-seeded");
   assert.ok(!ensureCall.includes("--from-config"));
+});
+
+test("runtime provisioning skips when PAPERCLIP_CONFIG canonically names the target", () => {
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const worktreeCwd = makeTempDir("paperclip-provision-runtime-target-source-");
+  fs.mkdirSync(path.join(worktreeCwd, ".paperclip"), { recursive: true });
+  fs.writeFileSync(path.join(worktreeCwd, ".paperclip", "config.json"), "{}\n");
+  const nonIdenticalTargetPath = `${worktreeCwd}/./.paperclip/config.json`;
+
+  const result = runRuntimeProvision(baseCwd, worktreeCwd, {
+    paperclipConfig: nonIdenticalTargetPath,
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /worktree config is the only on-disk config/);
+  assert.equal(
+    readCliInvocations(baseCwd).filter((args) => args[0] === "worktree" && args[1] === "ensure-seeded").length,
+    0,
+  );
+  const skipEvidence = JSON.parse(
+    fs.readFileSync(path.join(worktreeCwd, ".paperclip", "seed-skip-no-source"), "utf8"),
+  );
+  assert.equal(skipEvidence.reason, "source-config-is-target-config");
+  assert.equal(skipEvidence.sourceConfigPath, nonIdenticalTargetPath);
 });
 
 test("runtime provisioning exits 0 when no seed source config exists on disk", () => {

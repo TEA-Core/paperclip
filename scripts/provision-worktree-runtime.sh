@@ -99,6 +99,13 @@ if [[ -L "$base_cwd/.paperclip" && ! -d "$base_cwd/.paperclip" ]]; then
   echo "Registered base project workspace .paperclip is a broken symlink: $base_cwd/.paperclip" >&2
   exit 1
 fi
+write_seed_skip_marker() {
+  SEED_SKIP_MARKER_PATH="$seed_skip_marker_path" \
+  SEED_SKIP_SOURCE_CONFIG_PATH="$1" \
+  SEED_SKIP_REASON="$2" \
+  node -e 'const fs = require("node:fs"); const marker = { reason: process.env.SEED_SKIP_REASON, sourceConfigPath: process.env.SEED_SKIP_SOURCE_CONFIG_PATH || null, at: new Date().toISOString() }; fs.writeFileSync(process.env.SEED_SKIP_MARKER_PATH, JSON.stringify(marker, null, 2) + "\n");'
+}
+
 source_config_args=()
 if [[ ! -e "$base_cwd/.paperclip/config.json" && ! -L "$base_cwd/.paperclip/config.json" ]]; then
   source_config_path="${PAPERCLIP_CONFIG:-$paperclip_home/instances/$paperclip_instance_id/config.json}"
@@ -115,11 +122,17 @@ if [[ ! -e "$base_cwd/.paperclip/config.json" && ! -L "$base_cwd/.paperclip/conf
     # but malformed (a symlink or a non-canonical alias) is still refused by the
     # CLI.
     if [[ ! -e "$source_config_path" && ! -L "$source_config_path" ]]; then
-      SEED_SKIP_MARKER_PATH="$seed_skip_marker_path" \
-      SEED_SKIP_SOURCE_CONFIG_PATH="$source_config_path" \
-      node -e 'const fs = require("node:fs"); const marker = { reason: "no-on-disk-seed-source", sourceConfigPath: process.env.SEED_SKIP_SOURCE_CONFIG_PATH || null, at: new Date().toISOString() }; fs.writeFileSync(process.env.SEED_SKIP_MARKER_PATH, JSON.stringify(marker, null, 2) + "\n");'
+      write_seed_skip_marker "$source_config_path" "no-on-disk-seed-source"
       echo "No on-disk Paperclip seed source config found; the self-contained worktree has nothing to seed." >&2
       exit 0
+    fi
+    if [[ -e "$source_config_path" && ! -L "$source_config_path" ]]; then
+      source_config_canonical_path="$(SOURCE_CONFIG_PATH="$source_config_path" WORKTREE_CONFIG_PATH="$worktree_config_path" node -e 'const fs = require("node:fs"); const source = fs.realpathSync(process.env.SOURCE_CONFIG_PATH); const target = fs.realpathSync(process.env.WORKTREE_CONFIG_PATH); if (source === target) process.stdout.write("same");')"
+      if [[ "$source_config_canonical_path" == "same" ]]; then
+        write_seed_skip_marker "$source_config_path" "source-config-is-target-config"
+        echo "The worktree config is the only on-disk config; the self-contained worktree has nothing to seed." >&2
+        exit 0
+      fi
     fi
     source_config_args=(--from-config "$source_config_path")
   fi
