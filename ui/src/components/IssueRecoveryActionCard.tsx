@@ -261,7 +261,7 @@ function readEvidenceString(value: unknown): string | null {
 
 // Human-sentence evidence sources render as prose; code-shaped sources
 // (error codes, statuses) stay in the mono treatment used for run ids.
-const PROSE_EVIDENCE_KEYS = ["summary", "detectedProgressSummary", "missingDisposition", "retryReason"] as const;
+const PROSE_EVIDENCE_KEYS = ["summary", "detectedProgressSummary", "missingDisposition", "retryReason", "outcomeMessage"] as const;
 const CODE_EVIDENCE_KEYS = ["latestRunErrorCode", "latestRunStatus", "latestIssueStatus"] as const;
 
 function pickEvidenceSummary(action: IssueRecoveryAction): { text: string; isCode: boolean } | null {
@@ -269,6 +269,10 @@ function pickEvidenceSummary(action: IssueRecoveryAction): { text: string; isCod
   for (const key of PROSE_EVIDENCE_KEYS) {
     const next = readEvidenceString(evidence[key]);
     if (next) return { text: next, isCode: false };
+  }
+  if (action.kind === "close_arm_failed") {
+    const cause = readEvidenceString(action.cause);
+    if (cause) return { text: cause, isCode: false };
   }
   for (const key of CODE_EVIDENCE_KEYS) {
     const next = readEvidenceString(evidence[key]);
