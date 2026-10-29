@@ -109,25 +109,22 @@ write_seed_skip_marker() {
 source_config_args=()
 if [[ ! -e "$base_cwd/.paperclip/config.json" && ! -L "$base_cwd/.paperclip/config.json" ]]; then
   source_config_path="${PAPERCLIP_CONFIG:-$paperclip_home/instances/$paperclip_instance_id/config.json}"
-  # A human may invoke this after sourcing `worktree env`, which points
-  # PAPERCLIP_CONFIG at the target. Naming the target as its own source is never
-  # right, so leave the source to the CLI in that case.
-  if [[ "$source_config_path" != "$worktree_config_path" ]]; then
-    # A deployment may be configured entirely from process state (for example, a
-    # shared DATABASE_URL in the environment) and have no on-disk instance config
-    # anywhere. That is not an error: there is simply no seed source to clone
-    # from, so exit without demanding one. Record the intentional skip as durable
-    # evidence: the runtime consumer accepts the marker where it otherwise demands
-    # a verified seed manifest (workspace-runtime.ts). A source that is present
-    # but malformed (a symlink or a non-canonical alias) is still refused by the
-    # CLI.
+  if [[ "$source_config_path" == "$worktree_config_path" ]]; then
+    if [[ -f "$worktree_config_path" && ! -L "$worktree_config_path" ]] &&
+      WORKTREE_CONFIG_PATH="$worktree_config_path" node -e 'const fs = require("node:fs"); const target = process.env.WORKTREE_CONFIG_PATH; const stat = fs.lstatSync(target); if (!stat.isFile() || fs.realpathSync(target) !== target) process.exit(1);'; then
+      write_seed_skip_marker "$source_config_path" "source-config-is-target-config"
+      echo "The worktree config is the only on-disk config; the self-contained worktree has nothing to seed." >&2
+      exit 0
+    fi
+    source_config_args=(--from-config "$source_config_path")
+  else
     if [[ ! -e "$source_config_path" && ! -L "$source_config_path" ]]; then
       write_seed_skip_marker "$source_config_path" "no-on-disk-seed-source"
       echo "No on-disk Paperclip seed source config found; the self-contained worktree has nothing to seed." >&2
       exit 0
     fi
     if [[ -e "$source_config_path" && ! -L "$source_config_path" ]]; then
-      source_config_canonical_path="$(SOURCE_CONFIG_PATH="$source_config_path" WORKTREE_CONFIG_PATH="$worktree_config_path" node -e 'const fs = require("node:fs"); const source = fs.realpathSync(process.env.SOURCE_CONFIG_PATH); const target = fs.realpathSync(process.env.WORKTREE_CONFIG_PATH); if (source === target) process.stdout.write("same");')"
+      source_config_canonical_path="$(SOURCE_CONFIG_PATH="$source_config_path" WORKTREE_CONFIG_PATH="$worktree_config_path" node -e 'const fs = require("node:fs"); const source = fs.realpathSync(process.env.SOURCE_CONFIG_PATH); const targetPath = process.env.WORKTREE_CONFIG_PATH; const target = fs.realpathSync(targetPath); const targetStat = fs.lstatSync(targetPath); if (source === target && targetStat.isFile() && target === targetPath) process.stdout.write("same");')"
       if [[ "$source_config_canonical_path" == "same" ]]; then
         write_seed_skip_marker "$source_config_path" "source-config-is-target-config"
         echo "The worktree config is the only on-disk config; the self-contained worktree has nothing to seed." >&2

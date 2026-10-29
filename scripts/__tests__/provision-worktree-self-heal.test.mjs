@@ -586,6 +586,51 @@ test("runtime provisioning skips when PAPERCLIP_CONFIG canonically names the tar
   assert.equal(skipEvidence.sourceConfigPath, nonIdenticalTargetPath);
 });
 
+test("runtime provisioning skips when PAPERCLIP_CONFIG exactly names the target", () => {
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const worktreeCwd = makeTempDir("paperclip-provision-runtime-exact-target-source-");
+  fs.mkdirSync(path.join(worktreeCwd, ".paperclip"), { recursive: true });
+  fs.writeFileSync(path.join(worktreeCwd, ".paperclip", "config.json"), "{}\n");
+  const targetPath = path.join(worktreeCwd, ".paperclip", "config.json");
+
+  const result = runRuntimeProvision(baseCwd, worktreeCwd, {
+    paperclipConfig: targetPath,
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /worktree config is the only on-disk config/);
+  assert.equal(
+    readCliInvocations(baseCwd).filter((args) => args[0] === "worktree" && args[1] === "ensure-seeded").length,
+    0,
+  );
+  const skipEvidence = JSON.parse(
+    fs.readFileSync(path.join(worktreeCwd, ".paperclip", "seed-skip-no-source"), "utf8"),
+  );
+  assert.equal(skipEvidence.reason, "source-config-is-target-config");
+  assert.equal(skipEvidence.sourceConfigPath, targetPath);
+});
+
+test("runtime provisioning refuses a canonical source when the target config is a symlink", () => {
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const worktreeCwd = makeTempDir("paperclip-provision-runtime-symlink-target-");
+  const sourceConfigPath = path.join(worktreeCwd, "source-config.json");
+  fs.mkdirSync(path.join(worktreeCwd, ".paperclip"), { recursive: true });
+  fs.writeFileSync(sourceConfigPath, "{}\n");
+  fs.symlinkSync(sourceConfigPath, path.join(worktreeCwd, ".paperclip", "config.json"));
+
+  const result = runRuntimeProvision(baseCwd, worktreeCwd, {
+    paperclipConfig: sourceConfigPath,
+  });
+
+  assert.notEqual(result.status, 0, "a symlinked target must not be accepted as a no-source skip");
+  assert.match(result.stderr, /same canonical file/);
+  assert.equal(
+    readCliInvocations(baseCwd).filter((args) => args[0] === "worktree" && args[1] === "ensure-seeded").length,
+    1,
+  );
+  assert.equal(fs.existsSync(path.join(worktreeCwd, ".paperclip", "seed-skip-no-source")), false);
+});
+
 test("runtime provisioning exits 0 when no seed source config exists on disk", () => {
   // Env-configured deployment: the base is a plain checkout (no instance config),
   // the registered PAPERCLIP_HOME instance home has no config.json, and no
