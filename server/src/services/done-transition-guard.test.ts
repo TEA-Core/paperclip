@@ -5914,6 +5914,59 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.tier).toBe("tier1");
     });
 
+    it("accepts landing-delegated when the merge queue GraphQL response has errors", async () => {
+      const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);
+      ghFetchMock.mockImplementation(async (url) => {
+        if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
+          return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        if (String(url).includes("graphql")) {
+          return new Response(JSON.stringify({ errors: [{ message: "RATE_LIMITED" }] }), { status: 200 });
+        }
+        return new Response("{}", { status: 500 });
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("accepts landing-delegated when the auto-merge lookup fails", async () => {
+      const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);
+      ghFetchMock.mockImplementation(async (url) => {
+        if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
+          return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        if (String(url).includes("graphql")) {
+          return new Response(JSON.stringify({ data: { repository: { mergeQueue: null } } }), { status: 200 });
+        }
+        if (String(url).endsWith("/pulls/4103")) {
+          return new Response("{}", { status: 503 });
+        }
+        return new Response("{}", { status: 500 });
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
     it("retries the repository auto-merge read with the next repo token after a 403", async () => {
       const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);

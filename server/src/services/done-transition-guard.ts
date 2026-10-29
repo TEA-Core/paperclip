@@ -861,9 +861,13 @@ async function proveLandingDelegated(
             );
             if (queueResponse.ok) {
               const payload = (await queueResponse.json().catch(() => null)) as {
-                data?: { repository?: { mergeQueue?: { configuration?: unknown } | null } | null };
+                data?: { repository?: { mergeQueue?: { configuration?: unknown } | null } | null } | null;
+                errors?: unknown;
               } | null;
-              queueCarrier = payload?.data?.repository?.mergeQueue?.configuration != null ? "configured" : "none";
+              const hasErrors = Array.isArray(payload?.errors) && payload.errors.length > 0;
+              if (payload && !hasErrors && payload.data?.repository) {
+                queueCarrier = payload.data.repository.mergeQueue?.configuration != null ? "configured" : "none";
+              }
             }
           }
           if (queueCarrier === "none") {
@@ -873,7 +877,10 @@ async function proveLandingDelegated(
             );
             if (prLookup.ok) {
               const prPayload = (await prLookup.json().catch(() => null)) as { auto_merge?: unknown } | null;
-              if (prPayload?.auto_merge != null) queueCarrier = "queued";
+              if (prPayload === null) queueCarrier = "unknown";
+              else if (prPayload.auto_merge != null) queueCarrier = "queued";
+            } else {
+              queueCarrier = "unknown";
             }
           }
           if (queueCarrier === "none") {
