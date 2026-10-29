@@ -1280,8 +1280,13 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect(res.body.details.identifier).toBe(identifier);
       // The rejection must name both accepted forms.
       expect(res.body.details.remedy).toContain('"Closed at Tier 2 (live): <probe evidence>"');
-      expect(res.body.details.remedy).toContain(TIER1_FORM.slice(1, -1));
-      expect(res.body.details.remedy).not.toContain(TIER1_FORM);
+      expect(res.body.details.remedy).toContain(TIER1_FORM);
+      expect(res.body.details.remedy).toContain(
+        '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."',
+      );
+      expect(res.body.details.remedy).toContain(
+        '"Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; landing obligation transferred to done-close-landing-backstop, not yet discharged; <why Tier 2 was not probed>. Liveness unverified."',
+      );
       // SUP-21339 review: the PATCH door response itself carries the structured forms.
       expect(res.body.details.remedy).toContain(DONE_TIER_STRUCTURED_FORMS);
       expect(res.body.details.remedy).toContain('"doneTier":');
