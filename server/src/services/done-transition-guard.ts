@@ -4,6 +4,7 @@ import { agents, issueExecutionDecisions, issueLabels, issues, labels, type Db }
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   resolveGitHubToken,
+  resolveGitHubTokenCandidatesForRepo,
   type GitHubTokenScope,
 } from "./github-credential.js";
 import { logActivity } from "./activity-log.js";
@@ -798,24 +799,90 @@ async function proveLandingDelegated(
   } catch (err) {
     return refuseTier1(unverifiedTier1(err));
   }
-  const pr = linked.find((candidate) => candidate.number === number);
-  if (!pr) {
+  const namedPrs = linked.filter((candidate) => candidate.number === number);
+  if (namedPrs.length === 0) {
     return refuseTier1(
       `Tier 1 declaration using "landing-delegated" names PR #${number}, which is not a linked pull request.`,
     );
   }
+  let pr = namedPrs[0]!;
+  if (namedPrs.length > 1) {
+    const openPrs = namedPrs.filter((candidate) => candidate.cachedState === "open");
+    if (openPrs.length === 1) {
+      pr = openPrs[0]!;
+    } else {
+      return refuseTier1(
+        `Tier 1 declaration using "landing-delegated" names PR #${number}, which matches linked pull requests in multiple repositories (${namedPrs.map((candidate) => `${candidate.owner}/${candidate.repo}`).join(", ")}); name an unambiguous linked PR.`,
+      );
+    }
+  }
   try {
-    const tokenResult = await resolveGitHubToken(db, issue.companyId);
-    if (tokenResult.token !== null) {
-      const live = await hydrateLinkedPrState(pr, tokenResult.token);
+    const candidates = await resolveGitHubTokenCandidatesForRepo(db, issue.companyId, pr.owner, pr.repo);
+    for (const candidate of candidates) {
+      const live = await hydrateLinkedPrState(pr, candidate.token);
       if (live !== pr && live.cachedState === "open" && live.draft && (await loadOwnDraftPredicate(db, issue, [live]))(live)) {
         return refuseTier1(
           `head_draft: linked PR #${number} is an open draft; promote it out of draft before closing this card done.`,
         );
       }
+      const headers = {
+        accept: "application/vnd.github+json",
+        "user-agent": "paperclip-done-transition-guard",
+        "x-github-api-version": "2022-11-28",
+        authorization: `Bearer ${candidate.token}`,
+      };
+      const repositoryUrl = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}`;
+      const repositoryResponse = await ghFetch(repositoryUrl, { headers });
+      if (repositoryResponse.ok) {
+        const repository = (await repositoryResponse.json().catch(() => null)) as Record<string, unknown> | null;
+        if (repository?.allow_auto_merge === false) {
+          // GitHub exempts branches that require a merge queue from the
+          // repository-level "Allow auto-merge" setting: enablePullRequestAutoMerge
+          // still lands those PRs via the queue. Only refuse when no merge queue
+          // covers the PR's base branch either; an already-queued PR (its REST
+          // auto_merge payload) is also positive proof of a working carrier.
+          const queueGraphql = async (query: string) =>
+            ghFetch(GITHUB_GRAPHQL_URL, {
+              method: "POST",
+              headers: { ...headers, "content-type": "application/json" },
+              body: JSON.stringify({ query }),
+            });
+          const escapeGraphqlString = (value: string) =>
+            value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+          let queueCarrier: "queued" | "configured" | "none" | "unknown" = "unknown";
+          if (pr.baseRefName) {
+            const queueResponse = await queueGraphql(
+              `query { repository(owner: "${escapeGraphqlString(pr.owner)}", name: "${escapeGraphqlString(pr.repo)}") { mergeQueue(branch: "${escapeGraphqlString(pr.baseRefName)}") { configuration { mergeMethod } } } }`,
+            );
+            if (queueResponse.ok) {
+              const payload = (await queueResponse.json().catch(() => null)) as {
+                data?: { repository?: { mergeQueue?: { configuration?: unknown } | null } | null };
+              } | null;
+              queueCarrier = payload?.data?.repository?.mergeQueue?.configuration != null ? "configured" : "none";
+            }
+          }
+          if (queueCarrier === "none") {
+            const prLookup = await ghFetch(
+              `${repositoryUrl}/pulls/${number}`,
+              { headers },
+            );
+            if (prLookup.ok) {
+              const prPayload = (await prLookup.json().catch(() => null)) as { auto_merge?: unknown } | null;
+              if (prPayload?.auto_merge != null) queueCarrier = "queued";
+            }
+          }
+          if (queueCarrier === "none") {
+            return refuseTier1(
+              `Tier 1 declaration using "landing-delegated" names PR #${number}, but repository auto-merge is disabled and no merge queue covers the PR's base branch; enable auto-merge, enable a merge queue for the base branch, or use landed-at-tip evidence. The backstop arms merges via GitHub's enablePullRequestAutoMerge, which on a repository with auto-merge disabled and no merge queue has no landing carrier.`,
+            );
+          }
+        }
+        break;
+      }
+      if (![401, 403, 404].includes(repositoryResponse.status)) break;
     }
   } catch {
-    // Credential resolution failed: draft state is unverifiable, so do not refuse on a stale cached flag.
+    // Credential or provider resolution failed: auto-merge capability is unverifiable, so do not refuse.
   }
   return acceptTier1(reason, sameRun);
 }

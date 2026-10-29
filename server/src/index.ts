@@ -1513,7 +1513,9 @@ async function startServerWithDatabaseTeardown(
       trackHeartbeatSchedulerWork(doneCloseLandingBackstop
         .sweep()
         .then((result) => {
-          if (result.candidates > 0 || result.confirmed > 0 || result.failed > 0 || result.deferred > 0) {
+          if (result.unarmable.length > 0) {
+            logger.warn(result, "done-close landing backstop sweep found unarmable pending cards");
+          } else if (result.candidates > 0 || result.confirmed > 0 || result.failed > 0 || result.deferred > 0) {
             logger.info(result, "done-close landing backstop sweep dispositioned decision-carried skips");
           }
           return result;
