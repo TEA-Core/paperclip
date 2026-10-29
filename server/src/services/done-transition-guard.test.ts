@@ -5769,6 +5769,27 @@ describe("evaluateDoneTierDeclaration", () => {
       );
     });
 
+    it("refuses landing-delegated when the repository has auto-merge disabled", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr(4103, "open")]);
+      ghFetchMock.mockImplementation(async (url) => {
+        if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
+          return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        return new Response("{}", { status: 500 });
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("auto-merge is disabled");
+    });
+
     async function declareDelegated(prNumber: number, cached: Record<string, unknown>) {
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([{ ...linkedPr(prNumber), ...cached }]);
       return evaluateDoneTierDeclaration(

@@ -813,9 +813,26 @@ async function proveLandingDelegated(
           `head_draft: linked PR #${number} is an open draft; promote it out of draft before closing this card done.`,
         );
       }
+      const repositoryUrl = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}`;
+      const repositoryResponse = await ghFetch(repositoryUrl, {
+        headers: {
+          accept: "application/vnd.github+json",
+          "user-agent": "paperclip-done-transition-guard",
+          "x-github-api-version": "2022-11-28",
+          authorization: `Bearer ${tokenResult.token}`,
+        },
+      });
+      if (repositoryResponse.ok) {
+        const repository = (await repositoryResponse.json().catch(() => null)) as Record<string, unknown> | null;
+        if (repository?.allow_auto_merge === false) {
+          return refuseTier1(
+            `Tier 1 declaration using "landing-delegated" names PR #${number}, but repository auto-merge is disabled; enable it or use landed-at-tip evidence.`,
+          );
+        }
+      }
     }
   } catch {
-    // Credential resolution failed: draft state is unverifiable, so do not refuse on a stale cached flag.
+    // Credential or provider resolution failed: auto-merge capability is unverifiable, so do not refuse.
   }
   return acceptTier1(reason, sameRun);
 }
