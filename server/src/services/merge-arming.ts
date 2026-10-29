@@ -213,6 +213,11 @@ export interface LinkedPullRequest {
   draft?: boolean;
   /** Live head repository of a hydrated PR; absent on cached mention rows. */
   headRepoFullName?: string | null;
+  /**
+   * Base branch the PR targets (e.g. "main"), when known. The done-transition
+   * guard reads this to probe whether a merge queue covers the branch.
+   */
+  baseRefName?: string | null;
 }
 
 export interface IssueRepoContext {

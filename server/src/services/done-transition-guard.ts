@@ -825,21 +825,57 @@ async function proveLandingDelegated(
           `head_draft: linked PR #${number} is an open draft; promote it out of draft before closing this card done.`,
         );
       }
+      const headers = {
+        accept: "application/vnd.github+json",
+        "user-agent": "paperclip-done-transition-guard",
+        "x-github-api-version": "2022-11-28",
+        authorization: `Bearer ${candidate.token}`,
+      };
       const repositoryUrl = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}`;
-      const repositoryResponse = await ghFetch(repositoryUrl, {
-        headers: {
-          accept: "application/vnd.github+json",
-          "user-agent": "paperclip-done-transition-guard",
-          "x-github-api-version": "2022-11-28",
-          authorization: `Bearer ${candidate.token}`,
-        },
-      });
+      const repositoryResponse = await ghFetch(repositoryUrl, { headers });
       if (repositoryResponse.ok) {
         const repository = (await repositoryResponse.json().catch(() => null)) as Record<string, unknown> | null;
         if (repository?.allow_auto_merge === false) {
-          return refuseTier1(
-            `Tier 1 declaration using "landing-delegated" names PR #${number}, but repository auto-merge is disabled; enable it or use landed-at-tip evidence. The backstop arms merges via the repository's auto-merge queue (GitHub's enablePullRequestAutoMerge), so a repository without auto-merge enabled has no landing carrier.`,
-          );
+          // GitHub exempts branches that require a merge queue from the
+          // repository-level "Allow auto-merge" setting: enablePullRequestAutoMerge
+          // still lands those PRs via the queue. Only refuse when no merge queue
+          // covers the PR's base branch either; an already-queued PR (its REST
+          // auto_merge payload) is also positive proof of a working carrier.
+          const queueGraphql = async (query: string) =>
+            ghFetch(GITHUB_GRAPHQL_URL, {
+              method: "POST",
+              headers: { ...headers, "content-type": "application/json" },
+              body: JSON.stringify({ query }),
+            });
+          const escapeGraphqlString = (value: string) =>
+            value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+          let queueCarrier: "queued" | "configured" | "none" | "unknown" = "unknown";
+          if (pr.baseRefName) {
+            const queueResponse = await queueGraphql(
+              `query { repository(owner: "${escapeGraphqlString(pr.owner)}", name: "${escapeGraphqlString(pr.repo)}") { mergeQueue(branch: "${escapeGraphqlString(pr.baseRefName)}") { configuration { mergeMethod } } } }`,
+            );
+            if (queueResponse.ok) {
+              const payload = (await queueResponse.json().catch(() => null)) as {
+                data?: { repository?: { mergeQueue?: { configuration?: unknown } | null } | null };
+              } | null;
+              queueCarrier = payload?.data?.repository?.mergeQueue?.configuration != null ? "configured" : "none";
+            }
+          }
+          if (queueCarrier === "none") {
+            const prLookup = await ghFetch(
+              `${repositoryUrl}/pulls/${number}`,
+              { headers },
+            );
+            if (prLookup.ok) {
+              const prPayload = (await prLookup.json().catch(() => null)) as { auto_merge?: unknown } | null;
+              if (prPayload?.auto_merge != null) queueCarrier = "queued";
+            }
+          }
+          if (queueCarrier === "none") {
+            return refuseTier1(
+              `Tier 1 declaration using "landing-delegated" names PR #${number}, but repository auto-merge is disabled and no merge queue covers the PR's base branch; enable auto-merge, enable a merge queue for the base branch, or use landed-at-tip evidence. The backstop arms merges via GitHub's enablePullRequestAutoMerge, which on a repository with auto-merge disabled and no merge queue has no landing carrier.`,
+            );
+          }
         }
         break;
       }

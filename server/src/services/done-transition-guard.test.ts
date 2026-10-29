@@ -5779,11 +5779,18 @@ describe("evaluateDoneTierDeclaration", () => {
       );
     });
 
-    it("refuses landing-delegated when the repository has auto-merge disabled", async () => {
-      mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr(4103, "open")]);
+    it("refuses landing-delegated when the repository has auto-merge disabled and no merge queue", async () => {
+      const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);
       ghFetchMock.mockImplementation(async (url) => {
         if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
           return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        if (String(url).includes("graphql")) {
+          return new Response(JSON.stringify({ data: { repository: { mergeQueue: null } } }), { status: 200 });
+        }
+        if (String(url).endsWith("/pulls/4103")) {
+          return new Response(JSON.stringify({ auto_merge: null }), { status: 200 });
         }
         return new Response("{}", { status: 500 });
       });
@@ -5798,6 +5805,7 @@ describe("evaluateDoneTierDeclaration", () => {
 
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("auto-merge is disabled");
+      expect(result.reason).toContain("no merge queue");
       expect(mockResolveGitHubTokenCandidatesForRepo).toHaveBeenCalledWith(
         mockDb,
         "company-1",
@@ -5806,8 +5814,62 @@ describe("evaluateDoneTierDeclaration", () => {
       );
     });
 
+    it("accepts landing-delegated when auto-merge is disabled but a merge queue covers the base branch", async () => {
+      const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);
+      ghFetchMock.mockImplementation(async (url) => {
+        if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
+          return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        if (String(url).includes("graphql")) {
+          return new Response(JSON.stringify({ data: { repository: { mergeQueue: { configuration: { mergeMethod: "SQUASH" } } } } }), { status: 200 });
+        }
+        return new Response("{}", { status: 500 });
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("accepts landing-delegated when auto-merge is disabled but the PR is already queued for auto-merge", async () => {
+      const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);
+      ghFetchMock.mockImplementation(async (url) => {
+        if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
+          return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        if (String(url).includes("graphql")) {
+          return new Response(JSON.stringify({ data: { repository: { mergeQueue: null } } }), { status: 200 });
+        }
+        if (String(url).endsWith("/pulls/4103")) {
+          return new Response(JSON.stringify({ auto_merge: { enabled_by: { login: "bot" }, merge_method: "squash", commit_title: "", commit_message: "" } }), { status: 200 });
+        }
+        return new Response("{}", { status: 500 });
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
     it("retries the repository auto-merge read with the next repo token after a 403", async () => {
-      mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr(4103, "open")]);
+      const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);
       mockResolveGitHubTokenCandidatesForRepo.mockReset();
       mockResolveGitHubTokenCandidatesForRepo.mockResolvedValue([
         { token: "wrong-repo-token", scope: "company", secretName: "GITHUB_TOKEN" },
@@ -5822,6 +5884,12 @@ describe("evaluateDoneTierDeclaration", () => {
             return new Response("{}", { status: 403 });
           }
           return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        if (String(url).includes("graphql")) {
+          return new Response(JSON.stringify({ data: { repository: { mergeQueue: null } } }), { status: 200 });
+        }
+        if (String(url).endsWith("/pulls/4103")) {
+          return new Response(JSON.stringify({ auto_merge: null }), { status: 200 });
         }
         return new Response("{}", { status: 500 });
       });
