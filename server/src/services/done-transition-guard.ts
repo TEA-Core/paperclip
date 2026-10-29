@@ -548,10 +548,10 @@ async function hydrateLinkedPrState(
   try {
     const response = await ghFetch(url, { headers });
     if (!response.ok) {
-      return pr;
+      return { ...pr, baseRefName: null };
     }
     const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
-    if (!body) return pr;
+    if (!body) return { ...pr, baseRefName: null };
     const state = body.state as string | undefined;
     if (typeof state === "string") {
       // The live call just succeeded: the persisted refresh error code (if any)
@@ -573,11 +573,16 @@ async function hydrateLinkedPrState(
         headRefName: typeof head?.ref === "string" ? head.ref : null,
         title: typeof body.title === "string" ? body.title : null,
         headRepoFullName,
+        baseRefName:
+          body.base && typeof body.base === "object" && !Array.isArray(body.base) &&
+          typeof (body.base as Record<string, unknown>).ref === "string"
+            ? (body.base as Record<string, unknown>).ref as string
+            : null,
       };
     }
-    return pr;
+    return { ...pr, baseRefName: null };
   } catch {
-    return pr;
+    return { ...pr, baseRefName: null };
   }
 }
 
@@ -819,8 +824,8 @@ async function proveLandingDelegated(
   try {
     const candidates = await resolveGitHubTokenCandidatesForRepo(db, issue.companyId, pr.owner, pr.repo);
     for (const candidate of candidates) {
-      const live = await hydrateLinkedPrState(pr, candidate.token);
-      if (live !== pr && live.cachedState === "open" && live.draft && (await loadOwnDraftPredicate(db, issue, [live]))(live)) {
+      pr = await hydrateLinkedPrState(pr, candidate.token);
+      if (pr.cachedState === "open" && pr.draft && (await loadOwnDraftPredicate(db, issue, [pr]))(pr)) {
         return refuseTier1(
           `head_draft: linked PR #${number} is an open draft; promote it out of draft before closing this card done.`,
         );
