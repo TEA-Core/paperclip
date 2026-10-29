@@ -147,6 +147,13 @@ export interface DoneCloseLandingSweepResult {
   reenqueued: number;
   escalated: number;
   draftStranded: number;
+  /**
+   * SUP-21651 (AC3): cards this sweep dispositioned as unable to arm (escalated
+   * because the carrier cannot land them), named so a cycle that armed nothing
+   * is never read as an all-clear. `identifier` falls back to the issue id when
+   * the card has no human-readable identifier.
+   */
+  unarmable: Array<{ identifier: string; pr: string; reason: string }>;
 }
 
 export type MeasuredPullRequestState = "merged" | "closed" | "open";
@@ -187,6 +194,7 @@ interface SweepCounts {
   reenqueued: number;
   escalated: number;
   draftStranded: number;
+  unarmable: Array<{ identifier: string; pr: string; reason: string }>;
 }
 
 /** A live-measured PR, captured in the first pass before any disposition. */
@@ -368,7 +376,7 @@ export function createDoneCloseLandingBackstopService(
     // The heartbeat tick fires every 30s; GitHub measurement is expensive, so
     // every non-due tick is a no-op.
     if (lastRunAt !== null && checkedAt.getTime() - lastRunAt < sweepIntervalMs) {
-      return { due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0, draftStranded: 0 };
+      return { due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0, draftStranded: 0, unarmable: [] };
     }
     lastRunAt = checkedAt.getTime();
     const result: DoneCloseLandingSweepResult = {
@@ -380,6 +388,7 @@ export function createDoneCloseLandingBackstopService(
       reenqueued: 0,
       escalated: 0,
       draftStranded: 0,
+      unarmable: [],
     };
 
     const windowStart = new Date(checkedAt.getTime() - lookbackMs);
@@ -401,7 +410,7 @@ export function createDoneCloseLandingBackstopService(
     const svc = issueService(db);
 
     for (const row of candidates) {
-      const counts: SweepCounts = { confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0, draftStranded: 0 };
+      const counts: SweepCounts = { confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0, draftStranded: 0, unarmable: [] };
       try {
         await sweepCandidate(row, counts, { resolver, svc, graceCutoff });
       } catch (err) {
@@ -416,6 +425,7 @@ export function createDoneCloseLandingBackstopService(
       result.reenqueued += counts.reenqueued;
       result.escalated += counts.escalated;
       result.draftStranded += counts.draftStranded;
+      result.unarmable.push(...counts.unarmable);
     }
     return result;
   }
@@ -1173,6 +1183,7 @@ export function createDoneCloseLandingBackstopService(
                 : mergeArmingEnabled
                   ? "re-enqueue attempt failed (no resolvable GitHub token or API error)"
                   : "merge arming lane is closed for this company (mergeArmingEnabled=false) — no agent can re-enqueue the PR into the merge queue";
+        counts.unarmable.push({ identifier: issue.identifier ?? issue.id, pr: prKey, reason });
         if (refusedHead) {
           // SUP-15315 (AC2): durable refusal row — the live head is not covered
           // by an authorized head, so no re-enqueue row is written for it.
