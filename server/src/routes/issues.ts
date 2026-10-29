@@ -422,7 +422,7 @@ import {
 } from "../services/issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
 import { applyReviewEscalationDecision } from "../services/issue-stage-decision.js";
-import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, findSelfSatisfyingReviewStage } from "../services/issue-assignee-review-gate.js";
+import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, assertWikiHandoffWriteIntegrity, findSelfSatisfyingReviewStage } from "../services/issue-assignee-review-gate.js";
 import {
   type CallerSeat,
   type RefusalCaller,
@@ -18966,6 +18966,42 @@ export function issueRoutes(
         incomingAssigneeAgentId: normalizedAssigneeAgentId,
         // A board caller gets the unchanged base message: changing the stage's
         // participants is its own lawful repair, so the seat tail is wrong for it.
+        refusalContext:
+          req.actor.type === "board"
+            ? undefined
+            : { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
+      });
+      await assertWikiHandoffWriteIntegrity({
+        db,
+        companyId: existing.companyId,
+        issue: {
+          title: updateFields.title ?? existing.title,
+          description: updateFields.description ?? existing.description,
+          executionPolicy: nextExecutionPolicy,
+          executionState: existing.executionState,
+        },
+        incomingAssigneeAgentId: normalizedAssigneeAgentId,
+        refusalContext:
+          req.actor.type === "board"
+            ? undefined
+            : { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
+      });
+    }
+    if (
+      normalizedAssigneeAgentId === undefined &&
+      req.body.executionPolicy !== undefined &&
+      updateFields.executionPolicy !== undefined
+    ) {
+      await assertWikiHandoffWriteIntegrity({
+        db,
+        companyId: existing.companyId,
+        issue: {
+          title: updateFields.title ?? existing.title,
+          description: updateFields.description ?? existing.description,
+          executionPolicy: nextExecutionPolicy,
+          executionState: existing.executionState,
+        },
+        incomingAssigneeAgentId: requestedAssigneeAgentId ?? null,
         refusalContext:
           req.actor.type === "board"
             ? undefined
