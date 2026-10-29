@@ -272,8 +272,10 @@ vi.mock("./secrets.js", () => ({
 }));
 
 const mockResolveGitHubToken = vi.hoisted(() => vi.fn());
+const mockResolveGitHubTokenCandidatesForRepo = vi.hoisted(() => vi.fn());
 vi.mock("./github-credential.js", () => ({
   resolveGitHubToken: mockResolveGitHubToken,
+  resolveGitHubTokenCandidatesForRepo: mockResolveGitHubTokenCandidatesForRepo,
 }));
 
 vi.mock("./activity-log.js", () => ({
@@ -345,6 +347,10 @@ describe("evaluateDoneTransitionGuard", () => {
     mockFetchOpenPullRequests.mockResolvedValue({ ok: true, status: 200, message: null, items: [] });
     mockResolveGitHubToken.mockReset();
     mockResolveGitHubToken.mockResolvedValue({ token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" });
+    mockResolveGitHubTokenCandidatesForRepo.mockReset();
+    mockResolveGitHubTokenCandidatesForRepo.mockResolvedValue([
+      { token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" },
+    ]);
     vi.mocked(logActivity).mockClear();
     mockExecFile.mockReset();
     mockGitProbe("0", "0");
@@ -5661,6 +5667,10 @@ describe("evaluateDoneTierDeclaration", () => {
         scope: "company",
         secretName: "GITHUB_TOKEN",
       });
+      mockResolveGitHubTokenCandidatesForRepo.mockReset();
+      mockResolveGitHubTokenCandidatesForRepo.mockResolvedValue([
+        { token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" },
+      ]);
       setupDbMock({ executionWorkspaces: [mockExecutionWorkspaceRow()] });
     });
 
@@ -5788,6 +5798,64 @@ describe("evaluateDoneTierDeclaration", () => {
 
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("auto-merge is disabled");
+      expect(mockResolveGitHubTokenCandidatesForRepo).toHaveBeenCalledWith(
+        mockDb,
+        "company-1",
+        "TEA-Core",
+        "paperclip",
+      );
+    });
+
+    it("retries the repository auto-merge read with the next repo token after a 403", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr(4103, "open")]);
+      mockResolveGitHubTokenCandidatesForRepo.mockReset();
+      mockResolveGitHubTokenCandidatesForRepo.mockResolvedValue([
+        { token: "wrong-repo-token", scope: "company", secretName: "GITHUB_TOKEN" },
+        { token: "right-repo-token", scope: "company", secretName: "GITHUB_TOKEN" },
+      ]);
+      const authByCall: string[] = [];
+      ghFetchMock.mockImplementation(async (url, init) => {
+        if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
+          const authorization = (init as { headers?: Record<string, string> } | undefined)?.headers?.authorization ?? "";
+          authByCall.push(authorization);
+          if (authorization === "Bearer wrong-repo-token") {
+            return new Response("{}", { status: 403 });
+          }
+          return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        return new Response("{}", { status: 500 });
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("auto-merge is disabled");
+      expect(authByCall).toEqual(["Bearer wrong-repo-token", "Bearer right-repo-token"]);
+    });
+
+    it("refuses landing-delegated when the named PR number is ambiguous across repositories", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr(4103, "open"),
+        { ...linkedPr(4103, "open"), owner: "other-org", repo: "other-repo" },
+      ]);
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("multiple repositories");
+      expect(ghFetchMock).not.toHaveBeenCalled();
     });
 
     async function declareDelegated(prNumber: number, cached: Record<string, unknown>) {

@@ -4976,6 +4976,9 @@ export function issueRoutes(
               sourceIssueId: issue.id,
               kind: "close_arm_failed",
               ownerType: "board",
+              ownerAgentId: null,
+              ownerUserId: null,
+              supersedeOnIdentityChange: true,
               cause: armingOutcome.message,
               fingerprint: `close_arm_failed:${issue.companyId}:${issue.id}:${headIdentity}`,
               evidence: {
@@ -4991,10 +4994,43 @@ export function issueRoutes(
               maxAttempts: 5,
             });
           } catch (recoveryErr) {
-            logger.error(
-              { err: recoveryErr, issueId: issue.id, companyId: issue.companyId },
-              "failed to create close-time merge-arm recovery action",
-            );
+            try {
+              const headIdentity =
+                /^[0-9a-f]{40}$/.test(statusOutcome.headSha ?? "")
+                  ? (statusOutcome.headSha as string)
+                  : "unresolved-head";
+              await recoveryActionsSvc.upsertSourceScoped({
+                companyId: issue.companyId,
+                sourceIssueId: issue.id,
+                kind: "close_arm_failed",
+                ownerType: "board",
+                ownerAgentId: null,
+                ownerUserId: null,
+                supersedeOnIdentityChange: true,
+                cause: armingOutcome.message,
+                fingerprint: `close_arm_failed:${issue.companyId}:${issue.id}:${headIdentity}`,
+                evidence: {
+                  identifier: issue.identifier ?? null,
+                  headSha: statusOutcome.headSha ?? null,
+                  outcomeKind: armingOutcome.kind,
+                  outcomeMessage: armingOutcome.message,
+                  decisionOutcome: decision?.outcome ?? null,
+                },
+                nextAction:
+                  "Inspect the merge-arming failure, then enable repository auto-merge or land the certified pull request manually before resolving this recovery action.",
+                wakePolicy: null,
+                maxAttempts: 5,
+              });
+              logger.warn(
+                { err: recoveryErr, issueId: issue.id, companyId: issue.companyId },
+                "close-time merge-arm recovery action created on retry",
+              );
+            } catch (recoveryRetryErr) {
+              logger.error(
+                { err: recoveryRetryErr, firstErr: recoveryErr, issueId: issue.id, companyId: issue.companyId },
+                "failed to create close-time merge-arm recovery action",
+              );
+            }
           }
         }
 
@@ -9068,6 +9104,28 @@ export function issueRoutes(
   ) {
     if (req.actor.type !== "agent") return true;
     if (!activeRecoveryAction) return true;
+
+    // A close_arm_failed action is board-owned: only the board may settle it
+    // through the recovery-resolution door. An agent assignee/owner must not
+    // resolve it as owner_completed/false_positive. Ordinary issue updates
+    // (e.g. re-approval of an already-done card) are not resolutions and stay
+    // governed by the checks below.
+    if (
+      activeRecoveryAction.kind === "close_arm_failed" &&
+      input.source === "recovery_action_resolution"
+    ) {
+      throw forbidden("Board access required to resolve a close-time merge-arm recovery action", {
+        issueId: issue.id,
+        recoveryActionId: activeRecoveryAction.id,
+        recoveryKind: activeRecoveryAction.kind,
+        source: input.source,
+        securityPrinciples: [
+          "Least Privilege",
+          "Complete Mediation",
+          "Secure Defaults",
+        ],
+      });
+    }
 
     const actorAgentId = req.actor.agentId;
     if (!actorAgentId) {

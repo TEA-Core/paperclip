@@ -1171,19 +1171,20 @@ export function createDoneCloseLandingBackstopService(
       // ADR-091 D5), the re-enqueue cap is exhausted (still open), the lane is
       // closed, the re-enqueue attempt failed this tick, or the live head was
       // positively UNSTAMPED (head-authorization refusal).
+      const escalationReason = deliveryRefusal
+        ? deliveryRefusal.reason
+        : reenqueueExhausted
+          ? `the PR has been re-enqueued ${priorReenqueues} times and is still open past the done-close grace window — the merge queue is not landing it (e.g. failing checks, conflicts, or it is behind the base branch)`
+          : refusedHead
+            ? refusedHead.reason
+            : ejectionRefusal
+              ? ejectionRefusal.reason
+              : mergeArmingEnabled
+                ? "re-enqueue attempt failed (no resolvable GitHub token or API error)"
+                : "merge arming lane is closed for this company (mergeArmingEnabled=false) — no agent can re-enqueue the PR into the merge queue";
+      counts.unarmable.push({ identifier: issue.identifier ?? issue.id, pr: prKey, reason: escalationReason });
       if (!alreadyEscalated.has(prKey)) {
-        const reason = deliveryRefusal
-          ? deliveryRefusal.reason
-          : reenqueueExhausted
-            ? `the PR has been re-enqueued ${priorReenqueues} times and is still open past the done-close grace window — the merge queue is not landing it (e.g. failing checks, conflicts, or it is behind the base branch)`
-            : refusedHead
-              ? refusedHead.reason
-              : ejectionRefusal
-                ? ejectionRefusal.reason
-                : mergeArmingEnabled
-                  ? "re-enqueue attempt failed (no resolvable GitHub token or API error)"
-                  : "merge arming lane is closed for this company (mergeArmingEnabled=false) — no agent can re-enqueue the PR into the merge queue";
-        counts.unarmable.push({ identifier: issue.identifier ?? issue.id, pr: prKey, reason });
+        const reason = escalationReason;
         if (refusedHead) {
           // SUP-15315 (AC2): durable refusal row — the live head is not covered
           // by an authorized head, so no re-enqueue row is written for it.

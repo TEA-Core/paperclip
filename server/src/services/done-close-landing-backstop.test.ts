@@ -823,6 +823,44 @@ describe("createDoneCloseLandingBackstopService", () => {
     expect(wakeup).toHaveBeenCalledTimes(1);
   });
 
+  it("still records unarmable after the PR was already escalated, without re-escalating", async () => {
+    const { service } = makeService({
+      candidates: [candidateRow()],
+      existingLandingRows: [
+        {
+          action: "issue.done_close_landing_escalated",
+          entityId: ISSUE,
+          details: { pr: "paperclipai/paperclip#3145" },
+        },
+      ],
+      companyMergeArmingEnabled: false,
+    });
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      linkedPr({ number: 3145, displayName: "paperclipai/paperclip#3145" }),
+    ]);
+    mockResolver(async () => openSnapshot);
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 0,
+      reenqueued: 0,
+      escalated: 0, draftStranded: 0,
+      unarmable: [
+        {
+          identifier: "SUP-13326",
+          pr: "paperclipai/paperclip#3145",
+          reason: expect.stringContaining("merge arming lane is closed for this company (mergeArmingEnabled=false)"),
+        },
+      ],
+    });
+    expect(mockLogActivity).toHaveBeenCalledTimes(0);
+    expect(mockUpdate).toHaveBeenCalledTimes(0);
+    expect(mockAddComment).toHaveBeenCalledTimes(0);
+  });
+
   it("escalates an arming-refusal card whose linked PR is still open past grace (SUP-14900)", async () => {
     const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
     const { service } = makeService(
@@ -1894,7 +1932,11 @@ describe("createDoneCloseLandingBackstopService", () => {
       // escalated row and do NOT re-escalate (no 2nd/3rd board action on one PR).
       const second = await service.sweep();
       expect(second).toEqual({
-        due: true, candidates: 3, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 1, draftStranded: 0, unarmable: [{ identifier: expect.any(String), pr: expect.any(String), reason: expect.any(String) }],
+        due: true, candidates: 3, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 1, draftStranded: 0, unarmable: [
+          { identifier: "SUP-15104", pr: "paperclipai/paperclip#3443", reason: expect.any(String) },
+          { identifier: "SUP-15105", pr: "paperclipai/paperclip#3443", reason: expect.any(String) },
+          { identifier: "SUP-15107", pr: "paperclipai/paperclip#3443", reason: expect.any(String) },
+        ],
       });
       expect(mockEnableAutoMerge).toHaveBeenCalledTimes(3); // no 4th attempt ever
       expect(mockUpdate).toHaveBeenCalledTimes(1); // one blocked card, not three
@@ -3783,7 +3825,12 @@ describe("SUP-16689: draft-stranded done cards", () => {
         deferred: 0,
         reenqueued: 0,
         escalated: 0,
-        draftStranded: 0, unarmable: [],
+        draftStranded: 0,
+        unarmable: [{
+          identifier: expect.any(String),
+          pr: "tea-core/tsp-obsidian-vault#493",
+          reason: expect.stringContaining("is not this card's delivery repo TEA-Core/Trading-Signal-Platform"),
+        }],
       });
       expect(mockLogActivity).not.toHaveBeenCalled();
       expect(mockUpdate).not.toHaveBeenCalled();

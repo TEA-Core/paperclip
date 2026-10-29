@@ -634,6 +634,82 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
     );
   });
 
+  it("SUP-21651: a new head failure supersedes the prior close_arm_failed action instead of overwriting it (service)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("DARM6", {
+      preCompleted: 1,
+    });
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    const firstHeadSha = "d".repeat(40);
+    mockResolveApprovalDecisionHead.mockResolvedValue({
+      kind: "resolved",
+      headSha: firstHeadSha,
+      displayName: "TEA-Core/paperclip#679",
+    });
+    mockPublishApprovalStatus.mockResolvedValue({ kind: "armed", message: "status:published", headSha: firstHeadSha });
+    mockArmMergeOnApproval.mockResolvedValue({ kind: "failed", message: "failed: first head 502" });
+
+    expect((await approveCurrentStage(identifier)).status).toBe(200);
+    expect(await closeArmRecoveryActions(issueId)).toEqual([
+      expect.objectContaining({ status: "active", cause: "failed: first head 502" }),
+    ]);
+
+    const svc = (await import("../services/issue-recovery-actions.js")).issueRecoveryActionService(db as never);
+    const secondHeadSha = "e".repeat(40);
+    await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "close_arm_failed",
+      ownerType: "board",
+      ownerAgentId: null,
+      ownerUserId: null,
+      supersedeOnIdentityChange: true,
+      cause: "failed: second head 502",
+      fingerprint: `close_arm_failed:${companyId}:${issueId}:${secondHeadSha}`,
+      evidence: { outcomeKind: "failed", outcomeMessage: "failed: second head 502" },
+      nextAction: "Inspect the merge-arming failure.",
+      wakePolicy: null,
+      maxAttempts: 5,
+    });
+    await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "close_arm_failed",
+      ownerType: "board",
+      ownerAgentId: null,
+      ownerUserId: null,
+      supersedeOnIdentityChange: true,
+      cause: "failed: second head 502",
+      fingerprint: `close_arm_failed:${companyId}:${issueId}:${secondHeadSha}`,
+      evidence: { outcomeKind: "failed", outcomeMessage: "failed: second head 502" },
+      nextAction: "Inspect the merge-arming failure.",
+      wakePolicy: null,
+      maxAttempts: 5,
+    });
+
+    const all = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(all.filter((row) => row.kind === "close_arm_failed" && row.status === "active")).toEqual([
+      expect.objectContaining({
+        fingerprint: `close_arm_failed:${companyId}:${issueId}:${secondHeadSha}`,
+        cause: "failed: second head 502",
+      }),
+    ]);
+    expect(all.filter((row) => row.kind === "close_arm_failed" && row.status === "cancelled")).toEqual([
+      expect.objectContaining({
+        cause: "failed: first head 502",
+        outcome: "cancelled",
+        resolutionNote: expect.stringContaining("different identity superseded"),
+      }),
+    ]);
+  });
+
+  // Note: a second route-level re-approval on an already-done card does not
+  // re-enter the closing-transition hook with a new head identity (verified by
+  // the idempotency test above), so the route-to-supersede chain is covered by
+  // the service test above, which exercises the same input the route passes.
+
   it("SUP-15163 mid-ladder card: approving stage 1 of 2 refuses -> no stamp, no arm, exactly one non-terminal-ladder comment, card stays in_review", async () => {
     // The exact SUP-15163 shape that the bug allowed through: a two-stage card
     // whose first stage is approved but whose second stage is still pending.

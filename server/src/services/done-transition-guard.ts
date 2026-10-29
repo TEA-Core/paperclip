@@ -4,6 +4,7 @@ import { agents, issueExecutionDecisions, issueLabels, issues, labels, type Db }
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   resolveGitHubToken,
+  resolveGitHubTokenCandidatesForRepo,
   type GitHubTokenScope,
 } from "./github-credential.js";
 import { logActivity } from "./activity-log.js";
@@ -798,16 +799,27 @@ async function proveLandingDelegated(
   } catch (err) {
     return refuseTier1(unverifiedTier1(err));
   }
-  const pr = linked.find((candidate) => candidate.number === number);
-  if (!pr) {
+  const namedPrs = linked.filter((candidate) => candidate.number === number);
+  if (namedPrs.length === 0) {
     return refuseTier1(
       `Tier 1 declaration using "landing-delegated" names PR #${number}, which is not a linked pull request.`,
     );
   }
+  let pr = namedPrs[0]!;
+  if (namedPrs.length > 1) {
+    const openPrs = namedPrs.filter((candidate) => candidate.cachedState === "open");
+    if (openPrs.length === 1) {
+      pr = openPrs[0]!;
+    } else {
+      return refuseTier1(
+        `Tier 1 declaration using "landing-delegated" names PR #${number}, which matches linked pull requests in multiple repositories (${namedPrs.map((candidate) => `${candidate.owner}/${candidate.repo}`).join(", ")}); name an unambiguous linked PR.`,
+      );
+    }
+  }
   try {
-    const tokenResult = await resolveGitHubToken(db, issue.companyId);
-    if (tokenResult.token !== null) {
-      const live = await hydrateLinkedPrState(pr, tokenResult.token);
+    const candidates = await resolveGitHubTokenCandidatesForRepo(db, issue.companyId, pr.owner, pr.repo);
+    for (const candidate of candidates) {
+      const live = await hydrateLinkedPrState(pr, candidate.token);
       if (live !== pr && live.cachedState === "open" && live.draft && (await loadOwnDraftPredicate(db, issue, [live]))(live)) {
         return refuseTier1(
           `head_draft: linked PR #${number} is an open draft; promote it out of draft before closing this card done.`,
@@ -819,17 +831,19 @@ async function proveLandingDelegated(
           accept: "application/vnd.github+json",
           "user-agent": "paperclip-done-transition-guard",
           "x-github-api-version": "2022-11-28",
-          authorization: `Bearer ${tokenResult.token}`,
+          authorization: `Bearer ${candidate.token}`,
         },
       });
       if (repositoryResponse.ok) {
         const repository = (await repositoryResponse.json().catch(() => null)) as Record<string, unknown> | null;
         if (repository?.allow_auto_merge === false) {
           return refuseTier1(
-            `Tier 1 declaration using "landing-delegated" names PR #${number}, but repository auto-merge is disabled; enable it or use landed-at-tip evidence.`,
+            `Tier 1 declaration using "landing-delegated" names PR #${number}, but repository auto-merge is disabled; enable it or use landed-at-tip evidence. The backstop arms merges via the repository's auto-merge queue (GitHub's enablePullRequestAutoMerge), so a repository without auto-merge enabled has no landing carrier.`,
           );
         }
+        break;
       }
+      if (![401, 403, 404].includes(repositoryResponse.status)) break;
     }
   } catch {
     // Credential or provider resolution failed: auto-merge capability is unverifiable, so do not refuse.
