@@ -867,7 +867,6 @@ describeEmbeddedPostgres("wiki handoff canonical resolution (SUP-21752)", () => 
         errorCode: "adapter_failed",
         contextSnapshot: { retryReason: "issue_continuation_needed" },
         livenessState: "needs_followup",
-        companyId,
       } as const,
       comment: "Automatic continuation recovery failed.",
       recoveryOwnerAgentId: intruderId,
