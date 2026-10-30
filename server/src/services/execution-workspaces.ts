@@ -3318,6 +3318,24 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           keep(workspace, "active run", "skippedActiveRun");
           continue;
         }
+        // SUP-20746: a recorded merged-delivery marker must not bypass the
+        // unpushed-commit check. The inherited cleanup destroys the worktree and
+        // the branch ref, so before any destructive cleanup require the
+        // checked-out commits to exist on a remote. Keep the row when the check
+        // fails or commits are missing. Record-only archives change no work
+        // tree. A missing worktree has no repo root, so the check skips and the
+        // leftover admin entry still prunes through the inherited cleanup.
+        if (!recordOnlyReason && git?.repoRoot && git.workspacePath) {
+          const commitsMissing = await countCommitsMissingFromRemote(git.workspacePath);
+          if (commitsMissing === null) {
+            keep(workspace, "remote check failed", "skippedUndelivered", "skippedRemoteCheckFailed");
+            continue;
+          }
+          if (commitsMissing > 0) {
+            keep(workspace, "commits missing from the remote", "skippedUndelivered", "skippedUnpushed");
+            continue;
+          }
+        }
         if (dryRun && !recordOnlyReason) {
           logDryRun(workspace, "not_previewed", "inherited cleanup path");
           continue;
