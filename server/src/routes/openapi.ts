@@ -11805,11 +11805,48 @@ const toolGatewaySessionSchema = z.object({
 });
 
 const toolGatewayCallSchema = z.object({
-  tool: z.string(),
-  parameters: z.record(z.string(), z.unknown()).optional(),
+  tool: z
+    .string()
+    .describe(
+      "Namespaced tool name as listed by GET /api/tool-gateway/tools " +
+        '(e.g. "llm-wiki:wiki_read_page").',
+    ),
+  parameters: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe(
+      "Tool arguments. Must satisfy the tool's declared inputSchema — plugin " +
+        'tools commonly require "companyId" alongside tool-specific fields; ' +
+        "schema-invalid arguments are rejected with 422 invalid_tool_arguments.",
+    ),
   timeoutMs: z.number().int().positive().optional(),
   approvedActionRequestId: z.string().optional(),
   idempotencyKey: z.string().optional(),
+});
+
+// 200 envelope for tools/call: the tool result is carried flat under
+// `result` ({content, data, error?}) for every provider — builtin, remote
+// MCP, and Paperclip plugin alike. On idempotent replay `result` carries the
+// stored summary record instead of a fresh tool result.
+const toolGatewayCallResponseSchema = z.object({
+  invocationId: z.string(),
+  status: z.enum(["completed", "replayed"]),
+  tool: z.string(),
+  targetTool: z.string().optional(),
+  result: z
+    .union([
+      z.object({
+        content: z.string().optional(),
+        data: z.unknown().optional(),
+        error: z.string().optional(),
+      }),
+      z.record(z.string(), z.unknown()),
+      z.null(),
+    ])
+    .describe(
+      "Tool result: {content, data, error?}. `data` is tool-specific " +
+        "(e.g. wiki read tools return {hash, ...} alongside markdown content).",
+    ),
 });
 
 const toolGatewayCompanyQuerySchema = z.object({
@@ -11996,10 +12033,11 @@ registerCurrentRoute({
   summary: "Execute a tool through the gateway",
   body: toolGatewayCallSchema,
   responses: {
-    200: r.ok(),
+    200: r.ok(toolGatewayCallResponseSchema),
     400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
+    422: r.unprocessable,
   },
 });
 

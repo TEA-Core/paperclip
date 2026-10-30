@@ -4,6 +4,8 @@ import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
 import { logger } from "../middleware/logger.js";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import Ajv, { type ErrorObject } from "ajv";
+import addFormats from "ajv-formats";
 import {
   and,
   asc,
@@ -668,6 +670,67 @@ function summarizeResult(result: unknown): Record<string, unknown> {
     hasData: record.data !== undefined,
     hasError: Boolean(record.error),
   };
+}
+
+/**
+ * Validate tool-call arguments against a plugin tool's declared JSON Schema.
+ *
+ * Plugin workers throw plain `Error`s for missing arguments (e.g.
+ * "companyId is required"), which the gateway would otherwise surface as an
+ * HTTP 500. Rejecting schema-invalid arguments here turns that into a 422
+ * that names the offending fields, before any invocation or policy state is
+ * recorded. Approved retries are exempt: they dispatch the signed, already
+ * reviewed arguments, not the retry request's own body.
+ */
+function validatePluginToolArguments(
+  tool: ToolGatewayDescriptor,
+  parameters: unknown,
+): void {
+  const schema = tool.parametersSchema;
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const AjvCtor = (Ajv as any).default ?? Ajv;
+  const ajv = new AjvCtor({ allErrors: true });
+  // ajv-formats v3 default export is a FormatsPlugin object; call it as a plugin.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const applyFormats = (addFormats as any).default ?? addFormats;
+  applyFormats(ajv);
+  let validate: (data: unknown) => boolean;
+  try {
+    validate = ajv.compile(schema) as (data: unknown) => boolean;
+  } catch {
+    // A malformed manifest schema must not brick every call to the tool; let
+    // the plugin's own runtime validation answer instead.
+    return;
+  }
+  if (validate(parameters)) return;
+  const issues = ((validate as { errors?: ErrorObject[] | null }).errors ?? []).map(
+    (error) => {
+      const field =
+        error.instancePath.replace(/^\//, "").replace(/\//g, ".") ||
+        (error.keyword === "required"
+          ? String(
+              (error.params as Record<string, unknown>).missingProperty ?? "",
+            )
+          : "");
+      return {
+        field: field || undefined,
+        keyword: error.keyword,
+        message: error.message ?? "invalid value",
+      };
+    },
+  );
+  const summary = issues
+    .map((issue) =>
+      issue.field ? `"${issue.field}" ${issue.message}` : issue.message,
+    )
+    .join("; ");
+  throw new ToolGatewayHttpError(
+    422,
+    `Invalid arguments for tool "${tool.name}": ${summary}`,
+    "invalid_tool_arguments",
+    { issues },
+  );
 }
 
 function inferToolRisk(toolName: string): ToolGatewayDescriptor["risk"] {
@@ -9839,6 +9902,12 @@ export function createToolGatewayService(
         sensitiveMode: "redact",
         promptInjectionMode: "ignore",
       });
+      if (
+        tool.providerType === "paperclip_plugin" &&
+        !input.approvedActionRequestId
+      ) {
+        validatePluginToolArguments(tool, requestedParameters);
+      }
       let effectiveParameters: unknown = requestedParameters;
       let effectiveArgumentsSummary = argumentValidation.summary;
 
@@ -10365,22 +10434,28 @@ export function createToolGatewayService(
                   executionTimeoutMs,
                 )
               : null;
+        // Plugin dispatch returns {pluginId, toolName, result}; the wire
+        // contract (HTTP tools/call, MCP tools/call, read-back doctrines)
+        // carries the inner ToolResult {content, data} directly, mirroring
+        // the MCP and builtin paths.
         const result = connectedMcpExecution
           ? connectedMcpExecution.result
           : tool.providerType === "paperclip_plugin"
-            ? await runWithTimeout(
-                pluginToolDispatcher!.executeTool(
-                  tool.name,
-                  effectiveParameters,
-                  {
-                    agentId: session.agentId!,
-                    runId: session.runId!,
-                    companyId: session.companyId,
-                    projectId: session.projectId ?? "",
-                  },
-                ),
-                executionTimeoutMs,
-              )
+            ? (
+                await runWithTimeout(
+                  pluginToolDispatcher!.executeTool(
+                    tool.name,
+                    effectiveParameters,
+                    {
+                      agentId: session.agentId!,
+                      runId: session.runId!,
+                      companyId: session.companyId,
+                      projectId: session.projectId ?? "",
+                    },
+                  ),
+                  executionTimeoutMs,
+                )
+              ).result
             : await runWithTimeout(
                 executeBuiltinTool(session, tool, effectiveParameters),
                 executionTimeoutMs,
