@@ -949,6 +949,64 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     }
   });
 
+  it.each([
+    { from: "record_only", to: "repository_delivery" },
+    { from: "repository_delivery", to: "record_only" },
+  ] as const)("refuses a final review escalation when classification flips from $from to $to together with an execution policy change", async ({ from, to }) => {
+    const fixture = await pendingDelivery({
+      deliveryRequirement: from,
+      repo: from === "repository_delivery",
+    });
+    const interaction = await seedEscalation(fixture);
+    const initial = await fixture.read();
+    const initialPolicy = initial.executionPolicy as { stages: Array<Record<string, unknown>> };
+    let raced = false;
+    const transact = db.transaction.bind(db);
+    const transactionSpy = vi.spyOn(db, "transaction").mockImplementation((async (...args) => {
+      if (!raced) {
+        raced = true;
+        // The appended stage is incomplete, so the ladder no longer reads as terminally approved under
+        // the locked policy and the locked preflight would otherwise skip its binding check entirely.
+        await db.update(issues).set({
+          deliveryRequirement: to,
+          executionPolicy: {
+            ...initialPolicy,
+            stages: [
+              ...initialPolicy.stages,
+              { id: randomUUID(), type: "approval", participants: [{ type: "user", userId: "board-user" }] },
+            ],
+          },
+        }).where(eq(issues.id, fixture.issue.id));
+      }
+      return transact(...args);
+    }) as typeof db.transaction);
+
+    try {
+      const response = await request(createApp(db, boardActor(fixture.company)))
+        .post(`/api/issues/${fixture.issue.id}/interactions/${interaction.id}/accept`)
+        .send({});
+
+      expect(raced).toBe(true);
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(response.body.details).toMatchObject({
+        code: "approval_final_delivery_preflight_stale",
+        reason: expect.stringContaining("delivery classification changed"),
+      });
+      const stored = await fixture.read();
+      expect(stored.deliveryRequirement).toBe(to);
+      expect(stored.status).toBe("in_review");
+      expect(stored.executionState).toEqual(initial.executionState);
+      const [pending] = await db.select().from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, interaction.id));
+      expect(pending?.status).toBe("pending");
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+      expect(fixture.writes).toEqual([]);
+      expect(fixture.armCalls).toEqual([]);
+    } finally {
+      transactionSpy.mockRestore();
+    }
+  });
+
   async function withIssueTrigger(name: string, when: string, body: string, run: () => Promise<void>) {
     await db.execute(sql.raw(`create or replace function ${name}() returns trigger language plpgsql as $$ begin ${body} end $$`));
     await db.execute(sql.raw(`create trigger ${name} before update on issues for each row when (${when}) execute function ${name}()`));
