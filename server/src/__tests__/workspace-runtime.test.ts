@@ -89,6 +89,10 @@ import {
   type EnvironmentLease,
 } from "@paperclipai/shared";
 import { resolvePaperclipConfigPath } from "../paths.ts";
+import {
+  resolveDefaultAgentWorkspaceDir,
+  resolveManagedProjectWorkspaceDir,
+} from "../home-paths.js";
 import type { WorkspaceOperation } from "@paperclipai/shared";
 import type { WorkspaceOperationRecorder } from "../services/workspace-operations.ts";
 import { deriveWorktreeInstanceId } from "../services/workspace-instance-cleanup.ts";
@@ -223,6 +227,27 @@ async function createTempRepoWithRemote(defaultBranch = "main") {
   await runGit(repoRoot, ["remote", "add", "origin", remoteRoot]);
   await runGit(repoRoot, ["push", "-u", "origin", defaultBranch]);
   return { repoRoot, remoteRoot };
+}
+
+async function hashDirectoryTree(root: string): Promise<string> {
+  const entries: string[] = [];
+  const pending: string[] = [root];
+  while (pending.length > 0) {
+    const dir = pending.pop()!;
+    for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+      const entryPath = path.join(dir, entry.name);
+      const relative = path.relative(root, entryPath);
+      if (entry.isSymbolicLink()) {
+        entries.push(`${relative}:symlink:${await fs.readlink(entryPath)}`);
+      } else if (entry.isDirectory()) {
+        pending.push(entryPath);
+      } else {
+        entries.push(`${relative}:file:${createHash("sha256").update(await fs.readFile(entryPath)).digest("hex")}`);
+      }
+    }
+  }
+  entries.sort();
+  return createHash("sha256").update(entries.join("\n")).digest("hex");
 }
 
 async function expectPersistedBranchMismatchRepaired(input: {
@@ -6444,6 +6469,185 @@ describe("realizeExecutionWorkspace", () => {
     });
     await expect(fs.stat(instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
     await fs.rm(worktreesDir, { recursive: true, force: true });
+  });
+
+  describe("local_fs terminal workspace cleanup guards", () => {
+    function buildLocalFsWorkspace(overrides: {
+      id: string;
+      cwd: string;
+    }) {
+      return {
+        id: overrides.id,
+        cwd: overrides.cwd,
+        providerType: "local_fs",
+        providerRef: overrides.cwd,
+        branchName: null,
+        repoUrl: null,
+        baseRef: null,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        sourceIssueId: "issue-1",
+        metadata: { createdByRuntime: true },
+      };
+    }
+
+    it("refuses to remove a foreign primary checkout with unpushed commits and leaves it byte-identical", async () => {
+      const repoRoot = await createTempRepo();
+      await fs.writeFile(path.join(repoRoot, "unpushed.txt"), "unpushed work\n", "utf8");
+      await runGit(repoRoot, ["add", "unpushed.txt"]);
+      await runGit(repoRoot, ["commit", "-m", "unpushed work"]);
+      const headBefore = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+      const treeBefore = await hashDirectoryTree(repoRoot);
+
+      const cleanup = await cleanupExecutionWorkspaceArtifacts({
+        workspace: buildLocalFsWorkspace({
+          id: "execution-workspace-local-fs-foreign-repo",
+          cwd: repoRoot,
+        }),
+        projectWorkspace: null,
+      });
+
+      expect(cleanup.cleaned).toBe(false);
+      expect(cleanup.warnings).toEqual([
+        `Refusing to remove path "${repoRoot}" because it is a git repository.`,
+      ]);
+      expect(await hashDirectoryTree(repoRoot)).toBe(treeBefore);
+      expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).toBe(headBefore);
+      expect(await readGit(repoRoot, ["cat-file", "-t", headBefore])).toBe("commit");
+    });
+
+    it("refuses to remove a plain directory outside the runtime-managed local workspace roots", async () => {
+      const foreignDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-foreign-dir-"));
+      await fs.writeFile(path.join(foreignDir, "notes.txt"), "notes\n", "utf8");
+
+      const cleanup = await cleanupExecutionWorkspaceArtifacts({
+        workspace: buildLocalFsWorkspace({
+          id: "execution-workspace-local-fs-foreign-dir",
+          cwd: foreignDir,
+        }),
+        projectWorkspace: null,
+      });
+
+      expect(cleanup.cleaned).toBe(false);
+      expect(cleanup.warnings).toEqual([
+        `Refusing to remove path "${foreignDir}" because it is outside the runtime-managed local workspace roots.`,
+      ]);
+      expect((await fs.stat(foreignDir)).isDirectory()).toBe(true);
+    });
+
+    it("removes a runtime-created plain directory inside the managed agent workspace root", async () => {
+      const previousHome = process.env.PAPERCLIP_HOME;
+      const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-local-fs-home-"));
+      process.env.PAPERCLIP_HOME = paperclipHome;
+      try {
+        const workspaceDir = path.join(resolveDefaultAgentWorkspaceDir("agent-local-fs"), "task-1");
+        await fs.mkdir(workspaceDir, { recursive: true });
+        await fs.writeFile(path.join(workspaceDir, "scratch.txt"), "scratch\n", "utf8");
+
+        const cleanup = await cleanupExecutionWorkspaceArtifacts({
+          workspace: buildLocalFsWorkspace({
+            id: "execution-workspace-local-fs-managed-dir",
+            cwd: workspaceDir,
+          }),
+          projectWorkspace: null,
+        });
+
+        expect(cleanup.cleaned).toBe(true);
+        expect(cleanup.warnings).toEqual([]);
+        await expect(fs.stat(workspaceDir)).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+        else process.env.PAPERCLIP_HOME = previousHome;
+        await fs.rm(paperclipHome, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses to remove a git repository even inside the managed projects root", async () => {
+      const previousHome = process.env.PAPERCLIP_HOME;
+      const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-local-fs-home-"));
+      process.env.PAPERCLIP_HOME = paperclipHome;
+      try {
+        const tempRepo = await createTempRepo();
+        const managedCheckout = resolveManagedProjectWorkspaceDir({
+          companyId: "company-1",
+          projectId: "project-1",
+          repoName: "repo",
+        });
+        await fs.cp(tempRepo, managedCheckout, { recursive: true });
+        const headBefore = await readGit(managedCheckout, ["rev-parse", "HEAD"]);
+
+        const cleanup = await cleanupExecutionWorkspaceArtifacts({
+          workspace: buildLocalFsWorkspace({
+            id: "execution-workspace-local-fs-managed-repo",
+            cwd: managedCheckout,
+          }),
+          projectWorkspace: null,
+        });
+
+        expect(cleanup.cleaned).toBe(false);
+        expect(cleanup.warnings).toEqual([
+          `Refusing to remove path "${managedCheckout}" because it is a git repository.`,
+        ]);
+        expect(await readGit(managedCheckout, ["rev-parse", "HEAD"])).toBe(headBefore);
+      } finally {
+        if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+        else process.env.PAPERCLIP_HOME = previousHome;
+        await fs.rm(paperclipHome, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses to remove a managed directory that contains a nested git repository", async () => {
+      const previousHome = process.env.PAPERCLIP_HOME;
+      const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-local-fs-home-"));
+      process.env.PAPERCLIP_HOME = paperclipHome;
+      try {
+        const workspaceDir = path.join(resolveDefaultAgentWorkspaceDir("agent-local-fs"), "task-2");
+        const nestedRepo = path.join(workspaceDir, "vendor", "cloned-repo");
+        await fs.mkdir(nestedRepo, { recursive: true });
+        await runGit(nestedRepo, ["init"]);
+
+        const cleanup = await cleanupExecutionWorkspaceArtifacts({
+          workspace: buildLocalFsWorkspace({
+            id: "execution-workspace-local-fs-nested-repo",
+            cwd: workspaceDir,
+          }),
+          projectWorkspace: null,
+        });
+
+        expect(cleanup.cleaned).toBe(false);
+        expect(cleanup.warnings).toEqual([
+          `Refusing to remove path "${workspaceDir}" because it contains a git repository at "${nestedRepo}".`,
+        ]);
+        expect((await fs.stat(nestedRepo)).isDirectory()).toBe(true);
+      } finally {
+        if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+        else process.env.PAPERCLIP_HOME = previousHome;
+        await fs.rm(paperclipHome, { recursive: true, force: true });
+      }
+    });
+
+    it("still refuses to remove a path that contains the project workspace", async () => {
+      const parentDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-project-parent-"));
+      const projectWorkspaceCwd = path.join(parentDir, "primary-checkout");
+      await fs.mkdir(projectWorkspaceCwd, { recursive: true });
+
+      const cleanup = await cleanupExecutionWorkspaceArtifacts({
+        workspace: buildLocalFsWorkspace({
+          id: "execution-workspace-local-fs-contains-project",
+          cwd: parentDir,
+        }),
+        projectWorkspace: {
+          cwd: projectWorkspaceCwd,
+          cleanupCommand: null,
+        },
+      });
+
+      expect(cleanup.cleaned).toBe(false);
+      expect(cleanup.warnings).toEqual([
+        `Refusing to remove path "${parentDir}" because it contains the project workspace.`,
+      ]);
+      expect((await fs.stat(projectWorkspaceCwd)).isDirectory()).toBe(true);
+    });
   });
 
   describe("default branch guard", () => {
