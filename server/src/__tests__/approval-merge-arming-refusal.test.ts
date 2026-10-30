@@ -73,9 +73,7 @@ vi.mock("../services/merge-arming.js", async (importOriginal) => {
 // by the same `return`: in the hook the refusal `return` sits OUTSIDE the inner
 // addComment try/catch, so a comment-write failure reaches the identical refusal.
 const realEvaluateStageIntegrity = vi.hoisted(() => ({
-  fn: null as
-    | null
-    | ((db: unknown, row: unknown) => Promise<{ reason: string; detail: string } | null>),
+  fn: null as null | typeof import("../services/approval-status-reconciler.js").evaluateStageIntegrity,
 }));
 const mockEvaluateStageIntegrity = vi.hoisted(() => vi.fn());
 
@@ -123,7 +121,8 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
     // stage-integrity refusal test exercises production behavior.
     mockEvaluateStageIntegrity.mockReset();
     mockEvaluateStageIntegrity.mockImplementation(
-      async (db: unknown, row: unknown) => realEvaluateStageIntegrity.fn!(db, row),
+      async (...args: Parameters<typeof import("../services/approval-status-reconciler.js").evaluateStageIntegrity>) =>
+        realEvaluateStageIntegrity.fn!(...args),
     );
   });
 
