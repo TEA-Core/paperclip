@@ -760,7 +760,9 @@ async function proveLandingDelegated(
   const number = Number(named[1]);
   let linked: LinkedPullRequest[];
   try {
-    linked = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id);
+    linked = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, {
+      includeDrafts: true,
+    });
   } catch (err) {
     return refuseTier1(unverifiedTier1(err));
   }
@@ -855,7 +857,9 @@ async function proveRecordOnly(
 ): Promise<DoneTierDeclarationResult> {
   let linked: LinkedPullRequest[];
   try {
-    const resolved = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id);
+    const resolved = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, {
+      includeDrafts: true,
+    });
     if (!Array.isArray(resolved)) {
       return refuseTier1(
         'Tier 1 declaration using "record-only" could not be verified: linked pull request ' +

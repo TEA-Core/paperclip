@@ -5490,7 +5490,35 @@ describe("evaluateDoneTierDeclaration", () => {
       );
       expect(result.allowed).toBe(true);
       expect(result.tier).toBe("tier1");
-      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(mockDb, "company-1", "issue-1");
+      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(mockDb, "company-1", "issue-1", {
+        includeDrafts: true,
+      });
+    });
+
+    // SUP-21941: the delegated proof resolves the linked set with drafts included,
+    // so naming a still-draft linked PR is truthful (landing delegated pre-merge).
+    // The mock mirrors the production resolver default (merge-arming drops draft
+    // rows unless includeDrafts is passed), pinning the caller-side policy.
+    it("accepts landing-delegated naming a draft linked PR when drafts are included", async () => {
+      mockResolveLinkedPullRequestsWithState.mockImplementation(
+        async (_db, _companyId, _issueId, options) =>
+          options?.includeDrafts ? [{ ...linkedPr(4103, "open"), draft: true }] : [],
+      );
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(
+        mockDb,
+        "company-1",
+        "issue-1",
+        { includeDrafts: true },
+      );
     });
 
     it("refuses landed-at-tip when GitHub credential resolution fails, and does not accept", async () => {
@@ -5578,7 +5606,9 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.allowed).toBe(true);
       expect(result.tier).toBe("tier1");
       expect(result.skipped).toBe(false);
-      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(mockDb, "company-1", "issue-1");
+      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(mockDb, "company-1", "issue-1", {
+        includeDrafts: true,
+      });
     });
 
     it("keeps non-code work products eligible for record-only", async () => {
@@ -5610,6 +5640,34 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.tier).toBe(null);
       expect(result.reason).toContain("record-only");
       expect(result.reason).toContain("linked");
+    });
+
+    // SUP-21941: record-only resolves with drafts included — under the resolver
+    // default (drafts dropped) a card whose only PR is a draft read as "no PR"
+    // and ghost-PASSed the empty-linked-set read. The mock mirrors that default.
+    it("refuses record-only when the only linked PR is a draft", async () => {
+      mockResolveLinkedPullRequestsWithState.mockImplementation(
+        async (_db, _companyId, _issueId, options) =>
+          options?.includeDrafts ? [{ ...linkedPr(1024, "open"), draft: true }] : [],
+      );
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        recordOnlyLine(),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("record-only");
+      expect(result.reason).toContain("linked");
+      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(
+        mockDb,
+        "company-1",
+        "issue-1",
+        { includeDrafts: true },
+      );
     });
 
     it("refuses record-only when linked-PR resolution throws", async () => {
