@@ -108,7 +108,10 @@ export type ScheduledRetryFacts = {
   pendingResponse?: "interaction" | "approval" | null;
 };
 
+export const MAX_QUEUED_ISSUE_RUN_AGE_MS = 24 * 60 * 60 * 1000;
+
 export type QueuedRunStalenessErrorCode =
+  | "queued_run_expired"
   | "execution_reconciliation_required"
   | "issue_dependencies_blocked"
   | "issue_not_found"
@@ -130,6 +133,10 @@ export type StalenessDecision =
     };
 
 export type QueuedRunFacts = {
+  runStatus?: string | null;
+  scheduledRetryAt?: Date | null;
+  hasActiveExecutionLease?: boolean;
+  hasActiveCheckoutLease?: boolean;
   /** Rechecked for automatic native replacements immediately before dispatch. */
   dependenciesBlocked?: DependencyBlockFacts | null;
   /** Armed worktree cutoff; a queued run created before it must not dispatch. */
@@ -533,6 +540,32 @@ export function decideQueuedRunStaleness(
       errorCode: "issue_not_found",
       reason: "Cancelled because the target issue no longer exists",
       details: { issueId: facts.issueId },
+    };
+  }
+
+  const runCreatedAt = facts.runCreatedAt;
+  const queueAgeExpired =
+    facts.runStatus === "queued" &&
+    runCreatedAt instanceof Date &&
+    _now.getTime() - runCreatedAt.getTime() >= MAX_QUEUED_ISSUE_RUN_AGE_MS &&
+    (facts.scheduledRetryAt === null ||
+      facts.scheduledRetryAt === undefined ||
+      facts.scheduledRetryAt.getTime() <= _now.getTime()) &&
+    !facts.hasActiveExecutionLease &&
+    !facts.hasActiveCheckoutLease;
+  if (queueAgeExpired) {
+    if (!(runCreatedAt instanceof Date)) return { stale: false };
+    return {
+      stale: true,
+      errorCode: "queued_run_expired",
+      reason: "Cancelled because the queued issue run exceeded the maximum queue age",
+      details: {
+        issueId: facts.issueId,
+        createdAt: runCreatedAt.toISOString(),
+        ageMs: _now.getTime() - runCreatedAt.getTime(),
+        maxAgeMs: MAX_QUEUED_ISSUE_RUN_AGE_MS,
+        scheduledRetryAt: facts.scheduledRetryAt?.toISOString() ?? null,
+      },
     };
   }
 
