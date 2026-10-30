@@ -1178,7 +1178,10 @@ describe("agent issue mutation checkout ownership", () => {
     const thirdAgentId = "0f0e0d0c-0b0a-4004-8004-0f0e0d0c0b0a";
     const verdictParticipant = { id: "5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b", type: "agent", agentId: peerAgentId };
 
-    function makeArmedReviewIssue(overrides: Record<string, unknown> = {}) {
+    function makeArmedReviewIssue(
+      overrides: Record<string, unknown> = {},
+      stateOverrides: Record<string, unknown> = {},
+    ) {
       return makeIssue({
         status: "in_review",
         assigneeAgentId: ownerAgentId,
@@ -1206,6 +1209,7 @@ describe("agent issue mutation checkout ownership", () => {
           lastDecisionId: null,
           lastDecisionOutcome: null,
           changesRequestedCount: 0,
+          ...stateOverrides,
         },
         ...overrides,
       });
@@ -1316,12 +1320,7 @@ describe("agent issue mutation checkout ownership", () => {
 
     it("denies the participant when the pending state points at a stage missing from the policy", async () => {
       mockIssueService.getById.mockResolvedValue(
-        makeArmedReviewIssue({
-          executionState: {
-            ...makeArmedReviewIssue().executionState as Record<string, unknown>,
-            currentStageId: "4d3c2b1a-0f1e-4d2c-9b8a-7f6e5d4c3b2a",
-          },
-        }),
+        makeArmedReviewIssue({}, { currentStageId: "4d3c2b1a-0f1e-4d2c-9b8a-7f6e5d4c3b2a" }),
       );
 
       const res = await request(await createApp(peerActor()))
@@ -1335,12 +1334,7 @@ describe("agent issue mutation checkout ownership", () => {
 
     it("denies the participant when the execution state is no longer pending", async () => {
       mockIssueService.getById.mockResolvedValue(
-        makeArmedReviewIssue({
-          executionState: {
-            ...makeArmedReviewIssue().executionState as Record<string, unknown>,
-            status: "changes_requested",
-          },
-        }),
+        makeArmedReviewIssue({}, { status: "changes_requested" }),
       );
 
       const res = await request(await createApp(peerActor()))
