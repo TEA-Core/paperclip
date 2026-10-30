@@ -10325,7 +10325,10 @@ export function createToolGatewayService(
             invocationId,
             status: "replayed" as const,
             tool: tool.name,
-            result: recorded.invocation.resultSummary ?? null,
+            // Same projection as the first execution: the persisted result
+            // payload parsed back out of its summary, not the summary wrapper
+            // ({summary, sha256, ...}) that used to leak here.
+            result: storedInvocationResult(recorded.invocation),
           };
         }
         if (accessDecision.decision === "require_approval") {
@@ -10757,6 +10760,10 @@ export function createToolGatewayService(
         sensitiveMode: "redact",
         promptInjectionMode: "ignore",
       });
+      // The direct plugin execute route must enforce the tool's manifest
+      // schema exactly like tools/call does; generic content validation
+      // alone would dispatch arguments the tool never declared.
+      validatePluginToolArguments(tool, requestedParameters);
 
       const decisionInput = policyInputForTool({
         session: sessionLike,
@@ -10773,7 +10780,10 @@ export function createToolGatewayService(
       invocationId = recorded.invocation.id;
 
       if (recorded.replayed) {
-        return recorded.invocation.resultSummary;
+        // Same projection as the first execution ({pluginId, toolName,
+        // result}): the persisted payload parsed from its summary, not the
+        // summary wrapper row itself.
+        return storedInvocationResult(recorded.invocation);
       }
 
       if (accessDecision.decision === "require_approval") {

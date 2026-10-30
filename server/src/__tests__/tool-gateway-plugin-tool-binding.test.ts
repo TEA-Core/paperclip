@@ -575,4 +575,96 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
       valid.body.result.data.hash,
     );
   });
+
+  it("rejects schema-invalid plugin tool arguments on the direct plugin execute path", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+
+    const error = await gateway
+      .executePluginTool({
+        actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
+        tool: "a.b:wiki_read_page",
+        parameters: { wikiId: "main", path: "index.md" },
+        runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+      })
+      .then(
+        () => {
+          throw new Error("Expected the schema-invalid plugin execute to be rejected");
+        },
+        (caught) => caught as ToolGatewayHttpError,
+      );
+    expect(error).toBeInstanceOf(ToolGatewayHttpError);
+    expect(error.status).toBe(422);
+    expect(error.reasonCode).toBe("invalid_tool_arguments");
+    expect(error.message).toContain("companyId");
+
+    // Schema rejection happens before invocation recording: no failed call,
+    // no audit noise for a client mistake.
+    const invocations = await db.select().from(toolInvocations);
+    expect(invocations).toEqual([]);
+  });
+
+  it("replays an idempotent tools/call with the same flat result projection", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    const parameters = { companyId: company.id, wikiId: "main", path: "index.md" };
+    const first = await gateway.executeTool({
+      sessionToken: session.token,
+      tool: "a.b:wiki_read_page",
+      parameters,
+      idempotencyKey: "replay-flat-contract",
+    });
+    expect(first.status).toBe("completed");
+
+    const replay = await gateway.executeTool({
+      sessionToken: session.token,
+      tool: "a.b:wiki_read_page",
+      parameters,
+      idempotencyKey: "replay-flat-contract",
+    });
+    expect(replay.status).toBe("replayed");
+    expect(replay.invocationId).toBe(first.invocationId);
+    // The replay carries the persisted result payload with the flat
+    // {content, data} shape — not the stored summary wrapper that would
+    // otherwise surface as {summary, sha256, ...}.
+    expect(replay.result).toEqual(first.result);
+    const replayedResult = replay.result as Record<string, unknown>;
+    expect(replayedResult).not.toHaveProperty("summary");
+    expect(replayedResult).not.toHaveProperty("result");
+    expect(replayedResult).not.toHaveProperty("pluginId");
+  });
+
+  it("replays a side-effecting plugin execute with the stored envelope projection", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+    const input = {
+      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: "a.b:wiki_append_log",
+      parameters: { path: "log/index.md", content: "same entry" },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+    };
+
+    const first = await gateway.executePluginTool(input);
+    // Side-effecting tools auto-key on their arguments; the identical call
+    // replays instead of dispatching twice.
+    const replay = await gateway.executePluginTool(input);
+
+    expect(replay).toEqual(first);
+    expect(replay).toMatchObject({
+      pluginId: "plugin-a",
+      toolName: "alpha",
+      result: { data: { ok: true } },
+    });
+    const invocations = await db.select().from(toolInvocations);
+    expect(invocations).toHaveLength(1);
+  });
 });
