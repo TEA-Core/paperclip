@@ -23,6 +23,17 @@ export interface WorkProductDiffSummary {
   changedFiles: number;
 }
 
+export const SERVER_PROVENANCE_KEY = "serverProvenance";
+
+export function stripServerProvenance(
+  metadata: Record<string, unknown> | null | undefined,
+): Record<string, unknown> | null {
+  if (metadata == null) return null;
+  if (!Object.prototype.hasOwnProperty.call(metadata, SERVER_PROVENANCE_KEY)) return metadata;
+  const { [SERVER_PROVENANCE_KEY]: _serverProvenance, ...rest } = metadata;
+  return rest;
+}
+
 function nonNegativeInteger(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
@@ -244,8 +255,12 @@ export function workProductService(
     },
 
     createForIssue: async (issueId: string, companyId: string, data: Omit<typeof issueWorkProducts.$inferInsert, "issueId" | "companyId">) => {
+      const sanitizedData = {
+        ...data,
+        metadata: stripServerProvenance(data.metadata as Record<string, unknown> | null | undefined),
+      };
       const row = await db.transaction(async (tx) => {
-        if (data.isPrimary) {
+        if (sanitizedData.isPrimary) {
           await tx
             .update(issueWorkProducts)
             .set({ isPrimary: false, updatedAt: new Date() })
@@ -253,14 +268,14 @@ export function workProductService(
               and(
                 eq(issueWorkProducts.companyId, companyId),
                 eq(issueWorkProducts.issueId, issueId),
-                eq(issueWorkProducts.type, data.type),
+                eq(issueWorkProducts.type, sanitizedData.type),
               ),
             );
         }
         return await tx
           .insert(issueWorkProducts)
           .values({
-            ...data,
+            ...sanitizedData,
             companyId,
             issueId,
           })
@@ -271,6 +286,10 @@ export function workProductService(
     },
 
     update: async (id: string, patch: Partial<typeof issueWorkProducts.$inferInsert>) => {
+      const sanitizedPatch =
+        patch.metadata === undefined
+          ? patch
+          : { ...patch, metadata: stripServerProvenance(patch.metadata as Record<string, unknown> | null | undefined) };
       const row = await db.transaction(async (tx) => {
         const existing = await tx
           .select()
@@ -279,7 +298,7 @@ export function workProductService(
           .then((rows) => rows[0] ?? null);
         if (!existing) return null;
 
-        if (patch.isPrimary === true) {
+        if (sanitizedPatch.isPrimary === true) {
           await tx
             .update(issueWorkProducts)
             .set({ isPrimary: false, updatedAt: new Date() })
@@ -294,7 +313,7 @@ export function workProductService(
 
         return await tx
           .update(issueWorkProducts)
-          .set({ ...patch, updatedAt: new Date() })
+          .set({ ...sanitizedPatch, updatedAt: new Date() })
           .where(eq(issueWorkProducts.id, id))
           .returning()
           .then((rows) => rows[0] ?? null);
@@ -332,7 +351,7 @@ export function workProductService(
           : false,
         healthStatus: row.healthStatus,
         summary: row.summary ?? null,
-        metadata: row.metadata ?? null,
+        metadata: stripServerProvenance(row.metadata ?? null),
         executionWorkspaceId: row.executionWorkspaceId ?? null,
         runtimeServiceId: row.runtimeServiceId ?? null,
         createdByRunId: row.createdByRunId ?? null,

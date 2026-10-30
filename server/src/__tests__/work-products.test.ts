@@ -159,6 +159,44 @@ describe("workProductService", () => {
     expect(result?.id).toBe("work-product-1");
   });
 
+  it("strips server provenance from create and update metadata", async () => {
+    const insertedRow = createWorkProductRow();
+    const insertReturning = vi.fn(async () => [insertedRow]);
+    const insertValues = vi.fn((_values: unknown) => ({ returning: insertReturning }));
+    const txInsert = vi.fn(() => ({ values: insertValues }));
+    const updateSet = vi.fn((_set: unknown) => ({
+      where: vi.fn(() => ({ returning: vi.fn(async () => [insertedRow]) })),
+    }));
+    const txSelect = vi.fn(() => ({
+      from: vi.fn(() => ({ where: vi.fn(async () => [createWorkProductRow()]) })),
+    }));
+    const txUpdate = vi.fn(() => ({ set: updateSet }));
+    const transaction = vi.fn(async (callback: (input: unknown) => Promise<unknown>) =>
+      await callback({ update: txUpdate, insert: txInsert, select: txSelect }),
+    );
+    const svc = workProductService({ transaction } as any);
+    const metadata = {
+      repository: "TEA-Core/paperclip",
+      serverProvenance: { actor: "pr-delivery", repository: "TEA-Core/paperclip" },
+    };
+    await svc.createForIssue("issue-1", "company-1", {
+      type: "pull_request",
+      provider: "github",
+      title: "PR 1",
+      status: "merged",
+      reviewState: "none",
+      isPrimary: false,
+      metadata,
+    });
+    expect((insertValues.mock.calls[0][0] as Record<string, unknown>).metadata).toEqual({
+      repository: "TEA-Core/paperclip",
+    });
+    await svc.update("work-product-1", { metadata });
+    expect((updateSet.mock.calls[0][0] as Record<string, unknown>).metadata).toEqual({
+      repository: "TEA-Core/paperclip",
+    });
+  });
+
   it("uses a transaction when promoting an existing work product to primary", async () => {
     const existingRow = createWorkProductRow({ isPrimary: false });
 

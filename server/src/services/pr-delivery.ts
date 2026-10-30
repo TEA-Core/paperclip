@@ -8,6 +8,7 @@ import {
 } from "./github-pull-request-merge.js";
 import { logActivity, logActivityInTransaction } from "./activity-log.js";
 import type { LogActivityInput } from "./activity-log.js";
+import { stripServerProvenance } from "./work-products.js";
 
 /**
  * Produce-side of the delivery-path PR work product (SUP-14645).
@@ -131,10 +132,45 @@ function externalIdFor(input: PrDeliveryInput): string {
   return `${input.repository}#${input.prNumber}`;
 }
 
+/**
+ * Parse the canonical carrier externalId (`owner/repo#N`) back into a live
+ * GitHub reference so the carrier fan-out can independently re-resolve the PR
+ * before trusting any merge fact (SUP-21818). Returns null when the id is not
+ * a canonical slug#number pair.
+ */
+function referenceFromExternalId(externalId: string): GitHubPullRequestReference | null {
+  const match = externalId.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/);
+  if (!match) return null;
+  return { host: "github.com", owner: match[1]!, repo: match[2]!, number: Number(match[3]) };
+}
+
+export type ServerProvenance = {
+  actor: "pr-delivery";
+  repository: string;
+  prNumber: number;
+  mergeCommitSha?: string;
+  mergedAt?: string;
+};
+
+export function prDeliveryServerProvenance(
+  repository: string,
+  prNumber: number,
+  merge?: { mergeCommitSha?: string | null; mergedAt?: string | null },
+): ServerProvenance {
+  return {
+    actor: "pr-delivery",
+    repository,
+    prNumber,
+    ...(merge?.mergeCommitSha ? { mergeCommitSha: merge.mergeCommitSha } : {}),
+    ...(merge?.mergedAt ? { mergedAt: merge.mergedAt } : {}),
+  };
+}
+
 function openMetadata(input: PrDeliveryInput): Record<string, unknown> {
   return {
     prNumber: input.prNumber,
     repository: input.repository,
+    serverProvenance: prDeliveryServerProvenance(input.repository, input.prNumber),
     ...(input.headRef ? { headRef: input.headRef } : {}),
     ...(input.baseRef ? { baseRef: input.baseRef } : {}),
     ...(input.headSha ? { headSha: input.headSha } : {}),
@@ -358,6 +394,10 @@ export function prDeliveryService(
             ...((existing.metadata as Record<string, unknown> | null) ?? {}),
             ...(mergedAt ? { mergedAt } : {}),
             ...(mergeCommitSha ? { mergeCommitSha } : {}),
+            serverProvenance: prDeliveryServerProvenance(input.repository, input.prNumber, {
+              mergeCommitSha,
+              mergedAt,
+            }),
             ...deliveredLocMetadata(details.additions, details.deletions),
           };
           await tx
@@ -399,11 +439,57 @@ export function prDeliveryService(
    * delivery does not demote a descendant's existing primary of the same type.
    * Idempotent on (issue, type, externalId) — re-delivery updates the existing
    * row instead of duplicating it.
+   *
+   * Provenance (SUP-21818): the mirrored metadata is request-supplied and
+   * therefore untrusted. Any incoming serverProvenance stamp is stripped, and
+   * a trusted stamp is written only when the carrier PR is independently
+   * re-resolved against GitHub and reported merged. A carrier the server
+   * cannot confirm fans out with merge facts but no stamp, so terminal
+   * verification refuses it rather than laundering agent metadata into
+   * trusted landing proof.
    */
   async function recordCarrierFanOut(input: PrCarrierFanOutInput): Promise<PrCarrierFanOutResult> {
     const tree = await listCarrierIssueIds(input.companyId, input.sourceIssueId);
     const descendants = tree.filter((issueId) => issueId !== input.sourceIssueId);
-    const metadata = input.metadata ?? {};
+    // SUP-21818 (redo of SUP-21294 Finding 2): input.metadata is agent-writable
+    // (the create route passes the request-supplied product metadata through),
+    // so it must never be a provenance source. Any incoming serverProvenance
+    // stamp is dropped here — this boundary cannot verify one — and a fresh
+    // stamp is written only from PR-delivery facts the server independently
+    // resolved from GitHub. Unresolved or unconfirmed carriers fan out with no
+    // stamp, which the done-transition guard refuses (fail closed).
+    const metadata: Record<string, unknown> = {
+      ...stripServerProvenance(input.metadata ?? null),
+    };
+    if (descendants.length > 0) {
+      const reference =
+        referenceFromExternalId(input.externalId) ??
+        referenceFromRow({ url: input.url, metadata: input.metadata ?? null });
+      if (reference) {
+        try {
+          const details = await resolvePullRequestDetails(input.companyId, reference);
+          if (details.state === "merged" && details.mergedAt && details.mergeCommitSha) {
+            const repository = `${reference.owner}/${reference.repo}`;
+            metadata.repository = repository;
+            metadata.prNumber = reference.number;
+            metadata.mergedAt = details.mergedAt;
+            metadata.mergeCommitSha = details.mergeCommitSha;
+            metadata.serverProvenance = prDeliveryServerProvenance(repository, reference.number, {
+              mergeCommitSha: details.mergeCommitSha,
+              mergedAt: details.mergedAt,
+            });
+          }
+        } catch (error) {
+          // Fail closed: a transient resolution failure mirrors the row without
+          // a trusted stamp (the merge sweep or the next fan-out re-proves it).
+          console.warn(
+            `[pr-delivery] carrier fan-out: failed to re-resolve PR ${input.externalId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      }
+    }
     const title = input.title ?? `PR ${input.externalId}`;
     const writtenIssueIds: string[] = [];
 
@@ -548,6 +634,11 @@ export function prDeliveryService(
         if (details.state === "merged") {
           if (details.mergedAt) nextMetadata.mergedAt = details.mergedAt;
           if (details.mergeCommitSha) nextMetadata.mergeCommitSha = details.mergeCommitSha;
+          nextMetadata.serverProvenance = prDeliveryServerProvenance(
+            `${reference.owner}/${reference.repo}`,
+            reference.number,
+            { mergeCommitSha: details.mergeCommitSha ?? null, mergedAt: details.mergedAt ?? null },
+          );
           Object.assign(nextMetadata, deliveredLocMetadata(details.additions, details.deletions));
           await db
             .update(issueWorkProducts)

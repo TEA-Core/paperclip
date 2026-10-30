@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { and, eq, inArray } from "drizzle-orm";
-import { agents, issueExecutionDecisions, issueLabels, issues, labels, type Db } from "@paperclipai/db";
+import { agents, issueExecutionDecisions, issueLabels, issues, issueWorkProducts, labels, projectWorkspaces, type Db } from "@paperclipai/db";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   resolveGitHubToken,
@@ -977,25 +977,206 @@ async function proveLandedAtTip(
       "Tier 1 declaration could not be verified: GitHub credential is not configured.",
     );
   }
-  let aheadBy: number | null;
+  // An authoritative merged pull-request work product records the repository
+  // its delivery actually landed in. When that repository differs from the
+  // project's repository (for example, the project is bound to one repository
+  // while the implementation was merged into another), the recorded metadata
+  // is the authoritative identity — verify the named merge commit against
+  // that repository's own default branch instead of querying the project
+  // repository, where the commit never landed.
+  let externalRepo: { owner: string; repo: string } | null;
   try {
-    aheadBy = await githubCompareAheadBy(
-      parsed.hostname,
-      parsed.owner,
-      parsed.repo,
-      ctx.defaultRef,
-      sha,
+    externalRepo = await loadMergedExternalWorkProductRepository(db, issue, sha, parsed);
+  } catch (err) {
+    return refuseTier1(unverifiedTier1(err));
+  }
+  if (externalRepo) {
+    const defaultBranch = await githubRepositoryDefaultBranch(
+      externalRepo.owner,
+      externalRepo.repo,
       token,
     );
+    if (!defaultBranch) {
+      return refuseTier1(
+        `Tier 1 declaration could not be verified: the default branch of ${externalRepo.owner}/${externalRepo.repo} ` +
+          "(the repository recorded by the merged linked pull-request work product) could not be resolved.",
+      );
+    }
+    return verifyLandedAgainst(
+      externalRepo.owner,
+      externalRepo.repo,
+      defaultBranch,
+      sha,
+      reason,
+      sameRun,
+      token,
+      ` of ${externalRepo.owner}/${externalRepo.repo} (the repository recorded by the merged linked pull-request work product)`,
+    );
+  }
+
+  return verifyLandedAgainst(
+    parsed.owner,
+    parsed.repo,
+    ctx.defaultRef,
+    sha,
+    reason,
+    sameRun,
+    token,
+    "",
+  );
+}
+
+async function verifyLandedAgainst(
+  owner: string,
+  repo: string,
+  defaultRef: string,
+  sha: string,
+  reason: string,
+  sameRun: boolean,
+  token: string,
+  repoQualifier: string,
+): Promise<DoneTierDeclarationResult> {
+  let aheadBy: number | null;
+  try {
+    aheadBy = await githubCompareAheadBy("github.com", owner, repo, defaultRef, sha, token);
   } catch (err) {
     return refuseTier1(unverifiedTier1(err));
   }
   if (aheadBy !== 0) {
     return refuseTier1(
-      `Tier 1 declaration merge commit ${sha} is not an ancestor of the default branch ${ctx.defaultRef}.`,
+      `Tier 1 declaration merge commit ${sha} is not an ancestor of the default branch ${defaultRef}${repoQualifier}.`,
     );
   }
   return acceptTier1(reason, sameRun);
+}
+
+// Well-formed owner/repo slug a delivery work product records; the strict
+// charset keeps a malformed value from being treated as authoritative.
+const OWNER_REPO_SLUG = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+function hasTrustedServerProvenance(
+  metadata: Record<string, unknown>,
+  mergeCommitSha: string,
+): boolean {
+  const provenance = metadata.serverProvenance;
+  if (!provenance || typeof provenance !== "object" || Array.isArray(provenance)) return false;
+  const record = provenance as Record<string, unknown>;
+  if (record.actor !== "pr-delivery") return false;
+  if (record.repository !== metadata.repository) return false;
+  if (typeof record.mergeCommitSha !== "string" || record.mergeCommitSha.toLowerCase() !== mergeCommitSha.toLowerCase()) return false;
+  if (typeof record.mergedAt !== "string" || record.mergedAt.trim().length === 0 || record.mergedAt !== metadata.mergedAt) return false;
+  const metadataPrNumber = metadata.prNumber;
+  if (typeof metadataPrNumber === "number") {
+    return Number.isInteger(metadataPrNumber) && record.prNumber === metadataPrNumber;
+  }
+  if (typeof metadataPrNumber === "string") {
+    const parsed = Number(metadataPrNumber);
+    return Number.isInteger(parsed) && record.prNumber === parsed;
+  }
+  return false;
+}
+
+// A work product counts as the authoritative external delivery only when it is
+// a recorded merged pull-request product (merged status plus a non-blank
+// merged-at marker) whose recorded merge commit is exactly the commit named in
+// the declaration and whose recorded repository is a well-formed slug that
+// differs from the project's repository. Anything missing or malformed is not
+// a valid external product: resolution returns null so the existing
+// same-repository verification (and its refusal behavior) is preserved.
+//
+// Metadata alone is agent-writable, so an external repository is trusted only
+// when the reserved serverProvenance stamp (written by the pr-delivery
+// service from GitHub-sourced values) exactly matches the declaration, and the
+// repository is authorized by a project workspace owned by the same company.
+async function loadMergedExternalWorkProductRepository(
+  db: Db,
+  issue: { id: string; companyId: string },
+  sha: string,
+  projectRepo: { hostname: string; owner: string; repo: string },
+): Promise<{ owner: string; repo: string } | null> {
+  if (projectRepo.hostname !== "github.com") return null;
+  const rows = await db
+    .select({
+      status: issueWorkProducts.status,
+      metadata: issueWorkProducts.metadata,
+      isPrimary: issueWorkProducts.isPrimary,
+      updatedAt: issueWorkProducts.updatedAt,
+    })
+    .from(issueWorkProducts)
+    .where(
+      and(
+        eq(issueWorkProducts.companyId, issue.companyId),
+        eq(issueWorkProducts.issueId, issue.id),
+        eq(issueWorkProducts.type, "pull_request"),
+      ),
+    );
+  const candidates = rows
+    .filter((row) => {
+      if (row.status !== "merged") return false;
+      const metadata = row.metadata ?? {};
+      if (typeof metadata.mergeCommitSha !== "string") return false;
+      if (metadata.mergeCommitSha.toLowerCase() !== sha.toLowerCase()) return false;
+      if (typeof metadata.mergedAt !== "string" || metadata.mergedAt.trim().length === 0) return false;
+      if (typeof metadata.repository !== "string" || !OWNER_REPO_SLUG.test(metadata.repository)) return false;
+      if (!hasTrustedServerProvenance(metadata, sha)) return false;
+      return true;
+    })
+    .sort((a, b) => {
+      if (a.isPrimary !== b.isPrimary) return a.isPrimary ? -1 : 1;
+      return b.updatedAt.getTime() - a.updatedAt.getTime();
+    });
+  if (candidates.length === 0) return null;
+  const authorizedWorkspaces = await db
+    .select({ repoUrl: projectWorkspaces.repoUrl })
+    .from(projectWorkspaces)
+    .where(eq(projectWorkspaces.companyId, issue.companyId));
+  const authorizedRepositories = new Set(
+    authorizedWorkspaces.flatMap((workspace) => {
+      const authorized = workspace.repoUrl ? parseRepoUrl(workspace.repoUrl) : null;
+      return authorized && authorized.hostname === "github.com"
+        ? [`${authorized.owner.toLowerCase()}/${authorized.repo.toLowerCase()}`]
+        : [];
+    }),
+  );
+  for (const row of candidates) {
+    const metadata = row.metadata ?? {};
+    const repository = metadata.repository as string;
+    const slash = repository.indexOf("/");
+    const owner = repository.slice(0, slash);
+    const repo = repository.slice(slash + 1);
+    if (
+      owner.toLowerCase() === projectRepo.owner.toLowerCase() &&
+      repo.toLowerCase() === projectRepo.repo.toLowerCase()
+    ) {
+      continue;
+    }
+    if (!authorizedRepositories.has(repository.toLowerCase())) continue;
+    return { owner, repo };
+  }
+  return null;
+}
+
+async function githubRepositoryDefaultBranch(
+  owner: string,
+  repo: string,
+  token: string,
+): Promise<string | null> {
+  const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": "paperclip-done-transition-guard",
+    "x-github-api-version": "2022-11-28",
+    authorization: `Bearer ${token}`,
+  };
+  try {
+    const response = await ghFetch(url, { headers });
+    if (!response.ok) return null;
+    const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+    const defaultBranch = body?.default_branch;
+    return typeof defaultBranch === "string" && defaultBranch.length > 0 ? defaultBranch : null;
+  } catch {
+    return null;
+  }
 }
 
 async function proveTier1Landing(
