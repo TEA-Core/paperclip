@@ -396,10 +396,30 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(parentWorkspace?.status).toBe("active");
   });
 
+  // Gives the repo a real remote holding main and the delivery branch, so the
+  // sweep's unpushed-commit check counts zero. Callers that want to simulate
+  // unpushed or remote-check-failure states publish first, then mutate.
+  async function publishWorktree(worktreePath: string) {
+    const commonDir = await readGit(worktreePath, ["rev-parse", "--git-common-dir"]);
+    if (!commonDir) throw new Error("worktree has no git common dir");
+    const repoRoot = path.dirname(path.resolve(worktreePath, commonDir));
+    const branchName = await readGit(worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"]);
+    if (!branchName) throw new Error("worktree has no branch");
+    const remotePath = path.join(path.dirname(repoRoot), `paperclip-remote-${randomUUID()}`);
+    tempDirs.add(remotePath);
+    await fs.mkdir(remotePath, { recursive: true });
+    await runGit(remotePath, ["init", "--bare"]);
+    await runGit(repoRoot, ["remote", "add", "origin", remotePath]);
+    await runGit(repoRoot, ["push", "origin", "main"]);
+    await runGit(worktreePath, ["push", "-u", "origin", branchName]);
+    return { repoRoot, branchName, remotePath };
+  }
+
   async function seedTerminalWorkspace(options: {
     mergedPr?: boolean;
     activeRun?: boolean;
     childStatus?: "done" | "todo";
+    publish?: boolean;
   } = {}) {
     const companyId = randomUUID();
     const projectId = randomUUID();
@@ -504,6 +524,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       });
       await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, sourceIssueId));
     }
+    if (options.publish) {
+      await publishWorktree(worktreePath);
+    }
     return { companyId, projectId, executionWorkspaceId, sourceIssueId, identifier, repoRoot, worktreePath, headSha };
   }
 
@@ -517,6 +540,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await fs.writeFile(path.join(worktreePath, "delivered.txt"), "delivered\n", "utf8");
     await runGit(worktreePath, ["add", "delivered.txt"]);
     await runGit(worktreePath, ["commit", "-m", "Delivered change"]);
+    await publishWorktree(worktreePath);
 
     const seeded = await seedTerminalWorkspace();
     await db.update(executionWorkspaces).set({
@@ -566,6 +590,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     updatedAt?: Date;
     mergedPr?: boolean;
     prMergedAt?: string;
+    publish?: boolean;
   } = {}) {
     // Build a worktree whose HEAD equals the base ref (zero commits ahead).
     // With no recorded PR the delivery verdict is unknown — ancestry is no
@@ -649,6 +674,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         metadata: { mergedAt: overrides.prMergedAt },
       });
     }
+    if (overrides.publish) {
+      await publishWorktree(worktreePath);
+    }
     return { companyId, projectId, executionWorkspaceId, sourceIssueId, worktreePath };
   }
 
@@ -716,7 +744,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   }, 20_000);
 
   it("fails the final cleanup fence when a later git status scan is unavailable", async () => {
-    const seeded = await seedAncestryTerminalWorkspace({ mergedPr: true });
+    const seeded = await seedAncestryTerminalWorkspace({ mergedPr: true, publish: true });
     const originalRun = workspaceGitOperationScheduler.run.bind(workspaceGitOperationScheduler);
     let statusScanCount = 0;
     const statusSpy = vi.spyOn(workspaceGitOperationScheduler, "run")
@@ -739,7 +767,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     // The scheduler can start a second sweep before the first one finishes. The
     // sweeps share the cursor and the boundary. A concurrent sweep must skip
     // instead of running, so it cannot corrupt the shared rotation state.
-    const seeded = await seedAncestryTerminalWorkspace({ mergedPr: true });
+    const seeded = await seedAncestryTerminalWorkspace({ mergedPr: true, publish: true });
 
     // Start the first sweep and do not wait. An async function runs its body up
     // to the first await, so the in-progress flag is set before the second call
@@ -886,7 +914,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         .where(eq(executionWorkspaces.id, workspaceId));
     }
     // The eligible workspace is newest, so it sorts after the whole skipped page.
-    const eligible = await seedAncestryTerminalWorkspace({ mergedPr: true, updatedAt: new Date(Date.UTC(2020, 0, 9)) });
+    const eligible = await seedAncestryTerminalWorkspace({ mergedPr: true, updatedAt: new Date(Date.UTC(2020, 0, 9)), publish: true });
 
     // A fresh service starts with an empty scan cursor. A single-row page
     // first hits a non-terminal subtree.
@@ -936,7 +964,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
 
     // A terminal source with an open child is skipped by the subtree gate.
     // Once its child completes, the cursor must eventually revisit it.
-    const eligible = await seedAncestryTerminalWorkspace({ mergedPr: true, updatedAt: new Date(Date.UTC(2021, 0, 2)) });
+    const eligible = await seedAncestryTerminalWorkspace({ mergedPr: true, updatedAt: new Date(Date.UTC(2021, 0, 2)), publish: true });
     const eligibleChildId = randomUUID();
     await db.insert(issues).values({
       id: eligibleChildId,
@@ -1097,7 +1125,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     }, 20_000);
 
     it("archives a terminal tree that is older than the cooldown", async () => {
-      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
       await db
         .update(executionWorkspaces)
         .set({ updatedAt: new Date(nowMs - DAY_MS) })
@@ -1115,7 +1143,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     }, 20_000);
 
     it("archives immediately when the cooldown is zero", async () => {
-      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
       await db
         .update(executionWorkspaces)
         .set({ updatedAt: new Date(nowMs - DAY_MS) })
@@ -1282,7 +1310,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   });
 
   it("refuses cleanup when the worktree changes after delivery assessment", async () => {
-    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
     await db.update(executionWorkspaces).set({
       metadata: {
         createdByRuntime: true,
@@ -1315,7 +1343,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     // writes the cleanup-failed status, a reopen and a fresh archive raise the
     // generation. The catch handler must skip its write, so the stale failure never
     // overwrites the newer archive lifecycle.
-    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
     const newerReason = "newer_archive_lifecycle_marker";
     const racingService = executionWorkspaceService(db, {
       workspaceReaperCooldownDays: 0,
@@ -1357,7 +1385,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   });
 
   it("archives terminal workspaces without running configured cleanup hooks", async () => {
-    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
     const cleanupMarker = path.join(path.dirname(seeded.worktreePath), `cleanup-marker-${randomUUID()}`);
     tempDirs.add(cleanupMarker);
     await db.update(executionWorkspaces).set({
@@ -1421,7 +1449,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     // request never moved the source issue out of the terminal state, and the
     // response-end clear never landed. The flag is older than the grace period.
     // The first sweep clears the stranded flag; a later sweep archives the row.
-    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
     const strandedSince = new Date(Date.now() - 10 * 60 * 1000).toISOString();
     await db
       .update(executionWorkspaces)
@@ -1917,7 +1945,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     // one generation and captures it. The cleanup then throws. Before the catch
     // handler writes cleanup_failed, a reopen and a fresh archive raise the
     // generation. The fenced write must skip, so the newer archive survives.
-    const failSeed = await seedTerminalWorkspace({ mergedPr: true });
+    const failSeed = await seedTerminalWorkspace({ mergedPr: true, publish: true });
     const newerReason = "newer_archive_lifecycle_marker";
     const racingService = executionWorkspaceService(db, {
       workspaceReaperCooldownDays: 0,
@@ -1954,7 +1982,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   });
 
   it("holds Git index and ref locks across terminal cleanup", async () => {
-    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
     await db.update(executionWorkspaces).set({
       metadata: {
         createdByRuntime: true,
@@ -1994,7 +2022,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   });
 
   it("reaps only fully-terminal delivered workspaces without active checkout runs", async () => {
-    const eligible = await seedTerminalWorkspace({ mergedPr: true, childStatus: "done" });
+    const eligible = await seedTerminalWorkspace({ mergedPr: true, childStatus: "done", publish: true });
     const activeRun = await seedTerminalWorkspace({ mergedPr: true, activeRun: true });
     const openDescendant = await seedTerminalWorkspace({ mergedPr: true, childStatus: "todo" });
     const undelivered = await seedTerminalWorkspace();
@@ -5916,22 +5944,6 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         .where(eq(executionWorkspaces.id, id));
     }
 
-    async function publishWorktree(worktreePath: string) {
-      const commonDir = await readGit(worktreePath, ["rev-parse", "--git-common-dir"]);
-      if (!commonDir) throw new Error("worktree has no git common dir");
-      const repoRoot = path.dirname(path.resolve(worktreePath, commonDir));
-      const branchName = await readGit(worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"]);
-      if (!branchName) throw new Error("worktree has no branch");
-      const remotePath = path.join(path.dirname(repoRoot), `paperclip-remote-${randomUUID()}`);
-      tempDirs.add(remotePath);
-      await fs.mkdir(remotePath, { recursive: true });
-      await runGit(remotePath, ["init", "--bare"]);
-      await runGit(repoRoot, ["remote", "add", "origin", remotePath]);
-      await runGit(repoRoot, ["push", "origin", "main"]);
-      await runGit(worktreePath, ["push", "-u", "origin", branchName]);
-      return { repoRoot, branchName, remotePath };
-    }
-
     // Logs each git argv. By default every call fails; passThrough runs the real git.
     async function gitCallsDuring(run: () => Promise<unknown>, options: { passThrough?: boolean } = {}) {
       const realGit = options.passThrough
@@ -6111,6 +6123,38 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect(dirtySweep.skippedTrackedDirty).toBe(1);
       expect((await workspaceStatus(dirty.executionWorkspaceId))?.status).toBe("active");
       await expect(fs.readFile(path.join(dirty.worktreePath, "README.md"), "utf8")).resolves.toBe("tracked edit\n");
+    }, 20_000);
+
+    it("keeps a merged-delivery worktree whose commits are missing from the remote", async () => {
+      // SUP-20746: the recorded merged marker must not bypass the unpushed
+      // check. A follow-up commit that never reached a remote keeps the
+      // worktree, the branch ref, and the active row.
+      const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
+      await runGit(seeded.worktreePath, ["commit", "--allow-empty", "-m", "Never pushed follow-up"]);
+      const branchBefore = await readGit(seeded.repoRoot, ["rev-parse", "refs/heads/PAP-16015-delivery"]);
+
+      const sweep = await freshSweep().sweepTerminalWorkspaces();
+      const row = await workspaceStatus(seeded.executionWorkspaceId);
+
+      expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedUnpushed: 1 });
+      expect(row?.status).toBe("active");
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+      expect(await readGit(seeded.repoRoot, ["rev-parse", "refs/heads/PAP-16015-delivery"])).toBe(branchBefore);
+    }, 20_000);
+
+    it("keeps a merged-delivery worktree when the remote check fails", async () => {
+      // SUP-20746: an unborn HEAD makes the rev-list remote check fail. The
+      // sweep must fail closed and keep the merged-delivery worktree instead of
+      // destroying it on an unverifiable remote state.
+      const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
+      await runGit(seeded.worktreePath, ["switch", "--orphan", "unborn"]);
+
+      const sweep = await freshSweep().sweepTerminalWorkspaces();
+      const row = await workspaceStatus(seeded.executionWorkspaceId);
+
+      expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedRemoteCheckFailed: 1 });
+      expect(row?.status).toBe("active");
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
     }, 20_000);
 
     it("archives an isolated no-PR workspace with only untracked files as a record only", async () => {
