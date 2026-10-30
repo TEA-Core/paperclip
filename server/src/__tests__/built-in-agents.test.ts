@@ -129,6 +129,18 @@ describe("built-in agent asset loading", () => {
     const instructions = reflectionCoach?.defaultInstructions ?? "";
     expect(instructions).toContain("Never mark an issue `done` or `cancelled` while a `request_confirmation`");
   });
+
+  it("summarizer instructions make a refused slot write terminal instead of minting another summary task (SUP-20739)", () => {
+    const definitions = listBuiltInAgentDefinitions();
+    const summarizer = definitions.find((definition) => definition.key === "summarizer");
+    expect(summarizer).toBeDefined();
+
+    const instructions = summarizer?.defaultInstructions ?? "";
+    expect(instructions).toContain("refused with HTTP 403");
+    expect(instructions).toContain("mark the task `blocked` quoting the 403 error text");
+    expect(instructions).toContain("Do not create or request another summary task");
+    expect(instructions).toContain("do not escalate separately");
+  });
 });
 
 describeEmbeddedPostgres("built-in agents", () => {
