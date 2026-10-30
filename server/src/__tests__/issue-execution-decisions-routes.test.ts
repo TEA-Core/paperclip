@@ -583,6 +583,118 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight" });
   });
 
+  it("allows a final approval with an accepted merged-elsewhere override when no linked PR resolves (SUP-21498)", async () => {
+    const fixture = await pendingDelivery({ missing: true, deliveryRequirement: "repository_delivery" });
+    const response = await fixture.approve({
+      doneTransitionOverride: {
+        disposition: "merged-elsewhere",
+        reason: "Deliverable merged elsewhere; this card has no deliverable head of its own.",
+      },
+    });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.status).toBe("done");
+    expect(stored.executionState).toMatchObject({
+      completedStageIds: [fixture.stageId], lastDecisionOutcome: "approved",
+    });
+    const overrideRows = await db.select().from(activityLog)
+      .where(eq(activityLog.entityId, fixture.issue.id));
+    expect(overrideRows.map((row) => row.action)).toContain("issue.done_transition_override");
+    expect(fixture.writes).toEqual([]);
+  });
+
+  it("still refuses the same final approval shape without an override (SUP-21498 negative control)", async () => {
+    const fixture = await pendingDelivery({ missing: true, deliveryRequirement: "repository_delivery" });
+    const response = await fixture.approve();
+
+    expect(response.status).toBe(409);
+    expect(response.body.details).toMatchObject({
+      code: "approval_final_delivery_preflight",
+      reason: expect.stringContaining("no-pr"),
+    });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_review");
+    expect(stored.executionState).toMatchObject({ status: "pending", completedStageIds: [] });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(fixture.writes).toEqual([]);
+  });
+
+  it("allows a deferred final approval with an accepted merged-elsewhere override when no linked PR resolves (SUP-21498 deferred)", async () => {
+    // Assigned + terminalizing (in_review -> done) sets deferFinalDeliveryPrefetch,
+    // so the preflight re-runs at the deferred call site (issues.ts ~19291)
+    // instead of only the pre-lock / in-transaction sites. Without an assignee
+    // the deferred branch never fires (previous positive case).
+    const fixture = await pendingDelivery({ missing: true, deliveryRequirement: "repository_delivery" });
+    const authorId = (await fixture.read()).createdByAgentId!;
+    await db.update(issues).set({ assigneeAgentId: authorId, assigneeUserId: null })
+      .where(eq(issues.id, fixture.issue.id));
+    const response = await fixture.approve({
+      doneTransitionOverride: {
+        disposition: "merged-elsewhere",
+        reason: "Deliverable merged elsewhere; this card has no deliverable head of its own.",
+      },
+    });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.status).toBe("done");
+    expect(stored.executionState).toMatchObject({
+      completedStageIds: [fixture.stageId], lastDecisionOutcome: "approved",
+    });
+    const overrideRows = await db.select().from(activityLog)
+      .where(eq(activityLog.entityId, fixture.issue.id));
+    expect(overrideRows.map((row) => row.action)).toContain("issue.done_transition_override");
+    expect(fixture.writes).toEqual([]);
+  });
+
+  it("still refuses the deferred final approval shape without an override (SUP-21498 deferred negative control)", async () => {
+    const fixture = await pendingDelivery({ missing: true, deliveryRequirement: "repository_delivery" });
+    const authorId = (await fixture.read()).createdByAgentId!;
+    await db.update(issues).set({ assigneeAgentId: authorId, assigneeUserId: null })
+      .where(eq(issues.id, fixture.issue.id));
+    const response = await fixture.approve();
+
+    expect(response.status).toBe(409);
+    expect(response.body.details).toMatchObject({
+      code: "approval_final_delivery_preflight",
+      reason: expect.stringContaining("no-pr"),
+    });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_review");
+    expect(stored.executionState).toMatchObject({ status: "pending", completedStageIds: [] });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(fixture.writes).toEqual([]);
+  });
+
+  it("refuses a deferred accepted override when the delivery binding moves after its final-delivery snapshot", async () => {
+    const fixture = await pendingDelivery({ holdPull: true, mergeArmingEnabled: true });
+    const authorId = (await fixture.read()).createdByAgentId!;
+    await db.update(issues).set({ assigneeAgentId: authorId, assigneeUserId: null })
+      .where(eq(issues.id, fixture.issue.id));
+    const approval = fixture.approve({
+      doneTransitionOverride: {
+        disposition: "merged-elsewhere",
+        reason: "Deliverable merged elsewhere; this card has no deliverable head of its own.",
+      },
+    }).then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, approval, async () => {
+      await db.update(executionWorkspaces).set({ branchName: "SUP-1-rebound-delivery" })
+        .where(eq(executionWorkspaces.id, (await fixture.read()).executionWorkspaceId!));
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.body.details).toMatchObject({
+      code: "approval_final_delivery_preflight_stale",
+      reason: expect.stringContaining("head_moved"),
+    });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_review");
+    expect(stored.executionState).toMatchObject({ status: "pending", completedStageIds: [] });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(fixture.writes).toEqual([]);
+  });
+
   it("refuses a final board verdict when the delivery binding changes during the preflight without touching the issue row", async () => {
     const previous = process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
     process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "true";
