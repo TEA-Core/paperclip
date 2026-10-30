@@ -8,6 +8,7 @@ import {
   issues as issuesTable,
   issueWorkProducts as issueWorkProductsTable,
   labels as labelsTable,
+  projectWorkspaces as projectWorkspacesTable,
 } from "@paperclipai/db";
 import {
   countLadderedChildren,
@@ -148,7 +149,7 @@ function filterLabelRowsByName(
  * `select().from().where()` resolves to the `executionWorkspaces` rows exactly
  * as the legacy positional chain did, so pre-existing tests are untouched.
  */
-function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[]; issueWorkProducts?: Record<string, unknown>[] }) {
+function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[]; issueWorkProducts?: Record<string, unknown>[]; issueWorkProductsError?: Error; authorizedProjectWorkspaces?: Record<string, unknown>[]; authorizedProjectWorkspacesError?: Error }) {
   // SUP-15233: the guard reads the issues table twice inside
   // countLadderedChildren: read 1 is the parent_id edge (decomposition
   // children), read 2 is the inArray re-read (blockedBy edge, only present in
@@ -208,8 +209,12 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
   // dispatch by table identity, empty by default.
   const workProductsChain = {
     from: vi.fn().mockReturnThis(),
-    where: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
-    then: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
+    where: rows.issueWorkProductsError
+      ? vi.fn().mockRejectedValue(rows.issueWorkProductsError)
+      : vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
+    then: rows.issueWorkProductsError
+      ? vi.fn().mockRejectedValue(rows.issueWorkProductsError)
+      : vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
   };
   const selectChain = {
     from: vi.fn().mockReturnThis(),
@@ -231,6 +236,15 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     where: vi.fn().mockReturnThis(),
     then: vi.fn().mockResolvedValue(rows.projectWorkspaces ?? []),
   };
+  const authorizedWorkspacesChain = {
+    from: vi.fn().mockReturnThis(),
+    where: rows.authorizedProjectWorkspacesError
+      ? vi.fn().mockRejectedValue(rows.authorizedProjectWorkspacesError)
+      : vi.fn().mockResolvedValue(rows.authorizedProjectWorkspaces ?? []),
+    then: rows.authorizedProjectWorkspacesError
+      ? vi.fn().mockRejectedValue(rows.authorizedProjectWorkspacesError)
+      : vi.fn().mockResolvedValue(rows.authorizedProjectWorkspaces ?? []),
+  };
   let issuesCallCount = 0;
   (mockDb.select as any).mockImplementation((_cols?: any) => {
     let callCount = 0;
@@ -247,6 +261,7 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
         if (table === labelsTable) return labelsChain;
         if (table === issueLabelsTable) return issueLabelsChain;
         if (table === issueWorkProductsTable) return workProductsChain;
+        if (table === projectWorkspacesTable && (rows.authorizedProjectWorkspaces !== undefined || rows.authorizedProjectWorkspacesError !== undefined)) return authorizedWorkspacesChain;
         const chain = chains[callCount] ?? selectChain;
         callCount++;
         return chain;
@@ -6054,6 +6069,17 @@ describe("evaluateDoneTierDeclaration", () => {
       const agentToolsWorkspaceRow = (repoUrl: string) =>
         mockExecutionWorkspaceRow({ repoUrl, baseRef: "main", branchName: "external-work" });
 
+      function serverProvenance(overrides: Record<string, unknown> = {}) {
+        return {
+          actor: "pr-delivery",
+          repository: "TEA-Core/paperclip",
+          prNumber: 1005,
+          mergeCommitSha: EXTERNAL_SHA,
+          mergedAt: "2026-10-26T18:00:20Z",
+          ...overrides,
+        };
+      }
+
       function mergedProduct(metadata: Record<string, unknown>, status = "merged") {
         return {
           status,
@@ -6063,11 +6089,16 @@ describe("evaluateDoneTierDeclaration", () => {
             baseRef: "fold/tea-patches-v2026.722.0",
             mergeCommitSha: EXTERNAL_SHA,
             mergedAt: "2026-10-26T18:00:20Z",
+            serverProvenance: serverProvenance(),
             ...metadata,
           },
           isPrimary: true,
           updatedAt: new Date("2026-10-26T18:33:38.745Z"),
         };
+      }
+
+      function authorizedWorkspace(repoUrl = "https://github.com/TEA-Core/paperclip") {
+        return { repoUrl };
       }
 
       function runLandedDeclaration(sha: string) {
@@ -6101,6 +6132,7 @@ describe("evaluateDoneTierDeclaration", () => {
         setupDbMock({
           executionWorkspaces: [agentToolsWorkspaceRow("https://github.com/TEA-Core/paperclip-agent-tools")],
           issueWorkProducts: [mergedProduct({})],
+          authorizedProjectWorkspaces: [authorizedWorkspace()],
         });
         mockExternalGitHub(0);
         const result = await runLandedDeclaration(EXTERNAL_SHA);
@@ -6116,7 +6148,10 @@ describe("evaluateDoneTierDeclaration", () => {
       it("external product is ignored when its recorded repository is the project repository", async () => {
         setupDbMock({
           executionWorkspaces: [mockExecutionWorkspaceRow()],
-          issueWorkProducts: [mergedProduct({ mergeCommitSha: MERGE_SHA })],
+          issueWorkProducts: [mergedProduct({
+            mergeCommitSha: MERGE_SHA,
+            serverProvenance: serverProvenance({ mergeCommitSha: MERGE_SHA }),
+          })],
         });
         compareAhead(0);
         const result = await runLandedDeclaration(MERGE_SHA);
@@ -6186,6 +6221,7 @@ describe("evaluateDoneTierDeclaration", () => {
         setupDbMock({
           executionWorkspaces: [agentToolsWorkspaceRow("https://github.com/TEA-Core/paperclip-agent-tools")],
           issueWorkProducts: [mergedProduct({})],
+          authorizedProjectWorkspaces: [authorizedWorkspace()],
         });
         ghFetchMock.mockResolvedValue(new Response(JSON.stringify({}), { status: 404 }));
         const result = await runLandedDeclaration(EXTERNAL_SHA);
@@ -6199,6 +6235,7 @@ describe("evaluateDoneTierDeclaration", () => {
         setupDbMock({
           executionWorkspaces: [agentToolsWorkspaceRow("https://github.com/TEA-Core/paperclip-agent-tools")],
           issueWorkProducts: [mergedProduct({})],
+          authorizedProjectWorkspaces: [authorizedWorkspace()],
         });
         mockExternalGitHub(3);
         const result = await runLandedDeclaration(EXTERNAL_SHA);
@@ -6207,6 +6244,80 @@ describe("evaluateDoneTierDeclaration", () => {
         expect(result.reason).toContain(EXTERNAL_SHA);
         expect(result.reason).toContain("TEA-Core/paperclip");
         expect(result.reason).toContain("ancestor");
+      });
+
+      it("a merged product without server provenance is not authoritative", async () => {
+        setupDbMock({
+          executionWorkspaces: [agentToolsWorkspaceRow("https://github.com/TEA-Core/paperclip-agent-tools")],
+          issueWorkProducts: [mergedProduct({ serverProvenance: undefined })],
+          authorizedProjectWorkspaces: [authorizedWorkspace()],
+        });
+        mockExternalGitHub(1);
+        const result = await runLandedDeclaration(EXTERNAL_SHA);
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("ancestor");
+        expect(compareUrls().some((u) => u.includes("paperclip-agent-tools"))).toBe(true);
+        expect(compareUrls().some((u) => u.includes("/repos/TEA-Core/paperclip/compare/"))).toBe(false);
+      });
+
+      it("a merged product whose provenance does not exactly match its declaration is not authoritative", async () => {
+        setupDbMock({
+          executionWorkspaces: [agentToolsWorkspaceRow("https://github.com/TEA-Core/paperclip-agent-tools")],
+          issueWorkProducts: [mergedProduct({ serverProvenance: serverProvenance({ prNumber: 999 }) })],
+          authorizedProjectWorkspaces: [authorizedWorkspace()],
+        });
+        mockExternalGitHub(1);
+        const result = await runLandedDeclaration(EXTERNAL_SHA);
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("ancestor");
+        expect(compareUrls().some((u) => u.includes("paperclip-agent-tools"))).toBe(true);
+        expect(compareUrls().some((u) => u.includes("/repos/TEA-Core/paperclip/compare/"))).toBe(false);
+      });
+
+      it("an external product whose repository is not authorized in the company is not authoritative", async () => {
+        setupDbMock({
+          executionWorkspaces: [agentToolsWorkspaceRow("https://github.com/TEA-Core/paperclip-agent-tools")],
+          issueWorkProducts: [mergedProduct({})],
+          authorizedProjectWorkspaces: [authorizedWorkspace("https://github.com/TEA-Core/other-repo")],
+        });
+        mockExternalGitHub(1);
+        const result = await runLandedDeclaration(EXTERNAL_SHA);
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("ancestor");
+        expect(compareUrls().some((u) => u.includes("paperclip-agent-tools"))).toBe(true);
+        expect(compareUrls().some((u) => u.includes("/repos/TEA-Core/paperclip/compare/"))).toBe(false);
+      });
+
+      it("refuses when loading authorization workspaces fails instead of falling back", async () => {
+        const error = new Error("authorization workspace query failed");
+        setupDbMock({
+          executionWorkspaces: [agentToolsWorkspaceRow("https://github.com/TEA-Core/paperclip-agent-tools")],
+          issueWorkProducts: [mergedProduct({})],
+          authorizedProjectWorkspacesError: error,
+        });
+        compareAhead(0);
+        const result = await runLandedDeclaration(EXTERNAL_SHA);
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("authorization workspace query failed");
+        expect(compareUrls()).toHaveLength(0);
+      });
+
+      it("refuses when loading work products fails instead of falling back to the project repository", async () => {
+        const error = new Error("work product query failed");
+        setupDbMock({
+          executionWorkspaces: [agentToolsWorkspaceRow("https://github.com/TEA-Core/paperclip-agent-tools")],
+          issueWorkProductsError: error,
+        });
+        compareAhead(0);
+        const result = await runLandedDeclaration(EXTERNAL_SHA);
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("work product query failed");
+        expect(compareUrls()).toHaveLength(0);
       });
     });
   });

@@ -227,9 +227,46 @@ describeEmbeddedPostgres("prDeliveryService", () => {
       const metadata = row.metadata as Record<string, unknown>;
       expect(metadata.mergedAt).toBe("2026-08-31T17:26:58Z");
       expect(metadata.mergeCommitSha).toBe("3fc37fe91c6190ab695a651224ad057db0a38aba");
+      expect(metadata.serverProvenance).toEqual({
+        actor: "pr-delivery",
+        repository: REPOSITORY,
+        prNumber: PR_NUMBER,
+        mergeCommitSha: "3fc37fe91c6190ab695a651224ad057db0a38aba",
+        mergedAt: "2026-08-31T17:26:58Z",
+      });
       // open-time metadata is preserved alongside the merge stamp
       expect(metadata.prNumber).toBe(PR_NUMBER);
       expect(metadata.headRef).toBe("carrier-branch");
+    }
+  });
+
+  it("stamps server provenance at open, and the sweep re-stamps it on merge", async () => {
+    const service = prDeliveryService(db, {
+      resolvePullRequestDetails: vi.fn(async () => ({
+        state: "merged",
+        headRef: "carrier-branch",
+        headSha: "abc123",
+        mergedAt: "2026-08-31T17:26:58Z",
+        mergeCommitSha: "3fc37fe91c6190ab695a651224ad057db0a38aba",
+      })),
+    });
+    await service.recordAtOpen(input());
+    for (const row of await readRows()) {
+      expect((row.metadata as Record<string, unknown>).serverProvenance).toEqual({
+        actor: "pr-delivery",
+        repository: REPOSITORY,
+        prNumber: PR_NUMBER,
+      });
+    }
+    await service.sweepMergeState();
+    for (const row of await readRows()) {
+      expect((row.metadata as Record<string, unknown>).serverProvenance).toEqual({
+        actor: "pr-delivery",
+        repository: REPOSITORY,
+        prNumber: PR_NUMBER,
+        mergeCommitSha: "3fc37fe91c6190ab695a651224ad057db0a38aba",
+        mergedAt: "2026-08-31T17:26:58Z",
+      });
     }
   });
 

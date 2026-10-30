@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { and, eq, inArray } from "drizzle-orm";
-import { agents, issueExecutionDecisions, issueLabels, issues, issueWorkProducts, labels, type Db } from "@paperclipai/db";
+import { agents, issueExecutionDecisions, issueLabels, issues, issueWorkProducts, labels, projectWorkspaces, type Db } from "@paperclipai/db";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   resolveGitHubToken,
@@ -948,7 +948,12 @@ async function proveLandedAtTip(
   // is the authoritative identity — verify the named merge commit against
   // that repository's own default branch instead of querying the project
   // repository, where the commit never landed.
-  const externalRepo = await loadMergedExternalWorkProductRepository(db, issue, sha, parsed);
+  let externalRepo: { owner: string; repo: string } | null;
+  try {
+    externalRepo = await loadMergedExternalWorkProductRepository(db, issue, sha, parsed);
+  } catch (err) {
+    return refuseTier1(unverifiedTier1(err));
+  }
   if (externalRepo) {
     const defaultBranch = await githubRepositoryDefaultBranch(
       externalRepo.owner,
@@ -1013,6 +1018,28 @@ async function verifyLandedAgainst(
 // charset keeps a malformed value from being treated as authoritative.
 const OWNER_REPO_SLUG = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
+function hasTrustedServerProvenance(
+  metadata: Record<string, unknown>,
+  mergeCommitSha: string,
+): boolean {
+  const provenance = metadata.serverProvenance;
+  if (!provenance || typeof provenance !== "object" || Array.isArray(provenance)) return false;
+  const record = provenance as Record<string, unknown>;
+  if (record.actor !== "pr-delivery") return false;
+  if (record.repository !== metadata.repository) return false;
+  if (typeof record.mergeCommitSha !== "string" || record.mergeCommitSha.toLowerCase() !== mergeCommitSha.toLowerCase()) return false;
+  if (typeof record.mergedAt !== "string" || record.mergedAt.trim().length === 0 || record.mergedAt !== metadata.mergedAt) return false;
+  const metadataPrNumber = metadata.prNumber;
+  if (typeof metadataPrNumber === "number") {
+    return Number.isInteger(metadataPrNumber) && record.prNumber === metadataPrNumber;
+  }
+  if (typeof metadataPrNumber === "string") {
+    const parsed = Number(metadataPrNumber);
+    return Number.isInteger(parsed) && record.prNumber === parsed;
+  }
+  return false;
+}
+
 // A work product counts as the authoritative external delivery only when it is
 // a recorded merged pull-request product (merged status plus a non-blank
 // merged-at marker) whose recorded merge commit is exactly the commit named in
@@ -1020,6 +1047,11 @@ const OWNER_REPO_SLUG = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 // differs from the project's repository. Anything missing or malformed is not
 // a valid external product: resolution returns null so the existing
 // same-repository verification (and its refusal behavior) is preserved.
+//
+// Metadata alone is agent-writable, so an external repository is trusted only
+// when the reserved serverProvenance stamp (written by the pr-delivery
+// service from GitHub-sourced values) exactly matches the declaration, and the
+// repository is authorized by a project workspace owned by the same company.
 async function loadMergedExternalWorkProductRepository(
   db: Db,
   issue: { id: string; companyId: string },
@@ -1041,8 +1073,7 @@ async function loadMergedExternalWorkProductRepository(
         eq(issueWorkProducts.issueId, issue.id),
         eq(issueWorkProducts.type, "pull_request"),
       ),
-    )
-    .catch(() => [] as Array<{ status: string; metadata: Record<string, unknown> | null; isPrimary: boolean; updatedAt: Date }>);
+    );
   const candidates = rows
     .filter((row) => {
       if (row.status !== "merged") return false;
@@ -1051,12 +1082,26 @@ async function loadMergedExternalWorkProductRepository(
       if (metadata.mergeCommitSha.toLowerCase() !== sha.toLowerCase()) return false;
       if (typeof metadata.mergedAt !== "string" || metadata.mergedAt.trim().length === 0) return false;
       if (typeof metadata.repository !== "string" || !OWNER_REPO_SLUG.test(metadata.repository)) return false;
+      if (!hasTrustedServerProvenance(metadata, sha)) return false;
       return true;
     })
     .sort((a, b) => {
       if (a.isPrimary !== b.isPrimary) return a.isPrimary ? -1 : 1;
       return b.updatedAt.getTime() - a.updatedAt.getTime();
     });
+  if (candidates.length === 0) return null;
+  const authorizedWorkspaces = await db
+    .select({ repoUrl: projectWorkspaces.repoUrl })
+    .from(projectWorkspaces)
+    .where(eq(projectWorkspaces.companyId, issue.companyId));
+  const authorizedRepositories = new Set(
+    authorizedWorkspaces.flatMap((workspace) => {
+      const authorized = workspace.repoUrl ? parseRepoUrl(workspace.repoUrl) : null;
+      return authorized && authorized.hostname === "github.com"
+        ? [`${authorized.owner.toLowerCase()}/${authorized.repo.toLowerCase()}`]
+        : [];
+    }),
+  );
   for (const row of candidates) {
     const metadata = row.metadata ?? {};
     const repository = metadata.repository as string;
@@ -1069,6 +1114,7 @@ async function loadMergedExternalWorkProductRepository(
     ) {
       continue;
     }
+    if (!authorizedRepositories.has(repository.toLowerCase())) continue;
     return { owner, repo };
   }
   return null;

@@ -131,10 +131,33 @@ function externalIdFor(input: PrDeliveryInput): string {
   return `${input.repository}#${input.prNumber}`;
 }
 
+export type ServerProvenance = {
+  actor: "pr-delivery";
+  repository: string;
+  prNumber: number;
+  mergeCommitSha?: string;
+  mergedAt?: string;
+};
+
+export function prDeliveryServerProvenance(
+  repository: string,
+  prNumber: number,
+  merge?: { mergeCommitSha?: string | null; mergedAt?: string | null },
+): ServerProvenance {
+  return {
+    actor: "pr-delivery",
+    repository,
+    prNumber,
+    ...(merge?.mergeCommitSha ? { mergeCommitSha: merge.mergeCommitSha } : {}),
+    ...(merge?.mergedAt ? { mergedAt: merge.mergedAt } : {}),
+  };
+}
+
 function openMetadata(input: PrDeliveryInput): Record<string, unknown> {
   return {
     prNumber: input.prNumber,
     repository: input.repository,
+    serverProvenance: prDeliveryServerProvenance(input.repository, input.prNumber),
     ...(input.headRef ? { headRef: input.headRef } : {}),
     ...(input.baseRef ? { baseRef: input.baseRef } : {}),
     ...(input.headSha ? { headSha: input.headSha } : {}),
@@ -358,6 +381,10 @@ export function prDeliveryService(
             ...((existing.metadata as Record<string, unknown> | null) ?? {}),
             ...(mergedAt ? { mergedAt } : {}),
             ...(mergeCommitSha ? { mergeCommitSha } : {}),
+            serverProvenance: prDeliveryServerProvenance(input.repository, input.prNumber, {
+              mergeCommitSha,
+              mergedAt,
+            }),
             ...deliveredLocMetadata(details.additions, details.deletions),
           };
           await tx
@@ -403,7 +430,17 @@ export function prDeliveryService(
   async function recordCarrierFanOut(input: PrCarrierFanOutInput): Promise<PrCarrierFanOutResult> {
     const tree = await listCarrierIssueIds(input.companyId, input.sourceIssueId);
     const descendants = tree.filter((issueId) => issueId !== input.sourceIssueId);
-    const metadata = input.metadata ?? {};
+    const metadata: Record<string, unknown> = { ...(input.metadata ?? {}) };
+    const provenanceRepository =
+      typeof metadata.repository === "string" && metadata.repository ? metadata.repository : null;
+    const provenancePrNumber =
+      typeof metadata.prNumber === "number" && Number.isInteger(metadata.prNumber) ? metadata.prNumber : null;
+    if (provenanceRepository && provenancePrNumber !== null) {
+      metadata.serverProvenance = prDeliveryServerProvenance(provenanceRepository, provenancePrNumber, {
+        mergeCommitSha: typeof metadata.mergeCommitSha === "string" ? metadata.mergeCommitSha : null,
+        mergedAt: typeof metadata.mergedAt === "string" ? metadata.mergedAt : null,
+      });
+    }
     const title = input.title ?? `PR ${input.externalId}`;
     const writtenIssueIds: string[] = [];
 
@@ -548,6 +585,11 @@ export function prDeliveryService(
         if (details.state === "merged") {
           if (details.mergedAt) nextMetadata.mergedAt = details.mergedAt;
           if (details.mergeCommitSha) nextMetadata.mergeCommitSha = details.mergeCommitSha;
+          nextMetadata.serverProvenance = prDeliveryServerProvenance(
+            `${reference.owner}/${reference.repo}`,
+            reference.number,
+            { mergeCommitSha: details.mergeCommitSha ?? null, mergedAt: details.mergedAt ?? null },
+          );
           Object.assign(nextMetadata, deliveredLocMetadata(details.additions, details.deletions));
           await db
             .update(issueWorkProducts)
