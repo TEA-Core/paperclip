@@ -25,6 +25,17 @@ import { recoveryService } from "../services/recovery/service.js";
 // of RECOVERY_ACTION_WAKE_INTERVAL_MS in the ambient environment.
 const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
+// Mirrors the wake options the sweeper passes through to enqueueWakeup, so
+// mock.calls is a typed [agentId, options] tuple instead of never[].
+type RecoveryWakeupOptions = {
+  reason?: string | null;
+  idempotencyKey?: string | null;
+};
+
+function makeEnqueueWakeupMock() {
+  return vi.fn(async (_agentId: string, _options?: RecoveryWakeupOptions) => null);
+}
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -122,7 +133,9 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
     return issueId;
   }
 
-  async function seedRecoveryAction(overrides: Record<string, unknown> = {}) {
+  async function seedRecoveryAction(
+    overrides: Partial<typeof issueRecoveryActions.$inferInsert> = {},
+  ) {
     const now = new Date();
     const staleAt = new Date(now.getTime() - 20 * 60 * 1000);
     const actionId = randomUUID();
@@ -168,7 +181,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
       wakePolicy: { type: "wake_owner", reason: "test" },
     });
 
-    const enqueueWakeup = vi.fn(async () => null);
+    const enqueueWakeup = makeEnqueueWakeupMock();
     const recovery = recoveryService(db, { enqueueWakeup });
     const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
@@ -188,8 +201,8 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
 
     expect(enqueueWakeup).toHaveBeenCalledTimes(1);
     expect(enqueueWakeup.mock.calls[0][0]).toBe(ctoId);
-    expect(enqueueWakeup.mock.calls[0][1].reason).toBe("source_scoped_recovery_action");
-    expect(enqueueWakeup.mock.calls[0][1].idempotencyKey).toBe(
+    expect(enqueueWakeup.mock.calls[0][1]?.reason).toBe("source_scoped_recovery_action");
+    expect(enqueueWakeup.mock.calls[0][1]?.idempotencyKey).toBe(
       `source_scoped_recovery_action:${actionId}:1`,
     );
   });
@@ -204,7 +217,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
       wakePolicy: { type: "wake_owner" },
     });
 
-    const enqueueWakeup = vi.fn(async () => null);
+    const enqueueWakeup = makeEnqueueWakeupMock();
     const recovery = recoveryService(db, { enqueueWakeup });
     const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
@@ -225,7 +238,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
       wakePolicy: { type: "wake_owner" },
     });
 
-    const enqueueWakeup = vi.fn(async () => null);
+    const enqueueWakeup = makeEnqueueWakeupMock();
     const recovery = recoveryService(db, { enqueueWakeup });
     const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
@@ -251,7 +264,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
       wakePolicy: { type: "manual_repair_required" },
     });
 
-    const enqueueWakeup = vi.fn(async () => null);
+    const enqueueWakeup = makeEnqueueWakeupMock();
     const recovery = recoveryService(db, { enqueueWakeup });
     const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
@@ -272,7 +285,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
       wakePolicy: { type: "board_escalation" },
     });
 
-    const enqueueWakeup = vi.fn(async () => null);
+    const enqueueWakeup = makeEnqueueWakeupMock();
     const recovery = recoveryService(db, { enqueueWakeup });
     const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
@@ -296,7 +309,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
 
     expect(enqueueWakeup).toHaveBeenCalledTimes(1);
     expect(enqueueWakeup.mock.calls[0][0]).toBe(coderId);
-    expect(enqueueWakeup.mock.calls[0][1].reason).toBe("source_scoped_recovery_action");
+    expect(enqueueWakeup.mock.calls[0][1]?.reason).toBe("source_scoped_recovery_action");
   });
 
   it("leaves board_escalation action dead when owner resolution is exhausted", async () => {
@@ -318,7 +331,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
       wakePolicy: { type: "board_escalation" },
     });
 
-    const enqueueWakeup = vi.fn(async () => null);
+    const enqueueWakeup = makeEnqueueWakeupMock();
     const recovery = recoveryService(db, { enqueueWakeup });
     const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
@@ -345,7 +358,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
       wakePolicy: { type: "wake_owner" },
     });
 
-    const enqueueWakeup = vi.fn(async () => null);
+    const enqueueWakeup = makeEnqueueWakeupMock();
     const recovery = recoveryService(db, { enqueueWakeup });
     const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
@@ -366,7 +379,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
       lastAttemptAt: new Date(),
     });
 
-    const enqueueWakeup = vi.fn(async () => null);
+    const enqueueWakeup = makeEnqueueWakeupMock();
     const recovery = recoveryService(db, { enqueueWakeup });
     const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
@@ -387,7 +400,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
       status: "resolved",
     });
 
-    const enqueueWakeup = vi.fn(async () => null);
+    const enqueueWakeup = makeEnqueueWakeupMock();
     const recovery = recoveryService(db, { enqueueWakeup });
     const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
@@ -407,7 +420,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
       wakePolicy: { type: "wake_owner" },
     });
 
-    const enqueueWakeup = vi.fn(async () => null);
+    const enqueueWakeup = makeEnqueueWakeupMock();
     const recovery = recoveryService(db, { enqueueWakeup });
 
     const first = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
@@ -437,7 +450,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
       wakePolicy: { type: "wake_owner" },
     });
 
-    const enqueueWakeup = vi.fn(async () => null);
+    const enqueueWakeup = makeEnqueueWakeupMock();
     const recovery = recoveryService(db, { enqueueWakeup });
     const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
@@ -459,7 +472,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
       attemptCount: 5,
     });
 
-    const enqueueWakeup = vi.fn(async () => null);
+    const enqueueWakeup = makeEnqueueWakeupMock();
     const recovery = recoveryService(db, { enqueueWakeup });
     const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
@@ -495,7 +508,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
       attemptCount: 5,
     });
 
-    const enqueueWakeup = vi.fn(async () => null);
+    const enqueueWakeup = makeEnqueueWakeupMock();
     const recovery = recoveryService(db, { enqueueWakeup });
     const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
@@ -565,7 +578,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
       wakePolicy: { type: "board_escalation" },
     });
 
-    const enqueueWakeup = vi.fn(async () => null);
+    const enqueueWakeup = makeEnqueueWakeupMock();
     const recovery = recoveryService(db, { enqueueWakeup });
     const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
@@ -629,7 +642,7 @@ describeEmbeddedPostgres("recovery reconcileStaleRecoveryActionWakes (stranded a
       wakePolicy: { type: "board_escalation" },
     });
 
-    const enqueueWakeup = vi.fn(async () => null);
+    const enqueueWakeup = makeEnqueueWakeupMock();
     const recovery = recoveryService(db, { enqueueWakeup });
     const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
 
