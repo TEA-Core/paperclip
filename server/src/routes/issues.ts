@@ -1439,6 +1439,70 @@ function hasExecutionParticipant(value: unknown) {
   return false;
 }
 
+// SUP-21863: the only PATCH body fields a stage participant's own verdict may
+// carry for the participant-verdict deferral in the issues PATCH. The verdict
+// itself (`status`) plus the durable comment it is recorded with — anything
+// else (title, assignee, policy, comment-only, …) keeps the full
+// assignee-ownership boundary, so the exception can never become a generic
+// write grant.
+const ACTIVE_STAGE_VERDICT_PATCH_FIELDS = new Set([
+  "status",
+  "comment",
+  "commentClientRequestId",
+  "attachmentIds",
+  "doneTier",
+]);
+
+/**
+ * SUP-21863: whether this PATCH is exactly the current, pending
+ * execution-stage verdict held by `actorAgentId` — the one shape in which a
+ * lawful agent is NOT the issue's `assigneeAgentId` (an armed review stage
+ * points `executionState.currentParticipant` at the reviewer while the
+ * assignee column stays on the delivery owner) and must still reach the
+ * execution-policy decision logic instead of being rejected by
+ * `assertAgentIssueMutationAllowed` first.
+ *
+ * The check only confirms the deferral shape: a verdict-only body, the issue
+ * armed `in_review`, a `pending` state whose `currentStageId` resolves to a
+ * review/approval stage in the CURRENT policy revision, and the actor being
+ * that state's `currentParticipant` agent. Identity of the participant and
+ * every workflow-controlled reassignment the verdict triggers stay owned by
+ * the execution-policy engine (`principalsEqual(currentParticipant, actor)`
+ * in `applyIssueExecutionStageTransition`), which re-validates against the
+ * same persisted state this reads.
+ */
+function isAgentActiveStageVerdictRequest(
+  issue: {
+    status?: string | null;
+    executionPolicy?: unknown;
+    executionState?: unknown;
+  },
+  actorAgentId: string,
+  body: Record<string, unknown> | undefined,
+): boolean {
+  if (!body || typeof body.status !== "string" || body.status === "in_review") {
+    return false;
+  }
+  for (const key of Object.keys(body)) {
+    if (!ACTIVE_STAGE_VERDICT_PATCH_FIELDS.has(key)) return false;
+  }
+  if (issue.status !== "in_review") return false;
+  const state = parseIssueExecutionState(issue.executionState);
+  if (!state || state.status !== "pending") return false;
+  const participant = state.currentParticipant;
+  if (!participant || participant.type !== "agent" || participant.agentId !== actorAgentId) {
+    return false;
+  }
+  const policy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+  if (!policy) return false;
+  const stage =
+    state.currentStageId
+      ? policy.stages.find((candidate) => candidate.id === state.currentStageId) ?? null
+      : null;
+  if (!stage) return false;
+  return stage.type === "review" || stage.type === "approval";
+}
+
 function hasScheduledMonitor(input: {
   existingMonitorNextCheckAt?: Date | null;
   patchMonitorNextCheckAt?: unknown;
@@ -18033,6 +18097,23 @@ export function issueRoutes(
         }
         mutationAccess = await assertFreshTaskWatchdogSourceMutation(res, watchdogScope, existing);
         if (!mutationAccess) return;
+      } else if (isAgentActiveStageVerdictRequest(existing, actorAgentId, req.body)) {
+        // SUP-21863: an armed review stage points
+        // `executionState.currentParticipant` at the reviewer while
+        // `assigneeAgentId` stays on the delivery owner, so
+        // `assertAgentIssueMutationAllowed` rejected the lawful participant
+        // (403 issue_write_no_grant) before the execution-policy engine could
+        // validate the decision. Defer ONLY the verified active-verdict shape
+        // (see isAgentActiveStageVerdictRequest): the engine stays the
+        // authority for participant identity and every reassignment the
+        // verdict triggers; every other mutation keeps the full boundary.
+        mutationAccess = {
+          allowed: true,
+          reason: "allow_active_stage_participant_verdict",
+          action: "issue:mutate",
+          explanation:
+            "Allowed because the actor is the current pending execution-stage participant submitting that stage's verdict; the execution-policy engine validates the decision.",
+        };
       } else {
         const boundaryDecision = await decideIssueAccess(req, existing, "issue:mutate");
         if (boundaryDecision.allowed) {
