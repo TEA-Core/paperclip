@@ -266,6 +266,22 @@ describe("openapi routes", () => {
     expect(wake.responses["409"]).toBeDefined();
     expect(wake.description).toContain("durable queued/deferred receipt");
   });
+  it("documents the bounded child conformance response shape", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/issues/{id}/children/conformance"].get;
+    const schema = operation.responses["200"].content["application/json"].schema;
+    expect(schema.required).toEqual(["items", "nextCursor"]);
+    expect(schema.properties.items.items.required).toEqual([
+      "id",
+      "identifier",
+      "currentExecutionWorkspace",
+      "workProducts",
+    ]);
+    expect(schema.properties.items.items.properties.currentExecutionWorkspace.properties.deliveryState.enum)
+      .toEqual(["merged_via_pr", "merged_by_ancestry", "unmerged", "unknown"]);
+    expect(schema.properties.items.items.properties.workProducts.items.required).toContain("type");
+  });
+
   it("serves the generated OpenAPI document", async () => {
     const res = await request(createApp()).get("/api/openapi.json");
 
@@ -1613,7 +1629,7 @@ describe("openapi auth parity (SUP-14798)", () => {
   function hasAgentBearerAuth(route: string): boolean {
     const [method, routePath] = splitAuthRoute(route);
     const security = operation(method, routePath)?.security ?? [];
-    return security.some((req) => AGENT_BEARER in req);
+    return security.some((req: Record<string, unknown>) => AGENT_BEARER in req);
   }
 
   it("reproduces the issue's 54 board + 7 instance-admin closure counts", () => {
