@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { and, eq, inArray } from "drizzle-orm";
-import { agents, issueExecutionDecisions, issueLabels, issues, labels, type Db } from "@paperclipai/db";
+import { agents, issueExecutionDecisions, issueLabels, issueWorkProducts, issues, labels, type Db } from "@paperclipai/db";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   resolveGitHubToken,
@@ -639,11 +639,19 @@ function parseTier1Declaration(body: string): Tier1Parse {
 //  - `landed-at-tip`: the named commit is an ancestor of the repo default branch right now.
 //  - `landing-delegated`: names a linked `PR #<N>` and `done-close-landing-backstop` as the
 //    post-merge carrier (the async worker itself is unchanged here).
+//  - `record-only` (SUP-21019): the card has no repository deliverable to land. Proved at the
+//    close boundary by two independent, company+issue scoped reads: linked-PR resolution
+//    returning an empty list, and no `pull_request` / `branch` / `commit` work product on the
+//    card. Both reads fail closed — an error, an unusable result, or an unusable row (a
+//    non-object, or a missing/blank `type`) is never read as "nothing found". Cards with an
+//    unlinked PR or a code-delivery work product keep the two landing proof paths above.
 // TIER1_FORM is token-bearing so every emitted accepted form reaches the landing-token pre-check.
 // Tier 2 is a separate live-probe concern and is not checked here.
 const LANDED_AT_TIP_TOKEN = "landed-at-tip";
 const LANDING_DELEGATED_TOKEN = "landing-delegated";
+const RECORD_ONLY_TOKEN = "record-only";
 const LANDING_BACKSTOP_CARRIER = "done-close-landing-backstop";
+const CODE_DELIVERY_WORK_PRODUCT_TYPES = ["pull_request", "branch", "commit"] as const;
 const NAMED_PR_RE = /\bPR #([1-9][0-9]*)\b/;
 const NAMED_MERGE_COMMIT_RE = /\b([0-9a-f]{7,40})\b/i;
 
@@ -673,6 +681,26 @@ function acceptTier1(reason: string, sameRun: boolean): DoneTierDeclarationResul
 function unverifiedTier1(err: unknown): string {
   const detail = err instanceof Error ? err.message : "unknown";
   return `Tier 1 declaration could not be verified against the default branch (${detail}).`;
+}
+
+function unverifiedRecordOnly(err: unknown): string {
+  const detail = err instanceof Error ? err.message : "unknown";
+  return `Tier 1 declaration using "record-only" could not be verified at the close boundary (${detail}).`;
+}
+
+// SUP-21019 review finding `record-only-work-product-row-validation-fails-open`: every row the
+// two close-boundary reads return must be shape-checked before it is interpreted. A row that is
+// not an object, or whose `type` is absent/blank/non-string, is refused — never silently treated
+// as "not a code-delivery row" (which would admit `record-only` off a malformed read).
+function isUsableWorkProductRow(row: unknown): row is { type: string } {
+  if (typeof row !== "object" || row === null || Array.isArray(row)) return false;
+  const type = (row as { type?: unknown }).type;
+  return typeof type === "string" && type.trim().length > 0;
+}
+
+function isUsableLinkedPullRequestRow(row: unknown): boolean {
+  if (typeof row !== "object" || row === null || Array.isArray(row)) return false;
+  return Number.isInteger((row as { number?: unknown }).number);
 }
 
 async function loadTier1RepoFields(
@@ -732,7 +760,9 @@ async function proveLandingDelegated(
   const number = Number(named[1]);
   let linked: LinkedPullRequest[];
   try {
-    linked = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id);
+    linked = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, {
+      includeDrafts: true,
+    });
   } catch (err) {
     return refuseTier1(unverifiedTier1(err));
   }
@@ -819,6 +849,83 @@ async function proveLandedAtTip(
   return acceptTier1(reason, sameRun);
 }
 
+async function proveRecordOnly(
+  db: Db,
+  issue: { id: string; companyId: string },
+  reason: string,
+  sameRun: boolean,
+): Promise<DoneTierDeclarationResult> {
+  let linked: LinkedPullRequest[];
+  try {
+    const resolved = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, {
+      includeDrafts: true,
+    });
+    if (!Array.isArray(resolved)) {
+      return refuseTier1(
+        'Tier 1 declaration using "record-only" could not be verified: linked pull request ' +
+          "resolution returned an unusable result.",
+      );
+    }
+    linked = resolved;
+  } catch (err) {
+    return refuseTier1(unverifiedRecordOnly(err));
+  }
+  if (linked.length > 0) {
+    if (!linked.every(isUsableLinkedPullRequestRow)) {
+      return refuseTier1(
+        'Tier 1 declaration using "record-only" could not be verified: linked pull request ' +
+          "resolution returned an unusable row.",
+      );
+    }
+    return refuseTier1(
+      `Tier 1 declaration using "record-only" is not truthful: the card has ${linked.length} ` +
+        `linked pull request${linked.length === 1 ? "" : "s"} (${linked
+          .slice(0, 3)
+          .map((pr) => `#${pr.number}`)
+          .join(", ")}). Name the landing state of the linked PR instead.`,
+    );
+  }
+  let rows: { type: string }[];
+  try {
+    const selected = await db
+      .select({ type: issueWorkProducts.type })
+      .from(issueWorkProducts)
+      .where(
+        and(
+          eq(issueWorkProducts.companyId, issue.companyId),
+          eq(issueWorkProducts.issueId, issue.id),
+        ),
+      );
+    if (!Array.isArray(selected)) {
+      return refuseTier1(
+        'Tier 1 declaration using "record-only" could not be verified: the work-product read ' +
+          "returned an unusable result.",
+      );
+    }
+    const unusable = selected.some((row) => !isUsableWorkProductRow(row));
+    if (unusable) {
+      return refuseTier1(
+        'Tier 1 declaration using "record-only" could not be verified: the work-product read ' +
+          "returned an unusable row (every row must carry a non-empty string `type`).",
+      );
+    }
+    rows = selected;
+  } catch (err) {
+    return refuseTier1(unverifiedRecordOnly(err));
+  }
+  const codeDelivery = rows.filter((row) =>
+    (CODE_DELIVERY_WORK_PRODUCT_TYPES as readonly string[]).includes(row.type),
+  );
+  if (codeDelivery.length > 0) {
+    const types = [...new Set(codeDelivery.map((row) => row.type))].join(", ");
+    return refuseTier1(
+      `Tier 1 declaration using "record-only" is not truthful: the card carries a code-delivery ` +
+        `work product (${types}). Name the landing state of that artifact instead.`,
+    );
+  }
+  return acceptTier1(reason, sameRun);
+}
+
 async function proveTier1Landing(
   db: Db,
   issue: {
@@ -834,18 +941,26 @@ async function proveTier1Landing(
 ): Promise<DoneTierDeclarationResult> {
   const hasLanded = new RegExp(`\\b${LANDED_AT_TIP_TOKEN}\\b`).test(reason);
   const hasDelegated = new RegExp(`\\b${LANDING_DELEGATED_TOKEN}\\b`).test(reason);
-  if (hasLanded && hasDelegated) {
+  const hasRecordOnly = new RegExp(`\\b${RECORD_ONLY_TOKEN}\\b`).test(reason);
+  const namedTokens = [
+    hasLanded ? LANDED_AT_TIP_TOKEN : null,
+    hasDelegated ? LANDING_DELEGATED_TOKEN : null,
+    hasRecordOnly ? RECORD_ONLY_TOKEN : null,
+  ].filter((token): token is string => token !== null);
+  if (namedTokens.length > 1) {
     return refuseTier1(
-      'Tier 1 declaration names both "landed-at-tip" and "landing-delegated"; name exactly one.',
+      `Tier 1 declaration names ${namedTokens.map((token) => `"${token}"`).join(" and ")}; ` +
+        "name exactly one landing-state token.",
     );
   }
-  if (!hasLanded && !hasDelegated) {
+  if (namedTokens.length === 0) {
     return refuseTier1(
-      'Tier 1 declaration is missing a landing-state token in <reason>; include "landed-at-tip" ' +
-        'or "landing-delegated".',
+      'Tier 1 declaration is missing a landing-state token in <reason>; include "landed-at-tip", ' +
+        '"landing-delegated", or "record-only".',
     );
   }
   if (hasDelegated) return proveLandingDelegated(db, issue, reason, sameRun);
+  if (hasRecordOnly) return proveRecordOnly(db, issue, reason, sameRun);
   return proveLandedAtTip(db, issue, reason, sameRun);
 }
 

@@ -4,6 +4,7 @@ import {
   issueExecutionDecisions as issueExecutionDecisionsTable,
   issueLabels as issueLabelsTable,
   issueRelations as issueRelationsTable,
+  issueWorkProducts as issueWorkProductsTable,
   issues as issuesTable,
   labels as labelsTable,
 } from "@paperclipai/db";
@@ -141,7 +142,7 @@ function filterLabelRowsByName(
  * `select().from().where()` resolves to the `executionWorkspaces` rows exactly
  * as the legacy positional chain did, so pre-existing tests are untouched.
  */
-function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[] }) {
+function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[]; issueWorkProducts?: Record<string, unknown>[]; workProductsUnavailable?: boolean }) {
   // SUP-15233: the guard reads the issues table twice inside
   // countLadderedChildren: read 1 is the parent_id edge (decomposition
   // children), read 2 is the inArray re-read (blockedBy edge, only present in
@@ -197,6 +198,19 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     where: vi.fn().mockResolvedValue(rows.issueLabels ?? []),
     then: vi.fn().mockResolvedValue(rows.issueLabels ?? []),
   };
+  // SUP-21019: the record-only Tier 1 carve-out reads the code-delivery work
+  // products of the issue. Dispatch by table identity so the read is
+  // distinguishable from the positional chains; `workProductsUnavailable`
+  // emulates a database read failure (the carve-out must fail closed on it).
+  const issueWorkProductsChain = {
+    from: vi.fn().mockReturnThis(),
+    where: vi.fn(() =>
+      rows.workProductsUnavailable
+        ? Promise.reject(new Error("work products read failed"))
+        : Promise.resolve(rows.issueWorkProducts ?? []),
+    ),
+    then: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
+  };
   const selectChain = {
     from: vi.fn().mockReturnThis(),
     where: vi.fn().mockResolvedValue(rows.executionWorkspaces ?? []),
@@ -232,6 +246,7 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
         if (table === issueExecutionDecisionsTable) return decisionsChain;
         if (table === labelsTable) return labelsChain;
         if (table === issueLabelsTable) return issueLabelsChain;
+        if (table === issueWorkProductsTable) return issueWorkProductsChain;
         const chain = chains[callCount] ?? selectChain;
         callCount++;
         return chain;
@@ -5475,7 +5490,35 @@ describe("evaluateDoneTierDeclaration", () => {
       );
       expect(result.allowed).toBe(true);
       expect(result.tier).toBe("tier1");
-      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(mockDb, "company-1", "issue-1");
+      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(mockDb, "company-1", "issue-1", {
+        includeDrafts: true,
+      });
+    });
+
+    // SUP-21941: the delegated proof resolves the linked set with drafts included,
+    // so naming a still-draft linked PR is truthful (landing delegated pre-merge).
+    // The mock mirrors the production resolver default (merge-arming drops draft
+    // rows unless includeDrafts is passed), pinning the caller-side policy.
+    it("accepts landing-delegated naming a draft linked PR when drafts are included", async () => {
+      mockResolveLinkedPullRequestsWithState.mockImplementation(
+        async (_db, _companyId, _issueId, options) =>
+          options?.includeDrafts ? [{ ...linkedPr(4103, "open"), draft: true }] : [],
+      );
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(
+        mockDb,
+        "company-1",
+        "issue-1",
+        { includeDrafts: true },
+      );
     });
 
     it("refuses landed-at-tip when GitHub credential resolution fails, and does not accept", async () => {
@@ -5506,6 +5549,264 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.skipped).toBe(false);
       expect(result.skipReason).toBeNull();
       expect(result.reason).not.toContain("transition allowed");
+    });
+  });
+
+  describe("SUP-21019 record-only Tier 1 carve-out", () => {
+    const MERGE_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    function tier1Line(reason: string) {
+      return `Closed at Tier 1 (landed, not liveness-probed): ${reason} Liveness unverified.`;
+    }
+
+    function linkedPr(number: number, cachedState = "open") {
+      return {
+        id: `pr-${number}`,
+        owner: "TEA-Core",
+        repo: "paperclip",
+        number,
+        nodeId: null,
+        headRefName: null,
+        displayName: `TEA-Core/paperclip#${number}`,
+        title: null,
+        cachedState,
+        lastErrorCode: null,
+        reviewDecision: null,
+      };
+    }
+
+    function workProduct(type: string) {
+      return { id: `wp-${type}`, type };
+    }
+
+    const recordOnlyLine = () =>
+      tier1Line("record-only: this routine card has no repository deliverable.");
+
+    beforeEach(() => {
+      ghFetchMock.mockReset();
+      mockResolveLinkedPullRequestsWithState.mockReset();
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
+      mockResolveGitHubToken.mockReset();
+      mockResolveGitHubToken.mockResolvedValue({
+        token: "test-token",
+        scope: "company",
+        secretName: "GITHUB_TOKEN",
+      });
+      setupDbMock({});
+    });
+
+    it("accepts record-only when there are no linked PRs and no code-delivery work products", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        recordOnlyLine(),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+      expect(result.skipped).toBe(false);
+      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(mockDb, "company-1", "issue-1", {
+        includeDrafts: true,
+      });
+    });
+
+    it("keeps non-code work products eligible for record-only", async () => {
+      setupDbMock({
+        issueWorkProducts: [workProduct("document"), workProduct("artifact"), workProduct("preview_url")],
+      });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        recordOnlyLine(),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("refuses record-only when a linked PR is resolved", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr(4103, "open")]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        recordOnlyLine(),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("record-only");
+      expect(result.reason).toContain("linked");
+    });
+
+    // SUP-21941: record-only resolves with drafts included — under the resolver
+    // default (drafts dropped) a card whose only PR is a draft read as "no PR"
+    // and ghost-PASSed the empty-linked-set read. The mock mirrors that default.
+    it("refuses record-only when the only linked PR is a draft", async () => {
+      mockResolveLinkedPullRequestsWithState.mockImplementation(
+        async (_db, _companyId, _issueId, options) =>
+          options?.includeDrafts ? [{ ...linkedPr(1024, "open"), draft: true }] : [],
+      );
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        recordOnlyLine(),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("record-only");
+      expect(result.reason).toContain("linked");
+      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(
+        mockDb,
+        "company-1",
+        "issue-1",
+        { includeDrafts: true },
+      );
+    });
+
+    it("refuses record-only when linked-PR resolution throws", async () => {
+      mockResolveLinkedPullRequestsWithState.mockRejectedValue(new Error("github unavailable"));
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        recordOnlyLine(),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).not.toContain("transition allowed");
+    });
+
+    it("refuses record-only when linked-PR resolution returns an unusable result", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue(null);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        recordOnlyLine(),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+    });
+
+    for (const type of ["pull_request", "branch", "commit"]) {
+      it(`refuses record-only when a ${type} work product exists`, async () => {
+        setupDbMock({ issueWorkProducts: [workProduct(type)] });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          tierIssue,
+          recordOnlyLine(),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("record-only");
+        expect(result.reason).toContain(type);
+      });
+    }
+
+    it("refuses record-only when the work-product read fails", async () => {
+      setupDbMock({ workProductsUnavailable: true });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        recordOnlyLine(),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).not.toContain("transition allowed");
+    });
+
+    // SUP-21019 review finding `record-only-work-product-row-validation-fails-open`: a row the
+    // read returned must be shape-checked, not read as "not a code-delivery row".
+    const malformedWorkProductRows: { label: string; rows: unknown[] }[] = [
+      { label: "empty object", rows: [{}] },
+      { label: "null", rows: [null] },
+      { label: "undefined", rows: [undefined] },
+      { label: "non-string type", rows: [{ type: 42 }] },
+      { label: "blank string type", rows: [{ type: "   " }] },
+      { label: "valid row beside a malformed row", rows: [{ type: "document" }, {}] },
+    ];
+    for (const { label, rows } of malformedWorkProductRows) {
+      it(`refuses record-only when a work product row is unusable (${label})`, async () => {
+        setupDbMock({ issueWorkProducts: rows as Record<string, unknown>[] });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          tierIssue,
+          recordOnlyLine(),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.skipped).toBe(false);
+        expect(result.reason).toContain("record-only");
+        expect(result.reason).toContain("unusable row");
+        expect(result.reason).not.toContain("transition allowed");
+      });
+    }
+
+    it("refuses record-only when a linked-PR row is unusable", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([null]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        recordOnlyLine(),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("record-only");
+      expect(result.reason).toContain("unusable row");
+    });
+
+    it("refuses record-only combined with another landing-state token", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        tier1Line(`record-only and landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("exactly one");
+    });
+
+    it("names record-only in the missing-token remedy", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        tier1Line("production probe unavailable."),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("record-only");
+    });
+
+    it("accepts record-only from a same-run comment", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        null,
+        "run-1",
+        () => Promise.resolve([mockComment(recordOnlyLine(), "run-1")]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
     });
   });
 
