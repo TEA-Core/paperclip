@@ -8,6 +8,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { isValidOpenCodeModelId } from "../index.js";
 
+export const OPENCODE_V2_CLI_VERSION = "2.0.26";
 const MODELS_CACHE_TTL_MS = 60_000;
 const MODELS_DISCOVERY_TIMEOUT_MS = 20_000;
 // `opencode models` is a lightweight metadata call, but on a shared ollama
@@ -80,6 +81,42 @@ function firstNonEmptyLine(text: string): string {
   );
 }
 
+export async function verifyOpenCodeCliVersion(input: {
+  cliVersion?: unknown;
+  command?: unknown;
+  cwd?: unknown;
+  env?: unknown;
+} = {}): Promise<void> {
+  const expectedVersion = asString(input.cliVersion, "").trim();
+  if (!expectedVersion) return;
+  const command = resolveOpenCodeCommand(input.command);
+  const cwd = asString(input.cwd, process.cwd());
+  const env = normalizeEnv(input.env);
+  const result = await runChildProcess(
+    `opencode-version-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    command,
+    ["--version"],
+    {
+      cwd,
+      env: normalizeEnv(ensurePathInEnv({ ...process.env, ...env })),
+      timeoutSec: 10,
+      graceSec: 3,
+      onLog: async () => {},
+    },
+  );
+  if (result.timedOut || (result.exitCode ?? 1) !== 0) {
+    const detail = firstNonEmptyLine(result.stderr) || firstNonEmptyLine(result.stdout);
+    throw new Error(`OpenCode CLI version probe failed for ${command}${detail ? `: ${detail}` : "."}`);
+  }
+  const match = /(?:^|\s)v?(\d+\.\d+\.\d+)(?:\s|$)/i.exec(`${result.stdout}\n${result.stderr}`);
+  const actualVersion = match?.[1] ?? null;
+  if (actualVersion !== expectedVersion) {
+    throw new Error(
+      `OpenCode CLI version mismatch: expected ${expectedVersion}, received ${actualVersion ?? "unknown"}.`,
+    );
+  }
+}
+
 export function parseOpenCodeModelsOutput(stdout: string): AdapterModel[] {
   const parsed: AdapterModel[] = [];
   for (const raw of stdout.split(/\r?\n/)) {
@@ -117,6 +154,7 @@ function hashValue(value: string): string {
 }
 
 function discoveryCacheKey(
+  cliVersion: string,
   command: string,
   cwd: string,
   env: Record<string, string>,
@@ -126,7 +164,7 @@ function discoveryCacheKey(
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([key, value]) => `${key}=${hashValue(value)}`)
     .join("\n");
-  return `${command}\n${cwd}\n${envKey}`;
+  return `${cliVersion}\n${command}\n${cwd}\n${envKey}`;
 }
 
 function pruneExpiredDiscoveryCache(now: number) {
@@ -137,12 +175,15 @@ function pruneExpiredDiscoveryCache(now: number) {
 
 export async function discoverOpenCodeModels(
   input: {
+    cliVersion?: unknown;
     command?: unknown;
     cwd?: unknown;
     env?: unknown;
     refresh?: boolean;
   } = {},
 ): Promise<AdapterModel[]> {
+  const cliVersion = asString(input.cliVersion, "").trim();
+  const isV2 = cliVersion === OPENCODE_V2_CLI_VERSION;
   const command = resolveOpenCodeCommand(input.command);
   const cwd = asString(input.cwd, process.cwd());
   const env = normalizeEnv(input.env);
@@ -167,6 +208,9 @@ export async function discoverOpenCodeModels(
       OPENCODE_DISABLE_PROJECT_CONFIG: "true",
     }),
   );
+  if (isV2) {
+    await verifyOpenCodeCliVersion({ cliVersion, command, cwd, env: runtimeEnv });
+  }
 
   const maxAttempts = MODELS_DISCOVERY_RETRY_DELAYS_MS.length + 1;
   let lastError: Error | undefined;
@@ -175,7 +219,7 @@ export async function discoverOpenCodeModels(
     const result = await runChildProcess(
       `opencode-models-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       command,
-      ["models", ...(input.refresh ? ["--refresh"] : [])],
+      ["models", ...(isV2 ? ["--standalone"] : []), ...(input.refresh && !isV2 ? ["--refresh"] : [])],
       {
         cwd,
         env: runtimeEnv,
@@ -211,6 +255,7 @@ export async function discoverOpenCodeModels(
 
 export async function discoverOpenCodeModelsCached(
   input: {
+    cliVersion?: unknown;
     command?: unknown;
     cwd?: unknown;
     env?: unknown;
@@ -219,18 +264,20 @@ export async function discoverOpenCodeModelsCached(
   const command = resolveOpenCodeCommand(input.command);
   const cwd = asString(input.cwd, process.cwd());
   const env = normalizeEnv(input.env);
-  const key = discoveryCacheKey(command, cwd, env);
+  const cliVersion = asString(input.cliVersion, "").trim();
+  const key = discoveryCacheKey(cliVersion, command, cwd, env);
   const now = Date.now();
   pruneExpiredDiscoveryCache(now);
   const cached = discoveryCache.get(key);
   if (cached && cached.expiresAt > now) return cached.models;
 
-  const models = await discoverOpenCodeModels({ command, cwd, env });
+  const models = await discoverOpenCodeModels({ cliVersion, command, cwd, env });
   discoveryCache.set(key, { expiresAt: now + MODELS_CACHE_TTL_MS, models });
   return models;
 }
 
 async function refreshOpenCodeModelsCached(input: {
+  cliVersion?: unknown;
   command?: unknown;
   cwd?: unknown;
   env?: unknown;
@@ -238,19 +285,24 @@ async function refreshOpenCodeModelsCached(input: {
   const command = resolveOpenCodeCommand(input.command);
   const cwd = asString(input.cwd, process.cwd());
   const env = normalizeEnv(input.env);
+  const cliVersion = asString(input.cliVersion, "").trim();
+  const isV2 = cliVersion === OPENCODE_V2_CLI_VERSION;
   // OpenCode 1.18.17 uses `models --refresh` only to update its on-disk
   // models.dev cache. Its stdout is a confirmation message, not the refreshed
   // catalog, so enumerate once more after the refresh under the exact same
   // command/cwd/env before deciding whether the configured model exists.
-  await discoverOpenCodeModels({
-    command,
-    cwd,
-    env,
-    refresh: true,
-  });
-  const models = await discoverOpenCodeModels({ command, cwd, env });
+  if (!isV2) {
+    await discoverOpenCodeModels({
+      cliVersion,
+      command,
+      cwd,
+      env,
+      refresh: true,
+    });
+  }
+  const models = await discoverOpenCodeModels({ cliVersion, command, cwd, env });
   if (models.length > 0) {
-    discoveryCache.set(discoveryCacheKey(command, cwd, env), {
+    discoveryCache.set(discoveryCacheKey(cliVersion, command, cwd, env), {
       expiresAt: Date.now() + MODELS_CACHE_TTL_MS,
       models,
     });
@@ -265,12 +317,15 @@ export function isTruthyEnvFlag(value: string | undefined): boolean {
 }
 
 export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
+  cliVersion?: unknown;
   model?: unknown;
   command?: unknown;
   cwd?: unknown;
   env?: unknown;
 }): Promise<AdapterModel[]> {
   const model = requireOpenCodeModelId(input.model);
+  const cliVersion = asString(input.cliVersion, "").trim();
+  const isV2 = cliVersion === OPENCODE_V2_CLI_VERSION;
 
   // When the caller opts into OPENCODE_ALLOW_ALL_MODELS, OpenCode accepts any
   // provider/model at run time (e.g. gateway-routed models that never appear in
@@ -289,6 +344,7 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
   let models: AdapterModel[];
   try {
     models = await discoverOpenCodeModelsCached({
+      cliVersion,
       command: input.command,
       cwd: input.cwd,
       env: input.env,
@@ -300,6 +356,11 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
     // authoritative, so a probe that can't execute must never be fatal.
     // (Previously this threw and crashed runs mid-flight, discarding the agent's
     // completed work and its terminal disposition, which then reopened the issue.)
+    if (isV2) {
+      throw new Error(
+        `OpenCode V2 model discovery failed for "${model}": ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     console.warn(
       `[opencode-local] Model availability probe could not run for "${model}" (${
         err instanceof Error ? err.message : String(err)
@@ -329,6 +390,7 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
       await new Promise((resolve) => setTimeout(resolve, 750 * attempt));
       try {
         const fresh = await discoverOpenCodeModels({
+          cliVersion,
           command: input.command,
           cwd: input.cwd,
           env: input.env,
@@ -341,6 +403,9 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
   }
 
   if (models.length === 0) {
+    if (isV2) {
+      throw new Error(`OpenCode V2 model discovery returned no models for "${model}".`);
+    }
     // The probe ran but returned nothing (e.g. a transient provider-auth blip).
     // Same reasoning as above: warn, don't block the run.
     console.warn(
@@ -357,6 +422,7 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
     // model retains the strict availability rejection below.
     try {
       const refreshedModels = await refreshOpenCodeModelsCached({
+        cliVersion,
         command: input.command,
         cwd: input.cwd,
         env: input.env,
