@@ -1222,6 +1222,185 @@ export async function evaluateDoneTierDeclaration(
   };
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// SUP-20525 (SUP-18110 ask 1): cited-commit-SHA resolver. A done close
+// whose accompanying comment cites a commit SHA that does not exist in the
+// delivery repository is refused with 422 done_transition_cited_sha_unresolvable
+// by the route. Extraction recognises four citation grammars — backticked hex
+// tokens, `owner/repo@<hex>` / `<name>@<hex>` handles, GitHub commit URLs, and
+// a hex token following the word "commit" or "sha" — and never a plain-English
+// word: a candidate must contain at least one digit AND at least one a-f
+// letter (`deadbeef`, `cafe`, `SUP-18110`, `PR #873` are not citations).
+// A SHA is marked nonexistent ONLY when GitHub explicitly reports the ref
+// unresolvable (422 "No commit found" or 404) AND a positive control probe
+// proves the default branch ref resolves in the same repo with the same
+// credential — so a repo-visibility, credential, or outage condition can never
+// manufacture a refusal. Every other outcome is `unverifiable`, and the route
+// fails open on it: the resolver is a liar-detector on top of the tier gate,
+// not a new close requirement.
+// ───────────────────────────────────────────────────────────────────────
+
+export type CitedCommitStatus = "resolved" | "nonexistent" | "unverifiable";
+
+export interface CitedCommitResolution {
+  sha: string;
+  status: CitedCommitStatus;
+}
+
+export interface CitedShaResolution {
+  results: CitedCommitResolution[];
+}
+
+const CITED_SHA_PATTERNS: RegExp[] = [
+  /`([0-9a-f]{7,40})`/gi,
+  /\b[A-Za-z0-9_.-]+@([0-9a-f]{7,40})(?![0-9a-f])/gi,
+  /github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/commit\/([0-9a-f]{7,40})(?![0-9a-f])/gi,
+  /\b(?:commits?|shas?)\s*[:#]?\s*([0-9a-f]{7,40})(?![0-9a-f])/gi,
+];
+
+const CITED_SHA_MAX = 10;
+
+function looksLikeShaCandidate(token: string): boolean {
+  return /[0-9]/.test(token) && /[a-f]/.test(token);
+}
+
+export function extractCitedCommitShas(text: string | null | undefined): string[] {
+  if (!text) return [];
+  const seen = new Set<string>();
+  for (const pattern of CITED_SHA_PATTERNS) {
+    for (const match of text.matchAll(pattern)) {
+      const raw = match[1];
+      if (!raw) continue;
+      const sha = raw.toLowerCase();
+      if (!looksLikeShaCandidate(sha)) continue;
+      seen.add(sha);
+      if (seen.size >= CITED_SHA_MAX) return [...seen];
+    }
+  }
+  return [...seen];
+}
+
+type CommitRefProbeOutcome = "present" | "absent" | "error";
+
+async function githubCommitRefProbe(
+  hostname: string,
+  owner: string,
+  repo: string,
+  ref: string,
+  token: string,
+): Promise<CommitRefProbeOutcome> {
+  const url = `${gitHubApiBase(hostname)}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(ref)}`;
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": "paperclip-done-transition-guard",
+    "x-github-api-version": "2022-11-28",
+    authorization: `Bearer ${token}`,
+  };
+  let response: Response;
+  try {
+    response = await ghFetch(url, { headers });
+  } catch {
+    // ghFetch throws on network failure; the ref's existence was not measured.
+    return "error";
+  }
+  if (response.ok) return "present";
+  if (response.status === 404) return "absent";
+  if (response.status === 422) {
+    // GitHub answers a SHA-shaped ref it cannot resolve with 422 + "No commit
+    // found for <ref>"; a 422 with any other message says nothing about the
+    // ref's existence, so it must not be read as absence.
+    const body = await response.json().catch(() => null);
+    const message = (body as Record<string, unknown> | null)?.message;
+    if (typeof message === "string" && /no commit found/i.test(message)) {
+      return "absent";
+    }
+    return "error";
+  }
+  return "error";
+}
+
+export async function resolveCitedCommits(
+  db: Db,
+  issue: {
+    id: string;
+    companyId: string;
+    identifier: string | null;
+    projectId?: string | null;
+    projectWorkspaceId?: string | null;
+    executionWorkspaceId?: string | null;
+  },
+  text: string | null | undefined,
+): Promise<CitedShaResolution> {
+  const shas = extractCitedCommitShas(text);
+  if (shas.length === 0) return { results: [] };
+
+  const unverifiableAll = (): CitedShaResolution => ({
+    results: shas.map((sha) => ({ sha, status: "unverifiable" as const })),
+  });
+
+  let ctx: IssueRepoContext | null;
+  try {
+    const fields = await loadTier1RepoFields(db, issue);
+    ctx = await resolveIssueRepoContext(db, {
+      companyId: issue.companyId,
+      projectId: fields.projectId,
+      projectWorkspaceId: fields.projectWorkspaceId,
+      executionWorkspaceId: fields.executionWorkspaceId,
+    });
+  } catch {
+    return unverifiableAll();
+  }
+  if (!ctx?.repoUrl || !ctx.defaultRef) return unverifiableAll();
+  const parsed = parseRepoUrl(ctx.repoUrl);
+  if (!parsed) return unverifiableAll();
+
+  let token: string | null;
+  try {
+    const tokenResult = await resolveGitHubToken(db, issue.companyId);
+    token = tokenResult.token;
+  } catch {
+    return unverifiableAll();
+  }
+  if (!token) return unverifiableAll();
+
+  const apiHostname = parsed.hostname;
+  const repoOwner = parsed.owner;
+  const repoName = parsed.repo;
+  const defaultRef = ctx.defaultRef;
+  const authToken = token;
+
+  // Positive control (probed lazily, once, only when a SHA probe first reports
+  // absence): the default branch ref must resolve in the same repo with the
+  // same credential before any "nonexistent" verdict is trusted. The remote-
+  // tracking prefix is stripped exactly as the compare probe does (SUP-13691).
+  let control: CommitRefProbeOutcome | null = null;
+  const controlPresent = async (): Promise<boolean> => {
+    if (control === null) {
+      const controlRef =
+        defaultRef.startsWith("origin/") && defaultRef.length > "origin/".length
+          ? defaultRef.slice("origin/".length)
+          : defaultRef;
+      control = await githubCommitRefProbe(apiHostname, repoOwner, repoName, controlRef, authToken);
+    }
+    return control === "present";
+  };
+
+  const results: CitedCommitResolution[] = [];
+  for (const sha of shas) {
+    const outcome = await githubCommitRefProbe(apiHostname, repoOwner, repoName, sha, authToken);
+    if (outcome === "present") {
+      results.push({ sha, status: "resolved" });
+      continue;
+    }
+    if (outcome === "absent" && (await controlPresent())) {
+      results.push({ sha, status: "nonexistent" });
+      continue;
+    }
+    results.push({ sha, status: "unverifiable" });
+  }
+  return { results };
+}
+
 /**
  * SUP-13831: live discovery of open PRs when the issue has zero cached
  * mention rows. Mention rows are only created when a comment posts a full PR

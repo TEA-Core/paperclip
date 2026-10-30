@@ -1543,4 +1543,185 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(details.ladderedChildCount).toBe(1);
     expect(details.excludedChildIdentifiers).toEqual(excludedChildIdentifiers);
   });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // SUP-20525 (SUP-18110 ask 1): cited-commit-SHA resolver on the done close.
+  // A close comment citing a commit GitHub provably does not have (explicit
+  // not-found + a resolving default-branch control) is refused 422; resolvable
+  // or unverifiable citations never block, and board closes never reach the
+  // resolver at all.
+  // ───────────────────────────────────────────────────────────────────────
+
+  /** Merged branch + commit-ref probes for the cited-SHA resolver. */
+  function mockMergedBranchWithCommitProbes(
+    shas: Record<string, "present" | "absent">,
+    controlStatus = 200,
+  ) {
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+      if (url.includes("/commits/")) {
+        const ref = decodeURIComponent(url.split("/commits/")[1] ?? "");
+        if (ref === "fold/tea-patches-v2026.722.0") {
+          return new Response(JSON.stringify({ ref }), { status: controlStatus });
+        }
+        if (shas[ref] === "absent") {
+          return new Response(JSON.stringify({ message: `No commit found for sha ${ref}` }), { status: 422 });
+        }
+        return new Response(JSON.stringify({ sha: ref }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+  }
+
+  function commitProbeCalls(): string[] {
+    return mockGhFetch.mock.calls
+      .map(([url]) => String(url))
+      .filter((url) => url.includes("/commits/"));
+  }
+
+  describe("cited-SHA resolver (SUP-20525)", () => {
+    it("PATCH: a plain close citing a nonexistent commit SHA is refused 422 and records why", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D20525A");
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockMergedBranchWithCommitProbes({ afc6278bea3c: "absent" });
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment:
+            "Closed at Tier 2 (live): fix landed in merge commit afc6278bea3c; probe re-hit the endpoint.",
+        });
+
+      // The tier line passed; the provably nonexistent cited SHA is the refusal.
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_cited_sha_unresolvable");
+      expect(res.body.details.shas).toEqual(["afc6278bea3c"]);
+      expect(res.body.details.remedy).toContain("afc6278bea3c");
+      expect(await statusOf(issueId)).toBe("in_review");
+
+      // Thread-readable refusal record per the SUP-17125 contract.
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments.filter((c) => c.authorType !== "system")).toHaveLength(0);
+      const records = comments.filter((c) => c.authorType === "system");
+      expect(records).toHaveLength(1);
+      const body = records[0]?.body ?? "";
+      expect(body).toContain("[Terminal status refused] done_transition_cited_sha_unresolvable");
+      expect(body).toContain("HTTP 422");
+      expect(body).toContain("afc6278bea3c");
+      expect(body).toContain(`Refusing run: ${runId}`);
+
+      // The resolution itself is audited with the per-SHA verdict.
+      const rows = await vi.waitFor(
+        async () => {
+          const found = await auditRows(companyId, issueId, "issue.done_transition_cited_sha_resolved");
+          if (found.length === 0) throw new Error("waiting for cited-sha audit row");
+          return found;
+        },
+        { timeout: 5000 },
+      );
+      expect(rows[0]?.details).toMatchObject({
+        decisionCarried: false,
+        results: [{ sha: "afc6278bea3c", status: "nonexistent" }],
+      });
+    });
+
+    it("PATCH: a close citing only resolvable SHAs still closes (no regression)", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D20525B");
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockMergedBranchWithCommitProbes({ "674fef15d2": "present" });
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment: "Closed at Tier 2 (live): landed in `674fef15d2`; probe re-hit the endpoint.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+      expect(commitProbeCalls()).toEqual([
+        "https://api.github.com/repos/TEA-Core/paperclip/commits/674fef15d2",
+      ]);
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments.filter((c) => c.authorType === "system")).toHaveLength(0);
+    });
+
+    it("PATCH: a close whose citations cannot be verified still closes (fail open)", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D20525C");
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      // The SHA probe says absent, but the control ref does not resolve either,
+      // so absence is unproven: the citation is unverifiable and the close holds.
+      mockMergedBranchWithCommitProbes({ afc6278bea3c: "absent" }, 404);
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment: "Closed at Tier 2 (live): landed in `afc6278bea3c`; probe re-hit the endpoint.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+      const rows = await vi.waitFor(
+        async () => {
+          const found = await auditRows(companyId, issueId, "issue.done_transition_cited_sha_resolved");
+          if (found.length === 0) throw new Error("waiting for cited-sha audit row");
+          return found;
+        },
+        { timeout: 5000 },
+      );
+      expect(rows[0]?.details).toMatchObject({
+        results: [{ sha: "afc6278bea3c", status: "unverifiable" }],
+      });
+    });
+
+    it("PATCH: a board close citing a nonexistent SHA is untouched by the resolver", async () => {
+      const { companyId, issueId, identifier } = await seedIssueAwaitingReview("D20525D");
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      currentActor = {
+        type: "board",
+        userId: "cloud-user-1",
+        companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+        source: "cloud_tenant",
+        isInstanceAdmin: false,
+        runId: randomUUID(),
+      };
+      mockMergedBranchWithCommitProbes({ afc6278bea3c: "absent" });
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Board close citing merge commit afc6278bea3c." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+      expect(commitProbeCalls()).toHaveLength(0);
+    });
+
+    it("PATCH: a close with no cited SHAs makes no commit probes (unchanged behavior)", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D20525E");
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockMergedBranchWithCommitProbes({});
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment: "Closed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+      expect(commitProbeCalls()).toHaveLength(0);
+      expect(await auditRows(companyId, issueId, "issue.done_transition_cited_sha_resolved")).toHaveLength(0);
+    });
+  });
 });
