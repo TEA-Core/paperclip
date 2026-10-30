@@ -689,8 +689,8 @@ describe("shared-group-ownership regression (real fs)", () => {
     realFs = await vi.importActual("node:fs/promises");
     tmpRoot = await realFs.mkdtemp(path.join(os.tmpdir(), "sgo-regression-"));
     // Use real fs for open/realpath in these tests
-    mockOpen.mockImplementation((...args) => realFs.open(...args));
-    mockRealpath.mockImplementation((...args) => realFs.realpath(...args));
+    mockOpen.mockImplementation((path, flags, mode) => realFs.open(path, flags, mode));
+    mockRealpath.mockImplementation((path, options) => realFs.realpath(path, options));
   });
 
   afterAll(async () => {
