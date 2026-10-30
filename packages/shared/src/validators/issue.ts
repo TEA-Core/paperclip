@@ -2311,6 +2311,7 @@ export const acceptIssueThreadInteractionSchema = z
       .array(z.string().trim().min(1).max(120))
       .max(REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT)
       .optional(),
+    doneTier: doneTierDeclarationSchema.optional(),
   })
   .superRefine((value, ctx) => {
     const seenClientKeys = new Set<string>();
