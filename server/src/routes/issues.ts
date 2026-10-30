@@ -1500,7 +1500,42 @@ function isAgentActiveStageVerdictRequest(
       ? policy.stages.find((candidate) => candidate.id === state.currentStageId) ?? null
       : null;
   if (!stage) return false;
+  // SUP-21863 (round-2 review): the participant slot alone is not enough —
+  // the actor must still be an agent participant of this stage in the CURRENT
+  // policy revision, so a stale `currentParticipant` pointer (a policy edit
+  // that swapped participants without re-pointing the state) cannot bypass
+  // the ownership boundary.
+  if (
+    !stage.participants.some(
+      (candidate) => candidate.type === "agent" && candidate.agentId === actorAgentId,
+    )
+  ) {
+    return false;
+  }
   return stage.type === "review" || stage.type === "approval";
+}
+
+/**
+ * SUP-21863 (round-2 review): the durable `authorizationPath` label recorded
+ * on BOTH the issue-update and the comment authorization activity metadata
+ * whenever a mutation was allowed through a non-default authorization reason
+ * (the manager-chain escape hatch or the deferred active-stage-participant
+ * verdict). Every other mutation records no path — it went through the
+ * default assignee-ownership boundary.
+ */
+function issueMutationAuthorizationPathLabel(
+  mutationAccess:
+    | boolean
+    | { allowed: boolean; reason: string; action: string; explanation: string }
+    | undefined
+    | null,
+): string | null {
+  if (!mutationAccess || mutationAccess === true) return null;
+  if (mutationAccess.reason === "allow_manager_chain") return "escape_hatch_manager_chain";
+  if (mutationAccess.reason === "allow_active_stage_participant_verdict") {
+    return "active_stage_participant_verdict";
+  }
+  return null;
 }
 
 function hasScheduledMonitor(input: {
@@ -18074,8 +18109,17 @@ export function issueRoutes(
       await denyIssueWrite(req, res, existing, "issue_write_attribution_spoof_rejected");
       return;
     }
-    healAgentDefaultProjectWorkspacePair(existing, req.body);
     const actorAgentId = req.actor.type === "agent" ? req.actor.agentId : null;
+    // SUP-21863 (round-2 review): evaluate the verdict predicate against the
+    // ORIGINAL PATCH body, before healAgentDefaultProjectWorkspacePair writes
+    // `body.projectWorkspaceId = null` onto a verdict-only body when the
+    // stored issue carries the agent_default + projectWorkspaceId pair — the
+    // injected key would fail the verdict-only shape check and lock the lawful
+    // participant out of its own verdict.
+    const allowActiveStageVerdict =
+      actorAgentId != null &&
+      isAgentActiveStageVerdictRequest(existing, actorAgentId, req.body);
+    healAgentDefaultProjectWorkspacePair(existing, req.body);
     let mutationAccess:
       | boolean
       | { allowed: boolean; reason: string; action: string; explanation: string };
@@ -18097,7 +18141,7 @@ export function issueRoutes(
         }
         mutationAccess = await assertFreshTaskWatchdogSourceMutation(res, watchdogScope, existing);
         if (!mutationAccess) return;
-      } else if (isAgentActiveStageVerdictRequest(existing, actorAgentId, req.body)) {
+      } else if (allowActiveStageVerdict) {
         // SUP-21863: an armed review stage points
         // `executionState.currentParticipant` at the reviewer while
         // `assigneeAgentId` stays on the delivery owner, so
@@ -18142,9 +18186,20 @@ export function issueRoutes(
       }
     }
     if (req.body.comment && !(await assertBoardCommentNotPaused(req, res, existing))) return;
-    const issueMutationAuthorizationReason = req.actor.type === "agent"
-      ? issueWriteAuthorizationReason(req, await decideIssueAccess(req, existing, "issue:mutate"))
-      : issueWriteAuthorizationReason(req, true);
+    // SUP-21863 (round-2 review): when the mutation was allowed through the
+    // active-stage-participant verdict deferral, the durable authorization
+    // reason recorded on the issue update AND on the comment's authorization
+    // metadata must name that deferral — the boundary decision itself denies
+    // (the participant holds no generic write grant), so recording the denial
+    // reason would mislabel the allowed verdict. The `allow_` prefix also
+    // marks the verdict comment as an explicit external agent write.
+    const issueMutationAuthorizationReason =
+      typeof mutationAccess === "object" &&
+      mutationAccess.reason === "allow_active_stage_participant_verdict"
+        ? mutationAccess.reason
+        : req.actor.type === "agent"
+          ? issueWriteAuthorizationReason(req, await decideIssueAccess(req, existing, "issue:mutate"))
+          : issueWriteAuthorizationReason(req, true);
 
     if (
       mutationAccess !== true &&
@@ -20417,8 +20472,8 @@ export function issueRoutes(
         ...(commentBody ? { source: "comment" } : {}),
         ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
         ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus } : {}),
-        ...(mutationAccess !== true && typeof mutationAccess === "object" && mutationAccess.reason === "allow_manager_chain"
-          ? { authorizationPath: "escape_hatch_manager_chain" }
+        ...(issueMutationAuthorizationPathLabel(mutationAccess)
+          ? { authorizationPath: issueMutationAuthorizationPathLabel(mutationAccess) }
           : {}),
         ...(scheduledRetrySupersededByComment
           ? {
@@ -20748,8 +20803,8 @@ export function issueRoutes(
             bodySnippet: createdComment.body.slice(0, 120),
             identifier: issue.identifier,
             issueTitle: issue.title,
-            ...(mutationAccess !== true && typeof mutationAccess === "object" && mutationAccess.reason === "allow_manager_chain"
-              ? { authorizationPath: "escape_hatch_manager_chain" }
+            ...(issueMutationAuthorizationPathLabel(mutationAccess)
+              ? { authorizationPath: issueMutationAuthorizationPathLabel(mutationAccess) }
               : {}),
             authorizationReason: issueMutationAuthorizationReason,
             ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
@@ -20894,8 +20949,8 @@ export function issueRoutes(
           bodySnippet: comment.body.slice(0, 120),
           identifier: issue.identifier,
           issueTitle: issue.title,
-          ...(mutationAccess !== true && typeof mutationAccess === "object" && mutationAccess.reason === "allow_manager_chain"
-            ? { authorizationPath: "escape_hatch_manager_chain" }
+          ...(issueMutationAuthorizationPathLabel(mutationAccess)
+            ? { authorizationPath: issueMutationAuthorizationPathLabel(mutationAccess) }
             : {}),
           authorizationReason: issueMutationAuthorizationReason,
           ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
