@@ -257,6 +257,50 @@ vi.mock("../services/cross-issue-influence-limit.js", () => ({
   crossIssueInfluenceRunContextError: mockCrossIssueInfluenceRunContextError,
 }));
 
+// SUP-21902: this suite exercises reopen semantics against a fully mocked db, so
+// the real Tier 2 origin predicate (which resolves heads through the commits API
+// over a live database) cannot run here. The boundary mock keeps the contract
+// enforceable for these fixtures: a close declaration must still carry the
+// machine-checkable probe/head/post-merge shape, or the close fails. The real
+// predicate is covered end-to-end by done-transition-guard.test.ts and the
+// done-transition-guard-*-routes suites.
+vi.mock("../services/done-transition-guard.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/done-transition-guard.js")>();
+  const TIER2_PREFIX = "Closed at Tier 2 (live):";
+  const TIER2_PROBE_SHAPE = /^probe `[^`]+` head [0-9a-f]{7,40} post-merge: .+$/i;
+  return {
+    ...actual,
+    evaluateDoneTierDeclaration: async (
+      _db: unknown,
+      _issue: unknown,
+      accompanyingComment: string | null,
+    ) => {
+      const line = (accompanyingComment ?? "")
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .find((l) => l.startsWith(TIER2_PREFIX));
+      const malformed = {
+        allowed: false,
+        reason:
+          "(reopen-suite tier boundary) Tier 2 declaration probe evidence is not in the machine-checkable shape.",
+        tier: null,
+        skipped: false,
+        skipReason: null,
+      };
+      if (!line) return malformed;
+      const evidence = line.slice(TIER2_PREFIX.length).trim();
+      if (!TIER2_PROBE_SHAPE.test(evidence)) return malformed;
+      return {
+        allowed: true,
+        reason: `Tier 2 declaration found: ${evidence}`,
+        tier: "tier2",
+        skipped: false,
+        skipReason: null,
+      };
+    },
+  };
+});
+
 function createApp() {
   const app = express();
   app.use(express.json());
@@ -3363,7 +3407,7 @@ describe.sequential("issue comment reopen routes", () => {
         lastDecisionOutcome: null,
       },
     };
-    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
+    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-1",
@@ -3456,7 +3500,7 @@ describe.sequential("issue comment reopen routes", () => {
         lastDecisionOutcome: null,
       },
     };
-    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
+    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.getByIdForUpdate.mockResolvedValue({
       ...issue,
@@ -3539,7 +3583,7 @@ describe.sequential("issue comment reopen routes", () => {
         lastDecisionOutcome: null,
       },
     };
-    const reviewBody = "kind: review\ndecision: approved\nsummary: ship it\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
+    const reviewBody = "kind: review\ndecision: approved\nsummary: ship it\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-2",
@@ -3633,7 +3677,7 @@ describe.sequential("issue comment reopen routes", () => {
       },
       parentId: null,
     };
-    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
+    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-3",
@@ -3724,7 +3768,7 @@ describe.sequential("issue comment reopen routes", () => {
         lastDecisionOutcome: null,
       },
     };
-    const reviewBody = "## Review: APPROVED\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
+    const reviewBody = "## Review: APPROVED\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-5",
@@ -4174,27 +4218,27 @@ describe.sequential("issue comment reopen routes", () => {
     {
       name: "uppercase approval",
       body:
-        "## Review: APPROVED\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.",
+        "## Review: APPROVED\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the changed surface.",
     },
     {
       name: "trailing punctuation",
       body:
-        "## Review: APPROVED!\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.",
+        "## Review: APPROVED!\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the changed surface.",
     },
     {
       name: "ticketed approval",
       body:
-        "## Review: PAP-580 - APPROVED\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.",
+        "## Review: PAP-580 - APPROVED\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the changed surface.",
     },
     {
       name: "lowercase approval",
       body:
-        "## Review: LGTM, approved\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.",
+        "## Review: LGTM, approved\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the changed surface.",
     },
     {
       name: "approval with body context",
       body:
-        "## Review: APPROVED\n\nReady to ship.\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.",
+        "## Review: APPROVED\n\nReady to ship.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the changed surface.",
     },
   ])("auto-approves positive approval phrasings ($name)", ({ body }) => {
     it("triggers the auto-approval transition", async () => {
@@ -4317,7 +4361,7 @@ describe.sequential("issue comment reopen routes", () => {
         lastDecisionOutcome: null,
       },
     };
-    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
+    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-atomic",
@@ -4392,7 +4436,7 @@ describe.sequential("issue comment reopen routes", () => {
         lastDecisionOutcome: null,
       },
     };
-    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): reviewer probe verified the changed surface.";
+    const reviewBody = "## Review: PAP-580 - APPROVED\n\nLooks good.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the changed surface.";
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-review-missing",

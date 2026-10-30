@@ -2,16 +2,18 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
   companies,
   companyMemberships,
   createDb,
+  executionWorkspaces,
   heartbeatRuns,
   issueComments,
   issues,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -20,6 +22,25 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { logActivity, logActivityInTransaction } from "../services/activity-log.js";
+
+const mockGetByName = vi.hoisted(() => vi.fn());
+const mockResolveSecretValue = vi.hoisted(() => vi.fn());
+vi.mock("../services/secrets.js", () => ({
+  secretService: () => ({ getByName: mockGetByName, resolveSecretValue: mockResolveSecretValue }),
+}));
+// SUP-21902: the done-transition guard resolves the declared probe head and the
+// delivery default branch tip through the commits API; the mocked remote serves
+// the same head for both, so the fixtures' named probe heads match the merge head.
+vi.mock("../services/github-fetch.js", () => ({
+  ghFetch: (url: string) =>
+    typeof url === "string" && /\/commits\//.test(url)
+      ? Promise.resolve({ ok: true, status: 200, json: async () => ({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }) } as unknown as Response)
+      : Promise.resolve(new Response(JSON.stringify({}), { status: 404 })),
+  gitHubApiBase: (hostname: string) =>
+    hostname === "github.com" || hostname === "www.github.com"
+      ? "https://api.github.com"
+      : `https://${hostname}/api/v3`,
+}));
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
@@ -137,6 +158,43 @@ describeEmbeddedPostgres("best-effort activity log on issue routes", () => {
       assigneeAgentId: agentId,
       createdByUserId: "cloud-user-1",
     });
+    // SUP-21902: bind the card to a repo-backed execution workspace so its Tier 2
+    // close predicate can resolve the default branch and verify the declared head.
+    const tier2ProjectId = randomUUID();
+    const tier2WorkspaceId = randomUUID();
+    const tier2Now = new Date();
+    await db.insert(projects).values({
+      id: tier2ProjectId,
+      companyId,
+      name: "Tier 2 Fixture Project",
+      status: "active",
+      createdAt: tier2Now,
+      updatedAt: tier2Now,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: tier2WorkspaceId,
+      companyId,
+      projectId: tier2ProjectId,
+      projectWorkspaceId: null,
+      sourceIssueId: null,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "tier2-fixture-ws",
+      status: "active",
+      cwd: "/tmp/test",
+      repoUrl: "https://github.com/TEA-Core/paperclip",
+      baseRef: "fold/tea-patches-v2026.722.0",
+      branchName: "tier2-fixture-ws",
+      providerType: "git_worktree",
+      providerRef: "/tmp/test",
+      lastUsedAt: tier2Now,
+      openedAt: tier2Now,
+      createdAt: tier2Now,
+      updatedAt: tier2Now,
+    });
+    await db.update(issues).set({ executionWorkspaceId: tier2WorkspaceId }).where(eq(issues.id, issueId));
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
 
     return { companyId, agentId, issueId, identifier };
   }
@@ -250,7 +308,7 @@ describeEmbeddedPostgres("best-effort activity log on issue routes", () => {
 
     const res = await request(app)
       .patch(`/api/issues/${identifier}`)
-      .send({ status: "done", comment: "Closed at Tier 2 (live): best-effort audit path exercised." });
+      .send({ status: "done", comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: best-effort audit path exercised." });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(await readStatus(issueId)).toBe("done");
@@ -312,7 +370,7 @@ describeEmbeddedPostgres("best-effort activity log on issue routes", () => {
     // same transaction (see issues.ts and `inbox-archive-routes`). Best-effort
     // covers the audits that run *after* their mutation has committed, which is
     // every other one on this route.
-    { label: "agent", issuePrefix: "BEG", nextStatus: "done", comment: "Closed at Tier 2 (live): best-effort audit path exercised." },
+    { label: "agent", issuePrefix: "BEG", nextStatus: "done", comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: best-effort audit path exercised." },
     { label: "board", issuePrefix: "BEH", nextStatus: "in_progress", comment: "Picked up: best-effort audit path exercised." },
   ])("keeps a $label status change committed when the audit insert fails", async ({ label, issuePrefix, nextStatus, comment }) => {
     const { companyId, agentId, issueId, identifier } = await seedIssue(issuePrefix);

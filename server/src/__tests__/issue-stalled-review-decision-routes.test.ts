@@ -11,6 +11,8 @@ import {
   companies,
   companyMemberships,
   createDb,
+  executionWorkspaces,
+  projects,
   heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
@@ -36,7 +38,28 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 // SUP-12693: every done transition must carry a tier declaration. These tests
 // are about review policy, not about the tier guard, so they satisfy it and
 // move on.
-const DONE_TIER_DECLARATION = "Closed at Tier 2 (live): review verdict path exercised.";
+const DONE_TIER_DECLARATION =
+  "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: review verdict path exercised.";
+
+const mockGetByName = vi.hoisted(() => vi.fn());
+const mockResolveSecretValue = vi.hoisted(() => vi.fn());
+vi.mock("../services/secrets.js", () => ({
+  secretService: () => ({ getByName: mockGetByName, resolveSecretValue: mockResolveSecretValue }),
+}));
+// SUP-21902: the done-transition guard resolves the declared probe head and the
+// delivery default branch tip through the commits API; the mocked remote serves
+// the same head for both, so the fixtures' named probe heads match the merge head.
+vi.mock("../services/github-fetch.js", () => ({
+  ghFetch: (url: string) =>
+    typeof url === "string" && /\/commits\//.test(url)
+      ? Promise.resolve({ ok: true, status: 200, json: async () => ({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }) } as unknown as Response)
+      : Promise.resolve(new Response(JSON.stringify({}), { status: 404 })),
+  gitHubApiBase: (hostname: string) =>
+    hostname === "github.com" || hostname === "www.github.com"
+      ? "https://api.github.com"
+      : `https://${hostname}/api/v3`,
+}));
+
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -80,6 +103,8 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(issueInboxArchives);
     await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projects);
     await db.delete(companyMemberships);
     await db.delete(agents);
     await db.delete(companies);
@@ -152,6 +177,46 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     return { companyId, assigneeAgentId, peerAgentId, memberUserId, peerUserId, viewerUserId };
   }
 
+/** SUP-21902: bind the card to a repo-backed execution workspace so its Tier 2
+ * close predicate can resolve the default branch and verify the declared head. */
+async function seedTier2RepoContext(companyId: string, issueId: string) {
+  const projectId = randomUUID();
+  const workspaceId = randomUUID();
+  const now = new Date();
+  await db.insert(projects).values({
+    id: projectId,
+    companyId,
+    name: "Tier 2 Fixture Project",
+    status: "active",
+    createdAt: now,
+    updatedAt: now,
+  });
+  await db.insert(executionWorkspaces).values({
+    id: workspaceId,
+    companyId,
+    projectId,
+    projectWorkspaceId: null,
+    sourceIssueId: null,
+    mode: "isolated_workspace",
+    strategyType: "git_worktree",
+    name: "tier2-fixture-ws",
+    status: "active",
+    cwd: "/tmp/test",
+    repoUrl: "https://github.com/TEA-Core/paperclip",
+    baseRef: "fold/tea-patches-v2026.722.0",
+    branchName: "tier2-fixture-ws",
+    providerType: "git_worktree",
+    providerRef: "/tmp/test",
+    lastUsedAt: now,
+    openedAt: now,
+    createdAt: now,
+    updatedAt: now,
+  });
+  await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, issueId));
+  mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+  mockResolveSecretValue.mockResolvedValue("test-token");
+}
+
   async function seedReview(input: {
     companyId: string;
     assigneeAgentId: string;
@@ -181,6 +246,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
         payload: { version: 1, prompt: "Review?" },
       });
     }
+    await seedTier2RepoContext(input.companyId, issueId);
     return issueId;
   }
 
@@ -375,6 +441,11 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     });
     const stageId = randomUUID();
     await db.update(issues).set({
+      // SUP-21902: the stage ladder's terminal approval would otherwise demand
+      // an OPEN repository delivery preflight this fixture does not model; the
+      // card's delivery is record-only, so the close only owes the Tier 2
+      // probe-head predicate, which the commits-API mock above verifies.
+      deliveryRequirement: "record_only",
       executionPolicy: {
         mode: "normal",
         commentRequired: true,
