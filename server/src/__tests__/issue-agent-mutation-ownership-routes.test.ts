@@ -366,11 +366,15 @@ function createRunContextDb(
   const firstRun = runRows[0] ?? {};
   const runAgentId = typeof firstRun.agentId === "string" ? firstRun.agentId : ownerAgentId;
   const runAgentCompanyId = typeof firstRun.agentCompanyId === "string" ? firstRun.agentCompanyId : companyId;
-  const rowsForSelection = async (selection: Record<string, unknown>, chatBindingQuery = false, settledRecoveryQuery = false, heartbeatRunQuery = false) => {
+  const rowsForSelection = async (selection: Record<string, unknown>, chatBindingQuery = false, settledRecoveryQuery = false, heartbeatRunQuery = false, tableName?: string) => {
     if (chatBindingQuery) return chatBindings;
     // An unknown selector has no settled recovery receipt. Returning the
     // generic issue fixture here would invent an unrelated replay row.
     if (settledRecoveryQuery) return [];
+    // SUP-21863: the changes_requested verdict path asks summary_slots
+    // whether this issue is a summary-generation card; the generic fallback
+    // row would fabricate one and hijack the return assignee.
+    if (tableName === "summary_slots") return [];
     if (heartbeatRunQuery) {
       const predicate = heartbeatRunQueries.at(-1);
       const [selectedRunId, selectedCompanyId, selectedAgentId, selectedStatus] = predicate?.params ?? [];
@@ -394,16 +398,16 @@ function createRunContextDb(
     }
     return [{ id: runAgentId, companyId: runAgentCompanyId, permissions: {}, role: "engineer", reportsTo: null }];
   };
-  const buildQuery = (selection: Record<string, unknown>, chatBindingQuery = false, settledRecoveryQuery = false, heartbeatRunQuery = false) => {
+  const buildQuery = (selection: Record<string, unknown>, chatBindingQuery = false, settledRecoveryQuery = false, heartbeatRunQuery = false, tableName?: string) => {
     const whereResult = {
       orderBy: vi.fn(async () => []),
       limit: vi.fn(() => ({
-        then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery, heartbeatRunQuery)),
+        then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery, heartbeatRunQuery, tableName)),
       })),
       for: vi.fn(() => ({
-        then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery, heartbeatRunQuery)),
+        then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery, heartbeatRunQuery, tableName)),
       })),
-      then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery, heartbeatRunQuery)),
+      then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery, heartbeatRunQuery, tableName)),
     };
     const query = {
       innerJoin: vi.fn(() => query),
@@ -432,6 +436,7 @@ function createRunContextDb(
           tableName === "chat_conversations",
           tableName === "issue_recovery_actions",
           heartbeatRunQuery,
+          tableName,
         );
       }),
     })),
@@ -1166,6 +1171,469 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  describe("active execution-stage participant verdict (SUP-21863)", () => {
+    const verdictStageId = "3f2d1c0b-9a8b-4c7d-8e6f-1a2b3c4d5e6f";
+    const secondApprovalStageId = "6a7b8c9d-0e1f-4022-8222-3c4d5e6f7a8b";
+    const thirdAgentId = "0f0e0d0c-0b0a-4004-8004-0f0e0d0c0b0a";
+    const verdictParticipant = { id: "5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b", type: "agent", agentId: peerAgentId };
+
+    function makeArmedReviewIssue(
+      overrides: Record<string, unknown> = {},
+      stateOverrides: Record<string, unknown> = {},
+    ) {
+      return makeIssue({
+        status: "in_review",
+        assigneeAgentId: ownerAgentId,
+        executionPolicy: {
+          mode: "normal",
+          stages: [
+            {
+              id: verdictStageId,
+              type: "review",
+              approvalsNeeded: 1,
+              participants: [verdictParticipant],
+            },
+          ],
+          returnAssigneeAgentId: ownerAgentId,
+        },
+        executionState: {
+          status: "pending",
+          currentStageId: verdictStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: verdictParticipant,
+          returnAssignee: { type: "agent", agentId: ownerAgentId },
+          deliveryAuthor: { type: "agent", agentId: ownerAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          changesRequestedCount: 0,
+          ...stateOverrides,
+        },
+        ...overrides,
+      });
+    }
+
+    function makeArmedApprovalIssue(
+      overrides: Record<string, unknown> = {},
+      stateOverrides: Record<string, unknown> = {},
+    ) {
+      return makeIssue({
+        status: "in_review",
+        assigneeAgentId: ownerAgentId,
+        executionPolicy: {
+          mode: "normal",
+          stages: [
+            {
+              id: verdictStageId,
+              type: "approval",
+              approvalsNeeded: 1,
+              participants: [verdictParticipant],
+            },
+            {
+              id: secondApprovalStageId,
+              type: "approval",
+              approvalsNeeded: 1,
+              participants: [
+                { id: "7b8c9d0e-1f2a-4033-8333-4d5e6f7a8b9c", type: "agent", agentId: thirdAgentId },
+              ],
+            },
+          ],
+          returnAssigneeAgentId: ownerAgentId,
+        },
+        executionState: {
+          status: "pending",
+          currentStageId: verdictStageId,
+          currentStageIndex: 0,
+          currentStageType: "approval",
+          currentParticipant: verdictParticipant,
+          returnAssignee: { type: "agent", agentId: ownerAgentId },
+          deliveryAuthor: { type: "agent", agentId: ownerAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          changesRequestedCount: 0,
+          ...stateOverrides,
+        },
+        ...overrides,
+      });
+    }
+
+    it("lets the armed stage's active participant submit its verdict while the assignee stays the delivery owner", async () => {
+      mockIssueService.getById.mockResolvedValue(makeArmedReviewIssue());
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", comment: "Changes requested: the guard is too narrow here." });
+
+      // Without SUP-21863 the boundary grant path reaches
+      // assertAgentIssueMutationAllowed, which rejects the reviewer as a
+      // non-assignee before the execution-policy engine can validate the
+      // verdict.
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          status: "in_progress",
+          assigneeAgentId: ownerAgentId,
+        }),
+        expect.anything(),
+      );
+    });
+
+    it("lets the active participant submit its verdict even when issue mutation is outside its boundary", async () => {
+      mockIssueService.getById.mockResolvedValue(makeArmedReviewIssue());
+      // Live SUP-21246 shape: the reviewer only holds a read grant, so
+      // decideIssueAccess(issue:mutate) would deny with issue_write_no_grant.
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action === "issue:read",
+        action: input.action,
+        reason: input.action === "issue:read" ? "allow_issue_mention_grant" : "deny_missing_grant",
+        explanation:
+          input.action === "issue:read"
+            ? "Allowed by a mention-scoped issue comment grant."
+            : "Missing permission.",
+      }));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", comment: "Changes requested: boundary-denied reviewer verdict." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          status: "in_progress",
+          assigneeAgentId: ownerAgentId,
+        }),
+        expect.anything(),
+      );
+    });
+
+    it("keeps third-party agents denied even for a verdict-shaped body", async () => {
+      mockIssueService.getById.mockResolvedValue(makeArmedReviewIssue());
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action === "issue:read",
+        action: input.action,
+        reason: input.action === "issue:read" ? "allow_issue_mention_grant" : "deny_missing_grant",
+        explanation: "Read grant only.",
+      }));
+
+      const res = await request(await createApp(peerActor({ agentId: thirdAgentId })))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", comment: "Third-party verdict attempt." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details.code).toBe("issue_write_no_grant");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("keeps a policy-restricted actor denied even for an exact active verdict", async () => {
+      // SUP-21915: the deferral exists only for the missing-grant shape. A
+      // policy-restricted actor class must keep its full denial even when it
+      // is the armed stage's current participant.
+      mockIssueService.getById.mockResolvedValue(makeArmedReviewIssue());
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action !== "issue:mutate",
+        action: input.action,
+        reason:
+          input.action === "issue:mutate" ? "deny_policy_restricted" : "allow_explicit_grant",
+        explanation:
+          input.action === "issue:mutate"
+            ? "Actor class is policy-restricted."
+            : "Allowed by test default.",
+      }));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", comment: "Verdict from a policy-restricted participant." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details.code).toBe("issue_write_actor_class_excluded");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("keeps a low-trust boundary actor denied even for an exact active verdict", async () => {
+      // SUP-21915: same as policy-restricted — the low-trust boundary is an
+      // actor-class wall the verdict deferral must not tunnel through.
+      mockIssueService.getById.mockResolvedValue(makeArmedReviewIssue());
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action !== "issue:mutate",
+        action: input.action,
+        reason:
+          input.action === "issue:mutate" ? "deny_low_trust_boundary" : "allow_explicit_grant",
+        explanation:
+          input.action === "issue:mutate"
+            ? "Actor is inside a low-trust boundary."
+            : "Allowed by test default.",
+      }));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", comment: "Verdict from a low-trust participant." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details.code).toBe("issue_write_actor_class_excluded");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("keeps a responsible-user coded denial enforced even for an exact active verdict", async () => {
+      // SUP-21915: `deny_missing_grant` alone is not enough — a decision that
+      // carries a responsible-user denial code names a harder ceiling, so the
+      // deferral must not fire and the coded denial copy must answer.
+      mockIssueService.getById.mockResolvedValue(makeArmedReviewIssue());
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action !== "issue:mutate",
+        action: input.action,
+        reason: input.action === "issue:mutate" ? "deny_missing_grant" : "allow_explicit_grant",
+        ...(input.action === "issue:mutate"
+          ? { code: "RESPONSIBLE_USER_UNAUTHORIZED" as const }
+          : {}),
+        explanation:
+          input.action === "issue:mutate"
+            ? "Responsible-user ceiling denial."
+            : "Allowed by test default.",
+      }));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", comment: "Verdict from a ceiling-denied participant." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details.code).toBe("issue_write_responsible_user_ceiling");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("keeps ordinary field mutations denied for the active participant", async () => {
+      mockIssueService.getById.mockResolvedValue(makeArmedReviewIssue());
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Participant field hijack" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("keeps comment-only writes denied for the active participant", async () => {
+      mockIssueService.getById.mockResolvedValue(makeArmedReviewIssue());
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ comment: "Comment-only write through the verdict deferral." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects verdict bodies that smuggle a reassignment alongside the verdict", async () => {
+      mockIssueService.getById.mockResolvedValue(makeArmedReviewIssue());
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", comment: "Verdict plus assignee change.", assigneeAgentId: thirdAgentId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("denies the participant when the pending state points at a stage missing from the policy", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeArmedReviewIssue({}, { currentStageId: "4d3c2b1a-0f1e-4d2c-9b8a-7f6e5d4c3b2a" }),
+      );
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", comment: "Verdict against a stale stage reference." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("denies the participant when the execution state is no longer pending", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeArmedReviewIssue({}, { status: "changes_requested" }),
+      );
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", comment: "Verdict after the stage already recorded changes_requested." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("keeps the verdict deferral working when workspace-pair healing rewrites the body (stored agent_default pair)", async () => {
+      // Round-2 review finding 1: healAgentDefaultProjectWorkspacePair writes
+      // `body.projectWorkspaceId = null` onto a verdict-only body when the
+      // stored issue carries the agent_default + projectWorkspaceId pair. The
+      // predicate must inspect the ORIGINAL body, or the injected key makes
+      // the verdict-only shape check fail and locks the lawful participant out.
+      mockIssueService.getById.mockResolvedValue(
+        makeArmedReviewIssue({
+          projectWorkspaceId: "8a9b0c1d-2e3f-4044-8444-5a6b7c8d9e0f",
+          executionWorkspacePreference: "agent_default",
+        }),
+      );
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", comment: "Changes requested on an agent_default-provisioned card." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_progress" }),
+        expect.anything(),
+      );
+    });
+
+    it("denies a stale currentParticipant that the current policy stage no longer lists as a participant", async () => {
+      // Round-2 review finding 2: the participant slot alone must not bypass
+      // ownership — the actor must still be an agent participant of the stage
+      // in the CURRENT policy revision.
+      mockIssueService.getById.mockResolvedValue(
+        makeArmedReviewIssue({
+          executionPolicy: {
+            mode: "normal",
+            stages: [
+              {
+                id: verdictStageId,
+                type: "review",
+                approvalsNeeded: 1,
+                participants: [
+                  { id: "9c0d1e2f-3a4b-4055-8555-6b7c8d9e0f1a", type: "agent", agentId: thirdAgentId },
+                ],
+              },
+            ],
+            returnAssigneeAgentId: ownerAgentId,
+          },
+        }),
+      );
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", comment: "Verdict from a participant the policy no longer lists." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("records the deferred verdict authorization path on the issue update and comment activity", async () => {
+      // Round-2 review finding 3: both the issue-update and the comment
+      // authorization metadata must name the deferred verdict path.
+      mockIssueService.getById.mockResolvedValue(makeArmedReviewIssue());
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", comment: "Changes requested with an audit trail." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.updated",
+          details: expect.objectContaining({
+            authorizationReason: "allow_active_stage_participant_verdict",
+            authorizationPath: "active_stage_participant_verdict",
+          }),
+        }),
+      );
+      // The comment's durable authorization metadata is passed to addComment:
+      // the verdict comment must be authored under the deferred allow reason,
+      // not the boundary's deny reason (the participant holds no generic
+      // write grant).
+      expect(mockIssueService.addComment).toHaveBeenCalledWith(
+        issueId,
+        expect.stringContaining("Changes requested with an audit trail."),
+        expect.objectContaining({ agentId: peerAgentId }),
+        expect.objectContaining({ authorizationReason: "allow_active_stage_participant_verdict" }),
+        expect.anything(),
+      );
+    });
+
+    it("lets the active participant approve a non-final approval stage, re-pending the next stage", async () => {
+      mockIssueService.getById.mockResolvedValue(makeArmedApprovalIssue());
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Approved: safe to advance to the second approval." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          status: "in_review",
+          executionState: expect.objectContaining({
+            currentStageId: secondApprovalStageId,
+            lastDecisionOutcome: "approved",
+          }),
+        }),
+        expect.anything(),
+      );
+    });
+
+    it("lets the active participant close the card with the final approval verdict, including comment and doneTier", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeArmedApprovalIssue({
+          // record_only: the final-approval close skips the repository
+          // delivery preflight (this harness has no repo context).
+          deliveryRequirement: "record_only",
+          executionPolicy: {
+            mode: "normal",
+            stages: [
+              {
+                id: verdictStageId,
+                type: "approval",
+                approvalsNeeded: 1,
+                participants: [verdictParticipant],
+              },
+            ],
+            returnAssigneeAgentId: ownerAgentId,
+          },
+        }),
+      );
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "done",
+          comment: "Approved: closing the delivery.",
+          doneTier: {
+            tier: "tier2",
+            probeEvidence:
+              "pkill -f 'paperclip serve' && paperclip serve >&2 & sleep 2; curl -sf http://127.0.0.1:8787/healthz => {\"ok\":true} on the locally built carrier head",
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const updateCall = mockIssueService.update.mock.calls.at(-1);
+      expect(updateCall?.[0]).toBe(issueId);
+      expect(updateCall?.[1]).toMatchObject({
+        status: "done",
+        executionState: {
+          status: "completed",
+          lastDecisionOutcome: "approved",
+          currentStageId: null,
+          completedStageIds: [verdictStageId],
+        },
+      });
+      const addCommentCall = mockIssueService.addComment.mock.calls.at(-1);
+      expect(addCommentCall?.[0]).toBe(issueId);
+      // The structured doneTier is rendered into the verdict comment.
+      expect(addCommentCall?.[1]).toEqual(
+        expect.stringMatching(
+          /Approved: closing the delivery\.[\s\S]*Closed at Tier 2 \(live\): .+healthz/,
+        ),
+      );
+      expect(addCommentCall?.[2]).toMatchObject({ agentId: peerAgentId });
+    });
   });
 
   it("denies cross-company agents before comment authorization is evaluated", async () => {
