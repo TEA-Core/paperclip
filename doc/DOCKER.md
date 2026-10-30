@@ -10,7 +10,7 @@ All commands below assume you are in the **project root** (the directory contain
 docker build -t paperclip-local .
 ```
 
-The Dockerfile installs common agent tools (`git`, `gh`, `curl`, `wget`, `ripgrep`, `python3`) and the Claude, Codex, and OpenCode CLIs. OpenCode on `PATH` is pinned to `opencode-ai@1.18.33` (`/usr/local/bin/opencode`). OpenCode V2 `@opencode/cli@2.0.26` is installed only at `/opt/opencode-v2/bin/opencode` and is not linked onto `PATH`, so a non-opted-in launch still runs V1. Opt in by setting that absolute path as the agent command. The linux/x64 binary digest is `d9123b9bcdb0a31f7ab9fe9812b58a9dc1768ad6d97e7b276dff1181813218c9`, written to `/opt/opencode-v2/OPENCODE_V2_SHA256` and checked on amd64 image builds.
+The Dockerfile installs common agent tools (`git`, `gh`, `curl`, `wget`, `ripgrep`, `python3`) and the Claude, Codex, and OpenCode CLIs. OpenCode on `PATH` is pinned to `opencode-ai@1.18.33` (`/usr/local/bin/opencode`). OpenCode V2 `@opencode/cli@2.0.26` is installed only at `/opt/opencode-v2/bin/opencode` and is not linked onto `PATH`, so a non-opted-in launch still runs V1. Opt in by setting that absolute path as the agent command. The linux/x64 binary digest is `d9123b9bcdb0a31f7ab9fe9812b58a9dc1768ad6d97e7b276dff1181813218c9`, written to `/opt/opencode-v2/OPENCODE_V2_SHA256` and checked on amd64 image builds. Both opencode installs run with an explicit npm `--allow-scripts` permission for their package: npm 11 ships only a stub `bin/opencode.exe`, and the real platform binary is placed by the package `postinstall` (without the allowance npm warns on every uncovered lifecycle script, and a future enforcement would leave the stub that errors).
 
 Build arguments:
 
