@@ -4601,7 +4601,6 @@ export function issueRoutes(
       | { completedStageIds?: string[]; lastDecisionOutcome?: string | null; lastDecisionId?: string | null }
       | undefined;
     if (!shouldPublishApprovalStatus(decision) || !ladderIsTerminallyApproved(policy, state)) return;
-    if (options.overrideAccepted) return;
     if (issue.deliveryRequirement === "record_only") {
       if (options.locked === undefined || options.locked.prefetch === null) return;
     }
@@ -4633,9 +4632,10 @@ export function issueRoutes(
       }
       resolution = prefetched.resolution;
     }
-    if (!resolution.repoBacked) return; // Existing repository-free doc/gate close.
+    if (issue.deliveryRequirement === "record_only" || !resolution.repoBacked) return;
     const { verdict, deliveryOwnerIssueId } = resolution;
     if (verdict.kind !== "resolved") {
+      if (options.overrideAccepted) return;
       const remedy = `Delivery owner ${deliveryOwnerIssueId}: provide one OPEN, non-draft owned PR and a readable reviewed head, then submit the final verdict again. ${verdict.reason}`;
       throw conflict("Final repository delivery preflight refused; stage remains pending", {
         code: "approval_final_delivery_preflight", reason: verdict.reason, deliveryOwnerIssueId, remedy,
@@ -19569,12 +19569,11 @@ export function issueRoutes(
         return;
       }
       doneOverrideAccepted = outcome.overrideAccepted === true;
-      if (terminalApprovalNeedsPreflight && outcome.overrideAccepted !== true) {
+      if (terminalApprovalNeedsClassificationCheck) {
+        finalDeliveryPrefetch = await prefetchFinalDelivery(finalDeliveryIssue);
         deferFinalDeliveryPrefetch = Boolean(existing.assigneeAgentId && (assigneeWillChange || terminalizingIssue));
         if (deferFinalDeliveryPrefetch) {
           originalDeliveryBinding = await readFinalDeliveryBinding(db, existing);
-        } else {
-          finalDeliveryPrefetch = await prefetchFinalDelivery(finalDeliveryIssue);
         }
       }
       if (!deferFinalDeliveryPrefetch) {
@@ -19938,6 +19937,7 @@ export function issueRoutes(
       || reviewPolicySensitiveMutationRequested
       || workspaceReprovisionCloseId !== null
       || deliveryIdentityWorkspaceBranchWrite
+      || terminalApprovalNeedsClassificationCheck
       // ADR-103 M4: a re-parent must commit atomically with its close-ladder
       // check, so force every parent-edge mutation through the transactional
       // path (a plain re-parent otherwise falls through to the non-
@@ -20143,17 +20143,15 @@ export function issueRoutes(
                 reason: "head_moved: delivery classification changed before final delivery preflight",
               });
             }
-            if (effectiveDeliveryRequirement !== "record_only") {
-              const effectiveLockedIssue =
-                effectiveDeliveryRequirement === lockedIssue.deliveryRequirement
-                  ? lockedIssue
-                  : { ...lockedIssue, deliveryRequirement: effectiveDeliveryRequirement };
-              const lockedPrefetch = finalDeliveryPrefetch ?? await prefetchFinalDelivery(effectiveLockedIssue);
-              await preflightTerminalApproval(effectiveLockedIssue, updateFields, transition.decision, nextExecutionPolicy, {
-                overrideAccepted: doneOverrideAccepted,
-                locked: { prefetch: lockedPrefetch, tx: tx as unknown as Db },
-              });
-            }
+            const effectiveLockedIssue =
+              effectiveDeliveryRequirement === lockedIssue.deliveryRequirement
+                ? lockedIssue
+                : { ...lockedIssue, deliveryRequirement: effectiveDeliveryRequirement };
+            const lockedPrefetch = finalDeliveryPrefetch ?? await prefetchFinalDelivery(effectiveLockedIssue);
+            await preflightTerminalApproval(effectiveLockedIssue, updateFields, transition.decision, nextExecutionPolicy, {
+              overrideAccepted: doneOverrideAccepted,
+              locked: { prefetch: lockedPrefetch, tx: tx as unknown as Db },
+            });
             issueUpdateData.executionState = updateFields.executionState;
           }
 

@@ -667,6 +667,31 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(fixture.writes).toEqual([]);
   });
 
+  it("refuses an accepted override when the card moves after its final-delivery snapshot", async () => {
+    const fixture = await pendingDelivery({ holdPull: true, mergeArmingEnabled: true });
+    const approval = fixture.approve({
+      doneTransitionOverride: {
+        disposition: "merged-elsewhere",
+        reason: "Deliverable merged elsewhere; this card has no deliverable head of its own.",
+      },
+    }).then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, approval, async () => {
+      await db.update(issues).set({ updatedAt: new Date(Date.now() + 60_000) })
+        .where(eq(issues.id, fixture.issue.id));
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.body.details).toMatchObject({
+      code: "approval_final_delivery_preflight_stale",
+      reason: expect.stringContaining("head_moved"),
+    });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_review");
+    expect(stored.executionState).toMatchObject({ status: "pending", completedStageIds: [] });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(fixture.writes).toEqual([]);
+  });
+
   it("refuses a final board verdict when the delivery binding changes during the preflight without touching the issue row", async () => {
     const previous = process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
     process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "true";
