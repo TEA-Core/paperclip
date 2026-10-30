@@ -5670,6 +5670,50 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.reason).not.toContain("transition allowed");
     });
 
+    // SUP-21019 review finding `record-only-work-product-row-validation-fails-open`: a row the
+    // read returned must be shape-checked, not read as "not a code-delivery row".
+    const malformedWorkProductRows: { label: string; rows: unknown[] }[] = [
+      { label: "empty object", rows: [{}] },
+      { label: "null", rows: [null] },
+      { label: "undefined", rows: [undefined] },
+      { label: "non-string type", rows: [{ type: 42 }] },
+      { label: "blank string type", rows: [{ type: "   " }] },
+      { label: "valid row beside a malformed row", rows: [{ type: "document" }, {}] },
+    ];
+    for (const { label, rows } of malformedWorkProductRows) {
+      it(`refuses record-only when a work product row is unusable (${label})`, async () => {
+        setupDbMock({ issueWorkProducts: rows as Record<string, unknown>[] });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          tierIssue,
+          recordOnlyLine(),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.skipped).toBe(false);
+        expect(result.reason).toContain("record-only");
+        expect(result.reason).toContain("unusable row");
+        expect(result.reason).not.toContain("transition allowed");
+      });
+    }
+
+    it("refuses record-only when a linked-PR row is unusable", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([null]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        recordOnlyLine(),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("record-only");
+      expect(result.reason).toContain("unusable row");
+    });
+
     it("refuses record-only combined with another landing-state token", async () => {
       const result = await evaluateDoneTierDeclaration(
         mockDb,

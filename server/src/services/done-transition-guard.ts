@@ -642,9 +642,9 @@ function parseTier1Declaration(body: string): Tier1Parse {
 //  - `record-only` (SUP-21019): the card has no repository deliverable to land. Proved at the
 //    close boundary by two independent, company+issue scoped reads: linked-PR resolution
 //    returning an empty list, and no `pull_request` / `branch` / `commit` work product on the
-//    card. Both reads fail closed — an error or unusable result is never read as "nothing
-//    found". Cards with an unlinked PR or a code-delivery work product keep the two landing
-//    proof paths above.
+//    card. Both reads fail closed — an error, an unusable result, or an unusable row (a
+//    non-object, or a missing/blank `type`) is never read as "nothing found". Cards with an
+//    unlinked PR or a code-delivery work product keep the two landing proof paths above.
 // TIER1_FORM is token-bearing so every emitted accepted form reaches the landing-token pre-check.
 // Tier 2 is a separate live-probe concern and is not checked here.
 const LANDED_AT_TIP_TOKEN = "landed-at-tip";
@@ -686,6 +686,21 @@ function unverifiedTier1(err: unknown): string {
 function unverifiedRecordOnly(err: unknown): string {
   const detail = err instanceof Error ? err.message : "unknown";
   return `Tier 1 declaration using "record-only" could not be verified at the close boundary (${detail}).`;
+}
+
+// SUP-21019 review finding `record-only-work-product-row-validation-fails-open`: every row the
+// two close-boundary reads return must be shape-checked before it is interpreted. A row that is
+// not an object, or whose `type` is absent/blank/non-string, is refused — never silently treated
+// as "not a code-delivery row" (which would admit `record-only` off a malformed read).
+function isUsableWorkProductRow(row: unknown): row is { type: string } {
+  if (typeof row !== "object" || row === null || Array.isArray(row)) return false;
+  const type = (row as { type?: unknown }).type;
+  return typeof type === "string" && type.trim().length > 0;
+}
+
+function isUsableLinkedPullRequestRow(row: unknown): boolean {
+  if (typeof row !== "object" || row === null || Array.isArray(row)) return false;
+  return Number.isInteger((row as { number?: unknown }).number);
 }
 
 async function loadTier1RepoFields(
@@ -852,6 +867,12 @@ async function proveRecordOnly(
     return refuseTier1(unverifiedRecordOnly(err));
   }
   if (linked.length > 0) {
+    if (!linked.every(isUsableLinkedPullRequestRow)) {
+      return refuseTier1(
+        'Tier 1 declaration using "record-only" could not be verified: linked pull request ' +
+          "resolution returned an unusable row.",
+      );
+    }
     return refuseTier1(
       `Tier 1 declaration using "record-only" is not truthful: the card has ${linked.length} ` +
         `linked pull request${linked.length === 1 ? "" : "s"} (${linked
@@ -875,6 +896,13 @@ async function proveRecordOnly(
       return refuseTier1(
         'Tier 1 declaration using "record-only" could not be verified: the work-product read ' +
           "returned an unusable result.",
+      );
+    }
+    const unusable = selected.some((row) => !isUsableWorkProductRow(row));
+    if (unusable) {
+      return refuseTier1(
+        'Tier 1 declaration using "record-only" could not be verified: the work-product read ' +
+          "returned an unusable row (every row must carry a non-empty string `type`).",
       );
     }
     rows = selected;
