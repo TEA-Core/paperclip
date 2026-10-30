@@ -1402,6 +1402,117 @@ export async function resolveCitedCommits(
 }
 
 /**
+ * SUP-21901 / SUP-21910: service-level backstop sweeps (merged-operator
+ * merge cards, execution-control reconciliation) transition cards to `done`
+ * outside every HTTP door, so they must run the SAME shared predicates the
+ * PATCH door runs — the delivery/ladder guard plus the done-tier declaration
+ * gate — instead of writing terminal status around them. This is the
+ * service-callable equivalent of the route wrapper
+ * (`evaluateDoneTransitionGuards` in routes/issues.ts). It intentionally does
+ * NOT post a thread-readable refusal comment: that helper is route-local, and
+ * a periodic sweep re-attempting a refused card every tick would spam the
+ * thread — refusals surface as the guard's own durable audit rows plus the
+ * caller's warn log, and the card stays non-terminal for its owner.
+ *
+ * Tier handling mirrors the wrapper's two branches exactly, without
+ * duplicating predicates:
+ * - a sweep that holds landing evidence supplies `structuredDoneTier`; it is
+ *   rendered into the close comment (persisted the same way PATCH renders the
+ *   structured field into the persisted close comment) and evaluated by the
+ *   shared `evaluateDoneTierDeclaration`.
+ * - a declaration-incapable system janitor passes none and gets the SUP-13939
+ *   board-bypass shape: the runner RETURNS the `doneTierSkipAudit` activity
+ *   input (same shape the guard's own audit rows use) instead of writing it —
+ *   a fire-and-forget insert here would race the caller's in-transaction
+ *   settle-window read (`max(updatedAt, latest comment, latest activity-log
+ *   row)`) and make the card look freshly active, silently un-closing it. The
+ *   bypass caller persists the row inside its close transaction so the skip
+ *   stays countable in the ghost-PASS census and dies with the close on
+ *   rollback.
+ *
+ * Callers must invoke this BEFORE opening their close transaction on an
+ * unlocked read: the delivery guard probes GitHub and the tier evaluator
+ * reads the comment store, and running either under the sweep's row lock
+ * reproduces the FOR KEY SHARE deadlock the recovery door fix documented.
+ */
+export async function evaluateDoneTransitionGuardForBackstopClose(input: {
+  db: Db;
+  issue: Parameters<typeof evaluateDoneTransitionGuard>[1] & { id: string };
+  actorId: string;
+  closeComment: string | null;
+  structuredDoneTier?: DoneTierDeclaration | null;
+  listComments?: (issueId: string) => Promise<IssueComment[]>;
+}): Promise<
+  | { allowed: true; closeComment: string | null; doneTierSkipAudit: null }
+  | {
+      allowed: true;
+      closeComment: string | null;
+      doneTierSkipAudit: Parameters<typeof logActivity>[1];
+    }
+  | {
+      allowed: false;
+      code: "done_transition_missing_delivery" | "done_transition_missing_tier_declaration";
+      reason: string;
+    }
+> {
+  const { db, issue, actorId, closeComment, structuredDoneTier, listComments } = input;
+  const guardResult = await evaluateDoneTransitionGuard(db, issue, null, false);
+  if (!guardResult.allowed) {
+    return {
+      allowed: false,
+      code: "done_transition_missing_delivery",
+      reason: guardResult.reason,
+    };
+  }
+  if (structuredDoneTier) {
+    const renderedComment = renderDoneTierDeclaration(closeComment, structuredDoneTier);
+    const tierResult = await evaluateDoneTierDeclaration(
+      db,
+      issue,
+      renderedComment,
+      null,
+      listComments ?? (async () => []),
+    );
+    if (!tierResult.allowed) {
+      return {
+        allowed: false,
+        code: "done_transition_missing_tier_declaration",
+        reason: tierResult.reason,
+      };
+    }
+    if (tierResult.tier === "tier1") {
+      void writeAuditLog(db, issue, "issue.done_transition_tier1_close", {
+        reason: tierResult.reason,
+        systemBackstopActor: actorId,
+      });
+    }
+    return { allowed: true, closeComment: renderedComment, doneTierSkipAudit: null };
+  }
+  return {
+    allowed: true,
+    closeComment,
+    doneTierSkipAudit: {
+      companyId: issue.companyId,
+      actorType: "system",
+      actorId: "done-transition-guard",
+      agentId: null,
+      runId: null,
+      agentApiKeyId: null,
+      action: "issue.done_tier_declaration_skipped",
+      entityType: "issue",
+      entityId: issue.id,
+      details: {
+        identifier: issue.identifier ?? null,
+        reason:
+          `System backstop actor ${actorId} closed this card; a system sweep cannot write a done-tier declaration`,
+        skipReason: `system_backstop_bypass:${actorId}`,
+        systemBackstopActor: actorId,
+      },
+    },
+  };
+}
+
+/**
  * SUP-13831: live discovery of open PRs when the issue has zero cached
  * mention rows. Mention rows are only created when a comment posts a full PR
  * URL; repos that name a PR without the URL (e.g. "PR #3264") leave the

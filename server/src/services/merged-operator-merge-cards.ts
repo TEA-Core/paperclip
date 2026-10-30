@@ -33,6 +33,7 @@ import {
   publishActivity,
   type ActivityPublication,
 } from "./activity-log.js";
+import { evaluateDoneTransitionGuardForBackstopClose } from "./done-transition-guard.js";
 
 export const MERGED_OPERATOR_MERGE_CARDS_ACTOR_ID = "system:merged-operator-merge-cards";
 export const MERGED_OPERATOR_MERGE_CARDS_CLOSED_ACTION = "issue.merged_operator_merge_card_closed";
@@ -375,6 +376,51 @@ export function createMergedOperatorMergeCardSweepService(
         ...evidenceLines,
       ].join("\n");
 
+      // SUP-21901 / SUP-21910: this sweep is a backstop `done` writer, so the
+      // close must pass the SAME shared done-transition guard the PATCH door
+      // runs — no duplicated predicates. The sweep live-probed every gate pull
+      // request as merged, so the close carries a truthful structured Tier-2
+      // declaration whose probe evidence is that measurement; it renders into
+      // the persisted close comment exactly like PATCH renders the structured
+      // doneTier field. Run BEFORE the advisory-lock transaction on an
+      // unlocked full-row read: the delivery guard probes GitHub and the tier
+      // evaluator reads the comment store, and running either under the row
+      // lock reproduces the FOR KEY SHARE deadlock the recovery door fix
+      // documented. A refusal defers the card (guard audit rows + warn); the
+      // in-transaction status re-check below stays authoritative.
+      const [guardIssue] = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, row.id))
+        .limit(1);
+      if (!guardIssue) continue;
+      const guardProbeEvidence = [
+        "all gate pull requests verified merged by the merged-operator merge-card sweep:",
+        ...references.map((reference) => {
+          const item = evidence.get(pullRequestEvidenceKey(row.companyId, reference))!;
+          const mergedAt = item.mergedAt ? ` merged at ${item.mergedAt}` : "";
+          const sha = item.mergeCommitSha ? `, merge commit ${item.mergeCommitSha}` : "";
+          return `${reference.owner}/${reference.repo}#${reference.number}${mergedAt}${sha}`;
+        }),
+      ].join(" ");
+      const guardVerdict = await evaluateDoneTransitionGuardForBackstopClose({
+        db,
+        issue: guardIssue,
+        actorId: MERGED_OPERATOR_MERGE_CARDS_ACTOR_ID,
+        closeComment: commentBody,
+        structuredDoneTier: { tier: "tier2", probeEvidence: guardProbeEvidence },
+        listComments: (issueId) =>
+          issueSvc.listComments(issueId, { order: "desc", limit: 100 }),
+      });
+      if (!guardVerdict.allowed) {
+        logger.warn(
+          { issueId: row.id, code: guardVerdict.code, reason: guardVerdict.reason },
+          "merged operator merge-card sweep: done-transition guard refused the close; deferring",
+        );
+        continue;
+      }
+      const closeCommentBody = guardVerdict.closeComment ?? commentBody;
+
       // The candidate scan is a snapshot; the close happens under a per-card
       // advisory lock so two concurrent sweeps (this process or another) cannot
       // both close the card or both write the withhold audit. Discharge read,
@@ -435,7 +481,7 @@ export function createMergedOperatorMergeCardSweepService(
           // passed explicitly: passing the tx handle as the service's own
           // connection would make update's internal `dbOrTx === db` check open
           // a nested transaction on the tx handle.
-          await issueSvc.addComment(row.id, commentBody, {}, {
+          await issueSvc.addComment(row.id, closeCommentBody, {}, {
             authorType: "system",
           }, txDb);
           const updated = await issueSvc.update(

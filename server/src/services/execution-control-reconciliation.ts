@@ -20,7 +20,7 @@ import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { reportRunFailure } from "./run-failure-report.js";
 import { conversationRunPredicate } from "./conversation-continuation.js";
-import { publishActivity, type ActivityPublication } from "./activity-log.js";
+import { logActivityInTransaction, publishActivity, type ActivityPublication } from "./activity-log.js";
 import {
   executeIssuePostCommitActions,
   issueService,
@@ -32,6 +32,7 @@ import {
 } from "./issue-continuation-path.js";
 import { hydrateSuccessfulRunHandoffLiveness } from "./successful-run-handoff-state.js";
 import { hasSummaryGenerationToken } from "./summary-slot-finalization.js";
+import { evaluateDoneTransitionGuardForBackstopClose } from "./done-transition-guard.js";
 
 /**
  * Terminal run states — a run in any of these is not live and cannot be
@@ -62,6 +63,16 @@ function staleOwnerLeasePredicate() {
  * this reaper drains.
  */
 export const SUMMARIZER_AGENT_ID = "bf538a39-f705-4600-9918-f4c8a49bb0a7";
+
+/**
+ * SUP-21901 / SUP-21910: system actor id recorded on the done-transition
+ * audit rows this sweep's backstop `done` writes emit. The stranded-summary
+ * reaper is a declaration-incapable system janitor (no landing and no live
+ * probe exists for "continuation paths all died"), so it takes the SUP-13939
+ * board-bypass shape — the tier skip itself is audited, keeping the close
+ * countable in the ghost-PASS census instead of a silent gap.
+ */
+const EXECUTION_CONTROL_RECONCILIATION_ACTOR_ID = "system:execution-control-reconciliation";
 
 /** The run→issue link used by the dispatch path (§2a disjuncts 1 and 4). */
 const HEARTBEAT_RUN_ISSUE_ID = sql<string>`coalesce(
@@ -367,6 +378,47 @@ export async function reapStrandedSummaryGenerationIssues(
       while (nextCandidate < candidates.length) {
         const candidate = candidates[nextCandidate++]!;
         try {
+          // SUP-21901 / SUP-21910: this reaper is a backstop `done` writer, so
+          // the terminal write must pass the SAME shared done-transition guard
+          // the PATCH door runs. Run BEFORE the close transaction on an
+          // unlocked full-row read (the delivery guard probes GitHub; under
+          // the row lock that reproduces the FOR KEY SHARE deadlock the
+          // recovery door fix documented). A delivery/ladder refusal defers
+          // the card — a true positive the sweep must not bypass — while the
+          // tier branch records the audited system-bypass row; the in-tx
+          // continuation re-checks below stay authoritative.
+          const [guardIssue] = await db
+            .select()
+            .from(issues)
+            .where(
+              and(
+                eq(issues.id, candidate.issueId),
+                eq(issues.companyId, candidate.companyId),
+              ),
+            )
+            .limit(1);
+          if (!guardIssue) continue;
+          const guardVerdict = await evaluateDoneTransitionGuardForBackstopClose({
+            db,
+            issue: guardIssue,
+            actorId: EXECUTION_CONTROL_RECONCILIATION_ACTOR_ID,
+            closeComment: null,
+          });
+          if (!guardVerdict.allowed) {
+            logger.warn(
+              {
+                issueId: candidate.issueId,
+                code: guardVerdict.code,
+                reason: guardVerdict.reason,
+              },
+              "Stranded summary-generation terminalization refused by the done-transition guard; continuing with other issues",
+            );
+            continue;
+          }
+          // Persisted INSIDE the close transaction below, after the settle
+          // read: a pre-transaction insert would make the card look freshly
+          // active to the settle window and silently un-close it.
+          const tierSkipAudit = guardVerdict.doneTierSkipAudit;
           const postCommitActivityPublications: ActivityPublication[] = [];
           const postCommitIssueActions: IssuePostCommitAction[] = [];
           const settled = await db.transaction(async (tx) => {
@@ -572,6 +624,14 @@ export async function reapStrandedSummaryGenerationIssues(
               lastActivityAt,
             });
             if (continuation.ok) return false;
+
+            // SUP-21901 / SUP-21910: the audited system tier-bypass row (the
+            // SUP-13939 census shape) lands in the SAME transaction as the
+            // terminal write — the census can never miss a close the sweep
+            // made, and a rollback kills both.
+            if (tierSkipAudit) {
+              await logActivityInTransaction(tx as unknown as Parameters<typeof logActivityInTransaction>[0], tierSkipAudit);
+            }
 
             // The funnel re-locks this same row (a no-op inside this
             // transaction), flips the status, and runs the terminal side
