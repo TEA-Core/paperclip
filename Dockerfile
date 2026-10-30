@@ -479,7 +479,10 @@ RUN if getent passwd "${AGENT_UID}" >/dev/null \
       fi \
    && gosu node-agent test -x /opt/opencode-v2/bin/opencode \
    && gosu node-agent test ! -w /opt/opencode-v2/bin/opencode \
-   && test "$(gosu node-agent /opt/opencode-v2/bin/opencode --version)" = "opencode v${OPENCODE_V2_VERSION}" \
+   # V2 (bun) creates $HOME/.local/share/opencode/log even for --version; at
+   # build time /paperclip is owned by node, so probe with HOME=/tmp. Runtime
+   # mounts /paperclip writable for the agent principal.
+   && test "$(gosu node-agent env HOME=/tmp /opt/opencode-v2/bin/opencode --version)" = "opencode v${OPENCODE_V2_VERSION}" \
    && test "$(gosu node /usr/local/bin/opencode --version)" = "1.18.33"
 
 COPY --from=build /app /app
