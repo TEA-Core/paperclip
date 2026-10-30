@@ -24340,9 +24340,6 @@ export function issueRoutes(
     let comment: Awaited<ReturnType<typeof svc.addComment>>;
     let goalCommentSteered = false;
     if (shouldAutoApproveReviewComment) {
-      if (doneTier !== undefined) {
-        commentBody = renderDoneTierDeclaration(commentBody, doneTier);
-      }
       const transition = applyIssueExecutionPolicyTransition({
         issue: currentIssue,
         policy: currentExecutionPolicy,
@@ -24363,6 +24360,10 @@ export function issueRoutes(
       // unwritten.
       const autoApproveEffectiveStatus =
         typeof transition.patch.status === "string" ? transition.patch.status : "done";
+      if (doneTier !== undefined && autoApproveEffectiveStatus === "done") {
+        commentBody = renderDoneTierDeclaration(commentBody, doneTier);
+        if (transition.decision) transition.decision.body = commentBody;
+      }
       if (autoApproveEffectiveStatus === "done" && currentIssue.status !== "done") {
         const outcome = await evaluateDoneTransitionGuards({
           issue: currentIssue,

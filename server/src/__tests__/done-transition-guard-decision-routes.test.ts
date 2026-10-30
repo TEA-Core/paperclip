@@ -974,6 +974,42 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(decision?.body).toBe(expectedBody);
   });
 
+  it("POST comment: a non-final-stage approval with a structured tier does not persist a close line", async () => {
+    // The render must key on the status the transition RESOLVES to. A stage-1
+    // approval on a two-stage ladder resolves to `in_review`; stamping a Tier
+    // line there would be a ghost close in both the comment and the decision audit.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D20574B", {
+      stageCount: 2,
+    });
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockMergedBranch();
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({
+        body: "## Review: APPROVED\n\nShip it.",
+        doneTier: { tier: "tier2", probeEvidence: "reviewer probe verified the patched path on the PR head." },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await statusOf(issueId)).toBe("in_review");
+
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const comment = comments.find((entry) => entry.body?.startsWith("## Review: APPROVED"));
+    const decisions = await db
+      .select({ body: issueExecutionDecisions.body })
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    const decision = decisions.find((entry) => entry.body?.startsWith("## Review: APPROVED"));
+
+    expect(comment?.body).toBe("## Review: APPROVED\n\nShip it.");
+    expect(comment?.body).not.toContain("Closed at Tier");
+    expect(decision?.body).not.toContain("Closed at Tier");
+  });
+
     it("POST comment: a decision-carrying approval without a tier declaration 422s with nothing written (SUP-14367)", async () => {
       // The guard runs BEFORE the comment+status transaction (the pre-transaction
       // contract): a 422 must leave both the comment and the status change unwritten,
