@@ -580,7 +580,9 @@ describe("execute — cliVersion validation", () => {
           context: {},
           onLog: async () => {},
         }),
-      ).rejects.toThrow("Unsupported OpenCode CLI version: 2.0.26");
+      ).rejects.toThrow(
+        `Unsupported OpenCode CLI version: 2.0.26 reported by ${commandPath}. Install 2.2.4 or point command at a V1 binary.`,
+      );
       expect(runAdapterExecutionTargetProcessMock).not.toHaveBeenCalled();
     } finally {
       await fs.rm(root, { recursive: true, force: true });

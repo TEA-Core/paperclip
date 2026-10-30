@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { OPENCODE_V2_SUPPORTED_CLI_VERSIONS } from "../index.js";
+import { OPENCODE_V2_CLI_VERSION } from "../index.js";
 import { buildOpenCodeRunArgs } from "./execute.js";
 import {
   isOpenCodeV2CliVersion,
-  isSupportedOpenCodeV2CliVersion,
+  unsupportedDetectedOpenCodeV2CliVersionMessage,
   unsupportedOpenCodeV2CliVersionMessage,
 } from "./version.js";
 
@@ -18,15 +18,20 @@ describe("OpenCode V2 detection", () => {
     expect(isOpenCodeV2CliVersion(null)).toBe(false);
   });
 
-  it("accepts only listed versions, so a bump is a list change", () => {
-    for (const version of OPENCODE_V2_SUPPORTED_CLI_VERSIONS) {
-      expect(isSupportedOpenCodeV2CliVersion(version)).toBe(true);
-      expect(isOpenCodeV2CliVersion(version)).toBe(true);
-    }
-    expect(isSupportedOpenCodeV2CliVersion("2.0.26")).toBe(false);
-    expect(isSupportedOpenCodeV2CliVersion("1.18.33")).toBe(false);
-    expect(isSupportedOpenCodeV2CliVersion("")).toBe(false);
-    expect(unsupportedOpenCodeV2CliVersionMessage("2.0.26")).toContain(OPENCODE_V2_SUPPORTED_CLI_VERSIONS[0]);
+  it("pins the V2 runtime to 2.2.4", () => {
+    expect(OPENCODE_V2_CLI_VERSION).toBe("2.2.4");
+    expect(isOpenCodeV2CliVersion(OPENCODE_V2_CLI_VERSION)).toBe(true);
+  });
+
+  it("words the configured and detected rejections for what the operator can actually do", () => {
+    expect(unsupportedOpenCodeV2CliVersionMessage("2.0.26")).toBe(
+      "Unsupported OpenCode CLI version: 2.0.26. Use 2.2.4 for V2 opt-in or omit cliVersion for V1.",
+    );
+    const detected = unsupportedDetectedOpenCodeV2CliVersionMessage("opencode", "2.3.0");
+    expect(detected).toBe(
+      "Unsupported OpenCode CLI version: 2.3.0 reported by opencode. Install 2.2.4 or point command at a V1 binary.",
+    );
+    expect(detected).not.toContain("omit cliVersion");
   });
 
   it("builds V2 argv from the same rule for any 2.x version", () => {

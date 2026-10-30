@@ -32,8 +32,12 @@ import {
 } from "./models.js";
 import { verifyRemoteOpenCodeCliVersion } from "./execute.js";
 import { parseOpenCodeJsonl } from "./parse.js";
-import { OPENCODE_V2_SUPPORTED_CLI_VERSIONS, SANDBOX_INSTALL_COMMAND } from "../index.js";
-import { isOpenCodeV2CliVersion, isSupportedOpenCodeV2CliVersion } from "./version.js";
+import { OPENCODE_V2_CLI_VERSION, SANDBOX_INSTALL_COMMAND } from "../index.js";
+import {
+  isOpenCodeV2CliVersion,
+  probeOpenCodeCliVersion,
+  unsupportedDetectedOpenCodeV2CliVersionMessage,
+} from "./version.js";
 import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
 
 function summarizeStatus(checks: AdapterEnvironmentCheck[]): AdapterEnvironmentTestResult["status"] {
@@ -77,7 +81,8 @@ export async function testEnvironment(
   const checks: AdapterEnvironmentCheck[] = [];
   const config = parseObject(ctx.config);
   const command = asString(config.command, "opencode");
-  const cliVersion = asString(config.cliVersion, "").trim();
+  const configuredCliVersion = asString(config.cliVersion, "").trim();
+  let cliVersion = configuredCliVersion;
   const target = ctx.executionTarget ?? null;
   const targetIsRemote = target?.kind === "remote";
   const targetIsSandbox = target?.kind === "remote" && target.transport === "sandbox";
@@ -87,12 +92,12 @@ export async function testEnvironment(
     : null;
   const runId = `opencode-envtest-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-  if (cliVersion && !isSupportedOpenCodeV2CliVersion(cliVersion)) {
+  if (configuredCliVersion && configuredCliVersion !== OPENCODE_V2_CLI_VERSION) {
     checks.push({
       code: "opencode_cli_version_unsupported",
       level: "error",
-      message: `Unsupported OpenCode CLI version: ${cliVersion}.`,
-      hint: `Use ${OPENCODE_V2_SUPPORTED_CLI_VERSIONS.join(" or ")} for V2 opt-in or omit cliVersion for V1.`,
+      message: `Unsupported OpenCode CLI version: ${configuredCliVersion}.`,
+      hint: `Use ${OPENCODE_V2_CLI_VERSION} for V2 opt-in or omit cliVersion for V1.`,
     });
   }
 
@@ -217,6 +222,25 @@ export async function testEnvironment(
       if (installCheck) checks.push(installCheck);
       try {
         await ensureAdapterExecutionTargetCommandResolvable(command, runtimeTarget, runtimeCwd, runtimeEnv);
+        if (!configuredCliVersion) {
+          const detected = await probeOpenCodeCliVersion({
+            runId: `${runId}:opencode-version`,
+            command,
+            target: runtimeTarget,
+            cwd: runtimeCwd,
+            env: targetIsRemote ? preparedRuntimeConfig.env : runtimeEnv,
+            timeoutSec: 10,
+            graceSec: 3,
+          });
+          cliVersion = detected?.version ?? "";
+          if (isOpenCodeV2CliVersion(cliVersion) && cliVersion !== OPENCODE_V2_CLI_VERSION) {
+            checks.push({
+              code: "opencode_cli_version_unsupported",
+              level: "error",
+              message: unsupportedDetectedOpenCodeV2CliVersionMessage(command, cliVersion),
+            });
+          }
+        }
         if (isOpenCodeV2CliVersion(cliVersion)) {
           if (targetIsRemote && runtimeTarget) {
             await verifyRemoteOpenCodeCliVersion({

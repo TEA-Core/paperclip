@@ -13,7 +13,8 @@ import {
 } from "./models.js";
 import { execute } from "./execute.js";
 import { testEnvironment } from "./test.js";
-import { isSupportedOpenCodeV2CliVersion, parseOpenCodeCliVersion } from "./version.js";
+import { OPENCODE_V2_CLI_VERSION } from "../index.js";
+import { parseOpenCodeCliVersion } from "./version.js";
 
 // Drives a real OpenCode V2 binary (`@opencode/cli`, called by its absolute
 // `cli-<platform>/bin/opencode` path because the package's own `opencode` bin
@@ -167,7 +168,7 @@ const suite = describe.skipIf(!enabled || !binary)("OpenCode V2 real-binary acce
   }
 
   it("runs a binary version the adapter supports and never inherits the model-discovery bypass", async () => {
-    expect(isSupportedOpenCodeV2CliVersion(cliVersion)).toBe(true);
+    expect(cliVersion).toBe(OPENCODE_V2_CLI_VERSION);
     expect(process.env.OPENCODE_ALLOW_ALL_MODELS).toBeUndefined();
     expect(baseEnv.OPENCODE_ALLOW_ALL_MODELS).toBeUndefined();
     const result = await testEnvironment({

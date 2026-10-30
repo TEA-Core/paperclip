@@ -90,7 +90,7 @@ import {
 } from "./db-guard.js";
 import { ensureAgentAccessibleDir } from "@paperclipai/adapter-utils/agent-shared-dir";
 import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
-import { SANDBOX_INSTALL_COMMAND } from "../index.js";
+import { OPENCODE_V2_CLI_VERSION, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { redactCommandText } from "@paperclipai/adapter-utils/command-redaction";
 import {
   prepareOpenCodeIsolatedSkillsHome,
@@ -100,8 +100,8 @@ import {
 import { formatOpenCodeSkillExposureLine } from "./exposure-line.js";
 import {
   isOpenCodeV2CliVersion,
-  isSupportedOpenCodeV2CliVersion,
   probeOpenCodeCliVersion,
+  unsupportedDetectedOpenCodeV2CliVersionMessage,
   unsupportedOpenCodeV2CliVersionMessage,
 } from "./version.js";
 
@@ -733,7 +733,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
   const command = asString(config.command, "opencode");
   const configuredCliVersion = asString(config.cliVersion, "").trim();
-  if (configuredCliVersion && !isSupportedOpenCodeV2CliVersion(configuredCliVersion)) {
+  if (configuredCliVersion && configuredCliVersion !== OPENCODE_V2_CLI_VERSION) {
     throw new Error(unsupportedOpenCodeV2CliVersionMessage(configuredCliVersion));
   }
   const model = asString(config.model, "").trim();
@@ -963,8 +963,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     graceSec,
   });
   const cliVersion = configuredCliVersion || detectedCliVersion?.version;
-  if (cliVersion && isOpenCodeV2CliVersion(cliVersion) && !isSupportedOpenCodeV2CliVersion(cliVersion)) {
-    throw new Error(unsupportedOpenCodeV2CliVersionMessage(cliVersion));
+  if (cliVersion && isOpenCodeV2CliVersion(cliVersion) && cliVersion !== OPENCODE_V2_CLI_VERSION) {
+    throw new Error(unsupportedDetectedOpenCodeV2CliVersionMessage(command, cliVersion));
   }
   const openCodeV2 = isOpenCodeV2CliVersion(cliVersion);
   const runtimeMcpServers = openCodeV2 ? await ctx.runtimeMcp?.getServers() ?? [] : [];
