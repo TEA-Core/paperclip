@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   agents as agentsTable,
@@ -11,6 +12,10 @@ import {
   countLadderedChildren,
   evaluateDoneTransitionGuard,
   evaluateDoneTierDeclaration,
+  DONE_TIER_STRUCTURED_FORMS,
+  DONE_TIER_TIER1_DELEGATED_JSON,
+  DONE_TIER_TIER1_LANDED_JSON,
+  DONE_TIER_TIER2_JSON,
   renderDoneTierDeclaration,
   TIER1_FORM,
   GitHubAuthError,
@@ -267,8 +272,10 @@ vi.mock("./secrets.js", () => ({
 }));
 
 const mockResolveGitHubToken = vi.hoisted(() => vi.fn());
+const mockResolveGitHubTokenCandidatesForRepo = vi.hoisted(() => vi.fn());
 vi.mock("./github-credential.js", () => ({
   resolveGitHubToken: mockResolveGitHubToken,
+  resolveGitHubTokenCandidatesForRepo: mockResolveGitHubTokenCandidatesForRepo,
 }));
 
 vi.mock("./activity-log.js", () => ({
@@ -340,6 +347,10 @@ describe("evaluateDoneTransitionGuard", () => {
     mockFetchOpenPullRequests.mockResolvedValue({ ok: true, status: 200, message: null, items: [] });
     mockResolveGitHubToken.mockReset();
     mockResolveGitHubToken.mockResolvedValue({ token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" });
+    mockResolveGitHubTokenCandidatesForRepo.mockReset();
+    mockResolveGitHubTokenCandidatesForRepo.mockResolvedValue([
+      { token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" },
+    ]);
     vi.mocked(logActivity).mockClear();
     mockExecFile.mockReset();
     mockGitProbe("0", "0");
@@ -3238,6 +3249,60 @@ describe("evaluateDoneTransitionGuard", () => {
     });
   });
 
+  describe("record_only delivery requirement (SUP-21258)", () => {
+    it("skips repository delivery for record_only without probing GitHub or linked PRs", async () => {
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, deliveryRequirement: "record_only" },
+        null,
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.skipped).toBe(true);
+      expect(result.skipReason).toBe("record_only_delivery_skipped");
+      expect(result.reason).toContain("repository/PR delivery is not required");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_guard_skipped",
+          details: expect.objectContaining({ skipReason: "record_only_delivery_skipped" }),
+        }),
+      );
+    });
+
+    it("does not skip repository delivery for repository_delivery", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 1, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#1", cachedState: "open", lastErrorCode: null },
+      ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, deliveryRequirement: "repository_delivery" },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipReason).not.toBe("record_only_delivery_skipped");
+    });
+
+    it("still refuses a record_only close whose review ladder is unsatisfied", async () => {
+      const stageA = "11111111-1111-4111-8111-111111111111";
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        {
+          ...issue,
+          deliveryRequirement: "record_only",
+          executionPolicy: { stages: [{ id: stageA, type: "review" }] },
+          executionState: {},
+        },
+        null,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.mechanism).toBe("C");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+  });
+
   describe("open linked PRs block", () => {
     it("blocks transition when a linked PR is cached open, no GitHub token configured, and the last refresh succeeded (zero outbound fetch)", async () => {
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([
@@ -5306,6 +5371,41 @@ describe("evaluateDoneTierDeclaration", () => {
       })).toBe("Closing now\n\nClosed at Tier 2 (live): Health check returned 200");
     });
 
+    it("replaces conflicting canonical tier declarations", () => {
+      expect(renderDoneTierDeclaration(
+        "Context\nClosed at Tier 0 (decision-only): stale reason",
+        {
+          tier: "tier2",
+          probeEvidence: "Health check returned 200",
+        },
+      )).toBe(
+        "Context\n\nClosed at Tier 2 (live): Health check returned 200",
+      );
+      expect(renderDoneTierDeclaration(
+        "Context\nClosed at Tier 2 (live): stale evidence",
+        {
+          tier: "tier1",
+          reason: "Merged change is ready",
+          landing: { mode: "landedAtTip", mergeCommit: "abcdef1234567" },
+        },
+      )).toBe(
+        "Context\n\nClosed at Tier 1 (landed, not liveness-probed): landed-at-tip abcdef1234567 — Merged change is ready. Liveness unverified.",
+      );
+    });
+
+    it("replaces a conflicting declaration even when the requested tier is also present", () => {
+      expect(renderDoneTierDeclaration(
+        "Context\nClosed at Tier 2 (live): stale evidence\nClosed at Tier 1 (landed, not liveness-probed): valid declaration. Liveness unverified.",
+        {
+          tier: "tier1",
+          reason: "Updated reason",
+          landing: { mode: "landedAtTip", mergeCommit: "abcdef1234567" },
+        },
+      )).toBe(
+        "Context\n\nClosed at Tier 1 (landed, not liveness-probed): landed-at-tip abcdef1234567 — Updated reason. Liveness unverified.",
+      );
+    });
+
     it("renders both Tier 1 landing states with exactly one landing token", () => {
       expect(renderDoneTierDeclaration(null, {
         tier: "tier1",
@@ -5319,12 +5419,50 @@ describe("evaluateDoneTierDeclaration", () => {
       })).toBe("Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #123 via done-close-landing-backstop — Landing delegated. Liveness unverified.");
     });
 
-    it("does not duplicate an existing valid declaration", () => {
-      const body = "Closed at Tier 2 (live): already rendered";
+    it("preserves the body when the existing Tier 2 declaration matches", () => {
+      const body = "Context\n\nClosed at Tier 2 (live): existing evidence\n\nFollow-up";
       expect(renderDoneTierDeclaration(body, {
         tier: "tier2",
-        probeEvidence: "new evidence",
+        probeEvidence: "existing evidence",
       })).toBe(body);
+    });
+
+    it("preserves the body when the existing Tier 1 declaration matches", () => {
+      const body = "Context\n\nClosed at Tier 1 (landed, not liveness-probed): landed-at-tip abcdef1234567 — Merged change is ready. Liveness unverified.\n\nFollow-up";
+      expect(renderDoneTierDeclaration(body, {
+        tier: "tier1",
+        reason: "Merged change is ready",
+        landing: { mode: "landedAtTip", mergeCommit: "abcdef1234567" },
+      })).toBe(body);
+    });
+
+    it("replaces an existing same-tier declaration with the supplied declaration", () => {
+      expect(renderDoneTierDeclaration("Closed at Tier 2 (live): stale evidence", {
+        tier: "tier2",
+        probeEvidence: "new evidence",
+      })).toBe("Closed at Tier 2 (live): new evidence");
+    });
+
+    it("renders structured declarations only after both close doors resolve to done", () => {
+      const route = readFileSync(new URL("../routes/issues.ts", import.meta.url), "utf8");
+      const patchStatus = route.indexOf("const effectiveStatus =");
+      const patchRender = route.indexOf('if (doneTier !== undefined && effectiveStatus === "done") {');
+      const transitionComment = route.indexOf("const transitionCommentBody =");
+      const transition = route.indexOf(
+        "const transition = applyIssueExecutionPolicyTransition({",
+        transitionComment,
+      );
+      const commentStatus = route.indexOf("const autoApproveEffectiveStatus =");
+      const commentRender = route.indexOf('if (doneTier !== undefined && autoApproveEffectiveStatus === "done") {');
+
+      expect(patchStatus).toBeGreaterThan(-1);
+      expect(patchRender).toBeGreaterThan(patchStatus);
+      expect(transitionComment).toBeGreaterThan(-1);
+      expect(transitionComment).toBeLessThan(transition);
+      expect(commentStatus).toBeGreaterThan(patchRender);
+      expect(commentRender).toBeGreaterThan(commentStatus);
+      expect(route).not.toContain('if (doneTier !== undefined && updateFields.status === "done")');
+      expect(route).not.toContain("req.body.doneTier && req.body.reopen !== true");
     });
   });
 
@@ -5395,7 +5533,7 @@ describe("evaluateDoneTierDeclaration", () => {
 
     it("feeds the Tier 1 remedy form through the landing-token pre-check", async () => {
       ghFetchMock.mockClear();
-      const remedyForm = TIER1_FORM.slice(1, -1);
+      const remedyForm = TIER1_FORM.split('" or "')[1]!.replace(/^"|"$/g, "");
       const result = await evaluateDoneTierDeclaration(
         mockDb,
         tierIssue,
@@ -5406,6 +5544,75 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.reason).not.toContain("missing a landing-state token");
       expect(result.reason).toContain("must name a linked PR");
       expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("SUP-21328: accepted Tier 1 forms advertise both landed-at-tip and landing-delegated", () => {
+      expect(TIER1_FORM).toContain("landed-at-tip <sha>");
+      expect(TIER1_FORM).toContain("landing-delegated PR #<N>");
+      expect(TIER1_FORM).toContain("done-close-landing-backstop");
+    });
+
+    it("SUP-21328: each advertised Tier 1 prose form reaches the landing-token pre-check", async () => {
+      const forms = TIER1_FORM.split('" or "').map((form) => form.replace(/^"|"$/g, ""));
+      expect(forms).toHaveLength(2);
+      for (const form of forms) {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          tierIssue,
+          form,
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.reason).not.toContain("missing a landing-state token");
+      }
+    });
+
+    it("SUP-21328: missing-tier remedy names structured doneTier with an exact JSON form per tier", async () => {
+      expect(DONE_TIER_STRUCTURED_FORMS).toContain('"doneTier":');
+      expect(DONE_TIER_TIER2_JSON).toBe(
+        '"doneTier": { "tier": "tier2", "probeEvidence": "<consumer-surface probe output>" }',
+      );
+      expect(DONE_TIER_TIER1_LANDED_JSON).toBe(
+        '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landedAtTip", "mergeCommit": "<sha>" } }',
+      );
+      expect(DONE_TIER_TIER1_DELEGATED_JSON).toBe(
+        '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landingDelegated", "prNumber": <N>, "carrier": "done-close-landing-backstop" } }',
+      );
+      expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER2_JSON);
+      expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_LANDED_JSON);
+      expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_DELEGATED_JSON);
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        "Fixed the bug, no tiers here.",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("landed-at-tip <sha>");
+      expect(result.reason).toContain("landing-delegated PR #<N>");
+
+      const route = readFileSync(new URL("../routes/issues.ts", import.meta.url), "utf8");
+      expect(route).toContain("DONE_TIER_STRUCTURED_FORMS");
+      expect(route).toContain("structured doneTier field");
+    });
+
+    it("SUP-21474: routes remedy interpolates TIER1_FORM un-cut so both Tier 1 forms keep balanced quotes", () => {
+      const route = readFileSync(new URL("../routes/issues.ts", import.meta.url), "utf8");
+      expect(route).not.toContain("TIER1_FORM.slice(1, -1)");
+      expect(route).toContain("` or ${TIER1_FORM}`");
+
+      const tier2Form = '"Closed at Tier 2 (live): <probe evidence>"';
+      const remedy = `${tier2Form} or ${TIER1_FORM} — per SUP-12693.`;
+      expect(remedy).toContain(
+        '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."',
+      );
+      expect(remedy).toContain(
+        '"Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; landing obligation transferred to done-close-landing-backstop, not yet discharged; <why Tier 2 was not probed>. Liveness unverified."',
+      );
+      expect(TIER1_FORM.startsWith('"')).toBe(true);
+      expect(TIER1_FORM.endsWith('"')).toBe(true);
     });
 
     it("rejects Tier 1 substitution with empty reason", async () => {
@@ -5477,6 +5684,10 @@ describe("evaluateDoneTierDeclaration", () => {
         scope: "company",
         secretName: "GITHUB_TOKEN",
       });
+      mockResolveGitHubTokenCandidatesForRepo.mockReset();
+      mockResolveGitHubTokenCandidatesForRepo.mockResolvedValue([
+        { token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" },
+      ]);
       setupDbMock({ executionWorkspaces: [mockExecutionWorkspaceRow()] });
     });
 
@@ -5583,6 +5794,248 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(
         mockDb, "company-1", "issue-1", { includeDrafts: true },
       );
+    });
+
+    it("refuses landing-delegated when the repository has auto-merge disabled and no merge queue", async () => {
+      const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);
+      ghFetchMock.mockImplementation(async (url) => {
+        if (String(url).endsWith("/pulls/4103")) {
+          return new Response(JSON.stringify({ state: "open", draft: false, base: { ref: "main" } }), { status: 200 });
+        }
+        if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
+          return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        if (String(url).includes("graphql")) {
+          return new Response(JSON.stringify({ data: { repository: { mergeQueue: null } } }), { status: 200 });
+        }
+        if (String(url).endsWith("/pulls/4103")) {
+          return new Response(JSON.stringify({ auto_merge: null }), { status: 200 });
+        }
+        return new Response("{}", { status: 500 });
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("auto-merge is disabled");
+      expect(result.reason).toContain("no merge queue");
+      expect(mockResolveGitHubTokenCandidatesForRepo).toHaveBeenCalledWith(
+        mockDb,
+        "company-1",
+        "TEA-Core",
+        "paperclip",
+      );
+    });
+
+    it("does not use a cached base branch when live hydration omits base.ref", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { ...linkedPr(4103, "open"), baseRefName: "main" },
+      ]);
+      let queueProbeSeen = false;
+      ghFetchMock.mockImplementation(async (url, init) => {
+        const u = String(url);
+        if (u.includes("graphql") && String((init as { body?: string } | undefined)?.body ?? "").includes("mergeQueue")) {
+          queueProbeSeen = true;
+        }
+        if (u.endsWith("/pulls/4103")) {
+          return new Response(JSON.stringify({
+            state: "open",
+            draft: false,
+            head: { ref: "SUP-42-branch", repo: { full_name: "TEA-Core/paperclip" } },
+          }), { status: 200 });
+        }
+        if (u.endsWith("/repos/TEA-Core/paperclip")) {
+          return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        return new Response("{}", { status: 500 });
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+      expect(queueProbeSeen).toBe(false);
+    });
+
+    it("accepts landing-delegated when auto-merge is disabled but a merge queue covers the base branch", async () => {
+      const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);
+      ghFetchMock.mockImplementation(async (url) => {
+        if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
+          return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        if (String(url).includes("graphql")) {
+          return new Response(JSON.stringify({ data: { repository: { mergeQueue: { configuration: { mergeMethod: "SQUASH" } } } } }), { status: 200 });
+        }
+        return new Response("{}", { status: 500 });
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("accepts landing-delegated when auto-merge is disabled but the PR is already queued for auto-merge", async () => {
+      const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);
+      ghFetchMock.mockImplementation(async (url) => {
+        if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
+          return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        if (String(url).includes("graphql")) {
+          return new Response(JSON.stringify({ data: { repository: { mergeQueue: null } } }), { status: 200 });
+        }
+        if (String(url).endsWith("/pulls/4103")) {
+          return new Response(JSON.stringify({ auto_merge: { enabled_by: { login: "bot" }, merge_method: "squash", commit_title: "", commit_message: "" } }), { status: 200 });
+        }
+        return new Response("{}", { status: 500 });
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("accepts landing-delegated when the merge queue GraphQL response has errors", async () => {
+      const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);
+      ghFetchMock.mockImplementation(async (url) => {
+        if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
+          return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        if (String(url).includes("graphql")) {
+          return new Response(JSON.stringify({ errors: [{ message: "RATE_LIMITED" }] }), { status: 200 });
+        }
+        return new Response("{}", { status: 500 });
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("accepts landing-delegated when the auto-merge lookup fails", async () => {
+      const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);
+      ghFetchMock.mockImplementation(async (url) => {
+        if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
+          return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        if (String(url).includes("graphql")) {
+          return new Response(JSON.stringify({ data: { repository: { mergeQueue: null } } }), { status: 200 });
+        }
+        if (String(url).endsWith("/pulls/4103")) {
+          return new Response("{}", { status: 503 });
+        }
+        return new Response("{}", { status: 500 });
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("retries the repository auto-merge read with the next repo token after a 403", async () => {
+      const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);
+      mockResolveGitHubTokenCandidatesForRepo.mockReset();
+      mockResolveGitHubTokenCandidatesForRepo.mockResolvedValue([
+        { token: "wrong-repo-token", scope: "company", secretName: "GITHUB_TOKEN" },
+        { token: "right-repo-token", scope: "company", secretName: "GITHUB_TOKEN" },
+      ]);
+      const authByCall: string[] = [];
+      ghFetchMock.mockImplementation(async (url, init) => {
+        if (String(url).endsWith("/pulls/4103")) {
+          return new Response(JSON.stringify({ state: "open", draft: false, base: { ref: "main" } }), { status: 200 });
+        }
+        if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
+          const authorization = (init as { headers?: Record<string, string> } | undefined)?.headers?.authorization ?? "";
+          authByCall.push(authorization);
+          if (authorization === "Bearer wrong-repo-token") {
+            return new Response("{}", { status: 403 });
+          }
+          return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        if (String(url).includes("graphql")) {
+          return new Response(JSON.stringify({ data: { repository: { mergeQueue: null } } }), { status: 200 });
+        }
+        if (String(url).endsWith("/pulls/4103")) {
+          return new Response(JSON.stringify({ auto_merge: null }), { status: 200 });
+        }
+        return new Response("{}", { status: 500 });
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("auto-merge is disabled");
+      expect(authByCall).toEqual(["Bearer wrong-repo-token", "Bearer right-repo-token"]);
+    });
+
+    it("refuses landing-delegated when the named PR number is ambiguous across repositories", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        linkedPr(4103, "open"),
+        { ...linkedPr(4103, "open"), owner: "other-org", repo: "other-repo" },
+      ]);
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("multiple repositories");
+      expect(ghFetchMock).not.toHaveBeenCalled();
     });
 
     async function declareDelegated(prNumber: number, cached: Record<string, unknown>) {

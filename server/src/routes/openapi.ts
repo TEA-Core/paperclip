@@ -41,6 +41,8 @@ import {
   approveIssueHeadSchema,
   enrollReleaseAssuranceSchema,
   releaseAssuranceDecisionSchema,
+  releaseIssueHeadSchema,
+  overrideReleaseIssueHeadSchema,
   stalledReviewDecisionSchema,
   createIssueLabelSchema,
   addIssueCommentSchema,
@@ -643,6 +645,65 @@ const registry = new OpenAPIRegistry();
 // ─── Common schemas ──────────────────────────────────────────────────────────
 
 const ErrorSchema = registry.register("Error", z.object({ error: z.string() }));
+
+// PATCH also emits unrelated 403s, so keep its general Error alternative while
+// exposing the exact record-only selection reasons to generated clients.
+const IssuePatchRecordOnlyForbiddenSchema = registry.register(
+  "IssuePatchRecordOnlyForbidden",
+  z.object({
+    error: z.string(),
+    details: z.object({
+      reason: z.enum(["record_only_self_assignee", "record_only_not_authorized"]),
+    }),
+  }),
+);
+
+// Keep the compare-and-set objects, and still accept the older shapes this
+// route already returns. A validation 400 carries a details array. Some
+// non-CAS 409s carry a details object that omits code.
+const IssuePatchCompareAndSetBadRequestSchema = registry.register(
+  "IssuePatchCompareAndSetBadRequest",
+  z.object({
+    error: z.string(),
+    code: z.string().optional(),
+    details: z.object({ code: z.string() }).optional(),
+  }),
+);
+const IssuePatchValidationBadRequestSchema = registry.register(
+  "IssuePatchValidationBadRequest",
+  z.object({
+    error: z.string(),
+    details: z.array(z.record(z.string(), z.unknown())),
+  }),
+);
+const issuePatchCompareAndSetConflictCodes = [
+  "issue_version_conflict",
+  "checkout_adoption_required",
+  "workspace_reopen_required",
+] as const;
+const IssuePatchCompareAndSetConflictSchema = registry.register(
+  "IssuePatchCompareAndSetConflict",
+  z.object({
+    error: z.string(),
+    code: z.enum(issuePatchCompareAndSetConflictCodes),
+    details: z.object({
+      code: z.enum(issuePatchCompareAndSetConflictCodes),
+      updatedAt: z.string(),
+      retryable: z.boolean().optional(),
+      issueId: z.string().optional(),
+      checkoutRunId: z.string().nullable().optional(),
+      executionRunId: z.string().nullable().optional(),
+    }),
+  }),
+);
+const IssuePatchExistingConflictSchema = registry.register(
+  "IssuePatchExistingConflict",
+  z.object({
+    error: z.string(),
+    code: z.string().optional(),
+    details: z.record(z.string(), z.unknown()).optional(),
+  }),
+);
 
 const responses = {
   ok: (schema: z.ZodTypeAny = z.record(z.string(), z.unknown())) => ({
@@ -1429,7 +1490,10 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/issues/{id}/release-decisions",
   "POST /api/issues/{id}/release-assurance/enroll",
   "POST /api/issues/{id}/release-decisions",
+  "POST /api/issues/{id}/merge-arming/release",
+  "POST /api/issues/{id}/merge-arming/release-override",
   "POST /api/issues/{id}/execution-stage/board-decision",
+  "POST /api/issues/{id}/restore-participant",
   "GET /api/companies/{companyId}/tools/gallery",
   "GET /api/companies/{companyId}/tools/apps/{galleryKey}/preflight",
   "POST /api/companies/{companyId}/tools/apps/connect",
@@ -3915,7 +3979,9 @@ registry.registerPath({
   tags: ["issues"],
   summary: "Update an issue",
   description:
-    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads.",
+    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. Optional expectedUpdatedAt is a compare-and-set token. Equality is the millisecond bucket the API returns: instants in the same millisecond compare equal, and a token one millisecond newer or older does not. The issue UPDATE commits only when that bucket still matches. A mismatch is 409 issue_version_conflict with code and the current updatedAt in details, and the issue write persists nothing. A successful response updatedAt is the committed post-write value, including a comment that bumps the row after the field update, so a client can chain that token. For an agent whose run does not yet hold the checkout lock (the recorded run is terminal or missing, or no run holds it), the update is refused with 409 checkout_adoption_required (details.retryable true, current updatedAt) instead of adopting the lock. That refusal writes no issue, audit, or wake row; check out, re-read updatedAt, and retry. expectedUpdatedAt combined with a request that cancels a run or stops an agent goal before the write (comment with interrupt, reassignment away from an agent, terminal status change on an agent-assigned issue, or a comment that supersedes a scheduled retry) is rejected up front with 400 expected_updated_at_unsupported_with_side_effects and persists nothing, including no done-tier audit. A comment or agent work update on an issue linked to a closed isolated workspace is rejected up front with 409 workspace_reopen_required (current updatedAt in details) and persists nothing; retry without expectedUpdatedAt to get the normal reopen. Omit expectedUpdatedAt for an unconditional update. The field grants no new permission." +
+    "An authorized board actor may set deliveryRequirement=record_only even if assigned to the board user; a viewer remains read-only. An agent may not select it when it is the current or incoming assignee, including while reassigning. A 403 selecting record_only reports details.reason=record_only_self_assignee for an assigned agent, or record_only_not_authorized for an earlier authorization refusal including viewer access. " +
+    "PATCH applies pending execution-stage transitions too: if the stage has drifted from its participant, even a deliveryRequirement-only PATCH can set status=in_review and reassign to the active stage participant. Inspect the returned status and assignee.",
   request: {
     params: z.object({ id: z.string() }),
     // Documented shape omits the create-only attribution keys: they are accepted-and-ignored, not
@@ -3956,14 +4022,123 @@ registry.registerPath({
         .describe(
           "Record this card's delivery identity (ADR-091 D1) on a transition into `in_review`. Writable only by the agent run holding the issue's lease (422 `delivery_identity_write_rejected` otherwise). `repo` must match the card's project repo (422 `delivery_identity_write_rejected` otherwise) and `branch` must be the card's own delivery branch or a legitimate ADR-083 carrier owner's branch (422 `delivery_identity_branch_write_rejected` otherwise). `recordedByRunId`/`recordedAt` are server-owned, never client-supplied.",
         ),
+      expectedUpdatedAt: z.string().datetime({ offset: true }).optional().describe(
+        "Compare-and-set token for any update. Send the issue's updatedAt from a prior read. Matching uses the millisecond bucket the API returns: a token and a stored instant in the same millisecond compare equal, and a token one millisecond newer or older does not. The write commits only if that bucket still matches; otherwise the response is 409 issue_version_conflict and includes the current updatedAt. A successful response updatedAt is the committed post-write value. Omit the field to update unconditionally. Not supported with requests that cancel a run or stop an agent goal first (400 expected_updated_at_unsupported_with_side_effects).",
+      ),
     })),
+  },
+  responses: {
+    200: r.ok(),
+    400: {
+      description: "Bad request. A compare-and-set refusal is 400 expected_updated_at_unsupported_with_side_effects and persists nothing, including no done-tier audit. A validation failure is also 400 and carries details as an array. The schema is a union of those shapes.",
+      content: {
+        "application/json": {
+          schema: {
+            anyOf: [
+              IssuePatchCompareAndSetBadRequestSchema,
+              IssuePatchValidationBadRequestSchema,
+            ],
+          },
+        },
+      },
+    },
+    401: r.unauthorized,
+    403: {
+      description: "Forbidden; record-only selection refusals expose a named reason",
+      content: {
+        "application/json": {
+          schema: { anyOf: [IssuePatchRecordOnlyForbiddenSchema, ErrorSchema] },
+        },
+      },
+    },
+    404: r.notFound,
+    409: {
+      description: "Conflict. issue_version_conflict, checkout_adoption_required, and workspace_reopen_required require code and details.updatedAt and write nothing. Other conflicts on this route omit those codes. The schema is a oneOf union of those shapes.",
+      content: {
+        "application/json": {
+          schema: {
+            oneOf: [
+              IssuePatchCompareAndSetConflictSchema,
+              {
+                allOf: [
+                  IssuePatchExistingConflictSchema,
+                  {
+                    not: {
+                      required: ["code"],
+                      properties: {
+                        code: { enum: [...issuePatchCompareAndSetConflictCodes] },
+                      },
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    },
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/restore-participant",
+  tags: ["issues"],
+  summary: "Restore the assignee of an already-pending agent execution stage",
+  description:
+    "Board-only compare-and-set repair requiring assignment authority for the pending participant. " +
+    "All four expected values must match the locked issue row. The issue must be in_review or blocked " +
+    "with an active, undecided policy stage naming the agent; completed/skipped stages, removed agent " +
+    "memberships, fixed conversation identities, external chat channel bindings, and self-satisfying or self-authored reviews are refused. Refuses pending interactions, " +
+    "active recovery actions, live runs and checkout/execution locks. The repair row-locks the issue's live " +
+    "heartbeat_runs rows and then the issue row; recovery-action upserts share the issue-row lock. " +
+    "Native restart recovery uses the opposite issue-then-run order: it retries a lock timeout or " +
+    "deadlock once in a fresh transaction, then defers that issue and schedules three fast backoff " +
+    "passes at 1, 2 and 4 seconds. Exhaustion logs an error and emits one error-level " +
+    "native.recovery.transition run event (reason lock_retry_exhausted); a still-lock-conflicted " +
+    "candidate continues on a 5-second periodic retry, rather than remaining stranded after the cap. " +
+    "The repair's 250ms lock timeout returns 409 with details.code=participant_restore_lock_busy, " +
+    "details.retryable=true, and Retry-After: 1. Nested-only paperclipIssue.id heartbeat wakes stay " +
+    "unscoped but acquire the issue-row lock for queued-run admission, same-scope coalescing and bounded " +
+    "retry scheduling, and a former owner is refused once the pending stage belongs to another participant. " +
+    "Delayed disposition retries also lock the source issue through their receipt/run insert and recheck the current assignee. " +
+    "Raw operator SQL live-run inserts are the named residual race; see doc/restore-participant-assurance.md for the writer census. " +
+    "Self-declared runs first change status/assignee under an issue-row update predicate, excluding " +
+    "eligible restore in either order, but do not hold a continuous issue-row lock through run insertion. " +
+    "Nothing enforces the issue lock for a future application live-run insert or restore grant (a typed-lock guard is tracked as a follow-up design), and raw SQL, unbound runs, and unsupported bindings remain outside it. Only the assignee and updatedAt change; status, " +
+    "statusVersion, executionState, decision history and pendingSince remain unchanged. " +
+    "Does not wake or re-arm the stage.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(z.object({
+      expectedAssigneeAgentId: z.string().uuid().nullable(),
+      expectedStatus: z.string().min(1),
+      expectedStatusVersion: z.number().int().nonnegative(),
+      expectedPendingParticipantAgentId: z.string().uuid(),
+    }).strict()),
   },
   responses: {
     200: r.ok(),
     400: r.badRequest,
     401: r.unauthorized,
+    403: r.forbidden,
     404: r.notFound,
-    422: r.unprocessable,
+    409: {
+      description: "Conflict. A restore lock timeout (55P03) or deadlock (40P01) returns details.code=participant_restore_lock_busy, details.retryable=true and Retry-After: 1; other eligibility conflicts are not automatically retryable.",
+      headers: {
+        "Retry-After": { description: "One second; present only on a restore lock timeout or deadlock.", schema: { type: "integer", minimum: 1 } },
+      },
+      content: {
+        "application/json": {
+          schema: z.object({
+            error: z.string(),
+            code: z.string().optional(),
+            details: z.object({ code: z.string().optional(), retryable: z.boolean().optional() }).passthrough().optional(),
+          }),
+        },
+      },
+    },
   },
 });
 
@@ -7696,6 +7871,25 @@ registry.registerPath({
   },
 });
 
+const MergeReleaseOutcomeSchema = z.object({
+  outcome: z.enum(["released", "already_approved", "refused", "failed", "stale"]),
+  // Absent on a deadline (409) or busy (503) answer: those come before the head is read.
+  headSha: z.string().optional(),
+  message: z.string(),
+  // false on 200 `released` when only the outcome audit row could not be written: the status is out, the intent row is the trail.
+  auditRecorded: z.boolean(),
+});
+// A card refusal ({ error }) is answered before anything is published; a publication outcome is not.
+const mergeReleaseBusy = {
+  description: "Busy: too many release requests are being authenticated (status:failed:busy); nothing was published, retry after Retry-After seconds",
+  headers: { "Retry-After": { schema: { type: "string" as const } } },
+  content: { "application/json": { schema: MergeReleaseOutcomeSchema } },
+};
+const mergeReleaseConflict = {
+  description: "Conflict: a card refusal ({ error }) or a publication outcome ({ outcome, headSha, message, auditRecorded })",
+  content: { "application/json": { schema: z.union([z.object({ error: z.string() }), MergeReleaseOutcomeSchema]) } },
+};
+
 registry.registerPath({
   method: "get",
   path: "/api/issues/{id}/release-decisions",
@@ -7747,6 +7941,68 @@ registry.registerPath({
     body: jsonBody(releaseAssuranceDecisionSchema),
   },
   responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/merge-arming/release",
+  tags: ["issues"],
+  summary: "Release the card's delivery PR head to merge: publish paperclip/approved bound to exactly headSha",
+  description:
+    "Board-only (company owner/admin). The audited replacement for the Paperclip-Approved-Waiver body " +
+    "line on a card-bound PR. Publishes paperclip/approved with the control-plane App token only (no fallback " +
+    "credential) and the description 'released by <actor> for <sha>: <reason>' for exactly headSha. Only for a " +
+    "card whose own review decided that head: a completed approving ladder whose approved head is headSha, or a " +
+    "certified delivery (approvalStatus.finalDelivery) for this PR at headSha; a cancelled, never-approved, " +
+    "incomplete-ladder or stale-certification card is 409 with no GitHub call (use release-override). 409 also when " +
+    "the card has no verified delivery PR binding (a merely cited PR is never a target), the bound PR is not the " +
+    "card's certified finalDelivery, the PR is not open and non-draft or left the bound branch, or headSha is not " +
+    "the PR's live head (checked before any already-approved answer, before the write and before each retry; a " +
+    "head that moved after the write is reported as outcome stale). Idempotent and serialized per company/repo/head: " +
+    "a head whose newest paperclip/approved is a control-plane success returns 200 already_approved without a " +
+    "second write. Audited: issue.merge_release_requested before the write, then issue.merge_release (fresh write) " +
+    "or issue.merge_release_outcome.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(releaseIssueHeadSchema),
+  },
+  responses: {
+    200: r.ok(MergeReleaseOutcomeSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: mergeReleaseConflict,
+    503: mergeReleaseBusy,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/merge-arming/release-override",
+  tags: ["issues"],
+  summary: "Override release for a card the default release refuses: publish paperclip/approved bound to exactly headSha",
+  description:
+    "Board-only (company owner/admin). For the cards merge-arming/release refuses (cancelled, no approving " +
+    "decision, incomplete ladder, stale or absent certification). Takes its own required field overrideReason " +
+    "(written reason); the default route does not accept it. Same head binding, live-PR checks, certified-PR " +
+    "pin, control-plane App credential and serialization as the default release. Audited separately: " +
+    "issue.merge_release_override_requested before the write, then issue.merge_release_override or " +
+    "issue.merge_release_override_outcome. A release does not re-arm the merge for a card with no certified " +
+    "final delivery.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(overrideReleaseIssueHeadSchema),
+  },
+  responses: {
+    200: r.ok(MergeReleaseOutcomeSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: mergeReleaseConflict,
+    503: mergeReleaseBusy,
+  },
 });
 
 registry.registerPath({

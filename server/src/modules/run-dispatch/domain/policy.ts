@@ -81,6 +81,7 @@ export type ScheduledRetryFacts = {
   issueId: string | null;
   retryReasonKind: RetryReasonKind;
   enforceIssueExecutionLock: boolean;
+  retryIsAlreadyScheduled?: boolean;
 
   budgetBlock: BudgetBlockFacts | null;
 
@@ -107,7 +108,10 @@ export type ScheduledRetryFacts = {
   pendingResponse?: "interaction" | "approval" | null;
 };
 
+export const MAX_QUEUED_ISSUE_RUN_AGE_MS = 24 * 60 * 60 * 1000;
+
 export type QueuedRunStalenessErrorCode =
+  | "queued_run_expired"
   | "execution_reconciliation_required"
   | "issue_dependencies_blocked"
   | "issue_not_found"
@@ -129,8 +133,15 @@ export type StalenessDecision =
     };
 
 export type QueuedRunFacts = {
+  runStatus?: string | null;
+  scheduledRetryAt?: Date | null;
+  hasActiveExecutionLease?: boolean;
+  hasActiveCheckoutLease?: boolean;
   /** Rechecked for automatic native replacements immediately before dispatch. */
   dependenciesBlocked?: DependencyBlockFacts | null;
+  /** Armed worktree cutoff; a queued run created before it must not dispatch. */
+  worktreeExecutionCutoff?: Date | null;
+  runCreatedAt?: Date | null;
   runId: string;
   runAgentId: string;
   issueId: string;
@@ -213,6 +224,7 @@ function decideIssueStatus(facts: IssueStatusFacts): IssueStatusOutcome {
 
 type ExecutionLockFacts = {
   requiresExecutionLock: boolean;
+  allowVacantExecutionLock?: boolean;
   runId: string;
   issueExecutionRunId: string | null;
   issueCheckoutRunId?: string | null;
@@ -222,7 +234,11 @@ type ExecutionLockOutcome = "ok" | "lock_changed";
 
 /** Decides whether the issue's execution lock still belongs to this run. */
 function decideExecutionLock(facts: ExecutionLockFacts): ExecutionLockOutcome {
-  if (facts.requiresExecutionLock && facts.issueExecutionRunId !== facts.runId) {
+  if (
+    facts.requiresExecutionLock &&
+    !(facts.allowVacantExecutionLock && facts.issueExecutionRunId === null) &&
+    facts.issueExecutionRunId !== facts.runId
+  ) {
     return "lock_changed";
   }
   return "ok";
@@ -406,8 +422,13 @@ export function decideScheduledRetryGate(
   const lockOutcome = decideExecutionLock({
     requiresExecutionLock:
       (requiresInProgress ||
-        (facts.retryReasonKind === "ai_connection_wait" && !facts.isNonAssigneeWorkspaceBusyRetry)) &&
+        (facts.retryReasonKind === "ai_connection_wait" &&
+          !facts.isNonAssigneeWorkspaceBusyRetry &&
+          !facts.retryIsAlreadyScheduled)) &&
       facts.enforceIssueExecutionLock,
+    allowVacantExecutionLock:
+      facts.retryReasonKind === "max_turn_continuation" &&
+      !facts.isNonAssigneeWorkspaceBusyRetry,
     runId: facts.runId,
     issueExecutionRunId: facts.issueExecutionRunId,
   });
@@ -496,12 +517,55 @@ export function decideQueuedRunStaleness(
   facts: QueuedRunFacts,
   _now: Date,
 ): StalenessDecision {
+  if (
+    facts.worktreeExecutionCutoff &&
+    facts.runCreatedAt &&
+    facts.runCreatedAt.getTime() < facts.worktreeExecutionCutoff.getTime()
+  ) {
+    return {
+      stale: true,
+      errorCode: "execution_reconciliation_required",
+      reason: "Cancelled because the queued run predates the armed worktree execution cutoff",
+      details: {
+        issueId: facts.issueId,
+        createdAt: facts.runCreatedAt.toISOString(),
+        cutoff: facts.worktreeExecutionCutoff.toISOString(),
+      },
+    };
+  }
+
   if (!facts.issueFound) {
     return {
       stale: true,
       errorCode: "issue_not_found",
       reason: "Cancelled because the target issue no longer exists",
       details: { issueId: facts.issueId },
+    };
+  }
+
+  const runCreatedAt = facts.runCreatedAt;
+  const queueAgeExpired =
+    facts.runStatus === "queued" &&
+    runCreatedAt instanceof Date &&
+    _now.getTime() - runCreatedAt.getTime() >= MAX_QUEUED_ISSUE_RUN_AGE_MS &&
+    (facts.scheduledRetryAt === null ||
+      facts.scheduledRetryAt === undefined ||
+      facts.scheduledRetryAt.getTime() <= _now.getTime()) &&
+    !facts.hasActiveExecutionLease &&
+    !facts.hasActiveCheckoutLease;
+  if (queueAgeExpired) {
+    if (!(runCreatedAt instanceof Date)) return { stale: false };
+    return {
+      stale: true,
+      errorCode: "queued_run_expired",
+      reason: "Cancelled because the queued issue run exceeded the maximum queue age",
+      details: {
+        issueId: facts.issueId,
+        createdAt: runCreatedAt.toISOString(),
+        ageMs: _now.getTime() - runCreatedAt.getTime(),
+        maxAgeMs: MAX_QUEUED_ISSUE_RUN_AGE_MS,
+        scheduledRetryAt: facts.scheduledRetryAt?.toISOString() ?? null,
+      },
     };
   }
 
@@ -633,9 +697,10 @@ export function decideQueuedRunStaleness(
   }
 
   const lockOutcome = decideExecutionLock({
-    // A server-recorded non-assignee wake never held the task execution lock.
-    requiresExecutionLock: requiresInProgress ||
-      (facts.retryReasonKind === "ai_connection_wait" && !facts.isNonAssigneeWorkspaceBusyRetry),
+    requiresExecutionLock: requiresInProgress,
+    allowVacantExecutionLock:
+      facts.retryReasonKind === "max_turn_continuation" &&
+      !facts.isNonAssigneeWorkspaceBusyRetry,
     runId: facts.runId,
     issueExecutionRunId: facts.issueExecutionRunId,
   });

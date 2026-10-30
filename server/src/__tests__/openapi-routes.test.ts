@@ -1750,6 +1750,16 @@ describe("openapi auth parity (SUP-14798)", () => {
     expect(count, `POST /api/issues/{id}/stalled-review-decision should be registered exactly once`).toBe(1);
   });
 
+  it("documents the merge release 409 as either a card refusal or a publication outcome", () => {
+    for (const routePath of ["/api/issues/{id}/merge-arming/release", "/api/issues/{id}/merge-arming/release-override"]) {
+      const schema = JSON.stringify(
+        (operation("post", routePath) as any)?.responses?.["409"]?.content?.["application/json"]?.schema,
+      );
+      expect(schema, `${routePath} 409`).toContain("outcome");
+      expect(schema, `${routePath} 409`).toMatch(/"error"|Error/);
+    }
+  });
+
   it("board and instance-admin routes carry the board-only security requirement", () => {
     for (const route of [...BOARD_ROUTES, ...INSTANCE_ADMIN_ROUTES]) {
       const [method, routePath] = splitAuthRoute(route);
@@ -1780,5 +1790,28 @@ describe("routine executionWorkspacePreference contract (SUP-21022)", () => {
   it("documents the policy 422 on create and update", () => {
     expect(routineSpec.paths["/api/companies/{companyId}/routines"].post.responses["422"]).toBeDefined();
     expect(routineSpec.paths["/api/routines/{id}"].patch.responses["422"]).toBeDefined();
+  });
+});
+
+describe("issue PATCH record-only OpenAPI contract", () => {
+  it("exposes the two refusal codes without restricting other PATCH errors", async () => {
+    const res = await request(createApp()).get("/api/openapi.json");
+    expect(res.status).toBe(200);
+    expect(
+      res.body.paths["/api/issues/{id}"].patch.responses["403"]
+        .content["application/json"].schema,
+    ).toEqual({
+      anyOf: [
+        { $ref: "#/components/schemas/IssuePatchRecordOnlyForbidden" },
+        { $ref: "#/components/schemas/Error" },
+      ],
+    });
+    expect(
+      res.body.components.schemas.IssuePatchRecordOnlyForbidden.properties.details.properties.reason,
+    ).toMatchObject({
+      type: "string",
+      enum: ["record_only_self_assignee", "record_only_not_authorized"],
+    });
+    expect(res.body.components.schemas.Error.properties).toEqual({ error: { type: "string" } });
   });
 });

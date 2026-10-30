@@ -1,0 +1,36 @@
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+const [,, headScript, baseScript, repoRoot] = process.argv;
+const HEAD = "a".repeat(40);
+const TC = { id: 317012809, login: "tea-core[bot]", type: "Bot" };
+const OTHER = { id: 1, login: "fleet-only[bot]", type: "Bot" };
+const SHIM = ["#!/usr/bin/env bash","set -euo pipefail","url=\"\"","jqfilter=\"\"","while [ \"$#\" -gt 0 ]; do","  case \"$1\" in","    api|--slurp|--paginate) ;;","    -H) shift ;;","    --jq|-q) shift; jqfilter=\"$1\" ;;","    *) [ -n \"$url\" ] || url=\"$1\" ;;","  esac","  shift","done","echo \"$url\" >> \"$GH_SHIM_DIR/trace\"","case \"$url\" in","  */statuses*) jq -r \"$jqfilter\" \"$GH_SHIM_DIR/statuses.json\" ;;","  */pulls/*/reviews*) echo '[]' ;;","  */pulls/*) cat \"$GH_SHIM_DIR/pull.json\" ;;","  *) echo \"gh shim: unexpected call: $url\" >&2; exit 1 ;;","esac",""].join("\n");
+const rel = (id, creator, state="success") => ({ id, context:"paperclip/approved", state, creator, description:`released by user:u1 for ${HEAD}: r` });
+const ord = (id, creator, state="success") => ({ id, context:"paperclip/approved", state, creator, description:"SUP-1 approved via Paperclip" });
+const mk = (id, creator, desc) => ({ id, context:"paperclip/release-confirmed", state:"success", creator, description: desc });
+const statusSets = [[], [rel(1,TC)], [mk(2,TC,"confirms status 1"), rel(1,TC)], [rel(1,TC), mk(2,TC,"confirms status 1")], [mk(2,OTHER,"confirms status 1"), rel(1,TC)], [rel(1,OTHER)], [ord(1,TC)], [ord(1,OTHER)], [rel(3,TC,"failure"), rel(1,TC)], [mk(2,TC,"confirms status 9"), rel(1,TC)], [{id:5,context:"other/ctx",state:"success",creator:TC}, rel(1,TC)], [{id:41,context:"paperclip/approved",state:"success",creator:null,description:"317012809"}], [{id:41,context:"paperclip/approved",state:"success",creator:{id:"",login:""},description:"317012809"}], [rel(1,{id:317012809,login:""})], [mk(2,{id:317012809,login:""},"confirms status 1"), rel(1,{id:317012809,login:""})], [{id:7,context:"",state:"success",creator:TC}, rel(1,TC)]];
+const refs = ["SUP-20772-x","doctrine-sync","fold-sync/x"];
+const authors = [{login:"op",type:"User"},{login:"fleet-only[bot]",type:"Bot"}];
+const events = ["pull_request","merge_group"];
+const bodies = ["", "Paperclip-Approved-Waiver: r"];
+const switches = ["1"];
+const QUEUE = "refs/heads/gh-readonly-queue/fold/tea-patches-v2026.722.0/pr-4242-0123456789abcdef";
+function run(script, c) {
+  const dir = mkdtempSync(path.join(tmpdir(), "offcmp-"));
+  try {
+    writeFileSync(path.join(dir,"pull.json"), JSON.stringify({head:{sha:HEAD,ref:c.ref},title:"",body:c.body,labels:[],user:c.author}));
+    writeFileSync(path.join(dir,"statuses.json"), JSON.stringify(c.statuses));
+    mkdirSync(path.join(dir,"bin")); writeFileSync(path.join(dir,"bin","gh"), SHIM); chmodSync(path.join(dir,"bin","gh"),0o755);
+    const r = spawnSync("bash",[script,c.event,c.event==="pull_request"?"4242":""].filter((x,i)=>i<2||x),{cwd:repoRoot,encoding:"utf8",env:{...process.env,PATH:`${dir}/bin:${process.env.PATH}`,GH_SHIM_DIR:dir,GH_REPO:"TEA-Core/paperclip",PAPERCLIP_APPROVED_STATUS_CREATOR_ID:"317012809",PAPERCLIP_APPROVED_STATUS_CREATOR_LOGIN:"tea-core[bot]",PAPERCLIP_CARD_WAIVER_RETIRED:c.sw,GITHUB_REF:QUEUE,GITHUB_REF_NAME:QUEUE.replace("refs/heads/",""),GITHUB_STEP_SUMMARY:path.join(dir,"summary")}});
+    
+    return JSON.stringify([r.status,r.stdout,r.stderr]);
+  } finally { rmSync(dir,{recursive:true,force:true}); }
+}
+let total=0, diff=0; const ex=[];
+for (const statuses of statusSets) for (const ref of refs) for (const author of authors) for (const event of events) for (const body of bodies) for (const sw of switches) {
+  const c={statuses,ref,author,event,body,sw}; total++;
+  if (run(headScript,c)!==run(baseScript,c)) { diff++; if (ex.length<3) ex.push(JSON.stringify({sw,ref,event,n:statuses.length})); }
+}
+console.log(JSON.stringify({total,diff,ex}));

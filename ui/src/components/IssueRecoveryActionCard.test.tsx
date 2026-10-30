@@ -294,6 +294,30 @@ describe("IssueRecoveryActionCard", () => {
     );
   });
 
+  it("renders close_arm_failed failure evidence from outcomeMessage and cause", () => {
+    const node = render(
+      <IssueRecoveryActionCard
+        action={buildAction({
+          kind: "close_arm_failed",
+          ownerType: "board",
+          ownerAgentId: null,
+          cause: "Auto-merge is disabled for this repository.",
+          evidence: {
+            identifier: "SUP-1",
+            headSha: "a".repeat(40),
+            outcomeKind: "failed",
+            outcomeMessage: "Auto-merge is disabled for this repository.",
+          },
+          nextAction:
+            "Inspect the merge-arming failure, then enable repository auto-merge or land the certified pull request manually before resolving this recovery action.",
+        })}
+      />,
+    );
+    expect(node.textContent).toContain("Close-time Merge Arm Failed");
+    expect(node.textContent).toContain("Auto-merge is disabled for this repository.");
+    expect(node.textContent).toContain("enable repository auto-merge");
+  });
+
   it("keeps code-shaped evidence (error code, no summary) in the mono treatment", () => {
     const node = render(
       <IssueRecoveryActionCard

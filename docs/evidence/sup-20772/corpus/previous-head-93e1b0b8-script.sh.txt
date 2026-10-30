@@ -1,0 +1,951 @@
+#!/usr/bin/env bash
+# Paperclip-approved enforcer (SUP-13589 / SUP-13590; ported to the
+# TEA-Core/paperclip fold under SUP-13629).
+#
+# Approval gate: an approving review from an identity other than the pusher
+# is required before a PR can merge. The signal is the control-plane
+# `paperclip/approved` commit status on the PR head; this script CONSUMES it
+# (read-only) and enforces it at the merge boundary.
+#
+# Consume-contract (pinned — do not change, do not write this status):
+#   context: "paperclip/approved"
+#   state:   "success"
+#
+# The producer is the CONTROL PLANE (publishApprovalStatus), which fires when
+# a card's `review` stage records an `approved` decision AND the card has
+# exactly one linked, open PR. Nothing in this repository may create, mock,
+# or write that context — a local write is a contract violation that
+# manufactures a fake signal. This script makes two read-only API calls:
+#   GET repos/{owner}/{repo}/pulls/{n}
+#   GET repos/{owner}/{repo}/commits/{head-sha}/statuses
+#   GET repos/{owner}/{repo}/pulls/{n}/reviews   (only when a waiver is
+#                                                 present on a fold-sync head)
+#   and, only when the override label is on the PR and the head has no stamp:
+#   GET repos/{owner}/{repo}/issues/{n}/events
+#   GET repos/{owner}/{repo}/collaborators/{labeler}/permission
+#   GET repos/{owner}/{repo}/activity?ref=refs/heads/{head-ref}
+#
+# All of them go through `gh_api_retry`, which re-issues them on an HTTP 5xx or a
+# transport failure (3 attempts, 2s then 5s, so at most +7s per call site) and
+# never on a 4xx. See the long note at that function for why a 403 is excluded
+# and for the incident that motivated it.
+#
+# ATTRIBUTION. `paperclip/approved` is a plain commit status and the
+# `fleet-only` installation grants `statuses:write` to every Paperclip-assigned
+# agent, so possession of the signal proves nothing on its own — any agent could
+# publish a success on its own head SHA. A `success` is therefore accepted only
+# when its `creator` is the control-plane App's bot user (id
+# $APPROVED_STATUS_CREATOR_ID). The LIST endpoint is used rather than the
+# combined `/status` one because the combined endpoint omits `creator`
+# entirely, which is why this hole stood open.
+#
+# Behaviour, by event:
+#   pull_request -> advisory: log the observed state, exit 0 (green). The
+#                 control plane publishes paperclip/approved only at
+#                 review-stage approval, which happens AFTER CI first runs on
+#                 the PR; a fail-closed pull_request would make every PR red
+#                 for its whole working life. The queue entry is the
+#                 enforcement point — the last gate before the commit lands
+#                 on main.
+#   merge_group  -> fail-closed: missing / pending / failed = exit 1, blocks
+#                 the merge.
+#   push (main)  -> no-op: log, exit 0.
+#
+# merge_group resolves the PR number from the queue ref
+# (refs/heads/gh-readonly-queue/main/pr-<N>-<sha> on paperclip-agent-tools;
+# refs/heads/gh-readonly-queue/fold/tea-patches-v2026.722.0/pr-<N>-<sha> on the
+# TEA-Core/paperclip fold, whose base branch name itself contains slashes) —
+# and from that source only. An unresolvable identity must never read as
+# approved.
+#
+# Override (SUP-20897): the label `override:paperclip-approval` lets a person with
+# write access approve ONE PR when the reviewer pipeline cannot publish
+# `paperclip/approved`. It is consulted only when the head carries no valid
+# stamp, never replaces a FORGED-stamp refusal, and is honored only when ALL hold
+# (every uncertainty fails closed; the reason is logged either way):
+#   - the label is on the PR now and its most recent `labeled` issue event was
+#     applied by an `actor.type == "User"` (the same machine-identity rejection
+#     as human_countersigner's `user.type`) whose repository role is admin,
+#     maintain or write (the OWNER/MEMBER/COLLABORATOR standing the waiver path
+#     requires, read from the collaborator-permission API because issue events
+#     carry no author_association);
+#   - the PR head repo is this repo (no fork) and the NEWEST activity on the PR's
+#     head branch is a push of exactly the current head SHA, recorded strictly
+#     BEFORE the label event. The activity timestamp is server-set, and a
+#     pusher cannot choose it, so a head pushed or fast-forwarded after the label
+#     (including a commit pre-built elsewhere and backdated) is refused.
+# The binding reads only PR-scoped data (issue events + the PR head branch's
+# activity), never check runs: a merge_group check run carries no PR association,
+# and an override that needs one is ejected from the queue even when the PR is
+# labeled and green. The PR number comes from the queue ref (see below), so the
+# override serves pull_request and merge_group alike. Branch names are never an
+# input: a card-bound branch cannot self-override. Read-only; no label is created
+# here (see docs/branch-protection.md for creating it).
+#
+# Waiver (either one) for PRs with no Paperclip card (doctrine sync, rescue,
+# router-only):
+#   1. PR body contains a line:  Paperclip-Approved-Waiver: <reason>
+#   2. PR carries the label:     no-paperclip-card
+#
+# RETIRED FOR CARDED PRs (SUP-20772) -- ARMED BY PAPERCLIP_CARD_WAIVER_RETIRED=1.
+# Anyone with `pull_requests:write` can write either waiver, and that includes
+# every fleet agent, so a free-text waiver is no control. Once the switch is on:
+#   - On a card-bound head (`SUP-<n>-...`) neither waiver is honoured. The gate
+#     falls through to the status check; the PR lands on a real stamp or on the
+#     board release (POST /api/issues/:id/merge-arming/release), which publishes
+#     paperclip/approved as the control plane, bound to the exact head SHA.
+#   - On a cardless head both waivers stay, but only for an author that is a
+#     person (user.type User) or this repository's own automation
+#     (github-actions[bot]) or the control-plane App itself (tea-core, the
+#     identity the lockfile refresh opens its PR as). Any other App-authored PR
+#     (the fleet's) cannot self-waive.
+# The switch ships OFF so merging this change cannot freeze anything before the
+# release route is deployed. Turn it on (repository variable of the same name)
+# only after the route answers on the live control plane.
+#
+# KNOWN RESIDUAL BYPASS -- DO NOT SET THE SWITCH UNTIL BOTH HALVES ARE CLOSED.
+# This script reads GitHub only. It holds no control-plane credential, so it
+# cannot ask which card owns a PR. Both inputs to the refusal are therefore ones
+# the PR author controls:
+#   1. Card binding is judged from the head ref (`SUP-<n>...`). A card work item
+#      pushed to any other branch name reads as cardless and keeps its waiver.
+#   2. Author type is GitHub's label, not an identity proof. A machine token that
+#      is a GitHub `User` (the fleet's shared operator token is one) reads as a person.
+# So with the switch on this closes the honest mistake and the `SUP-` branch path
+# only; it does not stop an agent that renames its branch or pushes as a User.
+# Closing it needs control-plane data (the card's recorded delivery PR/branch)
+# fed to this check by a path the author cannot write, plus a fleet token that is
+# not a User. Every waiver honoured with the switch on is logged `UNVERIFIED`.
+#
+# COUNTERSIGNATURE on fold-sync heads -- ADVISORY SINCE 2026-09-07, NOT ENFORCED.
+# A PR whose head ref starts with `fold-sync/` cannot earn `paperclip/approved`
+# at all -- the head must stay `fold-sync/*` for pr.yml's lockfile exemption,
+# which is mutually exclusive with the execution-workspace branch match
+# `isDeliveredByCard()` requires -- so on that branch class the waiver is not an
+# escape hatch, it is the only route.
+#
+# From 2026-09-07 the waiver STANDS ALONE on a fold-sync head. The operator
+# ruling and its reasoning are in the fork design doc, D3; the short version is
+# that TEA-Core/paperclip has two collaborators and the fold PR is opened by the
+# operator, so the rule required a second account that in practice was the same
+# person -- a formality this gate cannot detect, which is worse than no gate
+# because it reads as a safety property in write-ups.
+#
+# The countersignature is still COMPUTED and REPORTED on every fold waiver, as
+# telemetry only. It gates nothing. Do not cite the note as an approval control;
+# it answers "did a human look at this fold", which the design doc lists as a
+# metric, and nothing more. Re-enabling is a one-line change: make
+# `require_countersignature` return the advisory result instead of 0.
+#
+# The resolution logic behind the note is deliberately kept intact and tested --
+# APPROVED and still approved (a later CHANGES_REQUESTED or DISMISSED from the
+# same login supersedes), `user.type == "User"`, on the current head SHA, not the
+# PR author, and `author_association` in OWNER / MEMBER / COLLABORATOR. It costs
+# one read-only call:
+#   GET repos/{owner}/{repo}/pulls/{n}/reviews
+# Every other head ref keeps the unmodified waiver behaviour.
+#
+# Usage:
+#   check-paperclip-approved.sh <event> [pr-number]
+#
+#   <event>      pull_request | merge_group | push
+#   [pr-number]  numeric PR number. pull_request: pass it explicitly (the CI
+#                job passes github.event.pull_request.number). merge_group:
+#                not used — the number is resolved from the queue ref.
+#
+# Environment:
+#   GH_REPO            owner/repo (default: parsed from `git remote get-url origin`)
+#   GITHUB_REF         fully-qualified ref (refs/heads/gh-readonly-queue/...)
+#   GITHUB_REF_NAME    short ref (gh-readonly-queue/main/pr-<N>-<sha>)
+#   PR_NUMBER          explicit PR number (pull_request only)
+#   GITHUB_PR_NUMBER   explicit PR number (pull_request only)
+#
+# Exit codes:
+#   0  approved, OR advisory (pull_request), OR push no-op, OR valid waiver
+#      (on a fold-sync head, "valid" additionally means countersigned), OR an
+#      honored override label
+#   1  enforcement failure on merge_group: status missing/pending/failed,
+#      unresolvable PR identity, unresolvable repository, or API failure —
+#      fail-closed: an error must never read as approved
+#   2  usage error (bad/unknown event, non-numeric pr-number, missing dependency)
+set -euo pipefail
+
+CONTEXT="paperclip/approved"
+STATE="success"
+
+# A literal backtick, so the job-summary blocks below can render inline code
+# without an unquoted delimiter treating backticks as command substitution.
+BT='`'
+
+# The ONLY identity whose `paperclip/approved` status counts: the control-plane
+# GitHub App's bot user. A bot user's numeric id is stable for the life of the
+# App and cannot be re-registered, which a login can. Overridable so the same
+# script can run against a differently-installed control plane; the default is
+# this repository's.
+APPROVED_STATUS_CREATOR_ID="${PAPERCLIP_APPROVED_STATUS_CREATOR_ID:-317012809}"
+APPROVED_STATUS_CREATOR_LOGIN="${PAPERCLIP_APPROVED_STATUS_CREATOR_LOGIN:-tea-core[bot]}"
+
+err() { echo "[paperclip-approved][error] $*" >&2; }
+note() { echo "[paperclip-approved] $*"; }
+
+usage() {
+  err "usage: $(basename "$0") <pull_request|merge_group|push> [pr-number]"
+  exit 2
+}
+
+[ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage
+EVENT="$1"
+PR_NUMBER_ARG="${2:-}"
+
+case "$EVENT" in
+  pull_request|merge_group|push) ;;
+  *) usage ;;
+esac
+
+if [ -n "$PR_NUMBER_ARG" ] && ! [[ "$PR_NUMBER_ARG" =~ ^[0-9]+$ ]]; then
+  usage
+fi
+
+command -v jq >/dev/null 2>&1 || { err "jq is required but not on PATH"; exit 2; }
+command -v gh >/dev/null 2>&1 || { err "gh is required but not on PATH"; exit 2; }
+
+# Advisory (pull_request) vs enforcing (merge_group). Fail-closed default:
+# only pull_request is advisory.
+MODE="advisory"
+[ "$EVENT" = "merge_group" ] && MODE="enforcing"
+
+# fail: in enforcing mode exit 1 (blocks the merge); in advisory mode log and
+# exit 0 — pull_request is non-blocking by design, the merge queue enforces
+# at the merge boundary.
+fail() {
+  if [ "$MODE" = "enforcing" ]; then
+    err "$*"
+    exit 1
+  fi
+  note "ADVISORY: $* — pull_request is non-blocking; the merge queue enforces at the merge boundary"
+  exit 0
+}
+
+# --- transient-failure retry for the read-only API calls ---------------------
+# Measured 2026-09-23. Merge window attempt 3 for fold PR #748 was ejected from
+# the merge queue on this job, and the whole log was:
+#
+#   [paperclip-approved] checking TEA-Core/paperclip PR #748 (mode: enforcing)
+#   [paperclip-approved][error] API failure: GET repos/TEA-Core/paperclip/pulls/748 — Unexpected error
+#   gh: HTTP 500
+#
+# Every other precondition was green — CI 30/0, 0 commits behind, an empty
+# queue, and the merged tree proved byte-identical to the PR head tree that had
+# just passed CI. A single transient GitHub 5xx on one read-only GET cost the
+# whole window, which is about 98 runner-minutes (see the merge-queue ejection
+# cost note). This leg is fail-closed on merge_group by design and MUST stay
+# that way — an error must never read as approved — so the only correct fix is
+# to stop treating a server-side blip as an answer.
+#
+# WHAT IS RETRIED, AND WHY ONLY THIS. All three call sites are read-only GETs,
+# so re-issuing one has no side effect and cannot double-apply anything. The
+# retry is therefore scoped to the transport/server layer:
+#
+#   HTTP 5xx        retried. A 500/502/503/504 is GitHub saying "I failed",
+#                   not "the answer is no". It is exactly the class that
+#                   clears on its own within seconds.
+#   transport       retried. Connection reset/refused, unexpected EOF, i/o or
+#                   TLS-handshake timeout, DNS blips: same shape, no answer
+#                   was ever produced.
+#   HTTP 4xx        NOT retried, checked FIRST so it can never be overridden
+#                   by a 5xx-looking substring in a response body. A 401, 404
+#                   or 422 is a real, stable answer and repeating it only
+#                   delays a correct failure by the whole backoff budget.
+#
+#   403 IN PARTICULAR IS NOT RETRIED, deliberately. A 403 here is either a
+#   permissions answer (stable — retrying is pure delay) or a rate limit. Both
+#   GitHub rate limits are far longer-lived than any backoff a CI gate may
+#   spend: the primary limit resets on the hour and returns a Retry-After that
+#   is routinely minutes, and secondary limits persist for minutes and are
+#   documented to EXTEND when you keep requesting while limited. A 7-second
+#   budget cannot clear either one, so retrying a 403 would convert a fast,
+#   correct, legible failure into a slower identical failure — and, in the
+#   secondary-limit case, make the underlying condition worse for every other
+#   job on the same token. Both workflows that invoke this script (pr.yml and
+#   paperclip-approved.yml) pass `GH_TOKEN: ${{ github.token }}`, the per-job
+#   installation token — NOT the fleet personal PAT — so the blast radius is
+#   this repository's jobs rather than the whole fleet. It is still real. A
+#   rate-limited gate is a capacity problem to fix at the token, not a blip to
+#   paper over here.
+#
+# BOUNDED, AND FREE IN THE HAPPY PATH. Attempts = 1 + ${#GH_API_BACKOFF[@]},
+# i.e. 3 attempts, with sleeps of 2s then 5s. Worst-case ADDED wall time is
+# therefore exactly 7 seconds per call site. Across a whole run the reachable
+# worst case is 14 seconds, not 21: `fail` always exits, so if the first call
+# (GET pulls/{n}) exhausts its attempts the script terminates there and the
+# other two never run. Only the reviews and statuses reads can both exhaust in
+# one execution — that happens when a waiver is present but its countersignature
+# read exhausts, which returns advisory rather than exiting, and the run then
+# falls through to the statuses read. Bounded by construction either way,
+# because the backoff list is finite and is the only thing that produces a
+# sleep. When the first attempt succeeds the function
+# returns before reaching any sleep, so the ordinary run is not one millisecond
+# slower than before.
+GH_API_BACKOFF=(2 5)
+
+# gh_api_retryable <combined-output>
+#   0 -> the failure looks transient and re-issuing the GET may help
+#   1 -> the failure is an answer (or unrecognised): do not retry
+gh_api_retryable() {
+  # Lowercased once so every pattern below can be written in one case. gh's
+  # wording is not stable across versions ("gh: HTTP 500" for a non-JSON body,
+  # "gh: <message> (HTTP 502)" when the body parses), so the patterns match the
+  # code anywhere in the text rather than anchoring on a fixed prefix.
+  local text="${1,,}" client_error='http 4[0-9][0-9]' server_error='http 5[0-9][0-9]' transport
+
+  # 4xx first and unconditionally. See the 403 reasoning above.
+  [[ "$text" =~ $client_error ]] && return 1
+
+  [[ "$text" =~ $server_error ]] && return 0
+
+  transport='connection reset|connection refused|broken pipe|unexpected eof'
+  transport+='|i/o timeout|client\.timeout|tls handshake timeout'
+  transport+='|context deadline exceeded|dial tcp|no such host|server misbehaving'
+  transport+='|temporary failure in name resolution'
+  [[ "$text" =~ $transport ]] && return 0
+
+  return 1
+}
+
+# gh_api_retry <gh api args...>
+# Drop-in replacement for `gh api "$@" 2>&1` in a command substitution: it emits
+# the combined stdout+stderr of the LAST attempt on stdout and returns that
+# attempt's exit status, so each call site's existing error text, control flow
+# and exit codes are byte-for-byte what they were before.
+#
+# The `2>&1` moved INSIDE this function on purpose. It still merges gh's stderr
+# into the caller's variable — that is what makes `${PR_JSON}` carry "gh: HTTP
+# 500" in the failure message — but it now applies to gh ONLY. The retry log
+# lines below go through `err`, which writes to the script's real stderr; had
+# they used `note` (stdout) or had a call site kept its own `2>&1`, the retry
+# chatter would be captured into the payload variable and fed straight to `jq`.
+#
+# --paginate + --jq: THE ONE WAY TO GET THIS WRONG. With `--paginate`, gh
+# streams each page's `--jq` output as it arrives, so a call that dies on page 3
+# has ALREADY emitted pages 1-2 before exiting non-zero. Accumulating output
+# across attempts — appending, or teeing to a file — would therefore splice a
+# truncated first attempt onto a complete second one and hand the caller a
+# duplicated status/review list. That is avoided structurally rather than by
+# care: every attempt captures into the SAME local `out` via a fresh command
+# substitution, so each attempt's result wholly REPLACES the previous one and a
+# partial page stream is discarded the moment the retry begins. There is no
+# concatenation operator anywhere in this function, and there must never be.
+gh_api_retry() {
+  local attempt=1 attempts=$(( ${#GH_API_BACKOFF[@]} + 1 )) rc=0 out="" wait_s line
+
+  while :; do
+    # Fresh capture, never an append. See the --paginate note above.
+    out="$(gh api "$@" 2>&1)" && rc=0 || rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+      if [ "$attempt" -gt 1 ]; then
+        err "gh api recovered on attempt ${attempt}/${attempts}: gh api $*"
+      fi
+      printf '%s\n' "$out"
+      return 0
+    fi
+
+    if [ "$attempt" -ge "$attempts" ] || ! gh_api_retryable "$out"; then
+      break
+    fi
+
+    wait_s="${GH_API_BACKOFF[$(( attempt - 1 ))]}"
+    # Logged, never silent: a gate that quietly papers over 5xx hides a
+    # degrading API until it degrades past three attempts.
+    err "gh api attempt ${attempt}/${attempts} failed with a transient error (rc=${rc}), retrying in ${wait_s}s: gh api $*"
+    # Prefix EVERY line: a multi-line gh payload would otherwise land in the
+    # merge-queue log as bare unprefixed lines, and any `::`-prefixed line
+    # inside an API payload would sit at column 0 where Actions reads it as a
+    # workflow command.
+    while IFS= read -r line; do err "  ${line}"; done <<<"$out"
+    sleep "$wait_s"
+    attempt=$(( attempt + 1 ))
+  done
+
+  # Exhausted, or a non-transient answer. Hand the caller exactly what a single
+  # unretried `gh api ... 2>&1` would have handed it.
+  printf '%s\n' "$out"
+  return "$rc"
+}
+
+# --- reporting the verdict to the PR checks view (advisory leg) -------------
+# The pull_request leg is green on purpose (advisory), so a bare exit 0 is all
+# an operator sees in the PR checks view even when the merge queue is about to
+# evict this entry. The two surfaces that reach the checks view WITHOUT a red
+# check are the runner's job summary and this step's annotations, so the verdict
+# is written to both. Both no-op safely when the script runs outside a workflow.
+job_summary() {
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    printf '%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+  fi
+}
+
+# A GitHub Actions warning annotation is parsed from this step's stdout and shown
+# on the step in the PR checks view even though the step (and the job) still
+# report success. The message must be a single line. Outside a workflow
+# (GITHUB_ACTIONS unset) fall back to a plain log line so a local run still
+# surfaces the verdict.
+warn_annotation() {
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    printf '::warning::%s\n' "$1"
+  else
+    note "WARNING: $1"
+  fi
+}
+
+# Job-summary block for the two advisory outcomes. Kept in functions so the
+# scratch variable stays out of the global scope of this linear script.
+advisory_summary_present() {
+  local block
+  block="$(
+    printf '%s\n' \
+      "### ${BT}${CONTEXT}${BT} is present on this PR" \
+      "" \
+      "- **PR:** #${PR_NUMBER}" \
+      "- **Head SHA:** ${BT}${HEAD_SHA}${BT}" \
+      "- **Context state:** ${BT}${STATE}${BT} (published by ${APPROVAL_CREATOR_LOGIN})" \
+      "" \
+      "${BT}${CONTEXT}${BT} = ${STATE} is present on head ${BT}${HEAD_SHA}${BT}, published by the control" \
+      "plane. The merge queue will admit this entry, subject to every other required check. This" \
+      "check is advisory on ${BT}pull_request${BT} and reports ${BT}success${BT}."
+  )"
+  job_summary "$block"
+}
+
+advisory_summary_absent() {
+  local block
+  block="$(
+    printf '%s\n' \
+      "### ${BT}${CONTEXT}${BT} is not published on this PR" \
+      "" \
+      "- **PR:** #${PR_NUMBER}" \
+      "- **Head SHA:** ${BT}${HEAD_SHA}${BT}" \
+      "- **Observed state:** ${BT}${APPROVAL_STATE:-missing}${BT} (expected ${BT}${STATE}${BT})" \
+      "" \
+      "This check is **advisory** on ${BT}pull_request${BT} and reports **success**. The merge queue" \
+      "enforces the same gate at the merge boundary (${BT}merge_group${BT})." \
+      "" \
+      "Until the control plane publishes ${BT}${CONTEXT}${BT} = ${STATE} on head ${BT}${HEAD_SHA}${BT}," \
+      "**this PR will be evicted from the merge queue** on every entry."
+  )"
+  job_summary "$block"
+}
+
+# --- push (main): no-op ------------------------------------------------------
+if [ "$EVENT" = "push" ]; then
+  note "push:main — no-op, reporting success: the commit already passed this gate at merge_group"
+  exit 0
+fi
+
+# --- PR number ---------------------------------------------------------------
+# The queue ref embeds the base branch, which on the TEA-Core/paperclip fold
+# itself contains slashes (gh-readonly-queue/fold/tea-patches-v2026.722.0/...),
+# so the branch segment is one-or-more path components, never assumed to be a
+# single component (SUP-13629 — a single-component regex silently fails to
+# resolve every fold queue entry and deadlocks the fold merge queue).
+QUEUE_REF_RE='^gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]+$'
+
+pr_from_queue_ref() {
+  local ref short
+  for ref in "${GITHUB_REF_NAME:-}" "${GITHUB_REF:-}"; do
+    [ -n "$ref" ] || continue
+    short="${ref#refs/heads/}"
+    if [[ "$short" =~ $QUEUE_REF_RE ]]; then
+      printf '%s' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [ "$EVENT" = "merge_group" ]; then
+  # Pinned by SUP-13590: on merge_group the PR number comes from the queue
+  # ref ONLY. An unresolvable identity must never read as approved.
+  if ! PR_NUMBER="$(pr_from_queue_ref)"; then
+    err "merge_group: cannot resolve the PR number from the merge-queue ref"
+    err "  expected GITHUB_REF(_NAME) = refs/heads/gh-readonly-queue/<base>/pr-<N>-<sha>"
+    err "  (on the TEA-Core/paperclip fold the <base> itself contains slashes, e.g. gh-readonly-queue/fold/tea-patches-v2026.722.0/pr-<N>-<sha>)"
+    err "  got GITHUB_REF='${GITHUB_REF:-<unset>}' GITHUB_REF_NAME='${GITHUB_REF_NAME:-<unset>}'"
+    exit 1
+  fi
+else
+  # pull_request: explicit argument (the CI job passes it), then the
+  # PR_NUMBER / GITHUB_PR_NUMBER environment, then the queue ref (defensive).
+  PR_NUMBER="$PR_NUMBER_ARG"
+  [ -n "$PR_NUMBER" ] || PR_NUMBER="${PR_NUMBER:-${GITHUB_PR_NUMBER:-}}"
+  [ -n "$PR_NUMBER" ] || PR_NUMBER="$(pr_from_queue_ref || true)"
+  if [ -z "$PR_NUMBER" ]; then
+    fail "could not resolve the PR number (no argument, no PR_NUMBER/GITHUB_PR_NUMBER, no merge-queue ref)"
+  fi
+fi
+
+# --- repository --------------------------------------------------------------
+resolve_repo() {
+  local repo="${GH_REPO:-}" remote cand
+  if [ -n "$repo" ]; then
+    if [[ "$repo" =~ ^[^/]+/[^/]+$ ]]; then
+      printf '%s' "$repo"
+      return 0
+    fi
+    return 1
+  fi
+  remote="$(git remote get-url origin 2>/dev/null || true)"
+  remote="${remote%.git}"
+  if [[ "$remote" =~ github\.com[/:]([^/]+/[^/]+)$ ]]; then
+    cand="${BASH_REMATCH[1]}"
+    if [[ "$cand" =~ ^[^/]+/[^/]+$ ]]; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+if ! REPO="$(resolve_repo)"; then
+  fail "could not determine the repository (owner/repo); set GH_REPO"
+fi
+note "checking ${REPO} PR #${PR_NUMBER} (mode: ${MODE})"
+
+# --- PR head SHA + waiver metadata (one read-only call) ----------------------
+PR_JSON="$(gh_api_retry "repos/${REPO}/pulls/${PR_NUMBER}")" \
+  || fail "API failure: GET repos/${REPO}/pulls/${PR_NUMBER} — ${PR_JSON}"
+jq -e . >/dev/null 2>&1 <<<"$PR_JSON" \
+  || fail "malformed PR payload from GET repos/${REPO}/pulls/${PR_NUMBER}"
+
+HEAD_SHA="$(jq -r '.head.sha // empty' <<<"$PR_JSON")"
+[ -n "$HEAD_SHA" ] || fail "could not resolve the head SHA for PR #${PR_NUMBER}"
+note "PR #${PR_NUMBER} head SHA: ${HEAD_SHA}"
+
+PR_BODY="$(jq -r '.body // ""' <<<"$PR_JSON")"
+PR_LABELS="$(jq -c '(.labels // []) | map(.name)' <<<"$PR_JSON")"
+
+PR_HEAD_REF="$(jq -r '.head.ref // ""' <<<"$PR_JSON")"
+PR_AUTHOR="$(jq -r '.user.login // ""' <<<"$PR_JSON")"
+PR_AUTHOR_TYPE="$(jq -r '.user.type // ""' <<<"$PR_JSON")"
+PR_AUTHOR_ID="$(jq -r '.user.id // ""' <<<"$PR_JSON")"
+
+# A card-bound head is `SUP-<n>` or `SUP-<n>-...` (the execution-workspace
+# branch). Case-insensitive so `sup-123-x` cannot step round the rule. This is
+# judged from a name the PR author chooses, so it is NOT proof a PR has no card;
+# see KNOWN RESIDUAL BYPASS in the header.
+CARD_BOUND=0
+[[ "$PR_HEAD_REF" =~ ^[Ss][Uu][Pp]-[0-9]+(-|$) ]] && CARD_BOUND=1
+
+# --- fold-sync heads: a waiver must be countersigned by a human ---------------
+# A fold PR cannot earn `paperclip/approved` at all. `isDeliveredByCard()`
+# matches the PR head ref against the card's execution-workspace branch, but the
+# head must stay `fold-sync/*` for pr.yml's lockfile exemption (an exact
+# `startsWith`), and no execution workspace has ever carried a `fold-sync/`
+# name. The two requirements are mutually exclusive, so the waiver is not an
+# escape hatch on this branch class -- it is the only route, taken by default,
+# on the single riskiest change class in the repository.
+#
+# Left as-is that means the automation writes its own exemption for a fold: the
+# `fleet-only` installation grants `pull_requests:write` to any Paperclip
+# assigned agent, so the same identity that opens the PR can author both waiver
+# forms. Requiring a countersignature puts a person on the only irreversible
+# path without touching the other ~26 PRs/day, and needs no ruleset change and
+# no control-plane plumbing.
+#
+# Scoped to `fold-sync/` heads deliberately. Cardless doctrine-sync, rescue and
+# router-only PRs keep the unmodified waiver.
+FOLD_HEAD=0
+case "$PR_HEAD_REF" in
+  fold-sync/*) FOLD_HEAD=1 ;;
+esac
+
+# The countersigning review must be:
+#   APPROVED       -- and still approved: a later CHANGES_REQUESTED or DISMISSED
+#                     from the same login supersedes it, so only each login's
+#                     final state on the head SHA counts.
+#   user.type User -- a GitHub App review reports type "Bot". The whole point is
+#                     an identity the fleet's own token cannot produce.
+#   on HEAD_SHA    -- pr.yml's "Reject stale merge base" hard-fails past 20
+#                     commits behind or 24h, so a fold PR is pushed to its final
+#                     SHA and only then approved. An approval carried over from
+#                     an earlier commit reviewed a different tree.
+#   not the author -- GitHub already refuses author self-approval; asserted here
+#                     because this gate is what a compromised token would aim at.
+human_countersigner() {
+  local reviews state commit login utype assoc approver
+  reviews="$(gh_api_retry --paginate \
+    "repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100" \
+    --jq '.[] | [(.state // ""), (.commit_id // ""), (.user.login // ""), (.user.type // ""), (.author_association // "")] | @tsv')" \
+    || { err "API failure: GET repos/${REPO}/pulls/${PR_NUMBER}/reviews — ${reviews}"; return 2; }
+
+  # Reviews come back in submission order, so a later state for a login
+  # supersedes an earlier one. Resolve each login's FINAL state across every
+  # eligible review FIRST, and only then ask whether that final state is an
+  # approval of the current head.
+  #
+  # The head-SHA test cannot live in this loop. A review may target any commit
+  # associated with the PR, so a reviewer can approve on HEAD_SHA and then
+  # submit CHANGES_REQUESTED against an older commit: filtering by commit while
+  # accumulating would discard the retraction and leave the superseded approval
+  # standing. Record the state and the commit it was made on, and judge both at
+  # the end.
+  declare -A final_state=()
+  declare -A final_commit=()
+  declare -A final_assoc=()
+  while IFS=$'\t' read -r state commit login utype assoc; do
+    [ -n "$state" ] || continue
+    [ "$utype" = "User" ] || continue
+    [ -n "$login" ] || continue
+    [ "$login" != "$PR_AUTHOR" ] || continue
+    # COMMENTED reviews do not change an approval either way.
+    [ "$state" != "COMMENTED" ] || continue
+    final_state["$login"]="$state"
+    final_commit["$login"]="$commit"
+    final_assoc["$login"]="$assoc"
+  done <<<"$reviews"
+
+  # Every condition is applied HERE, to each login's final review, and none of
+  # them inside the loop above. `author_association` is computed per review at
+  # submission time, so it can differ between two reviews by the same account —
+  # someone who leaves the org submits their next review as CONTRIBUTOR. Filter
+  # on it while accumulating and a later CHANGES_REQUESTED gets skipped as
+  # "untrusted" instead of superseding, leaving the earlier approval standing.
+  # That is the same shape as the commit_id bug fixed just above; the rule for
+  # this loop is accumulate first, judge last.
+  for approver in "${!final_state[@]}"; do
+    [ "${final_state[$approver]}" = "APPROVED" ] || continue
+    [ "${final_commit[$approver]}" = "$HEAD_SHA" ] || continue
+    # TEA-Core/paperclip is a PUBLIC repository, so any GitHub account can
+    # submit an approving review on any PR. `user.type == "User"` proves the
+    # reviewer is a person rather than an App; it proves nothing about their
+    # standing here, and a drive-by APPROVED from an unaffiliated account would
+    # otherwise countersign a fold waiver.
+    case "${final_assoc[$approver]}" in
+      OWNER|MEMBER|COLLABORATOR) ;;
+      *) continue ;;
+    esac
+    printf '%s' "$approver"
+    return 0
+  done
+  return 1
+}
+
+# require_countersignature <waiver-description>
+#   0 -> the waiver stands (not a fold head, or a human countersigned it)
+#   1 -> the waiver is present but uncountersigned; fall through to the status
+#        check, which is the ordinary gate and can still pass on its own
+# ALWAYS RETURNS 0. The countersignature is telemetry as of 2026-09-07, not a
+# gate; see the header. It is still resolved so the log records whether a human
+# looked at the fold, and so the resolution logic does not rot before anyone
+# decides to re-enable it. A failure reading the reviews is reported and then
+# ignored, because an advisory signal must not be able to fail a build.
+require_countersignature() {
+  local what="$1" approver rc
+  [ "$FOLD_HEAD" = "1" ] || return 0
+
+  approver="$(human_countersigner)" && rc=0 || rc=$?
+  if [ "${rc:-1}" = "0" ] && [ -n "$approver" ]; then
+    note "countersigned (advisory): ${what}, approved on head ${HEAD_SHA} by @${approver} (human account)"
+  elif [ "${rc:-1}" = "2" ]; then
+    note "countersignature UNKNOWN (advisory): could not read the reviews for ${what} — not enforced, so the waiver stands"
+  else
+    note "NOT countersigned (advisory): ${what} on fold head '${PR_HEAD_REF}' carries no approving review from a human account on head ${HEAD_SHA} — not enforced, so the waiver stands"
+  fi
+  return 0
+}
+
+# --- per-PR override (SUP-20897) ----------------------------------------------
+OVERRIDE_LABEL="override:paperclip-approval"
+OVERRIDE_REFUSAL=""
+OVERRIDE_ACTOR=""
+OVERRIDE_TS=""
+
+# override_refuse <reason>: record why the override is not honored; always 1.
+override_refuse() {
+  OVERRIDE_REFUSAL="$*"
+  return 1
+}
+
+# evaluate_override
+#   0 -> honored (OVERRIDE_ACTOR / OVERRIDE_TS name the audit trail)
+#   1 -> label present but not honored (OVERRIDE_REFUSAL says why)
+#   2 -> label absent, nothing attempted
+evaluate_override() {
+  local events last event ts actor actor_type role head_repo enc newest
+  local push_type push_after push_ts
+
+  printf '%s' "$PR_LABELS" | jq -e --arg l "$OVERRIDE_LABEL" 'index($l)' >/dev/null 2>&1 || return 2
+
+  # A fork head lives in another repository, so its branch activity is not
+  # readable here: fail closed rather than bind to a name this repo does not own.
+  head_repo="$(jq -r '.head.repo.full_name // ""' <<<"$PR_JSON")"
+  [ -n "$head_repo" ] && [ "${head_repo,,}" = "${REPO,,}" ] \
+    || { override_refuse "PR head repository '${head_repo:-<deleted>}' is not ${REPO}; a fork head cannot be bound to the label"; return 1; }
+
+  # Ascending, so the LAST labeled/unlabeled event is the current state. '-'
+  # stands in for a missing field: IFS-tab `read` collapses empty fields.
+  events="$(gh_api_retry --paginate \
+    "repos/${REPO}/issues/${PR_NUMBER}/events?per_page=100" \
+    --jq '.[] | select((.event == "labeled" or .event == "unlabeled") and .label.name == "'"${OVERRIDE_LABEL}"'") | [.event, (.created_at // "-"), (.actor.login // "-"), (.actor.type // "-")] | @tsv')" \
+    || { override_refuse "API failure: GET repos/${REPO}/issues/${PR_NUMBER}/events — ${events}"; return 1; }
+  last="$(tail -n 1 <<<"$events")"
+  [ -n "$last" ] || { override_refuse "no labeled event for ${OVERRIDE_LABEL} in the issue history of PR #${PR_NUMBER}"; return 1; }
+  IFS=$'\t' read -r event ts actor actor_type <<<"$last"
+  [ "$event" = "labeled" ] \
+    || { override_refuse "the most recent ${OVERRIDE_LABEL} event is '${event}', not 'labeled'"; return 1; }
+  OVERRIDE_ACTOR="$actor"
+  OVERRIDE_TS="$ts"
+  jq -ne --arg t "$ts" '$t | fromdateiso8601 | . > 0' >/dev/null 2>&1 \
+    || { override_refuse "the ${OVERRIDE_LABEL} event has no valid created_at (${ts}); the override cannot be audited"; return 1; }
+
+  # Authority: a person (not an App or bot — the machine-identity rejection
+  # human_countersigner applies via user.type) with write access. Deliberately
+  # NOT "not the PR author": every fleet PR is opened as the shared operator
+  # identity, which is also the person holding the lever. The head binding below
+  # is what stops a label from covering work pushed after it.
+  [ "$actor_type" = "User" ] \
+    || { override_refuse "labeler '${actor}' is type '${actor_type}', not User; a bot or App cannot apply the override"; return 1; }
+  [[ "$actor" =~ ^[A-Za-z0-9-]+$ ]] \
+    || { override_refuse "labeler login '${actor}' is not a valid GitHub user login"; return 1; }
+  role="$(gh_api_retry "repos/${REPO}/collaborators/${actor}/permission" --jq '.role_name // .permission // ""')" \
+    || { override_refuse "API failure: GET repos/${REPO}/collaborators/${actor}/permission — ${role}"; return 1; }
+  case "$role" in
+    admin|maintain|write) ;;
+    *) override_refuse "labeler '${actor}' has role '${role:-none}' on ${REPO}; the override needs admin, maintain or write"; return 1 ;;
+  esac
+
+  # Head binding. Newest activity on the PR's head branch must be a push of
+  # exactly HEAD_SHA, recorded before the label. Newest-first, one row.
+  enc="$(jq -rn --arg r "refs/heads/${PR_HEAD_REF}" '$r | @uri')"
+  newest="$(gh_api_retry "repos/${REPO}/activity?ref=${enc}&per_page=1" \
+    --jq '(.[0] // empty) | [.activity_type, (.after // "-"), (.timestamp // "-")] | @tsv')" \
+    || { override_refuse "API failure: GET repos/${REPO}/activity?ref=refs/heads/${PR_HEAD_REF} — ${newest}"; return 1; }
+  [ -n "$newest" ] || { override_refuse "no push activity recorded for refs/heads/${PR_HEAD_REF}; the push time of head ${HEAD_SHA} is unverifiable"; return 1; }
+  IFS=$'\t' read -r push_type push_after push_ts <<<"$newest"
+  case "$push_type" in
+    push|force_push|branch_creation) ;;
+    *) override_refuse "the newest activity on refs/heads/${PR_HEAD_REF} is '${push_type}', not a push"; return 1 ;;
+  esac
+  [ "$push_after" = "$HEAD_SHA" ] \
+    || { override_refuse "the newest push to refs/heads/${PR_HEAD_REF} left ${push_after}, not the PR head ${HEAD_SHA}; the head moved or was reset"; return 1; }
+  jq -ne --arg p "$push_ts" --arg l "$ts" '($p | fromdateiso8601) < ($l | fromdateiso8601)' >/dev/null 2>&1 \
+    || { override_refuse "override voided: head ${HEAD_SHA} was pushed at ${push_ts}, not strictly before the ${OVERRIDE_LABEL} event at ${ts}"; return 1; }
+  return 0
+}
+
+# waiver_unverified <what>: say, in the log, that a waiver was honoured on
+# author-controlled evidence only (branch name and author type).
+waiver_unverified() {
+  note "UNVERIFIED: ${1} honoured on head '${PR_HEAD_REF}' by author ${PR_AUTHOR:-<unknown>} (type ${PR_AUTHOR_TYPE:-<unknown>}) — no card binding was checked against the control plane, and a card work item on a non-SUP branch or a machine token typed User passes this check"
+}
+
+# waiver_retirement_on: the single reading of PAPERCLIP_CARD_WAIVER_RETIRED.
+# Only the exact value 1 arms it. Everything that exists because of the board
+# release (the waiver refusal, the description and id columns, the release
+# confirmation marker rule, the release log line and the denial hint) is gated on
+# this, so with the switch off the script reads, judges and prints exactly what it did
+# before SUP-20772.
+waiver_retirement_on() {
+  [ "${PAPERCLIP_CARD_WAIVER_RETIRED:-0}" = "1" ]
+}
+
+# waiver_honoured <what>
+#   0 -> the waiver counts
+#   1 -> refused (SUP-20772): the gate falls through to the status check
+# Always 0 until PAPERCLIP_CARD_WAIVER_RETIRED=1; see the header, including
+# KNOWN RESIDUAL BYPASS: neither the branch name nor the author type below is
+# control-plane data, so a honoured waiver is logged UNVERIFIED, never trusted.
+waiver_honoured() {
+  local what="$1"
+  waiver_retirement_on || return 0
+  if [ "$CARD_BOUND" = "1" ]; then
+    note "REFUSED: ${what} on card-bound head '${PR_HEAD_REF}' — a card-bound PR lands on a control-plane paperclip/approved or a board release (POST /api/issues/:id/merge-arming/release), never a waiver"
+    return 1
+  fi
+  case "${PR_AUTHOR_TYPE}:${PR_AUTHOR}" in
+    User:*|Bot:github-actions\[bot\]) waiver_unverified "$what"; return 0 ;;
+  esac
+  [ "$PR_AUTHOR_TYPE" = "Bot" ] && [ "$PR_AUTHOR_ID" = "$APPROVED_STATUS_CREATOR_ID" ] && { waiver_unverified "$what"; return 0; }
+  note "REFUSED: ${what} on PR #${PR_NUMBER} authored by ${PR_AUTHOR:-<unknown>} (type ${PR_AUTHOR_TYPE:-<unknown>}) — only a person, github-actions[bot] or ${APPROVED_STATUS_CREATOR_LOGIN} may waive a cardless PR"
+  return 1
+}
+
+# Waiver 1: body line "Paperclip-Approved-Waiver: <reason>" with a non-empty
+# reason (a cardless PR never gets a paperclip/approved status, so the
+# waiver is checked before the status lookup).
+reason_line="$(grep -E '^[[:space:]]*Paperclip-Approved-Waiver:[[:space:]]*[^[:space:]]' <<<"$PR_BODY" | head -1 || true)"
+if [ -n "$reason_line" ]; then
+  reason="$(sed -E 's/^[[:space:]]*Paperclip-Approved-Waiver:[[:space:]]*//' <<<"$reason_line")"
+  if waiver_honoured "body waiver 'Paperclip-Approved-Waiver: ${reason}'" \
+    && require_countersignature "body waiver 'Paperclip-Approved-Waiver: ${reason}'"; then
+    note "waived: PR body declares 'Paperclip-Approved-Waiver: ${reason}' (no Paperclip card)"
+    exit 0
+  fi
+fi
+
+# Waiver 2: exact "no-paperclip-card" label (whole-element match; no substrings).
+# Countersigned on a fold head for the same reason as the body waiver: the
+# `fleet-only` grant carries `pull_requests:write`, so an agent can apply this
+# label to its own PR. Leaving one of the two waiver forms uncountersigned would
+# leave the gate exactly as open as before.
+if [ -n "$PR_LABELS" ] && printf '%s' "$PR_LABELS" | jq -e --arg l 'no-paperclip-card' 'index($l)' >/dev/null 2>&1; then
+  if waiver_honoured "the 'no-paperclip-card' label" \
+    && require_countersignature "the 'no-paperclip-card' label"; then
+    note "waived: PR carries the 'no-paperclip-card' label (no Paperclip card)"
+    exit 0
+  fi
+fi
+
+# --- the consume-contract itself ----------------------------------------------
+# Read the LIST endpoint, not the combined one. `GET /commits/{sha}/status`
+# omits `creator` from every entry it returns — verified against a real
+# published status — so on that endpoint the enforcer structurally cannot see
+# who wrote the signal it is enforcing. `GET /commits/{sha}/statuses` carries
+# `creator`, and returns entries newest-first, so the first entry matching the
+# context is the same value the combined endpoint would have reported.
+# `--paginate`, not a bare first page. Anything holding `statuses:write` can
+# add a context to this commit, and the list is not filtered server-side; 100
+# newer unrelated statuses would push the approval onto page two, where an
+# unpaginated read sees `missing` and — this leg being fail-closed — blocks an
+# approved entry out of the queue. Pagination preserves order across pages, so
+# the first matching row is still the newest.
+# A board release (POST /api/issues/:id/merge-arming/release) is a control-plane success whose
+# description starts "released by ". This script holds no control-plane credential and cannot ask the
+# database whether the release was CONFIRMED, so the control plane says so on GitHub: after it commits the
+# confirmation it writes a second status, `paperclip/release-confirmed`, whose description is
+# "confirms status <id of the success>". With the switch ON, a release-described success counts only when
+# that marker, written by the same control-plane creator, names it; a release with no marker (a write that
+# timed out, a release the control plane voided or never confirmed) is treated as not approved. The
+# description and id columns are requested only then. With the switch OFF the query, the parse and the
+# verdict are exactly what they were before SUP-20772, so a release-described success is judged like any
+# other success until the switch is armed.
+RELEASE_CONFIRMED_CONTEXT="paperclip/release-confirmed"
+STATUS_ROW='(.context // ""), (.state // ""), ((.creator.id // "") | tostring), (.creator.login // "")'
+STATUS_DEF=''
+if waiver_retirement_on; then
+  # Every field has a value: tab-IFS `read` collapses an empty field into its neighbour, which would shift a
+  # later column (a description, an id) into the creator columns. An empty field is "-" and is mapped back
+  # to empty after the read, so a missing or null creator stays untrusted.
+  STATUS_DEF='def f: if . == "" then "-" else . end; '
+  STATUS_ROW='((.context // "") | f), ((.state // "") | f), (((.creator.id // "") | tostring) | f), ((.creator.login // "") | f), ((.description // "") | f), ((.id // "-") | tostring)'
+fi
+STATUSES_TSV="$(gh_api_retry --paginate \
+  "repos/${REPO}/commits/${HEAD_SHA}/statuses?per_page=100" \
+  --jq "${STATUS_DEF}.[] | [${STATUS_ROW}] | @tsv")" \
+  || fail "API failure: GET repos/${REPO}/commits/${HEAD_SHA}/statuses — ${STATUSES_TSV}"
+
+APPROVAL_STATE="missing"
+APPROVAL_CREATOR_ID=""
+APPROVAL_CREATOR_LOGIN=""
+APPROVAL_DESCRIPTION=""
+APPROVAL_STATUS_ID=""
+CONFIRMED_RELEASE_IDS=" "
+while IFS=$'\t' read -r status_context status_state status_creator_id status_creator_login status_description status_id; do
+  if waiver_retirement_on; then
+    [ "$status_context" = "-" ] && status_context=""
+    [ "$status_state" = "-" ] && status_state=""
+    [ "$status_creator_id" = "-" ] && status_creator_id=""
+    [ "$status_creator_login" = "-" ] && status_creator_login=""
+  fi
+  if waiver_retirement_on && [ "$status_context" = "$RELEASE_CONFIRMED_CONTEXT" ]; then
+    # Only the control plane's own marker counts, and only one that names a numeric status id.
+    if [ "$status_state" = "$STATE" ] && [ "$status_creator_id" = "$APPROVED_STATUS_CREATOR_ID" ]; then
+      confirmed_id="${status_description#confirms status }"
+      case "$status_description" in
+        "confirms status "*) case "$confirmed_id" in ''|*[!0-9]*) ;; *) CONFIRMED_RELEASE_IDS="${CONFIRMED_RELEASE_IDS}${confirmed_id} " ;; esac ;;
+      esac
+    fi
+    continue
+  fi
+  [ "$status_context" = "$CONTEXT" ] || continue
+  # The newest paperclip/approved status decides (the list is newest first). With the switch on the
+  # rest of the list is still read, for markers.
+  if [ -z "${approval_seen:-}" ]; then
+    approval_seen=1
+    APPROVAL_STATE="${status_state:-missing}"
+    APPROVAL_CREATOR_ID="$status_creator_id"
+    APPROVAL_CREATOR_LOGIN="$status_creator_login"
+    APPROVAL_DESCRIPTION="$status_description"
+    APPROVAL_STATUS_ID="$status_id"
+  fi
+  waiver_retirement_on || break
+done <<<"$STATUSES_TSV"
+
+# With the switch on, a release success the control plane has not confirmed is not an approval. A success
+# from any other creator is left to the FORGED refusal below.
+if waiver_retirement_on && [ "$APPROVAL_STATE" = "$STATE" ] && [ "$APPROVAL_CREATOR_ID" = "$APPROVED_STATUS_CREATOR_ID" ]; then
+  case "$APPROVAL_DESCRIPTION" in
+    "released by "*)
+      case "$CONFIRMED_RELEASE_IDS" in
+        *" ${APPROVAL_STATUS_ID} "*) ;;
+        *)
+          err "UNCONFIRMED RELEASE: ${CONTEXT} on ${HEAD_SHA} is a board release (status ${APPROVAL_STATUS_ID}) that the control plane has not marked confirmed (${RELEASE_CONFIRMED_CONTEXT})"
+          APPROVAL_STATE="unconfirmed-release"
+          ;;
+      esac
+      ;;
+  esac
+fi
+
+if [ "$APPROVAL_STATE" = "$STATE" ]; then
+  # `paperclip/approved` is a plain commit status, and the `fleet-only`
+  # installation grants `statuses:write` to any Paperclip-assigned agent. So
+  # until this check existed the gate was forgeable by capability, whatever the
+  # header above asserts: any agent in the fleet could publish a success on its
+  # own head SHA and merge. The producer is the control plane, which acts as the
+  # `tea-core` App — a different installation, whose bot identity the fleet
+  # token cannot assume.
+  if [ "$APPROVAL_CREATOR_ID" != "$APPROVED_STATUS_CREATOR_ID" ]; then
+    err "FORGED: ${CONTEXT} on ${HEAD_SHA} was written by ${APPROVAL_CREATOR_LOGIN:-<unknown>} (id ${APPROVAL_CREATOR_ID:-<none>})"
+    err "  the only accepted producer is the control-plane App ${APPROVED_STATUS_CREATOR_LOGIN} (id ${APPROVED_STATUS_CREATOR_ID})"
+    err "  the fleet installation grants statuses:write to every Paperclip-assigned agent, so a"
+    err "  ${CONTEXT} status from any other identity is a self-published approval, not an approval"
+    fail "${CONTEXT} on ${HEAD_SHA} was not published by the control plane"
+  fi
+  note "pass: ${CONTEXT} = ${STATE} on PR #${PR_NUMBER} head ${HEAD_SHA} (published by ${APPROVAL_CREATOR_LOGIN})"
+  if waiver_retirement_on; then
+    case "$APPROVAL_DESCRIPTION" in
+      "released by "*) note "board release: ${APPROVAL_DESCRIPTION}" ;;
+    esac
+  fi
+  if [ "$MODE" = "advisory" ]; then
+    advisory_summary_present
+  fi
+  exit 0
+fi
+
+# --- per-PR override: consulted only when the head carries no valid stamp -------
+OVERRIDE_RC=0
+evaluate_override || OVERRIDE_RC=$?
+if [ "$OVERRIDE_RC" = "0" ]; then
+  note "OVERRIDE HONORED: ${OVERRIDE_LABEL} applied by @${OVERRIDE_ACTOR} at ${OVERRIDE_TS}; PR #${PR_NUMBER} head ${HEAD_SHA} was last pushed before the label (stamp ${APPROVAL_STATE}, no ${CONTEXT} required)"
+  warn_annotation "${CONTEXT} OVERRIDDEN on PR #${PR_NUMBER} head ${HEAD_SHA}: ${OVERRIDE_LABEL} applied by @${OVERRIDE_ACTOR} at ${OVERRIDE_TS}. The head has no control-plane approval; a person approved this PR."
+  job_summary "$(printf '%s\n' \
+    "### ${BT}${CONTEXT}${BT} OVERRIDDEN" \
+    "" \
+    "- **PR:** #${PR_NUMBER}" \
+    "- **Head SHA:** ${BT}${HEAD_SHA}${BT}" \
+    "- **Label:** ${BT}${OVERRIDE_LABEL}${BT} applied by @${OVERRIDE_ACTOR} at ${OVERRIDE_TS}" \
+    "" \
+    "A person with write access approved this head by label. A push after the label voids it.")"
+  exit 0
+elif [ "$OVERRIDE_RC" = "1" ]; then
+  note "override NOT honored: ${OVERRIDE_REFUSAL}"
+fi
+
+if [ "$MODE" = "advisory" ]; then
+  note "ADVISORY: ${CONTEXT} is ${APPROVAL_STATE}, expected ${STATE}; pull_request is non-blocking — the merge queue enforces at the merge boundary"
+  advisory_summary_absent
+  warn_annotation "${CONTEXT} is ${APPROVAL_STATE:-missing} on head ${HEAD_SHA} (PR #${PR_NUMBER}): this PR will be evicted from the merge queue until the control plane publishes ${CONTEXT} = ${STATE}${OVERRIDE_REFUSAL:+ (override not honored: ${OVERRIDE_REFUSAL})}. This check is advisory and reports success."
+  exit 0
+fi
+
+err "FAIL: ${CONTEXT} is ${APPROVAL_STATE}, expected ${STATE} — PR #${PR_NUMBER} head ${HEAD_SHA} is not approved"
+err "  an approval is produced by the control plane when the card's review stage records 'approved'"
+err "  (a hand PATCH of the card status skips publishApprovalStatus — no status is ever published)"
+if waiver_retirement_on; then
+  err "  a card-bound PR can also be released by the board: POST /api/issues/:id/merge-arming/release {headSha, reason}"
+fi
+err "  or waive a cardless PR: body line 'Paperclip-Approved-Waiver: <reason>' or the 'no-paperclip-card' label"
+err "  or have a person with write access apply the '${OVERRIDE_LABEL}' label AFTER the last push${OVERRIDE_REFUSAL:+ — override not honored: ${OVERRIDE_REFUSAL}}"
+exit 1

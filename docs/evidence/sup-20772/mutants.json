@@ -1,0 +1,141 @@
+{
+  "mutants": {
+    "M1 no write-ahead record (arm proceeds without writing it)": [
+      {
+        "file": "src/services/merge-arming.test.ts",
+        "filter": "take-back record written before the arm",
+        "failed": 6,
+        "passed": 2,
+        "failedNames": [
+          "is on the card while GitHub is asked to enable, and gone once the arm stands",
+          "arms nothing when the record cannot be written",
+          "keeps the record when GitHub gives no answer, and the sweep takes the arm back when the authority changed",
+          "keeps the record when GitHub gives no answer, and the sweep only drops the record when the authority still holds",
+          "refuses a second arm while the card holds a record",
+          "refuses to arm at the backlog cap and still takes every recorded arm back"
+        ]
+      }
+    ],
+    "M2 no backlog cap at admission": [
+      {
+        "file": "src/services/merge-arming.test.ts",
+        "filter": "take-back record written before the arm",
+        "failed": 1,
+        "passed": 7,
+        "failedNames": [
+          "refuses to arm at the backlog cap and still takes every recorded arm back"
+        ]
+      }
+    ],
+    "M3 sweep ignores in-flight records": [
+      {
+        "file": "src/services/merge-arming.test.ts",
+        "filter": "take-back record written before the arm",
+        "failed": 3,
+        "passed": 5,
+        "failedNames": [
+          "keeps the record when GitHub gives no answer, and the sweep takes the arm back when the authority changed",
+          "keeps the record when GitHub gives no answer, and the sweep only drops the record when the authority still holds",
+          "takes back an arm a previous process left in flight when the authority changed, and leaves a young record alone"
+        ]
+      }
+    ],
+    "M4 no authority re-check after an accepted enable": [
+      {
+        "file": "src/services/merge-arming.test.ts",
+        "filter": "revocation matrix|take-back|window from",
+        "failed": 13,
+        "passed": 8,
+        "failedNames": [
+          "keeps a failed take-back on the card, and a later tick turns auto-merge off and clears it",
+          "retries a pending take-back on every reconciler tick",
+          "provider round trip 0 ms, merges 0 ms after accepting",
+          "provider round trip 0 ms, merges 50 ms after accepting",
+          "provider round trip 0 ms, merges 100 ms after accepting",
+          "provider round trip 0 ms, merges 1000 ms after accepting",
+          "provider round trip 0 ms, merges 5000 ms after accepting",
+          "provider round trip 150 ms, merges 0 ms after accepting",
+          "provider round trip 150 ms, merges 50 ms after accepting",
+          "provider round trip 150 ms, merges 100 ms after accepting",
+          "provider round trip 150 ms, merges 1000 ms after accepting",
+          "provider round trip 150 ms, merges 5000 ms after accepting"
+        ]
+      },
+      {
+        "file": "src/services/approval-status-reconciler.test.ts",
+        "filter": "revocation matrix through the real",
+        "failed": 4,
+        "passed": 4,
+        "failedNames": [
+          "the decision row becomes changes_requested, at the final accepted enable",
+          "the card's last decision outcome changes, at the final accepted enable",
+          "the certificate is removed, at the final accepted enable",
+          "the decider is terminated, at the final accepted enable"
+        ]
+      },
+      {
+        "file": "src/services/done-close-landing-backstop.test.ts",
+        "filter": "revocation matrix through the real backstop",
+        "failed": 0,
+        "passed": 8,
+        "failedNames": []
+      }
+    ],
+    "M5 driver type lookup back on (fetch_types true)": [
+      {
+        "file": "src/__tests__/merge-arming-republish.test.ts",
+        "filter": "cancel during connection startup",
+        "failed": 4,
+        "passed": 2,
+        "failedNames": [
+          "pooled (pool 1): a cancel during connection startup leaves no unhandled rejection",
+          "pooled (pool 2): a cancel during connection startup leaves no unhandled rejection",
+          "pooled (pool 3): a cancel during connection startup leaves no unhandled rejection",
+          "pooled (pool 10): a cancel during connection startup leaves no unhandled rejection"
+        ]
+      }
+    ],
+    "M6 record never dropped once the arm stands": [
+      {
+        "file": "src/services/merge-arming.test.ts",
+        "filter": "take-back record written before the arm",
+        "failed": 1,
+        "passed": 7,
+        "failedNames": [
+          "is on the card while GitHub is asked to enable, and gone once the arm stands"
+        ]
+      }
+    ],
+    "M7 OFF consumer accepts an unconfirmed release again": [
+      {
+        "file": "src/__tests__/merge-arming-republish.test.ts",
+        "filter": "late provider success, judged",
+        "failed": 7,
+        "passed": 1,
+        "failedNames": [
+          "a success GitHub accepted lands 0 ms after the 409: refused while newest and after the void",
+          "a success GitHub accepted lands 100 ms after the 409: refused while newest and after the void",
+          "a success GitHub accepted lands 1000 ms after the 409: refused while newest and after the void",
+          "a success GitHub accepted lands 2000 ms after the 409: refused while newest and after the void",
+          "a success GitHub accepted lands 5000 ms after the 409: refused while newest and after the void",
+          "a success that lands after BOTH re-checks saw the void stays the newest status and is still refused (unknown state beyond the re-checks)",
+          "a re-check that cannot read the head's statuses fails closed, and a success landing later is still refused"
+        ]
+      }
+    ],
+    "M8 backstop: no authority re-check after an accepted enable": [
+      {
+        "file": "src/services/done-close-landing-backstop.test.ts",
+        "filter": "revocation matrix through the real backstop",
+        "failed": 4,
+        "passed": 4,
+        "failedNames": [
+          "the decision row becomes changes_requested, at the final accepted enable",
+          "the card's last decision outcome changes, at the final accepted enable",
+          "the certificate is removed, at the final accepted enable",
+          "the decider's membership is revoked, at the final accepted enable"
+        ]
+      }
+    ]
+  }
+}

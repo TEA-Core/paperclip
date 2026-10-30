@@ -1,0 +1,9 @@
+{
+ "M9 no admission lock (cap raced by concurrent admissions)": {"file":"server/src/services/merge-arming.ts","old":"    await tx.execute(sql`select pg_advisory_xact_lock(hashtext('paperclip:auto-merge-disarm-admission'))`);\n","new":""},
+ "M10 settle clears an in-flight record whose authority is unchanged instead of taking the arm back": {"file":"server/src/services/auto-merge-disarm.ts","old":"    record = { ...record, state: \"pending\", reason: \"arm interrupted before it was settled\" };\n    await recordPendingAutoMergeDisarm(db, row.companyId, row.id, record);","new":"    await clearAutoMergeDisarmRecord(db, row.companyId, row.id, record.token);\n    return \"none\";"},
+ "M11 escalation deadline never reached": {"file":"server/src/services/merge-arming.ts","old":"  return !Number.isNaN(since) && now - since >= disarmEscalation.afterMs;","new":"  return false;"},
+ "M12 enable request has no deadline": {"file":"server/src/services/merge-arming.ts","old":"const attemptTimeoutMs = options.attemptTimeoutMs ?? ENABLE_ATTEMPT_TIMEOUT_MS;","new":"const attemptTimeoutMs = options.attemptTimeoutMs ?? 2_000_000_000;"},
+ "M13 a timed-out enable drops the record": {"file":"server/src/services/merge-arming.ts","old":"result.error?.startsWith(\"timeout after \") || ","new":""},
+ "M14 sweep takes one record by default": {"file":"server/src/services/auto-merge-disarm.ts","old":".limit(options.limit ?? disarmBacklog.cap);","new":".limit(options.limit ?? 1);"},
+ "M15 an escalated record does not refuse the arm with its own answer": {"file":"server/src/services/merge-arming.ts","old":"  return disarmRecordEscalated(existing as { since?: string; escalatedAt?: string }) ? \"escalated\" : \"exists\";","new":"  return \"exists\";"}
+}

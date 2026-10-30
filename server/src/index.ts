@@ -1513,7 +1513,9 @@ async function startServerWithDatabaseTeardown(
       trackHeartbeatSchedulerWork(doneCloseLandingBackstop
         .sweep()
         .then((result) => {
-          if (result.candidates > 0 || result.confirmed > 0 || result.failed > 0 || result.deferred > 0) {
+          if (result.unarmable.length > 0) {
+            logger.warn(result, "done-close landing backstop sweep found unarmable pending cards");
+          } else if (result.candidates > 0 || result.confirmed > 0 || result.failed > 0 || result.deferred > 0) {
             logger.info(result, "done-close landing backstop sweep dispositioned decision-carried skips");
           }
           return result;
@@ -1922,6 +1924,11 @@ async function startServerWithDatabaseTeardown(
           logger.warn({ ...staleWakes }, "startup stale recovery action wake sweep re-fired wakes");
         }
 
+        const exhaustedDrain = await heartbeat.reconcileExhaustedRecoveryDrain();
+        if (exhaustedDrain.monitorArmed > 0 || exhaustedDrain.recoveryIssueMinted > 0 || exhaustedDrain.noInvokableOwner > 0) {
+          logger.warn({ ...exhaustedDrain }, "startup exhausted recovery drain swept terminal actions into live wake paths");
+        }
+
         const permanentlyUnfinalizable = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
         if (permanentlyUnfinalizable.reported > 0) {
           logger.warn({ ...permanentlyUnfinalizable }, "startup permanently-unfinalizable-blocker sweep reported issues");
@@ -2252,6 +2259,10 @@ async function startServerWithDatabaseTeardown(
               if (staleWakes.reFired > 0 || staleWakes.rerouted > 0 || staleWakes.maxAttemptsReached > 0) {
                 logger.warn({ ...staleWakes }, "periodic stale recovery action wake sweep re-fired wakes");
               }
+              const exhaustedDrain = await heartbeat.reconcileExhaustedRecoveryDrain();
+              if (exhaustedDrain.monitorArmed > 0 || exhaustedDrain.recoveryIssueMinted > 0 || exhaustedDrain.noInvokableOwner > 0) {
+                logger.warn({ ...exhaustedDrain }, "periodic exhausted recovery drain swept terminal actions into live wake paths");
+              }
             })
             .then(async () => {
               const completedRunStrand = await heartbeat.reconcileCompletedRunStrandIssues();
@@ -2342,6 +2353,12 @@ async function startServerWithDatabaseTeardown(
   // reconciler re-publishes on the live head, gated by content identity
   // (Guard A) and stage integrity (Guard B); idempotent re-runs perform zero
   // writes.
+  {
+    // SUP-20772: take-backs of auto-merge arms recorded before this process started are tried now, not at the first tick
+    // (the in-process retry timers died with the last process), whether or not the reconciler is enabled.
+    const { resumePendingAutoMergeDisarms } = await import("./services/auto-merge-disarm.js");
+    void resumePendingAutoMergeDisarms(db);
+  }
   if (config.approvalStatusReconcilerEnabled) {
     const { startApprovalStatusReconciler } = await import("./services/approval-status-reconciler.js");
     logger.info(

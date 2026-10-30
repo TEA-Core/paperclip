@@ -583,6 +583,216 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       });
     });
 
+    it.each([
+      { label: "absent", contextSnapshot: {} },
+      { label: "blank", contextSnapshot: { issueId: "   " } },
+    ])("cancels a pre-cutoff queued run whose legacy context has a $label issue id", async ({ contextSnapshot }) => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const cutoff = new Date("2026-10-26T12:00:00.000Z");
+      const runId = await seedRun({
+        companyId,
+        agentId,
+        contextSnapshot,
+        now: new Date(cutoff.getTime() - 1_000),
+      });
+
+      const outcome = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+        worktreeExecutionCutoff: cutoff,
+      });
+
+      expect(outcome).toMatchObject({
+        outcome: "cancelled",
+        errorCode: "execution_reconciliation_required",
+      });
+      const [run] = await db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+      expect(run).toMatchObject({
+        status: "cancelled",
+        errorCode: "execution_reconciliation_required",
+      });
+    });
+
+    it("clears a matching checkout lock for a pre-cutoff run with no issue id", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const cutoff = new Date("2026-10-26T12:00:00.000Z");
+      const runId = await seedRun({
+        companyId,
+        agentId,
+        contextSnapshot: {},
+        now: new Date(cutoff.getTime() - 1_000),
+      });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, issueId));
+
+      const outcome = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+        worktreeExecutionCutoff: cutoff,
+      });
+
+      expect(outcome).toMatchObject({
+        outcome: "cancelled",
+        errorCode: "execution_reconciliation_required",
+      });
+      const [issue] = await db
+        .select({ checkoutRunId: issues.checkoutRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      expect(issue).toEqual({ checkoutRunId: null });
+    });
+
+    it("locks a matching checkout issue before cancelling a pre-cutoff run with no issue id", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const replacementAgentId = randomUUID();
+      await seedAgent({ id: replacementAgentId, companyId, name: "ReplacementCoder" });
+      const cutoff = new Date("2026-10-26T12:00:00.000Z");
+      const runId = await seedRun({
+        companyId,
+        agentId,
+        contextSnapshot: {},
+        now: new Date(cutoff.getTime() - 1_000),
+      });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, issueId));
+
+      const { done: holderDone } = await reassignIssueAndLockRunOnceAConcurrentWaiterBlocks(
+        issueId,
+        runId,
+        replacementAgentId,
+      );
+      const outcome = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+        worktreeExecutionCutoff: cutoff,
+      });
+      await holderDone;
+
+      expect(outcome).toMatchObject({
+        outcome: "cancelled",
+        errorCode: "execution_reconciliation_required",
+      });
+    });
+
+    it.each([
+      { label: "at", createdAt: 0 },
+      { label: "after", createdAt: 1_000 },
+    ])("leaves a $label-cutoff queued run with no issue id untouched", async ({ createdAt }) => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const cutoff = new Date("2026-10-26T12:00:00.000Z");
+      const runId = await seedRun({
+        companyId,
+        agentId,
+        contextSnapshot: {},
+        now: new Date(cutoff.getTime() + createdAt),
+      });
+
+      const outcome = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+        worktreeExecutionCutoff: cutoff,
+      });
+
+      expect(outcome).toEqual({ outcome: "not_stale" });
+      const [run] = await db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+      expect(run).toMatchObject({ status: "queued", errorCode: null });
+    });
+
+    it.each([
+      { label: "matching", preservesCheckoutLock: false },
+      { label: "nonmatching", preservesCheckoutLock: true },
+    ])("clears only a $label checkout lock when cancelling a stale run", async ({ preservesCheckoutLock }) => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "done", assigneeAgentId: agentId });
+      const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId } });
+      const otherRunId = preservesCheckoutLock
+        ? await seedRun({ companyId, agentId, contextSnapshot: { issueId } })
+        : null;
+      const checkoutRunId = otherRunId ?? runId;
+      await db
+        .update(issues)
+        .set({ executionRunId: runId, checkoutRunId })
+        .where(eq(issues.id, issueId));
+
+      const outcome = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+      });
+
+      expect(outcome).toMatchObject({ outcome: "cancelled", errorCode: "issue_terminal_status" });
+      const [issue] = await db
+        .select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      expect(issue).toEqual({
+        executionRunId: null,
+        checkoutRunId: otherRunId,
+      });
+    });
+
+    it("expires an old queued issue run when its own non-running pointers are stale", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      const now = new Date("2026-01-02T00:00:00.000Z");
+      const createdAt = new Date("2025-12-31T00:00:00.000Z");
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId }, now: createdAt });
+      await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, issueId));
+
+      const result = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now,
+      });
+
+      expect(result).toMatchObject({ outcome: "cancelled", errorCode: "queued_run_expired" });
+      const [issue] = await db.select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
+        .from(issues).where(eq(issues.id, issueId));
+      expect(issue).toEqual({ executionRunId: null, checkoutRunId: null });
+    });
+
+    it("keeps an old queued issue run live while another running run owns its execution pointer", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      const now = new Date("2026-01-02T00:00:00.000Z");
+      const createdAt = new Date("2025-12-31T00:00:00.000Z");
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const queuedRunId = await seedRun({ companyId, agentId, contextSnapshot: { issueId }, now: createdAt });
+      const runningRunId = await seedRun({ companyId, agentId, contextSnapshot: { issueId }, status: "running", now });
+      await db.update(issues).set({ executionRunId: runningRunId }).where(eq(issues.id, issueId));
+
+      const result = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+        runId: queuedRunId,
+        companyId,
+        expectedStatus: "queued",
+        now,
+      });
+
+      expect(result).toEqual({ outcome: "not_stale" });
+      const [run] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, queuedRunId));
+      expect(run?.status).toBe("queued");
+    });
+
     it("maps a reassigned issue into a stale queued-run decision", async () => {
       const { companyId, agentId } = await seedCompanyAndAgent();
       const replacementAgentId = randomUUID();

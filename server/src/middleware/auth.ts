@@ -207,7 +207,7 @@ async function auditAgentKeyMissingResponsibleUser(
   }
 }
 
-interface ActorMiddlewareOptions {
+export interface ActorMiddlewareOptions {
   deploymentMode: DeploymentMode;
   resolveSession?: (req: Request) => Promise<BetterAuthSessionResult | null>;
 }
@@ -216,7 +216,14 @@ const publicMcpGatewayProtocolPath = /^\/mcp\/gateways\/gw_[a-f0-9]{32}\/?$/i;
 
 export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
   const boardAuth = boardAuthService(db);
-  return async (req, _res, next) => {
+  return async (req, res, rawNext) => {
+    // A release request whose clock ran out has been answered (see releaseRequestClock): authentication that
+    // is still running must neither write anything (the key's usage stamp) nor hand the request on.
+    const clockExpired = () => (res.locals?.releaseClock as { expired?: boolean } | undefined)?.expired === true;
+    const next: typeof rawNext = (err?: unknown) => {
+      if (clockExpired()) return;
+      (rawNext as (e?: unknown) => void)(err);
+    };
     req.actor =
       opts.deploymentMode === "local_trusted"
         ? {
@@ -312,7 +319,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       }
       const access = await boardAuth.resolveBoardAccess(boardKey.userId);
       if (access.user) {
-        await boardAuth.touchBoardApiKey(boardKey.id);
+        if (!clockExpired()) await boardAuth.touchBoardApiKey(boardKey.id);
         req.actor = {
           type: "board",
           userId: boardKey.userId,
@@ -392,7 +399,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         ));
       if (identityRun?.status === "cancelled" && identityRun.contextSnapshot?.conversationMode === true
         && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
-        _res.status(403).json({ error: "This conversation turn was cancelled", code: "conversation_turn_cancelled" });
+        res.status(403).json({ error: "This conversation turn was cancelled", code: "conversation_turn_cancelled" });
         return;
       }
       if (identityRun?.activeIdentityContextId && identityRun.status === "running") {

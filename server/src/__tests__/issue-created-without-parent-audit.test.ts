@@ -401,6 +401,13 @@ describeEmbeddedPostgres("issue created without parent audit row (SUP-15668)", (
 
     expect(res.status).toBe(422);
     expect(res.body).toMatchObject({ code: "done_transition_missing_tier_declaration" });
+    // SUP-21339 review: the create door has no comment and createIssueSchema
+    // rejects doneTier, so its remedy must direct callers to create
+    // non-terminal and close via PATCH — never to retry an invalid create.
+    const remedy = (res.body as { details?: { remedy?: string } }).details?.remedy ?? "";
+    expect(remedy).toContain("non-terminal");
+    expect(remedy).toContain("PATCH /api/issues/{id}");
+    expect(remedy).not.toContain("in this same request body");
   });
 
   it("still returns 201 and persists the issue when the audit insert fails for an agent top-level create", async () => {

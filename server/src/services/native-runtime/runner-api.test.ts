@@ -96,7 +96,7 @@ describe("runner API catalog", () => {
       searchRunnerApi({ query: "GET /api/companies/{companyId}/issues" })
         .results[0].dedicatedTools,
     ).toContain("search_tasks");
-    expect(searchRunnerApi({ query: "nothing-zzzzzzzzzz" }).total).toBe(0);
+    expect(searchRunnerApi({ query: "zzzzzzzzzz-qqqqqqqqqq" }).total).toBe(0);
   });
   it("paginates without duplicates and rejects stale or mismatched cursors", () => {
     const first = searchRunnerApi({ query: "project", limit: 1 });

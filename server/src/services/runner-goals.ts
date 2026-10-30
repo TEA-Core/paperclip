@@ -370,6 +370,15 @@ export function runnerGoalService(
     }
 
     const accepted = await db.transaction(async (tx) => {
+      // Serialize goal actions with ownership changes. The preflight binding
+      // can become stale while the repair transaction is waiting for the issue.
+      const [lockedIssue] = await tx.select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+        .for("update");
+      if (lockedIssue?.assigneeAgentId !== request.agentId) {
+        throw new RunnerGoalActionError("agent_not_assigned", "The selected agent is not assigned to this issue.");
+      }
       await tx.insert(agentTaskSessions).values({
         companyId,
         agentId: request.agentId,

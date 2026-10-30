@@ -1,0 +1,278 @@
+{
+ "measuredAt": "2026-10-27",
+ "previousHead": {
+  "previous head 84ab1e97": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 12,
+    "passed": 13,
+    "failedNames": [
+     "403: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "422: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "503: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "a request that never answers: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "keeps trying the fence every round while the status route refuses too, and says so",
+     "reads the live head when the record has none",
+     "waits for the escalation deadline before fencing an arm that was only left in flight, then fences and alerts",
+     "fences inline, in the arming process, when the take-back right after a revoked arm is refused (no sweep, no scheduler)",
+     "says when the inline fence could not be written either",
+     "tries every record in a default sweep, including ones above the admission cap",
+     "gives up on an enable request that never answers at the default deadline, aborts it, keeps the record and holds no lock",
+     "takes the admission lock: an arm waits behind a holder of it, writes nothing until it is released, and then arms"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500",
+    "failed": 2,
+    "passed": 1,
+    "failedNames": [
+     "answers 409, not 500, when a statement timeout cuts off the request's first write before its own deadline",
+     "answers 409, not 500, when a lock timeout cuts off the request's first write before its own deadline"
+    ]
+   }
+  ]
+ },
+ "mutants": {
+  "M9 no admission lock (cap raced by concurrent admissions)": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 2,
+    "passed": 23,
+    "failedNames": [
+     "holds the cap under concurrent admissions and a default sweep tries every record at it",
+     "takes the admission lock: an arm waits behind a holder of it, writes nothing until it is released, and then arms"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500",
+    "failed": 0,
+    "passed": 3,
+    "failedNames": []
+   }
+  ],
+  "M10 settle clears an in-flight record whose authority is unchanged instead of taking the arm back": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 5,
+    "passed": 20,
+    "failedNames": [
+     "keeps the record when GitHub gives no answer, and the sweep takes the arm back when the authority still holds",
+     "takes back an arm a previous process left in flight whatever the authority is now, and leaves a young record alone",
+     "holds the cap under concurrent admissions and a default sweep tries every record at it",
+     "waits for the escalation deadline before fencing an arm that was only left in flight, then fences and alerts",
+     "tries every record in a default sweep, including ones above the admission cap"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500",
+    "failed": 0,
+    "passed": 3,
+    "failedNames": []
+   }
+  ],
+  "M11 escalation deadline never reached": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 3,
+    "passed": 22,
+    "failedNames": [
+     "is escalated once past the deadline, by the sweep, and no control-plane arm gets through meanwhile",
+     "refuses every arm past the deadline with no sweep having run at all, and is cleared by a confirmed disable",
+     "waits for the escalation deadline before fencing an arm that was only left in flight, then fences and alerts"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500",
+    "failed": 0,
+    "passed": 3,
+    "failedNames": []
+   }
+  ],
+  "M12 enable request has no deadline": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 2,
+    "passed": 23,
+    "failedNames": [
+     "gives up on an enable request that never answers at the default deadline, aborts it, keeps the record and holds no lock",
+     "applies its default deadline when no option is given"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500",
+    "failed": 0,
+    "passed": 3,
+    "failedNames": []
+   }
+  ],
+  "M13 a timed-out enable drops the record": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 2,
+    "passed": 23,
+    "failedNames": [
+     "keeps the record when the enable call timed out: the arm may be in force",
+     "gives up on an enable request that never answers at the default deadline, aborts it, keeps the record and holds no lock"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500",
+    "failed": 0,
+    "passed": 3,
+    "failedNames": []
+   }
+  ],
+  "M14 sweep takes a limited number of records by default": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 2,
+    "passed": 23,
+    "failedNames": [
+     "holds the cap under concurrent admissions and a default sweep tries every record at it",
+     "tries every record in a default sweep, including ones above the admission cap"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500",
+    "failed": 0,
+    "passed": 3,
+    "failedNames": []
+   }
+  ],
+  "M15 an escalated record does not refuse the arm with its own answer": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 2,
+    "passed": 23,
+    "failedNames": [
+     "is escalated once past the deadline, by the sweep, and no control-plane arm gets through meanwhile",
+     "refuses every arm past the deadline with no sweep having run at all, and is cleared by a confirmed disable"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500",
+    "failed": 0,
+    "passed": 3,
+    "failedNames": []
+   }
+  ],
+  "M16 the sweep never fences the head": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 7,
+    "passed": 18,
+    "failedNames": [
+     "403: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "422: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "503: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "a request that never answers: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "keeps trying the fence every round while the status route refuses too, and says so",
+     "reads the live head when the record has none",
+     "waits for the escalation deadline before fencing an arm that was only left in flight, then fences and alerts"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500",
+    "failed": 0,
+    "passed": 3,
+    "failedNames": []
+   }
+  ],
+  "M17 the arming process does not fence inline": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 2,
+    "passed": 23,
+    "failedNames": [
+     "fences inline, in the arming process, when the take-back right after a revoked arm is refused (no sweep, no scheduler)",
+     "says when the inline fence could not be written either"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500",
+    "failed": 0,
+    "passed": 3,
+    "failedNames": []
+   }
+  ],
+  "M18 an arm only left in flight is fenced at once, before the escalation deadline": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 1,
+    "passed": 24,
+    "failedNames": [
+     "waits for the escalation deadline before fencing an arm that was only left in flight, then fences and alerts"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500",
+    "failed": 0,
+    "passed": 3,
+    "failedNames": []
+   }
+  ],
+  "M19 the status route fence writes a success instead of a failure": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 5,
+    "passed": 20,
+    "failedNames": [
+     "403: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "422: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "503: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "a request that never answers: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "fences inline, in the arming process, when the take-back right after a revoked arm is refused (no sweep, no scheduler)"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500",
+    "failed": 0,
+    "passed": 3,
+    "failedNames": []
+   }
+  ],
+  "M20 a statement or lock timeout before the deadline answers 500": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 0,
+    "passed": 25,
+    "failedNames": []
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500",
+    "failed": 2,
+    "passed": 1,
+    "failedNames": [
+     "answers 409, not 500, when a statement timeout cuts off the request's first write before its own deadline",
+     "answers 409, not 500, when a lock timeout cuts off the request's first write before its own deadline"
+    ]
+   }
+  ]
+ }
+}

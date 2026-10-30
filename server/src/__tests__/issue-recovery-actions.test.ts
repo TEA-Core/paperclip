@@ -76,11 +76,14 @@ describe("issueRecoveryActionService", () => {
   it("does not reactivate an action resolved between the active read and update", async () => {
     const existingRow = makeRecoveryActionRow({ id: "existing-action", attemptCount: 1 });
     const createdRow = makeRecoveryActionRow({ id: "new-action", attemptCount: 1 });
-    const selectResults = [[existingRow], []];
+    const selectResults = [[{ id: "source-1" }], [existingRow], []];
 
     const makeSelectQuery = (rows: unknown[]) => ({
       from() {
         return this;
+      },
+      for() {
+        return Promise.resolve(rows);
       },
       where() {
         return this;
@@ -98,7 +101,7 @@ describe("issueRecoveryActionService", () => {
       },
     });
 
-    const fakeDb = {
+    const fakeTx = {
       select: vi.fn(() => makeSelectQuery(selectResults.shift() ?? [])),
       update: vi.fn(() => ({
         set: vi.fn(() => ({
@@ -113,6 +116,10 @@ describe("issueRecoveryActionService", () => {
         })),
       })),
     };
+    const fakeDb = {
+      ...fakeTx,
+      transaction: vi.fn(async (callback: (tx: typeof fakeTx) => Promise<unknown>) => callback(fakeTx)),
+    };
 
     const result = await issueRecoveryActionService(fakeDb as never).upsertSourceScoped({
       companyId: "company-1",
@@ -126,8 +133,8 @@ describe("issueRecoveryActionService", () => {
     });
 
     expect(result).toMatchObject({ id: "new-action", status: "active" });
-    expect(fakeDb.update).toHaveBeenCalledTimes(1);
-    expect(fakeDb.insert).toHaveBeenCalledTimes(1);
+    expect(fakeTx.update).toHaveBeenCalledTimes(1);
+    expect(fakeTx.insert).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -4180,6 +4187,57 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
     const [live] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
     expect(live?.status).toBe("todo");
+  });
+
+  it("refuses an agent resolving a board-owned close_arm_failed action as owner_completed", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "close_arm_failed",
+      ownerType: "board",
+      ownerAgentId: null,
+      ownerUserId: null,
+      supersedeOnIdentityChange: true,
+      cause: "failed: GitHub returned 502",
+      fingerprint: "close_arm_failed:board-only",
+      evidence: { outcomeKind: "failed", outcomeMessage: "failed: GitHub returned 502" },
+      nextAction: "Inspect the merge-arming failure.",
+      wakePolicy: null,
+      maxAttempts: 5,
+    });
+    // Give the agent the strongest generic authority available: assignee and
+    // recovery owner. Board-owned close_arm_failed resolution must still refuse.
+    await db.update(issues).set({ assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
+    await db.update(issueRecoveryActions).set({ ownerType: "agent", ownerAgentId: managerId }).where(eq(issueRecoveryActions.id, action.id));
+    const reloaded = await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId);
+    expect(reloaded).toMatchObject({ ownerType: "agent", ownerAgentId: managerId, kind: "close_arm_failed" });
+
+    const runId = randomUUID();
+    const app = createApp(
+      { type: "agent", agentId: managerId, companyId, runId, source: "agent_jwt" },
+      {
+        recoveryActionEnqueueWakeup: vi.fn(async () => null) as any,
+      },
+    );
+    await seedHeartbeatRun({ companyId, agentId: managerId, runId, issueId: sourceIssueId });
+
+    const rejected = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "done",
+        resolutionNote: "Agent claims the merge landed.",
+      })
+      .expect(403);
+
+    expect(rejected.body.error).toContain("Board access required");
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+      id: action.id,
+      status: "active",
+    });
   });
 
   it("wakes dependents blocked on the source issue when recovery resolution closes it", async () => {
