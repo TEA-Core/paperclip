@@ -16,7 +16,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { armMergeOnApproval as armMergeOnApprovalReal, enableAutoMerge, publishApprovalStatus, resolveLinkedPullRequests, shouldPublishApprovalStatus, type MergeArmingDecision } from "../services/merge-arming.js";
+import { armMergeOnApproval as armMergeOnApprovalReal, enableAutoMerge, isGitHubTokenResolution, publishApprovalStatus, resolveLinkedPullRequests, shouldPublishApprovalStatus, type MergeArmingDecision } from "../services/merge-arming.js";
 // The arm gate names the head it is written to. These cases do not model a head read, so an arm that names none is given one;
 // the case about an unbound arm passes `{}` itself and models the read.
 const armMergeOnApproval: typeof armMergeOnApprovalReal = (db, companyId, issueId, decision, pr, options) =>
@@ -257,7 +257,7 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
     await db.insert(externalObjectMentions).values({
       companyId: obj.companyId,
       sourceIssueId: obj.sourceIssueId ?? issueId,
-      sourceKind: "issue_comment",
+      sourceKind: "comment",
       objectId: externalObj!.id,
       objectType: obj.objectType,
       providerKey: obj.providerKey,
@@ -276,7 +276,6 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
         id: randomUUID(),
         companyId,
         name: `${owner}/${repo}`,
-        urlKey: `${owner}-${repo}`,
         status: "in_progress",
         env: {
           GITHUB_TOKEN: { type: "secret_ref", secretId: projectSecretId, version: "latest" },
@@ -879,7 +878,7 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
       await db.insert(externalObjectMentions).values({
         companyId,
         sourceIssueId: issueId,
-        sourceKind: "issue_comment",
+        sourceKind: "comment",
         objectId: externalObj!.id,
         objectType: "pull_request",
         providerKey: "gitlab",
@@ -1211,7 +1210,7 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
     await db.insert(externalObjectMentions).values({
       companyId: obj.companyId,
       sourceIssueId: issueId,
-      sourceKind: "issue_comment",
+      sourceKind: "comment",
       objectId: externalObj!.id,
       objectType: obj.objectType,
       providerKey: obj.providerKey,
@@ -1230,7 +1229,6 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
         id: randomUUID(),
         companyId,
         name: `${owner}/${repo}`,
-        urlKey: `${owner}-${repo}`,
         status: "in_progress",
         env: {
           GITHUB_TOKEN: { type: "secret_ref", secretId: projectSecretId, version: "latest" },
@@ -1636,7 +1634,6 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
           id: randomUUID(),
           companyId,
           name: "TEA-Core/paperclip",
-          urlKey: "TEA-Core-paperclip",
           status: "in_progress",
         })
         .returning();
@@ -2073,7 +2070,7 @@ describeEmbeddedPostgres("publishApprovalStatus", () => {
       await db.insert(externalObjectMentions).values({
         companyId,
         sourceIssueId: issueId,
-        sourceKind: "issue_comment",
+        sourceKind: "comment",
         objectId: externalObj.id,
         objectType: "pull_request",
         providerKey: "github",
@@ -2310,7 +2307,6 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project env secret_ref b
         id: randomUUID(),
         companyId,
         name: "Trading Signal Platform v2",
-        urlKey: "trading-signal-platform-v2",
         status: "in_progress",
         env: {
           GITHUB_TOKEN: {
@@ -2336,9 +2332,12 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project env secret_ref b
     const { resolveGitHubTokenForRepo } = await import("../services/merge-arming.js");
     const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Trading-Signal-Platform");
 
-    expect(result.token).toBe("ghp_tsp_token_value");
-    expect(result.scope).toBe("project_env");
-    expect(result.secretName).toBe("GITHUB_TOKEN");
+    expect(isGitHubTokenResolution(result)).toBe(true);
+    if (isGitHubTokenResolution(result)) {
+      expect(result.token).toBe("ghp_tsp_token_value");
+      expect(result.scope).toBe("project_env");
+      expect(result.secretName).toBe("GITHUB_TOKEN");
+    }
     expect(mockResolveSecretValue).toHaveBeenCalledWith(companyId, "secret-tsp", "latest");
   });
 
@@ -2349,7 +2348,6 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project env secret_ref b
         id: randomUUID(),
         companyId,
         name: "Trading Signal Platform v2",
-        urlKey: "trading-signal-platform-v2",
         status: "in_progress",
         env: {
           GITHUB_TOKEN: {
@@ -2384,9 +2382,12 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project env secret_ref b
     const { resolveGitHubTokenForRepo } = await import("../services/merge-arming.js");
     const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Trading-Signal-Platform");
 
-    expect(result.token).toBe("ghp_tsp_token_value");
-    expect(result.scope).toBe("project_env");
-    expect(result.secretName).toBe("GITHUB_TOKEN");
+    expect(isGitHubTokenResolution(result)).toBe(true);
+    if (isGitHubTokenResolution(result)) {
+      expect(result.token).toBe("ghp_tsp_token_value");
+      expect(result.scope).toBe("project_env");
+      expect(result.secretName).toBe("GITHUB_TOKEN");
+    }
   });
 
   it("falls back to company-scoped token when project env has no GitHub token binding", async () => {
@@ -2396,7 +2397,6 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project env secret_ref b
         id: randomUUID(),
         companyId,
         name: "Trading Signal Platform v2",
-        urlKey: "trading-signal-platform-v2",
         status: "in_progress",
         env: {},
       })
@@ -2422,9 +2422,12 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project env secret_ref b
     const { resolveGitHubTokenForRepo } = await import("../services/merge-arming.js");
     const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Trading-Signal-Platform");
 
-    expect(result.token).toBe("ghp_company_token");
-    expect(result.scope).toBe("company");
-    expect(result.secretName).toBe("GITHUB_TOKEN");
+    expect(isGitHubTokenResolution(result)).toBe(true);
+    if (isGitHubTokenResolution(result)) {
+      expect(result.token).toBe("ghp_company_token");
+      expect(result.scope).toBe("company");
+      expect(result.secretName).toBe("GITHUB_TOKEN");
+    }
   });
 
   it("returns failure naming the project when no binding and no company token", async () => {
@@ -2434,7 +2437,6 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project env secret_ref b
         id: randomUUID(),
         companyId,
         name: "Trading Signal Platform v2",
-        urlKey: "trading-signal-platform-v2",
         status: "in_progress",
         env: {},
       })
@@ -2454,8 +2456,11 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project env secret_ref b
     const { resolveGitHubTokenForRepo } = await import("../services/merge-arming.js");
     const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Trading-Signal-Platform");
 
-    expect(result.token).toBeNull();
-    expect(result.reason).toBe("No GitHub token bound to project for TEA-Core/Trading-Signal-Platform");
+    expect(isGitHubTokenResolution(result)).toBe(false);
+    if (!isGitHubTokenResolution(result)) {
+      expect(result.token).toBeNull();
+      expect(result.reason).toBe("No GitHub token bound to project for TEA-Core/Trading-Signal-Platform");
+    }
   });
 
   it("returns failure when repo is not found at company or project scope", async () => {
@@ -2464,8 +2469,11 @@ describeEmbeddedPostgres("resolveGitHubTokenForRepo — project env secret_ref b
     const { resolveGitHubTokenForRepo } = await import("../services/merge-arming.js");
     const result = await resolveGitHubTokenForRepo(db, companyId, "TEA-Core", "Some-Unknown-Repo");
 
-    expect(result.token).toBeNull();
-    expect(result.reason).toBe("No GitHub token resolvable for TEA-Core/Some-Unknown-Repo (repo not found at company or project scope)");
+    expect(isGitHubTokenResolution(result)).toBe(false);
+    if (!isGitHubTokenResolution(result)) {
+      expect(result.token).toBeNull();
+      expect(result.reason).toBe("No GitHub token resolvable for TEA-Core/Some-Unknown-Repo (repo not found at company or project scope)");
+    }
   });
 });
 
@@ -2569,7 +2577,6 @@ describeEmbeddedPostgres(
           id: randomUUID(),
           companyId,
           name: "TEA-Core/paperclip",
-          urlKey: "tea-core-paperclip",
           status: "in_progress",
         })
         .returning();
@@ -2599,7 +2606,7 @@ describeEmbeddedPostgres(
       await db.insert(externalObjectMentions).values({
         companyId,
         sourceIssueId: issueId,
-        sourceKind: "issue_comment",
+        sourceKind: "comment",
         objectId: externalObj!.id,
         objectType: "pull_request",
         providerKey: "github",
@@ -2829,7 +2836,7 @@ describeEmbeddedPostgres(
       await db.insert(externalObjectMentions).values({
         companyId,
         sourceIssueId: issueId,
-        sourceKind: "issue_comment",
+        sourceKind: "comment",
         objectId: externalObj!.id,
         objectType: "pull_request",
         providerKey: "github",

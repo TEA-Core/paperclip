@@ -71,9 +71,7 @@ vi.mock("../services/merge-arming.js", async (importOriginal) => {
 });
 
 const realEvaluateStageIntegrity = vi.hoisted(() => ({
-  fn: null as
-    | null
-    | ((db: unknown, row: unknown) => Promise<{ reason: string; detail: string } | null>),
+  fn: null as null | typeof import("../services/approval-status-reconciler.js").evaluateStageIntegrity,
 }));
 const mockEvaluateStageIntegrity = vi.hoisted(() => vi.fn());
 
@@ -119,7 +117,8 @@ describeEmbeddedPostgres("approval-arming refusal on a closing transition (SUP-1
     mockPublishApprovalStatus.mockReset();
     mockEvaluateStageIntegrity.mockReset();
     mockEvaluateStageIntegrity.mockImplementation(
-      async (inputDb: unknown, row: unknown) => realEvaluateStageIntegrity.fn!(inputDb, row),
+      async (...args: Parameters<typeof import("../services/approval-status-reconciler.js").evaluateStageIntegrity>) =>
+        realEvaluateStageIntegrity.fn!(...args),
     );
   });
 
