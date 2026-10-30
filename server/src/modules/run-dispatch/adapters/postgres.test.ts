@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -22,6 +22,10 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../../../__tests__/helpers/embedded-postgres.js";
 import { createPostgresRunDispatchAdapter } from "./postgres.js";
+import {
+  createCancelStaleQueuedRun,
+  createSweepStaleQueuedRuns,
+} from "../application/use-cases.js";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 
@@ -766,9 +770,87 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       });
 
       expect(result).toMatchObject({ outcome: "cancelled", errorCode: "queued_run_expired" });
+      const [run] = await db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(run).toMatchObject({
+        status: "cancelled",
+        errorCode: "queued_run_expired",
+        resultJson: expect.objectContaining({ stopReason: "queued_run_expired" }),
+      });
+      const [event] = await db.select({ eventType: heartbeatRunEvents.eventType, message: heartbeatRunEvents.message })
+        .from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+      expect(event).toEqual({
+        eventType: "lifecycle",
+        message: "Cancelled because the queued issue run exceeded the maximum queue age",
+      });
       const [issue] = await db.select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
         .from(issues).where(eq(issues.id, issueId));
       expect(issue).toEqual({ executionRunId: null, checkoutRunId: null });
+    });
+
+    it("lists ordinary old queued runs without requiring a retry alarm", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const now = new Date("2026-01-02T00:00:00.000Z");
+      const oldRunId = await seedRun({ companyId, agentId, now: new Date("2025-12-31T00:00:00.000Z") });
+      await seedRun({ companyId, agentId, now });
+
+      await expect(createPostgresRunDispatchAdapter(db).listStaleQueuedRuns({
+        cutoff: new Date("2026-01-01T00:00:00.000Z"),
+        limit: 50,
+      })).resolves.toEqual([{ runId: oldRunId, companyId }]);
+    });
+
+    it("sweeps ordinary age-expired queued runs through the enforcement path", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const oldestIssueId = randomUUID();
+      const newerIssueId = randomUUID();
+      await seedIssue({ companyId, issueId: oldestIssueId, status: "in_progress", assigneeAgentId: agentId });
+      await seedIssue({ companyId, issueId: newerIssueId, status: "in_progress", assigneeAgentId: agentId });
+      const oldestRunId = await seedRun({ companyId, agentId, contextSnapshot: { issueId: oldestIssueId }, now: new Date("2025-12-30T00:00:00.000Z") });
+      const newerRunId = await seedRun({ companyId, agentId, contextSnapshot: { issueId: newerIssueId }, now: new Date("2025-12-31T12:00:00.000Z") });
+      const freshRunId = await seedRun({ companyId, agentId, now: new Date("2026-01-01T23:00:00.000Z") });
+      const retryRunId = await seedRun({ companyId, agentId, status: "scheduled_retry", now: new Date("2025-12-30T00:00:00.000Z") });
+      const runningRunId = await seedRun({ companyId, agentId, status: "running", now: new Date("2025-12-30T00:00:00.000Z") });
+
+      const adapter = createPostgresRunDispatchAdapter(db);
+      const sweepStaleQueuedRuns = createSweepStaleQueuedRuns({
+        reader: adapter,
+        cancelStaleQueuedRun: createCancelStaleQueuedRun({ writer: adapter }),
+      });
+      const result = await sweepStaleQueuedRuns({ now: new Date("2026-01-02T00:00:00.000Z") });
+
+      expect(result.cancelled).toBe(2);
+      expect(result.runIds).toEqual([oldestRunId, newerRunId]);
+      const rows = await db
+        .select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          errorCode: heartbeatRuns.errorCode,
+          resultJson: heartbeatRuns.resultJson,
+        })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, [oldestRunId, newerRunId, freshRunId, retryRunId, runningRunId]));
+      const rowsById = new Map(rows.map((row) => [row.id, row]));
+      for (const runId of [oldestRunId, newerRunId]) {
+        expect(rowsById.get(runId)).toMatchObject({
+          status: "cancelled",
+          errorCode: "queued_run_expired",
+          resultJson: expect.objectContaining({ stopReason: "queued_run_expired" }),
+        });
+      }
+      expect(rowsById.get(freshRunId)).toMatchObject({ status: "queued", errorCode: null });
+      expect(rowsById.get(retryRunId)).toMatchObject({ status: "scheduled_retry", errorCode: null });
+      expect(rowsById.get(runningRunId)).toMatchObject({ status: "running", errorCode: null });
+      const events = await db
+        .select({ runId: heartbeatRunEvents.runId, eventType: heartbeatRunEvents.eventType })
+        .from(heartbeatRunEvents)
+        .where(inArray(heartbeatRunEvents.runId, [oldestRunId, newerRunId]));
+      expect(events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ runId: oldestRunId, eventType: "lifecycle" }),
+          expect.objectContaining({ runId: newerRunId, eventType: "lifecycle" }),
+        ]),
+      );
     });
 
     it("keeps an old queued issue run live while another running run owns its execution pointer", async () => {

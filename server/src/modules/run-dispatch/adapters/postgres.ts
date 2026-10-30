@@ -53,6 +53,8 @@ import type {
   DispatchResolvedInteractionOutcome,
   DueRetryRun,
   EvaluateScheduledRetryGateInput,
+  StaleQueuedRun,
+  ListStaleQueuedRunsInput,
   ListDueRetriesInput,
   PromoteOrCancelDueRetryInput,
   RunDispatchWriter,
@@ -496,6 +498,16 @@ export function createPostgresRunDispatchAdapter(
       runId: row.id,
       companyId: row.companyId,
     }));
+  }
+
+  async function listStaleQueuedRuns(input: ListStaleQueuedRunsInput): Promise<StaleQueuedRun[]> {
+    const rows = await db
+      .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.status, "queued"), lte(heartbeatRuns.createdAt, input.cutoff)))
+      .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+      .limit(input.limit);
+    return rows.map((row) => ({ runId: row.id, companyId: row.companyId }));
   }
 
   async function loadStalenessFacts(
@@ -1125,6 +1137,7 @@ export function createPostgresRunDispatchAdapter(
   return {
     evaluateScheduledRetryGate,
     listDueRetries,
+    listStaleQueuedRuns,
     cancelStaleQueuedRun,
     dispatchResolvedInteractionIfCurrent,
     promoteOrCancelDueRetry,
