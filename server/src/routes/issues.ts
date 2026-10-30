@@ -20147,11 +20147,15 @@ export function issueRoutes(
               effectiveDeliveryRequirement === lockedIssue.deliveryRequirement
                 ? lockedIssue
                 : { ...lockedIssue, deliveryRequirement: effectiveDeliveryRequirement };
-            const lockedPrefetch = finalDeliveryPrefetch ?? await prefetchFinalDelivery(effectiveLockedIssue);
-            await preflightTerminalApproval(effectiveLockedIssue, updateFields, transition.decision, nextExecutionPolicy, {
-              overrideAccepted: doneOverrideAccepted,
-              locked: { prefetch: lockedPrefetch, tx: tx as unknown as Db },
-            });
+            const needsLockedFinalDeliveryPreflight =
+              effectiveLockedIssue.deliveryRequirement !== "record_only" || doneOverrideAccepted;
+            if (needsLockedFinalDeliveryPreflight) {
+              const lockedPrefetch = finalDeliveryPrefetch ?? await prefetchFinalDelivery(effectiveLockedIssue);
+              await preflightTerminalApproval(effectiveLockedIssue, updateFields, transition.decision, nextExecutionPolicy, {
+                overrideAccepted: doneOverrideAccepted,
+                locked: { prefetch: lockedPrefetch, tx: tx as unknown as Db },
+              });
+            }
             issueUpdateData.executionState = updateFields.executionState;
           }
 
