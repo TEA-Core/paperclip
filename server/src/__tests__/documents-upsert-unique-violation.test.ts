@@ -18,11 +18,13 @@ import { HttpError } from "../errors.js";
 // pre-fix, top-level-only `isUniqueViolation` check missed.
 
 function makeDrizzleWrappedUniqueViolation(): Error {
-  const driverError = new Error(
-    'duplicate key value violates unique constraint "issue_documents_company_issue_key_uq"',
+  const driverError = Object.assign(
+    new Error('duplicate key value violates unique constraint "issue_documents_company_issue_key_uq"'),
+    {
+      code: "23505",
+      constraint_name: "issue_documents_company_issue_key_uq",
+    },
   );
-  driverError.code = "23505";
-  driverError.constraint_name = "issue_documents_company_issue_key_uq";
 
   // Mirrors Drizzle's Failed-query wrapper: no top-level `.code`, the 23505 is
   // only reachable through `.cause`.
