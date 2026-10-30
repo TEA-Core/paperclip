@@ -80,4 +80,11 @@ test("OpenCode V2 is installed off PATH at a pinned version and digest", () => {
     productionStage,
     /gosu node-agent test ! -w \/opt\/opencode-v2\/bin\/opencode/,
   );
+  // The V2 exec probe must point HOME at /tmp: V2 (bun) creates
+  // $HOME/.local/share/opencode/log even for --version, and /paperclip is
+  // node-owned at build time.
+  assert.match(
+    productionStage,
+    /gosu node-agent env HOME=\/tmp \/opt\/opencode-v2\/bin\/opencode --version/,
+  );
 });
