@@ -5421,6 +5421,18 @@ describe("evaluateDoneTierDeclaration", () => {
       })).toBe("Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #123 via done-close-landing-backstop — Landing delegated. Liveness unverified.");
     });
 
+    it("renders a record-only Tier 1 close with no SHA, PR, landed, or landing-delegated claim", () => {
+      const rendered = renderDoneTierDeclaration(null, {
+        tier: "tier1",
+        reason: "No repository landing exists",
+        landing: { mode: "noRepositoryLanding" },
+      });
+      expect(rendered).toBe(
+        "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — No repository landing exists. Liveness unverified.",
+      );
+      expect(rendered).not.toMatch(/[0-9a-f]{7,40}|PR #|landed-at-tip|landing-delegated/i);
+    });
+
     it("preserves the body when the existing Tier 2 declaration matches", () => {
       const body = "Context\n\nClosed at Tier 2 (live): existing evidence\n\nFollow-up";
       expect(renderDoneTierDeclaration(body, {
@@ -5520,6 +5532,31 @@ describe("evaluateDoneTierDeclaration", () => {
   });
 
   describe("Tier 1 via accompanying comment", () => {
+    it("accepts no-repository-landing only when the issue is record_only", async () => {
+      const comment =
+        "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — No repository landing exists. Liveness unverified.";
+      const accepted = await evaluateDoneTierDeclaration(
+        mockDb,
+        { ...tierIssue, deliveryRequirement: "record_only" },
+        comment,
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(accepted.allowed).toBe(true);
+      expect(accepted.tier).toBe("tier1");
+
+      const refused = await evaluateDoneTierDeclaration(
+        mockDb,
+        { ...tierIssue, deliveryRequirement: "repository_delivery" },
+        comment,
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(refused.allowed).toBe(false);
+      expect(refused.tier).toBe(null);
+      expect(refused.reason).toContain("record_only");
+    });
+
     it("refuses a syntactically complete Tier 1 line that is only arbitrary prose", async () => {
       const result = await evaluateDoneTierDeclaration(
         mockDb,
