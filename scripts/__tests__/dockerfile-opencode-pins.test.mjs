@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
@@ -87,4 +88,51 @@ test("OpenCode V2 is installed off PATH at a pinned version and digest", () => {
     productionStage,
     /gosu node-agent env HOME=\/tmp \/opt\/opencode-v2\/bin\/opencode --version/,
   );
+});
+
+test("V1 router-plugin fixture is the pinned fleet copy (baseline launch evidence)", () => {
+  // Byte-identical fixture of the V1 router plugin from TEA-Core/sectoid-stack-admin
+  // paperclip-docker/config/opencode-plugin @ 2664878e38f33e84a3789a277c6f2c4bb352ec22.
+  // That repo is private, so the CI launch assertion cannot fetch the plugin
+  // and ships this copy instead. If the fleet plugin changes, update this pin
+  // deliberately: the baseline assertion is only meaningful against a recorded
+  // plugin revision, so silent drift must fail here rather than in CI.
+  const fixtureDir = path.join(repoRoot, "scripts", "opencode-v1-plugin-fixture");
+  const pins = [
+    ["plugin/router-catalog.js", "1adc76f9ac64c81ae23f38965222094fc9b590a966b73e16e1ad4e8a1ca9286e"],
+    ["router-catalog/lib.mjs", "c0a2a6df3f2f8a273c90280d4efb268fc3d9ab0910eb02236862c728acb6f6d7"],
+  ];
+  for (const [rel, sha] of pins) {
+    const digest = createHash("sha256")
+      .update(readFileSync(path.join(fixtureDir, rel)))
+      .digest("hex");
+    assert.equal(
+      digest,
+      sha,
+      `scripts/opencode-v1-plugin-fixture/${rel} drifted from the pinned fleet revision`,
+    );
+  }
+});
+
+test("CI launches the baseline V1 agent with the V1 router plugin on every PR", () => {
+  // An assertion nobody runs is worse than no assertion: pin the wiring of the
+  // in-image launch probe, not just its existence.
+  const dockerWorkflow = readFileSync(path.join(repoRoot, ".github", "workflows", "docker.yml"), "utf8");
+  const job = dockerWorkflow.slice(dockerWorkflow.indexOf("docker-build-assert:"));
+  assert.match(job, /Assert baseline V1 agent launch with the V1 router plugin/);
+  assert.match(job, /assert-opencode-v1-baseline-launch\.sh:\/probe\.sh:ro/);
+  assert.match(job, /opencode-v1-plugin-fixture:\/v1-plugin-fixture:ro/);
+  assert.match(job, /paperclip:pr \/probe\.sh/);
+  // The probe must keep launching the PATH V1 as the agent principal, not the
+  // off-PATH V2.
+  const probe = readFileSync(
+    path.join(repoRoot, "scripts", "assert-opencode-v1-baseline-launch.sh"),
+    "utf8",
+  );
+  assert.match(probe, /V1_BIN="\$\{V1_BIN:-\/usr\/local\/bin\/opencode\}"/);
+  assert.match(probe, /V1_LAUNCH_GOSU="\$\{V1_LAUNCH_GOSU-gosu node-agent\}"/);
+  assert.match(probe, /test "\$\(command -v opencode\)" = \/usr\/local\/bin\/opencode/);
+  assert.match(probe, /test "\$V1_VERSION" = "1\.18\.33"/);
+  assert.match(probe, /--model router\/coder/);
+  assert.doesNotMatch(probe, /opencode-v2/);
 });

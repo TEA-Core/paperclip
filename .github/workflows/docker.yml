@@ -675,3 +675,20 @@ jobs:
             -e EXPECTED_KEY=ci-assert-master-key \
             -v "$PWD/scripts/assert-secrets-hardening.sh:/probe.sh:ro" \
             paperclip:pr /probe.sh
+
+      # SUP-19143 acceptance: the rebuild must keep the V1 agent path usable.
+      # The static pins (scripts/__tests__/dockerfile-opencode-pins.test.mjs)
+      # prove the binaries are installed at the pinned versions; this step
+      # proves the agent still launches on the rebuilt image. The unchanged V1
+      # binary auto-loads the V1 router plugin (fixture of the fleet plugin
+      # from TEA-Core/sectoid-stack-admin, sha256-pinned in the same test),
+      # builds the router providers from a live catalog served on loopback,
+      # and completes a full agent turn through the router provider as the
+      # agent principal (node-agent, uid 1001).
+      - name: Assert baseline V1 agent launch with the V1 router plugin
+        run: |
+          docker run --rm \
+            --entrypoint /bin/sh \
+            -v "$PWD/scripts/assert-opencode-v1-baseline-launch.sh:/probe.sh:ro" \
+            -v "$PWD/scripts/opencode-v1-plugin-fixture:/v1-plugin-fixture:ro" \
+            paperclip:pr /probe.sh
