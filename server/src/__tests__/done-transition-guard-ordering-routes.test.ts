@@ -15,6 +15,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueExecutionDecisions,
+  issueRecoveryActions,
   issues,
   projectWorkspaces,
   projects,
@@ -1339,11 +1340,18 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         .where(eq(issues.id, issueId));
       expect(statusRows[0]?.status).toBe("done");
 
-      const audit = await db
-        .select({ action: activityLog.action })
-        .from(activityLog)
-        .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
-        .then((rows) => rows.filter((r) => r.action === "issue.done_transition_tier1_close"));
+      const audit = await vi.waitFor(
+        async () => {
+          const found = await db
+            .select({ action: activityLog.action })
+            .from(activityLog)
+            .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
+            .then((rows) => rows.filter((r) => r.action === "issue.done_transition_tier1_close"));
+          if (found.length === 0) throw new Error("waiting for tier1 close audit row");
+          return found;
+        },
+        { timeout: 5000 },
+      );
       expect(audit).toHaveLength(1);
     });
 
@@ -1595,6 +1603,222 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         }
         if (expected === 409) expect(res.body.code).toBe("done_transition_missing_delivery");
       }
+    });
+  });
+
+  describe("SUP-21910 recovery-resolution done door (merge-arming close tier gate)", () => {
+    function recoveryDeliveryAllowed(branch: string) {
+      return {
+        allowed: true,
+        reason: `Branch ${branch} delivered; transition allowed`,
+        aheadBy: 0,
+        branch,
+        defaultRef: "fold/tea-patches-v2026.722.0",
+        owner: "TEA-Core",
+        repo: "paperclip",
+        skipped: false,
+      };
+    }
+
+    async function seedRecoveryAction(
+      companyId: string,
+      issueId: string,
+      agentId: string,
+      runId: string,
+    ) {
+      const now = new Date();
+      await db.insert(issueRecoveryActions).values({
+        id: randomUUID(),
+        companyId,
+        sourceIssueId: issueId,
+        recoveryIssueId: null,
+        kind: "missing_disposition",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: agentId,
+        ownerUserId: null,
+        previousOwnerAgentId: null,
+        returnOwnerAgentId: null,
+        cause: "successful_run_missing_issue_disposition",
+        fingerprint: `missing-disposition:${issueId}`,
+        evidence: { runId },
+        nextAction: "Choose a valid issue disposition.",
+        wakePolicy: null,
+        monitorPolicy: null,
+        attemptCount: 1,
+        maxAttempts: null,
+        timeoutAt: null,
+        lastAttemptAt: now,
+        outcome: null,
+        resolutionNote: null,
+        resolvedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
+    async function recoveryActionRow(issueId: string) {
+      const [row] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      return row;
+    }
+
+    async function issueStatusRow(issueId: string) {
+      return db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+    }
+
+    it("restore-to-done without a tier declaration is 422 done_transition_missing_tier_declaration, status unchanged", async () => {
+      const { companyId, agentId, issueId, branchName } = await seedIssue("SUP21910A");
+      const runId = await seedRun(companyId, agentId, issueId);
+      await seedRecoveryAction(companyId, issueId, agentId, runId);
+      currentActor = agentActor(companyId, agentId, runId);
+      mockEvaluateDoneTransitionGuard.mockResolvedValue(recoveryDeliveryAllowed(branchName));
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({ outcome: "restored", sourceIssueStatus: "done" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+      expect(res.body.error).toContain("No done-tier declaration found");
+
+      const statusRows = await issueStatusRow(issueId);
+      expect(statusRows[0]?.status).toBe("todo");
+      const action = await recoveryActionRow(issueId);
+      expect(action?.status).toBe("active");
+
+      const records = await vi.waitFor(async () => {
+        const rows = await db
+          .select({ body: issueComments.body, authorType: issueComments.authorType })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, issueId));
+        const system = rows.filter((r) => r.authorType === "system");
+        if (system.length === 0) throw new Error("waiting for refusal record");
+        return system;
+      }, { timeout: 5000 });
+      expect(records).toHaveLength(1);
+      expect(records[0]?.body).toContain("[Terminal status refused] done_transition_missing_tier_declaration");
+    });
+
+    it("structured doneTier renders into the note, persists as an issue comment, and closes the card", async () => {
+      const { companyId, agentId, issueId, branchName } = await seedIssue("SUP21910B");
+      const runId = await seedRun(companyId, agentId, issueId);
+      await seedRecoveryAction(companyId, issueId, agentId, runId);
+      currentActor = agentActor(companyId, agentId, runId);
+      mockEvaluateDoneTransitionGuard.mockResolvedValue(recoveryDeliveryAllowed(branchName));
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          outcome: "restored",
+          sourceIssueStatus: "done",
+          resolutionNote: "Owner landed the recovery; closing the card.",
+          doneTier: {
+            tier: "tier2",
+            probeEvidence:
+              "acceptance probe — GET /api/health returned 200 after the manual landing",
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      const statusRows = await issueStatusRow(issueId);
+      expect(statusRows[0]?.status).toBe("done");
+
+      const comments = await db
+        .select({ body: issueComments.body, authorType: issueComments.authorType })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      const declaration = comments.filter(
+        (c) => c.authorType !== "system" && c.body.includes("Closed at Tier 2 (live):"),
+      );
+      expect(declaration).toHaveLength(1);
+      expect(declaration[0]?.body).toContain("acceptance probe — GET /api/health returned 200");
+      expect(declaration[0]?.body).toContain("Owner landed the recovery; closing the card.");
+
+      const action = await recoveryActionRow(issueId);
+      expect(action?.status).toBe("resolved");
+      expect(action?.outcome).toBe("owner_completed");
+      expect(action?.resolutionNote).toContain("Closed at Tier 2 (live):");
+    });
+
+    it("Tier 1 landed-at-tip claim whose merge commit is not on the default branch is rejected", async () => {
+      const { companyId, agentId, issueId, branchName } = await seedIssue("SUP21910C");
+      const runId = await seedRun(companyId, agentId, issueId);
+      await seedRecoveryAction(companyId, issueId, agentId, runId);
+      currentActor = agentActor(companyId, agentId, runId);
+      mockEvaluateDoneTransitionGuard.mockResolvedValue(recoveryDeliveryAllowed(branchName));
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          outcome: "restored",
+          sourceIssueStatus: "done",
+          resolutionNote:
+            "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip merge commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa. Liveness unverified.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+      expect(res.body.error).toContain("not an ancestor of the default branch");
+
+      const statusRows = await issueStatusRow(issueId);
+      expect(statusRows[0]?.status).toBe("todo");
+      const action = await recoveryActionRow(issueId);
+      expect(action?.status).toBe("active");
+    });
+
+    it("Tier 1 landed-at-tip claim verified against the merged default branch closes the card", async () => {
+      const { companyId, agentId, issueId, branchName } = await seedIssue("SUP21910D");
+      const runId = await seedRun(companyId, agentId, issueId);
+      await seedRecoveryAction(companyId, issueId, agentId, runId);
+      currentActor = agentActor(companyId, agentId, runId);
+      mockEvaluateDoneTransitionGuard.mockResolvedValue(recoveryDeliveryAllowed(branchName));
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          outcome: "restored",
+          sourceIssueStatus: "done",
+          resolutionNote:
+            "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip merge commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa. Liveness unverified.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      const statusRows = await issueStatusRow(issueId);
+      expect(statusRows[0]?.status).toBe("done");
+      const action = await recoveryActionRow(issueId);
+      expect(action?.status).toBe("resolved");
+      expect(action?.outcome).toBe("owner_completed");
+
+      const audit = await db
+        .select({ action: activityLog.action })
+        .from(activityLog)
+        .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
+        .then((rows) => rows.filter((r) => r.action === "issue.done_transition_tier1_close"));
+      expect(audit).toHaveLength(1);
     });
   });
 });

@@ -3503,6 +3503,10 @@ describe("agent issue mutation checkout ownership", () => {
         actionId: recoveryActionId,
         outcome: "restored",
         sourceIssueStatus: "done",
+        // SUP-21910: agent done-resolves through this door now carry a
+        // done-tier declaration, exactly like the PATCH close door.
+        resolutionNote:
+          "Owner completed.\nClosed at Tier 2 (live): probed the delivered branch head after merge.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -3524,6 +3528,9 @@ describe("agent issue mutation checkout ownership", () => {
         actionId: recoveryActionId,
         outcome: "restored",
         sourceIssueStatus: "done",
+        // SUP-21910: done-tier declaration for the gated recovery done door.
+        resolutionNote:
+          "Owner completed.\nClosed at Tier 2 (live): probed the delivered branch head after merge.",
       });
 
     // Fork divergence: upstream's `board_escalation_no_takeover_v1` owns stranded
@@ -3552,6 +3559,9 @@ describe("agent issue mutation checkout ownership", () => {
         actionId: recoveryActionId,
         outcome: "restored",
         sourceIssueStatus: "done",
+        // SUP-21910: done-tier declaration for the gated recovery done door.
+        resolutionNote:
+          "Owner completed.\nClosed at Tier 2 (live): probed the delivered branch head after merge.",
       });
 
     // Fork divergence: upstream's `board_escalation_no_takeover_v1` owns stranded
@@ -3641,7 +3651,15 @@ describe("agent issue mutation checkout ownership", () => {
 
     const res = await request(await createApp(peerActor()))
       .post(`/api/issues/${issueId}/recovery-actions/resolve`)
-      .send({ actionId: recoveryActionId, outcome: "restored", sourceIssueStatus: "done" });
+      .send({
+        actionId: recoveryActionId,
+        outcome: "restored",
+        sourceIssueStatus: "done",
+        // SUP-21910: carry a done-tier declaration so the shared guard lets the
+        // request through to the participant-authority refusal under test.
+        resolutionNote:
+          "Owner completed.\nClosed at Tier 2 (live): probed the delivered branch head after merge.",
+      });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     // The fork denies this one gate earlier, at the assignee-ownership boundary
@@ -3666,7 +3684,15 @@ describe("agent issue mutation checkout ownership", () => {
 
     const res = await request(await createApp(ownerActor()))
       .post(`/api/issues/${issueId}/recovery-actions/resolve`)
-      .send({ actionId: recoveryActionId, outcome: "restored", sourceIssueStatus: "done" });
+      .send({
+        actionId: recoveryActionId,
+        outcome: "restored",
+        sourceIssueStatus: "done",
+        // SUP-21910: carry a done-tier declaration so the shared guard lets the
+        // request through to the review-policy refusal under test.
+        resolutionNote:
+          "Owner completed.\nClosed at Tier 2 (live): probed the delivered branch head after merge.",
+      });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.details?.code).toBe("review_policy_denied");

@@ -13525,6 +13525,8 @@ export function issueRoutes(
         outcome,
         sourceIssueStatus,
         resolutionNote,
+        doneTier,
+        doneTransitionOverride,
         executionReconciliation,
       } = req.body;
       if (outcome === "false_positive" || outcome === "cancelled") {
@@ -13595,6 +13597,87 @@ export function issueRoutes(
         sourceIssueStatus === "done" && existing.status !== "done" && existing.deliveryRequirement !== "record_only"
           ? await prefetchFinalDelivery((await svc.getById(existing.id)) ?? existing)
           : null;
+      // SUP-21910 (parent SUP-21901 audit F1): this door can land a card on
+      // `done` — an owner restore after a manual landing (owner_completed) or an
+      // agent's final-stage approval restore (SUP-17163), which then runs the
+      // post-commit merge-arming hook — and until now it wrote the terminal
+      // status without the done-transition guard the PATCH and comment doors
+      // run. That gap let merge-arming close SUP-21664 with no tier declaration.
+      // Run the same shared guard here, pre-transaction (like PATCH): the
+      // guard's refusal artifacts (audit row + system comment) go through the
+      // autocommit service connection, and an in-transaction run would deadlock
+      // its comment INSERT's FOR KEY SHARE against this route's own FOR UPDATE.
+      // Recovery-action authority is re-checked pre-tx first on an unlocked
+      // read purely so a 403 security refusal (board-only close_arm_failed)
+      // outranks the tier verdict; the locked in-tx checks below remain
+      // authoritative. The structured doneTier renders into the resolution note
+      // exactly as the PATCH door renders its close comment, board actors keep
+      // their SUP-13939 carve-out inside the guard itself, and the sanctioned
+      // doneTransitionOverride escape hatch mirrors the PATCH close door. The
+      // one residual ungated edge is the board-only automatic-recovery reopen
+      // lane below (settled action + executionReconciliation), which cannot be
+      // read pre-tx; it stays board-gated by assertBoard.
+      let doneTierResolutionNote = resolutionNote ?? null;
+      let structuredDoneTierRendered = false;
+      if (sourceIssueStatus === "done" && existing.status !== "done") {
+        const preTxsRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
+          existing.companyId,
+          existing.id,
+        );
+        if (
+          preTxsRecoveryAction &&
+          (!actionId || preTxsRecoveryAction.id === actionId)
+        ) {
+          await requireRecoveryActionAuthority(
+            req,
+            existing,
+            preTxsRecoveryAction,
+            { source: "recovery_action_resolution" },
+          );
+        }
+        if (doneTier !== undefined && doneTier !== null) {
+          doneTierResolutionNote = renderDoneTierDeclaration(
+            doneTierResolutionNote,
+            doneTier,
+          );
+          structuredDoneTierRendered = true;
+        }
+        const recoveryDonePolicy = normalizeIssueExecutionPolicy(
+          existing.executionPolicy ?? null,
+        );
+        const doneCarryTransition = applyIssueExecutionPolicyTransition({
+          issue: existing,
+          policy: recoveryDonePolicy,
+          previousPolicy: recoveryDonePolicy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: {
+            agentId: actor.agentId ?? null,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+          allowBoardOverride: req.actor.type === "board",
+          commentBody: doneTierResolutionNote,
+        });
+        const recoveryDoneOutcome = await evaluateDoneTransitionGuards({
+          issue: existing,
+          override:
+            doneTransitionOverride &&
+            typeof doneTransitionOverride === "object"
+              ? {
+                  disposition: doneTransitionOverride.disposition ?? "",
+                  reason: doneTransitionOverride.reason,
+                }
+              : null,
+          commentBody: doneTierResolutionNote,
+          runId: actor.runId ?? null,
+          decisionCarried: !!doneCarryTransition.decision,
+          boardActor: req.actor.type === "board",
+        });
+        if (!recoveryDoneOutcome.ok) {
+          res.status(recoveryDoneOutcome.status).json(recoveryDoneOutcome.body);
+          return;
+        }
+      }
       const result = await db.transaction(async (tx) => {
         const lockedIssue = await tx
           .select()
@@ -13868,7 +13951,7 @@ export function issueRoutes(
                 userId: actor.actorType === "user" ? actor.actorId : null,
               },
               allowBoardOverride: req.actor.type === "board",
-              commentBody: resolutionNote ?? null,
+              commentBody: doneTierResolutionNote,
             });
             const recoveryDecisionId = transition.decision ? randomUUID() : null;
             if (recoveryDecisionId) {
@@ -13950,6 +14033,23 @@ export function issueRoutes(
                 );
           if (!updatedIssue) throw notFound("Issue not found");
           issue = updatedIssue;
+          // SUP-21910: persist a structured done-tier declaration as an issue
+          // comment, the same durable record the PATCH close door writes, so the
+          // declaration and its evidence survive on the card, not only on the
+          // recovery-action row.
+          if (sourceIssueStatus === "done" && structuredDoneTierRendered) {
+            await svc.addComment(
+              id,
+              doneTierResolutionNote!,
+              {
+                agentId: actor.agentId ?? undefined,
+                userId: actor.actorType === "user" ? actor.actorId : undefined,
+                runId: actor.runId ?? undefined,
+              },
+              {},
+              tx,
+            );
+          }
         }
 
         const recordedOutcome =
@@ -13979,7 +14079,7 @@ export function issueRoutes(
             actionId: activeRecoveryAction.id,
             status: actionStatus,
             outcome: recordedOutcome,
-            resolutionNote: resolutionNote ?? null,
+            resolutionNote: doneTierResolutionNote,
             // Drop the automatic no-replay hold only when the restore lands an
             // armed stage; otherwise leave the resolved action's evidence intact.
             evidence: restoredLandsArmedStage

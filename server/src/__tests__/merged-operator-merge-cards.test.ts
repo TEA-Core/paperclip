@@ -697,6 +697,137 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
     expect(card?.status).toBe("todo");
   });
 
+  it("SUP-21910: the close carries a structured Tier-2 declaration rendered into the persisted system comment", async () => {
+    // The sweep live-probed every gate pull request as merged, so the close
+    // declares that measurement in the structured doneTier form PATCH uses —
+    // rendered into the persisted close comment, evaluated by the shared
+    // gate, and never a landed-at-tip (Tier-1) claim.
+    const { companyId, goalId, agentId } = await seedCompany(db);
+    const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
+      cardTitle: "Merge approved PR TEA-Core/paperclip#404 into fold/tea-patches-v2026.722.0",
+      cardDescription: mergeGateMarker([404]),
+    });
+
+    const resolvePullRequest = vi.fn(async () => ({ ...MERGED_EVIDENCE }));
+    const enqueueWakeup = vi.fn(async () => ({ id: "wake-1" }));
+    const service = createMergedOperatorMergeCardSweepService(db, {
+      resolvePullRequest,
+      enqueueWakeup,
+    });
+
+    await expect(service.sweepMergedOperatorMergeCards()).resolves.toEqual({
+      checked: 1,
+      candidates: 1,
+      closed: 1,
+      woken: 1,
+    });
+    expect(
+      await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, fixture.cardId))
+        .then((rows) => rows[0]?.status),
+    ).toBe("done");
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, fixture.cardId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]!.authorType).toBe("system");
+    expect(comments[0]!.body).toContain("Closed at Tier 2 (live): ");
+    expect(comments[0]!.body).toContain(
+      "all gate pull requests verified merged by the merged-operator merge-card sweep:",
+    );
+    expect(comments[0]!.body).toContain(
+      "TEA-Core/paperclip#404 merged at 2026-08-29T00:11:06Z, merge commit c0cd56e43f9a81f360532f7b92fbf176798016ad",
+    );
+    // The sweep measured merges, not a landed-at-tip probe: the declaration
+    // must never claim Tier 1.
+    expect(comments[0]!.body).not.toContain("Closed at Tier 1");
+  });
+
+  it("SUP-21910: a done-transition guard refusal defers the card instead of closing around the ladder", async () => {
+    // Mechanism C: a card with an unsatisfied review ladder must not be
+    // closed by the sweep even though its pull-request evidence is fully
+    // measurable — the sweep now routes through the same shared guard the
+    // PATCH door runs, and a refusal defers the card (guard audit row + warn,
+    // no thread spam) instead of silently bypassing it.
+    const { companyId, goalId, agentId } = await seedCompany(db);
+    const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
+      cardTitle: "Merge approved PR TEA-Core/paperclip#404 into fold/tea-patches-v2026.722.0",
+      cardDescription: mergeGateMarker([404]),
+    });
+    const stage1Id = randomUUID();
+    const stage2Id = randomUUID();
+    await db
+      .update(issues)
+      .set({
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [
+            { id: stage1Id, type: "review", participants: [{ type: "agent", agentId }] },
+            { id: stage2Id, type: "review", participants: [{ type: "agent", agentId }] },
+          ],
+        },
+        executionState: {
+          status: "pending",
+          currentStageId: stage2Id,
+          currentStageIndex: 1,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId, userId: null },
+          returnAssignee: { type: "agent", agentId, userId: null },
+          completedStageIds: [stage1Id],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          pendingSince: new Date(Date.now() - 60_000).toISOString(),
+        },
+      })
+      .where(eq(issues.id, fixture.cardId));
+
+    const resolvePullRequest = vi.fn(async () => ({ ...MERGED_EVIDENCE }));
+    const enqueueWakeup = vi.fn(async () => ({ id: "wake-1" }));
+    const service = createMergedOperatorMergeCardSweepService(db, {
+      resolvePullRequest,
+      enqueueWakeup,
+    });
+
+    await expect(service.sweepMergedOperatorMergeCards()).resolves.toEqual({
+      checked: 1,
+      candidates: 1,
+      closed: 0,
+      woken: 0,
+    });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const card = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, fixture.cardId))
+      .then((rows) => rows[0] ?? null);
+    expect(card?.status).toBe("todo");
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, fixture.cardId));
+    expect(comments).toHaveLength(0);
+
+    const refusalAudits = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, fixture.cardId));
+    expect(refusalAudits).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_refused",
+          actorId: "done-transition-guard",
+        }),
+      ]),
+    );
+  });
+
   it("caches merged evidence within the TTL and re-checks after it expires", async () => {
     const { companyId, goalId, agentId } = await seedCompany(db);
     const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {

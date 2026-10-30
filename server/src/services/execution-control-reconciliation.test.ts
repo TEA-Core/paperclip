@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agents,
   companies,
   createDb,
@@ -464,6 +465,97 @@ describeEmbeddedPostgres(
       expect(issue?.status).toBe("done");
       expect(issue?.executionRunId).toBeNull();
       expect(issue?.checkoutRunId).toBeNull();
+    });
+
+    it("SUP-21910: the backstop close runs the shared done-transition guard and records the audited system tier bypass", async () => {
+      // A declaration-incapable system janitor cannot write a truthful Tier-1
+      // or Tier-2 declaration, so the close takes the SUP-13939 board-bypass
+      // shape: the skip itself is audited and countable in the ghost-PASS
+      // census instead of a silent gap.
+      const issueId = await seedStrandedGenerationTask({ companyId, reviewerAgentId });
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      expect(result).toEqual({ scanned: 1, terminalized: 1 });
+      expect((await getIssue(issueId))?.status).toBe("done");
+
+      const skipAudits = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.entityId, issueId));
+      expect(skipAudits).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            action: "issue.done_tier_declaration_skipped",
+            actorId: "done-transition-guard",
+            details: expect.objectContaining({
+              skipReason: "system_backstop_bypass:system:execution-control-reconciliation",
+            }),
+          }),
+        ]),
+      );
+    });
+
+    it("SUP-21910: a guard refusal defers the card instead of closing around the ladder", async () => {
+      // Mechanism C: the card carries a review ladder with no recorded
+      // decision for its current stage. The reaper must NOT terminalize it —
+      // the silent bypass was the defect — and the refusal surfaces as the
+      // guard's own durable audit row.
+      const issueId = await seedStrandedGenerationTask({ companyId, reviewerAgentId });
+      const stage1Id = randomUUID();
+      const stage2Id = randomUUID();
+      await db
+        .update(issues)
+        .set({
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            stages: [
+              { id: stage1Id, type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] },
+              { id: stage2Id, type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] },
+            ],
+          },
+          executionState: {
+            status: "pending",
+            currentStageId: stage2Id,
+            currentStageIndex: 1,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+            returnAssignee: { type: "agent", agentId: SUMMARIZER_AGENT_ID, userId: null },
+            completedStageIds: [stage1Id],
+            skippedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            pendingSince: new Date(Date.now() - 60_000).toISOString(),
+          },
+        })
+        .where(eq(issues.id, issueId));
+
+      const result = await reapStrandedSummaryGenerationIssues(db);
+
+      expect(result).toEqual({ scanned: 1, terminalized: 0 });
+      const issue = await getIssue(issueId);
+      expect(issue?.status).toBe("in_progress");
+
+      const refusalAudits = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.entityId, issueId));
+      expect(refusalAudits).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            action: "issue.done_transition_ladder_refused",
+            actorId: "done-transition-guard",
+          }),
+        ]),
+      );
+
+      // This describe shares one database and isolates with fresh rows, so a
+      // card this test deliberately leaves non-terminal would inflate every
+      // later test's candidate count. Remove it now that its refusal is
+      // asserted.
+      await db.delete(activityLog).where(eq(activityLog.entityId, issueId));
+      await db.delete(issues).where(eq(issues.id, issueId));
     });
 
     it("terminalizes a summary task with a null execution state and no live run", async () => {
