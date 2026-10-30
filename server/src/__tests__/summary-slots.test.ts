@@ -1139,9 +1139,49 @@ describeEmbeddedPostgres("summary slot service", () => {
       const companyId = await seedCompany();
       const projectId = await seedProject(companyId);
       const summarizerAgentId = await seedSummarizer(companyId);
+      const reviewerAgentId = await seedPlainAgent(companyId);
       const { svc, generationIssueId, runId } = await startGeneration(companyId, projectId, summarizerAgentId);
 
-      // First revision lands while the task remains active and the slot remains linked.
+      const armedReviewStageId = randomUUID();
+      await db
+        .update(issues)
+        .set({
+          assigneeAgentId: reviewerAgentId,
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            returnAssigneeAgentId: summarizerAgentId,
+            stages: [
+              {
+                id: armedReviewStageId,
+                type: "review",
+                approvalsNeeded: 1,
+                participants: [{ id: randomUUID(), type: "agent", agentId: reviewerAgentId }],
+              },
+            ],
+          },
+          status: "todo",
+          executionState: {
+            status: "pending",
+            currentStageId: armedReviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: reviewerAgentId },
+            returnAssignee: { type: "agent", agentId: summarizerAgentId },
+            deliveryAuthor: { type: "agent", agentId: summarizerAgentId },
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        })
+        .where(eq(issues.id, generationIssueId));
+
+      const preWriteIssue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, generationIssueId))
+        .then((rows) => rows[0]!);
+      expect(preWriteIssue.assigneeAgentId).toBe(reviewerAgentId);
+
       const first = await svc.write(
         { ...projectSelector(companyId, projectId), markdown: "# Summary v1", generationIssueId },
         { agentId: summarizerAgentId, runId },
