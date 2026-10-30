@@ -1687,21 +1687,32 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       .limit(100);
   }
 
+  // SUP-20761: the recorded-marker test shared by the hydrated git path — a PR
+  // row counts as merged only with status "merged" AND a non-null recorded
+  // mergedAt.
+  function isRecordedMergedPullRequest(product: { status: string; metadata: unknown }): boolean {
+    return product.status === "merged"
+      && readNullableString(isRecord(product.metadata) ? product.metadata.mergedAt : null) !== null;
+  }
+
   function deriveRecordedDeliveryState(
     products: Array<{ status: string; metadata: unknown }>,
-    aheadOfBase: boolean,
   ): ExecutionWorkspaceDeliveryState {
-    const hasMergedPullRequestProduct = products.some((product) =>
-      product.status === "merged"
-      && readNullableString(isRecord(product.metadata) ? product.metadata.mergedAt : null) !== null,
-    );
+    const hasMergedPullRequestProduct = products.some((product) => isRecordedMergedPullRequest(product));
     return deriveExecutionWorkspaceDeliveryState({
       hasMergedPullRequestProduct,
-      hasUnmergedPullRequestProduct: products.some((product) =>
-        !(product.status === "merged"
-          && readNullableString(isRecord(product.metadata) ? product.metadata.mergedAt : null) !== null),
+      hasUnmergedPullRequestProduct: products.some((product) => !isRecordedMergedPullRequest(product)),
+      // SUP-20761: the batch path never scans git. The already-batched PR
+      // product rows carry the persisted ahead-of-base evidence instead:
+      // recordAtOpen (pr-delivery) records the branch head SHA at PR-open
+      // time, and a recorded open PR can only exist for a branch that was
+      // ahead of its base. A PR row without that recorded SHA carries no
+      // ahead-of-base evidence and must fail safe to unknown, matching the
+      // hydrated policy for a branch that is not ahead.
+      aheadOfBase: products.some((product) =>
+        !isRecordedMergedPullRequest(product)
+        && readNullableString(isRecord(product.metadata) ? product.metadata.headSha : null) !== null,
       ),
-      aheadOfBase,
     });
   }
 
@@ -2771,7 +2782,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           toExecutionWorkspace(
             row,
             (runtimeServicesByWorkspaceId.get(row.id) ?? []).map(toRuntimeService),
-            deriveRecordedDeliveryState(productsByIssueId.get(row.sourceIssueId ?? "") ?? [], false),
+            deriveRecordedDeliveryState(productsByIssueId.get(row.sourceIssueId ?? "") ?? []),
           ),
         ]),
       );
