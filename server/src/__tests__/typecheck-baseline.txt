@@ -858,8 +858,6 @@ server/src/__tests__/issue-execution-policy.test.ts(259,43): TS2741
 server/src/__tests__/issue-execution-policy.test.ts(322,43): TS2741
 server/src/__tests__/issue-execution-policy.test.ts(3372,7): TS2741
 server/src/__tests__/issue-execution-policy.test.ts(3580,13): TS2322
-server/src/__tests__/issue-execution-stage-board-decision.test.ts(250,50): TS2339
-server/src/__tests__/issue-execution-stage-board-decision.test.ts(252,52): TS2339
 server/src/__tests__/issue-monitor-scheduler.test.ts(207,39): TS2339
 server/src/__tests__/issue-monitor-scheduler.test.ts(207,74): TS2339
 server/src/__tests__/issue-monitor-scheduler.test.ts(208,39): TS2339

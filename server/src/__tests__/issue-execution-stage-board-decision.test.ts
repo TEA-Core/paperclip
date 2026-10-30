@@ -191,7 +191,12 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
       });
     }
 
-    const stages = [
+    const stages: Array<{
+      id: string;
+      type: "review" | "approval";
+      approvalsNeeded: 1;
+      participants: Array<{ type: "agent" | "user"; agentId?: string; userId?: string }>;
+    }> = [
       {
         id: STAGE_ID,
         type: "review" as const,
@@ -203,7 +208,7 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
             {
               id: SECOND_STAGE_ID,
               type: "approval" as const,
-              approvalsNeeded: 1,
+              approvalsNeeded: 1 as const,
               // Distinct from the return assignee: the selector excludes the
               // return assignee from participant selection (SUP-15805).
               participants: [{ type: "agent" as const, agentId: secondStageAgentId }],
