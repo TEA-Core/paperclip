@@ -1330,6 +1330,82 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
+    it("keeps a policy-restricted actor denied even for an exact active verdict", async () => {
+      // SUP-21915: the deferral exists only for the missing-grant shape. A
+      // policy-restricted actor class must keep its full denial even when it
+      // is the armed stage's current participant.
+      mockIssueService.getById.mockResolvedValue(makeArmedReviewIssue());
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action !== "issue:mutate",
+        action: input.action,
+        reason:
+          input.action === "issue:mutate" ? "deny_policy_restricted" : "allow_explicit_grant",
+        explanation:
+          input.action === "issue:mutate"
+            ? "Actor class is policy-restricted."
+            : "Allowed by test default.",
+      }));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", comment: "Verdict from a policy-restricted participant." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details.code).toBe("issue_write_actor_class_excluded");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("keeps a low-trust boundary actor denied even for an exact active verdict", async () => {
+      // SUP-21915: same as policy-restricted — the low-trust boundary is an
+      // actor-class wall the verdict deferral must not tunnel through.
+      mockIssueService.getById.mockResolvedValue(makeArmedReviewIssue());
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action !== "issue:mutate",
+        action: input.action,
+        reason:
+          input.action === "issue:mutate" ? "deny_low_trust_boundary" : "allow_explicit_grant",
+        explanation:
+          input.action === "issue:mutate"
+            ? "Actor is inside a low-trust boundary."
+            : "Allowed by test default.",
+      }));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", comment: "Verdict from a low-trust participant." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details.code).toBe("issue_write_actor_class_excluded");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("keeps a responsible-user coded denial enforced even for an exact active verdict", async () => {
+      // SUP-21915: `deny_missing_grant` alone is not enough — a decision that
+      // carries a responsible-user denial code names a harder ceiling, so the
+      // deferral must not fire and the coded denial copy must answer.
+      mockIssueService.getById.mockResolvedValue(makeArmedReviewIssue());
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action !== "issue:mutate",
+        action: input.action,
+        reason: input.action === "issue:mutate" ? "deny_missing_grant" : "allow_explicit_grant",
+        ...(input.action === "issue:mutate"
+          ? { code: "RESPONSIBLE_USER_UNAUTHORIZED" as const }
+          : {}),
+        explanation:
+          input.action === "issue:mutate"
+            ? "Responsible-user ceiling denial."
+            : "Allowed by test default.",
+      }));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "todo", comment: "Verdict from a ceiling-denied participant." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details.code).toBe("issue_write_responsible_user_ceiling");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
     it("keeps ordinary field mutations denied for the active participant", async () => {
       mockIssueService.getById.mockResolvedValue(makeArmedReviewIssue());
 
