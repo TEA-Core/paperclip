@@ -1005,8 +1005,11 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .where(eq(issueExecutionDecisions.issueId, issueId));
     const decision = decisions.find((entry) => entry.body?.startsWith("## Review: APPROVED"));
 
-    expect(comment?.body).toBe("## Review: APPROVED\n\nShip it.");
+    const expectedBody = "## Review: APPROVED\n\nShip it.";
+    expect(comment?.body).toBe(expectedBody);
     expect(comment?.body).not.toContain("Closed at Tier");
+    expect(decision).toBeDefined();
+    expect(decision?.body).toBe(expectedBody);
     expect(decision?.body).not.toContain("Closed at Tier");
   });
 
