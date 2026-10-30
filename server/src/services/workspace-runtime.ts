@@ -37,7 +37,7 @@ import {
 import { and, desc, eq, gte, inArray, isNull, lte, ne, or } from "drizzle-orm";
 import { asNumber, asString, defaultPathForPlatform, parseObject, renderTemplate, resolveCommandForLogs } from "../adapters/utils.js";
 import { conflict } from "../errors.js";
-import { resolveHomeAwarePath } from "../home-paths.js";
+import { resolveHomeAwarePath, resolvePaperclipInstanceRoot } from "../home-paths.js";
 import {
   ensureSharedGroupOwnership,
   ensureSharedGroupTraversalPath,
@@ -7088,6 +7088,34 @@ export async function removeGitWorktreeArtifact(input: {
   }
 }
 
+async function findGitMarkerEntry(root: string): Promise<string | null> {
+  const rootMarker = path.join(root, ".git");
+  if (await fs.lstat(rootMarker).then(() => true, () => false)) {
+    return rootMarker;
+  }
+  const pending: string[] = [root];
+  while (pending.length > 0) {
+    const dir = pending.pop()!;
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const entryPath = path.join(dir, entry.name);
+      if (entry.name === ".git") return entryPath;
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        pending.push(entryPath);
+      }
+    }
+  }
+  return null;
+}
+
+function isInsideLocalWorkspaceManagedRoot(candidate: string): boolean {
+  const instanceRoot = resolvePaperclipInstanceRoot();
+  return ["workspaces", "projects"].some((segment) => {
+    const rel = path.relative(path.resolve(instanceRoot, segment), candidate);
+    return rel !== "" && rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+  });
+}
+
 export async function cleanupExecutionWorkspaceArtifacts(input: {
   workspace: {
     id: string;
@@ -7293,24 +7321,47 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
       : false;
     if (containsProjectWorkspace) {
       warnings.push(`Refusing to remove path "${workspacePath}" because it contains the project workspace.`);
-    } else {
-      await input.assertSafeToCleanup?.();
-      await fs.rm(resolvedWorkspacePath, { recursive: true, force: true });
-      if (input.recorder) {
-        await input.recorder.recordOperation({
-          phase: "workspace_teardown",
-          cwd: projectWorkspaceCwd ?? process.cwd(),
-          metadata: {
-            workspaceId: input.workspace.id,
-            workspacePath: resolvedWorkspacePath,
-            cleanupAction: "remove_local_fs",
-          },
-          run: async () => ({
-            status: "succeeded",
-            exitCode: 0,
-            system: `Removed local workspace directory ${resolvedWorkspacePath}\n`,
-          }),
-        });
+    } else if (await directoryExists(resolvedWorkspacePath)) {
+      let gitMarker: string | null = null;
+      let scanError: string | null = null;
+      try {
+        gitMarker = await findGitMarkerEntry(resolvedWorkspacePath);
+      } catch (err) {
+        scanError = err instanceof Error ? err.message : String(err);
+      }
+      if (scanError) {
+        warnings.push(
+          `Refusing to remove path "${workspacePath}" because the git repository safety scan failed: ${scanError}.`,
+        );
+      } else if (gitMarker === path.join(resolvedWorkspacePath, ".git")) {
+        warnings.push(`Refusing to remove path "${workspacePath}" because it is a git repository.`);
+      } else if (gitMarker) {
+        warnings.push(
+          `Refusing to remove path "${workspacePath}" because it contains a git repository at "${path.dirname(gitMarker)}".`,
+        );
+      } else if (!isInsideLocalWorkspaceManagedRoot(resolvedWorkspacePath)) {
+        warnings.push(
+          `Refusing to remove path "${workspacePath}" because it is outside the runtime-managed local workspace roots.`,
+        );
+      } else {
+        await input.assertSafeToCleanup?.();
+        await fs.rm(resolvedWorkspacePath, { recursive: true, force: true });
+        if (input.recorder) {
+          await input.recorder.recordOperation({
+            phase: "workspace_teardown",
+            cwd: projectWorkspaceCwd ?? process.cwd(),
+            metadata: {
+              workspaceId: input.workspace.id,
+              workspacePath: resolvedWorkspacePath,
+              cleanupAction: "remove_local_fs",
+            },
+            run: async () => ({
+              status: "succeeded",
+              exitCode: 0,
+              system: `Removed local workspace directory ${resolvedWorkspacePath}\n`,
+            }),
+          });
+        }
       }
     }
   }
