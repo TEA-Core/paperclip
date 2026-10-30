@@ -574,7 +574,7 @@ async function hydrateLinkedPrState(
         headRefName: typeof head?.ref === "string" ? head.ref : null,
         title: typeof body.title === "string" ? body.title : null,
         headRepoFullName,
-        baseRefName: typeof base?.ref === "string" ? base.ref : (pr.baseRefName ?? null),
+        baseRefName: typeof base?.ref === "string" ? base.ref : null,
       };
     }
     return pr;
@@ -822,8 +822,6 @@ async function proveLandingDelegated(
     const candidates = await resolveGitHubTokenCandidatesForRepo(db, issue.companyId, pr.owner, pr.repo);
     for (const candidate of candidates) {
       const live = await hydrateLinkedPrState(pr, candidate.token);
-      // The queue probe below keys on the hydrated PR: live hydration may have
-      // supplied baseRefName from base.ref that the cached resolver value lacked.
       const probePr = live !== pr ? live : pr;
       if (live !== pr && live.cachedState === "open" && live.draft && (await loadOwnDraftPredicate(db, issue, [live]))(live)) {
         return refuseTier1(
@@ -855,7 +853,7 @@ async function proveLandingDelegated(
           const escapeGraphqlString = (value: string) =>
             value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
           let queueCarrier: "queued" | "configured" | "none" | "unknown" = "unknown";
-          if (probePr.baseRefName) {
+          if (live !== pr && probePr.baseRefName) {
             const queueResponse = await queueGraphql(
               `query { repository(owner: "${escapeGraphqlString(pr.owner)}", name: "${escapeGraphqlString(pr.repo)}") { mergeQueue(branch: "${escapeGraphqlString(probePr.baseRefName)}") { configuration { mergeMethod } } } }`,
             );
