@@ -113,6 +113,24 @@ describeEmbeddedPostgres("documentService system issue documents", () => {
     }));
   });
 
+  it("preserves literal backslash escapes across document writes and reads", async () => {
+    const { issueId } = await createIssueWithDocuments();
+    const current = (await svc.getIssueDocumentByKey(issueId, "plan"))!;
+    const body = String.raw`# Plan\n\nShip it\\t\[literal]`;
+
+    const saved = await svc.upsertIssueDocument({
+      issueId,
+      key: "plan",
+      title: "Plan",
+      format: "markdown",
+      body,
+      baseRevisionId: current.latestRevisionId,
+    });
+
+    expect(saved.document.body).toBe(body);
+    expect((await svc.getIssueDocumentByKey(issueId, "plan"))?.body).toBe(body);
+  });
+
   it("explains the revision guard and rejects missing or stale update revisions without changing the document", async () => {
     const { issueId } = await createIssueWithDocuments();
     const current = (await svc.getIssueDocumentByKey(issueId, "plan"))!;

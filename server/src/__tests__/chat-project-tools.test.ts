@@ -72,6 +72,15 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await documentService(server.db).getIssueDocumentByKey(result.id, "plan"))?.body).toContain("Implement in the execution task");
   });
 
+  it("rejects unsupported execution policies instead of dropping them", async () => {
+    const f = await server.fixture({ conversation: true });
+    await expect(callProjectTool({ name: "create_task", arguments: {
+      title: "Reject silent monitor loss", projectId: f.projectId, idempotencyKey: "reject-monitor-policy",
+      executionPolicy: { monitor: { kind: "external_service", serviceName: "weekly-report-composition", nextCheckAt: "2026-10-22T00:05:00Z", recoveryPolicy: "wake_owner", scheduledBy: "assignee" } },
+    }, apiUrl: server.apiUrl, token: createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId, f.responsibleUserId)!,
+    companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, conversation: true })).rejects.toThrow("paperclip_runner_tool_arguments_invalid");
+  });
+
   it("retains ordinary child delegation and projectless task creation", async () => {
     const f = await server.fixture();
     const result = await call(f, "create_task", { title: "Delegate ordinary work", idempotencyKey: "child" }) as any;
