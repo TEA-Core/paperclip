@@ -49,10 +49,10 @@ describeEmbeddedPostgres("heartbeat workspace_validation_failed classification r
     registerServerAdapter({
       type: NO_REASON_ADAPTER,
       execute: async () => {
-        const err: Record<string, unknown> = new Error("adapter_failed");
-        err.code = "workspace_validation_failed";
-        err.resultJson = { stopReason: "adapter_failed", timeoutFired: false };
-        throw err;
+        throw Object.assign(new Error("adapter_failed"), {
+          code: "workspace_validation_failed",
+          resultJson: { stopReason: "adapter_failed", timeoutFired: false },
+        });
       },
       testEnvironment: async () => ({
         adapterType: NO_REASON_ADAPTER,
@@ -65,14 +65,14 @@ describeEmbeddedPostgres("heartbeat workspace_validation_failed classification r
     registerServerAdapter({
       type: WITH_REASON_ADAPTER,
       execute: async () => {
-        const err: Record<string, unknown> = new Error("adapter_failed");
-        err.code = "workspace_validation_failed";
-        err.resultJson = {
-          stopReason: "adapter_failed",
-          timeoutFired: false,
-          workspaceValidation: { reason: "git_worktree_base_agent_home" },
-        };
-        throw err;
+        throw Object.assign(new Error("adapter_failed"), {
+          code: "workspace_validation_failed",
+          resultJson: {
+            stopReason: "adapter_failed",
+            timeoutFired: false,
+            workspaceValidation: { reason: "git_worktree_base_agent_home" },
+          },
+        });
       },
       testEnvironment: async () => ({
         adapterType: WITH_REASON_ADAPTER,
@@ -172,6 +172,7 @@ describeEmbeddedPostgres("heartbeat workspace_validation_failed classification r
       });
     }, { timeout: 10_000, interval: 50 }).toBe("error");
 
+    agentRow = await readAgent();
     expect(agentRow?.errorReason).toMatch(/^\[adapter_failed\]/);
     expect(agentRow?.errorReason).not.toMatch(/^\[workspace_validation_failed\]/);
   }, 30_000);
@@ -197,6 +198,7 @@ describeEmbeddedPostgres("heartbeat workspace_validation_failed classification r
       });
     }, { timeout: 10_000, interval: 50 }).toBe("workspace_validation_failed");
 
+    runRow = await readRunErrorCode();
     expect(runRow?.errorCode).toBe("workspace_validation_failed");
     expect(runRow?.status).toBe("failed");
 
@@ -209,6 +211,7 @@ describeEmbeddedPostgres("heartbeat workspace_validation_failed classification r
       });
     }, { timeout: 10_000, interval: 50 }).toBe("idle");
 
+    agentRow = await readAgent();
     expect(agentRow?.status).toBe("idle");
     expect(agentRow?.errorReason).toBeNull();
   }, 30_000);

@@ -666,10 +666,6 @@ server/src/__tests__/heartbeat-workspace-finalize-branch.test.ts(484,43): TS2345
 server/src/__tests__/heartbeat-workspace-finalize-branch.test.ts(484,50): TS7006
 server/src/__tests__/heartbeat-workspace-finalize-branch.test.ts(552,43): TS2345
 server/src/__tests__/heartbeat-workspace-finalize-branch.test.ts(552,50): TS7006
-server/src/__tests__/heartbeat-workspace-occupancy.test.ts(382,39): TS2345
-server/src/__tests__/heartbeat-workspace-occupancy.test.ts(382,46): TS7006
-server/src/__tests__/heartbeat-workspace-occupancy.test.ts(444,9): TS2493
-server/src/__tests__/heartbeat-workspace-occupancy.test.ts(519,14): TS2493
 server/src/__tests__/heartbeat-workspace-ready-comment.test.ts(7,11): TS2741
 server/src/__tests__/heartbeat-workspace-session.test.ts(107,5): TS2741
 server/src/__tests__/heartbeat-workspace-session.test.ts(1507,12): TS18047
@@ -685,14 +681,6 @@ server/src/__tests__/heartbeat-workspace-session.test.ts(3735,9): TS2353
 server/src/__tests__/heartbeat-workspace-session.test.ts(3809,9): TS2561
 server/src/__tests__/heartbeat-workspace-session.test.ts(62,3): TS2322
 server/src/__tests__/heartbeat-workspace-session.test.ts(92,5): TS2741
-server/src/__tests__/heartbeat-workspace-validation-failure-classification.test.ts(175,22): TS2339
-server/src/__tests__/heartbeat-workspace-validation-failure-classification.test.ts(176,22): TS2339
-server/src/__tests__/heartbeat-workspace-validation-failure-classification.test.ts(200,20): TS2339
-server/src/__tests__/heartbeat-workspace-validation-failure-classification.test.ts(201,20): TS2339
-server/src/__tests__/heartbeat-workspace-validation-failure-classification.test.ts(212,22): TS2339
-server/src/__tests__/heartbeat-workspace-validation-failure-classification.test.ts(213,22): TS2339
-server/src/__tests__/heartbeat-workspace-validation-failure-classification.test.ts(52,15): TS2322
-server/src/__tests__/heartbeat-workspace-validation-failure-classification.test.ts(68,15): TS2322
 server/src/__tests__/heartbeat-worktree-suppression.test.ts(297,7): TS2322
 server/src/__tests__/helpers/paperclip-semantic-conformance.ts(305,9): TS2322
 server/src/__tests__/helpers/paperclip-semantic-conformance.ts(343,7): TS2322
@@ -1323,8 +1311,6 @@ server/src/__tests__/server-startup-feedback-export.test.ts(691,7): TS2349
 server/src/__tests__/server-startup-feedback-export.test.ts(769,7): TS2322
 server/src/__tests__/server-startup-feedback-export.test.ts(789,7): TS2349
 server/src/__tests__/server-startup-feedback-export.test.ts(828,7): TS2349
-server/src/__tests__/shared-group-ownership.test.ts(692,58): TS2556
-server/src/__tests__/shared-group-ownership.test.ts(693,66): TS2556
 server/src/__tests__/status-cards.test.ts(134,49): TS2322
 server/src/__tests__/status-cards.test.ts(245,19): TS2769
 server/src/__tests__/status-cards.test.ts(271,9): TS2741

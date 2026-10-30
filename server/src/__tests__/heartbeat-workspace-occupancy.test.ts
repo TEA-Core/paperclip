@@ -72,7 +72,7 @@ vi.mock("../services/environment-run-orchestrator.js", async (importOriginal) =>
 });
 
 const adapterExecute = vi.hoisted(() =>
-  vi.fn(async () => ({
+  vi.fn(async (_input: unknown) => ({
     exitCode: 0,
     signal: null,
     timedOut: false,
@@ -440,8 +440,8 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
       status: "cancelled",
       errorCode: "execution_workspace_occupied",
     });
-    const contenderAdapterCalls = adapterExecute.mock.calls.filter(
-      ([input]) => readAdapterCall(input).issueId === seeded.contenderIssueId,
+    const contenderAdapterCalls = adapterExecute.mock.calls.filter((call) =>
+      readAdapterCall(call[0]).issueId === seeded.contenderIssueId,
     );
     expect(contenderAdapterCalls).toHaveLength(0);
 
@@ -516,7 +516,7 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
     expect(promotedRun).toMatchObject({ status: "succeeded" });
 
     const contenderCalls = adapterExecute.mock.calls
-      .map(([input]) => readAdapterCall(input))
+      .map((call) => readAdapterCall(call[0]))
       .filter((call) => call.issueId === seeded.contenderIssueId);
     expect(contenderCalls).toHaveLength(1);
     expect(contenderCalls[0]?.executionWorkspaceId).toBe(occupantWorkspace.executionWorkspaceId);
