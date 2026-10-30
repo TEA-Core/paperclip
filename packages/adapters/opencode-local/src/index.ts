@@ -44,6 +44,10 @@ export const SANDBOX_INSTALL_COMMAND =
 
 export const DEFAULT_OPENCODE_LOCAL_MODEL = "openai/gpt-5.2-codex";
 
+// The one OpenCode V2 CLI version the adapter drives. 2.2.3+ is required for
+// `error type=output-limit`, and 2.2.0+ for a position-agnostic `--standalone`.
+export const OPENCODE_V2_CLI_VERSION = "2.2.4";
+
 export function isValidOpenCodeModelId(value: unknown): value is string {
   if (typeof value !== "string") return false;
   const trimmed = value.trim();
@@ -83,7 +87,7 @@ Core fields:
 - dangerouslySkipPermissions (boolean, optional): inject a runtime OpenCode config that allows \`external_directory\` access without interactive prompts; defaults to true for unattended Paperclip runs
 - promptTemplate (string, optional): run prompt template
 - command (string, optional): defaults to "opencode"
-- cliVersion (string, optional): exact opt-in OpenCode CLI version; 2.0.26 enables V2 arguments and standalone execution
+- cliVersion (string, optional): exact OpenCode CLI version; only ${OPENCODE_V2_CLI_VERSION} is accepted and it enables V2 arguments and standalone execution. When omitted, the adapter probes \`command --version\`: a 1.x binary runs as V1, a detected 2.x binary other than ${OPENCODE_V2_CLI_VERSION} is refused, and a version that cannot be determined (probe failed, timed out, or empty or unparseable output) is treated as V1
 - extraArgs (string[], optional): additional CLI args
 - env (object, optional): KEY=VALUE environment variables
 - skillIsolation (string, optional): "shared" (default) or "desired-only". "shared"

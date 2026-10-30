@@ -56,6 +56,20 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
   startAdapterExecutionTargetPaperclipBridge: vi.fn(async () => null),
 }));
 
+// These suites mock the process runner. A bare `opencode` command would still be
+// probed for `--version` with a real child process and resolve to whatever the
+// host has on PATH (a V2 build changes argv and config), so treat it as undetected.
+vi.mock("./version.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./version.js")>();
+  return {
+    ...actual,
+    probeOpenCodeCliVersion: (input: Parameters<typeof actual.probeOpenCodeCliVersion>[0]) =>
+      input.target?.kind !== "remote" && input.command === "opencode"
+        ? Promise.resolve(null)
+        : actual.probeOpenCodeCliVersion(input),
+  };
+});
+
 vi.mock("@paperclipai/adapter-utils/server-utils", async () => {
   const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/server-utils")>(
     "@paperclipai/adapter-utils/server-utils",
@@ -137,7 +151,7 @@ describe("buildOpenCodeRunArgs", () => {
         extraArgs: [],
         printLogs: false,
         resumeSessionId: null,
-        cliVersion: "2.0.26",
+        cliVersion: "2.2.4",
         autoApprovePermissions: true,
       }),
     ).toEqual([
@@ -241,7 +255,7 @@ describe("buildOpenCodeRunArgs", () => {
 
     expect(
       buildOpenCodeRunArgs({
-        cliVersion: "2.0.26",
+        cliVersion: "2.2.4",
         dir: "/workspaces/SUP-9238",
         model: "router/coder",
         variant: "high",
@@ -549,6 +563,80 @@ describe("execute — cliVersion validation", () => {
     ).rejects.toThrow("Unsupported OpenCode CLI version: 2.0.25");
     expect(runAdapterExecutionTargetProcessMock).not.toHaveBeenCalled();
   });
+
+  it("rejects an unsupported V2 binary detected on PATH when cliVersion is unset", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-detected-v2-"));
+    const commandPath = path.join(root, "opencode");
+    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '2.0.26\\n'; fi\n", "utf8");
+    await fs.chmod(commandPath, 0o755);
+    runAdapterExecutionTargetProcessMock.mockReset();
+    try {
+      await expect(
+        execute({
+          runId: "run-detected-unsupported-v2",
+          agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+          runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+          config: { command: commandPath, cwd: root, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+          context: {},
+          onLog: async () => {},
+        }),
+      ).rejects.toThrow(
+        `Unsupported OpenCode CLI version: 2.0.26 reported by ${commandPath}. Install 2.2.4 or point command at a V1 binary.`,
+      );
+      expect(runAdapterExecutionTargetProcessMock).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  describe("desired-only per-run skill dirs", () => {
+    async function runDesiredOnlyAndListLeakedDirs(input: {
+      version: string;
+      expectedMessage: string;
+    }): Promise<string[]> {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-skill-cleanup-"));
+      const scratchTmp = path.join(root, "tmp");
+      const commandPath = path.join(root, "opencode");
+      await fs.mkdir(scratchTmp);
+      await fs.writeFile(commandPath, `#!/bin/sh\nif [ "$1" = "--version" ]; then printf '${input.version}\\n'; fi\n`, "utf8");
+      await fs.chmod(commandPath, 0o755);
+      runAdapterExecutionTargetProcessMock.mockReset();
+      ensureCommandResolvableMock.mockReset();
+      const previousTmpdir = process.env.TMPDIR;
+      process.env.TMPDIR = scratchTmp;
+      try {
+        await expect(
+          execute({
+            runId: "run-skill-cleanup",
+            agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+            runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+            config: {
+              command: commandPath,
+              cwd: root,
+              model: "openai/gpt-5",
+              skillIsolation: "desired-only",
+              env: { OPENCODE_ALLOW_ALL_MODELS: "1" },
+            },
+            context: {},
+            onLog: async () => {},
+          }),
+        ).rejects.toThrow(input.expectedMessage);
+        return (await fs.readdir(scratchTmp)).filter((entry) => entry.startsWith("paperclip-opencode-skills-") || entry.startsWith("paperclip-opencode-home-"));
+      } finally {
+        if (previousTmpdir === undefined) delete process.env.TMPDIR;
+        else process.env.TMPDIR = previousTmpdir;
+        await fs.rm(root, { recursive: true, force: true });
+        ensureCommandResolvableMock.mockReset();
+        ensureCommandResolvableMock.mockImplementation(async () => {});
+      }
+    }
+
+    it("leaves none behind when an unsupported V2 binary is detected", async () => {
+      await expect(
+        runDesiredOnlyAndListLeakedDirs({ version: "2.3.0", expectedMessage: "Unsupported OpenCode CLI version: 2.3.0" }),
+      ).resolves.toEqual([]);
+    });
+  });
 });
 
 describe("execute — OpenRouter credentials", () => {
@@ -625,6 +713,53 @@ describe("execute — OpenRouter credentials", () => {
   });
 });
 
+describe("execute — OpenCode V2 output cap", () => {
+  const lengthStream = (extra: unknown[] = []) => [
+    { type: "step_start", sessionID: "session-cap" },
+    { type: "text", sessionID: "session-cap", part: { text: "partial answer" } },
+    { type: "step_finish", sessionID: "session-cap", part: { reason: "length", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } } },
+    ...extra,
+  ].map((event) => JSON.stringify(event)).join("\n");
+
+  async function runCapped(stdout: string, exitCode: number) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-v2-cap-"));
+    const commandPath = path.join(root, "opencode");
+    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '2.2.4\\n'; fi\n", "utf8");
+    await fs.chmod(commandPath, 0o755);
+    runAdapterExecutionTargetProcessMock.mockReset();
+    runAdapterExecutionTargetProcessMock.mockImplementation(async () => probeResult({ stdout, exitCode }));
+    try {
+      return await execute({
+        runId: "run-v2-cap",
+        agent: { id: "agent-v2-cap", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: commandPath, cliVersion: "2.2.4", cwd: root, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+        context: {},
+        onLog: async () => {},
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
+
+  it("reports the OpenCode 2.2.3+ output-limit error as a failure", async () => {
+    const error = { type: "error", sessionID: "session-cap", error: { name: "output-limit", message: "Response still truncated after two output token limit continuations" } };
+    const result = await runCapped(lengthStream([error]), 1);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("Response still truncated after two output token limit continuations");
+    expect(result.finishReason).toBe("length");
+  });
+
+  it("turns an exit-0 stream that stopped at the output cap into a failure", async () => {
+    const result = await runCapped(lengthStream(), 0);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("output-token cap");
+    expect(result.finishReason).toBe("length");
+  });
+});
+
 describe("execute — OpenCode V2 native MCP", () => {
   it("projects runtime MCP servers into the staged native config before the first prompt", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-v2-mcp-"));
@@ -632,7 +767,7 @@ describe("execute — OpenCode V2 native MCP", () => {
     const commandPath = path.join(root, "opencode");
     const token = "runtime-mcp-secret";
     await fs.mkdir(workspace, { recursive: true });
-    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '2.0.26\\n'; fi\n", "utf8");
+    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '2.2.4\\n'; fi\n", "utf8");
     await fs.chmod(commandPath, 0o755);
     runAdapterExecutionTargetProcessMock.mockReset();
     runAdapterExecutionTargetProcessMock.mockImplementation(async (_runId: string, _target: unknown, _command: string, _args: string[], options: { env?: Record<string, string> }) => {
@@ -693,7 +828,7 @@ describe("execute — OpenCode V2 native MCP", () => {
         events.push("version");
         return probeResult({
           exitCode: runtimeInstalled ? 0 : 127,
-          stdout: runtimeInstalled ? "2.0.26\n" : "",
+          stdout: runtimeInstalled ? "2.2.4\n" : "",
         });
       }
       return probeResult({
@@ -844,7 +979,7 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable — probe is non-fatal
   it("rejects when the V2 remote probe exits non-zero", async () => {
     runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ exitCode: 1, stderr: "Unexpected error" }));
     await expect(
-      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, cliVersion: "2.0.26", model: "openai/gpt-5" }),
+      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, cliVersion: "2.2.4", model: "openai/gpt-5" }),
     ).rejects.toThrow("OpenCode V2 model discovery failed");
   });
 
@@ -858,7 +993,7 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable — probe is non-fatal
   it("rejects when the V2 remote probe times out", async () => {
     runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ timedOut: true, exitCode: null }));
     await expect(
-      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, cliVersion: "2.0.26", model: "openai/gpt-5" }),
+      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, cliVersion: "2.2.4", model: "openai/gpt-5" }),
     ).rejects.toThrow("OpenCode V2 model discovery failed");
   });
 
@@ -872,7 +1007,7 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable — probe is non-fatal
   it("rejects when the V2 remote probe returns no models", async () => {
     runAdapterExecutionTargetProcessMock.mockResolvedValueOnce(probeResult({ exitCode: 0, stdout: "" }));
     await expect(
-      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, cliVersion: "2.0.26", model: "openai/gpt-5" }),
+      ensureRemoteOpenCodeModelConfiguredAndAvailable({ ...base, cliVersion: "2.2.4", model: "openai/gpt-5" }),
     ).rejects.toThrow("OpenCode V2 model discovery returned no models");
   });
 

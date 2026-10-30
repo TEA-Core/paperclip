@@ -7,8 +7,8 @@ import {
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 import { isValidOpenCodeModelId } from "../index.js";
+import { isOpenCodeV2CliVersion } from "./version.js";
 
-export const OPENCODE_V2_CLI_VERSION = "2.0.26";
 const MODELS_CACHE_TTL_MS = 60_000;
 const MODELS_DISCOVERY_TIMEOUT_MS = 20_000;
 // `opencode models` is a lightweight metadata call, but on a shared ollama
@@ -183,7 +183,7 @@ export async function discoverOpenCodeModels(
   } = {},
 ): Promise<AdapterModel[]> {
   const cliVersion = asString(input.cliVersion, "").trim();
-  const isV2 = cliVersion === OPENCODE_V2_CLI_VERSION;
+  const isV2 = isOpenCodeV2CliVersion(cliVersion);
   const command = resolveOpenCodeCommand(input.command);
   const cwd = asString(input.cwd, process.cwd());
   const env = normalizeEnv(input.env);
@@ -286,7 +286,7 @@ async function refreshOpenCodeModelsCached(input: {
   const cwd = asString(input.cwd, process.cwd());
   const env = normalizeEnv(input.env);
   const cliVersion = asString(input.cliVersion, "").trim();
-  const isV2 = cliVersion === OPENCODE_V2_CLI_VERSION;
+  const isV2 = isOpenCodeV2CliVersion(cliVersion);
   // OpenCode 1.18.17 uses `models --refresh` only to update its on-disk
   // models.dev cache. Its stdout is a confirmation message, not the refreshed
   // catalog, so enumerate once more after the refresh under the exact same
@@ -325,7 +325,7 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
 }): Promise<AdapterModel[]> {
   const model = requireOpenCodeModelId(input.model);
   const cliVersion = asString(input.cliVersion, "").trim();
-  const isV2 = cliVersion === OPENCODE_V2_CLI_VERSION;
+  const isV2 = isOpenCodeV2CliVersion(cliVersion);
 
   // When the caller opts into OPENCODE_ALLOW_ALL_MODELS, OpenCode accepts any
   // provider/model at run time (e.g. gateway-routed models that never appear in

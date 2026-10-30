@@ -71,7 +71,6 @@ import {
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
   isTruthyEnvFlag,
-  OPENCODE_V2_CLI_VERSION,
   verifyOpenCodeCliVersion,
   parseOpenCodeModelsOutput,
   requireOpenCodeModelId,
@@ -91,7 +90,7 @@ import {
 } from "./db-guard.js";
 import { ensureAgentAccessibleDir } from "@paperclipai/adapter-utils/agent-shared-dir";
 import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
-import { SANDBOX_INSTALL_COMMAND } from "../index.js";
+import { OPENCODE_V2_CLI_VERSION, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { redactCommandText } from "@paperclipai/adapter-utils/command-redaction";
 import {
   prepareOpenCodeIsolatedSkillsHome,
@@ -99,7 +98,12 @@ import {
   resolveOpenCodeSkillsHome,
 } from "./skills.js";
 import { formatOpenCodeSkillExposureLine } from "./exposure-line.js";
-import { probeOpenCodeCliVersion, usesOpenCodeV2Cli } from "./version.js";
+import {
+  isOpenCodeV2CliVersion,
+  probeOpenCodeCliVersion,
+  unsupportedDetectedOpenCodeV2CliVersionMessage,
+  unsupportedOpenCodeV2CliVersionMessage,
+} from "./version.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -379,7 +383,7 @@ export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
   graceSec: number;
 }) {
   const model = requireOpenCodeModelId(input.model);
-  const isV2 = asString(input.cliVersion, "").trim() === OPENCODE_V2_CLI_VERSION;
+  const isV2 = isOpenCodeV2CliVersion(asString(input.cliVersion, "").trim());
 
   // When the caller opts into OPENCODE_ALLOW_ALL_MODELS, OpenCode accepts any
   // provider/model at run time (e.g. gateway-routed models that never appear in
@@ -701,7 +705,7 @@ export function buildOpenCodeRunArgs(input: {
   resumeSessionId: string | null;
   autoApprovePermissions?: boolean;
 }): string[] {
-  const isV2 = input.cliVersion === OPENCODE_V2_CLI_VERSION;
+  const isV2 = isOpenCodeV2CliVersion(input.cliVersion);
   const args = isV2 ? ["run", "--standalone", "--format", "json"] : ["run", "--format", "json"];
   if (input.printLogs) args.push("--print-logs");
   if (!isV2 && input.dir) args.push("--dir", input.dir);
@@ -730,9 +734,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const command = asString(config.command, "opencode");
   const configuredCliVersion = asString(config.cliVersion, "").trim();
   if (configuredCliVersion && configuredCliVersion !== OPENCODE_V2_CLI_VERSION) {
-    throw new Error(
-      `Unsupported OpenCode CLI version: ${configuredCliVersion}. Use ${OPENCODE_V2_CLI_VERSION} for V2 opt-in or omit cliVersion for V1.`,
-    );
+    throw new Error(unsupportedOpenCodeV2CliVersionMessage(configuredCliVersion));
   }
   const model = asString(config.model, "").trim();
   const variant = asString(config.variant, "").trim();
@@ -960,8 +962,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     timeoutSec,
     graceSec,
   });
+  // Only a detected 2.x version other than the pin is refused. A version that
+  // cannot be determined (probe failed, timed out, or empty or unparseable
+  // output) leaves cliVersion undefined and is treated as V1.
   const cliVersion = configuredCliVersion || detectedCliVersion?.version;
-  const openCodeV2 = usesOpenCodeV2Cli(detectedCliVersion);
+  if (cliVersion && isOpenCodeV2CliVersion(cliVersion) && cliVersion !== OPENCODE_V2_CLI_VERSION) {
+    // The per-run skills dirs were staged above and the try/finally that
+    // removes them starts later, so remove them before refusing the version.
+    await Promise.all([
+      localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
+      isolatedSkillsHome ? fs.rm(isolatedSkillsHome, { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
+    ]);
+    throw new Error(unsupportedDetectedOpenCodeV2CliVersionMessage(command, cliVersion));
+  }
+  const openCodeV2 = isOpenCodeV2CliVersion(cliVersion);
   const runtimeMcpServers = openCodeV2 ? await ctx.runtimeMcp?.getServers() ?? [] : [];
   const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({
     env,
@@ -1003,7 +1017,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       installCommand: SANDBOX_INSTALL_COMMAND,
       timeoutSec,
     });
-    if (cliVersion === OPENCODE_V2_CLI_VERSION && !executionTargetIsRemote) {
+    if (openCodeV2 && !executionTargetIsRemote) {
       await verifyOpenCodeCliVersion({ cliVersion, command, cwd, env: runtimeEnv });
     }
     const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, executionTarget, cwd, runtimeEnv);
@@ -1112,7 +1126,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           { cwd, env: preparedRuntimeConfig.env, timeoutSec, graceSec, onLog },
         );
       }
-      if (cliVersion === OPENCODE_V2_CLI_VERSION) {
+      if (openCodeV2) {
         await verifyRemoteOpenCodeCliVersion({
           runId,
           executionTarget,
