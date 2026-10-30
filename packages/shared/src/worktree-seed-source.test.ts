@@ -148,8 +148,9 @@ describe("resolveCanonicalWorktreeSeedSource", () => {
       manifestTargetInstanceId: target.instanceId,
     });
 
-    expect(resolved.configPath).toBe(source.configPath);
-    expect(resolved.instanceId).toBe("default");
+    expect(resolved).not.toBeNull();
+    expect(resolved?.configPath).toBe(source.configPath);
+    expect(resolved?.instanceId).toBe("default");
   });
 
   it("fails closed when the base workspace carries no config and none is named", () => {
@@ -165,7 +166,7 @@ describe("resolveCanonicalWorktreeSeedSource", () => {
     })).toThrow(/no Paperclip config of its own/);
   });
 
-  it("fails closed without registration and when source equals target", () => {
+  it("returns no source when the registered config is the target config", () => {
     const target = makeInstance("paperclip-seed-same-target-", "target-instance");
     const diagnostic = { configPath: target.configPath, instanceId: target.instanceId };
 
@@ -176,12 +177,12 @@ describe("resolveCanonicalWorktreeSeedSource", () => {
       manifestTargetInstanceId: target.instanceId,
     })).toThrow(/not registered/);
 
-    expect(() => resolveCanonicalWorktreeSeedSource({
+    expect(resolveCanonicalWorktreeSeedSource({
       registeredBaseWorkspaceCwd: target.cwd,
-      targetConfigPath: target.configPath,
+      targetConfigPath: path.join(target.cwd, "nested", "..", ".paperclip", "config.json"),
       expectedTargetInstanceId: target.instanceId,
       manifestSource: diagnostic,
       manifestTargetInstanceId: target.instanceId,
-    })).toThrow(/same canonical file/);
+    })).toBeNull();
   });
 });

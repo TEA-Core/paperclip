@@ -15,6 +15,8 @@ export type CanonicalWorktreeSeedSource = {
   targetInstanceId: string;
 };
 
+export type WorktreeSeedSourceResolution = CanonicalWorktreeSeedSource | null;
+
 export type RegisteredWorktreeSeedSourceInput = {
   registeredBaseWorkspaceCwd?: string | null;
   explicitSourceConfigPath?: string | null;
@@ -114,7 +116,7 @@ function canonicalRegularFile(filePath: string, label: string): string {
 /** Resolve the authoritative source and target identities without consulting diagnostics. */
 export function resolveRegisteredWorktreeSeedSource(
   input: RegisteredWorktreeSeedSourceInput,
-): CanonicalWorktreeSeedSource {
+): WorktreeSeedSourceResolution {
   const registeredCwd = input.registeredBaseWorkspaceCwd?.trim();
   const explicitSource = input.explicitSourceConfigPath?.trim();
   if (!registeredCwd && !explicitSource) {
@@ -168,7 +170,7 @@ export function resolveRegisteredWorktreeSeedSource(
     "Target worktree Paperclip config",
   );
   if (canonicalSourceConfigPath === canonicalTargetConfigPath) {
-    throw new Error("Source and target Paperclip configs are the same canonical file.");
+    return null;
   }
 
   const sourceInstanceId = readInstanceId(canonicalSourceConfigPath, "source");
@@ -202,8 +204,9 @@ export function resolveRegisteredWorktreeSeedSource(
 export function resolveCanonicalWorktreeSeedSource(input: RegisteredWorktreeSeedSourceInput & {
   manifestSource: WorktreeSeedSourceDiagnostic | null | undefined;
   manifestTargetInstanceId?: unknown;
-}): CanonicalWorktreeSeedSource {
+}): WorktreeSeedSourceResolution {
   const registered = resolveRegisteredWorktreeSeedSource(input);
+  if (!registered) return null;
   const diagnosticPath = typeof input.manifestSource?.configPath === "string"
     ? input.manifestSource.configPath.trim()
     : "";
