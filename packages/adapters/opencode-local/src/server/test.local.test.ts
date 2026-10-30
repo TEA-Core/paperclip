@@ -108,4 +108,53 @@ describe("opencode testEnvironment — binary detected on PATH", () => {
       "run --format json --model openai/gpt-5 --variant high",
     );
   });
+
+  it("does not report ok when the version probe of a configured V2 binary fails", async () => {
+    const command = path.join(root, "opencode");
+    await fs.writeFile(
+      command,
+      [
+        "#!/bin/sh",
+        'case "$1" in',
+        "  --version) echo 'probe exploded' >&2; exit 3 ;;",
+        `  run) printf '%s' "$*" > '${runArgsPath}' ;;`,
+        "esac",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(command, 0o755);
+
+    const result = await testEnvironment(envTestContext(command, { cliVersion: "2.2.4" }));
+
+    expect(result.status).toBe("fail");
+    const codes = result.checks.map((check) => check.code);
+    expect(codes).toContain("opencode_command_unresolvable");
+    expect(codes).not.toContain("opencode_command_resolvable");
+    expect(codes).not.toContain("opencode_hello_probe_passed");
+    expect(result.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: "opencode_command_unresolvable",
+        level: "error",
+        message: expect.stringContaining("version probe failed"),
+      }),
+    ]));
+    await expect(fs.access(runArgsPath)).rejects.toThrow();
+  });
+
+  it("does not report ok when a configured V2 version does not match the binary", async () => {
+    const command = await writeStub("2.2.3");
+
+    const result = await testEnvironment(envTestContext(command, { cliVersion: "2.2.4" }));
+
+    expect(result.status).toBe("fail");
+    expect(result.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: "opencode_command_unresolvable",
+        level: "error",
+        message: expect.stringContaining("version mismatch: expected 2.2.4, received 2.2.3"),
+      }),
+    ]));
+    expect(result.checks.map((check) => check.code)).not.toContain("opencode_command_resolvable");
+  });
 });

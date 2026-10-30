@@ -201,6 +201,36 @@ describe("openCode models", () => {
     ).rejects.toThrow("OpenCode V2 model discovery returned no models");
   });
 
+  it("requires the configured model to be in a non-empty V2 catalog", async () => {
+    delete process.env.OPENCODE_ALLOW_ALL_MODELS;
+    process.env.PAPERCLIP_OPENCODE_MODEL_VALIDATION_RETRIES = "0";
+    const spy = vi.spyOn(serverUtils, "runChildProcess").mockImplementation(async (_runId, _command, args) => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: args[0] === "--version" ? "opencode 2.2.4\n" : "openai/gpt-5\nanthropic/claude-sonnet-4-5\n",
+      stderr: "",
+      pid: 1,
+      startedAt: new Date().toISOString(),
+    }));
+
+    const available = await ensureOpenCodeModelConfiguredAndAvailable({
+      cliVersion: "2.2.4",
+      model: "openai/gpt-5",
+    });
+    expect(available.map((entry) => entry.id)).toEqual(["anthropic/claude-sonnet-4-5", "openai/gpt-5"]);
+
+    // A model absent from the same non-empty catalog is rejected, not passed through.
+    resetOpenCodeModelsCacheForTests();
+    await expect(
+      ensureOpenCodeModelConfiguredAndAvailable({
+        cliVersion: "2.2.4",
+        model: "openai/not-in-catalog",
+      }),
+    ).rejects.toThrow("Configured OpenCode model is unavailable: openai/not-in-catalog");
+    expect(spy.mock.calls.some((call) => (call[2] as string[])[0] === "models")).toBe(true);
+  });
+
   it("fails loudly when V2 catalog discovery fails", async () => {
     vi.useFakeTimers();
     vi.spyOn(serverUtils, "runChildProcess").mockResolvedValue({

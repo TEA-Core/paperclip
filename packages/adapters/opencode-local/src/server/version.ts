@@ -19,7 +19,9 @@ export function parseOpenCodeCliVersion(value: string): OpenCodeCliVersion | nul
 
 // The single V2 rule: a CLI version string (configured or detected) is V2 when
 // its major version is 2. Argv shape, runtime config, MCP projection and model
-// discovery all key off this; OPENCODE_V2_CLI_VERSION only gates acceptance.
+// discovery all key off this; OPENCODE_V2_CLI_VERSION only gates acceptance of a
+// version that is known. A version that cannot be determined (probe failed, timed
+// out, or empty or unparseable output) is not V2 here, so callers treat it as V1.
 export function isOpenCodeV2CliVersion(version: string | null | undefined): boolean {
   return typeof version === "string" && parseOpenCodeCliVersion(version)?.major === 2;
 }

@@ -232,6 +232,9 @@ export async function testEnvironment(
             timeoutSec: 10,
             graceSec: 3,
           });
+          // Only a detected 2.x version other than the pin is refused. A version
+          // that cannot be determined (probe failed, timed out, or empty or
+          // unparseable output) leaves cliVersion empty and is treated as V1.
           cliVersion = detected?.version ?? "";
           if (isOpenCodeV2CliVersion(cliVersion) && cliVersion !== OPENCODE_V2_CLI_VERSION) {
             checks.push({

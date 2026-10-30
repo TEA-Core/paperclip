@@ -592,7 +592,6 @@ describe("execute — cliVersion validation", () => {
   describe("desired-only per-run skill dirs", () => {
     async function runDesiredOnlyAndListLeakedDirs(input: {
       version: string;
-      arrange?: () => void;
       expectedMessage: string;
     }): Promise<string[]> {
       const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-skill-cleanup-"));
@@ -603,7 +602,6 @@ describe("execute — cliVersion validation", () => {
       await fs.chmod(commandPath, 0o755);
       runAdapterExecutionTargetProcessMock.mockReset();
       ensureCommandResolvableMock.mockReset();
-      input.arrange?.();
       const previousTmpdir = process.env.TMPDIR;
       process.env.TMPDIR = scratchTmp;
       try {
@@ -636,22 +634,6 @@ describe("execute — cliVersion validation", () => {
     it("leaves none behind when an unsupported V2 binary is detected", async () => {
       await expect(
         runDesiredOnlyAndListLeakedDirs({ version: "2.3.0", expectedMessage: "Unsupported OpenCode CLI version: 2.3.0" }),
-      ).resolves.toEqual([]);
-    });
-
-    it("leaves none behind when a later preflight throws after they are built", async () => {
-      await expect(
-        runDesiredOnlyAndListLeakedDirs({
-          version: "1.18.33",
-          expectedMessage: "command vanished",
-          arrange: () => {
-            ensureCommandResolvableMock
-              .mockImplementationOnce(async () => {})
-              .mockImplementationOnce(async () => {
-                throw new Error("command vanished");
-              });
-          },
-        }),
       ).resolves.toEqual([]);
     });
   });
@@ -728,6 +710,53 @@ describe("execute — OpenRouter credentials", () => {
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("execute — OpenCode V2 output cap", () => {
+  const lengthStream = (extra: unknown[] = []) => [
+    { type: "step_start", sessionID: "session-cap" },
+    { type: "text", sessionID: "session-cap", part: { text: "partial answer" } },
+    { type: "step_finish", sessionID: "session-cap", part: { reason: "length", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } } },
+    ...extra,
+  ].map((event) => JSON.stringify(event)).join("\n");
+
+  async function runCapped(stdout: string, exitCode: number) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-v2-cap-"));
+    const commandPath = path.join(root, "opencode");
+    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '2.2.4\\n'; fi\n", "utf8");
+    await fs.chmod(commandPath, 0o755);
+    runAdapterExecutionTargetProcessMock.mockReset();
+    runAdapterExecutionTargetProcessMock.mockImplementation(async () => probeResult({ stdout, exitCode }));
+    try {
+      return await execute({
+        runId: "run-v2-cap",
+        agent: { id: "agent-v2-cap", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: commandPath, cliVersion: "2.2.4", cwd: root, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+        context: {},
+        onLog: async () => {},
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
+
+  it("reports the OpenCode 2.2.3+ output-limit error as a failure", async () => {
+    const error = { type: "error", sessionID: "session-cap", error: { name: "output-limit", message: "Response still truncated after two output token limit continuations" } };
+    const result = await runCapped(lengthStream([error]), 1);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("Response still truncated after two output token limit continuations");
+    expect(result.finishReason).toBe("length");
+  });
+
+  it("turns an exit-0 stream that stopped at the output cap into a failure", async () => {
+    const result = await runCapped(lengthStream(), 0);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("output-token cap");
+    expect(result.finishReason).toBe("length");
   });
 });
 

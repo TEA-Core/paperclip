@@ -274,13 +274,14 @@ const suite = describe.skipIf(!enabled || !binary)("OpenCode V2 real-binary acce
       },
     }));
     expect(result.timedOut).toBe(false);
-    expect(result.exitCode).not.toBe(0);
+    expect(result.exitCode).toBe(1);
     expect(result.finishReason).toBe("length");
-    expect(result.errorMessage).toEqual(expect.any(String));
-    expect(result.errorMessage).not.toBe("");
+    expect(result.errorMessage).toEqual(expect.stringMatching(/output token limit|output-token cap/i));
     // OpenCode 2.2.3+ names the cap itself, so the failure is not only the
     // adapter's own reading of a `length` finish reason.
-    expect(String(result.resultJson?.stdout ?? "")).toContain("output-limit");
+    const stdout = String(result.resultJson?.stdout ?? "");
+    expect(stdout).toContain("output-limit");
+    expect(stdout).toContain('"type":"error"');
   }, 90_000);
 
   it("rejects an invalid model before launching the real binary", async () => {
