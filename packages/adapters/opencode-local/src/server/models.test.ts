@@ -102,13 +102,13 @@ describe("openCode models", () => {
       exitCode: 0,
       signal: null,
       timedOut: false,
-      stdout: "opencode 2.0.26\n",
+      stdout: "opencode 2.2.4\n",
       stderr: "",
       pid: 1,
       startedAt: new Date().toISOString(),
     });
 
-    await expect(verifyOpenCodeCliVersion({ cliVersion: "2.0.26" })).resolves.toBeUndefined();
+    await expect(verifyOpenCodeCliVersion({ cliVersion: "2.2.4" })).resolves.toBeUndefined();
     expect(spy.mock.calls[0]?.[2]).toEqual(["--version"]);
   });
 
@@ -123,7 +123,7 @@ describe("openCode models", () => {
       startedAt: new Date().toISOString(),
     });
 
-    await expect(verifyOpenCodeCliVersion({ cliVersion: "2.0.26" })).rejects.toThrow(
+    await expect(verifyOpenCodeCliVersion({ cliVersion: "2.2.4" })).rejects.toThrow(
       "OpenCode CLI version mismatch",
     );
   });
@@ -133,13 +133,13 @@ describe("openCode models", () => {
       exitCode: 0,
       signal: null,
       timedOut: false,
-      stdout: "v2.0.26\n",
+      stdout: "v2.2.4\n",
       stderr: "",
       pid: 1,
       startedAt: new Date().toISOString(),
     });
 
-    await expect(verifyOpenCodeCliVersion({ cliVersion: "2.0.26" })).resolves.toBeUndefined();
+    await expect(verifyOpenCodeCliVersion({ cliVersion: "2.2.4" })).resolves.toBeUndefined();
   });
 
   it("rejects a failed V2 version probe", async () => {
@@ -153,7 +153,7 @@ describe("openCode models", () => {
       startedAt: new Date().toISOString(),
     });
 
-    await expect(verifyOpenCodeCliVersion({ cliVersion: "2.0.26" })).rejects.toThrow(
+    await expect(verifyOpenCodeCliVersion({ cliVersion: "2.2.4" })).rejects.toThrow(
       "OpenCode CLI version probe failed",
     );
   });
@@ -163,13 +163,13 @@ describe("openCode models", () => {
       exitCode: 0,
       signal: null,
       timedOut: false,
-      stdout: args[0] === "--version" ? "opencode 2.0.26\n" : "openai/gpt-5\n",
+      stdout: args[0] === "--version" ? "opencode 2.2.4\n" : "openai/gpt-5\n",
       stderr: "",
       pid: 1,
       startedAt: new Date().toISOString(),
     }));
 
-    await expect(discoverOpenCodeModels({ cliVersion: "2.0.26" })).resolves.toEqual([
+    await expect(discoverOpenCodeModels({ cliVersion: "2.2.4" })).resolves.toEqual([
       { id: "openai/gpt-5", label: "openai/gpt-5" },
     ]);
     expect(spy.mock.calls[0]?.[2]).toEqual(["--version"]);
@@ -187,7 +187,7 @@ describe("openCode models", () => {
       exitCode: 0,
       signal: null,
       timedOut: false,
-      stdout: args[0] === "--version" ? "opencode 2.0.26\n" : "",
+      stdout: args[0] === "--version" ? "opencode 2.2.4\n" : "",
       stderr: "",
       pid: 1,
       startedAt: new Date().toISOString(),
@@ -195,7 +195,7 @@ describe("openCode models", () => {
 
     await expect(
       ensureOpenCodeModelConfiguredAndAvailable({
-        cliVersion: "2.0.26",
+        cliVersion: "2.2.4",
         model: "openai/gpt-5",
       }),
     ).rejects.toThrow("OpenCode V2 model discovery returned no models");
@@ -214,7 +214,7 @@ describe("openCode models", () => {
     });
 
     const promise = ensureOpenCodeModelConfiguredAndAvailable({
-      cliVersion: "2.0.26",
+      cliVersion: "2.2.4",
       model: "openai/gpt-5",
     });
     const assertion = expect(promise).rejects.toThrow("OpenCode V2 model discovery failed");
