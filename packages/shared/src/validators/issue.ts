@@ -634,6 +634,20 @@ export const resolveIssueRecoveryActionSchema = z
     // left it truthful (SUP-15486, repeating SUP-13874 / SUP-14035).
     sourceIssueStatus: z.enum(ISSUE_STATUSES),
     resolutionNote: multilineTextSchema.optional().nullable(),
+    // SUP-21910: the resolve door can land a card on `done` (owner_completed),
+    // so it accepts the same structured done-tier declaration the PATCH close
+    // door accepts. The route renders it into the resolution note and runs the
+    // shared done-transition guard on it before writing the terminal status.
+    doneTier: z.lazy(() => doneTierDeclarationSchema).nullish(),
+    // SUP-21910: same sanctioned no-deliverable-head escape hatch the PATCH
+    // close door accepts, so a board operator can still land a done restore on
+    // a card with no deliverable head once the shared guard governs this door.
+    doneTransitionOverride: z
+      .object({
+        disposition: z.string().min(1),
+        reason: z.string().optional(),
+      })
+      .nullish(),
   })
   .strict()
   .superRefine((value, ctx) => {

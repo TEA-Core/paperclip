@@ -3917,6 +3917,29 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       coderId,
       managerId,
     });
+    // SUP-21910: the recovery done door now runs the shared done-transition
+    // guard. Backfill a durable approved decision for the seeded review stage
+    // (the SUP-14912 recovered-approval shape) so the ladder is satisfied, and
+    // let the resolve body below waive the no-deliverable head check.
+    const [seededIssue] = await db
+      .select({ executionPolicy: issues.executionPolicy })
+      .from(issues)
+      .where(eq(issues.id, sourceIssueId));
+    const seededStageId = (
+      (seededIssue?.executionPolicy as { stages?: Array<{ id: string }> } | null)
+        ?.stages ?? []
+    )[0]?.id;
+    const { issueExecutionDecisions } = await import("@paperclipai/db");
+    await db.insert(issueExecutionDecisions).values({
+      companyId,
+      issueId: sourceIssueId,
+      stageId: seededStageId!,
+      stageType: "review",
+      actorAgentId: managerId,
+      outcome: "approved",
+      body: "Approved earlier; the run failed after approval.",
+      createdAt: new Date(),
+    });
     const executionStageWakeupEnqueue = vi.fn(async () => ({ id: randomUUID() } as never));
     const app = createApp(
       { type: "board", source: "local_implicit", userId: "board-user" },
@@ -3930,6 +3953,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         outcome: "restored",
         sourceIssueStatus: "done",
         resolutionNote: "Operator confirmed the source issue is complete.",
+        // SUP-21910: the recovery done door now runs the shared done-transition
+        // guard. This seeded card has no deliverable head, so a board restore
+        // uses the same sanctioned override the PATCH close door accepts.
+        doneTransitionOverride: {
+          disposition: "upstream-equivalent-fix-no-deliverable-head",
+          reason: "Operator-confirmed completion with no deliverable head.",
+        },
       })
       .expect(200);
 
@@ -4298,7 +4328,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         actionId: action.id,
         outcome: "restored",
         sourceIssueStatus: "done",
-        resolutionNote: "Owner confirmed the source issue is complete.",
+        // SUP-21910: an agent landing a card on `done` through the recovery
+        // door must carry a done-tier declaration, exactly like PATCH.
+        resolutionNote:
+          "Owner confirmed the source issue is complete.\nClosed at Tier 2 (live): probed the delivered branch head; tests and lint pass on it.",
       })
       .expect(200);
 
@@ -4306,7 +4339,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       id: action.id,
       status: "resolved",
       outcome: "owner_completed",
-      resolutionNote: "Owner confirmed the source issue is complete.",
+      resolutionNote:
+        "Owner confirmed the source issue is complete.\nClosed at Tier 2 (live): probed the delivered branch head; tests and lint pass on it.",
     });
 
     const dependencyWakes = wakeCalls.filter(
