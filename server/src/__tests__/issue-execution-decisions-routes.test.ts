@@ -667,8 +667,11 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(fixture.writes).toEqual([]);
   });
 
-  it("refuses an accepted override when the card moves after its final-delivery snapshot", async () => {
+  it("refuses a deferred accepted override when the delivery binding moves after its final-delivery snapshot", async () => {
     const fixture = await pendingDelivery({ holdPull: true, mergeArmingEnabled: true });
+    const authorId = (await fixture.read()).createdByAgentId!;
+    await db.update(issues).set({ assigneeAgentId: authorId, assigneeUserId: null })
+      .where(eq(issues.id, fixture.issue.id));
     const approval = fixture.approve({
       doneTransitionOverride: {
         disposition: "merged-elsewhere",
@@ -676,8 +679,8 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       },
     }).then((response) => response);
     const response = await raceAtDecisionTransaction(fixture, approval, async () => {
-      await db.update(issues).set({ updatedAt: new Date(Date.now() + 60_000) })
-        .where(eq(issues.id, fixture.issue.id));
+      await db.update(executionWorkspaces).set({ branchName: "SUP-1-rebound-delivery" })
+        .where(eq(executionWorkspaces.id, (await fixture.read()).executionWorkspaceId!));
     });
 
     expect(response.status).toBe(409);
