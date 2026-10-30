@@ -534,10 +534,22 @@ async function fetchPullRequestReviewDecision(
   }
 }
 
+/**
+ * Hydration result carries an explicit success flag. Callers must not infer
+ * hydration success from object identity — every unresolvable outcome returns a
+ * fresh object with the live-only fields cleared (SUP-21856) — nor from
+ * `baseRefName` alone, which is also null on a successful lookup that omitted
+ * `base.ref`.
+ */
+type HydratedLinkedPr = {
+  pr: LinkedPullRequest;
+  hydrated: boolean;
+};
+
 async function hydrateLinkedPrState(
   pr: LinkedPullRequest,
   token: string,
-): Promise<LinkedPullRequest> {
+): Promise<HydratedLinkedPr> {
   const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}/pulls/${pr.number}`;
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
@@ -545,13 +557,14 @@ async function hydrateLinkedPrState(
     "x-github-api-version": "2022-11-28",
     authorization: `Bearer ${token}`,
   };
+  const stale = (): HydratedLinkedPr => ({ pr: { ...pr, baseRefName: null }, hydrated: false });
   try {
     const response = await ghFetch(url, { headers });
     if (!response.ok) {
-      return pr;
+      return stale();
     }
     const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
-    if (!body) return pr;
+    if (!body) return stale();
     const state = body.state as string | undefined;
     if (typeof state === "string") {
       // The live call just succeeded: the persisted refresh error code (if any)
@@ -566,20 +579,23 @@ async function hydrateLinkedPrState(
       const headRepoFullName = typeof headRepo?.full_name === "string" ? headRepo.full_name : null;
       const base = body.base as Record<string, unknown> | null | undefined;
       return {
-        ...pr,
-        cachedState: state,
-        lastErrorCode: null,
-        reviewDecision,
-        draft: typeof body.draft === "boolean" ? body.draft : pr.draft,
-        headRefName: typeof head?.ref === "string" ? head.ref : null,
-        title: typeof body.title === "string" ? body.title : null,
-        headRepoFullName,
-        baseRefName: typeof base?.ref === "string" ? base.ref : null,
+        hydrated: true,
+        pr: {
+          ...pr,
+          cachedState: state,
+          lastErrorCode: null,
+          reviewDecision,
+          draft: typeof body.draft === "boolean" ? body.draft : pr.draft,
+          headRefName: typeof head?.ref === "string" ? head.ref : null,
+          title: typeof body.title === "string" ? body.title : null,
+          headRepoFullName,
+          baseRefName: typeof base?.ref === "string" ? base.ref : null,
+        },
       };
     }
-    return pr;
+    return stale();
   } catch {
-    return pr;
+    return stale();
   }
 }
 
@@ -821,9 +837,19 @@ async function proveLandingDelegated(
   try {
     const candidates = await resolveGitHubTokenCandidatesForRepo(db, issue.companyId, pr.owner, pr.repo);
     for (const candidate of candidates) {
-      const live = await hydrateLinkedPrState(pr, candidate.token);
-      const probePr = live !== pr ? live : pr;
-      if (live !== pr && live.cachedState === "open" && live.draft && (await loadOwnDraftPredicate(db, issue, [live]))(live)) {
+      const hydration = await hydrateLinkedPrState(pr, candidate.token);
+      const live = hydration.pr;
+      // A refusal must rest on live proof, never on a cached row: an unresolved
+      // hydration degrades to the cached state, and failing closed on a provider
+      // outage is the `stale_open_unverifiable` deadlock this file refuses to
+      // create (SUP-21856). `hydrated` is the only hydration-success signal —
+      // object identity is not one, since failures return a fresh object.
+      if (
+        hydration.hydrated &&
+        live.cachedState === "open" &&
+        live.draft &&
+        (await loadOwnDraftPredicate(db, issue, [live]))(live)
+      ) {
         return refuseTier1(
           `head_draft: linked PR #${number} is an open draft; promote it out of draft before closing this card done.`,
         );
@@ -853,9 +879,9 @@ async function proveLandingDelegated(
           const escapeGraphqlString = (value: string) =>
             value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
           let queueCarrier: "queued" | "configured" | "none" | "unknown" = "unknown";
-          if (live !== pr && probePr.baseRefName) {
+          if (hydration.hydrated && live.baseRefName) {
             const queueResponse = await queueGraphql(
-              `query { repository(owner: "${escapeGraphqlString(pr.owner)}", name: "${escapeGraphqlString(pr.repo)}") { mergeQueue(branch: "${escapeGraphqlString(probePr.baseRefName)}") { configuration { mergeMethod } } } }`,
+              `query { repository(owner: "${escapeGraphqlString(pr.owner)}", name: "${escapeGraphqlString(pr.repo)}") { mergeQueue(branch: "${escapeGraphqlString(live.baseRefName)}") { configuration { mergeMethod } } } }`,
             );
             if (queueResponse.ok) {
               const payload = (await queueResponse.json().catch(() => null)) as {
@@ -2469,7 +2495,7 @@ async function evaluateDoneTransitionGuardCore(
       const toHydrate = resolvedPrs.filter((p) => p.cachedState === null || p.cachedState === "open");
       if (toHydrate.length > 0) {
         const hydrated = await Promise.all(
-          toHydrate.map((p) => hydrateLinkedPrState(p, tokenResult.token)),
+          toHydrate.map(async (p) => (await hydrateLinkedPrState(p, tokenResult.token)).pr),
         );
         const hydratedMap = new Map(hydrated.map((p) => [p.id, p] as const));
         resolvedPrs = resolvedPrs.map((p) => hydratedMap.get(p.id) ?? p);
