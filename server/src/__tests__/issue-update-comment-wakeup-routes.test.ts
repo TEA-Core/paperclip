@@ -335,7 +335,7 @@ describe("issue update comment wakeups", () => {
 
     expect(res.status).toBe(200);
     expect(mockIssueService.addComment).toHaveBeenCalledWith(existing.id, "write the whole thing", expect.anything(),
-      expect.objectContaining({ clientRequestId: "55555555-5555-4555-8555-555555555555" }));
+      expect.objectContaining({ clientRequestId: "55555555-5555-4555-8555-555555555555" }), expect.anything());
     // The route dispatches the wake after it sends the response, so wait for
     // the fire-and-forget dispatch to settle. This keeps the wake inside this
     // test and stops it from leaking into the next test as an extra call.

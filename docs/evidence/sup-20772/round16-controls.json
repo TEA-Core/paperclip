@@ -1,0 +1,627 @@
+{
+ "measuredAt": "2026-10-27",
+ "previousHead": {
+  "previous head e02a09ee": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 8,
+    "passed": 25,
+    "failedNames": [
+     "403: the gate written before the arm is the newest status, the real enforcer refuses the head, and the card is blocked",
+     "422: the gate written before the arm is the newest status, the real enforcer refuses the head, and the card is blocked",
+     "503: the gate written before the arm is the newest status, the real enforcer refuses the head, and the card is blocked",
+     "a request that never answers: the gate written before the arm is the newest status, the real enforcer refuses the head, and the card is blocked",
+     "opens the gate again on recovery: a confirmed disable closes it, the record goes, the enforcer passes",
+     "an arm that stands with its authority closes the gate; if the closing write is refused the record stays and the sweep closes it",
+     "arms nothing when the gate cannot be written before the enable, and closes it later",
+     "a process that dies after the gate was written leaves it open: the sweep takes the arm back, then closes the gate"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 2,
+    "passed": 3,
+    "failedNames": [
+     "standard release: refused with 409 while an auto-merge take-back is unconfirmed on the card, and published once it is cleared",
+     "override release: refused with 409 while an auto-merge take-back is unconfirmed on the card, and published once it is cleared"
+    ]
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 9,
+    "passed": 6,
+    "failedNames": [
+     "switch off: a stamped head whose newest arm gate is open is refused",
+     "switch off: a pending arm gate is not a success either",
+     "switch off: an arm gate written by anyone else is ignored, in either direction",
+     "switch off: an open arm gate refuses a waiver as well (a card-bound head with the waiver line honoured, and a cardless one)",
+     "switch on: a stamped head whose newest arm gate is open is refused",
+     "switch on: a pending arm gate is not a success either",
+     "switch on: an arm gate written by anyone else is ignored, in either direction",
+     "switch on: an open arm gate refuses a waiver as well (a card-bound head with the waiver line honoured, and a cardless one)",
+     "the pull_request leg stays advisory: an open arm gate is reported and the job is green"
+    ]
+   }
+  ]
+ },
+ "mutants": {
+  "M9 no admission lock (cap raced by concurrent admissions)": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 2,
+    "passed": 31,
+    "failedNames": [
+     "holds the cap under concurrent admissions and a default sweep tries every record at it",
+     "takes the admission lock: an arm waits behind a holder of it, writes nothing until it is released, and then arms"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "M11 escalation deadline never reached": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 3,
+    "passed": 30,
+    "failedNames": [
+     "is escalated once past the deadline, by the sweep, and no control-plane arm gets through meanwhile",
+     "refuses every arm past the deadline with no sweep having run at all, and is cleared by a confirmed disable",
+     "waits for the escalation deadline before fencing an arm that was only left in flight, then fences and alerts"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "M12 enable request has no deadline": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 2,
+    "passed": 31,
+    "failedNames": [
+     "gives up on an enable request that never answers at the default deadline, aborts it, keeps the record and holds no lock",
+     "applies its default deadline when no option is given"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "M13 a timed-out enable drops the record": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 2,
+    "passed": 31,
+    "failedNames": [
+     "keeps the record when the enable call timed out: the arm may be in force",
+     "gives up on an enable request that never answers at the default deadline, aborts it, keeps the record and holds no lock"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "M14 sweep takes a limited number of records by default": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 2,
+    "passed": 31,
+    "failedNames": [
+     "holds the cap under concurrent admissions and a default sweep tries every record at it",
+     "tries every record in a default sweep, including ones above the admission cap"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "M15 an escalated record does not refuse the arm with its own answer": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 2,
+    "passed": 31,
+    "failedNames": [
+     "is escalated once past the deadline, by the sweep, and no control-plane arm gets through meanwhile",
+     "refuses every arm past the deadline with no sweep having run at all, and is cleared by a confirmed disable"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "M20 a statement or lock timeout before the deadline answers 500": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 0,
+    "passed": 33,
+    "failedNames": []
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 2,
+    "passed": 3,
+    "failedNames": [
+     "answers 409, not 500, when a statement timeout cuts off the request's first write before its own deadline",
+     "answers 409, not 500, when a lock timeout cuts off the request's first write before its own deadline"
+    ]
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "M10 settle clears an in-flight record whose authority is unchanged instead of taking the arm back": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 6,
+    "passed": 27,
+    "failedNames": [
+     "keeps the record when GitHub gives no answer, and the sweep takes the arm back when the authority still holds",
+     "takes back an arm a previous process left in flight whatever the authority is now, and leaves a young record alone",
+     "holds the cap under concurrent admissions and a default sweep tries every record at it",
+     "waits for the escalation deadline before fencing an arm that was only left in flight, then fences and alerts",
+     "a process that dies after the gate was written leaves it open: the sweep takes the arm back, then closes the gate",
+     "tries every record in a default sweep, including ones above the admission cap"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "M16 the sweep never fences the head": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 7,
+    "passed": 26,
+    "failedNames": [
+     "403: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "422: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "503: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "a request that never answers: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "keeps trying the fence every round while the status route refuses too, and says so",
+     "reads the live head when the record has none",
+     "waits for the escalation deadline before fencing an arm that was only left in flight, then fences and alerts"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "M17 the arming process does not fence inline": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 2,
+    "passed": 31,
+    "failedNames": [
+     "fences inline, in the arming process, when the take-back right after a revoked arm is refused (no sweep, no scheduler)",
+     "says when the inline fence could not be written either"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "M18 an arm only left in flight is fenced at once, before the escalation deadline": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 1,
+    "passed": 32,
+    "failedNames": [
+     "waits for the escalation deadline before fencing an arm that was only left in flight, then fences and alerts"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "M19 the status route fence writes a success instead of a failure": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 5,
+    "passed": 28,
+    "failedNames": [
+     "403: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "422: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "503: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "a request that never answers: keeps the record, sets the head's paperclip/approved to failure once, and clears when GitHub recovers",
+     "fences inline, in the arming process, when the take-back right after a revoked arm is refused (no sweep, no scheduler)"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "N3 enforcer: a waiver is not checked against the arm gate": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 0,
+    "passed": 33,
+    "failedNames": []
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 2,
+    "passed": 13,
+    "failedNames": [
+     "switch off: an open arm gate refuses a waiver as well (a card-bound head with the waiver line honoured, and a cardless one)",
+     "switch on: an open arm gate refuses a waiver as well (a card-bound head with the waiver line honoured, and a cardless one)"
+    ]
+   }
+  ],
+  "N4 card block: a release is not refused while a take-back is unconfirmed": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 0,
+    "passed": 33,
+    "failedNames": []
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 2,
+    "passed": 3,
+    "failedNames": [
+     "standard release: refused with 409 while an auto-merge take-back is unconfirmed on the card, and published once it is cleared",
+     "override release: refused with 409 while an auto-merge take-back is unconfirmed on the card, and published once it is cleared"
+    ]
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "N5 card block: an approval status is published while a take-back is unconfirmed": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 4,
+    "passed": 29,
+    "failedNames": [
+     "403: the gate written before the arm is the newest status, the real enforcer refuses the head, and the card is blocked",
+     "422: the gate written before the arm is the newest status, the real enforcer refuses the head, and the card is blocked",
+     "503: the gate written before the arm is the newest status, the real enforcer refuses the head, and the card is blocked",
+     "a request that never answers: the gate written before the arm is the newest status, the real enforcer refuses the head, and the card is blocked"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "N6 write-ahead: the arm gate is not written before the enable": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 6,
+    "passed": 27,
+    "failedNames": [
+     "403: the gate written before the arm is the newest status, the real enforcer refuses the head, and the card is blocked",
+     "422: the gate written before the arm is the newest status, the real enforcer refuses the head, and the card is blocked",
+     "503: the gate written before the arm is the newest status, the real enforcer refuses the head, and the card is blocked",
+     "a request that never answers: the gate written before the arm is the newest status, the real enforcer refuses the head, and the card is blocked",
+     "an arm that stands with its authority closes the gate; if the closing write is refused the record stays and the sweep closes it",
+     "arms nothing when the gate cannot be written before the enable, and closes it later"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "N7 an arm that stands does not close the gate": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 1,
+    "passed": 32,
+    "failedNames": [
+     "an arm that stands with its authority closes the gate; if the closing write is refused the record stays and the sweep closes it"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "N8 the sweep does not retry a closing write": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 1,
+    "passed": 32,
+    "failedNames": [
+     "an arm that stands with its authority closes the gate; if the closing write is refused the record stays and the sweep closes it"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "N9 a confirmed disable does not close the gate": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 2,
+    "passed": 31,
+    "failedNames": [
+     "opens the gate again on recovery: a confirmed disable closes it, the record goes, the enforcer passes",
+     "a process that dies after the gate was written leaves it open: the sweep takes the arm back, then closes the gate"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "N10 an arm is made even when the gate could not be opened": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 1,
+    "passed": 32,
+    "failedNames": [
+     "arms nothing when the gate cannot be written before the enable, and closes it later"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 0,
+    "passed": 15,
+    "failedNames": []
+   }
+  ],
+  "N1 enforcer: an open arm gate does not refuse the head": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 5,
+    "passed": 28,
+    "failedNames": [
+     "403: the gate written before the arm is the newest status, the real enforcer refuses the head, and the card is blocked",
+     "422: the gate written before the arm is the newest status, the real enforcer refuses the head, and the card is blocked",
+     "503: the gate written before the arm is the newest status, the real enforcer refuses the head, and the card is blocked",
+     "a request that never answers: the gate written before the arm is the newest status, the real enforcer refuses the head, and the card is blocked",
+     "an arm that stands with its authority closes the gate; if the closing write is refused the record stays and the sweep closes it"
+    ]
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 7,
+    "passed": 8,
+    "failedNames": [
+     "switch off: a stamped head whose newest arm gate is open is refused",
+     "switch off: a pending arm gate is not a success either",
+     "switch off: an arm gate written by anyone else is ignored, in either direction",
+     "switch on: a stamped head whose newest arm gate is open is refused",
+     "switch on: a pending arm gate is not a success either",
+     "switch on: an arm gate written by anyone else is ignored, in either direction",
+     "the pull_request leg stays advisory: an open arm gate is reported and the job is green"
+    ]
+   }
+  ],
+  "N2 enforcer: an arm-gate status from any creator counts": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "a take-back refused over both routes|round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds|second route|tries every record in a default sweep|enable-call deadline and the admission lock|applies its default deadline",
+    "failed": 0,
+    "passed": 33,
+    "failedNames": []
+   },
+   {
+    "file": "src/__tests__/merge-arming-republish.test.ts",
+    "filter": "answers 409, not 500|take-back is unconfirmed on the card",
+    "failed": 0,
+    "passed": 5,
+    "failedNames": []
+   },
+   {
+    "file": "scripts/__tests__/paperclip-approved-arm-gate.test.mjs",
+    "failed": 2,
+    "passed": 13,
+    "failedNames": [
+     "switch off: an arm gate written by anyone else is ignored, in either direction",
+     "switch on: an arm gate written by anyone else is ignored, in either direction"
+    ]
+   }
+  ]
+ }
+}

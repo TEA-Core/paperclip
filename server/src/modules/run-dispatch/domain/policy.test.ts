@@ -45,9 +45,11 @@ function baseGateFacts(): ScheduledRetryFacts {
 function baseStalenessFacts(): QueuedRunFacts {
   return {
     runId: "run-1",
+    runStatus: "queued",
     runAgentId: "agent-1",
     issueId: "issue-1",
     retryReasonKind: "other",
+    scheduledRetryAt: null,
     issueFound: true,
     issueStatus: "in_progress",
     issueAssigneeAgentId: "agent-1",
@@ -273,6 +275,101 @@ describe("decideQueuedRunStaleness", () => {
     });
   });
 
+  it("cancels an issue-bearing queued run at the 24-hour age boundary when its retry alarm is due", () => {
+    const createdAt = new Date(NOW.getTime() - 24 * 60 * 60 * 1000);
+    expect(decideQueuedRunStaleness({
+      ...baseStalenessFacts(),
+      runCreatedAt: createdAt,
+      scheduledRetryAt: new Date(NOW.getTime() - 1),
+    }, NOW)).toMatchObject({
+      stale: true,
+      errorCode: "queued_run_expired",
+      details: { createdAt: createdAt.toISOString() },
+    });
+  });
+
+  it("keeps a younger queued run live even when its retry alarm is due", () => {
+    expect(decideQueuedRunStaleness({
+      ...baseStalenessFacts(),
+      runCreatedAt: new Date(NOW.getTime() - 24 * 60 * 60 * 1000 + 1),
+      scheduledRetryAt: new Date(NOW.getTime() - 1),
+    }, NOW)).toEqual({ stale: false });
+  });
+
+  it.each([
+    { label: "missing", scheduledRetryAt: null },
+    { label: "past", scheduledRetryAt: new Date(NOW.getTime() - 1) },
+  ])("expires a 24-hour queued run when its retry alarm is $label", ({ scheduledRetryAt }) => {
+    expect(decideQueuedRunStaleness({
+      ...baseStalenessFacts(),
+      runCreatedAt: new Date(NOW.getTime() - 24 * 60 * 60 * 1000),
+      scheduledRetryAt,
+    }, NOW)).toMatchObject({ stale: true, errorCode: "queued_run_expired" });
+  });
+
+  it("keeps a 24-hour queued run live while its retry alarm is in the future", () => {
+    expect(decideQueuedRunStaleness({
+      ...baseStalenessFacts(),
+      runCreatedAt: new Date(NOW.getTime() - 24 * 60 * 60 * 1000),
+      scheduledRetryAt: new Date(NOW.getTime() + 1),
+    }, NOW)).toEqual({ stale: false });
+  });
+
+  it.each(["execution", "checkout"] as const)("keeps an old queued run live with an active running %s lease", (lease) => {
+    expect(decideQueuedRunStaleness({
+      ...baseStalenessFacts(),
+      runCreatedAt: new Date(NOW.getTime() - 7 * 24 * 60 * 60 * 1000),
+      scheduledRetryAt: null,
+      ...(lease === "execution" ? { hasActiveExecutionLease: true } : { hasActiveCheckoutLease: true }),
+    }, NOW)).toEqual({ stale: false });
+  });
+
+  it("keeps a running run live regardless of age", () => {
+    expect(decideQueuedRunStaleness({
+      ...baseStalenessFacts(),
+      runStatus: "running",
+      runCreatedAt: new Date(NOW.getTime() - 7 * 24 * 60 * 60 * 1000),
+      scheduledRetryAt: null,
+    }, NOW)).toEqual({ stale: false });
+  });
+
+  it("cancels a queued run with only its own non-running lock pointers", () => {
+    expect(decideQueuedRunStaleness({
+      ...baseStalenessFacts(),
+      runCreatedAt: new Date(NOW.getTime() - 7 * 24 * 60 * 60 * 1000),
+      scheduledRetryAt: null,
+      issueExecutionRunId: "run-1",
+      issueCheckoutRunId: "run-1",
+    }, NOW)).toMatchObject({ stale: true, errorCode: "queued_run_expired" });
+  });
+
+  it("cancels a queued run created before an armed worktree cutoff", () => {
+    const cutoff = new Date("2026-10-26T12:00:00.000Z");
+    const decision = decideQueuedRunStaleness(
+      {
+        ...baseStalenessFacts(),
+        runCreatedAt: new Date(cutoff.getTime() - 1_000),
+        worktreeExecutionCutoff: cutoff,
+      },
+      NOW,
+    );
+    expect(decision).toMatchObject({
+      stale: true,
+      errorCode: "execution_reconciliation_required",
+      details: { createdAt: "2026-10-26T11:59:59.000Z", cutoff: cutoff.toISOString() },
+    });
+  });
+
+  it("leaves a queued run created at or after an armed worktree cutoff", () => {
+    const cutoff = new Date("2026-10-26T12:00:00.000Z");
+    expect(
+      decideQueuedRunStaleness(
+        { ...baseStalenessFacts(), runCreatedAt: cutoff, worktreeExecutionCutoff: cutoff },
+        NOW,
+      ),
+    ).toEqual({ stale: false });
+  });
+
   it.each([
     {
       name: "issue_not_found",
@@ -489,14 +586,15 @@ describe("native replacement execution authority", () => {
 
 
 describe("AI subscription wait ownership", () => {
-  it.each([null, "another-run"])("preserves assignee lock guards and admits only recorded non-assignee waits: %s", (issueExecutionRunId) => {
+  it.each([null, "another-run"])("requires predecessor ownership before scheduling but not after promotion: %s", (issueExecutionRunId) => {
     const gate = {
       ...baseGateFacts(), retryReasonKind: "ai_connection_wait" as const,
       enforceIssueExecutionLock: true, issueExecutionRunId,
     };
     const queued = { ...baseStalenessFacts(), retryReasonKind: "ai_connection_wait" as const, issueExecutionRunId };
     expect(decideScheduledRetryGate(gate, NOW)).toMatchObject({ allowed: false, errorCode: "issue_execution_lock_changed" });
-    expect(decideQueuedRunStaleness(queued, NOW)).toMatchObject({ stale: true, errorCode: "issue_execution_lock_changed" });
+    expect(decideScheduledRetryGate({ ...gate, retryIsAlreadyScheduled: true, issueExecutionRunId: null }, NOW)).toEqual({ allowed: true });
+    expect(decideQueuedRunStaleness(queued, NOW)).toEqual({ stale: false });
     const nonAssignee = { issueAssigneeAgentId: "another-agent", isNonAssigneeWorkspaceBusyRetry: true };
     expect(decideScheduledRetryGate({ ...gate, ...nonAssignee }, NOW)).toEqual({ allowed: true });
     expect(decideQueuedRunStaleness({ ...queued, ...nonAssignee }, NOW)).toEqual({ stale: false });

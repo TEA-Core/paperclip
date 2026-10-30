@@ -1,5 +1,6 @@
 import { hasNativeLocalProcessStop } from "../native-local-process-stop.js";
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rename, rm } from "node:fs/promises";
@@ -7,7 +8,7 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   agents,
   companies,
@@ -35,6 +36,7 @@ import {
 } from "../../realtime/runner-prp-ws.js";
 import { readProcessStartedAt } from "../hot-restart.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
+import { logger } from "../../middleware/logger.js";
 
 const mockCaptureRunFailure = vi.hoisted(() => vi.fn());
 vi.mock("../../sentry.js", async () => {
@@ -913,6 +915,132 @@ describeEmbeddedPostgres("native runner restart recovery with real processes", (
       await stopOwnedProcessGroup(pid, stateDirectory).catch(() => undefined);
     }
   });
+
+  it("retries a run-row lock timeout rather than failing the restart recovery pass", async () => {
+    const fixture = await seedRun("LOCK-RETRY");
+    let signalLocked!: (pid: number) => void;
+    let releaseRun!: () => void;
+    const locked = new Promise<number>((resolve) => { signalLocked = resolve; });
+    const release = new Promise<void>((resolve) => { releaseRun = resolve; });
+    const holder = fixture.db.transaction(async (tx) => {
+      const [connection] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid()::int as pid`);
+      await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, fixture.runId)).for("update");
+      signalLocked(connection!.pid);
+      await release;
+    });
+    const holderPid = await locked;
+    const recovering = claimNativeRestartRecoveries({
+      db: fixture.db, controller: successor, restartKind: "hard", runIds: [fixture.runId],
+    });
+    let waitedForRun = false;
+    try {
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        const [row] = await fixture.db.execute<{ waiting: boolean }>(sql`
+          select exists (
+            select 1 from pg_stat_activity
+            where datname = current_database() and pid <> pg_backend_pid()
+              and ${holderPid} = any(pg_blocking_pids(pid))
+          ) as waiting
+        `);
+        if (row?.waiting) { waitedForRun = true; break; }
+        await delay(25);
+      }
+      // The first 1s lock budget expires while the holder is still active.
+      if (waitedForRun) await delay(1100);
+    } finally {
+      releaseRun();
+      await holder;
+    }
+    expect(waitedForRun).toBe(true);
+    expect(await recovering).toMatchObject([
+      { kind: "bootstrap_incomplete", runId: fixture.runId },
+    ]);
+  }, 20_000);
+
+  it("defers twenty 900 ms delayed recovery attempts without a rethrow", async () => {
+    const fixture = await seedRun("LOCK-DEFER");
+    let signalLocked!: () => void;
+    let releaseRun!: () => void;
+    const locked = new Promise<void>((resolve) => { signalLocked = resolve; });
+    const release = new Promise<void>((resolve) => { releaseRun = resolve; });
+    const holder = fixture.db.transaction(async (tx) => {
+      await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, fixture.runId)).for("update");
+      signalLocked();
+      await release;
+    });
+    await locked;
+    const warnings = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    try {
+      const failures: unknown[] = [];
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        await delay(900);
+        try {
+          expect(await claimNativeRestartRecoveries({
+            db: fixture.db, controller: successor, restartKind: "hard", runIds: [fixture.runId],
+          })).toEqual([{
+            kind: "deferred_lock_conflict",
+            runId: fixture.runId,
+            reason: "native_restart_recovery_lock_conflict",
+          }]);
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      expect(failures).toEqual([]);
+      expect(warnings).toHaveBeenCalledTimes(20);
+    } finally {
+      warnings.mockRestore();
+      releaseRun();
+      await holder;
+    }
+    expect(await claimNativeRestartRecoveries({
+      db: fixture.db, controller: successor, restartKind: "hard", runIds: [fixture.runId],
+    })).toMatchObject([{ kind: "bootstrap_incomplete", runId: fixture.runId }]);
+  }, 90_000);
+
+  it("observes a real PostgreSQL 40P01 when issue and run row locks invert", async () => {
+    const fixture = await seedRun("DEADLOCK");
+    let signalRun!: () => void;
+    let signalIssue!: () => void;
+    const runLocked = new Promise<void>((resolve) => { signalRun = resolve; });
+    const issueLocked = new Promise<void>((resolve) => { signalIssue = resolve; });
+    const runFirst = fixture.db.transaction(async (tx) => {
+      await tx.execute(sql`set local deadlock_timeout = '50ms'`);
+      await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, fixture.runId)).for("update");
+      signalRun();
+      await issueLocked;
+      await tx.select({ id: issues.id }).from(issues)
+        .where(eq(issues.id, fixture.issueId)).for("update");
+    });
+    const issueFirst = fixture.db.transaction(async (tx) => {
+      await tx.execute(sql`set local deadlock_timeout = '50ms'`);
+      await tx.select({ id: issues.id }).from(issues)
+        .where(eq(issues.id, fixture.issueId)).for("update");
+      signalIssue();
+      await runLocked;
+      await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, fixture.runId)).for("update");
+    });
+    const outcomes = await Promise.allSettled([runFirst, issueFirst]);
+    const errors = outcomes.flatMap((outcome) =>
+      outcome.status === "rejected" ? [outcome.reason as unknown] : []);
+    const codes = errors.map((error) => {
+      let cause = error;
+      for (let depth = 0; depth < 8 && cause && typeof cause === "object"; depth += 1) {
+        if ("code" in cause && typeof cause.code === "string") return cause.code;
+        cause = "cause" in cause ? cause.cause : null;
+      }
+      return null;
+    });
+    expect(codes).toEqual(["40P01"]);
+    expect(await fixture.db.select({ assignee: issues.assigneeAgentId }).from(issues)
+      .where(eq(issues.id, fixture.issueId))).toEqual([{ assignee: agentId }]);
+    expect(await fixture.db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, fixture.runId))).toEqual([{ status: "running" }]);
+  }, 20_000);
 
   it("allows only one of two concurrent successor controllers to claim a dead session", async () => {
     const fixture = await seedRun("CONCURRENT");

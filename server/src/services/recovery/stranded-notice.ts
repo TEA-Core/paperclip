@@ -263,11 +263,11 @@ const DISPATCH_SUPPRESSED_DISJUNCT_LABELS: Array<{
   { key: "successfulRunHandoffLive", label: "no live successful-run handoff" },
 ];
 
-// ADR-093 D3 (SUP-14881) — the board-visible notice posted when a persistently
-// dispatch-suppressed in_progress card is parked onto the
-// blocked_without_blockers surface. Names the failing §2a disjuncts (from the
-// D1 suppression row) and a concrete unblock action, so the board gets something
-// actionable — the defect that left SUP-14761's escalation untellable.
+export const TIMER_DISPATCH_PARK_RECOVERY_KIND = "issue_graph_liveness" as const;
+export const TIMER_DISPATCH_PARK_RECOVERY_CAUSE = "in_progress_without_live_continuation_path";
+
+// ADR-093 D3 — the notice posted alongside an assignee-owned recovery action
+// when a persistently dispatch-suppressed in_progress card is parked.
 export function buildDispatchSuppressionParkNotice(input: {
   disjuncts: ContinuationPathDisjuncts;
   identifier: string | null;
@@ -286,9 +286,8 @@ export function buildDispatchSuppressionParkNotice(input: {
     `Paperclip stopped dispatching timer runs for this${cardRef} ` +
     "`in_progress` card because no live continuation path remains. " +
     `Missing §2a disjuncts: ${disjunctSummary}. ` +
-    "The card has been parked on the blocked_without_blockers surface and will stay there until a live path returns. " +
-    "Unblock it by re-arming a monitor next check, restoring a watchdog, reassigning it to a live run, " +
-    "or recording the intended resolution.";
+    "The card has been parked with an assignee-owned recovery action until a live path returns. " +
+    "To recover, finish it, link a blocker or interaction, arm a monitor, or reassign it.";
 
   const disjunctRows: NoticeMetadataRow[] =
     failing.length > 0
@@ -301,7 +300,7 @@ export function buildDispatchSuppressionParkNotice(input: {
       : keyValueRow("Unblock owner", "Board decision required"),
     keyValueRow(
       "Next action",
-      "Restore a live continuation path (monitor next check, watchdog, live run, or recovery action), add valid blockers, or record the intended resolution",
+      "Finish the issue, link a blocker or interaction, arm a monitor, or reassign it",
     ),
   ];
 

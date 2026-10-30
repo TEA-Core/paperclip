@@ -44,18 +44,33 @@ The non-pusher approval is real; it is recorded one layer up from GitHub.
 
 ### The consume-contract (pinned)
 
-- `context: "paperclip/approved"`, `state: "success"` on the PR head.
-- Produced only by the control plane (`publishApprovalStatus`) when a card's
-  `review` stage records `approved` **and** the card has exactly one linked,
-  open PR. **Nothing in this repository may create, mock or backfill that
-  status** — a local write is a contract violation that manufactures a fake
-  approval. The enforcer is read-only (GETs only; the endpoints it calls are listed in
-  the script header).
-- Behaviour by event: `pull_request` → advisory (exit 0, green — the status
-  only exists after the review stage approves); `merge_group` → **fail-closed**
-  (missing/pending/failed/unresolvable/API-error all block the merge); `push`
-  → no-op success (never `skipped`, so the context can be required without
-  deadlocking the queue — SUP-13500).
+- On the current PR head, `paperclip/approved = success` from the control-plane
+  App remains the normal path. The alternative is
+  `release-assurance/approved = success` from the same App (creator user ID
+  `317012809`), with description `released by release-assurance for <40-hex-head>`.
+  The RA status target must be HTTPS
+  `/api/issues/<card-uuid>/release-decisions?repo=<URI-encoded-owner/repo>&pr=<number>&head=<40-hex-head>&decision=<decision-uuid>&evidence=<64-hex-digest>`.
+  The enforcer reads the latest entry in each context from the paginated
+  `/commits/<head>/statuses` list, which includes creator attribution.
+  Empty status fields are mapped to a `-` placeholder before parsing: a missing or null
+  creator cannot inherit a description or target URL as its App identity.
+  An array or object in a projected status field rejects the entire response
+  rather than being coerced into a string or bypassed as an unrelated row.
+  A present RA HOLD/NO-GO, untrusted producer, stale head or malformed target
+  blocks both approval alternatives and both cardless waivers/override.
+- The RA producer remains **shadow-only**: it records decisions and plans
+  statuses but does not write to GitHub. Its current generic planned target is
+  not an admitting RA stamp; a future publisher must emit the bound target
+  above and its separate App-pinned `release-assurance/go` veto check before
+  production enrollment can be enabled. This CI change publishes neither.
+- Normal `paperclip/approved` is produced by `publishApprovalStatus` only when
+  the card has an approved review stage and exactly one linked open PR. Nothing
+  in this CI job writes either approval context.
+- By event, `pull_request` is advisory (exit 0), `merge_group` fails closed
+  (missing/pending/failed/unresolvable/API-error block), and `push` is a no-op.
+  Both `.github/workflows/paperclip-approved.yml` and the early `Approval
+  precondition` in `.github/workflows/pr.yml` invoke the same shell script on
+  merge groups.
 - **Override label** (SUP-20897): `override:paperclip-approval` lets a person
   approve one PR when the reviewer pipeline cannot publish the stamp. See
   [Override label](#override-label-sup-20897).
@@ -269,10 +284,13 @@ gh label create "override:paperclip-approval" --repo TEA-Core/paperclip \
 ```
 
 The enforcer consults the label only when the head has no valid
-`paperclip/approved` stamp. A forged stamp still fails; the waivers
-(`Paperclip-Approved-Waiver`, `no-paperclip-card`) are checked first and are
-unchanged. The override is honored only when **all** of these hold, and the
-enforcer fails closed (merge_group exit 1, pull_request advisory) on any doubt:
+`paperclip/approved` stamp and no RA status. A forged board stamp still fails;
+the waivers (`Paperclip-Approved-Waiver`, `no-paperclip-card`) remain available
+on normal-lane PRs and are checked first (card-bound heads lose them once
+`PAPERCLIP_CARD_WAIVER_RETIRED=1`, see below), but neither waiver nor override
+bypasses an RA HOLD/NO-GO. The override is honored only when **all** of these
+hold, and the enforcer fails closed (merge_group exit 1, pull_request advisory)
+on any doubt:
 
 - **Authority.** The most recent `labeled` event for the label has an actor of
   type `User` (the machine-identity rejection the fold countersignature applies
@@ -304,6 +322,66 @@ in the failure. The override is read-only: it writes no status.
 **Residual risk.** Whoever can use the operator identity can apply the label, so
 the gate proves a write-access *person's account*, not a second human. The head
 binding still stops a label from covering work pushed after it.
+
+**Card-bound PRs do not use a waiver (SUP-20772).** Anyone with
+`pull_requests:write` can write either waiver line, and every fleet agent has it.
+With the repository variable `PAPERCLIP_CARD_WAIVER_RETIRED=1`, the enforcer
+ignores both waiver forms on a head named `SUP-<n>-...` and falls through to the
+status check, so the PR lands on a real stamp or on the board's head-bound release
+(`POST /api/issues/:issueId/merge-arming/release`, see
+[Approval-status reconciliation](approval-reconciliation.md)). Cardless heads keep
+both waivers, but only when the PR author is a person (`user.type == User`),
+`github-actions[bot]` or the control-plane App `tea-core[bot]` (the identity the
+lockfile refresh opens its PR as); any other App-authored PR cannot self-waive. The variable
+ships **unset** so merging the change cannot freeze a merge before the release route
+is deployed. Deploying the control plane and confirming the route answers is necessary,
+not sufficient: do not set the variable until the known residual bypass below is closed.
+Unsetting it is the rollback.
+
+**A board release counts in CI only with its confirmation marker (SUP-20772).**
+The control plane writes a release as `paperclip/approved` = success with a description
+starting `released by `, and, only after the release is confirmed in its database, a
+second status `paperclip/release-confirmed` whose description is `confirms status <id of
+that success>`, both as `tea-core[bot]`. The enforcer, with `PAPERCLIP_CARD_WAIVER_RETIRED`
+ON or OFF, accepts a release-described success only beside such a marker from that
+creator; without one it logs `UNCONFIRMED RELEASE` and treats the head as not approved (a
+success the control plane voided, never confirmed, could not confirm, or that landed late
+after the release had answered `failed` is therefore no approval). That description is
+written only by the release route, so with the switch OFF, the default, every other input
+is read, judged and printed exactly as the fold's script does; the switch gates only the
+waiver refusal, the release log line and the denial hint. `paperclip/release-confirmed` is read
+by the script and is **not** a required status check: do not add it to the ruleset (this
+document changes no ruleset).
+
+**An unsettled auto-merge arm blocks the head in CI (SUP-20772).** Before the control plane
+asks GitHub to arm auto-merge for a head it writes `paperclip/arm-gate` = failure on that
+head, and it writes `paperclip/arm-gate` = success only once the arm is settled (taken back
+and confirmed off, or standing with its authority). The enforcer, with
+`PAPERCLIP_CARD_WAIVER_RETIRED` ON or OFF, refuses a head whose newest `tea-core[bot]`
+`paperclip/arm-gate` status is not a success (`ARM GATE OPEN`, non-zero exit on
+`merge_group`, whatever stamp, release, waiver or override label the head carries; the
+advisory `pull_request` leg reports it and stays green). A status of that context from any
+other creator is ignored, so none can clear it. A head with no such status is judged as
+before. The point is the case in which GitHub refuses the control plane's take-back and
+every later write: the gate was written while GitHub still answered, so it is still there.
+It relies on `Paperclip Approval Enforcer` being a required check on the base branch (it
+already is for the fold); `paperclip/arm-gate` itself is read by the script and is **not**
+a required status check: do not add it to the ruleset (this document changes no ruleset).
+
+**Known residual bypass — do not set `PAPERCLIP_CARD_WAIVER_RETIRED` until it is
+closed.** The enforcer reads GitHub only and has no control-plane credential, so it
+cannot ask which card owns a PR. Both inputs to the refusal are chosen by the PR
+author: card binding comes from the head ref (`SUP-<n>...`), and "person" comes from
+GitHub's `user.type`. With the switch on, a card work item pushed to a branch that does
+not start `SUP-<n>` still reads as cardless and keeps its waiver, and a machine token
+that is a GitHub `User` (the fleet's shared operator token is one) reads as a person. The
+switch therefore only closes the honest mistake and the `SUP-` branch path; it does not
+stop an agent that renames its branch or pushes as a `User`. Closing it needs the card's
+recorded delivery PR/branch passed to this check over a path the author cannot write, and
+a fleet token that is not a `User`. Until then the shipped default (unset) is the safe
+state, and every waiver honoured with the switch on is logged `UNVERIFIED`. The tests in
+`scripts/__tests__/paperclip-approved-card-waiver.test.mjs` pin this behaviour so it
+cannot change unnoticed.
 
 ## Admin bypass — decision (SUP-13629)
 

@@ -6,6 +6,10 @@ import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { issueService } from "./issues.js";
 import {
+  createAuthorityGuard,
+  openArmRecord,
+  disableAutoMerge,
+  keepAutoMergeDisarmPending,
   enableAutoMerge,
   fetchGitHubNodeId,
   isGitHubTokenResolution,
@@ -15,6 +19,7 @@ import {
   fetchHeadViaTokenCandidates,
   fetchHeadApprovedStatusViaTokenCandidates,
   fetchLastMergeQueueEjectionViaTokenCandidates,
+  consumableReleaseStatusId,
   narrowToDelivered,
   notDeliveredReasonForPr,
   MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
@@ -142,6 +147,13 @@ export interface DoneCloseLandingSweepResult {
   reenqueued: number;
   escalated: number;
   draftStranded: number;
+  /**
+   * SUP-21651 (AC3): cards this sweep dispositioned as unable to arm (escalated
+   * because the carrier cannot land them), named so a cycle that armed nothing
+   * is never read as an all-clear. `identifier` falls back to the issue id when
+   * the card has no human-readable identifier.
+   */
+  unarmable: Array<{ identifier: string; pr: string; reason: string }>;
 }
 
 export type MeasuredPullRequestState = "merged" | "closed" | "open";
@@ -156,7 +168,7 @@ export type MeasuredPullRequestState = "merged" | "closed" | "open";
  *    (network/auth/404) — fail closed, defer to a later sweep, never report.
  */
 export type RequeueAuthorization =
-  | { kind: "authorized" }
+  | { kind: "authorized"; headSha: string }
   | { kind: "refused"; headSha: string; approvedHeadSha: string | null; reason: string }
   | { kind: "deferred"; reason: string };
 
@@ -182,6 +194,7 @@ interface SweepCounts {
   reenqueued: number;
   escalated: number;
   draftStranded: number;
+  unarmable: Array<{ identifier: string; pr: string; reason: string }>;
 }
 
 /** A live-measured PR, captured in the first pass before any disposition. */
@@ -363,7 +376,7 @@ export function createDoneCloseLandingBackstopService(
     // The heartbeat tick fires every 30s; GitHub measurement is expensive, so
     // every non-due tick is a no-op.
     if (lastRunAt !== null && checkedAt.getTime() - lastRunAt < sweepIntervalMs) {
-      return { due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0, draftStranded: 0 };
+      return { due: false, candidates: 0, confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0, draftStranded: 0, unarmable: [] };
     }
     lastRunAt = checkedAt.getTime();
     const result: DoneCloseLandingSweepResult = {
@@ -375,6 +388,7 @@ export function createDoneCloseLandingBackstopService(
       reenqueued: 0,
       escalated: 0,
       draftStranded: 0,
+      unarmable: [],
     };
 
     const windowStart = new Date(checkedAt.getTime() - lookbackMs);
@@ -396,7 +410,7 @@ export function createDoneCloseLandingBackstopService(
     const svc = issueService(db);
 
     for (const row of candidates) {
-      const counts: SweepCounts = { confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0, draftStranded: 0 };
+      const counts: SweepCounts = { confirmed: 0, failed: 0, deferred: 0, reenqueued: 0, escalated: 0, draftStranded: 0, unarmable: [] };
       try {
         await sweepCandidate(row, counts, { resolver, svc, graceCutoff });
       } catch (err) {
@@ -411,6 +425,7 @@ export function createDoneCloseLandingBackstopService(
       result.reenqueued += counts.reenqueued;
       result.escalated += counts.escalated;
       result.draftStranded += counts.draftStranded;
+      result.unarmable.push(...counts.unarmable);
     }
     return result;
   }
@@ -624,6 +639,7 @@ export function createDoneCloseLandingBackstopService(
     // merge on a head the merge boundary has not authorized. Fetch the card's
     // pinned approval stamp once per candidate so the per-PR gate can compare
     // the live head against it. Only needed when the re-enqueue lane is open.
+    const cardState = mergeArmingEnabled ? await readCardExecutionState(db, issue.id) : null;
     const approvedHeadSha = mergeArmingEnabled
       ? await readApprovedHeadSha(db, issue.id)
       : null;
@@ -1088,7 +1104,7 @@ export function createDoneCloseLandingBackstopService(
           ejectionRefusal = ejectionGate;
           await recordEjectionRefusal(issue, prKey, ejectionGate, alreadyRefused);
         } else {
-          const gate = await authorizeReenqueueHead(issue.companyId, pr, approvedHeadSha);
+          const gate = await authorizeReenqueueHead(issue.companyId, pr, approvedHeadSha, cardState);
           if (gate.kind === "deferred") {
             // AC4: unresolvable head or approval status — fail closed, never
             // re-enqueue and never report; retry on a later sweep.
@@ -1103,6 +1119,16 @@ export function createDoneCloseLandingBackstopService(
             const reenqueueSucceeded = await attemptReenqueue(
               issue.companyId,
               pr,
+              gate.headSha,
+              // Right before the arm the head and the approval are read again, with the certificate
+              // as it is now: the authorization above was given for one head and may not outlive it.
+              async () => authorizeReenqueueHead(
+                issue.companyId,
+                pr,
+                approvedHeadSha,
+                mergeArmingEnabled ? await readCardExecutionState(db, issue.id) : null,
+              ),
+              issue.id,
             );
             if (reenqueueSucceeded) {
               await logActivity(db, {
@@ -1145,18 +1171,20 @@ export function createDoneCloseLandingBackstopService(
       // ADR-091 D5), the re-enqueue cap is exhausted (still open), the lane is
       // closed, the re-enqueue attempt failed this tick, or the live head was
       // positively UNSTAMPED (head-authorization refusal).
+      const escalationReason = deliveryRefusal
+        ? deliveryRefusal.reason
+        : reenqueueExhausted
+          ? `the PR has been re-enqueued ${priorReenqueues} times and is still open past the done-close grace window — the merge queue is not landing it (e.g. failing checks, conflicts, or it is behind the base branch)`
+          : refusedHead
+            ? refusedHead.reason
+            : ejectionRefusal
+              ? ejectionRefusal.reason
+              : mergeArmingEnabled
+                ? "re-enqueue attempt failed (no resolvable GitHub token or API error)"
+                : "merge arming lane is closed for this company (mergeArmingEnabled=false) — no agent can re-enqueue the PR into the merge queue";
+      counts.unarmable.push({ identifier: issue.identifier ?? issue.id, pr: prKey, reason: escalationReason });
       if (!alreadyEscalated.has(prKey)) {
-        const reason = deliveryRefusal
-          ? deliveryRefusal.reason
-          : reenqueueExhausted
-            ? `the PR has been re-enqueued ${priorReenqueues} times and is still open past the done-close grace window — the merge queue is not landing it (e.g. failing checks, conflicts, or it is behind the base branch)`
-            : refusedHead
-              ? refusedHead.reason
-              : ejectionRefusal
-                ? ejectionRefusal.reason
-                : mergeArmingEnabled
-                  ? "re-enqueue attempt failed (no resolvable GitHub token or API error)"
-                  : "merge arming lane is closed for this company (mergeArmingEnabled=false) — no agent can re-enqueue the PR into the merge queue";
+        const reason = escalationReason;
         if (refusedHead) {
           // SUP-15315 (AC2): durable refusal row — the live head is not covered
           // by an authorized head, so no re-enqueue row is written for it.
@@ -1242,11 +1270,15 @@ export function createDoneCloseLandingBackstopService(
     }
   }
 
-  /**
-   * Reads the card's pinned approval-stamp head
-   * (`executionState.approvalStatus.approvedHeadSha`), or null when the card has
-   * no stamped head (e.g. an arming-refusal candidate).
-   */
+  /** The card's execution state as it is now (its certified delivery and any confirmed board release). */
+  async function readCardExecutionState(db: Db, issueId: string) {
+    const row = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    return (row[0]?.executionState as Record<string, unknown> | null | undefined) ?? null;
+  }
+
   async function readApprovedHeadSha(
     db: Db,
     issueId: string,
@@ -1288,6 +1320,7 @@ export function createDoneCloseLandingBackstopService(
     companyId: string,
     pr: LinkedPullRequest,
     approvedHeadSha: string | null,
+    cardState: Record<string, unknown> | null,
   ): Promise<RequeueAuthorization> {
     const head = await fetchHeadViaTokenCandidates(
       db,
@@ -1308,9 +1341,20 @@ export function createDoneCloseLandingBackstopService(
       pr.owner,
       pr.repo,
       liveHeadSha,
+      // Strict reading (SUP-20772): the newest paperclip/approved status must be a control-plane success,
+      // never a forged or historical one. A board release is a human decision, not a review, so it
+      // re-enqueues a card only when the card's own review certified this exact repository, PR and head
+      // AND the publisher confirmed that very status: a release whose confirmation is unknown or voided
+      // is never consumed.
+      {
+        strict: true,
+        confirmedReleaseStatusId: cardState
+          ? consumableReleaseStatusId(cardState, { owner: pr.owner, repo: pr.repo, number: pr.number, headSha: liveHeadSha })
+          : null,
+      },
     );
     if (!status.ok) return { kind: "deferred", reason: status.reason };
-    if (status.approved) return { kind: "authorized" };
+    if (status.approved) return { kind: "authorized", headSha: liveHeadSha };
     const shortLive = liveHeadSha.slice(0, 7);
     const shortAnchor = approvedHeadSha !== null ? approvedHeadSha.slice(0, 7) : null;
     let reason: string;
@@ -1431,6 +1475,9 @@ export function createDoneCloseLandingBackstopService(
   async function attemptReenqueue(
     companyId: string,
     pr: LinkedPullRequest,
+    authorizedHeadSha: string,
+    reauthorize: () => Promise<RequeueAuthorization>,
+    issueId: string,
   ): Promise<boolean> {
     const tokenResult = await resolveGitHubTokenForRepo(db, companyId, pr.owner, pr.repo);
     if (!isGitHubTokenResolution(tokenResult)) {
@@ -1449,7 +1496,51 @@ export function createDoneCloseLandingBackstopService(
       );
       return false;
     }
-    const result = await enableAutoMerge(tokenResult.token, nodeId);
+    // The card's authority, captured just before the final read of the head and the approval: a decision
+    // reversed, a certificate removed or a reviewer terminated after this point is a difference.
+    const guard = await createAuthorityGuard(db, companyId, issueId, { headSha: authorizedHeadSha });
+    const again = await reauthorize();
+    if (again.kind !== "authorized" || again.headSha !== authorizedHeadSha) {
+      logger.info(
+        { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, authorizedHeadSha },
+        "done-close backstop: re-enqueue skipped — the head or its approval changed after the authorization",
+      );
+      return false;
+    }
+    // The take-back record goes on the card BEFORE the enable call (an arm GitHub accepts is then covered even if this
+    // process dies right after); nothing is armed when it cannot be written.
+    const armRecord = await openArmRecord(db, companyId, issueId, pr, `${pr.owner}/${pr.repo}#${pr.number}`, nodeId, authorizedHeadSha, guard);
+    if (!armRecord.ok) {
+      logger.warn({ companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, message: armRecord.message }, "done-close backstop: re-enqueue skipped — the take-back record could not be opened");
+      return false;
+    }
+    // GitHub refuses the mutation if the PR's head is not the one authorized.
+    const result = await enableAutoMerge(tokenResult.token, nodeId, {
+      expectedHeadOid: authorizedHeadSha,
+      // Before the first attempt and before every retry.
+      beforeAttempt: () => guard.stillHolds(),
+    });
+    await armRecord.settleEnable(result);
+    if (result.success) {
+      // A revocation that committed while the call was in flight could not be seen before it.
+      // A recheck that cannot be completed is treated as a change: an arm that cannot be re-verified is taken back.
+      const changed = await guard.stillHolds().catch((error) =>
+        `the authority could not be re-verified (${error instanceof Error ? error.message : String(error)})`);
+      if (changed) {
+        const disabled = await disableAutoMerge(tokenResult.token, nodeId);
+        if (disabled.success) await armRecord.forget();
+        // An accepted arm that could not be turned off stays on the card and is retried every reconciler tick.
+        const kept = disabled.success ? "" : await keepAutoMergeDisarmPending(db, companyId, issueId, pr, nodeId, authorizedHeadSha, changed, disabled.error);
+        const where = { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, changed, disabled: disabled.success, disableError: disabled.error, kept };
+        if (disabled.success) {
+          logger.warn(where, "done-close backstop: re-enqueue taken back — the card's authority changed while auto-merge was being enabled");
+        } else {
+          logger.error(where, "done-close backstop: auto-merge could NOT be disabled after the card's authority changed while it was being enabled; it must be disabled by hand");
+        }
+        return false;
+      }
+      await armRecord.forget();
+    }
     if (!result.success) {
       logger.info(
         { companyId, pr: `${pr.owner}/${pr.repo}#${pr.number}`, error: result.error },

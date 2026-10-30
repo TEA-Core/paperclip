@@ -304,6 +304,81 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
     await heartbeat.waitForRunExecutionDrain(userRun!.id);
   }, 10_000);
 
+  it("cancels legacy queued runs excluded by an armed worktree cutoff without dispatching them", async () => {
+    const { companyId, agentId, issueId } = await insertAgentAndIssue();
+    const cutoff = new Date(Date.now());
+    const runId = randomUUID();
+    const wakeupRequestId = randomUUID();
+
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      payload: { issueId },
+      status: "queued",
+      requestedAt: new Date(cutoff.getTime() - 1_000),
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      createdAt: new Date(cutoff.getTime() - 1_000),
+    });
+    await db
+      .update(agentWakeupRequests)
+      .set({ runId })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    await db
+      .update(issues)
+      .set({ executionRunId: runId, executionLockedAt: new Date(cutoff.getTime() - 1_000) })
+      .where(eq(issues.id, issueId));
+    await armWorktreeRunExecution(cutoff);
+
+    const heartbeat = heartbeatService(db, {
+      runtimeEnv: {
+        PAPERCLIP_IN_WORKTREE: "true",
+        PAPERCLIP_INSTANCE_ID: "test-worktree",
+      },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    const cancelledRun = await db
+      .select({
+        status: heartbeatRuns.status,
+        startedAt: heartbeatRuns.startedAt,
+        errorCode: heartbeatRuns.errorCode,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    const unlockedIssue = await db
+      .select({ executionRunId: issues.executionRunId, executionLockedAt: issues.executionLockedAt })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    const skippedWake = await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+
+    expect(cancelledRun).toMatchObject({
+      status: "cancelled",
+      startedAt: null,
+      errorCode: "execution_reconciliation_required",
+    });
+    expect(unlockedIssue).toEqual({ executionRunId: null, executionLockedAt: null });
+    expect(skippedWake?.status).toBe("skipped");
+  });
+
   it("still creates live-plane assignment runs when suppression is not active", async () => {
     const { agentId, issueId } = await insertAgentAndIssue();
     await db

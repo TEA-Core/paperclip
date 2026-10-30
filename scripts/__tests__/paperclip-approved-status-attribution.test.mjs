@@ -13,6 +13,11 @@ const REPO = "TEA-Core/paperclip";
 const PR = 4242;
 const HEAD_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const QUEUE_REF = `refs/heads/gh-readonly-queue/fold/tea-patches-v2026.722.0/pr-${PR}-0123456789abcdef`;
+const DECISION_ID = "11111111-2222-4333-8444-555555555555";
+const CARD_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+const EVIDENCE = "b".repeat(64);
+const raTarget = (sha = HEAD_SHA, pr = PR) =>
+  `https://paperclip.example/api/issues/${CARD_ID}/release-decisions?repo=TEA-Core%2Fpaperclip&pr=${pr}&head=${sha}&decision=${DECISION_ID}&evidence=${EVIDENCE}`;
 
 // The real control-plane App bot, read off a published status on
 // TEA-Core/paperclip. A bot user's numeric id is stable for the life of the App.
@@ -61,14 +66,14 @@ const GH_SHIM = [
   "",
 ].join("\n");
 
-function makeFixture(statuses) {
+function makeFixture(statuses, { body = "an ordinary PR body with no waiver line", labels = [] } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "pc-attribution-"));
   writeFileSync(
     path.join(dir, "pull.json"),
     JSON.stringify({
       head: { sha: HEAD_SHA, ref: "SUP-15270-some-card-branch" },
-      body: "an ordinary PR body with no waiver line",
-      labels: [],
+      body,
+      labels: labels.map((name) => ({ name })),
       user: { login: "fleet-only[bot]" },
     }),
   );
@@ -82,12 +87,20 @@ function makeFixture(statuses) {
   return { dir, bin };
 }
 
-function status(state, creator, context = "paperclip/approved") {
-  return { context, state, creator };
+function status(state, creator, context = "paperclip/approved", extra = {}) {
+  return { context, state, creator, ...extra };
 }
 
-function run(statuses, { event = "merge_group" } = {}) {
-  const fixture = makeFixture(statuses);
+function raStatus(state = "success", creator = TEA_CORE, extra = {}) {
+  return status(state, creator, "release-assurance/approved", {
+    description: `released by release-assurance for ${HEAD_SHA}`,
+    target_url: raTarget(),
+    ...extra,
+  });
+}
+
+function run(statuses, { event = "merge_group", ...fixtureOptions } = {}) {
+  const fixture = makeFixture(statuses, fixtureOptions);
   try {
     const args = event === "merge_group" ? [script, event] : [script, event, String(PR)];
     const result = spawnSync("bash", args, {
@@ -137,6 +150,55 @@ test("a success with no creator at all is refused, not trusted", () => {
   assert.match(err, /FORGED/);
 });
 
+for (const [label, row] of [
+  ["null creator and numeric description", status("success", null, "paperclip/approved", { description: String(TEA_CORE.id) })],
+  ["missing creator and numeric description", { context: "paperclip/approved", state: "success", description: String(TEA_CORE.id) }],
+  ["empty creator and numeric description", status("success", {}, "paperclip/approved", { description: String(TEA_CORE.id) })],
+  ["null creator ID and numeric description", status("success", { id: null }, "paperclip/approved", { description: String(TEA_CORE.id) })],
+  ["empty creator ID and numeric description", status("success", { id: "" }, "paperclip/approved", { description: String(TEA_CORE.id) })],
+  ["null creator and numeric target", status("success", null, "paperclip/approved", { target_url: String(TEA_CORE.id) })],
+  ["missing creator and numeric target", { context: "paperclip/approved", state: "success", target_url: String(TEA_CORE.id) }],
+  ["schema-complete null creator", status("success", null, "paperclip/approved", { description: String(TEA_CORE.id), target_url: null, id: 1, url: "https://api.github.com/statuses/1", created_at: "2026-10-26T00:00:00Z", updated_at: "2026-10-26T00:00:00Z" })],
+]) {
+  test(`unattributed ordinary success is refused with ${label}`, () => {
+    const { code, err } = run([row]);
+    assert.equal(code, 1);
+    assert.match(err, /FORGED/);
+  });
+}
+
+for (const [label, row] of [
+  ["null creator", raStatus("success", null)],
+  ["missing creator", { context: "release-assurance/approved", state: "success", description: `released by release-assurance for ${HEAD_SHA}`, target_url: raTarget() }],
+]) {
+  test(`unattributed release-assurance success is refused with ${label}`, () => {
+    const { code, err } = run([row, status("success", TEA_CORE)]);
+    assert.equal(code, 1);
+    assert.match(err, /FORGED/);
+  });
+}
+
+// Non-scalar projected fields must fail the whole status response rather than
+// turning into printable text and leaving a trusted ordinary success admissible.
+for (const [label, rows] of [
+  ["ordinary creator login array", [status("success", { ...TEA_CORE, login: [] })]],
+  ["ordinary creator login object", [status("success", { ...TEA_CORE, login: {} })]],
+  ["ordinary creator login nonempty array", [status("success", { ...TEA_CORE, login: ["success"] })]],
+  ["ordinary creator login nonempty object", [status("success", { ...TEA_CORE, login: { value: "success" } })]],
+  ["unrelated context array", [status("success", FLEET_ONLY, []), status("success", TEA_CORE)]],
+  ["unrelated context object", [status("success", FLEET_ONLY, {}), status("success", TEA_CORE)]],
+  ["unrelated state array", [status([], FLEET_ONLY, "ci/unrelated"), status("success", TEA_CORE)]],
+  ["unrelated state object", [status({}, FLEET_ONLY, "ci/unrelated"), status("success", TEA_CORE)]],
+  ["unrelated creator login array", [status("success", { ...FLEET_ONLY, login: [] }, "ci/unrelated"), status("success", TEA_CORE)]],
+  ["unrelated creator login object", [status("success", { ...FLEET_ONLY, login: {} }, "ci/unrelated"), status("success", TEA_CORE)]],
+]) {
+  test(`non-scalar ${label} refuses the entire status response`, () => {
+    const { code, err } = run(rows);
+    assert.equal(code, 1);
+    assert.match(err, /API failure/);
+  });
+}
+
 test("the newest status for the context decides, even when an older one is genuine", () => {
   // The list endpoint returns entries newest-first, which is what makes the
   // first match equivalent to the combined endpoint's reported value. A forged
@@ -145,6 +207,18 @@ test("the newest status for the context decides, even when an older one is genui
   assert.equal(code, 1);
   assert.match(err, /FORGED/);
 });
+
+for (const [latestState, olderState, expectedCode] of [
+  ["success", "failure", 0],
+  ["pending", "success", 1],
+  ["failure", "success", 1],
+  ["missing", "success", 1], // Invalid GitHub state must not expose an older success.
+]) {
+  test(`the latest ordinary ${latestState} state decides ahead of an older ${olderState}`, () => {
+    const { code } = run([status(latestState, TEA_CORE), status(olderState, TEA_CORE)]);
+    assert.equal(code, expectedCode);
+  });
+}
 
 test("an older forged status does not taint a current genuine one", () => {
   const { code } = run([status("success", TEA_CORE), status("success", FLEET_ONLY)]);
@@ -197,4 +271,71 @@ test("pull_request stays advisory even for a forged status", () => {
   // would make every PR red for its whole working life.
   const { code } = run([status("success", FLEET_ONLY)], { event: "pull_request" });
   assert.equal(code, 0);
+});
+
+test("current-head release assurance from the trusted App and bound decision admits without a board stamp", () => {
+  const { code, out } = run([raStatus()]);
+  assert.equal(code, 0);
+  assert.match(out, /pass: release-assurance\/approved = success/);
+});
+
+test("a later pending or failed release decision vetoes an earlier valid GO and board approval", () => {
+  for (const state of ["pending", "failure"]) {
+    const { code } = run([raStatus(state), raStatus(), status("success", TEA_CORE)]);
+    assert.equal(code, 1, `${state} must veto older approvals`);
+  }
+});
+
+test("an untrusted release-assurance success cannot replace a genuine board approval", () => {
+  const { code, err } = run([raStatus("success", FLEET_ONLY), status("success", TEA_CORE)]);
+  assert.equal(code, 1);
+  assert.match(err, /FORGED/);
+});
+
+test("a release-assurance success must bind the live head, repository, PR and decision", () => {
+  for (const candidate of [
+    raStatus("success", TEA_CORE, { description: `released by release-assurance for ${"c".repeat(40)}` }),
+    raStatus("success", TEA_CORE, { target_url: raTarget("c".repeat(40)) }),
+    raStatus("success", TEA_CORE, { target_url: raTarget(HEAD_SHA, PR + 1) }),
+    raStatus("success", TEA_CORE, { target_url: `https://paperclip.example/api/issues/${CARD_ID}/release-decisions` }),
+    raStatus("success", TEA_CORE, { target_url: raTarget().replace("TEA-Core%2Fpaperclip", "attacker%2Frepo") }),
+    raStatus("success", TEA_CORE, { target_url: raTarget().replace(DECISION_ID, "not-a-decision") }),
+  ]) {
+    const { code } = run([candidate]);
+    assert.equal(code, 1, `unbound release assurance must fail: ${JSON.stringify(candidate)}`);
+  }
+});
+
+test("an older forged release status cannot override a newer genuine GO", () => {
+  const { code } = run([raStatus(), raStatus("success", FLEET_ONLY)]);
+  assert.equal(code, 0);
+});
+
+test("a release-assurance hold cannot be bypassed with either cardless waiver", () => {
+  for (const options of [
+    { body: "Paperclip-Approved-Waiver: self declared" },
+    { labels: ["no-paperclip-card"] },
+  ]) {
+    const { code } = run([raStatus("pending"), status("success", TEA_CORE)], options);
+    assert.equal(code, 1);
+  }
+});
+
+test("a missing-state latest RA record never falls back to an older GO or board stamp", () => {
+  const { code } = run([raStatus(null), raStatus(), status("success", TEA_CORE)]);
+  assert.equal(code, 1);
+});
+
+test("the latest release-assurance GO is found after a full page of unrelated statuses", () => {
+  const noise = Array.from({ length: 100 }, (_, i) =>
+    status("success", FLEET_ONLY, `ci/unrelated-${i}`),
+  );
+  const { code } = run([...noise, raStatus()]);
+  assert.equal(code, 0);
+});
+
+test("the advisory PR leg observes the RA GO without publishing a status", () => {
+  const { code, out } = run([raStatus()], { event: "pull_request" });
+  assert.equal(code, 0);
+  assert.match(out, /pass: release-assurance\/approved = success/);
 });

@@ -4,6 +4,7 @@ import { agents, issueExecutionDecisions, issueLabels, issues, labels, type Db }
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   resolveGitHubToken,
+  resolveGitHubTokenCandidatesForRepo,
   type GitHubTokenScope,
 } from "./github-credential.js";
 import { logActivity } from "./activity-log.js";
@@ -19,7 +20,7 @@ import {
   type LinkedPullRequest,
 } from "./merge-arming.js";
 import { logger } from "../middleware/logger.js";
-import type { IssueComment, UpdateIssue } from "@paperclipai/shared";
+import type { IssueComment, IssueDeliveryRequirement, UpdateIssue } from "@paperclipai/shared";
 import type { DoneTierDeclaration } from "@paperclipai/shared/validators/issue";
 import { normalizeAgentUrlKey } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
@@ -86,30 +87,51 @@ const TIER_1_SUFFIX = "Liveness unverified.";
 // 422 remedy and the parser always agree on the exact literal (SUP-15787).
 const TIER2_FORM = '"Closed at Tier 2 (live): <probe evidence>"';
 export const TIER1_FORM =
-  '"Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
+  '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."' +
+  ' or "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
   'landing obligation transferred to done-close-landing-backstop, not yet discharged; ' +
   '<why Tier 2 was not probed>. Liveness unverified."';
+// Structured `doneTier` forms (SUP-21328): the second accepted close form on both
+// agent-writable close doors. The missing-tier remedy names these verbatim so the
+// 422 remedy and the structured parser always agree (SUP-15787 invariant).
+export const DONE_TIER_TIER2_JSON =
+  '"doneTier": { "tier": "tier2", "probeEvidence": "<consumer-surface probe output>" }';
+export const DONE_TIER_TIER1_LANDED_JSON =
+  '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landedAtTip", "mergeCommit": "<sha>" } }';
+export const DONE_TIER_TIER1_DELEGATED_JSON =
+  '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landingDelegated", "prNumber": <N>, "carrier": "done-close-landing-backstop" } }';
+export const DONE_TIER_STRUCTURED_FORMS =
+  `${DONE_TIER_TIER2_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
 
 export function renderDoneTierDeclaration(
   body: string | null | undefined,
   declaration: DoneTierDeclaration,
 ): string {
   const current = body ?? "";
-  if (current.split(/\r?\n/).some((line) => {
+  const lines = current.split(/\r?\n/);
+  const isCanonicalTierDeclaration = (line: string): boolean => {
     const trimmed = line.trim();
     return trimmed.startsWith(TIER_2_PREFIX) ||
       trimmed.startsWith(TIER_1_PREFIX) ||
       trimmed.startsWith("Closed at Tier 0 (decision-only):");
-  })) {
-    return body ?? "";
-  }
+  };
 
   const rendered = declaration.tier === "tier2"
     ? `${TIER_2_PREFIX} ${declaration.probeEvidence}`
     : `${TIER_1_PREFIX} ${declaration.landing.mode === "landedAtTip"
       ? `landed-at-tip ${declaration.landing.mergeCommit}`
       : `landing-delegated PR #${declaration.landing.prNumber} via ${declaration.landing.carrier}`} — ${declaration.reason}. ${TIER_1_SUFFIX}`;
-  return current.length > 0 ? `${body}\n\n${rendered}` : rendered;
+  if (lines.some((line) => line.trim() === rendered)) {
+    return current;
+  }
+
+  const withoutCanonicalTierDeclaration = lines
+    .filter((line) => !isCanonicalTierDeclaration(line))
+    .join("\n")
+    .trim();
+  return withoutCanonicalTierDeclaration.length > 0
+    ? `${withoutCanonicalTierDeclaration}\n\n${rendered}`
+    : rendered;
 }
 
 /**
@@ -777,24 +799,90 @@ async function proveLandingDelegated(
   } catch (err) {
     return refuseTier1(unverifiedTier1(err));
   }
-  const pr = linked.find((candidate) => candidate.number === number);
-  if (!pr) {
+  const namedPrs = linked.filter((candidate) => candidate.number === number);
+  if (namedPrs.length === 0) {
     return refuseTier1(
       `Tier 1 declaration using "landing-delegated" names PR #${number}, which is not a linked pull request.`,
     );
   }
+  let pr = namedPrs[0]!;
+  if (namedPrs.length > 1) {
+    const openPrs = namedPrs.filter((candidate) => candidate.cachedState === "open");
+    if (openPrs.length === 1) {
+      pr = openPrs[0]!;
+    } else {
+      return refuseTier1(
+        `Tier 1 declaration using "landing-delegated" names PR #${number}, which matches linked pull requests in multiple repositories (${namedPrs.map((candidate) => `${candidate.owner}/${candidate.repo}`).join(", ")}); name an unambiguous linked PR.`,
+      );
+    }
+  }
   try {
-    const tokenResult = await resolveGitHubToken(db, issue.companyId);
-    if (tokenResult.token !== null) {
-      const live = await hydrateLinkedPrState(pr, tokenResult.token);
+    const candidates = await resolveGitHubTokenCandidatesForRepo(db, issue.companyId, pr.owner, pr.repo);
+    for (const candidate of candidates) {
+      const live = await hydrateLinkedPrState(pr, candidate.token);
       if (live !== pr && live.cachedState === "open" && live.draft && (await loadOwnDraftPredicate(db, issue, [live]))(live)) {
         return refuseTier1(
           `head_draft: linked PR #${number} is an open draft; promote it out of draft before closing this card done.`,
         );
       }
+      const headers = {
+        accept: "application/vnd.github+json",
+        "user-agent": "paperclip-done-transition-guard",
+        "x-github-api-version": "2022-11-28",
+        authorization: `Bearer ${candidate.token}`,
+      };
+      const repositoryUrl = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}`;
+      const repositoryResponse = await ghFetch(repositoryUrl, { headers });
+      if (repositoryResponse.ok) {
+        const repository = (await repositoryResponse.json().catch(() => null)) as Record<string, unknown> | null;
+        if (repository?.allow_auto_merge === false) {
+          // GitHub exempts branches that require a merge queue from the
+          // repository-level "Allow auto-merge" setting: enablePullRequestAutoMerge
+          // still lands those PRs via the queue. Only refuse when no merge queue
+          // covers the PR's base branch either; an already-queued PR (its REST
+          // auto_merge payload) is also positive proof of a working carrier.
+          const queueGraphql = async (query: string) =>
+            ghFetch(GITHUB_GRAPHQL_URL, {
+              method: "POST",
+              headers: { ...headers, "content-type": "application/json" },
+              body: JSON.stringify({ query }),
+            });
+          const escapeGraphqlString = (value: string) =>
+            value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+          let queueCarrier: "queued" | "configured" | "none" | "unknown" = "unknown";
+          if (pr.baseRefName) {
+            const queueResponse = await queueGraphql(
+              `query { repository(owner: "${escapeGraphqlString(pr.owner)}", name: "${escapeGraphqlString(pr.repo)}") { mergeQueue(branch: "${escapeGraphqlString(pr.baseRefName)}") { configuration { mergeMethod } } } }`,
+            );
+            if (queueResponse.ok) {
+              const payload = (await queueResponse.json().catch(() => null)) as {
+                data?: { repository?: { mergeQueue?: { configuration?: unknown } | null } | null };
+              } | null;
+              queueCarrier = payload?.data?.repository?.mergeQueue?.configuration != null ? "configured" : "none";
+            }
+          }
+          if (queueCarrier === "none") {
+            const prLookup = await ghFetch(
+              `${repositoryUrl}/pulls/${number}`,
+              { headers },
+            );
+            if (prLookup.ok) {
+              const prPayload = (await prLookup.json().catch(() => null)) as { auto_merge?: unknown } | null;
+              if (prPayload?.auto_merge != null) queueCarrier = "queued";
+            }
+          }
+          if (queueCarrier === "none") {
+            return refuseTier1(
+              `Tier 1 declaration using "landing-delegated" names PR #${number}, but repository auto-merge is disabled and no merge queue covers the PR's base branch; enable auto-merge, enable a merge queue for the base branch, or use landed-at-tip evidence. The backstop arms merges via GitHub's enablePullRequestAutoMerge, which on a repository with auto-merge disabled and no merge queue has no landing carrier.`,
+            );
+          }
+        }
+        break;
+      }
+      if (![401, 403, 404].includes(repositoryResponse.status)) break;
     }
   } catch {
-    // Credential resolution failed: draft state is unverifiable, so do not refuse on a stale cached flag.
+    // Credential or provider resolution failed: auto-merge capability is unverifiable, so do not refuse.
   }
   return acceptTier1(reason, sameRun);
 }
@@ -2008,6 +2096,7 @@ async function evaluateDoneTransitionGuardCore(
     createdByAgentId?: string | null;
     executionPolicy?: unknown;
     executionState?: unknown;
+    deliveryRequirement?: IssueDeliveryRequirement | null;
   },
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
@@ -2268,6 +2357,25 @@ async function evaluateDoneTransitionGuardCore(
       excludedChildIdentifiers: ladderShape.excludedChildIdentifiers,
       skipped: false,
       skipReason: null,
+    };
+  }
+
+  if (issue.deliveryRequirement === "record_only") {
+    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+      reason: "record_only_delivery_skipped",
+      skipReason: "record_only_delivery_skipped",
+      source: "done_transition_guard",
+    });
+    return {
+      allowed: true,
+      reason: "Record-only delivery requirement: repository/PR delivery is not required; transition allowed",
+      aheadBy: null,
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      skipped: true,
+      skipReason: "record_only_delivery_skipped",
     };
   }
 

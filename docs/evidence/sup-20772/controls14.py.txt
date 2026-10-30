@@ -1,0 +1,34 @@
+import subprocess, shutil, json, os, re, sys
+root=os.environ.get('REPO_ROOT','.'); sp=sys.argv[1]; mode=sys.argv[2]
+NEW=[('src/services/merge-arming.test.ts','round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds')]
+def run():
+    out=[]
+    for f,flt in NEW:
+        r=subprocess.run(['npx','vitest','run',f,'-t',flt],cwd=root+'/server',capture_output=True,text=True,timeout=900)
+        txt=r.stdout+r.stderr
+        m=re.search(r'Tests\s+(?:(\d+) failed \| )?(\d+) passed',txt)
+        failed=int(m.group(1) or 0) if m else -1; passed=int(m.group(2)) if m else -1
+        if not m:
+            m2=re.search(r'Tests\s+(\d+) failed',txt); failed=int(m2.group(1)) if m2 else -1
+        out.append({'file':f,'filter':flt,'failed':failed,'passed':passed,'failedNames':re.findall(r'^\s+×\s+(.+?)\s+\d+ms$',txt,re.M)[:12]})
+    return out
+def bak(p): shutil.copy(root+'/'+p,sp+'/b14_'+p.replace('/','_'))
+def res(p): shutil.copy(sp+'/b14_'+p.replace('/','_'),root+'/'+p)
+results={}
+if mode=='old':
+    files=['server/src/services/merge-arming.ts','server/src/services/auto-merge-disarm.ts']
+    for p in files: bak(p)
+    try:
+        for p in files: open(root+'/'+p,'w').write(subprocess.run(['git','show','5d6738936:'+p],cwd=root,capture_output=True,text=True).stdout)
+        results['previous head 5d673893']=run()
+    finally:
+        for p in files: res(p)
+else:
+    for name,m in json.load(open(sys.argv[3])).items():
+        p=m['file']; bak(p)
+        try:
+            s=open(root+'/'+p).read(); assert m['old'] in s,name
+            open(root+'/'+p,'w').write(s.replace(m['old'],m['new'],1))
+            results[name]=run()
+        finally: res(p)
+print(json.dumps(results,indent=1))

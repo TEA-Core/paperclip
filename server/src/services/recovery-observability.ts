@@ -78,6 +78,8 @@ export type RecoveryObservabilityReport = {
   thresholdPercent: number;
   weekly: WeeklyRecoveryRate[];
   alert: RecoveryRateAlert;
+  /** Named board-visible artifact for a breached alert (null when quiet). */
+  alertArtifactKey: string | null;
   byCause: RecoveryCauseGroup[];
   handoff: RecoveryHandoffSummary;
   perCauseRouting: RecoveryCauseRouting[];
@@ -148,8 +150,28 @@ export function evaluateRecoveryRateAlert(
   };
 }
 
+// SUP-21344: the alert is not decorative — a breached week yields a stable,
+// named board-visible artifact (the attention `recovery_rate_alert` item), so
+// a consumer can point at an artefact by id instead of re-deriving a breach
+// from the dashboard payload. Null when no week breached.
+export function recoveryRateAlertArtifactKey(
+  alert: RecoveryRateAlert,
+  companyId: string,
+): string | null {
+  const firstBreached = alert.breachedWeeks[0];
+  return alert.breached && firstBreached
+    ? `recovery_rate_alert:${companyId}:${firstBreached.weekStart}`
+    : null;
+}
+
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
+}
+
+/** True when the ISO week starting at `weekStart` (YYYY-MM-DD) has fully elapsed by `now`. */
+export function isCompleteRecoveryWeek(weekStart: string, now: Date | number): boolean {
+  const monday = new Date(`${weekStart}T00:00:00.000Z`).getTime();
+  return monday + 7 * 24 * 60 * 60 * 1000 <= (typeof now === "number" ? now : now.getTime());
 }
 
 function utcWeekStart(now: Date, weeksAgo: number): Date {
@@ -214,6 +236,13 @@ export function recoveryObservabilityService(db: Db) {
     });
 
     const alert = evaluateRecoveryRateAlert(weekly, thresholdPercent);
+    // SUP-21344: the artifact key must name the same complete-week window the
+    // attention service materialises; a breach limited to the current partial
+    // week has no attention item, so it must not expose a dangling key.
+    const completeWeekAlert = evaluateRecoveryRateAlert(
+      weekly.filter((w) => isCompleteRecoveryWeek(w.weekStart, now)),
+      thresholdPercent,
+    );
 
     // Cause + latestRunErrorCode taxonomy (from the action's evidence snapshot).
     const causeRows = (await db.execute(sql`
@@ -363,6 +392,7 @@ export function recoveryObservabilityService(db: Db) {
       thresholdPercent,
       weekly,
       alert,
+      alertArtifactKey: recoveryRateAlertArtifactKey(completeWeekAlert, companyId),
       byCause,
       handoff,
       perCauseRouting,

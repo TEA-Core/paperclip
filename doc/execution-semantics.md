@@ -211,6 +211,20 @@ Blocked issues should stay idle while blockers remain unresolved. Paperclip shou
 
 `cancelled` is terminal for the blocker issue itself, but it does not satisfy the dependency. A cancelled blocker edge remains unresolved until the edge is removed or replaced, and Paperclip must surface blocker attention on the dependent regardless of whether that dependent is currently displayed as `blocked`, `todo`, `backlog`, or another non-terminal agent-owned status.
 
+When reconciliation finds a `blocked` dependent with only terminal blockers
+and at least one cancelled edge, it opens a board-owned recovery action to
+decide whether to replace cancelled work or remove the edge; it does not treat
+the cancellation as a satisfied dependency. The action is resolved
+automatically once the dependent no longer has only cancelled unresolved
+blockers (for example when the stale edges are removed, after which the
+zero-blocker heal wakes the assignee). Resolved-dependency wake re-arm caps
+exempt only a succeeded run with no net effect on the dependent: no status
+change away from `blocked` (a checkout followed by a re-park nets out), no
+comment, and no new blocker edge. Failed, timed-out, cancelled,
+platform-refused, and run-less wakes always count. At the cap, the recovery
+action asks the board to distinguish platform refusal, all blockers terminal
+without a valid continuation, and an unlinked real blocker.
+
 If a parent is truly waiting on a child, model that with blockers. Do not rely on the parent/child relationship alone.
 
 ### Child→Parent Reporting
@@ -525,6 +539,19 @@ A healthy active-work state means at least one of these is true:
 - there is an open explicit recovery action for the lost execution path
 
 An agent-owned `in_progress` issue is stalled when it has no active run, no queued continuation, no persisted monitor, and no explicit recovery surface. An unmanaged local/background watcher does not satisfy any of those conditions. A Paperclip-tracked run that is still running but silent is not automatically stalled; it is handled by the active-run watchdog contract.
+
+When timer dispatch has been suppressed for a sustained two-hour window because
+none of the six continuation paths is live, Paperclip parks the `in_progress`
+issue as `blocked` and opens one source-scoped `issue_graph_liveness`
+recovery action with cause `in_progress_without_live_continuation_path`,
+owned by its assignee. The action asks the owner to finish,
+link a blocker or interaction, arm a monitor, or reassign. This is not a
+`blocked_without_blockers` board escalation or an automatic retry; the open
+action is listed in board attention instead. Periodic reconciliation cancels the
+action when the issue leaves `blocked`, is reassigned, gains an unresolved
+blocker or pending interaction, or a live run, future monitor, active task
+watchdog, scheduled retry, or live successful-run handoff restores a path;
+the action itself cannot satisfy its own restoration check.
 
 ### `in_review`
 

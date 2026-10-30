@@ -30,14 +30,12 @@ concurrency:
 
 jobs:
   # SUP-13589/SUP-13590/SUP-13629: the approval gate on the fold branch.
-  # Consumes the control-plane `paperclip/approved` commit status on the PR
-  # head (READ-ONLY — nothing in this repository may create, mock or write
-  # that context; see the script header). Advisory on pull_request (the status
-  # is published only at review-stage approval, which happens after CI first
-  # runs on the PR); fail-closed on merge_group (the last gate before the
-  # commit lands on the fold); no-op on push. Runs on all three events and
-  # always lands a conclusion — success on the advisory/no-op paths, never
-  # skipped.
+  # Publishes the required enforcer check by consuming either the normal
+  # `paperclip/approved` status or an exact-head, App-issued
+  # `release-assurance/approved` GO. No status is written here; the RA control
+  # plane remains shadow-only until separately activated. On pull_request
+  # the check is advisory; on merge_group it fails closed; push is a no-op.
+  # The job always concludes; it is never skipped.
   paperclip-approved-enforcer:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -62,9 +60,12 @@ jobs:
             *)            echo "paperclip-approved: '${{ github.event_name }}' — no-op, reporting success" ;;
           esac
       - uses: actions/checkout@v7
-      - name: Check the paperclip/approved status
+      - name: Check the Paperclip or release-assurance approval status
         env:
           GH_REPO: ${{ github.repository }}
+          # SUP-20772: off until the board release route is live. See the
+          # script header before turning it on.
+          PAPERCLIP_CARD_WAIVER_RETIRED: ${{ vars.PAPERCLIP_CARD_WAIVER_RETIRED }}
         run: |
           case "${{ github.event_name }}" in
             pull_request) bash scripts/ci/check-paperclip-approved.sh pull_request "${{ github.event.pull_request.number }}" ;;

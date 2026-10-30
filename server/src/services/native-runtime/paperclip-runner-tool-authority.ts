@@ -308,6 +308,9 @@ export class PaperclipRunnerToolAuthority {
     ) {
       throw new Error("paperclip_runner_tool_mode_denied");
     }
+    if (call.tool === "create_task" && "executionPolicy" in input) {
+      throw new Error("paperclip_runner_tool_arguments_invalid");
+    }
     switch (call.tool) {
       case "create_project":
       case "list_project_repositories":

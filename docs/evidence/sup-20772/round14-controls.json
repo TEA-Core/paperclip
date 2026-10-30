@@ -1,0 +1,107 @@
+{
+ "previousHead": {
+  "previous head 5d673893": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds",
+    "failed": 9,
+    "passed": 3,
+    "failedNames": [
+     "keeps the record when GitHub gives no answer, and the sweep takes the arm back when the authority still holds",
+     "takes back an arm a previous process left in flight whatever the authority is now, and leaves a young record alone",
+     "keeps the record when the enable call timed out: the arm may be in force",
+     "holds the cap under concurrent admissions and a default sweep tries every record at it",
+     "is escalated once past the deadline, by the sweep, and no control-plane arm gets through meanwhile",
+     "refuses every arm past the deadline with no sweep having run at all, and is cleared by a confirmed disable",
+     "is not escalated before the deadline",
+     "gives up on a request that never answers, aborts it, and reports no answer (status 0, so the take-back record stays)",
+     "is over, in the worst case, well before the in-flight record is settled"
+    ]
+   }
+  ]
+ },
+ "mutants": {
+  "M9 no admission lock (cap raced by concurrent admissions)": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds",
+    "failed": 1,
+    "passed": 11,
+    "failedNames": [
+     "holds the cap under concurrent admissions and a default sweep tries every record at it"
+    ]
+   }
+  ],
+  "M10 settle clears an in-flight record whose authority is unchanged instead of taking the arm back": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds",
+    "failed": 3,
+    "passed": 9,
+    "failedNames": [
+     "keeps the record when GitHub gives no answer, and the sweep takes the arm back when the authority still holds",
+     "takes back an arm a previous process left in flight whatever the authority is now, and leaves a young record alone",
+     "holds the cap under concurrent admissions and a default sweep tries every record at it"
+    ]
+   }
+  ],
+  "M11 escalation deadline never reached": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds",
+    "failed": 2,
+    "passed": 10,
+    "failedNames": [
+     "is escalated once past the deadline, by the sweep, and no control-plane arm gets through meanwhile",
+     "refuses every arm past the deadline with no sweep having run at all, and is cleared by a confirmed disable"
+    ]
+   }
+  ],
+  "M12 enable request has no deadline": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds",
+    "failed": 1,
+    "passed": 12,
+    "failedNames": [
+     "applies its default deadline when no option is given"
+    ]
+   }
+  ],
+  "M13 a timed-out enable drops the record": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds",
+    "failed": 1,
+    "passed": 11,
+    "failedNames": [
+     "keeps the record when the enable call timed out: the arm may be in force"
+    ]
+   }
+  ],
+  "M14 sweep takes one record by default": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds",
+    "failed": 2,
+    "passed": 10,
+    "failedNames": [
+     "takes back an arm a previous process left in flight whatever the authority is now, and leaves a young record alone",
+     "holds the cap under concurrent admissions and a default sweep tries every record at it"
+    ]
+   }
+  ],
+  "M15 an escalated record does not refuse the arm with its own answer": [
+   {
+    "file": "src/services/merge-arming.test.ts",
+    "filter": "round 14|keeps the record when the enable call|drops the record when GitHub refused|holds the cap under concurrent|a take-back GitHub never confirms|whatever the authority|when the authority still holds",
+    "failed": 2,
+    "passed": 10,
+    "failedNames": [
+     "is escalated once past the deadline, by the sweep, and no control-plane arm gets through meanwhile",
+     "refuses every arm past the deadline with no sweep having run at all, and is cleared by a confirmed disable"
+    ]
+   }
+  ]
+ }
+}

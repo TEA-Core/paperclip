@@ -10,7 +10,9 @@ import {
 import { and, desc, eq, ilike, ne, sql, type SQL } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { retryPendingAutoMergeDisarms, type DisarmSweepSummary } from "./auto-merge-disarm.js";
 import {
+  resolveControlPlaneGitHubToken,
   resolveGitHubTokenCandidatesForRepo,
   type GitHubTokenResolution,
 } from "./github-credential.js";
@@ -18,11 +20,18 @@ import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { issueService } from "./issues.js";
 import {
   armMergeOnApproval,
+  createAuthorityGuard,
   ladderIncompleteStageIds,
   ladderIsTerminallyApproved,
   narrowToDelivered,
   postPullRequestComment,
   publishApprovalStatus,
+  consumableReleaseStatusId,
+  CONTROL_PLANE_STATUS_CREATOR_ID,
+  isArmRecordRefusal,
+  isHeadBoundReleaseDescription,
+  RELEASE_CONFIRMED_CONTEXT,
+  releaseConfirmedDescription,
   readCertifiedFinalDelivery,
   resolveCardPullRequest,
   resolveLinkedPullRequestsWithState,
@@ -30,6 +39,7 @@ import {
   type ArmingOutcome,
   type LinkedPullRequest,
   type MergeArmingDecision,
+  writeCommitStatusWithRetry,
 } from "./merge-arming.js";
 
 // SUP-13535. The paperclip/approved commit status is written exactly once, on
@@ -155,6 +165,8 @@ export interface ApprovalStatusReconcilerTickOptions {
 }
 
 export interface ApprovalStatusReconcilerTickSummary {
+  /** Pending auto-merge take-backs retried this tick (SUP-20772): see auto-merge-disarm.ts. */
+  disarm?: DisarmSweepSummary;
   /** Candidates that were processed this tick. */
   scanned: number;
   /** Candidates whose paperclip/approved status was (re)published. */
@@ -2583,6 +2595,82 @@ async function reserveRearmSlot(
   return reserved.length > 0;
 }
 
+/** Gives back a slot reserved by reserveRearmSlot when the arm was refused before anything reached GitHub. */
+async function releaseRearmSlot(db: Db, row: CandidateRow, headSha: string): Promise<void> {
+  await db
+    .update(issues)
+    .set({
+      executionState: sql`jsonb_set(
+        ${issues.executionState},
+        '{approvalStatus,armReattempt,attempts}',
+        to_jsonb(greatest((${issues.executionState} -> 'approvalStatus' -> 'armReattempt' ->> 'attempts')::int - 1, 0))
+      )`,
+    })
+    .where(
+      and(
+        eq(issues.id, row.id),
+        sql`${issues.executionState} -> 'approvalStatus' -> 'armReattempt' ->> 'headSha' = ${headSha}`,
+      ),
+    );
+}
+
+/**
+ * A board release (SUP-20772) is a human decision on one head, not a review. It stands in for the
+ * approval that lets the reconciler re-arm the merge only when it is the very status the publisher
+ * confirmed on a card whose review certified this PR and head (`confirmedReleaseStatusId`); a card
+ * without that, or a release whose confirmation is unknown or voided, never counts.
+ */
+function hasApprovedSuccess(statuses: Array<Record<string, unknown>>, confirmedReleaseStatusId: string | null): boolean {
+  return statuses.some(
+    (s) =>
+      s.context === PAPERCLIP_APPROVED_CONTEXT &&
+      s.state === "success" &&
+      (!isHeadBoundReleaseDescription(s.description) ||
+        (confirmedReleaseStatusId !== null && s.id !== undefined && s.id !== null && String(s.id) === confirmedReleaseStatusId)),
+  );
+}
+
+/**
+ * A board release this card CONFIRMED carries a second control-plane status, the marker CI requires beside it
+ * (RELEASE_CONFIRMED_CONTEXT). The marker is written after the confirmation commits; when that write failed
+ * the release is confirmed here and still unaccepted by CI. This writes it again, idempotently, only for a
+ * status the card confirmed and only when the head's statuses do not already show it. Best effort: a failure
+ * is reported, never thrown.
+ */
+async function repairReleaseConfirmationMarker(
+  db: Db,
+  row: CandidateRow,
+  target: { owner: string; repo: string },
+  headSha: string,
+  statuses: Array<Record<string, unknown>>,
+  confirmedReleaseStatusId: string | null,
+): Promise<string | null> {
+  if (confirmedReleaseStatusId === null) return null;
+  const approved = statuses.find((s) => s.context === PAPERCLIP_APPROVED_CONTEXT && s.state === "success");
+  if (!approved || approved.id === undefined || approved.id === null || String(approved.id) !== confirmedReleaseStatusId) return null;
+  const description = releaseConfirmedDescription(confirmedReleaseStatusId);
+  try {
+    // The combined status omits who wrote each status, so the marker is looked for on the list, with the
+    // same creator check CI applies: a status of that name from anyone but the control plane is not the
+    // marker, and does not stand in for it.
+    const listed = await ghReadJson(db, row.companyId, target.owner, target.repo, `/commits/${encodeURIComponent(headSha)}/statuses?per_page=100`);
+    if (!listed.ok) return `release-marker: statuses list unreadable (HTTP ${listed.status}); marker not checked`;
+    const list = Array.isArray(listed.body) ? (listed.body as Array<Record<string, unknown>>) : [];
+    const trusted = list.some((s) =>
+      s.context === RELEASE_CONFIRMED_CONTEXT && s.state === "success" && s.description === description &&
+      String((s.creator as { id?: unknown } | null | undefined)?.id ?? "") === CONTROL_PLANE_STATUS_CREATOR_ID);
+    if (trusted) return null;
+    const credential = await resolveControlPlaneGitHubToken(db, row.companyId, target.owner, target.repo);
+    if (!credential) return "release-marker: no control-plane credential";
+    const written = await writeCommitStatusWithRetry(credential.token, target.owner, target.repo, headSha, "", {
+      description, context: RELEASE_CONFIRMED_CONTEXT, attempts: 2, delayMs: 500,
+    });
+    return written.success ? `release-marker: re-wrote ${RELEASE_CONFIRMED_CONTEXT}` : `release-marker: write failed (${written.error ?? `HTTP ${written.status}`})`;
+  } catch (error) {
+    return `release-marker: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
 /**
  * SUP-17274 finding-1 (stale-live-head-authorization-race): re-validate the
  * live head at the arm boundary — immediately before the actuator — not just at
@@ -2624,7 +2712,15 @@ async function verifyLiveHeadStillStamped(
   const statuses = Array.isArray((headStatus.body as Record<string, unknown> | null)?.statuses)
     ? ((headStatus.body as Record<string, unknown>).statuses as Array<Record<string, unknown>>)
     : [];
-  return statuses.some((s) => s.context === PAPERCLIP_APPROVED_CONTEXT && s.state === "success");
+  // The certificate and the confirmed release are read last, after the head and the status: the answer
+  // is the card as it is at the arm boundary, not as it was when the sweep started.
+  const [fresh] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, row.id));
+  return hasApprovedSuccess(
+    statuses,
+    consumableReleaseStatusId(fresh?.executionState as Record<string, unknown> | null | undefined, {
+      owner: pr.owner, repo: pr.repo, number: pr.number, headSha,
+    }),
+  );
 }
 
 /**
@@ -2729,6 +2825,9 @@ async function attemptRearmOnHealedStamp(
   if (!certifiedPr) {
     return undefined;
   }
+  // The card's authority, captured before the arm boundary's own reads: a decision reversed, a certificate
+  // removed or a reviewer terminated after this point stops the arm, on every attempt.
+  const authorityGuard = await createAuthorityGuard(db, row.companyId, row.id, { requireApprovedLadder: true, headSha });
   if (!(await verifyLiveHeadStillStamped(db, row, headSha, certifiedPr, opts.requireStamped ?? true))) {
     return undefined;
   }
@@ -2748,12 +2847,19 @@ async function attemptRearmOnHealedStamp(
 
   let outcome: ArmingOutcome;
   try {
-    outcome = await armMergeOnApproval(db, row.companyId, row.id, decision, certifiedPr);
+    // Bound to the head just verified: GitHub refuses to enable auto-merge on a PR that has moved on.
+    outcome = await armMergeOnApproval(db, row.companyId, row.id, decision, certifiedPr, { expectedHeadOid: headSha, authorityGuard });
   } catch (err) {
     outcome = {
       kind: "failed",
       message: `failed:internal: re-arm actuator threw: ${err instanceof Error ? err.message : String(err)}`,
     };
+  }
+
+  if (isArmRecordRefusal(outcome.message)) {
+    await releaseRearmSlot(db, row, headSha).catch((err) => {
+      logger.warn({ err, issueId: row.id, headSha }, "re-arm slot could not be given back after a refused arm");
+    });
   }
 
   const at = new Date().toISOString();
@@ -2964,8 +3070,12 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
   const statuses = Array.isArray((headStatus.body as Record<string, unknown> | null)?.statuses)
     ? ((headStatus.body as Record<string, unknown>).statuses as Array<Record<string, unknown>>)
     : [];
-  const alreadyStamped = statuses.some((s) => s.context === PAPERCLIP_APPROVED_CONTEXT && s.state === "success");
+  const confirmedRelease = consumableReleaseStatusId(row.executionState as Record<string, unknown> | null | undefined, {
+    owner: target.owner, repo: target.repo, number: target.number, headSha,
+  });
+  const alreadyStamped = hasApprovedSuccess(statuses, confirmedRelease);
   if (alreadyStamped && (!certified || headSha === certified.headSha)) {
+    const markerNote = await repairReleaseConfirmationMarker(db, row, target, headSha, statuses, confirmedRelease);
     // SUP-17274: the stamp is on the live head, but the decision-time arm may
     // have never succeeded (it failed, the first publish was refused before the
     // arm and the stamp was later healed, or the card was stamped before arming
@@ -2977,7 +3087,7 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
     return {
       kind: "skipped",
       reason: "already-success",
-      detail: `already-success: ${target.displayName} head ${headSha.slice(0, 7)} already carries ${PAPERCLIP_APPROVED_CONTEXT}=success`,
+      detail: `already-success: ${target.displayName} head ${headSha.slice(0, 7)} already carries ${PAPERCLIP_APPROVED_CONTEXT}=success${markerNote ? `; ${markerNote}` : ""}`,
       rearm,
     };
   }
@@ -3598,6 +3708,14 @@ export async function runApprovalStatusReconcilerTick(
 ): Promise<ApprovalStatusReconcilerTickSummary> {
   const maxCandidates = options.maxCandidates ?? DEFAULT_MAX_CANDIDATES;
   const resumeAfter = options.resumeAfter ?? null;
+  // First, and independent of the candidate scan: an arm the card's authority no longer backs, that could not
+  // be turned off when it was found, is retried until GitHub confirms it is off.
+  let disarm: DisarmSweepSummary | undefined;
+  try {
+    disarm = await retryPendingAutoMergeDisarms(db);
+  } catch (err) {
+    logger.error({ err }, "pending auto-merge disarm sweep failed; continuing tick");
+  }
   const rows = await findApprovalCandidates(db, maxCandidates + 1, resumeAfter);
   const capped = Math.max(0, rows.length - maxCandidates);
   const batch = capped > 0 ? rows.slice(0, maxCandidates) : rows;
@@ -3611,6 +3729,7 @@ export async function runApprovalStatusReconcilerTick(
     capped > 0 && batch.length > 0 ? (batch[batch.length - 1]?.identifier ?? null) : null;
 
   const summary: ApprovalStatusReconcilerTickSummary = {
+    ...(disarm ? { disarm } : {}),
     scanned: 0,
     republished: 0,
     skipped: {},

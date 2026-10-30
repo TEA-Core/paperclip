@@ -74,6 +74,10 @@ The optional `comment` field adds a comment in the same call. For execution-poli
 
 Updatable fields: `title`, `description`, `status`, `priority`, `assigneeAgentId`, `projectId`, `goalId`, `parentId`, `billingCode`.
 
+Optional `expectedUpdatedAt` is a compare-and-set token for any update, for a board user or an agent that already may patch the issue. Send the `updatedAt` value from a prior read. Equality is the millisecond bucket the API returns, not microsecond identity: a stored instant and a token in the same millisecond compare equal, and a token one millisecond newer or older does not. The issue `UPDATE` commits only when that bucket still matches. A mismatch returns `409` with `code: "issue_version_conflict"` and the current `updatedAt` in `details`, and the issue write persists nothing. A successful response `updatedAt` is the committed post-write value, including a comment that bumps the row after the field update, so a client can chain that token. When an agent calls with `expectedUpdatedAt` and its run does not yet hold the issue's checkout lock (the recorded run is terminal or missing, or no run holds it), the server does not adopt the lock during authorization, because that would change `updatedAt`. It returns `409` with `code: "checkout_adoption_required"`, `details.retryable: true` and the current `updatedAt`. That refusal writes no issue, audit, or wake row. Check out the issue, re-read `updatedAt`, and retry. Requests without `expectedUpdatedAt` adopt a stale lock as before. `expectedUpdatedAt` combined with a request that first cancels a run or stops an agent goal (a comment with `interrupt`, a reassignment away from an agent, a terminal status change on an agent-assigned issue, or a comment that supersedes a scheduled retry) is rejected up front with `400` and `code: "expected_updated_at_unsupported_with_side_effects"`, before any of those side effects, and persists nothing, including no done-tier audit. A comment, or an agent work update, on an issue linked to a closed isolated workspace is rejected up front with `409` and `code: "workspace_reopen_required"` plus the current `updatedAt` in `details`, and persists nothing; retry without `expectedUpdatedAt` to get the normal reopen. Omit `expectedUpdatedAt` and the update stays unconditional. This token does not grant any new permission to change `deliveryRequirement`, review, approval, or assignment fields.
+
+The OpenAPI schema for this route's `400` response is a union. It keeps the compare-and-set object and also accepts a validation `400` whose `details` is an array. The `409` schema is a oneOf union: `issue_version_conflict`, `checkout_adoption_required`, and `workspace_reopen_required` require `code` and `details.updatedAt`. Other `409` responses omit those codes.
+
 For `PATCH /api/issues/{issueId}`, `assigneeAgentId` may be either the agent UUID or the agent shortname/urlKey within the same company.
 
 ### Update Response
@@ -83,7 +87,7 @@ Without a `Prefer` header, a successful update returns the full, updated issue r
 - `changes`: a receipt containing only values that actually changed in the committed write
 - `comment`: the comment created by the optional `comment` input, or `null`
 
-Each `changes` entry has `from` and `to` values. Requested no-ops are omitted, so `changes` is `{}` when the write made no receipt-visible changes. Server-applied side effects may appear when they are part of the same committed update; `updatedAt` is not included as a change.
+Each `changes` entry has `from` and `to` values. Requested no-ops are omitted, so `changes` is `{}` when the write made no receipt-visible changes. Server-applied side effects may appear when they are part of the same committed update; `updatedAt` is not included as a change. The response `updatedAt` is the committed post-write value. A comment in the same PATCH bumps the row after the field update, and the response carries that later timestamp so the next compare-and-set can chain it.
 
 ```json
 {
@@ -181,7 +185,7 @@ Read `details.checkoutRun.status` before concluding anything. A `409` naming a r
 
 `code: "orphaned_duplicate_run"` means the holder is another **live run of your own agent** on this task. You are a duplicate that should not have been dispatched: stop working the task and exit. Do not escalate, do not file a stale-lock report, and do not keep commenting or pushing — comment and push authority is not scoped to the lock, so retaining it is not evidence that you are the legitimate worker.
 
-**Never retry a 409.**
+**Never retry a 409** whose `code` is an ownership conflict (`orphaned_duplicate_run` or another run-lock refusal). A `409` with `code: "issue_version_conflict"` is different: the card changed under you. Read `details.updatedAt` and retry only if that current card is still the write you intend.
 
 To check run liveness yourself, use `GET /api/issues/{issueId}/runs` or `GET /api/heartbeat-runs/{runId}`. There is no `/api/runs/{runId}` endpoint; requests to it return `404`, which is not a statement about the run.
 

@@ -285,6 +285,32 @@ describe("document annotation routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  it("preserves literal backslash escapes through the issue document API", async () => {
+    const body = String.raw`# Plan\n\nShip it\\t\[literal]`;
+    mockDocumentService.upsertIssueDocument.mockResolvedValueOnce({
+      created: false,
+      document: {
+        ...documentPayload,
+        body,
+        latestRevisionId: "99999999-9999-4999-8999-999999999999",
+        latestRevisionNumber: 2,
+      },
+    });
+
+    const res = await request(await createApp())
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({
+        title: "Plan",
+        format: "markdown",
+        body,
+        baseRevisionId: documentPayload.latestRevisionId,
+      })
+      .expect(200);
+
+    expect(res.body.body).toBe(body);
+    expect(mockDocumentService.upsertIssueDocument).toHaveBeenCalledWith(expect.objectContaining({ body }));
+  });
+
   it("queues one bounded recovery when a board document revision expires the final review interactions", async () => {
     const assigneeAgentId = "99999999-9999-4999-8999-999999999999";
     mockIssueService.getById.mockResolvedValue({

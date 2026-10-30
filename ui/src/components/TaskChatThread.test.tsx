@@ -11,6 +11,7 @@ import { TaskChatThread } from "./TaskChatThread";
 import type {
   IssueDocument,
   IssueQueuedCommentQueue,
+  IssueRecoveryAction,
   IssueThreadInteraction,
 } from "@paperclipai/shared";
 import { heartbeatsApi } from "@/api/heartbeats";
@@ -2471,6 +2472,60 @@ describe("TaskChatThread no-live-execution-path recovery", () => {
         '[data-testid="task-chat-no-live-path-try-again"]',
       ),
     ).toBeNull();
+  });
+});
+
+describe("TaskChatThread recovery action card", () => {
+  it("renders a close_arm_failed recovery action in the default thread", () => {
+    const recoveryAction = {
+      id: "recovery-1",
+      companyId: "company-1",
+      sourceIssueId: "issue-1",
+      recoveryIssueId: null,
+      kind: "close_arm_failed",
+      status: "active",
+      ownerType: "board",
+      ownerAgentId: null,
+      ownerUserId: null,
+      previousOwnerAgentId: null,
+      returnOwnerAgentId: null,
+      cause: "Auto-merge is disabled for this repository.",
+      fingerprint: "close_arm_failed:company-1:issue-1:head",
+      evidence: {
+        identifier: "SUP-1",
+        headSha: "a".repeat(40),
+        outcomeKind: "failed",
+        outcomeMessage: "Auto-merge is disabled for this repository.",
+      },
+      nextAction:
+        "Inspect the merge-arming failure, then enable repository auto-merge or land the certified pull request manually before resolving this recovery action.",
+      wakePolicy: null,
+      monitorPolicy: null,
+      attemptCount: 1,
+      maxAttempts: 5,
+      timeoutAt: null,
+      lastAttemptAt: "2026-08-15T12:00:00.000Z",
+      outcome: null,
+      resolutionNote: null,
+      resolvedAt: null,
+      createdAt: "2026-08-15T12:00:00.000Z",
+      updatedAt: "2026-08-15T12:00:00.000Z",
+    } as unknown as IssueRecoveryAction;
+
+    render(
+      <TaskChatThread
+        comments={createLongThreadComments()}
+        onAdd={async () => {}}
+        issueStatus="done"
+        recoveryAction={recoveryAction}
+        onResolveRecoveryAction={vi.fn()}
+      />,
+    );
+
+    expect(container.textContent).toContain("Close-time Merge Arm Failed");
+    expect(container.textContent).toContain(
+      "Auto-merge is disabled for this repository.",
+    );
   });
 });
 

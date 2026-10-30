@@ -1,0 +1,50 @@
+{
+  "old-head 681e0d70": [
+    {
+      "file": "src/services/merge-arming.test.ts",
+      "filter": "take-back record written before the arm|window from the provider accepting|revocation matrix",
+      "failed": 9,
+      "passed": 9,
+      "failedNames": [
+        "is on the card while GitHub is asked to enable, and gone once the arm stands",
+        "arms nothing when the record cannot be written",
+        "keeps the record when GitHub gives no answer, and the sweep takes the arm back when the authority changed",
+        "keeps the record when GitHub gives no answer, and the sweep only drops the record when the authority still holds",
+        "takes back an arm a previous process left in flight when the authority changed, and leaves a young record alone",
+        "refuses a second arm while the card holds a record",
+        "refuses to arm at the backlog cap and still takes every recorded arm back",
+        "a restart resumes the take-backs the last process left, at once and then with the prompt retries",
+        "provider round trip 0 ms, merges 0 ms after accepting"
+      ]
+    },
+    {
+      "file": "src/__tests__/merge-arming-republish.test.ts",
+      "filter": "cancel during connection startup|late provider success, judged",
+      "failed": 4,
+      "passed": 10,
+      "failedNames": [
+        "pooled (pool 1): a cancel during connection startup leaves no unhandled rejection",
+        "pooled (pool 2): a cancel during connection startup leaves no unhandled rejection",
+        "pooled (pool 3): a cancel during connection startup leaves no unhandled rejection",
+        "pooled (pool 10): a cancel during connection startup leaves no unhandled rejection"
+      ]
+    },
+    {
+      "file": "src/services/approval-status-reconciler.test.ts",
+      "filter": "revocation matrix through the real",
+      "failed": 0,
+      "passed": 8,
+      "failedNames": []
+    },
+    {
+      "file": "src/services/done-close-landing-backstop.test.ts",
+      "filter": "revocation matrix through the real backstop|opens the take-back record|arms nothing when the take-back",
+      "failed": 2,
+      "passed": 8,
+      "failedNames": [
+        "opens the take-back record before the enable call and forgets it once the arm stands",
+        "arms nothing when the take-back record is refused"
+      ]
+    }
+  ]
+}

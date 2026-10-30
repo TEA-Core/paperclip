@@ -27,6 +27,7 @@ export type WakeSkipReason =
   | "heartbeat.wakeOnDemand.disabled"
   | "company.inactive"
   | "issue_tree_hold_active"
+  | "heartbeat.nested_issue_owner_changed"
   | "heartbeat.timer.all_work_leased"
   | "heartbeat.timer.no_actionable_work"
   | "execution_reconciliation_required";
@@ -52,6 +53,7 @@ export const WAKE_SKIP_CLASSIFICATION: Record<WakeSkipReason, WakeSkipClass> = {
   "heartbeat.wakeOnDemand.disabled": "terminal",
   "company.inactive": "terminal",
   "issue_tree_hold_active": "terminal",
+  "heartbeat.nested_issue_owner_changed": "terminal",
   "heartbeat.timer.all_work_leased": "terminal",
   "heartbeat.timer.no_actionable_work": "terminal",
 };

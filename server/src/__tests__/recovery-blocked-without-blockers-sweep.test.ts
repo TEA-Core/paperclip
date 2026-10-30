@@ -56,7 +56,6 @@ vi.mock("../adapters/index.ts", async () => {
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { hasUsableUnblockDescriptor, isBlockedWithoutBlockers } from "../services/recovery/service.ts";
-import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "../services/issue-dependency-wakeups.ts";
 
 // loadConfig() in recovery/service.ts validates bind mode eagerly.
 process.env.PAPERCLIP_BIND = "loopback";
@@ -140,7 +139,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedCompanyAndAgent() {
+  async function seedCompanyAndAgent(overrides?: { agentRole?: string }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     await db.insert(companies).values({
@@ -154,7 +153,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       id: agentId,
       companyId,
       name: "Coder",
-      role: "engineer",
+      role: overrides?.agentRole ?? "engineer",
       status: "active",
       adapterType: "codex_local",
       adapterConfig: {},
@@ -443,91 +442,6 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(isBlockedWithoutBlockers({ status: "blocked", blockerIssueIds: ["x"] })).toBe(false);
     expect(isBlockedWithoutBlockers({ status: "todo", blockerIssueIds: [] })).toBe(false);
     expect(isBlockedWithoutBlockers({ status: "done", blockerIssueIds: [] })).toBe(false);
-  });
-
-  it("re-arm cap creates board-owned recovery action instead of wake", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent();
-    const issueId = randomUUID();
-    const blockerId = randomUUID();
-    const now = new Date("2026-08-05T12:00:00.000Z");
-    const longAgo = new Date("2026-08-01T00:00:00.000Z");
-
-    await db.insert(issues).values([
-      {
-        id: issueId,
-        companyId,
-        title: "Dependent blocked issue",
-        status: "blocked",
-        priority: "high",
-        assigneeAgentId: agentId,
-        updatedAt: oldDate(),
-      },
-      {
-        id: blockerId,
-        companyId,
-        title: "Resolved blocker",
-        status: "done",
-        priority: "high",
-        assigneeAgentId: agentId,
-      },
-    ]);
-    await db.insert(issueRelations).values({
-      id: randomUUID(),
-      companyId,
-      type: "blocks",
-      issueId: blockerId,
-      relatedIssueId: issueId,
-    });
-    const wakeIdempotencyKey = `${ISSUE_BLOCKERS_RESOLVED_WAKE_REASON}:${issueId}:${blockerId}`;
-    await db.insert(agentWakeupRequests).values(
-      [1, 2, 3].map(() => ({
-        id: randomUUID(),
-        companyId,
-        agentId,
-        source: "blockers_resolved_wake",
-        status: "completed" as const,
-        idempotencyKey: wakeIdempotencyKey,
-        runId: randomUUID(),
-        createdAt: longAgo,
-        updatedAt: longAgo,
-        payload: null,
-      })),
-    );
-
-    const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileResolvedDependencyWakeBackstop({
-      now,
-      rearmWindowMs: 100,
-      rearmMaxCount: 3,
-      companyId,
-    });
-
-    expect(result.checked).toBe(1);
-    expect(result.reArmCapEscalated).toBe(1);
-    expect(result.reArmCapSkipped).toBe(0);
-    expect(result.reArmCapEscalatedIssueIds).toEqual([issueId]);
-    expect(result.healed).toBe(0);
-
-    const action = await db
-      .select()
-      .from(issueRecoveryActions)
-      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
-      .then((rows) => rows[0]);
-    expect(action).toMatchObject({
-      companyId,
-      sourceIssueId: issueId,
-      kind: "blocked_without_blockers",
-      ownerType: "board",
-      previousOwnerAgentId: agentId,
-      cause: "dependency_wake_rearm_cap_exhausted",
-      fingerprint: `drearm:${companyId}:${issueId}`,
-      nextAction: expect.stringContaining("woken multiple times"),
-    });
-    expect(action?.evidence).toMatchObject({
-      identifier: null,
-      reArmCount: 3,
-      reArmMax: 3,
-    });
   });
 
   it("sweeps pre-cutoff issues (no createdAt filter)", async () => {
@@ -1835,15 +1749,25 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       maxAttempts: 5,
     });
 
-    // Passes 2 and 3: the candidate is still suppressed and the counter still
-    // increments, but no further row is written.
+    // Passes 2 and 3: SUP-21344 arms a board monitor on pass 1, so the card now
+    // has a future monitor and `hasActiveExecutionPath` drains it before the
+    // grace window (its updatedAt is now the monitor write) re-fails —
+    // the card is no longer double-counted as suppressed, no heal/escalation
+    // occurs, and no further suppression row is written.
     for (const pass of [2, 3] as const) {
       const result = await heartbeat.reconcileBlockedWithoutBlockers();
-      expect(result.exhaustedRecoverySuppressed).toBe(1);
+      expect(result.exhaustedRecoverySuppressed).toBe(0);
       expect(result.healed).toBe(0);
       expect(result.escalated).toBe(0);
       expect(await countSuppressionRows(issueId)).toBe(1);
     }
+    const [drainedIssue] = await db
+      .select({ monitorNextCheckAt: issues.monitorNextCheckAt, monitorScheduledBy: issues.monitorScheduledBy })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(drainedIssue.monitorNextCheckAt).not.toBeNull();
+    expect(drainedIssue.monitorNextCheckAt!.getTime()).toBeGreaterThan(Date.now());
+    expect(drainedIssue.monitorScheduledBy).toBe("board");
 
     // The issue is still blocked and the terminal action is untouched.
     const row = await db
@@ -1852,6 +1776,294 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(row?.status).toBe("blocked");
+  });
+
+  it("SUP-21344: exhausted drain on a blocked card with no agent assignee arms no fake monitor but links an owned recovery issue", async () => {
+    // Role "cto" puts the seed agent on the stranded-owner ladder as a
+    // resolvable owner candidate (the action's previousOwnerAgentId is not a
+    // ladder input, so a lone engineer never becomes a recovery owner here).
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
+    await enableBlockedWithoutBlockersAutoHeal();
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked behind an exhausted recovery action, unassigned",
+      status: "blocked",
+      priority: "high",
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileBlockedWithoutBlockers();
+    expect(result.exhaustedRecoverySuppressed).toBe(1);
+    expect(await countSuppressionRows(issueId)).toBe(1);
+
+    // The scheduler can never fire a monitor without an agent assignee, so
+    // the drain must not write monitor columns claiming a live wake.
+    const [drainedIssue] = await db
+      .select({
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        monitorScheduledBy: issues.monitorScheduledBy,
+        executionPolicy: issues.executionPolicy,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(drainedIssue.monitorNextCheckAt).toBeNull();
+    expect(drainedIssue.monitorScheduledBy).toBeNull();
+    expect((drainedIssue.executionPolicy as { monitor?: unknown } | null)?.monitor).toBeUndefined();
+
+    // Instead the action now links a durable, non-terminal recovery issue
+    // owned by an invokable agent (the manager-ladder owner for the seed
+    // agent), and the owner's wake was enqueued for it.
+    const [action] = await db
+      .select({ recoveryIssueId: issueRecoveryActions.recoveryIssueId })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action.recoveryIssueId).not.toBeNull();
+    const [recoveryIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, action.recoveryIssueId!));
+    expect(recoveryIssue).toBeDefined();
+    expect(recoveryIssue.status).toBe("todo");
+    expect(recoveryIssue.assigneeAgentId).toBe(agentId);
+    expect(recoveryIssue.originKind).toBe("stranded_issue_recovery");
+    expect(recoveryIssue.originId).toBe(issueId);
+
+    const ownerWakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(ownerWakes.length).toBeGreaterThan(0);
+
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const drainComment = comments.find((c) => (c.body ?? "").includes("Board decision item:"));
+    expect(drainComment).toBeDefined();
+    expect(drainComment!.body).toContain("not monitor-dispatchable");
+    expect(drainComment!.body).toContain(action.recoveryIssueId!);
+    expect(drainComment!.body).not.toContain("board check armed for");
+
+    // Idempotency: later passes reuse the linked recovery issue rather than
+    // minting a duplicate for the same exhausted action.
+    await heartbeat.reconcileBlockedWithoutBlockers();
+    const recoveryIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(recoveryIssues).toHaveLength(1);
+  });
+
+  it("SUP-21344: baseline drain arms a future board monitor on a non-blocked exhausted source and adds no comments on repeat passes", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "In review behind an exhausted recovery action",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileExhaustedRecoveryDrain();
+    expect(result.checked).toBe(1);
+    expect(result.monitorArmed).toBe(1);
+    expect(result.recoveryIssueMinted).toBe(0);
+
+    const [drainedIssue] = await db
+      .select({
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        monitorScheduledBy: issues.monitorScheduledBy,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(drainedIssue.monitorNextCheckAt).not.toBeNull();
+    expect(drainedIssue.monitorNextCheckAt!.getTime()).toBeGreaterThan(Date.now());
+    expect(drainedIssue.monitorScheduledBy).toBe("board");
+
+    const commentsAfterFirstPass = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const second = await heartbeat.reconcileExhaustedRecoveryDrain();
+    expect(second.monitorArmed).toBe(0);
+    expect(second.recoveryIssueMinted).toBe(0);
+    expect(second.alreadyLive).toBe(1);
+    const commentsAfterSecondPass = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(commentsAfterSecondPass).toHaveLength(commentsAfterFirstPass.length);
+  });
+
+  it("SUP-21344: baseline drain mints an owned recovery issue for an exhausted todo source with no agent assignee", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Todo behind an exhausted recovery action, unassigned",
+      status: "todo",
+      priority: "high",
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileExhaustedRecoveryDrain();
+    expect(result.checked).toBe(1);
+    expect(result.monitorArmed).toBe(0);
+    expect(result.recoveryIssueMinted).toBe(1);
+
+    const [sourceIssue] = await db
+      .select({
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        monitorScheduledBy: issues.monitorScheduledBy,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(sourceIssue.monitorNextCheckAt).toBeNull();
+    expect(sourceIssue.monitorScheduledBy).toBeNull();
+
+    const [action] = await db
+      .select({ recoveryIssueId: issueRecoveryActions.recoveryIssueId })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action.recoveryIssueId).not.toBeNull();
+    const [recoveryIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, action.recoveryIssueId!));
+    expect(recoveryIssue).toBeDefined();
+    expect(recoveryIssue.status).toBe("todo");
+    expect(recoveryIssue.assigneeAgentId).toBe(agentId);
+    expect(recoveryIssue.originKind).toBe("stranded_issue_recovery");
+    expect(recoveryIssue.originId).toBe(issueId);
+
+    const ownerWakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(ownerWakes.length).toBeGreaterThan(0);
+
+    const second = await heartbeat.reconcileExhaustedRecoveryDrain();
+    expect(second.monitorArmed).toBe(0);
+    expect(second.recoveryIssueMinted).toBe(0);
+    expect(second.alreadyLive).toBe(1);
+    const recoveryIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(recoveryIssues).toHaveLength(1);
+  });
+
+  it("SUP-21344-review: reused exhausted recovery issue re-enqueues the owner wake when no live wake remains", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Todo behind an exhausted recovery action, reused recovery issue",
+      status: "todo",
+      priority: "high",
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    const heartbeat = heartbeatService(db);
+    const first = await heartbeat.reconcileExhaustedRecoveryDrain();
+    expect(first.recoveryIssueMinted).toBe(1);
+    const [action] = await db
+      .select({ recoveryIssueId: issueRecoveryActions.recoveryIssueId })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action.recoveryIssueId).not.toBeNull();
+
+    // Simulate the first owner wake having been consumed without producing a
+    // disposition: a reused recovery issue must not stay a silent terminal sink.
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "cancelled" })
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    await drainAgentRuns(agentId);
+    const wakesBeforeReuse = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+
+    const second = await heartbeat.reconcileExhaustedRecoveryDrain();
+    expect(second.recoveryIssueMinted).toBe(0);
+    expect(second.alreadyLive).toBe(1);
+
+    const wakesAfterReuse = await db
+      .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status, payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakesAfterReuse.length).toBeGreaterThan(wakesBeforeReuse.length);
+    expect(wakesAfterReuse.some((wake) => {
+      const payload = wake.payload as { issueId?: unknown } | null;
+      return payload?.issueId === action.recoveryIssueId;
+    })).toBe(true);
+  });
+
+  it("SUP-21344-review: concurrent exhausted drains mint at most one recovery issue per source", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Todo behind an exhausted recovery action, concurrent drains",
+      status: "todo",
+      priority: "high",
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    const heartbeat = heartbeatService(db);
+    const results = await Promise.all([
+      heartbeat.reconcileExhaustedRecoveryDrain(),
+      heartbeat.reconcileExhaustedRecoveryDrain(),
+    ]);
+    expect(results.every((result) => result.checked >= 1)).toBe(true);
+
+    const recoveryIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(recoveryIssues).toHaveLength(1);
+
+    const [action] = await db
+      .select({ recoveryIssueId: issueRecoveryActions.recoveryIssueId })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action.recoveryIssueId).toBe(recoveryIssues[0]?.id);
   });
 
   it("flag ON + replacement exhausted recovery action (different id) — writes a fresh suppression row (SUP-14244)", async () => {
@@ -1919,9 +2131,20 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       lastAttemptAt: oldDate(),
     });
 
+    // SUP-21344: the first pass armed a board monitor and refreshed updatedAt,
+    // so the next sweep still sits inside the blocked-without-blockers grace
+    // window. Once that window elapses, the future monitor makes the card
+    // live-path skipped. Either way it must not double-record while armed.
     const second = await heartbeat.reconcileBlockedWithoutBlockers();
-    expect(second.exhaustedRecoverySuppressed).toBe(1);
-    expect(await countSuppressionRows(issueId)).toBe(2);
+    expect(second.exhaustedRecoverySuppressed).toBe(0);
+    expect(await countSuppressionRows(issueId)).toBe(1);
+    const [drainedIssue] = await db
+      .select({ monitorNextCheckAt: issues.monitorNextCheckAt, monitorScheduledBy: issues.monitorScheduledBy })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(drainedIssue.monitorNextCheckAt).not.toBeNull();
+    expect(drainedIssue.monitorNextCheckAt!.getTime()).toBeGreaterThan(Date.now());
+    expect(drainedIssue.monitorScheduledBy).toBe("board");
 
     const rows = await db
       .select({ details: activityLog.details })
@@ -1935,7 +2158,10 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     const suppressorIds = rows
       .map((r) => ((r.details as { suppressedBy: { id: string } }).suppressedBy.id))
       .sort();
-    expect(suppressorIds).toEqual([firstActionId, replacementActionId].sort());
+    // SUP-21344: only the first suppressor is recorded while the board monitor
+    // is armed; the replacement action is recorded on a later pass once the
+    // monitor has been consumed (board acted or check elapsed).
+    expect(suppressorIds).toEqual([firstActionId]);
   });
 });
 

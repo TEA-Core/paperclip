@@ -16,7 +16,11 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { armMergeOnApproval, publishApprovalStatus, resolveLinkedPullRequests, shouldPublishApprovalStatus, type MergeArmingDecision } from "../services/merge-arming.js";
+import { armMergeOnApproval as armMergeOnApprovalReal, enableAutoMerge, publishApprovalStatus, resolveLinkedPullRequests, shouldPublishApprovalStatus, type MergeArmingDecision } from "../services/merge-arming.js";
+// The arm gate names the head it is written to. These cases do not model a head read, so an arm that names none is given one;
+// the case about an unbound arm passes `{}` itself and models the read.
+const armMergeOnApproval: typeof armMergeOnApprovalReal = (db, companyId, issueId, decision, pr, options) =>
+  armMergeOnApprovalReal(db, companyId, issueId, decision, pr, options ?? { expectedHeadOid: "d".repeat(40) });
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -30,7 +34,19 @@ vi.mock("../services/secrets.js", () => ({
 }));
 
 vi.mock("../services/github-fetch.js", () => ({
-  ghFetch: mockGhFetch,
+  ghFetch: (url: string, init?: RequestInit) => {
+    // The arming actuator writes a `paperclip/arm-gate` status around every enable; GitHub accepts it here, apart from each test's own fake.
+    if (typeof url === "string" && /\/statuses\//.test(url) && init?.method === "POST" && String(init.body ?? "").includes('"paperclip/arm-gate"')) {
+      return Promise.resolve({ ok: true, status: 201, json: async () => ({ id: 9000 }) } as unknown as Response);
+    }
+    // An arm that names no head reads the PR's live head for the gate; a fake that does not model that read gets one.
+    return Promise.resolve(mockGhFetch(url, init)).catch((error: unknown) => {
+      if (typeof url === "string" && /\/pulls\/\d+$/.test(url) && /unmocked|unexpected/i.test(String((error as Error)?.message))) {
+        return { ok: true, status: 200, json: async () => ({ head: { sha: "c".repeat(40), ref: "live-head" }, state: "open", draft: false, merged: false }) } as unknown as Response;
+      }
+      throw error;
+    });
+  },
   gitHubApiBase: (hostname: string) =>
     hostname === "github.com" ? "https://api.github.com" : `https://${hostname}/api/v3`,
 }));
@@ -474,6 +490,21 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
       expect(mockGhFetch).toHaveBeenCalledTimes(1);
     });
 
+    it("SUP-20772: the enable mutation carries the expected head when given one, and refuses a malformed one without any call", async () => {
+      const head = "a".repeat(40);
+      mockGhFetch.mockResolvedValueOnce(
+        createMockResponse({ data: { enablePullRequestAutoMerge: { clientMutationId: "abc" } } }),
+      );
+      expect(await enableAutoMerge("tok", "PR_node", { expectedHeadOid: head })).toMatchObject({ success: true });
+      const body = JSON.parse(String(mockGhFetch.mock.calls[0]![1].body));
+      expect(body.query).toContain(`expectedHeadOid: "${head}"`);
+
+      mockGhFetch.mockClear();
+      const bad = await enableAutoMerge("tok", "PR_node", { expectedHeadOid: 'x"}) { evil' });
+      expect(bad).toMatchObject({ success: false });
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
     it("arms when the branch names the transitioning issue and the title names no card (SUP-12421 behaviour)", async () => {
       await insertMention(
         createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
@@ -607,6 +638,25 @@ describeEmbeddedPostgres("armMergeOnApproval", () => {
       const body = JSON.parse(graphqlCall[1]!.body as string);
       expect(body.query).toContain("enablePullRequestAutoMerge");
       expect(body.query).toContain(NODE_ID);
+    });
+
+    it("binds the arm to the head the caller authorized, and leaves it unbound when none is given", async () => {
+      await insertMention(
+        createPRExternalObject(companyId, "TEA-Core", "paperclip", 42, {
+          headRefName: `${issueIdentifier}-some-branch`,
+        }),
+      );
+      const head = "c".repeat(40);
+      mockGhFetch.mockImplementation(async (url: string) => url.endsWith("/pulls/42")
+        ? createMockResponse({ head: { sha: head, ref: "live" }, state: "open", draft: false, merged: false })
+        : createMockResponse({ data: { enablePullRequestAutoMerge: { clientMutationId: "abc" } } }));
+
+      expect((await armMergeOnApproval(db, companyId, issueId, DECISION, undefined, { expectedHeadOid: head })).kind).toBe("armed");
+      expect((await armMergeOnApproval(db, companyId, issueId, DECISION, undefined, {})).kind).toBe("armed");
+
+      const queries = mockGhFetch.mock.calls.filter((call) => call[0] === "https://api.github.com/graphql").map((call) => String(JSON.parse(call[1]!.body as string).query));
+      expect(queries[0]).toContain(`expectedHeadOid: "${head}"`);
+      expect(queries[1]).not.toContain("expectedHeadOid");
     });
 
     it("resolves node_id via REST API when not present in external object data", async () => {

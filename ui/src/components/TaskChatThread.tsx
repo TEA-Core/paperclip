@@ -16,6 +16,7 @@ import {
   IssueAssigneePausedNotice,
   IssueChatThread,
 } from "@/components/IssueChatThread";
+import { IssueRecoveryActionCard } from "@/components/IssueRecoveryActionCard";
 import {
   useLiveRunTranscripts,
   type RunTranscriptSource,
@@ -2916,6 +2917,25 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 )}
               </div>
             </div>
+            {props.recoveryAction ? (
+              <div className="mx-auto w-full max-w-(--tc-shell-max-w) px-4 pt-2">
+                <IssueRecoveryActionCard
+                  action={props.recoveryAction}
+                  agentMap={agentMap}
+                  scheduledRetry={props.scheduledRetry}
+                  onResolve={props.onResolveRecoveryAction}
+                  onReissueIsolated={props.onReissueIsolatedRecoveryAction}
+                  reissuePending={props.reissueIsolatedRecoveryActionPending}
+                  onReconcileForward={props.onReconcileForwardRecoveryAction}
+                  onBreakGlassOverride={props.onBreakGlassOverrideRecoveryAction}
+                  onQuarantineRestore={props.onQuarantineRestoreRecoveryAction}
+                  quarantineRestorePending={props.quarantineRestoreRecoveryActionPending}
+                  canBreakGlass={props.canBreakGlassRecoveryAction}
+                  reconcilePending={props.reconcileRecoveryActionPending}
+                  canFalsePositive={props.canFalsePositiveRecoveryAction}
+                />
+              </div>
+            ) : null}
             {assignedAgentForNotice?.status === "paused" ? (
               <div className="mx-auto w-full max-w-(--tc-shell-max-w) px-4 pt-2">
                 <IssueAssigneePausedNotice

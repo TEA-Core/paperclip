@@ -24,6 +24,17 @@ export function toContinuationPathDate(value: Date | string | null | undefined):
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
+// SUP-21344 / SUP-21122 — the shared cross-lane terminal-action predicate. A
+// recovery action at its attempt ceiling (`escalated` + `outcome: "exhausted"`)
+// is terminal: the ladder is dead and parked on the board, so it satisfies no
+// continuation disjunct on any lane (issue list, attention, weekly-report §2a).
+// Every lane must test through this one predicate instead of re-deriving it.
+export function isTerminalRecoveryAction(
+  action: { status?: string | null; outcome?: string | null } | null | undefined,
+): boolean {
+  return action?.status === "escalated" && action.outcome === "exhausted";
+}
+
 export interface ContinuationPathEvidence {
   activeRun: boolean;
   monitorNextCheckAt: Date | string | null | undefined;
@@ -64,8 +75,14 @@ export function evaluateIssueContinuationPath(
       monitorNextCheckAt !== null && monitorNextCheckAt.getTime() > now.getTime(),
     watchdog: evidence.watchdog !== null && evidence.watchdog !== undefined,
     scheduledRetry: evidence.scheduledRetry !== null && evidence.scheduledRetry !== undefined,
+    // Terminal actions (ceiling exhausted) come in as row objects from the
+    // recovery-action readers; they are not a live continuation path.
     activeRecoveryAction:
-      evidence.activeRecoveryAction !== null && evidence.activeRecoveryAction !== undefined,
+      evidence.activeRecoveryAction !== null &&
+      evidence.activeRecoveryAction !== undefined &&
+      !isTerminalRecoveryAction(
+        evidence.activeRecoveryAction as { status?: string | null; outcome?: string | null },
+      ),
     successfulRunHandoffLive: evidence.successfulRunHandoff?.hasLiveContinuation === true,
   };
   const settledWithinWindow =

@@ -33,6 +33,7 @@ import {
   type ApprovalStatusReconcilerTickSummary,
   type CandidateRow,
 } from "./approval-status-reconciler.js";
+import { clearAutoMergeDisarmRecord, recordPendingAutoMergeDisarm } from "./merge-arming.js";
 
 // SUP-15851 C1: `latestDecisionPerStage` is a pure helper (rows in, one Map by
 // stage out); this probe needs no DB and runs regardless of embedded-Postgres
@@ -81,8 +82,20 @@ vi.mock("./secrets.js", () => ({
   }),
 }));
 
+const mockResolveControlPlaneToken = vi.hoisted(() => vi.fn());
+vi.mock("./github-credential.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./github-credential.js")>()),
+  resolveControlPlaneGitHubToken: mockResolveControlPlaneToken,
+}));
+
 vi.mock("./github-fetch.js", () => ({
-  ghFetch: mockGhFetch,
+  // The arming actuator writes a `paperclip/arm-gate` status around every enable; GitHub accepts it here, apart from each cell's own fake.
+  ghFetch: (url: string, init?: RequestInit) => {
+    if (typeof url === "string" && /\/statuses\//.test(url) && init?.method === "POST" && String(init.body ?? "").includes('"paperclip/arm-gate"')) {
+      return Promise.resolve({ ok: true, status: 201, json: async () => ({ id: 9000 }) } as unknown as Response);
+    }
+    return mockGhFetch(url, init);
+  },
   gitHubApiBase: (hostname: string) =>
     hostname === "github.com" ? "https://api.github.com" : `https://${hostname}/api/v3`,
 }));
@@ -390,7 +403,8 @@ function postStatusCalls() {
   return mockGhFetch.mock.calls.filter((call) => {
     const url = String(call[0]);
     const init = call[1] as RequestInit | undefined;
-    return url.includes("/statuses") && init?.method === "POST";
+    // The arm gate (paperclip/arm-gate) is a separate context the arming actuator writes around every enable: these cells count approvals.
+    return url.includes("/statuses") && init?.method === "POST" && !String(init.body ?? "").includes('"paperclip/arm-gate"');
   });
 }
 
@@ -489,6 +503,7 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockResolvedValue(GITHUB_TOKEN);
     mockGhFetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({}) } as unknown as Response);
+    mockResolveControlPlaneToken.mockResolvedValue({ token: "ghs_control_plane_app_token", scope: "app_installation", secretName: "GITHUB_APP_PRIVATE_KEY" });
 
     // SUP-15211: the reconciler's approvalStatus writes now emit an activity_log
     // row; clear it first so the company delete isn't blocked by the FK.
@@ -646,6 +661,21 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
             owner: "TEA-Core", repo: "paperclip", number, headSha,
             displayName: `TEA-Core/paperclip#${number}`, decisionId: "decision-42",
           },
+        },
+      },
+    }).where(eq(issues.id, issueId));
+  }
+
+  // The publisher's record that it confirmed exactly this release status (approvalStatus.releaseConfirmation).
+  async function confirmRelease(issueId: string, statusId = "7001", headSha = NEW_HEAD, number = 42) {
+    const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+    const state = row!.executionState as Record<string, unknown>;
+    await db.update(issues).set({
+      executionState: {
+        ...state,
+        approvalStatus: {
+          ...(state.approvalStatus as Record<string, unknown>),
+          releaseConfirmation: { owner: "TEA-Core", repo: "paperclip", number, headSha, statusId },
         },
       },
     }).where(eq(issues.id, issueId));
@@ -3250,6 +3280,293 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       expect(comments[0]!.authorType).toBe("system");
     });
 
+    const RELEASE_STATUS = {
+      id: 7001,
+      context: PAPERCLIP_APPROVED,
+      state: "success",
+      description: `released by user:u1 for ${NEW_HEAD}: stamp cannot be published`,
+    };
+    const graphqlCalls = () => mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL);
+
+    it("SUP-20772: a board-release success on a card with no certified delivery does not re-arm the merge", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [RELEASE_STATUS] } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["already-success"]).toBeUndefined();
+      expect(summary.rearmed).toBe(0);
+      expect(graphqlCalls()).toHaveLength(0);
+    });
+
+    it("SUP-20772: a board-release success on a certified card at its certified head, confirmed by the publisher, re-arms bound to that head", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await certifyIssue(issueId);
+      await confirmRelease(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [RELEASE_STATUS] } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.skipped["already-success"]).toBe(1);
+      expect(summary.rearmed).toBe(1);
+      const mutations = graphqlCalls().map((call) => String(JSON.parse(String((call[1] as RequestInit).body)).query));
+      expect(mutations).toHaveLength(1);
+      expect(mutations[0]).toContain(`expectedHeadOid: "${NEW_HEAD}"`);
+    });
+
+    // Round 8/9: CI accepts a release only beside the control plane's marker; the reconciler writes a lost one again,
+    // judging an existing marker by its creator as CI does.
+    const markerPosts = () => postStatusCalls().filter((call) => JSON.parse(String((call[1] as RequestInit).body)).context === "paperclip/release-confirmed");
+    const LIST_STATUS_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${NEW_HEAD}/statuses?per_page=100`;
+    const CONTROL_PLANE = { id: 317012809, login: "tea-core[bot]" };
+    const marker = (creator: { id: number; login: string }) => ({ id: 7002, context: "paperclip/release-confirmed", state: "success", description: "confirms status 7001", creator });
+    async function tickWithMarkers(listed: unknown[], confirm = true) {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await certifyIssue(issueId);
+      if (confirm) await confirmRelease(issueId);
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [RELEASE_STATUS] } },
+        { url: LIST_STATUS_URL, body: listed },
+        { url: POST_STATUS_URL, body: { id: 7003 } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+      await runApprovalStatusReconcilerTick(db);
+    }
+
+    it("round 8: re-writes the CI confirmation marker of a confirmed release when the head does not show it", async () => {
+      await tickWithMarkers([]);
+
+      expect(markerPosts()).toHaveLength(1);
+      expect(JSON.parse(String((markerPosts()[0]![1] as RequestInit).body))).toMatchObject({
+        state: "success", context: "paperclip/release-confirmed", description: "confirms status 7001",
+      });
+    });
+
+    it("round 8: writes no second marker when the control plane's own marker is already on the head", async () => {
+      await tickWithMarkers([marker(CONTROL_PLANE)]);
+
+      expect(markerPosts()).toEqual([]);
+    });
+
+    it("round 9: a marker-named status from anyone but the control plane does not suppress the repair", async () => {
+      await tickWithMarkers([marker({ id: 42, login: "fleet-only[bot]" })]);
+
+      expect(markerPosts()).toHaveLength(1);
+    });
+
+    it("round 8: writes no marker for a release the card never confirmed", async () => {
+      await tickWithMarkers([], false);
+
+      expect(markerPosts()).toEqual([]);
+    });
+
+    it("SUP-20772: a board-release success whose confirmation was never recorded does not re-arm", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await certifyIssue(issueId);
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [RELEASE_STATUS] } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.rearmed).toBe(0);
+      expect(graphqlCalls()).toHaveLength(0);
+    });
+
+    it("SUP-20772: a newer release status than the confirmed one (a duplicate whose answer was lost) is not consumed", async () => {
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await certifyIssue(issueId);
+      await confirmRelease(issueId, "7001");
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [{ ...RELEASE_STATUS, id: 7002 }] } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.rearmed).toBe(0);
+      expect(graphqlCalls()).toHaveLength(0);
+    });
+
+    it("SUP-20772: the arm is bound to the verified head, so a head that moves to an uncertified one afterwards is refused by GitHub, not armed", async () => {
+      const MOVED_HEAD = "f".repeat(40);
+      const issueId = await insertIssue();
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await certifyIssue(issueId);
+      await confirmRelease(issueId);
+      let live = NEW_HEAD;
+      let statusReads = 0;
+      // GitHub's head check: a mutation naming a head other than the live one is refused.
+      mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        const respond = (body: unknown) => ({ ok: true, status: 200, json: async () => body }) as unknown as Response;
+        if (url === PR_URL) return respond({ ...OPEN_PR_BODY, head: { ...OPEN_PR_BODY.head, sha: live } });
+        if (url === COMBINED_STATUS_URL) {
+          // The head moves right after the arm boundary's own read of the stamp (the second one) and before the arm.
+          statusReads += 1;
+          const body = respond({ state: "success", statuses: [RELEASE_STATUS] });
+          if (statusReads === 2) live = MOVED_HEAD;
+          return body;
+        }
+        if (url === GRAPHQL_URL) {
+          const query = String(JSON.parse(String(init?.body)).query);
+          const expected = /expectedHeadOid: "([0-9a-f]+)"/.exec(query)?.[1];
+          if (expected !== undefined && expected !== live) return respond({ errors: [{ message: "Head branch was modified" }] });
+          return respond(GRAPHQL_ARM_OK_BODY);
+        }
+        throw new Error(`unmocked ghFetch URL: ${url}`);
+      });
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.rearmDetails.join("\n")).not.toContain("armed: Auto-merge enabled");
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+      expect((approvalStatus.armOutcome as { kind?: string } | undefined)?.kind).toBe("failed");
+      expect(graphqlCalls().every((call) => String(JSON.parse(String((call[1] as RequestInit).body)).query).includes(`expectedHeadOid: "${NEW_HEAD}"`))).toBe(true);
+    });
+
+    // Round 9 (R7-AUTH): the card's authority is read again around the enable call on the same head.
+    describe("an approval revoked on the same head", () => {
+      async function seedAndTick(opts: { revokeOn: "enable" | "first-attempt-502" }) {
+        const issueId = await insertIssue();
+        await insertDecision(issueId);
+        await insertMention(issueId);
+        await certifyIssue(issueId);
+        await confirmRelease(issueId);
+        let enables = 0;
+        const respond = (body: unknown, ok = true, status = 200) => ({ ok, status, json: async () => body }) as unknown as Response;
+        const revoke = () => db.update(issueExecutionDecisions).set({ outcome: "changes_requested" }).where(eq(issueExecutionDecisions.issueId, issueId));
+        mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+          if (url === PR_URL) return respond(OPEN_PR_BODY);
+          if (url === COMBINED_STATUS_URL) return respond({ state: "success", statuses: [RELEASE_STATUS] });
+          if (url === GRAPHQL_URL) {
+            const query = String(JSON.parse(String(init?.body)).query);
+            if (query.includes("disablePullRequestAutoMerge")) return respond({ data: {} });
+            enables += 1;
+            await revoke();
+            return opts.revokeOn === "first-attempt-502" ? respond({}, false, 502) : respond(GRAPHQL_ARM_OK_BODY);
+          }
+          throw new Error(`unmocked ghFetch URL: ${url}`);
+        });
+        const summary = await runApprovalStatusReconcilerTick(db);
+        return { summary, enables: () => enables, queries: () => graphqlCalls().map((call) => String(JSON.parse(String((call[1] as RequestInit).body)).query)) };
+      }
+
+      it("is taken back when it is revoked while the enable call is in flight", async () => {
+        const { summary, queries } = await seedAndTick({ revokeOn: "enable" });
+
+        expect(queries().some((q) => q.includes("disablePullRequestAutoMerge"))).toBe(true);
+        expect(summary.rearmDetails.join("\n")).toContain("authority-revoked");
+        expect(summary.rearmDetails.join("\n")).not.toContain("armed: Auto-merge enabled");
+      });
+
+      it("is not armed by the retry after a transient failure", async () => {
+        const { enables, summary } = await seedAndTick({ revokeOn: "first-attempt-502" });
+
+        expect(enables()).toBe(1);
+        expect(summary.rearmDetails.join("\n")).toContain("authority-changed");
+      });
+    });
+
+    // Round 13: the real reconciler tick (real database, real re-arm path, only the provider boundary faked) against the
+    // revocation matrix release assurance applies: 4 ways of revoking the authority x 2 moments (at the final accepted
+    // enable write, and before a transient retry). A revoked authority must never leave an accepted arm in force.
+    describe("the revocation matrix through the real re-arm path (4 revocations x 2 moments)", () => {
+      const revocations: Array<[string, (ctx: { issueId: string; agentId: string }) => Promise<void>]> = [
+        ["the decision row becomes changes_requested", async ({ issueId }) => {
+          await db.update(issueExecutionDecisions).set({ outcome: "changes_requested" }).where(eq(issueExecutionDecisions.issueId, issueId));
+        }],
+        ["the card's last decision outcome changes", async ({ issueId }) => {
+          const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+          await db.update(issues).set({ executionState: { ...(row!.executionState as object), lastDecisionOutcome: "changes_requested" } }).where(eq(issues.id, issueId));
+        }],
+        ["the certificate is removed", async ({ issueId }) => {
+          const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+          const state = row!.executionState as { approvalStatus: Record<string, unknown> };
+          const { finalDelivery: _removed, ...rest } = state.approvalStatus;
+          await db.update(issues).set({ executionState: { ...state, approvalStatus: rest } }).where(eq(issues.id, issueId));
+        }],
+        ["the decider is terminated", async ({ agentId }) => {
+          await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
+        }],
+      ];
+      for (const [label, revoke] of revocations) {
+        for (const moment of ["enable", "retry"] as const) {
+          it(`${label}, at ${moment === "enable" ? "the final accepted enable" : "a transient retry"}`, async () => {
+            const agentId = randomUUID();
+            await insertAgent(agentId, "Decider");
+            const issueId = await insertIssue();
+            await insertDecision(issueId, { actorAgentId: agentId, actorUserId: null });
+            await insertMention(issueId);
+            await certifyIssue(issueId);
+            await confirmRelease(issueId);
+            let enables = 0;
+            let directMerges = 0;
+            const respond = (body: unknown, ok = true, status = 200) => ({ ok, status, json: async () => body }) as unknown as Response;
+            mockGhFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+              if (url === PR_URL) return respond(OPEN_PR_BODY);
+              if (url === COMBINED_STATUS_URL) return respond({ state: "success", statuses: [RELEASE_STATUS] });
+              if (url === GRAPHQL_URL) {
+                const query = String(JSON.parse(String(init?.body)).query);
+                if (query.includes("disablePullRequestAutoMerge")) return respond({ data: {} });
+                if (query.includes("mergePullRequest")) { directMerges += 1; return respond({ data: {} }); }
+                enables += 1;
+                await revoke({ issueId, agentId });
+                return moment === "retry" ? respond({}, false, 502) : respond(GRAPHQL_ARM_OK_BODY);
+              }
+              throw new Error(`unmocked ghFetch URL: ${url}`);
+            });
+
+            const summary = await runApprovalStatusReconcilerTick(db);
+
+            const details = summary.rearmDetails.join("\n");
+            const queries = graphqlCalls().map((call) => String(JSON.parse(String((call[1] as RequestInit).body)).query));
+            expect(details).not.toContain("armed: Auto-merge enabled");
+            expect(directMerges).toBe(0);
+            if (moment === "enable") {
+              // The enable was accepted, so the arm is taken back and the record of it is gone.
+              expect(details).toContain("authority-revoked");
+              expect(queries.some((q) => q.includes("disablePullRequestAutoMerge"))).toBe(true);
+            } else {
+              // The retry never reached the provider.
+              expect(enables).toBe(1);
+              expect(details).toContain("authority-changed");
+              expect(queries.some((q) => q.includes("disablePullRequestAutoMerge"))).toBe(false);
+            }
+            const [row] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+            expect(((row!.executionState as { approvalStatus?: Record<string, unknown> }).approvalStatus ?? {}).autoMergeDisarm).toBeUndefined();
+          });
+        }
+      }
+    });
+
     it("an already-success head with a recorded armed armOutcome is not re-armed (no arm actuator I/O)", async () => {
       const issueId = await insertIssue({
         executionState: approvedState({
@@ -3529,6 +3846,50 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
       const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
       expect(approvalStatus.armReattempt).toMatchObject({ headSha: NEW_HEAD, attempts: 3 });
+    });
+
+    it("a take-back record on the card refuses the arm without spending a re-arm slot: four ticks later the card is still re-armed once the record is gone", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          approvalStatus: {
+            publishedHeadSha: NEW_HEAD,
+            publishedAt: APPROVED_AT,
+            armOutcome: { kind: "failed", message: "failed:HTTP 502 Bad Gateway", at: APPROVED_AT },
+          },
+        }),
+      });
+      await insertDecision(issueId);
+      await insertMention(issueId);
+      await recordPendingAutoMergeDisarm(db, companyId, issueId, {
+        owner: "TEA-Core", repo: "paperclip", number: 42, nodeId: "PR_node_42", headSha: NEW_HEAD, reason: "held",
+        since: new Date().toISOString(), attempts: 0, lastError: null, state: "in_flight", token: "held",
+      });
+
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "success", statuses: [{ context: PAPERCLIP_APPROVED, state: "success" }] } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      // A fresh in-flight record is left alone by the tick's disarm sweep (a pending one would be disabled and cleared first).
+      for (let tick = 0; tick < 4; tick += 1) {
+        const summary = await runApprovalStatusReconcilerTick(db);
+        expect(summary.rearmed).toBe(1);
+        expect(summary.rearmDetails[0]).toContain("skipped:arm-in-progress");
+      }
+      expect(mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL)).toHaveLength(0);
+      const readAttempts = async () => {
+        const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+        const approvalStatus = (row!.executionState as Record<string, unknown>).approvalStatus as Record<string, unknown>;
+        return (approvalStatus.armReattempt as { attempts: number }).attempts;
+      };
+      expect(await readAttempts()).toBe(0);
+
+      await clearAutoMergeDisarmRecord(db, companyId, issueId);
+      const summary = await runApprovalStatusReconcilerTick(db);
+      expect(summary.rearmDetails[0]).toContain("armed:");
+      expect(mockGhFetch.mock.calls.filter((call) => String(call[0]) === GRAPHQL_URL)).toHaveLength(1);
+      expect(await readAttempts()).toBe(1);
     });
 
     it("a recorded skipped:already-queued armOutcome is terminal, equivalent to armed — not re-armed (finding: already-queued-retried)", async () => {

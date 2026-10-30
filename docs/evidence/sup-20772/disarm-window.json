@@ -1,0 +1,75 @@
+{
+  "measuredAt": "2026-10-27T03:52:19.957Z",
+  "cells": [
+    {
+      "roundTripMs": 0,
+      "mergeAfterMs": 0,
+      "acceptToDisableRequestMs": 6,
+      "mergedBeforeDisable": true,
+      "outcome": "failed:authority-revoked: TEA-Core/paperclip#125 — the latest decision of stage "
+    },
+    {
+      "roundTripMs": 0,
+      "mergeAfterMs": 50,
+      "acceptToDisableRequestMs": 6,
+      "mergedBeforeDisable": false,
+      "outcome": "failed:authority-revoked: TEA-Core/paperclip#125 — the latest decision of stage "
+    },
+    {
+      "roundTripMs": 0,
+      "mergeAfterMs": 100,
+      "acceptToDisableRequestMs": 6,
+      "mergedBeforeDisable": false,
+      "outcome": "failed:authority-revoked: TEA-Core/paperclip#125 — the latest decision of stage "
+    },
+    {
+      "roundTripMs": 0,
+      "mergeAfterMs": 1000,
+      "acceptToDisableRequestMs": 6,
+      "mergedBeforeDisable": false,
+      "outcome": "failed:authority-revoked: TEA-Core/paperclip#125 — the latest decision of stage "
+    },
+    {
+      "roundTripMs": 0,
+      "mergeAfterMs": 5000,
+      "acceptToDisableRequestMs": 6,
+      "mergedBeforeDisable": false,
+      "outcome": "failed:authority-revoked: TEA-Core/paperclip#125 — the latest decision of stage "
+    },
+    {
+      "roundTripMs": 150,
+      "mergeAfterMs": 0,
+      "acceptToDisableRequestMs": 161,
+      "mergedBeforeDisable": true,
+      "outcome": "failed:authority-revoked: TEA-Core/paperclip#125 — the latest decision of stage "
+    },
+    {
+      "roundTripMs": 150,
+      "mergeAfterMs": 50,
+      "acceptToDisableRequestMs": 160,
+      "mergedBeforeDisable": true,
+      "outcome": "failed:authority-revoked: TEA-Core/paperclip#125 — the latest decision of stage "
+    },
+    {
+      "roundTripMs": 150,
+      "mergeAfterMs": 100,
+      "acceptToDisableRequestMs": 162,
+      "mergedBeforeDisable": true,
+      "outcome": "failed:authority-revoked: TEA-Core/paperclip#125 — the latest decision of stage "
+    },
+    {
+      "roundTripMs": 150,
+      "mergeAfterMs": 1000,
+      "acceptToDisableRequestMs": 157,
+      "mergedBeforeDisable": false,
+      "outcome": "failed:authority-revoked: TEA-Core/paperclip#125 — the latest decision of stage "
+    },
+    {
+      "roundTripMs": 150,
+      "mergeAfterMs": 5000,
+      "acceptToDisableRequestMs": 161,
+      "mergedBeforeDisable": false,
+      "outcome": "failed:authority-revoked: TEA-Core/paperclip#125 — the latest decision of stage "
+    }
+  ]
+}
