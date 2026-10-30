@@ -265,9 +265,20 @@ WORKDIR /app
 # never hit the layer cache and rebuilds on every build. The two `--from=build`
 # copies this fork used to open with now sit after the entrypoint, below.
 RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
-  && npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai@1.18.33 @google/gemini-cli@latest supabase@latest @moonshot-ai/kimi-code@latest \
+  # npm 11 ships only a stub bin/opencode.exe; the real binary is placed by the
+  # package postinstall. --allow-scripts pins that permission explicitly (npm
+  # warns on every uncovered lifecycle script) so a future npm that starts
+  # enforcing allowScripts cannot silently swap in the stub that errors.
+  && npm install --global --omit=dev --allow-scripts=opencode-ai @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai@1.18.33 @google/gemini-cli@latest supabase@latest @moonshot-ai/kimi-code@latest \
   && test "$(/usr/local/bin/opencode --version)" = "1.18.33" \
-  && test "$(readlink -f "$(command -v opencode)")" = "/usr/local/bin/opencode" \
+  && test "$(command -v opencode)" = "/usr/local/bin/opencode" \
+  # npm links global bins as symlinks into lib/node_modules, so readlink -f
+  # lands on the package's bin/opencode.exe, never on /usr/local/bin/opencode
+  # itself. Assert the resolution stays inside the pinned opencode-ai tree.
+  && case "$(readlink -f /usr/local/bin/opencode)" in \
+       /usr/local/lib/node_modules/opencode-ai/bin/*) ;; \
+       *) echo "FAIL: opencode resolves outside the pinned opencode-ai tree: $(readlink -f /usr/local/bin/opencode)" >&2; exit 1 ;; \
+     esac \
   && test ! -e /usr/local/bin/opencode2 \
   && apt-get update \
   && apt-get install -y --no-install-recommends openssh-client jq \
@@ -303,7 +314,7 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
 ARG OPENCODE_V2_VERSION=2.0.26
 ARG OPENCODE_V2_PACKAGE=@opencode/cli@2.0.26
 ARG OPENCODE_V2_SHA256=d9123b9bcdb0a31f7ab9fe9812b58a9dc1768ad6d97e7b276dff1181813218c9
-RUN npm install --global --omit=dev --prefix /opt/opencode-v2 "${OPENCODE_V2_PACKAGE}" \
+RUN npm install --global --omit=dev --allow-scripts=@opencode/cli --prefix /opt/opencode-v2 "${OPENCODE_V2_PACKAGE}" \
   && test "$(/opt/opencode-v2/bin/opencode --version)" = "opencode v${OPENCODE_V2_VERSION}" \
   && test "$(/opt/opencode-v2/bin/opencode2 --version)" = "opencode v${OPENCODE_V2_VERSION}" \
   && sha256sum /opt/opencode-v2/lib/node_modules/@opencode/cli/bin/opencode.exe \

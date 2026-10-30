@@ -18,9 +18,26 @@ test("PATH OpenCode stays the pinned V1 package and is version-checked", () => {
     productionStage,
     /npm install --global[^\n]*\sopencode-ai(?!@1\.18\.33)\b/,
   );
+  // npm 11 ships a stub bin/opencode.exe; the real binary only exists after
+  // the postinstall runs, so the install must carry an explicit allow-scripts.
+  assert.match(
+    productionStage,
+    /npm install --global[^\n]*--allow-scripts=opencode-ai[^\n]*opencode-ai@1\.18\.33/,
+  );
   assert.match(
     productionStage,
     /test "\$\(\/usr\/local\/bin\/opencode --version\)" = "1\.18\.33"/,
+  );
+  // npm links global bins as symlinks into lib/node_modules, so the resolution
+  // check must accept that layout instead of demanding a real file at
+  // /usr/local/bin/opencode.
+  assert.match(
+    productionStage,
+    /test "\$\(command -v opencode\)" = "\/usr\/local\/bin\/opencode"/,
+  );
+  assert.match(
+    productionStage,
+    /case "\$\(readlink -f \/usr\/local\/bin\/opencode\)" in[\s\S]{0,300}\/usr\/local\/lib\/node_modules\/opencode-ai\/bin\/\*/,
   );
   assert.match(productionStage, /test ! -e \/usr\/local\/bin\/opencode2/);
 });
@@ -30,7 +47,7 @@ test("OpenCode V2 is installed off PATH at a pinned version and digest", () => {
   assert.match(productionStage, /OPENCODE_V2_PACKAGE=@opencode\/cli@2\.0\.26/);
   assert.match(
     productionStage,
-    /npm install --global --omit=dev --prefix \/opt\/opencode-v2/,
+    /npm install --global --omit=dev --allow-scripts=@opencode\/cli --prefix \/opt\/opencode-v2/,
   );
   assert.doesNotMatch(
     productionStage,
