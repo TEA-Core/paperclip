@@ -2,11 +2,11 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import express from "express";
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import {
-  activityLog, agentSessionGoalActions, agentTaskSessions, agentWakeupRequests, agents, chatConversations, chatEndpoints, companies, companyMemberships, createDb, heartbeatRunEvents, heartbeatRuns,
-  issueExecutionDecisions, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, toolApplications, toolConnections, type Db,
+  activityLog, agentSessionGoalActions, agentTaskSessions, agentWakeupRequests, agents, chatConversations, chatEndpoints, companies, companyMemberships, createDb, executionWorkspaces, heartbeatRunEvents, heartbeatRuns,
+  issueExecutionDecisions, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, projects, toolApplications, toolConnections, type Db,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase, type EmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
@@ -20,6 +20,25 @@ import { collectDispositionRepairSourceState } from "../services/recovery/dispos
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeDb = support.supported ? describe.sequential : describe.skip;
+const mockGetByName = vi.hoisted(() => vi.fn());
+const mockResolveSecretValue = vi.hoisted(() => vi.fn());
+vi.mock("../services/secrets.js", () => ({
+  secretService: () => ({ getByName: mockGetByName, resolveSecretValue: mockResolveSecretValue }),
+}));
+// SUP-21902: the done-transition guard resolves the declared probe head and the
+// delivery default branch tip through the commits API; the mocked remote serves
+// the same head for both, so the fixtures' named probe heads match the merge head.
+vi.mock("../services/github-fetch.js", () => ({
+  ghFetch: (url: string) =>
+    typeof url === "string" && /\/commits\//.test(url)
+      ? Promise.resolve({ ok: true, status: 200, json: async () => ({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }) } as unknown as Response)
+      : Promise.resolve(new Response(JSON.stringify({}), { status: 404 })),
+  gitHubApiBase: (hostname: string) =>
+    hostname === "github.com" || hostname === "www.github.com"
+      ? "https://api.github.com"
+      : `https://${hostname}/api/v3`,
+}));
+
 const COMPANY = "11111111-1111-4111-8111-111111111111";
 const OTHER_COMPANY = "22222222-2222-4222-8222-222222222222";
 const ISSUE = "33333333-3333-4333-8333-333333333333";
@@ -73,6 +92,8 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agents);
+    await db.delete(executionWorkspaces);
+    await db.delete(projects);
     await db.delete(companyMemberships);
     await db.delete(companies);
     await db.insert(companies).values([
@@ -94,6 +115,28 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
       assigneeAgentId: ASSIGNEE, executionState: pendingState,
       executionPolicy: { mode: "normal", stages: [{ id: STAGE, type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: PARTICIPANT }, { type: "agent", agentId: INDEPENDENT }] }] },
     });
+    // SUP-21902: bind the card to a repo-backed execution workspace so its Tier 2
+    // close predicate can resolve the default branch and verify the declared head.
+    // Delivery is record-only: this fixture exercises participant restore, not the
+    // repository delivery preflight, so the close only owes the probe-head predicate.
+    const tier2ProjectId = randomUUID();
+    const tier2WorkspaceId = randomUUID();
+    const tier2Now = new Date();
+    await db.insert(projects).values({
+      id: tier2ProjectId, companyId: COMPANY, name: "Tier 2 Fixture Project",
+      status: "active", createdAt: tier2Now, updatedAt: tier2Now,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: tier2WorkspaceId, companyId: COMPANY, projectId: tier2ProjectId, projectWorkspaceId: null,
+      sourceIssueId: null, mode: "isolated_workspace", strategyType: "git_worktree",
+      name: "tier2-fixture-ws", status: "active", cwd: "/tmp/test",
+      repoUrl: "https://github.com/TEA-Core/paperclip", baseRef: "fold/tea-patches-v2026.722.0",
+      branchName: "tier2-fixture-ws", providerType: "git_worktree", providerRef: "/tmp/test",
+      lastUsedAt: tier2Now, openedAt: tier2Now, createdAt: tier2Now, updatedAt: tier2Now,
+    });
+    await db.update(issues).set({ executionWorkspaceId: tier2WorkspaceId, deliveryRequirement: "record_only" }).where(eq(issues.id, ISSUE));
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
     await db.insert(issueExecutionDecisions).values({
       id: DECISION, companyId: COMPANY, issueId: ISSUE, stageId: STAGE,
       stageType: "review", outcome: "changes_requested", body: "Earlier verdict",
@@ -341,7 +384,7 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
       .set("X-Paperclip-Run-Id", RUN)
       .send({
         status: "done",
-        comment: "Approved.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): verified the isolated fixture.",
+        comment: "Approved.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: verified the isolated fixture.",
       });
     expect(approved.status, JSON.stringify(approved.body)).toBe(200);
     expect((await snapshot()).status).toBe("done");
@@ -404,7 +447,7 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
         .set("X-Paperclip-Run-Id", RUN)
         .send({
           status: "done",
-          comment: "Approved.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): verified the isolated fixture.",
+          comment: "Approved.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: verified the isolated fixture.",
         });
       expect(decision.status, JSON.stringify(decision.body)).toBe(200);
       expect((await snapshot()).status).toBe("done");

@@ -44,7 +44,13 @@ vi.mock("../services/secrets.js", () => ({
 }));
 
 vi.mock("../services/github-fetch.js", () => ({
-  ghFetch: mockGhFetch,
+  // SUP-21902: the done-transition guard resolves the declared probe head and the
+  // delivery default branch tip through the commits API; the mocked remote serves
+  // the same head for both, so the fixtures' named probe heads match the merge head.
+  ghFetch: (url: string, init?: RequestInit) =>
+    typeof url === "string" && /\/commits\//.test(url)
+      ? Promise.resolve({ ok: true, status: 200, json: async () => ({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }) } as unknown as Response)
+      : mockGhFetch(url, init),
   gitHubApiBase: (hostname: string) =>
     hostname === "github.com" || hostname === "www.github.com"
       ? "https://api.github.com"
@@ -423,7 +429,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 2 (live): probe confirms the changed path is live.",
+          "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -474,7 +480,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 2 (live): probe confirms the changed path is live.",
+          "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -523,7 +529,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 2 (live): probe confirms the changed path is live. Agent comment marker: Tier 1.",
+          "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe confirms the changed path is live. Agent comment marker: Tier 1.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -562,7 +568,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
 
     const response = await request(app)
       .patch(`/api/issues/${identifier}`)
-      .send({ status: "done", comment: "Closed at Tier 2 (live): endpoint responds." });
+      .send({ status: "done", comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: endpoint responds." });
     expect(response.status, JSON.stringify(response.body)).toBe(409);
     expect(response.body.error).toContain("head_draft");
     expect(response.body.details.remedy).toContain("out of draft");
@@ -598,7 +604,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 2 (live): probe confirms the changed path is live.",
+          "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -645,7 +651,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 2 (live): probe confirms the changed path is live.",
+          "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -687,7 +693,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 2 (live): probe confirms the changed path is live.",
+          "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -706,6 +712,8 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
     await seedLinkedPrs(companyId, issueId, [
       { owner: "TEA-Core", repo: "paperclip", number: 274, state: "open", draft: false },
     ]);
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
 
     const res = await request(app)
       .patch(`/api/issues/${identifier}`)
@@ -713,7 +721,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         status: "done",
         doneTransitionOverride: { disposition: "upstream-equivalent-fix-no-deliverable-head", reason: "Tier 1" },
         comment:
-          "Closed at Tier 2 (live): probe confirms the changed path is live.",
+          "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -742,7 +750,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .patch(`/api/issues/${identifier}`)
       .send({
         status: "done",
-        comment: "Closed at Tier 2 (live): probe confirms fix.",
+        comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe confirms fix.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -783,7 +791,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 2 (live): probe confirms the changed path is live.",
+          "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -843,7 +851,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 2 (live): probe confirms the changed path is live.",
+          "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -869,13 +877,21 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
     mockGetByName.mockResolvedValue(null);
     mockResolveSecretValue.mockResolvedValue(null);
     mockGhFetch.mockImplementation(async () => new Response(JSON.stringify({}), { status: 404 }));
+    // SUP-21902: a Tier 2 (live) declaration can no longer verify without a
+    // credential, and the landed-branch token_missing skip is the subject of this
+    // test — so the tier declaration takes the credential-free fail-open form:
+    // landing-delegated onto a merged linked PR, whose auto-merge capability is
+    // unverifiable with no token and therefore not refused.
+    await seedLinkedPrs(companyId, issueId, [
+      { owner: "TEA-Core", repo: "paperclip", number: 275, state: "merged", draft: false },
+    ]);
 
     const res = await request(app)
       .patch(`/api/issues/${identifier}`)
       .send({
         status: "done",
         comment:
-          "Closed at Tier 2 (live): probe confirms the changed path is live.",
+          "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #275; landing obligation transferred to done-close-landing-backstop, not yet discharged; no credential is configured to probe. Liveness unverified.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -918,6 +934,10 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
     currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
 
     mockAddComment.mockClear();
+    // The delivery guard is mocked below, but the tier-declaration evaluation is
+    // real (SUP-21902), so the credential must resolve for the shaped Tier 2 line.
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
 
     mockEvaluateDoneTransitionGuard.mockResolvedValue({
       allowed: true,
@@ -936,7 +956,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .send({
         status: "done",
         comment:
-          "Closed at Tier 2 (live): probe confirms the changed path is live.",
+          "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe confirms the changed path is live.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -1279,7 +1299,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect(res.body.details.issueId).toBe(issueId);
       expect(res.body.details.identifier).toBe(identifier);
       // The rejection must name both accepted forms.
-      expect(res.body.details.remedy).toContain('"Closed at Tier 2 (live): <probe evidence>"');
+      expect(res.body.details.remedy).toContain('"Closed at Tier 2 (live): probe `<probe command>` head <probe head sha> post-merge: <post-merge predicate>"');
       expect(res.body.details.remedy).toContain(TIER1_FORM);
       expect(res.body.details.remedy).toContain(
         '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."',
@@ -1351,13 +1371,15 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       const { companyId, agentId, issueId, identifier, branchName } = await seedIssue("SUP13939C");
       currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
       mockEvaluateDoneTransitionGuard.mockResolvedValue(deliveryAllowed(branchName));
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
 
       const res = await request(app)
         .patch(`/api/issues/${identifier}`)
         .send({
           status: "done",
           comment:
-            "Closed at Tier 2 (live): acceptance probe — GET /api/health returned 200 and the patched path executed without the regression.",
+            "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: acceptance probe — GET /api/health returned 200 and the patched path executed without the regression.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);

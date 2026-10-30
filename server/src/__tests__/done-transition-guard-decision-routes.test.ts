@@ -71,6 +71,12 @@ vi.mock("../services/github-fetch.js", () => ({
     if (typeof url === "string" && /\/statuses\//.test(url) && init?.method === "POST" && String(init.body ?? "").includes('"paperclip/arm-gate"')) {
       return Promise.resolve({ ok: true, status: 201, json: async () => ({ id: 9000 }) } as unknown as Response);
     }
+    // SUP-21902: the done-transition guard resolves the declared probe head and the
+    // delivery default branch tip through the commits API; the mocked remote serves
+    // the same head for both, so the fixtures' named probe heads match the merge head.
+    if (typeof url === "string" && /\/commits\//.test(url)) {
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }) } as unknown as Response);
+    }
     // An arm that names no head reads the PR's live head for the gate; a fake that does not model that read gets one.
     return Promise.resolve(mockGhFetch(url, init)).catch((error: unknown) => {
       if (typeof url === "string" && /\/pulls\/\d+$/.test(url) && /unmocked|unexpected/i.test(String((error as Error)?.message))) {
@@ -717,7 +723,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .send({
         status: "done",
         comment:
-          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint and it no longer regresses.",
       });
 
     // The approval arms the merge (armMergeOnApproval); blocking it on the
@@ -778,18 +784,20 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D13185B");
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
 
-    // No credential at all -> the guard skips rather than blocks. Before this fix the
-    // decision path wrote nothing here, which is precisely why approval-closed cards
-    // never appeared in the SUP-13140 census.
-    mockGetByName.mockResolvedValue(null);
-    mockResolveSecretValue.mockResolvedValue(null);
+    // A credential resolves so the SUP-21902 Tier 2 origin predicate can verify the
+    // named probe head, but no remote is modeled beyond the commits API, so the
+    // landed-branch probe stays unverifiable and the guard skips rather than
+    // blocks. Before this fix the decision path wrote nothing here, which is
+    // precisely why approval-closed cards never appeared in the SUP-13140 census.
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
 
     const res = await request(app)
       .patch(`/api/issues/${identifier}`)
       .send({
         status: "done",
         comment:
-          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint and it no longer regresses.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -822,7 +830,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.code).toBe("done_transition_missing_tier_declaration");
-    expect(res.body.details.remedy).toContain('"Closed at Tier 2 (live): <probe evidence>"');
+    expect(res.body.details.remedy).toContain('"Closed at Tier 2 (live): probe `<probe command>` head <probe head sha> post-merge: <post-merge predicate>"');
     expect(await statusOf(issueId)).toBe("in_review");
 
     const rows = await auditRows(companyId, issueId, "issue.done_tier_declaration_skipped");
@@ -833,7 +841,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     for (const [suffix, tierLine] of [
       [
         "T2",
-        "Closed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+        "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint and it no longer regresses.",
       ],
       [
         "T1",
@@ -885,7 +893,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     const res = await request(app)
       .post(`/api/issues/${identifier}/comments`)
       .send({
-        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): reviewer probe verified the patched path on the PR head.",
+        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the patched path on the PR head.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
@@ -895,16 +903,22 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
   it("POST comment: record_only auto-approval closes without repository delivery (SUP-21258)", async () => {
     const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D21258A", { deliveryRequirement: "record_only" });
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
 
     const res = await request(app)
       .post(`/api/issues/${identifier}/comments`)
       .send({
-        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): wiki read-back verified.",
+        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: wiki read-back verified.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(await statusOf(issueId)).toBe("done");
-    expect(mockGhFetch).not.toHaveBeenCalled();
+    // SUP-21902: with the credential resolving, the Tier 2 origin predicate and the
+    // live open-PR discovery may READ the remote, but a record_only close must drive
+    // no repository delivery transport — no arming status, no merge.
+    const deliveryTransportCalls = mockGhFetch.mock.calls.filter(([u]) => /\/statuses\/|\/merge/.test(String(u)));
+    expect(deliveryTransportCalls).toHaveLength(0);
   });
 
   it("PATCH: record_only close skips repository delivery; repository_delivery keeps it (SUP-21258)", async () => {
@@ -919,7 +933,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
       const res = await request(app)
         .patch(`/api/issues/${identifier}`)
-        .send({ status: "done", comment: "Closed at Tier 2 (live): probe verified." });
+        .send({ status: "done", comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe verified." });
 
       expect(res.status, JSON.stringify(res.body)).toBe(expectedStatus);
       expect(await statusOf(issueId)).toBe(expectedStatus === 200 ? "done" : "in_review");
@@ -935,7 +949,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     const res = await request(app)
       .post(`/api/issues/${identifier}/comments`)
       .send({
-        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): reviewer probe verified the patched path on the PR head.",
+        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the patched path on the PR head.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
@@ -995,7 +1009,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       const body = records[0]!.body ?? "";
       expect(body).toContain("[Terminal status refused] done_transition_missing_tier_declaration");
       expect(body).toContain("HTTP 422");
-      expect(body).toContain('"Closed at Tier 2 (live): <probe evidence>"');
+      expect(body).toContain('"Closed at Tier 2 (live): probe `<probe command>` head <probe head sha> post-merge: <post-merge predicate>"');
       expect(body).toContain(`Refusing run: ${runId}`);
     });
 
@@ -1010,7 +1024,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         .send({
           status: "done",
           comment:
-            "Closed at Tier 2 (live): probed the endpoint after deploy and it holds.",
+            "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probed the endpoint after deploy and it holds.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -1088,7 +1102,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         .send({
           status: "done",
           comment:
-            "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint.",
+            "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -1130,7 +1144,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       const res = await request(app)
         .post(`/api/issues/${identifier}/comments`)
         .send({
-          body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): reviewer probe verified the patched path on the PR head.",
+          body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the patched path on the PR head.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -1189,7 +1203,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         .send({
           status: "done",
           comment:
-            "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint.",
+            "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint.",
         });
 
       // The open mergeable PR stays open until the merge lands (ADR-074 D6):
@@ -1258,7 +1272,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     const res = await request(app)
       .post(`/api/issues/${identifier}/comments`)
       .send({
-        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): reviewer probe verified the patched path on the PR head.",
+        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the patched path on the PR head.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
@@ -1347,7 +1361,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     const res = await request(app)
       .post(`/api/issues/${identifier}/comments`)
       .send({
-        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): reviewer probe verified the patched path on the PR head.",
+        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the patched path on the PR head.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -1395,7 +1409,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .send({
         status: "done",
         comment:
-          "Approved.\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+          "Approved.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint and it no longer regresses.",
       });
 
     // Before M3 the route selected the remedy from `ladderUnsatisfied`/`decisionCarried`,
@@ -1451,7 +1465,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .patch(`/api/issues/${identifier}`)
       .send({
         status: "done",
-        comment: "Closed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+        comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint and it no longer regresses.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -1493,7 +1507,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .send({
         status: "done",
         comment:
-          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint and it no longer regresses.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -1518,7 +1532,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .send({
         status: "done",
         comment:
-          "Approved.\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+          "Approved.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint and it no longer regresses.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
