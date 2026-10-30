@@ -269,6 +269,7 @@ import {
   countLadderedChildren,
   evaluateDoneTransitionGuard,
   evaluateDoneTierDeclaration,
+  resolveCitedCommits,
   DONE_TIER_STRUCTURED_FORMS,
   findMissingAdr072CloseLadderStages,
   renderDoneTierDeclaration,
@@ -5446,6 +5447,63 @@ export function issueRoutes(
         reason: tierResult.reason,
         decisionCarried,
       });
+    }
+    // SUP-20525 (SUP-18110 ask 1): resolve the close comment's cited commit
+    // SHAs against the delivery repository. Only a SHA GitHub explicitly
+    // reports not found — confirmed by a positive default-branch control
+    // probe — refuses the close (422); the refusal audit row is the
+    // cited-sha resolution row written above the branch. Unverifiable SHAs
+    // are audited and allowed, and the resolver itself never blocks: a throw
+    // fails open so this stays a liar-detector, not a new close gate.
+    try {
+      const citedShaResolution = await resolveCitedCommits(db, issue, commentBody);
+      if (citedShaResolution.results.length > 0) {
+        void writeAuditLog(db, issue, "issue.done_transition_cited_sha_resolved", {
+          results: citedShaResolution.results,
+          decisionCarried,
+        });
+      }
+      const nonexistentShas = citedShaResolution.results
+        .filter((result) => result.status === "nonexistent")
+        .map((result) => result.sha);
+      if (nonexistentShas.length > 0) {
+        const shaList = nonexistentShas.join(", ");
+        const refusalError =
+          nonexistentShas.length === 1
+            ? `Close comment cites commit SHA ${shaList}, which GitHub reports as not found in the delivery repository (the default-branch control probe resolved, so the repository and credential are live).`
+            : `Close comment cites commit SHAs ${shaList}, which GitHub reports as not found in the delivery repository (the default-branch control probe resolved, so the repository and credential are live).`;
+        const remedy = `Cite a commit that exists in the delivery repository (or drop the citation) and close again. Only provably nonexistent ${nonexistentShas.length === 1 ? "SHA" : "SHAs"} ${shaList} block this close; SHAs that could not be verified were allowed.`;
+        if (persistRefusalComment) {
+          await postTerminalStatusRefusalComment(svc, issue.id, {
+            httpStatus: 422,
+            code: "done_transition_cited_sha_unresolvable",
+            error: refusalError,
+            remedy,
+            runId,
+          });
+        }
+        return {
+          ok: false,
+          status: 422,
+          body: {
+            error: refusalError,
+            code: "done_transition_cited_sha_unresolvable",
+            details: {
+              issueId: issue.id,
+              identifier: issue.identifier ?? null,
+              shas: nonexistentShas,
+              results: citedShaResolution.results,
+              decisionCarried,
+              remedy,
+            },
+          },
+        };
+      }
+    } catch (citedShaErr) {
+      logger.warn(
+        { err: citedShaErr, issueId: issue.id, companyId: issue.companyId },
+        "cited-SHA resolution failed; done transition allowed (fail open)",
+      );
     }
     return { ok: true, overrideAccepted };
   }
