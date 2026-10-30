@@ -49,7 +49,6 @@ server/src/__tests__/agent-test-environment-routes.test.ts(358,46): TS2339
 server/src/__tests__/agents-adapter-config-user-secret.test.ts(411,12): TS2532
 server/src/__tests__/agents-adapter-config-user-secret.test.ts(411,45): TS2493
 server/src/__tests__/agents-claude-oauth-binding.test.ts(1094,7): TS2353
-server/src/__tests__/agents-service-remove-with-decision-watchdog-rows.test.ts(233,7): TS2769
 server/src/__tests__/ai-connections.test.ts(189,97): TS2353
 server/src/__tests__/ai-connections.test.ts(192,95): TS2353
 server/src/__tests__/ai-connections.test.ts(196,90): TS2353
@@ -366,7 +365,6 @@ server/src/__tests__/company-search-rate-limit-routes.test.ts(107,7): TS2741
 server/src/__tests__/company-search-rate-limit-routes.test.ts(47,7): TS2741
 server/src/__tests__/company-search-rate-limit-routes.test.ts(79,7): TS2741
 server/src/__tests__/company-skill-policy-routes.test.ts(68,7): TS2322
-server/src/__tests__/context-snapshot-bound.test.ts(61,34): TS2339
 server/src/__tests__/decision-queues-routes.test.ts(684,7): TS2740
 server/src/__tests__/decisions-service.test.ts(326,54): TS2322
 server/src/__tests__/dev-runner-native-binary.test.ts(9,8): TS7016
@@ -383,8 +381,6 @@ server/src/__tests__/device-login-service.test.ts(208,26): TS2741
 server/src/__tests__/document-annotation-routes.test.ts(324,7): TS2322
 server/src/__tests__/document-annotation-routes.test.ts(325,7): TS2322
 server/src/__tests__/document-annotation-routes.test.ts(332,55): TS2345
-server/src/__tests__/documents-upsert-unique-violation.test.ts(24,15): TS2339
-server/src/__tests__/documents-upsert-unique-violation.test.ts(25,15): TS2339
 server/src/__tests__/duplex-observability-recorder.test.ts(188,50): TS2345
 server/src/__tests__/email-channels.integration.test.ts(265,27): TS2345
 server/src/__tests__/email-channels.integration.test.ts(435,27): TS2345
@@ -1152,11 +1148,6 @@ server/src/__tests__/plugin-tenant-isolation.test.ts(159,34): TS2769
 server/src/__tests__/plugin-tenant-isolation.test.ts(401,70): TS2345
 server/src/__tests__/plugin-tool-dispatcher-pluginDbId.test.ts(155,7): TS2578
 server/src/__tests__/plugin-tool-dispatcher-pluginDbId.test.ts(186,54): TS2339
-server/src/__tests__/plugin-tool-dispatcher-undeliverable.test.ts(125,3): TS2322
-server/src/__tests__/plugin-tool-dispatcher-undeliverable.test.ts(126,25): TS2493
-server/src/__tests__/plugin-tool-dispatcher-undeliverable.test.ts(127,13): TS2769
-server/src/__tests__/plugin-tool-dispatcher-undeliverable.test.ts(153,12): TS2493
-server/src/__tests__/plugin-tool-dispatcher-undeliverable.test.ts(153,19): TS2493
 server/src/__tests__/plugin-worker-manager-duplex.test.ts(109,9): TS2345
 server/src/__tests__/plugin-worker-manager-duplex.test.ts(131,9): TS2345
 server/src/__tests__/plugin-worker-manager-duplex.test.ts(161,9): TS2345
@@ -1250,7 +1241,6 @@ server/src/__tests__/recovery-stranded-action-sweep.test.ts(299,40): TS2493
 server/src/__tests__/routable-blocked.test.ts(72,35): TS2493
 server/src/__tests__/routine-execution-supersede.test.ts(108,7): TS2741
 server/src/__tests__/routine-execution-supersede.test.ts(124,7): TS2741
-server/src/__tests__/routine-responsible-user-membership.test.ts(98,7): TS2741
 server/src/__tests__/routine-run-telemetry.test.ts(143,7): TS2741
 server/src/__tests__/routines-service.test.ts(1007,28): TS2352
 server/src/__tests__/routines-service.test.ts(1010,45): TS2322

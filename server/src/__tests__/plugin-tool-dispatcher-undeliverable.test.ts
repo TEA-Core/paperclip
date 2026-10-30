@@ -25,7 +25,7 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import type { PluginLifecycleManager } from "../services/plugin-lifecycle.js";
 
 const harness = vi.hoisted(() => ({
-  logActivity: vi.fn(async () => ({ id: "activity-row" })),
+  logActivity: vi.fn(async (_db: unknown, _input: Record<string, unknown>) => ({ id: "activity-row" })),
   // Populated per-test by each `it` before the dispatcher is built.
   registry: null as unknown,
 }));
@@ -123,8 +123,8 @@ function setRegistry(plugins: PluginRecord[]): void {
 
 function undeliverableInputs(): Array<Record<string, unknown>> {
   return harness.logActivity.mock.calls
-    .map((call) => call[1])
-    .filter((input: Record<string, unknown>) => input.action === UNDELIVERABLE_TOOLS_ACTION);
+    .map(([, input]) => input)
+    .filter((input) => input.action === UNDELIVERABLE_TOOLS_ACTION);
 }
 
 beforeEach(() => {
@@ -150,7 +150,7 @@ describe("dispatcher.initialize() — plugin.tools_undeliverable diagnostic", ()
     await dispatcher.initialize();
 
     expect(harness.logActivity).toHaveBeenCalledTimes(1);
-    const [dbArg, input] = harness.logActivity.mock.calls[0];
+    const [dbArg, input] = harness.logActivity.mock.calls[0]!;
     expect(dbArg).toBeTypeOf("object");
     expect(input).toMatchObject({
       companyId: COMPANY_ID,
