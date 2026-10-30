@@ -5800,6 +5800,9 @@ describe("evaluateDoneTierDeclaration", () => {
       const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);
       ghFetchMock.mockImplementation(async (url) => {
+        if (String(url).endsWith("/pulls/4103")) {
+          return new Response(JSON.stringify({ state: "open", draft: false, base: { ref: "main" } }), { status: 200 });
+        }
         if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
           return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
         }
@@ -5829,6 +5832,42 @@ describe("evaluateDoneTierDeclaration", () => {
         "TEA-Core",
         "paperclip",
       );
+    });
+
+    it("does not use a cached base branch when live hydration omits base.ref", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { ...linkedPr(4103, "open"), baseRefName: "main" },
+      ]);
+      let queueProbeSeen = false;
+      ghFetchMock.mockImplementation(async (url, init) => {
+        const u = String(url);
+        if (u.includes("graphql") && String((init as { body?: string } | undefined)?.body ?? "").includes("mergeQueue")) {
+          queueProbeSeen = true;
+        }
+        if (u.endsWith("/pulls/4103")) {
+          return new Response(JSON.stringify({
+            state: "open",
+            draft: false,
+            head: { ref: "SUP-42-branch", repo: { full_name: "TEA-Core/paperclip" } },
+          }), { status: 200 });
+        }
+        if (u.endsWith("/repos/TEA-Core/paperclip")) {
+          return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        return new Response("{}", { status: 500 });
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+      expect(queueProbeSeen).toBe(false);
     });
 
     it("accepts landing-delegated when auto-merge is disabled but a merge queue covers the base branch", async () => {
@@ -5884,6 +5923,59 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.tier).toBe("tier1");
     });
 
+    it("accepts landing-delegated when the merge queue GraphQL response has errors", async () => {
+      const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);
+      ghFetchMock.mockImplementation(async (url) => {
+        if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
+          return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        if (String(url).includes("graphql")) {
+          return new Response(JSON.stringify({ errors: [{ message: "RATE_LIMITED" }] }), { status: 200 });
+        }
+        return new Response("{}", { status: 500 });
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("accepts landing-delegated when the auto-merge lookup fails", async () => {
+      const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);
+      ghFetchMock.mockImplementation(async (url) => {
+        if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
+          return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        if (String(url).includes("graphql")) {
+          return new Response(JSON.stringify({ data: { repository: { mergeQueue: null } } }), { status: 200 });
+        }
+        if (String(url).endsWith("/pulls/4103")) {
+          return new Response("{}", { status: 503 });
+        }
+        return new Response("{}", { status: 500 });
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4103; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
     it("retries the repository auto-merge read with the next repo token after a 403", async () => {
       const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);
@@ -5894,6 +5986,9 @@ describe("evaluateDoneTierDeclaration", () => {
       ]);
       const authByCall: string[] = [];
       ghFetchMock.mockImplementation(async (url, init) => {
+        if (String(url).endsWith("/pulls/4103")) {
+          return new Response(JSON.stringify({ state: "open", draft: false, base: { ref: "main" } }), { status: 200 });
+        }
         if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
           const authorization = (init as { headers?: Record<string, string> } | undefined)?.headers?.authorization ?? "";
           authByCall.push(authorization);
