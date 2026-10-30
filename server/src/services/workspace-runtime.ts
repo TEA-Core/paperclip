@@ -4916,9 +4916,36 @@ async function restoreBaseRepoToDefaultRef(input: {
     return { restored: false, warnings, rescueRefs };
   }
 
-  const checkout = await runGit(["checkout", "--force", shortDefault], input.repoRoot)
-    .then(() => true)
-    .catch(() => false);
+  // SUP-22022: the checkout must land on the configured base ref's commit.
+  // `git checkout --force <shortDefault>` resolves refs/heads/<branch>, so a
+  // same-named local branch that is stale (or diverged) would move the repo —
+  // which on the managed reuse path can be an execution worktree itself —
+  // backward off the base tip. Only a local branch that already points at the
+  // base ref's commit may take the checkout; anything else detaches at that
+  // commit without mutating the stale branch ref.
+  const baseRefTargetSha = await resolveBaseRefSha(input.repoRoot, input.baseRef);
+  const localBranchSha = await runGit(
+    ["rev-parse", "--verify", "--quiet", `refs/heads/${shortDefault}`],
+    input.repoRoot,
+  )
+    .then((value) => value.trim() || null)
+    .catch(() => null);
+  const staleLocalBranch = Boolean(baseRefTargetSha && localBranchSha && localBranchSha !== baseRefTargetSha);
+  const checkoutCommand = staleLocalBranch
+    ? `git checkout --force --detach ${baseRefTargetSha}`
+    : `git checkout --force ${shortDefault}`;
+  const checkout = staleLocalBranch
+    ? await runGit(["checkout", "--force", "--detach", baseRefTargetSha!], input.repoRoot)
+        .then(() => true)
+        .catch(() => false)
+    : await runGit(["checkout", "--force", shortDefault], input.repoRoot)
+        .then(() => true)
+        .catch(() => false);
+  if (checkout && staleLocalBranch) {
+    warnings.push(
+      `base repo was detached at ${input.baseRef} (${baseRefTargetSha?.slice(0, 12)}) because local branch "${shortDefault}" is stale at ${localBranchSha?.slice(0, 12)} and does not point at the configured base ref`,
+    );
+  }
   let restored = checkout;
   if (!checkout) {
     // The default branch can be held by an agent worktree, which is its own bug
@@ -4941,12 +4968,13 @@ async function restoreBaseRepoToDefaultRef(input: {
   if (input.recorder) {
     await input.recorder.recordOperation({
       phase: "worktree_prepare",
-      command: `git checkout --force ${shortDefault}`,
+      command: checkoutCommand,
       cwd: input.repoRoot,
       metadata: {
         baseRepoHygiene: true,
         repoRoot: input.repoRoot,
         baseRef: input.baseRef,
+        baseRefSha: baseRefTargetSha,
         reasons: input.decision.reasons,
         rescueRefs,
         restored,
