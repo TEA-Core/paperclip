@@ -2429,6 +2429,60 @@ function deliveryBindingValidationError(
   return null;
 }
 
+type MergedDeliveryVerification =
+  | { outcome: "proven" }
+  | { outcome: "unproven"; reason: string }
+  | { outcome: "auth-failed"; status: number };
+
+/**
+ * SUP-21513: a MERGED delivery PR is a completed delivery exactly when its
+ * merge commit is contained in the recorded base branch. The GitHub compare
+ * endpoint `compare/{base}...{mergeCommitSha}` reports the head relative to the
+ * base: `ahead_by: 0` (status "identical" or "behind") means the merge commit
+ * is the base tip or an ancestor of it — contained, proven. "ahead"/"diverged"
+ * (or any unreadable answer) means it is NOT in base (e.g. the base branch was
+ * rewritten after the merge), which fails closed per ADR-091 D4. 401/403
+ * rotates to the next token candidate, mirroring the neighboring reads.
+ */
+async function verifyMergedPullRequestOnBaseBranch(
+  token: string,
+  owner: string,
+  repo: string,
+  baseRef: string | null,
+  mergeCommitSha: string | null,
+): Promise<MergedDeliveryVerification> {
+  if (!baseRef || !mergeCommitSha) {
+    return { outcome: "unproven", reason: "merged PR has no readable merge commit or base branch" };
+  }
+  let response: Response;
+  try {
+    response = await ghFetch(
+      `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare/${encodeURIComponent(baseRef)}...${encodeURIComponent(mergeCommitSha)}`,
+      { headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json" } },
+    );
+  } catch {
+    return { outcome: "unproven", reason: "merge-commit containment check failed with a network error" };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return { outcome: "auth-failed", status: response.status };
+  }
+  if (!response.ok) {
+    return { outcome: "unproven", reason: `merge-commit containment check returned HTTP ${response.status}` };
+  }
+  const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+  const aheadBy = body?.ahead_by;
+  const status = typeof body?.status === "string" ? body.status : null;
+  if (typeof aheadBy === "number" ? aheadBy === 0 : status === "identical" || status === "behind") {
+    return { outcome: "proven" };
+  }
+  return {
+    outcome: "unproven",
+    reason: status
+      ? `merge commit ${mergeCommitSha.slice(0, 7)} is not on base branch ${baseRef} (compare status: ${status})`
+      : "merge-commit containment check returned an unreadable compare response",
+  };
+}
+
 async function resolveExactBoundPullRequest(
   db: Db,
   companyId: string,
@@ -2451,7 +2505,30 @@ async function resolveExactBoundPullRequest(
       return { pr: null, reason: `recorded delivery identity PR open-state verification failed: HTTP ${result.status}` };
     }
     if (result.open !== true || result.draft === true) {
-      return { pr: null, reason: result.draft === true ? "recorded delivery identity PR is a draft" : "recorded delivery identity PR is not open" };
+      // SUP-21513: a MERGED delivery PR whose merge commit is proven on the
+      // recorded base branch is a completed delivery, not an unresolved one.
+      // Closed-unmerged and open drafts keep the original fail-closed refusals
+      // below, byte-identically (ADR-091 D4).
+      if (result.merged === true && result.draft !== true) {
+        const verified = await verifyMergedPullRequestOnBaseBranch(
+          candidate.token,
+          repo.owner,
+          repo.repo,
+          result.baseRef,
+          result.mergeCommitSha,
+        );
+        if (verified.outcome === "auth-failed" && candidate !== candidates[candidates.length - 1]) continue;
+        if (verified.outcome !== "proven") {
+          return {
+            pr: null,
+            reason: verified.outcome === "auth-failed"
+              ? `recorded delivery identity PR merge-commit verification failed: HTTP ${verified.status}`
+              : `recorded delivery identity PR is merged but not proven on its base branch: ${verified.reason}`,
+          };
+        }
+      } else {
+        return { pr: null, reason: result.draft === true ? "recorded delivery identity PR is a draft" : "recorded delivery identity PR is not open" };
+      }
     }
     if (result.headRef !== binding.branch) {
       return {
@@ -2474,7 +2551,7 @@ async function resolveExactBoundPullRequest(
         headRefName: result.headRef,
         title: null,
         displayName: `${repo.owner}/${repo.repo}#${binding.prNumber}`,
-        cachedState: "open",
+        cachedState: result.merged ? "merged" : "open",
         lastErrorCode: null,
         reviewDecision: null,
         draft: result.draft,
@@ -3394,6 +3471,9 @@ function samePullRequest(
 const finalDeliveryLiveSchema = z.object({
   state: z.string(), draft: z.boolean(), merged: z.boolean(), title: z.string(),
   head: z.object({ sha: z.string().min(1), ref: z.string(), repo: z.object({ full_name: z.string() }) }),
+  // SUP-21513: present on a merged PR; optional so open-PR payloads keep parsing.
+  merge_commit_sha: z.string().min(1).nullable().optional(),
+  base: z.object({ ref: z.string() }).optional(),
 });
 
 /** Read-only final-stage certification; no approval or status writes. */
@@ -3414,7 +3494,25 @@ export async function preflightFinalDelivery(
     const parsed = finalDeliveryLiveSchema.safeParse(await response.json());
     if (!parsed.success) return { kind: "unresolvable", reason: "head_unverifiable: incomplete live PR response" };
     const live = parsed.data;
-    if (live.state !== "open" || live.merged !== false) {
+    if (live.merged === true) {
+      // SUP-21513: a merged delivery whose merge commit is proven on the
+      // recorded base branch is a completed delivery — accept it. No status is
+      // written later; publishApprovalStatus truthfully skips merged PRs.
+      const verified = await verifyMergedPullRequestOnBaseBranch(
+        candidate.token,
+        pr.owner,
+        pr.repo,
+        live.base?.ref ?? null,
+        live.merge_commit_sha ?? null,
+      );
+      if (verified.outcome === "auth-failed") {
+        if (candidate !== candidates[candidates.length - 1]) continue;
+        return { kind: "unresolvable", reason: `head_unverifiable: merged delivery merge-commit verification returned HTTP ${verified.status}` };
+      }
+      if (verified.outcome !== "proven") {
+        return { kind: "unresolvable", reason: `head_merged_unproven: ${verified.reason}` };
+      }
+    } else if (live.state !== "open") {
       return { kind: "unresolvable", reason: "head_not_open: delivery must be OPEN and unmerged" };
     }
     if (live.draft !== false) {
@@ -4008,6 +4106,10 @@ export interface HeadShaSuccess extends GitHubFetchResult {
   open: boolean;
   draft: boolean;
   merged: boolean;
+  /** SUP-21513: the PR's merge commit once merged (body.merge_commit_sha), else null. */
+  mergeCommitSha: string | null;
+  /** SUP-21513: the PR's recorded base branch (body.base.ref), else null. */
+  baseRef: string | null;
 }
 
 export interface HeadShaFailure extends GitHubFetchResult {
@@ -4018,6 +4120,8 @@ export interface HeadShaFailure extends GitHubFetchResult {
   open: null;
   draft: null;
   merged: null;
+  mergeCommitSha: null;
+  baseRef: null;
 }
 
 export type HeadShaResult = HeadShaSuccess | HeadShaFailure;
@@ -4062,13 +4166,13 @@ async function fetchPullRequestHeadShaOnce(
   try {
     response = await ghFetch(url, { headers, signal });
   } catch {
-    return { ok: false, status: 0, message: "network_error", headSha: null, headRef: null, open: null, draft: null, merged: null };
+    return { ok: false, status: 0, message: "network_error", headSha: null, headRef: null, open: null, draft: null, merged: null, mergeCommitSha: null, baseRef: null };
   }
 
   if (!response.ok) {
     const body = await response.json().catch(() => null) as Record<string, unknown> | null;
     const message = body?.message as string | undefined;
-    return { ok: false, status: response.status, message: message ?? null, headSha: null, headRef: null, open: null, draft: null, merged: null };
+    return { ok: false, status: response.status, message: message ?? null, headSha: null, headRef: null, open: null, draft: null, merged: null, mergeCommitSha: null, baseRef: null };
   }
 
   const body = await response.json().catch(() => null) as Record<string, unknown> | null;
@@ -4082,12 +4186,20 @@ async function fetchPullRequestHeadShaOnce(
       open: null,
       draft: null,
       merged: null,
+      mergeCommitSha: null,
+      baseRef: null,
     };
   }
 
   const head = body.head as Record<string, unknown> | undefined;
   const sha = head?.sha as string | undefined;
   const ref = typeof head?.ref === "string" && head.ref.length > 0 ? head.ref : null;
+  const base = body.base as Record<string, unknown> | undefined;
+  const baseRef = typeof base?.ref === "string" && base.ref.length > 0 ? base.ref : null;
+  const mergeCommitSha =
+    typeof body.merge_commit_sha === "string" && body.merge_commit_sha.length > 0
+      ? body.merge_commit_sha
+      : null;
   if (typeof sha === "string" && sha.length > 0) {
     return {
       ok: true,
@@ -4099,6 +4211,8 @@ async function fetchPullRequestHeadShaOnce(
       open: body.state === "open" && body.merged !== true,
       draft: body.draft === true,
       merged: body.merged === true,
+      mergeCommitSha,
+      baseRef,
     };
   }
   return {
@@ -4110,6 +4224,8 @@ async function fetchPullRequestHeadShaOnce(
       open: null,
       draft: null,
       merged: null,
+      mergeCommitSha: null,
+      baseRef: null,
     };
 }
 
