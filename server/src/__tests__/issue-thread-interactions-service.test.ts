@@ -5351,4 +5351,37 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       comment.body.includes("Closed at Tier 2 (live): record-only native completion verified by the reviewer"),
     )).toBe(true);
   });
+
+  it("rejects native completion when the issue changes after the guard preflight", async () => {
+    const { companyId, goalId, issueId, interactionId } =
+      await seedNativeCompletionReview();
+
+    await expect(interactionsSvc.acceptInteraction(
+      { id: issueId, companyId, goalId, projectId: null },
+      interactionId,
+      {
+        doneTier: {
+          tier: "tier2",
+          probeEvidence: "record-only native completion verified by the reviewer",
+        },
+      },
+      { userId: "local-board" },
+      {
+        beforeResolveInTransaction: async () => {
+          await db
+            .update(issues)
+            .set({ status: "in_progress" })
+            .where(eq(issues.id, issueId));
+        },
+      },
+    )).rejects.toMatchObject({ status: 409 });
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [interaction] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interactionId));
+    expect(issue?.status).toBe("in_progress");
+    expect(interaction?.status).toBe("pending");
+  });
 });

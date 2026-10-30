@@ -2114,6 +2114,8 @@ export function issueThreadInteractionService(
       });
 
     let nativeCompletionCloseComment: string | null = null;
+    let nativeCompletionGuardStatus: string | null = null;
+    let nativeCompletionGuardStatusVersion: number | null = null;
     if (isNativeCompletionReview(args.current)) {
       const [guardIssue] = await db
         .select()
@@ -2148,8 +2150,9 @@ export function issueThreadInteractionService(
         );
       }
       nativeCompletionCloseComment = guardVerdict.closeComment;
+      nativeCompletionGuardStatus = guardIssue.status;
+      nativeCompletionGuardStatusVersion = guardIssue.statusVersion;
     }
-
     const now = new Date();
     const postCommitActivityPublications: ActivityPublication[] = [];
     const result = await db.transaction(async (tx) => {
@@ -2160,22 +2163,11 @@ export function issueThreadInteractionService(
       // before expiring linked proposals, so keep issue -> proposal ->
       // interaction as the shared lifecycle order.
       const issueContext = await tx
-        .select({
-          id: issues.id,
-          companyId: issues.companyId,
-          status: issues.status,
-          workMode: issues.workMode,
-          assigneeAgentId: issues.assigneeAgentId,
-          assigneeUserId: issues.assigneeUserId,
-          reviewPolicy: issues.reviewPolicy,
-          createdByAgentId: issues.createdByAgentId,
-          createdByUserId: issues.createdByUserId,
-          executionState: issues.executionState,
-        })
+        .select()
         .from(issues)
         .where(eq(issues.id, args.issue.id))
         .for("update")
-        .then((rows: IssueResolutionContext[]) => rows[0] ?? null);
+        .then((rows) => rows[0] ?? null);
 
       if (!issueContext || issueContext.companyId !== args.issue.companyId) {
         throw notFound("Issue not found");
@@ -2209,6 +2201,16 @@ export function issueThreadInteractionService(
         lockedCurrent,
         args.actor,
       );
+
+      if (
+        isNativeCompletionReview(lockedCurrent) &&
+        (issueContext.status !== nativeCompletionGuardStatus ||
+          issueContext.statusVersion !== nativeCompletionGuardStatusVersion)
+      ) {
+        throw conflict(
+          "Issue changed while the native completion review was being checked; retry the acceptance",
+        );
+      }
 
       const interaction = hydrateInteraction(lockedCurrent);
       const selectedOptionIds =
