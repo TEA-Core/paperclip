@@ -221,142 +221,6 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-// SUP-20761: the batch getByIds projection must carry the persisted
-// ahead-of-base evidence from the already-batched work-product rows instead of
-// hard-coding aheadOfBase=false, without scanning git per child.
-describeEmbeddedPostgres("executionWorkspaceService.getByIds recorded delivery projection (SUP-20761)", () => {
-  let db!: ReturnType<typeof createDb>;
-  let svc!: ReturnType<typeof executionWorkspaceService>;
-  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
-
-  beforeAll(async () => {
-    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-execution-workspaces-batch-");
-    db = createDb(tempDb.connectionString);
-    svc = executionWorkspaceService(db);
-  }, 20_000);
-
-  afterEach(async () => {
-    await db.delete(issueWorkProducts);
-    await db.delete(issues);
-    await db.delete(executionWorkspaces);
-    await db.delete(projectWorkspaces);
-    await db.delete(projects);
-    await db.delete(companies);
-  });
-
-  afterAll(async () => {
-    await tempDb?.cleanup();
-  });
-
-  it("projects unmerged only with persisted ahead-of-base evidence, without scanning git", async () => {
-    const companyId = randomUUID();
-    const projectId = randomUUID();
-    const issuePrefix = `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix,
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(projects).values({
-      id: projectId,
-      companyId,
-      name: "Batch delivery projection",
-      status: "in_progress",
-    });
-
-    async function seedChildWorkspace(input: {
-      name: string;
-      prStatus: string;
-      prMetadata: Record<string, unknown>;
-    }) {
-      const executionWorkspaceId = randomUUID();
-      const sourceIssueId = randomUUID();
-      await db.insert(executionWorkspaces).values({
-        id: executionWorkspaceId,
-        companyId,
-        projectId,
-        mode: "isolated_workspace",
-        strategyType: "git_worktree",
-        name: input.name,
-        status: "active",
-        providerType: "git_worktree",
-      });
-      await db.insert(issues).values({
-        id: sourceIssueId,
-        companyId,
-        projectId,
-        identifier: `${issuePrefix}-${input.name}`,
-        title: input.name,
-        status: "done",
-        priority: "medium",
-        executionWorkspaceId,
-      });
-      await db
-        .update(executionWorkspaces)
-        .set({ sourceIssueId })
-        .where(eq(executionWorkspaces.id, executionWorkspaceId));
-      await db.insert(issueWorkProducts).values({
-        companyId,
-        projectId,
-        issueId: sourceIssueId,
-        executionWorkspaceId,
-        type: "pull_request",
-        provider: "github",
-        title: `${input.name} PR`,
-        url: `https://github.com/paperclipai/paperclip/pull/${input.name}`,
-        status: input.prStatus,
-        metadata: input.prMetadata,
-      });
-      return executionWorkspaceId;
-    }
-
-    const aheadWorkspaceId = await seedChildWorkspace({
-      name: "ahead-child",
-      // recordAtOpen persists exactly this shape on the shared carrier branch;
-      // the recorded head SHA is the persisted evidence the branch was ahead
-      // of base at PR-open time.
-      prStatus: "ready_for_review",
-      prMetadata: {
-        prNumber: 101,
-        repository: "paperclipai/paperclip",
-        headRef: "feature/ahead-child",
-        baseRef: "main",
-        headSha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
-      },
-    });
-    const unknownWorkspaceId = await seedChildWorkspace({
-      name: "no-evidence-child",
-      // Distinguishing aheadOfBase=false case: a recorded non-merged PR with
-      // no head SHA carries no ahead-of-base evidence, so the projection must
-      // fail safe to unknown.
-      prStatus: "open",
-      prMetadata: {},
-    });
-    const mergedWorkspaceId = await seedChildWorkspace({
-      name: "merged-child",
-      prStatus: "merged",
-      prMetadata: {
-        mergedAt: "2026-01-01T00:00:00Z",
-        mergeCommitSha: "0000000000000000000000000000000000000000",
-        headSha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      },
-    });
-
-    const scan = vi.spyOn(workspaceGitOperationScheduler, "run");
-    try {
-      const batch = await svc.getByIds(companyId, [aheadWorkspaceId, unknownWorkspaceId, mergedWorkspaceId]);
-      expect(scan).not.toHaveBeenCalled();
-      expect(batch.size).toBe(3);
-      expect(batch.get(aheadWorkspaceId)?.deliveryState).toBe("unmerged");
-      expect(batch.get(unknownWorkspaceId)?.deliveryState).toBe("unknown");
-      expect(batch.get(mergedWorkspaceId)?.deliveryState).toBe("merged_via_pr");
-    } finally {
-      scan.mockRestore();
-    }
-  });
-});
-
 async function runGit(cwd: string, args: string[]) {
   await execFileAsync("git", ["-C", cwd, ...args], { cwd });
 }
@@ -7063,5 +6927,141 @@ describeEmbeddedPostgres("closePinnedWorkspaceForReprovision detaches bound issu
       executionWorkspaceId: seeded.workspaceId,
       executionWorkspacePreference: "reuse_existing",
     });
+  });
+});
+
+// SUP-20761: the batch getByIds projection must carry the persisted
+// ahead-of-base evidence from the already-batched work-product rows instead of
+// hard-coding aheadOfBase=false, without scanning git per child.
+describeEmbeddedPostgres("executionWorkspaceService.getByIds recorded delivery projection (SUP-20761)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof executionWorkspaceService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-execution-workspaces-batch-");
+    db = createDb(tempDb.connectionString);
+    svc = executionWorkspaceService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueWorkProducts);
+    await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("projects unmerged only with persisted ahead-of-base evidence, without scanning git", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const issuePrefix = `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Batch delivery projection",
+      status: "in_progress",
+    });
+
+    async function seedChildWorkspace(input: {
+      name: string;
+      prStatus: string;
+      prMetadata: Record<string, unknown>;
+    }) {
+      const executionWorkspaceId = randomUUID();
+      const sourceIssueId = randomUUID();
+      await db.insert(executionWorkspaces).values({
+        id: executionWorkspaceId,
+        companyId,
+        projectId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: input.name,
+        status: "active",
+        providerType: "git_worktree",
+      });
+      await db.insert(issues).values({
+        id: sourceIssueId,
+        companyId,
+        projectId,
+        identifier: `${issuePrefix}-${input.name}`,
+        title: input.name,
+        status: "done",
+        priority: "medium",
+        executionWorkspaceId,
+      });
+      await db
+        .update(executionWorkspaces)
+        .set({ sourceIssueId })
+        .where(eq(executionWorkspaces.id, executionWorkspaceId));
+      await db.insert(issueWorkProducts).values({
+        companyId,
+        projectId,
+        issueId: sourceIssueId,
+        executionWorkspaceId,
+        type: "pull_request",
+        provider: "github",
+        title: `${input.name} PR`,
+        url: `https://github.com/paperclipai/paperclip/pull/${input.name}`,
+        status: input.prStatus,
+        metadata: input.prMetadata,
+      });
+      return executionWorkspaceId;
+    }
+
+    const aheadWorkspaceId = await seedChildWorkspace({
+      name: "ahead-child",
+      // recordAtOpen persists exactly this shape on the shared carrier branch;
+      // the recorded head SHA is the persisted evidence the branch was ahead
+      // of base at PR-open time.
+      prStatus: "ready_for_review",
+      prMetadata: {
+        prNumber: 101,
+        repository: "paperclipai/paperclip",
+        headRef: "feature/ahead-child",
+        baseRef: "main",
+        headSha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+      },
+    });
+    const unknownWorkspaceId = await seedChildWorkspace({
+      name: "no-evidence-child",
+      // Distinguishing aheadOfBase=false case: a recorded non-merged PR with
+      // no head SHA carries no ahead-of-base evidence, so the projection must
+      // fail safe to unknown.
+      prStatus: "open",
+      prMetadata: {},
+    });
+    const mergedWorkspaceId = await seedChildWorkspace({
+      name: "merged-child",
+      prStatus: "merged",
+      prMetadata: {
+        mergedAt: "2026-01-01T00:00:00Z",
+        mergeCommitSha: "0000000000000000000000000000000000000000",
+        headSha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      },
+    });
+
+    const scan = vi.spyOn(workspaceGitOperationScheduler, "run");
+    try {
+      const batch = await svc.getByIds(companyId, [aheadWorkspaceId, unknownWorkspaceId, mergedWorkspaceId]);
+      expect(scan).not.toHaveBeenCalled();
+      expect(batch.size).toBe(3);
+      expect(batch.get(aheadWorkspaceId)?.deliveryState).toBe("unmerged");
+      expect(batch.get(unknownWorkspaceId)?.deliveryState).toBe("unknown");
+      expect(batch.get(mergedWorkspaceId)?.deliveryState).toBe("merged_via_pr");
+    } finally {
+      scan.mockRestore();
+    }
   });
 });
