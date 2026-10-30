@@ -13,6 +13,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { prDeliveryService } from "../services/pr-delivery.js";
+import type { PullRequestMergeDetails } from "../services/github-pull-request-merge.js";
 import { prDeliverySignature } from "../routes/issues.js";
 
 describe("prDeliverySignature (unit)", () => {
@@ -242,7 +243,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
 
   it("stamps server provenance at open, and the sweep re-stamps it on merge", async () => {
     const service = prDeliveryService(db, {
-      resolvePullRequestDetails: vi.fn(async () => ({
+      resolvePullRequestDetails: vi.fn(async (): Promise<PullRequestMergeDetails> => ({
         state: "merged",
         headRef: "carrier-branch",
         headSha: "abc123",

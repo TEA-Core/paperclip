@@ -162,9 +162,9 @@ describe("workProductService", () => {
   it("strips server provenance from create and update metadata", async () => {
     const insertedRow = createWorkProductRow();
     const insertReturning = vi.fn(async () => [insertedRow]);
-    const insertValues = vi.fn(() => ({ returning: insertReturning }));
+    const insertValues = vi.fn((_values: unknown) => ({ returning: insertReturning }));
     const txInsert = vi.fn(() => ({ values: insertValues }));
-    const updateSet = vi.fn(() => ({
+    const updateSet = vi.fn((_set: unknown) => ({
       where: vi.fn(() => ({ returning: vi.fn(async () => [insertedRow]) })),
     }));
     const txSelect = vi.fn(() => ({
