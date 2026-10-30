@@ -466,7 +466,7 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
   descriptor({
     operationId: "create_task",
     title: "Create task",
-    description: "Create an assigned task. In a conversation, create a project task with no parent; otherwise create a child of the active task. Include initialPlan to persist its plan before execution.",
+    description: "Create an assigned task. In a conversation, create a project task with no parent; otherwise create a child of the active task. Include initialPlan to persist its plan before execution. Execution-policy fields (including scheduled monitors) are not accepted here: they fail validation instead of being silently ignored; after creating the task, set them on the issue through the issue API.",
     placement: "optional",
     effect: "write",
     requiredClaims: ["delegation:tasks:create"],

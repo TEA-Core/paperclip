@@ -29,7 +29,7 @@ export const createTaskAction = {
   },
   "documentation": {
     "title": "Create task",
-    "description": "Create a project task from a conversation, or a child from an ordinary task. Persist initialPlan before execution.",
+    "description": "Create a project task from a conversation, or a child from an ordinary task. Persist initialPlan before execution. Execution-policy fields (including scheduled monitors) are not accepted here: they fail validation instead of being silently ignored; after creating the task, set them on the issue through the issue API.",
     "note": null
   },
   "examples": {
@@ -77,7 +77,7 @@ export const createTaskAction = {
       "operationId": "create_task",
       "version": 1,
       "title": "Create task",
-      "description": "Create a project task from a conversation, or a child from an ordinary task. Persist initialPlan before execution.",
+      "description": "Create a project task from a conversation, or a child from an ordinary task. Persist initialPlan before execution. Execution-policy fields (including scheduled monitors) are not accepted here: they fail validation instead of being silently ignored; after creating the task, set them on the issue through the issue API.",
       "exposure": "optional",
       "requiredClaims": [
         "delegation:tasks:create"

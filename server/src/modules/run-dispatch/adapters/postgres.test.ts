@@ -749,6 +749,50 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       });
     });
 
+    it("expires an old queued issue run when its own non-running pointers are stale", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      const now = new Date("2026-01-02T00:00:00.000Z");
+      const createdAt = new Date("2025-12-31T00:00:00.000Z");
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId }, now: createdAt });
+      await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, issueId));
+
+      const result = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now,
+      });
+
+      expect(result).toMatchObject({ outcome: "cancelled", errorCode: "queued_run_expired" });
+      const [issue] = await db.select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
+        .from(issues).where(eq(issues.id, issueId));
+      expect(issue).toEqual({ executionRunId: null, checkoutRunId: null });
+    });
+
+    it("keeps an old queued issue run live while another running run owns its execution pointer", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      const now = new Date("2026-01-02T00:00:00.000Z");
+      const createdAt = new Date("2025-12-31T00:00:00.000Z");
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const queuedRunId = await seedRun({ companyId, agentId, contextSnapshot: { issueId }, now: createdAt });
+      const runningRunId = await seedRun({ companyId, agentId, contextSnapshot: { issueId }, status: "running", now });
+      await db.update(issues).set({ executionRunId: runningRunId }).where(eq(issues.id, issueId));
+
+      const result = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+        runId: queuedRunId,
+        companyId,
+        expectedStatus: "queued",
+        now,
+      });
+
+      expect(result).toEqual({ outcome: "not_stale" });
+      const [run] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, queuedRunId));
+      expect(run?.status).toBe("queued");
+    });
+
     it("maps a reassigned issue into a stale queued-run decision", async () => {
       const { companyId, agentId } = await seedCompanyAndAgent();
       const replacementAgentId = randomUUID();
