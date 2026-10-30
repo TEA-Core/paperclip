@@ -18141,26 +18141,38 @@ export function issueRoutes(
         }
         mutationAccess = await assertFreshTaskWatchdogSourceMutation(res, watchdogScope, existing);
         if (!mutationAccess) return;
-      } else if (allowActiveStageVerdict) {
-        // SUP-21863: an armed review stage points
-        // `executionState.currentParticipant` at the reviewer while
-        // `assigneeAgentId` stays on the delivery owner, so
-        // `assertAgentIssueMutationAllowed` rejected the lawful participant
-        // (403 issue_write_no_grant) before the execution-policy engine could
-        // validate the decision. Defer ONLY the verified active-verdict shape
-        // (see isAgentActiveStageVerdictRequest): the engine stays the
-        // authority for participant identity and every reassignment the
-        // verdict triggers; every other mutation keeps the full boundary.
-        mutationAccess = {
-          allowed: true,
-          reason: "allow_active_stage_participant_verdict",
-          action: "issue:mutate",
-          explanation:
-            "Allowed because the actor is the current pending execution-stage participant submitting that stage's verdict; the execution-policy engine validates the decision.",
-        };
       } else {
+        // SUP-21915: the verdict deferral must not outrank a harder
+        // authorization denial. Evaluate the boundary decision FIRST and
+        // defer only when the actor is otherwise allowed, or when the sole
+        // obstacle is a missing grant (`deny_missing_grant` with no
+        // responsible-user denial code) — the SUP-21246 shape the deferral
+        // exists for. Policy-restricted, low-trust-boundary,
+        // responsible-user-ceiling, and visibility denials fall through and
+        // keep the full boundary below.
         const boundaryDecision = await decideIssueAccess(req, existing, "issue:mutate");
-        if (boundaryDecision.allowed) {
+        if (
+          allowActiveStageVerdict &&
+          (boundaryDecision.allowed ||
+            (boundaryDecision.reason === "deny_missing_grant" && !boundaryDecision.code))
+        ) {
+          // SUP-21863: an armed review stage points
+          // `executionState.currentParticipant` at the reviewer while
+          // `assigneeAgentId` stays on the delivery owner, so
+          // `assertAgentIssueMutationAllowed` rejected the lawful participant
+          // (403 issue_write_no_grant) before the execution-policy engine could
+          // validate the decision. Defer ONLY the verified active-verdict shape
+          // (see isAgentActiveStageVerdictRequest): the engine stays the
+          // authority for participant identity and every reassignment the
+          // verdict triggers; every other mutation keeps the full boundary.
+          mutationAccess = {
+            allowed: true,
+            reason: "allow_active_stage_participant_verdict",
+            action: "issue:mutate",
+            explanation:
+              "Allowed because the actor is the current pending execution-stage participant submitting that stage's verdict; the execution-policy engine validates the decision.",
+          };
+        } else if (boundaryDecision.allowed) {
           mutationAccess = await assertAgentIssueMutationAllowed(req, res, existing, {
             allowVisibleIssueWrite: true,
             noCheckoutAdoption: req.body.expectedUpdatedAt !== undefined,
