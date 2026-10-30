@@ -62,6 +62,7 @@ import {
   resolveApprovalDecisionHead,
   resolveCardDeliveryBranchOwnership,
   resolveCardPullRequest,
+  resolveLinkedPullRequests,
   resolveLinkedPullRequestsWithState,
   writeCommitStatusWithRetry,
   withTransientReadRetry,
@@ -855,6 +856,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       draft?: boolean;
       number?: number;
       headRefName?: string;
+      baseRef?: string | null;
       owner?: string;
       repo?: string;
     } = {},
@@ -867,6 +869,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       draft: overrides.draft ?? false,
       node_id: "PR_node_id_12345",
       head: { ref: overrides.headRefName ?? "SUP-42-branch" },
+      ...(overrides.baseRef === undefined ? {} : { baseRef: overrides.baseRef }),
       title: `Fix thing (SUP-${number})`,
     };
     const [externalObj] = await db
@@ -2245,6 +2248,34 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         source: "mention",
         draft: true,
       });
+    });
+  });
+
+  describe("SUP-21684: cached GitHub baseRef propagates to LinkedPullRequest.baseRefName", () => {
+    it("resolveLinkedPullRequests maps cached data.baseRef to baseRefName", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, baseRef: "main" });
+      await insertMention(issueId, { number: 43, baseRef: null });
+
+      const result = await resolveLinkedPullRequests(db, companyId, issueId);
+      const byNumber = new Map(result.map((pr) => [pr.number, pr]));
+
+      expect(byNumber.get(42)?.baseRefName).toBe("main");
+      expect(byNumber.get(43)?.baseRefName ?? null).toBeNull();
+    });
+
+    it("resolveLinkedPullRequestsWithState maps cached data.baseRef to baseRefName (incl. closed rows)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, baseRef: "main" });
+      await insertMention(issueId, { number: 43, state: "closed", baseRef: "release-1" });
+      await insertMention(issueId, { number: 44, baseRef: null });
+
+      const result = await resolveLinkedPullRequestsWithState(db, companyId, issueId);
+      const byNumber = new Map(result.map((pr) => [pr.number, pr]));
+
+      expect(byNumber.get(42)?.baseRefName).toBe("main");
+      expect(byNumber.get(43)?.baseRefName).toBe("release-1");
+      expect(byNumber.get(44)?.baseRefName ?? null).toBeNull();
     });
   });
 

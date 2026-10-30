@@ -246,7 +246,8 @@ export type EnsureWorktreeSeededResult = {
     | "verified_manifest"
     | "complete_marker"
     | "legacy_unmarked"
-    | "legacy_database";
+    | "legacy_database"
+    | "no_source";
   details?: SeedWorktreeDatabaseResult;
 };
 
@@ -1836,6 +1837,18 @@ function writeWorktreeSeedManifest(filePath: string, manifest: WorktreeSeedManif
   renameSync(temporaryPath, filePath);
 }
 
+function writeNoSourceSeedSkipMarker(
+  configPath: string,
+  input: { reason: "no-on-disk-seed-source" | "source-config-is-target-config"; sourceConfigPath?: string | null },
+): void {
+  const markerPath = path.join(path.dirname(path.resolve(configPath)), "seed-skip-no-source");
+  writeFileSync(markerPath, `${JSON.stringify({
+    reason: input.reason,
+    sourceConfigPath: input.sourceConfigPath ?? null,
+    at: new Date().toISOString(),
+  }, null, 2)}\n`, { mode: 0o600 });
+}
+
 export function readWorktreeSeedManifest(configPath: string): WorktreeSeedManifest | null {
   const manifestPath = resolveWorktreeSeedMarkerPaths(configPath).manifest;
   if (!existsSync(manifestPath)) return null;
@@ -2255,14 +2268,21 @@ export async function ensureWorktreeSeeded(
     expectedTargetInstanceId: targetPaths.instanceId,
   });
 
-  if (initialManifest && initialManifest.targetInstanceId !== registeredSeedSource.targetInstanceId) {
+  if (initialManifest && registeredSeedSource && initialManifest.targetInstanceId !== registeredSeedSource.targetInstanceId) {
     throw new Error("Worktree seed manifest target instance does not match the registered target instance.");
+  }
+
+  if (!registeredSeedSource) {
+    writeNoSourceSeedSkipMarker(configPath, {
+      reason: "source-config-is-target-config",
+      sourceConfigPath: explicitSourceConfigPath ?? path.join(registeredBaseWorkspaceCwd ?? "", ".paperclip", "config.json"),
+    });
+    return { seeded: false, reason: "no_source" };
   }
 
   // Resolve all authority-bearing paths before creating the lock. The manifest is
   // agent-writable diagnostic evidence and never selects the source. A stale source
   // diagnostic is replaced under the lock from this server/operator registration.
-  let canonicalSource = registeredSeedSource;
   mkdirSync(path.dirname(markers.lock), { recursive: true });
   const releaseLock = await acquireWorktreeSeedLock(markers.lock);
   try {
@@ -2337,7 +2357,7 @@ export async function ensureWorktreeSeeded(
       });
       manifest = readWorktreeSeedManifest(configPath)!;
     }
-    canonicalSource = resolveCanonicalWorktreeSeedSource({
+    const canonicalSource = resolveCanonicalWorktreeSeedSource({
       registeredBaseWorkspaceCwd,
       explicitSourceConfigPath,
       targetConfigPath: configPath,
@@ -2345,6 +2365,13 @@ export async function ensureWorktreeSeeded(
       manifestSource: manifest.source,
       manifestTargetInstanceId: manifest.targetInstanceId,
     });
+    if (!canonicalSource) {
+      writeNoSourceSeedSkipMarker(configPath, {
+        reason: "source-config-is-target-config",
+        sourceConfigPath: registeredSeedSource.configPath,
+      });
+      return { seeded: false, reason: "no_source" };
+    }
     const sourceConfigPath = canonicalSource.configPath;
 
     const sourceConfig = readConfig(sourceConfigPath);
@@ -2598,6 +2625,8 @@ export async function worktreeEnsureSeededCommand(opts: WorktreeEnsureSeededOpti
       spinner.stop("Seeded isolated worktree database (minimal).");
     } else if (result.reason === "legacy_database") {
       spinner.stop("Validated and adopted an existing legacy worktree database.");
+    } else if (result.reason === "no_source") {
+      spinner.stop("No distinct worktree seed source exists; skipping database seed.");
     } else {
       spinner.stop("Worktree database already has a verified seed manifest.");
     }

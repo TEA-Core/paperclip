@@ -28,6 +28,7 @@ export async function callProjectTool(input: {
   else if (input.name === "create_project") {
     body = createProjectSchema.extend({ idempotencyKey: z.string().min(1).max(255) }).parse(args);
   } else if (input.name === "create_task") {
+    if ("executionPolicy" in args) throw new Error("paperclip_runner_tool_arguments_invalid");
     const key = z.string().min(1).max(150).parse(args.idempotencyKey);
     path = `/companies/${input.companyId}/issues`;
     body = createIssueSchema.parse({

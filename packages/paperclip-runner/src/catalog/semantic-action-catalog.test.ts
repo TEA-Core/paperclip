@@ -37,6 +37,29 @@ describe("semantic action catalog", () => {
     }
   });
 
+  it("states the unsupported create_task executionPolicy boundary instead of silently discarding it", () => {
+    const liveSchema = createTaskAction.live.descriptor.inputSchema;
+    const catalogAction = paperclipSemanticAction("create_task")!;
+
+    expect(catalogAction).toBeDefined();
+    for (const schema of [liveSchema, catalogAction.inputSchema]) {
+      expect(schema).toMatchObject({ type: "object", additionalProperties: false });
+      expect(schema.properties).not.toHaveProperty("executionPolicy");
+    }
+    for (const description of [createTaskAction.documentation.description, catalogAction.description]) {
+      expect(description).toContain("Execution-policy fields");
+      expect(description).toContain("instead of being silently ignored");
+      expect(description).toContain("after creating the task");
+      expect(description).toContain("issue API");
+    }
+    expect(catalogAction.description)
+      .toContain("Execution-policy fields (including scheduled monitors) are not accepted here");
+    expect(catalogAction.description)
+      .toContain("after creating the task, set them on the issue through the issue API");
+    expect(createTaskAction.live.descriptor.description)
+      .toBe(createTaskAction.documentation.description);
+  });
+
   it("accepts project handoff receipts and preserves ordinary child task receipts", () => {
     const ajv = new Ajv2020({ allErrors: true, allowUnionTypes: true, strict: true });
     const validate = ajv.compile(createTaskAction.live.descriptor.outputSchema);

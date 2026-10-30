@@ -1139,9 +1139,49 @@ describeEmbeddedPostgres("summary slot service", () => {
       const companyId = await seedCompany();
       const projectId = await seedProject(companyId);
       const summarizerAgentId = await seedSummarizer(companyId);
+      const reviewerAgentId = await seedPlainAgent(companyId);
       const { svc, generationIssueId, runId } = await startGeneration(companyId, projectId, summarizerAgentId);
 
-      // First revision lands while the task remains active and the slot remains linked.
+      const armedReviewStageId = randomUUID();
+      await db
+        .update(issues)
+        .set({
+          assigneeAgentId: reviewerAgentId,
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            returnAssigneeAgentId: summarizerAgentId,
+            stages: [
+              {
+                id: armedReviewStageId,
+                type: "review",
+                approvalsNeeded: 1,
+                participants: [{ id: randomUUID(), type: "agent", agentId: reviewerAgentId }],
+              },
+            ],
+          },
+          status: "todo",
+          executionState: {
+            status: "pending",
+            currentStageId: armedReviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: reviewerAgentId },
+            returnAssignee: { type: "agent", agentId: summarizerAgentId },
+            deliveryAuthor: { type: "agent", agentId: summarizerAgentId },
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        })
+        .where(eq(issues.id, generationIssueId));
+
+      const preWriteIssue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, generationIssueId))
+        .then((rows) => rows[0]!);
+      expect(preWriteIssue.assigneeAgentId).toBe(reviewerAgentId);
+
       const first = await svc.write(
         { ...projectSelector(companyId, projectId), markdown: "# Summary v1", generationIssueId },
         { agentId: summarizerAgentId, runId },
@@ -1253,26 +1293,33 @@ describeEmbeddedPostgres("summary slot service", () => {
       const settled = await svc.getSlot(projectSelector(companyId, projectId));
       expect(settled.slot).toMatchObject({ status: "idle", generatingIssueId: null });
 
-      await db
-        .update(summarySlots)
-        .set({ status: "generating", generatingIssueId: generationIssueId })
-        .where(
-          and(
-            eq(summarySlots.companyId, companyId),
-            eq(summarySlots.scopeKind, "project"),
-            eq(summarySlots.slotKey, "header"),
-            eq(summarySlots.scopeId, projectId),
-          ),
-        );
+      // SUP-20900 closed the reopen path at the issue-update funnel: a terminal
+      // generation task cannot be re-armed by bouncing it back.
+      await expect(
+        issueService(db).update(generationIssueId, { status: "in_progress" }),
+      ).rejects.toMatchObject({
+        status: 409,
+        details: { code: "summary_generation_reopen_forbidden" },
+      });
+
+      // Defend the same wedge for a legacy or directly-reopened row that bypasses
+      // the funnel: the freed slot has no live binding, so the write must name the
+      // actual remedy instead of failing with a generic mismatch forever.
       await db
         .update(issues)
-        .set({ checkoutRunId: resubmitRunId })
+        .set({ status: "in_progress", checkoutRunId: resubmitRunId })
         .where(eq(issues.id, generationIssueId));
+      const reopened = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(reopened.slot).toMatchObject({
+        status: "idle",
+        generatingIssueId: null,
+      });
+
       await expect(
         svc.write(
           {
             ...projectSelector(companyId, projectId),
-            markdown: "# Too late",
+            markdown: "# Summary v3 after reopen",
             baseRevisionId: second.revision.id,
             generationIssueId,
           },
@@ -1280,7 +1327,7 @@ describeEmbeddedPostgres("summary slot service", () => {
         ),
       ).rejects.toMatchObject({
         status: 403,
-        message: "Summary write is not available from a terminal generation task",
+        message: "Summary write is unavailable; ask a board operator to re-generate the summary",
       });
     });
 

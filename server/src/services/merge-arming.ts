@@ -341,6 +341,27 @@ function headRefFromData(data: Record<string, unknown> | null | undefined): stri
   return readString(data.headRefName);
 }
 
+/**
+ * Extracts the base (target) branch ref from a cached external object's data.
+ * The canonical shape is the flat `baseRef` key the GitHub external-object
+ * provider writes (`pullRequestSnapshot` in
+ * `github-external-object-provider.ts`); nested `base.ref` and flat
+ * `baseRefName` are tolerated for legacy cached rows. The done-transition
+ * guard's merge-queue probe keys on this value, so dropping it here makes the
+ * guard treat the base as unknown and skip the probe (SUP-21684).
+ */
+function baseRefFromData(data: Record<string, unknown> | null | undefined): string | null {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const flat = readString(data.baseRef);
+  if (flat) return flat;
+  const base = data.base;
+  if (base && typeof base === "object" && !Array.isArray(base)) {
+    const ref = (base as Record<string, unknown>).ref;
+    if (typeof ref === "string" && ref.length > 0) return ref;
+  }
+  return readString(data.baseRefName);
+}
+
 export async function resolveLinkedPullRequests(
   db: Db,
   companyId: string,
@@ -401,6 +422,7 @@ export async function resolveLinkedPullRequests(
         reviewDecision: null,
         draft: draft === true,
         headRepoFullName: readString(row.data?.headRepoFullName),
+        baseRefName: baseRefFromData(row.data),
       });
   }
 
@@ -466,6 +488,7 @@ export async function resolveLinkedPullRequestsWithState(
         reviewDecision: null,
         draft: draft === true,
         headRepoFullName: readString(row.data?.headRepoFullName),
+        baseRefName: baseRefFromData(row.data),
       });
   }
 

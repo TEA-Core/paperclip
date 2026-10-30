@@ -564,6 +564,7 @@ async function hydrateLinkedPrState(
       const head = body.head as Record<string, unknown> | null | undefined;
       const headRepo = head?.repo as Record<string, unknown> | null | undefined;
       const headRepoFullName = typeof headRepo?.full_name === "string" ? headRepo.full_name : null;
+      const base = body.base as Record<string, unknown> | null | undefined;
       return {
         ...pr,
         cachedState: state,
@@ -573,11 +574,7 @@ async function hydrateLinkedPrState(
         headRefName: typeof head?.ref === "string" ? head.ref : null,
         title: typeof body.title === "string" ? body.title : null,
         headRepoFullName,
-        baseRefName:
-          body.base && typeof body.base === "object" && !Array.isArray(body.base) &&
-          typeof (body.base as Record<string, unknown>).ref === "string"
-            ? (body.base as Record<string, unknown>).ref as string
-            : null,
+        baseRefName: typeof base?.ref === "string" ? base.ref : null,
       };
     }
     return { ...pr, baseRefName: null };
@@ -824,8 +821,12 @@ async function proveLandingDelegated(
   try {
     const candidates = await resolveGitHubTokenCandidatesForRepo(db, issue.companyId, pr.owner, pr.repo);
     for (const candidate of candidates) {
-      pr = await hydrateLinkedPrState(pr, candidate.token);
-      if (pr.cachedState === "open" && pr.draft && (await loadOwnDraftPredicate(db, issue, [pr]))(pr)) {
+      const live = await hydrateLinkedPrState(pr, candidate.token);
+      // A failed or incomplete hydration now returns a fresh object with
+      // baseRefName cleared, so object identity is no longer a hydration
+      // success signal; baseRefName being a string is the proof the base
+      // branch came from the live lookup (SUP-21856).
+      if (live.cachedState === "open" && live.draft && (await loadOwnDraftPredicate(db, issue, [live]))(live)) {
         return refuseTier1(
           `head_draft: linked PR #${number} is an open draft; promote it out of draft before closing this card done.`,
         );
@@ -855,15 +856,19 @@ async function proveLandingDelegated(
           const escapeGraphqlString = (value: string) =>
             value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
           let queueCarrier: "queued" | "configured" | "none" | "unknown" = "unknown";
-          if (pr.baseRefName) {
+          if (live.baseRefName) {
             const queueResponse = await queueGraphql(
-              `query { repository(owner: "${escapeGraphqlString(pr.owner)}", name: "${escapeGraphqlString(pr.repo)}") { mergeQueue(branch: "${escapeGraphqlString(pr.baseRefName)}") { configuration { mergeMethod } } } }`,
+              `query { repository(owner: "${escapeGraphqlString(pr.owner)}", name: "${escapeGraphqlString(pr.repo)}") { mergeQueue(branch: "${escapeGraphqlString(live.baseRefName)}") { configuration { mergeMethod } } } }`,
             );
             if (queueResponse.ok) {
               const payload = (await queueResponse.json().catch(() => null)) as {
-                data?: { repository?: { mergeQueue?: { configuration?: unknown } | null } | null };
+                data?: { repository?: { mergeQueue?: { configuration?: unknown } | null } | null } | null;
+                errors?: unknown;
               } | null;
-              queueCarrier = payload?.data?.repository?.mergeQueue?.configuration != null ? "configured" : "none";
+              const hasErrors = Array.isArray(payload?.errors) && payload.errors.length > 0;
+              if (payload && !hasErrors && payload.data?.repository) {
+                queueCarrier = payload.data.repository.mergeQueue?.configuration != null ? "configured" : "none";
+              }
             }
           }
           if (queueCarrier === "none") {
@@ -873,7 +878,10 @@ async function proveLandingDelegated(
             );
             if (prLookup.ok) {
               const prPayload = (await prLookup.json().catch(() => null)) as { auto_merge?: unknown } | null;
-              if (prPayload?.auto_merge != null) queueCarrier = "queued";
+              if (prPayload === null) queueCarrier = "unknown";
+              else if (prPayload.auto_merge != null) queueCarrier = "queued";
+            } else {
+              queueCarrier = "unknown";
             }
           }
           if (queueCarrier === "none") {

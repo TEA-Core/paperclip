@@ -411,7 +411,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         if (!expectedTargetInstanceId) {
           throw new Error("Workspace repair cannot resolve the registered target instance.");
         }
-        repairSeedSource = resolveCanonicalWorktreeSeedSource({
+        const resolvedRepairSeedSource = resolveCanonicalWorktreeSeedSource({
           registeredBaseWorkspaceCwd: projectWorkspace.cwd,
           explicitSourceConfigPath: resolveFallbackSeedSourceConfigPath(projectWorkspace.cwd),
           targetConfigPath: path.join(workspaceCwd, ".paperclip", "config.json"),
@@ -419,6 +419,10 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
           manifestSource: manifest.source,
           manifestTargetInstanceId: manifest.targetInstanceId,
         });
+        if (!resolvedRepairSeedSource) {
+          throw new Error("Workspace repair source cannot be the target worktree config.");
+        }
+        repairSeedSource = resolvedRepairSeedSource;
         repairPreviousAttemptId = typeof manifest.attemptId === "string" ? manifest.attemptId : null;
 
         const baseWorkspaceCwd = repairSeedSource.baseWorkspaceCwd;
