@@ -18971,43 +18971,22 @@ export function issueRoutes(
             ? undefined
             : { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
       });
-      await assertWikiHandoffWriteIntegrity({
-        db,
-        companyId: existing.companyId,
-        issue: {
-          title: updateFields.title ?? existing.title,
-          description: updateFields.description ?? existing.description,
-          executionPolicy: nextExecutionPolicy,
-          executionState: existing.executionState,
-        },
-        incomingAssigneeAgentId: normalizedAssigneeAgentId,
-        refusalContext:
-          req.actor.type === "board"
-            ? undefined
-            : { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
-      });
     }
-    if (
-      normalizedAssigneeAgentId === undefined &&
-      req.body.executionPolicy !== undefined &&
-      updateFields.executionPolicy !== undefined
-    ) {
-      await assertWikiHandoffWriteIntegrity({
-        db,
-        companyId: existing.companyId,
-        issue: {
-          title: updateFields.title ?? existing.title,
-          description: updateFields.description ?? existing.description,
-          executionPolicy: nextExecutionPolicy,
-          executionState: existing.executionState,
-        },
-        incomingAssigneeAgentId: requestedAssigneeAgentId ?? null,
-        refusalContext:
-          req.actor.type === "board"
-            ? undefined
-            : { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
-      });
-    }
+    await assertWikiHandoffWriteIntegrity({
+      db,
+      companyId: existing.companyId,
+      issue: {
+        title: updateFields.title ?? existing.title,
+        description: updateFields.description ?? existing.description,
+        executionPolicy: nextExecutionPolicy,
+        executionState: existing.executionState,
+      },
+      incomingAssigneeAgentId: requestedAssigneeAgentId ?? null,
+      refusalContext:
+        req.actor.type === "board"
+          ? undefined
+          : { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
+    });
     if (updateFields.executionPolicy !== undefined) {
       const prevReturnAssignee = previousExecutionPolicy?.returnAssigneeAgentId ?? null;
       const nextReturnAssignee = nextExecutionPolicy?.returnAssigneeAgentId ?? null;

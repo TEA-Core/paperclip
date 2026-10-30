@@ -319,6 +319,7 @@ const HANDOFF_AGENT_ROWS = [{
   id: "55555555-5555-4555-8555-555555555555",
   companyId: "company-1",
   agentId: "33333333-3333-4333-8333-333333333333",
+  resourceId: "33333333-3333-4333-8333-333333333333",
   contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
   permissions: null,
 }];
@@ -3314,6 +3315,43 @@ describe("issue execution policy routes", () => {
         }),
       );
     });
+  });
+
+  it.each([
+    ["title", "Weekly report — updated handoff to Wiki Maintainer"],
+    ["description", "Updated handoff to Wiki Maintainer instructions."],
+  ])("rejects a %s-only PATCH on a Wiki handoff with a non-canonical existing assignee", async (field, value) => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: "44444444-4444-4444-8444-444444444444",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1550",
+      title: "Weekly report — handoff to Wiki Maintainer",
+      description: "Canonical handoff to Wiki Maintainer instructions.",
+      projectId: null,
+      goalId: null,
+      executionPolicy: null,
+      executionState: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${issue.id}`)
+      .send({ [field]: value });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.details).toMatchObject({
+      guard: "assignee_review_gate",
+      subGuard: "wiki_handoff",
+      reason: "wiki_handoff_non_canonical_assignee",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   describe("executionPolicy.baseRef HTTP round-trip (SUP-15838)", () => {
