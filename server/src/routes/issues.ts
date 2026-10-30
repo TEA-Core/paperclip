@@ -24796,6 +24796,7 @@ export function issueRoutes(
         typeof transition.patch.status === "string" ? transition.patch.status : "done";
       if (doneTier !== undefined && autoApproveEffectiveStatus === "done") {
         commentBody = renderDoneTierDeclaration(commentBody, doneTier);
+        if (transition.decision) transition.decision.body = commentBody;
       }
       if (autoApproveEffectiveStatus === "done" && currentIssue.status !== "done") {
         const outcome = await evaluateDoneTransitionGuards({
