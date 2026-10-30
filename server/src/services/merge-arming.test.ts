@@ -55,6 +55,7 @@ import {
   ladderIsTerminallyApproved,
   pickMostRecentMergeQueueEjection,
   narrowToDelivered,
+  preflightFinalDelivery,
   publishApprovalStatus,
   recordApprovalAnchor,
   recordPendingAutoMergeDisarm,
@@ -1897,6 +1898,167 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       if (result.kind === "unresolvable") {
         expect(result.reason).toMatch(/^delivery_identity_unresolved:/);
       }
+    });
+  });
+
+  // SUP-21513: a card whose recorded delivery PR has MERGED is a COMPLETED
+  // delivery, not an unresolved one — the approve preflight (the 409
+  // approval_final_delivery_preflight gate) must accept it once the merge
+  // commit is proven on the recorded base branch (GitHub compare
+  // base...merge_commit_sha reports ahead_by=0 / status behind|identical).
+  // Closed-UNMERGED keeps refusing, byte-identically (ADR-091 D4 fail-closed).
+  describe("SUP-21513 merged recorded delivery PR", () => {
+    const MERGE_SHA = "mergec000000000000000000000000000000000001";
+    const COMPARE_URL = `https://api.github.com/repos/${OWNER}/${REPO}/compare/main...${MERGE_SHA}`;
+
+    function mergedPrHeadBody() {
+      // Superset of both live readers: fetchPullRequestHeadShaOnce (head.sha,
+      // head.ref, state, merged, merge_commit_sha, base.ref) and
+      // finalDeliveryLiveSchema (title, head.repo.full_name).
+      return {
+        state: "closed",
+        draft: false,
+        merged: true,
+        title: "Fix thing (SUP-42)",
+        merge_commit_sha: MERGE_SHA,
+        base: { ref: "main" },
+        head: {
+          ref: "SUP-42-branch",
+          sha: APPROVED_HEAD,
+          repo: { full_name: `${OWNER}/${REPO}` },
+        },
+      };
+    }
+
+    function closedUnmergedPrHeadBody() {
+      return {
+        state: "closed",
+        draft: false,
+        merged: false,
+        title: "Fix thing (SUP-42)",
+        head: {
+          ref: "SUP-42-branch",
+          sha: APPROVED_HEAD,
+          repo: { full_name: `${OWNER}/${REPO}` },
+        },
+      };
+    }
+
+    async function insertBoundCard() {
+      const issueId = await insertIssue({
+        delivery: {
+          repo: { owner: OWNER, repo: REPO },
+          prNumber: 42,
+          prUrl: `https://github.com/${OWNER}/${REPO}/pull/42`,
+          branch: "SUP-42-branch",
+          headSha: APPROVED_HEAD,
+        },
+      });
+      await insertMention(issueId);
+      return issueId;
+    }
+
+    it("resolves the decision head when the merged PR's merge commit is on the base branch", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([
+        { url: PR_URL, body: mergedPrHeadBody() },
+        { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") {
+        expect(result.headSha).toBe(APPROVED_HEAD);
+        expect(result.displayName).toBe(`${OWNER}/${REPO}#42`);
+      }
+    });
+
+    it("keeps refusing a closed-UNMERGED recorded PR byte-identically (ADR-091 D4)", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([{ url: PR_URL, body: closedUnmergedPrHeadBody() }]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("recorded delivery identity PR is not open");
+      }
+    });
+
+    it("refuses a merged PR whose merge commit is NOT on the base branch", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([
+        { url: PR_URL, body: mergedPrHeadBody() },
+        { url: COMPARE_URL, body: { status: "ahead", ahead_by: 2 } },
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("merged but not proven on its base branch");
+      }
+    });
+
+    it("refuses a merged PR whose containment cannot be checked (fail closed, no compare route)", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([{ url: PR_URL, body: mergedPrHeadBody() }]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("merged but not proven on its base branch");
+      }
+    });
+
+    it("preflightFinalDelivery (the approve 409 gate) accepts the merged proven delivery", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([
+        { url: PR_URL, body: mergedPrHeadBody() },
+        { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") {
+        expect(result.headSha).toBe(APPROVED_HEAD);
+        expect(result.displayName).toBe(`${OWNER}/${REPO}#42`);
+      }
+    });
+
+    it("preflightFinalDelivery keeps refusing the closed-UNMERGED delivery", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([{ url: PR_URL, body: closedUnmergedPrHeadBody() }]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("recorded delivery identity PR is not open");
+      }
+    });
+
+    it("publishes no status for the merged proven delivery — truthful skip, zero GitHub writes", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([
+        { url: PR_URL, body: mergedPrHeadBody() },
+        { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+      ]);
+
+      const outcome = await publishApprovalStatus(db, companyId, issueId, "SUP-42", {
+        enforceDeliveryIdentity: true,
+        expectedHeadSha: APPROVED_HEAD,
+      });
+
+      expect(outcome.kind).toBe("skipped");
+      if (outcome.kind === "skipped") {
+        expect(outcome.message).toContain("pr-not-eligible");
+        expect(outcome.message).toContain("merged");
+      }
+      expect(postStatusShas()).toEqual([]);
     });
   });
 
