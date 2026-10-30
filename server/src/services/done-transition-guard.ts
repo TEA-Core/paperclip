@@ -91,7 +91,9 @@ export const TIER1_FORM =
   '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."' +
   ' or "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
   'landing obligation transferred to done-close-landing-backstop, not yet discharged; ' +
-  '<why Tier 2 was not probed>. Liveness unverified."';
+  '<why Tier 2 was not probed>. Liveness unverified."' +
+  ' or "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — ' +
+  '<why Tier 2 was not probed>; accepted on record_only issues only. Liveness unverified."';
 // Structured `doneTier` forms (SUP-21328): the second accepted close form on both
 // agent-writable close doors. The missing-tier remedy names these verbatim so the
 // 422 remedy and the structured parser always agree (SUP-15787 invariant).
@@ -1029,8 +1031,8 @@ async function proveTier1Landing(
   }
   if (landingTokenCount === 0) {
     return refuseTier1(
-      'Tier 1 declaration is missing a landing-state token in <reason>; include "landed-at-tip" ' +
-        'or "landing-delegated".',
+      'Tier 1 declaration is missing a landing-state token in <reason>; include "landed-at-tip", ' +
+        '"landing-delegated", or "no-repository-landing" (record_only issues only — SUP-21992).',
     );
   }
   if (hasNoRepositoryLanding) {
