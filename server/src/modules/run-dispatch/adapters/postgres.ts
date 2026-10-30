@@ -6,6 +6,7 @@ import {
   agentWakeupRequests,
   agents,
   approvals,
+  companies,
   issueApprovals,
   issueThreadInteractions,
   heartbeatRuns,
@@ -504,7 +505,12 @@ export function createPostgresRunDispatchAdapter(
     const rows = await db
       .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId })
       .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.status, "queued"), lte(heartbeatRuns.createdAt, input.cutoff)))
+      .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
+      .where(and(
+        eq(heartbeatRuns.status, "queued"),
+        lte(heartbeatRuns.createdAt, input.cutoff),
+        eq(companies.status, "active"),
+      ))
       .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
       .limit(input.limit);
     return rows.map((row) => ({ runId: row.id, companyId: row.companyId }));

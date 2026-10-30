@@ -72,12 +72,15 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedCompanyAndAgent(): Promise<{ companyId: string; agentId: string }> {
+  async function seedCompanyAndAgent(input?: {
+    companyStatus?: string;
+  }): Promise<{ companyId: string; agentId: string }> {
     const companyId = randomUUID();
     const agentId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
+      status: input?.companyStatus ?? "active",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
@@ -851,6 +854,68 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
           expect.objectContaining({ runId: newerRunId, eventType: "lifecycle" }),
         ]),
       );
+    });
+
+    it("sweeps only active-company age-expired queued runs, leaving archived-company rows unselected and unmutated", async () => {
+      const { companyId: activeCompanyId, agentId: activeAgentId } = await seedCompanyAndAgent();
+      const { companyId: archivedCompanyId, agentId: archivedAgentId } = await seedCompanyAndAgent({ companyStatus: "archived" });
+      const activeIssueId = randomUUID();
+      const archivedIssueId = randomUUID();
+      await seedIssue({ companyId: activeCompanyId, issueId: activeIssueId, status: "in_progress", assigneeAgentId: activeAgentId });
+      await seedIssue({ companyId: archivedCompanyId, issueId: archivedIssueId, status: "in_progress", assigneeAgentId: archivedAgentId });
+      const activeRunId = await seedRun({
+        companyId: activeCompanyId,
+        agentId: activeAgentId,
+        contextSnapshot: { issueId: activeIssueId },
+        now: new Date("2025-12-30T00:00:00.000Z"),
+      });
+      const archivedRunId = await seedRun({
+        companyId: archivedCompanyId,
+        agentId: archivedAgentId,
+        contextSnapshot: { issueId: archivedIssueId },
+        now: new Date("2025-12-30T00:00:00.000Z"),
+      });
+
+      const adapter = createPostgresRunDispatchAdapter(db);
+      await expect(adapter.listStaleQueuedRuns({
+        cutoff: new Date("2026-01-01T00:00:00.000Z"),
+        limit: 50,
+      })).resolves.toEqual([{ runId: activeRunId, companyId: activeCompanyId }]);
+
+      const sweepStaleQueuedRuns = createSweepStaleQueuedRuns({
+        reader: adapter,
+        cancelStaleQueuedRun: createCancelStaleQueuedRun({ writer: adapter }),
+      });
+      const result = await sweepStaleQueuedRuns({ now: new Date("2026-01-02T00:00:00.000Z") });
+
+      expect(result.cancelled).toBe(1);
+      expect(result.runIds).toEqual([activeRunId]);
+      const rows = await db
+        .select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          errorCode: heartbeatRuns.errorCode,
+          resultJson: heartbeatRuns.resultJson,
+        })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, [activeRunId, archivedRunId]));
+      const rowsById = new Map(rows.map((row) => [row.id, row]));
+      expect(rowsById.get(activeRunId)).toMatchObject({
+        status: "cancelled",
+        errorCode: "queued_run_expired",
+        resultJson: expect.objectContaining({ stopReason: "queued_run_expired" }),
+      });
+      expect(rowsById.get(archivedRunId)).toMatchObject({
+        status: "queued",
+        errorCode: null,
+      });
+      const events = await db
+        .select({ runId: heartbeatRunEvents.runId, eventType: heartbeatRunEvents.eventType })
+        .from(heartbeatRunEvents)
+        .where(inArray(heartbeatRunEvents.runId, [activeRunId, archivedRunId]));
+      expect(events).toEqual([
+        expect.objectContaining({ runId: activeRunId, eventType: "lifecycle" }),
+      ]);
     });
 
     it("keeps an old queued issue run live while another running run owns its execution pointer", async () => {
