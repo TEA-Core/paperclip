@@ -588,6 +588,73 @@ describe("execute — cliVersion validation", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+
+  describe("desired-only per-run skill dirs", () => {
+    async function runDesiredOnlyAndListLeakedDirs(input: {
+      version: string;
+      arrange?: () => void;
+      expectedMessage: string;
+    }): Promise<string[]> {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-skill-cleanup-"));
+      const scratchTmp = path.join(root, "tmp");
+      const commandPath = path.join(root, "opencode");
+      await fs.mkdir(scratchTmp);
+      await fs.writeFile(commandPath, `#!/bin/sh\nif [ "$1" = "--version" ]; then printf '${input.version}\\n'; fi\n`, "utf8");
+      await fs.chmod(commandPath, 0o755);
+      runAdapterExecutionTargetProcessMock.mockReset();
+      ensureCommandResolvableMock.mockReset();
+      input.arrange?.();
+      const previousTmpdir = process.env.TMPDIR;
+      process.env.TMPDIR = scratchTmp;
+      try {
+        await expect(
+          execute({
+            runId: "run-skill-cleanup",
+            agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+            runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+            config: {
+              command: commandPath,
+              cwd: root,
+              model: "openai/gpt-5",
+              skillIsolation: "desired-only",
+              env: { OPENCODE_ALLOW_ALL_MODELS: "1" },
+            },
+            context: {},
+            onLog: async () => {},
+          }),
+        ).rejects.toThrow(input.expectedMessage);
+        return (await fs.readdir(scratchTmp)).filter((entry) => entry.startsWith("paperclip-opencode-skills-") || entry.startsWith("paperclip-opencode-home-"));
+      } finally {
+        if (previousTmpdir === undefined) delete process.env.TMPDIR;
+        else process.env.TMPDIR = previousTmpdir;
+        await fs.rm(root, { recursive: true, force: true });
+        ensureCommandResolvableMock.mockReset();
+        ensureCommandResolvableMock.mockImplementation(async () => {});
+      }
+    }
+
+    it("leaves none behind when an unsupported V2 binary is detected", async () => {
+      await expect(
+        runDesiredOnlyAndListLeakedDirs({ version: "2.3.0", expectedMessage: "Unsupported OpenCode CLI version: 2.3.0" }),
+      ).resolves.toEqual([]);
+    });
+
+    it("leaves none behind when a later preflight throws after they are built", async () => {
+      await expect(
+        runDesiredOnlyAndListLeakedDirs({
+          version: "1.18.33",
+          expectedMessage: "command vanished",
+          arrange: () => {
+            ensureCommandResolvableMock
+              .mockImplementationOnce(async () => {})
+              .mockImplementationOnce(async () => {
+                throw new Error("command vanished");
+              });
+          },
+        }),
+      ).resolves.toEqual([]);
+    });
+  });
 });
 
 describe("execute — OpenRouter credentials", () => {

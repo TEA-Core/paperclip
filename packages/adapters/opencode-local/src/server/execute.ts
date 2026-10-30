@@ -761,70 +761,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const desiredOpenCodeSkillNames = resolveLegacyPaperclipDesiredSkillNames(config, openCodeSkillEntries);
   let localSkillsDir: string | null = null;
   let isolatedSkillsHome: string | null = null;
-  if (!executionTargetIsRemote) {
-    if (resolveOpenCodeSkillIsolation(config) === "desired-only") {
-      // Desired-only local run: build the filtered per-run skills dir (the same
-      // builder remote staging already uses) plus a per-run HOME whose
-      // .claude/skills points at it, instead of injecting into the shared
-      // skills home. The shared home is never read or written on this path.
-      localSkillsDir = await buildOpenCodeSkillsDir(config);
-      let isolated: { home: string; warnings: string[] };
-      try {
-        isolated = await prepareOpenCodeIsolatedSkillsHome({ config, skillsDir: localSkillsDir });
-      } catch (err) {
-        await fs
-          .rm(path.dirname(localSkillsDir), { recursive: true, force: true })
-          .catch(() => undefined);
-        localSkillsDir = null;
-        throw err;
-      }
-      isolatedSkillsHome = isolated.home;
-      for (const warning of isolated.warnings) {
-        await onLog("stdout", `[paperclip] ${warning}\n`);
-      }
-    } else {
-      await ensureOpenCodeSkillsInjected(
-        onLog,
-        openCodeSkillEntries,
-        desiredOpenCodeSkillNames,
-        resolveOpenCodeSkillsHome(config),
-      );
-    }
-  }
-  // One line per run naming the skill mode, how many skills it exposes
-  // (SUP-17881) and their sorted names, so the union-vs-desired-only
-  // cost of every run and the shared home's membership are readable from the
-  // run log. The format is a frozen contract: see exposure-line.ts.
-  if (!executionTargetIsRemote) {
-    if (isolatedSkillsHome && localSkillsDir) {
-      const exposedNames = await fs.readdir(localSkillsDir).catch((): string[] => []);
-      await onLog(
-        "stdout",
-        formatOpenCodeSkillExposureLine({
-          mode: "desired-only",
-          names: exposedNames,
-          location: isolatedSkillsHome,
-        }),
-      );
-    } else {
-      const skillsHome = resolveOpenCodeSkillsHome(config);
-      const sharedNames = await fs.readdir(skillsHome).catch((): string[] => []);
-      await onLog(
-        "stdout",
-        formatOpenCodeSkillExposureLine({
-          mode: "shared",
-          names: sharedNames,
-          location: skillsHome,
-        }),
-      );
-    }
-  } else if (resolveOpenCodeSkillIsolation(config) === "desired-only") {
-    await onLog(
-      "stdout",
-      `[paperclip] skillIsolation=desired-only is a no-op on remote targets; remote skill staging already exposes only the desired set.\n`,
-    );
-  }
-
   const envConfig = parseObject(config.env);
   const env: Record<string, string> = {
     ...buildPaperclipEnv(agent),
@@ -978,16 +914,79 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     preparedRuntimeConfig.env.OPENCODE_DB = openCodeDatabaseFile;
   }
   const localRuntimeConfigHome = preparedRuntimeConfig.runtimeConfigHome;
-  if (isolatedSkillsHome) {
-    preparedRuntimeConfig.env.HOME = isolatedSkillsHome;
-    const configuredHome = asString(parseObject(config.env).HOME, "");
-    if (configuredHome) {
-      preparedRuntimeConfig.notes.push(
-        `skillIsolation=desired-only overrides the configured env HOME ${configuredHome} with the per-run HOME ${isolatedSkillsHome}; the run's skill listing is scoped to its desiredSkills.`,
+  try {
+    if (!executionTargetIsRemote) {
+      if (resolveOpenCodeSkillIsolation(config) === "desired-only") {
+        // Desired-only local run: build the filtered per-run skills dir (the same
+        // builder remote staging already uses) plus a per-run HOME whose
+        // .claude/skills points at it, instead of injecting into the shared
+        // skills home. The shared home is never read or written on this path.
+        localSkillsDir = await buildOpenCodeSkillsDir(config);
+        let isolated: { home: string; warnings: string[] };
+        try {
+          isolated = await prepareOpenCodeIsolatedSkillsHome({ config, skillsDir: localSkillsDir });
+        } catch (err) {
+          await fs
+            .rm(path.dirname(localSkillsDir), { recursive: true, force: true })
+            .catch(() => undefined);
+          localSkillsDir = null;
+          throw err;
+        }
+        isolatedSkillsHome = isolated.home;
+        for (const warning of isolated.warnings) {
+          await onLog("stdout", `[paperclip] ${warning}\n`);
+        }
+      } else {
+        await ensureOpenCodeSkillsInjected(
+          onLog,
+          openCodeSkillEntries,
+          desiredOpenCodeSkillNames,
+          resolveOpenCodeSkillsHome(config),
+        );
+      }
+    }
+    // One line per run naming the skill mode, how many skills it exposes
+    // (SUP-17881) and their sorted names, so the union-vs-desired-only
+    // cost of every run and the shared home's membership are readable from the
+    // run log. The format is a frozen contract: see exposure-line.ts.
+    if (!executionTargetIsRemote) {
+      if (isolatedSkillsHome && localSkillsDir) {
+        const exposedNames = await fs.readdir(localSkillsDir).catch((): string[] => []);
+        await onLog(
+          "stdout",
+          formatOpenCodeSkillExposureLine({
+            mode: "desired-only",
+            names: exposedNames,
+            location: isolatedSkillsHome,
+          }),
+        );
+      } else {
+        const skillsHome = resolveOpenCodeSkillsHome(config);
+        const sharedNames = await fs.readdir(skillsHome).catch((): string[] => []);
+        await onLog(
+          "stdout",
+          formatOpenCodeSkillExposureLine({
+            mode: "shared",
+            names: sharedNames,
+            location: skillsHome,
+          }),
+        );
+      }
+    } else if (resolveOpenCodeSkillIsolation(config) === "desired-only") {
+      await onLog(
+        "stdout",
+        `[paperclip] skillIsolation=desired-only is a no-op on remote targets; remote skill staging already exposes only the desired set.\n`,
       );
     }
-  }
-  try {
+    if (isolatedSkillsHome) {
+      preparedRuntimeConfig.env.HOME = isolatedSkillsHome;
+      const configuredHome = asString(parseObject(config.env).HOME, "");
+      if (configuredHome) {
+        preparedRuntimeConfig.notes.push(
+          `skillIsolation=desired-only overrides the configured env HOME ${configuredHome} with the per-run HOME ${isolatedSkillsHome}; the run's skill listing is scoped to its desiredSkills.`,
+        );
+      }
+    }
     const runtimeEnv = Object.fromEntries(
       Object.entries(ensurePathInEnv({ ...sanitizeInheritedPaperclipEnv(process.env), ...preparedRuntimeConfig.env })).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
@@ -1747,11 +1746,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await Promise.all([
         paperclipBridge?.stop(),
         restoreRemoteWorkspace?.(),
-        localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
-        isolatedSkillsHome ? fs.rm(isolatedSkillsHome, { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
       ]);
     }
   } finally {
-    await preparedRuntimeConfig.cleanup();
+    await Promise.all([
+      preparedRuntimeConfig.cleanup(),
+      localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
+      isolatedSkillsHome ? fs.rm(isolatedSkillsHome, { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
+    ]);
   }
 }
