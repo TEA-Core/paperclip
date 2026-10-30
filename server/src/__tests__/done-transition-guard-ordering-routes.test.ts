@@ -1340,11 +1340,18 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         .where(eq(issues.id, issueId));
       expect(statusRows[0]?.status).toBe("done");
 
-      const audit = await db
-        .select({ action: activityLog.action })
-        .from(activityLog)
-        .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
-        .then((rows) => rows.filter((r) => r.action === "issue.done_transition_tier1_close"));
+      const audit = await vi.waitFor(
+        async () => {
+          const found = await db
+            .select({ action: activityLog.action })
+            .from(activityLog)
+            .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
+            .then((rows) => rows.filter((r) => r.action === "issue.done_transition_tier1_close"));
+          if (found.length === 0) throw new Error("waiting for tier1 close audit row");
+          return found;
+        },
+        { timeout: 5000 },
+      );
       expect(audit).toHaveLength(1);
     });
 
