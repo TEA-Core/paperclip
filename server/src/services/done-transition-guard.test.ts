@@ -6159,6 +6159,42 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.allowed).toBe(true);
     });
 
+    it("does not refuse head_draft from a fully cached own-draft row when the live lookup is unavailable", async () => {
+      ghFetchMock.mockResolvedValue(new Response("provider unavailable", { status: 503 }));
+      const result = await declareDelegated(4161, {
+        draft: true,
+        headRefName: "SUP-12345-work",
+        headRepoFullName: "TEA-Core/paperclip",
+      });
+      expect(result.allowed).toBe(true);
+      expect(result.reason ?? "").not.toContain("head_draft");
+    });
+
+    it("refuses head_draft from a fully cached own-draft row once the live lookup confirms it", async () => {
+      ghFetchMock.mockImplementation(async (url) => {
+        if (String(url).includes("graphql")) return new Response("{}", { status: 500 });
+        if (String(url).endsWith("/repos/TEA-Core/paperclip")) {
+          return new Response(JSON.stringify({ allow_auto_merge: false }), { status: 200 });
+        }
+        return new Response(
+          JSON.stringify({
+            state: "open",
+            draft: true,
+            base: { ref: "main" },
+            head: { ref: "SUP-12345-work", repo: { full_name: "TEA-Core/paperclip" } },
+          }),
+          { status: 200 },
+        );
+      });
+      const result = await declareDelegated(4161, {
+        draft: true,
+        headRefName: "SUP-12345-work",
+        headRepoFullName: "TEA-Core/paperclip",
+      });
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("head_draft");
+    });
+
     it("refuses landed-at-tip when GitHub credential resolution fails, and does not accept", async () => {
       mockResolveGitHubToken.mockRejectedValue(new Error("secret store down"));
       const result = await evaluateDoneTierDeclaration(
