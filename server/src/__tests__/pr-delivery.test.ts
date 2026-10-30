@@ -434,6 +434,107 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     expect(new Set(rows.map((row) => row.issueId)).size).toBe(4);
   });
 
+  // SUP-21818 (redo of SUP-21294 Finding 2): the create route passes the
+  // agent-writable product metadata into recordCarrierFanOut. A merged
+  // pull_request work product whose metadata fabricates repository / prNumber /
+  // mergeCommitSha / mergedAt must never receive a server-trusted
+  // serverProvenance stamp from those same values — that is provenance
+  // laundering. The stamp may come only from independently server-resolved
+  // PR-delivery facts (recordAtOpen / refreshMergeState / sweepMergeState, or
+  // the fan-out's own GitHub re-resolution).
+  const ATTACK_SHA = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+  const ATTACK_MERGED_AT = "2026-10-30T00:00:00.000Z";
+  function attackFanOutInput() {
+    return {
+      companyId,
+      sourceIssueId,
+      externalId: EXTERNAL_ID,
+      url: PR_URL,
+      title: `PR #${PR_NUMBER} ${REPOSITORY}`,
+      status: "merged",
+      reviewState: "none",
+      metadata: {
+        repository: REPOSITORY,
+        prNumber: PR_NUMBER,
+        mergeCommitSha: ATTACK_SHA,
+        mergedAt: ATTACK_MERGED_AT,
+      },
+    };
+  }
+
+  it("SUP-21818: fan-out never confers trusted provenance from agent-supplied merge metadata (laundering refused)", async () => {
+    // GitHub cannot confirm the fabricated carrier ("unknown" is what the
+    // resolver reports for a PR it cannot resolve; a fabricated PR number
+    // resolves to nothing).
+    const service = prDeliveryService(db, {
+      resolvePullRequestDetails: async () => ({
+        state: "unknown",
+        headRef: null,
+        headSha: null,
+      }),
+    });
+    await service.recordCarrierFanOut(attackFanOutInput());
+
+    const rows = await readRows();
+    expect(rows).toHaveLength(4);
+    for (const row of rows) {
+      const metadata = row.metadata as Record<string, unknown>;
+      // The fabricated merge facts may be mirrored as untrusted row data, but
+      // no descendant may carry a trusted stamp: without it the done-transition
+      // guard refuses Tier 1 and authorizes no external repository.
+      expect(metadata.serverProvenance).toBeUndefined();
+    }
+  });
+
+  it("SUP-21818: fan-out is fail-closed when the carrier cannot be re-resolved (resolver throws)", async () => {
+    const service = prDeliveryService(db, {
+      resolvePullRequestDetails: async () => {
+        throw new Error("transient GitHub API failure");
+      },
+    });
+    const result = await service.recordCarrierFanOut(attackFanOutInput());
+
+    // The mirror itself is preserved; only the trusted stamp is withheld.
+    expect(result.writtenIssueIds.sort()).toEqual(childIds.sort());
+    const rows = await readRows();
+    expect(rows).toHaveLength(4);
+    for (const row of rows) {
+      expect((row.metadata as Record<string, unknown>).serverProvenance).toBeUndefined();
+    }
+  });
+
+  it("SUP-21818: a carrier GitHub confirms merged stamps descendants with server-resolved facts, not agent merge facts", async () => {
+    const SERVER_SHA = "3fc37fe91c6190ab695a651224ad057db0a38aba";
+    const SERVER_MERGED_AT = "2026-08-31T17:26:58Z";
+    const service = prDeliveryService(db, {
+      resolvePullRequestDetails: async () => ({
+        state: "merged",
+        headRef: "carrier-branch",
+        headSha: "abc123",
+        mergedAt: SERVER_MERGED_AT,
+        mergeCommitSha: SERVER_SHA,
+      }),
+    });
+    await service.recordCarrierFanOut(attackFanOutInput());
+
+    const rows = await readRows();
+    expect(rows).toHaveLength(4);
+    for (const row of rows) {
+      const metadata = row.metadata as Record<string, unknown>;
+      expect(metadata.serverProvenance).toEqual({
+        actor: "pr-delivery",
+        repository: REPOSITORY,
+        prNumber: PR_NUMBER,
+        mergeCommitSha: SERVER_SHA,
+        mergedAt: SERVER_MERGED_AT,
+      });
+      // Server-resolved merge facts replace the agent-supplied ones so the
+      // stamp and the row cannot disagree.
+      expect(metadata.mergeCommitSha).toBe(SERVER_SHA);
+      expect(metadata.mergedAt).toBe(SERVER_MERGED_AT);
+    }
+  });
+
   it("sweepMergeState flips every delivery row to merged with mergedAt + mergeCommitSha", async () => {
     const service = prDeliveryService(db, {
       resolvePullRequestDetails: vi.fn(async () => ({

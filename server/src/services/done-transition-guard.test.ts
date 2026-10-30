@@ -6261,6 +6261,27 @@ describe("evaluateDoneTierDeclaration", () => {
         expect(compareUrls().some((u) => u.includes("/repos/TEA-Core/paperclip/compare/"))).toBe(false);
       });
 
+      it("SUP-21818: a carrier-fan-out descendant carrying only agent merge facts authorizes no external repository", async () => {
+        // Post-fix fan-out shape (redo of SUP-21294 Finding 2): the agent's
+        // fabricated repository/PR/merge facts are mirrored onto the descendant
+        // row as untrusted data, but no serverProvenance stamp accompanies them
+        // because the carrier was never independently resolved by the server.
+        // Even with the claimed repository authorized in the company, the
+        // descendant is refused as unverified Tier 1.
+        setupDbMock({
+          executionWorkspaces: [agentToolsWorkspaceRow("https://github.com/TEA-Core/paperclip-agent-tools")],
+          issueWorkProducts: [mergedProduct({ serverProvenance: undefined })],
+          authorizedProjectWorkspaces: [authorizedWorkspace()],
+        });
+        mockExternalGitHub(1);
+        const result = await runLandedDeclaration(EXTERNAL_SHA);
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("ancestor");
+        expect(compareUrls().some((u) => u.includes("/repos/TEA-Core/paperclip/compare/"))).toBe(false);
+        expect(compareUrls().some((u) => u.includes("paperclip-agent-tools"))).toBe(true);
+      });
+
       it("a merged product whose provenance does not exactly match its declaration is not authoritative", async () => {
         setupDbMock({
           executionWorkspaces: [agentToolsWorkspaceRow("https://github.com/TEA-Core/paperclip-agent-tools")],
