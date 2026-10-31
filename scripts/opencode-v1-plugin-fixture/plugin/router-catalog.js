@@ -10,8 +10,8 @@ import os from "node:os";
 import path from "node:path";
 import { applyCatalog, buildCatalog } from "../router-catalog/lib.mjs";
 
-const INGRESS = (process.env.PAPERCLIP_ROUTER_URL || "http://router.internal:9090").replace(/\/+$/, "");
-const CONTROL = (process.env.PAPERCLIP_ROUTER_CONTROL_URL || "http://router.internal:9091").replace(/\/+$/, "");
+const INGRESS = (process.env.PAPERCLIP_ROUTER_URL || "http://router.invalid").replace(/\/+$/, "");
+const CONTROL = (process.env.PAPERCLIP_ROUTER_CONTROL_URL || "http://router-control.invalid").replace(/\/+$/, "");
 const TIMEOUT_MS = Number(process.env.PAPERCLIP_ROUTER_CATALOG_TIMEOUT_MS || 4000);
 const CACHE = process.env.PAPERCLIP_ROUTER_CATALOG_CACHE ||
   path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "paperclip-router-catalog.json");

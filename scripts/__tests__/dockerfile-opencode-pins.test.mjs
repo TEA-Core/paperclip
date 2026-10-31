@@ -91,16 +91,18 @@ test("OpenCode V2 is installed off PATH at a pinned version and digest", () => {
 });
 
 test("V1 router-plugin fixture is the pinned fleet copy (baseline launch evidence)", () => {
-  // Byte-identical fixture of the V1 router plugin from TEA-Core/sectoid-stack-admin
-  // paperclip-docker/config/opencode-plugin @ 2664878e38f33e84a3789a277c6f2c4bb352ec22.
+  // Fixture of the V1 router plugin from TEA-Core/sectoid-stack-admin
+  // paperclip-docker/config/opencode-plugin @ 2664878e38f33e84a3789a277c6f2c4bb352ec22,
+  // with the internal router endpoint defaults replaced by placeholders and
+  // internal statistics dropped from comments (this repo is public).
   // That repo is private, so the CI launch assertion cannot fetch the plugin
   // and ships this copy instead. If the fleet plugin changes, update this pin
   // deliberately: the baseline assertion is only meaningful against a recorded
   // plugin revision, so silent drift must fail here rather than in CI.
   const fixtureDir = path.join(repoRoot, "scripts", "opencode-v1-plugin-fixture");
   const pins = [
-    ["plugin/router-catalog.js", "1adc76f9ac64c81ae23f38965222094fc9b590a966b73e16e1ad4e8a1ca9286e"],
-    ["router-catalog/lib.mjs", "c0a2a6df3f2f8a273c90280d4efb268fc3d9ab0910eb02236862c728acb6f6d7"],
+    ["plugin/router-catalog.js", "cb190e262b684e7cf8ba12846238743ba49eae4ea979433fe6a60d0d1dc3f298"],
+    ["router-catalog/lib.mjs", "f91851810329bf27a7b0ff835a8a0c1311020aec421e6332c3af152e9663ba64"],
   ];
   for (const [rel, sha] of pins) {
     const digest = createHash("sha256")
