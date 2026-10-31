@@ -1319,7 +1319,11 @@ private `opencode serve` on a kernel-assigned loopback port with a per-run
 creates (or resumes) the session and sends the prompt. The server is always
 stopped at the end of the attempt; the password and MCP bearer tokens are
 redacted from run logs and results. The server's events are mapped onto the
-`run --format json` line shape, so result parsing is unchanged.
+`run --format json` line shape, so result parsing is unchanged. A permission
+request for the run's session is rejected the way a headless `opencode run`
+rejects it (stderr line `! permission requested: ...; auto-rejecting`, the tool
+call fails and the model continues), so a run never waits on a reply; allowing
+actions stays the job of the `dangerouslySkipPermissions` allow-list.
 
 The gate waits for `mcp.resources.changed` on `GET /api/event` from every
 injected MCP server, settles 1000 ms, and fails the run (exit 1, no session

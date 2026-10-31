@@ -1455,8 +1455,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (useServeTransport) {
       commandNotes.push(
         `Running OpenCode V2 through a private \`opencode serve\` (loopback, per-run port and password); ` +
-          `the first prompt waits for mcp.resources.changed from ${runtimeMcpServers.length} injected MCP server(s) plus ` +
-          `${OPENCODE_SERVE_MCP_SETTLE_MS} ms (timer-based gate, fails the run after ${OPENCODE_SERVE_MCP_READY_TIMEOUT_MS / 1000}s).`,
+          (runtimeMcpServers.length > 0
+            ? `the first prompt waits for mcp.resources.changed from ${runtimeMcpServers.length} injected MCP server(s) plus ` +
+              `${OPENCODE_SERVE_MCP_SETTLE_MS} ms (timer-based gate, fails the run after ${OPENCODE_SERVE_MCP_READY_TIMEOUT_MS / 1000}s).`
+            : `no MCP server was injected, so the first prompt does not wait.`),
       );
     } else if (oneShotReason) {
       const warning =

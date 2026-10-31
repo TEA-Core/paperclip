@@ -40,6 +40,9 @@ export const OPENCODE_SERVE_MCP_READY_TIMEOUT_MS = 15_000;
 export const OPENCODE_SERVE_MCP_SETTLE_MS = 1_000;
 const SERVE_START_TIMEOUT_MS = 30_000;
 const SERVER_USERNAME = "opencode";
+// The text `opencode run` gives the model when it auto-rejects a permission request.
+const PERMISSION_REJECT_MESSAGE =
+  "This non-interactive run cannot ask the user for permission, so the request was rejected. Continue without this action.";
 
 export interface OpenCodeServeMcpServer {
   name: string;
@@ -180,6 +183,7 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
 
   const port = deferred<number>();
   let serverOutput = "";
+  let listening = false;
   // The server's own output is diagnostics, not run result: it goes to stderr so
   // `stdout` stays the JSONL contract of `run --format json`.
   const server = runChildProcess(input.runId, input.command, buildOpenCodeServeArgs(), {
@@ -189,9 +193,14 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     graceSec: input.graceSec,
     onSpawn: input.onSpawn,
     onLog: async (_stream, chunk) => {
-      serverOutput += chunk;
-      const match = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(serverOutput);
-      if (match) port.resolve(Number(match[1]));
+      if (!listening) {
+        serverOutput += chunk;
+        const match = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(serverOutput);
+        if (match) {
+          listening = true;
+          port.resolve(Number(match[1]));
+        }
+      }
       // The banner would otherwise be the first stderr line, which is what
       // `toResult` quotes when a run fails without a parsed error.
       const diagnostics = chunk.replace(/^.*listening on http:\/\/127\.0\.0\.1:\d+.*(?:\r?\n|$)/m, "");
@@ -213,6 +222,38 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
   const readyWaiters: Array<() => void> = [];
   const eventState = createOpenCodeServeEventState();
 
+  let base = "";
+  const request = async (path: string, init: RequestInit = {}) => {
+    const response = await fetch(`${base}${path}`, {
+      ...init,
+      headers: { Authorization: authorization, "content-type": "application/json" },
+      signal: abort.signal,
+    });
+    return { status: response.status, text: await response.text() };
+  };
+
+  // `opencode run` auto-rejects a permission request because it cannot ask
+  // anyone; a server waits for a reply forever, so the transport gives the same
+  // answer. Allowing is the job of the configured allow-list, never of this.
+  const rejectPermission = async (data: Record<string, unknown>) => {
+    const requestId = asString(data.id, "");
+    const resources = Array.isArray(data.resources) ? data.resources.map((resource) => String(resource)) : [];
+    await emit("stderr", redact(`! permission requested: ${asString(data.action, "")} (${resources.join(", ")}); auto-rejecting\n`));
+    try {
+      const reply = await request(
+        `/api/session/${encodeURIComponent(asString(data.sessionID, ""))}/permission/${encodeURIComponent(requestId)}/reply`,
+        { method: "POST", body: JSON.stringify({ decision: "reject", message: PERMISSION_REJECT_MESSAGE }) },
+      );
+      if (reply.status >= 300) throw new Error(`HTTP ${reply.status}`);
+    } catch (error) {
+      if (abort.signal.aborted) return;
+      // An unanswered request would hold the turn open until the wall clock.
+      failure = redact(`OpenCode permission request ${requestId} could not be rejected: ${error instanceof Error ? error.message : String(error)}`);
+      await reportFailure(failure);
+      turnDone.resolve("failed");
+    }
+  };
+
   const handleEvent = async (envelope: unknown) => {
     const event = parseObject(envelope);
     const data = parseObject(event.data);
@@ -223,6 +264,10 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
       return;
     }
     if (!boundSessionId || asString(data.sessionID, "") !== boundSessionId) return;
+    if (asString(event.type, "") === "permission.asked") {
+      void rejectPermission(data);
+      return;
+    }
     const mapped = mapOpenCodeServeEvent(envelope, eventState);
     for (const line of mapped.lines) await emit("stdout", `${redact(line)}\n`);
     if (mapped.outcome === "failed") {
@@ -260,9 +305,12 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     if (outcome === "interrupted" && !proc.timedOut) {
       await reportFailure("OpenCode session was interrupted before it finished");
     }
+    if (!endedByTurn && !proc.timedOut) {
+      await reportFailure("OpenCode ended before the turn finished (event stream closed or server exited)");
+    }
     return {
       ...proc,
-      exitCode: proc.timedOut ? proc.exitCode : endedByTurn ? exitCodeOnTurnEnd : proc.exitCode ?? 1,
+      exitCode: proc.timedOut ? proc.exitCode : endedByTurn ? exitCodeOnTurnEnd : proc.exitCode || 1,
       signal: endedByTurn ? null : proc.signal,
       stdout,
       stderr,
@@ -278,16 +326,7 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     if (started === "timeout") {
       throw new ServeTransportError(`OpenCode server did not start listening within ${SERVE_START_TIMEOUT_MS / 1000}s`);
     }
-    const listenPort = started;
-    const base = `http://127.0.0.1:${listenPort}`;
-    const request = async (path: string, init: RequestInit = {}) => {
-      const response = await fetch(`${base}${path}`, {
-        ...init,
-        headers: { Authorization: authorization, "content-type": "application/json" },
-        signal: abort.signal,
-      });
-      return { status: response.status, text: await response.text() };
-    };
+    base = `http://127.0.0.1:${started}`;
 
     // Subscribe before anything can happen so no event is missed. The server
     // sends `server.connected` first once the subscription is live.

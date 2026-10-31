@@ -15,6 +15,7 @@ import {
 
 const fakeServer = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "fake-opencode-serve.mjs");
 const TOKEN = "paperclip-mcp-bearer-token-value";
+const REJECT_MESSAGE = "This non-interactive run cannot ask the user for permission, so the request was rejected. Continue without this action.";
 
 describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
   let root: string;
@@ -184,6 +185,43 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
       }),
     );
     expect(result.exitCode).toBe(1);
+    await expectServerStopped();
+  });
+
+  it("auto-rejects a permission request for its session and finishes the turn, like opencode run", async () => {
+    const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_PERMISSION: "1" }), timeoutSec: 0 }));
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain("! permission requested: shell (echo hi); auto-rejecting\n");
+    expect(result.stderr).not.toContain("rm -rf");
+    const replies = (await requests()).filter((entry) => entry.path.includes("/permission/"));
+    expect(replies.map((entry) => entry.path)).toEqual(["/api/session/ses_fake/permission/per_1/reply"]);
+    expect(JSON.parse(replies[0]!.body)).toEqual({ decision: "reject", message: REJECT_MESSAGE });
+    const toolUse = result.stdout
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { type: string; part?: { tool?: string; state?: Record<string, unknown> } })
+      .find((event) => event.type === "tool_use");
+    expect(toolUse?.part?.tool).toBe("shell");
+    expect(toolUse?.part?.state).toMatchObject({ status: "error", error: REJECT_MESSAGE });
+    await expectServerStopped();
+  });
+
+  it("fails the run instead of hanging when a permission reply is refused", async () => {
+    const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_PERMISSION: "1", FAKE_PERMISSION_REPLY_STATUS: "500" }), timeoutSec: 0 }));
+
+    expect(result.exitCode).toBe(1);
+    expect(parseOpenCodeJsonl(result.stdout).errorMessage).toContain("permission request per_1 could not be rejected: HTTP 500");
+    expect(result.stderr).toContain("! permission requested: shell (echo hi); auto-rejecting");
+    await expectServerStopped();
+  });
+
+  it.each(["close-stream", "exit"])("reports a failure when the turn ends early (%s) instead of an exit-0 success", async (mode) => {
+    const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_ENDS_MID_TURN: mode }) }));
+
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(1);
+    expect(parseOpenCodeJsonl(result.stdout).errorMessage).toContain("ended before the turn finished");
     await expectServerStopped();
   });
 

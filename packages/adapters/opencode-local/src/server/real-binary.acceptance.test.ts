@@ -73,6 +73,8 @@ const model = "paperclip-fixture/acceptance-model";
 // Prompt markers the fixture reacts to; they travel through `promptTemplate`.
 const CANCEL_MARKER = "paperclip-acceptance-cancel";
 const FORCE_LENGTH_MARKER = "paperclip-acceptance-force-length";
+// A prompt carrying this marker makes the model call the shell tool once.
+const SHELL_CALL_MARKER = "paperclip-acceptance-shell-call";
 
 const execFileAsync = promisify(execFile);
 
@@ -82,6 +84,7 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
   let server: Server;
   let baseEnv: Record<string, string>;
   let guardEnv: Record<string, string>;
+  let fixtureConfig: Record<string, unknown>;
   let emptyCatalogEnv: Record<string, string>;
   let binary: string;
   let cliVersion: string;
@@ -150,19 +153,29 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
       let body = "";
       for await (const chunk of req) body += chunk;
       const lowered = body.toLowerCase();
+      let callsShell = false;
       try {
-        const parsed = JSON.parse(body) as { tools?: Array<{ function?: { name?: string } }>; messages?: unknown[] };
+        const parsed = JSON.parse(body) as { tools?: Array<{ function?: { name?: string } }>; messages?: Array<{ role?: string }> };
         if ((parsed.tools ?? []).length > 0) {
           mainRequests.push({
             tools: (parsed.tools ?? []).map((tool) => tool.function?.name ?? ""),
             messageCount: (parsed.messages ?? []).length,
           });
+          callsShell = lowered.includes(SHELL_CALL_MARKER) && !(parsed.messages ?? []).some((message) => message.role === "tool");
         }
       } catch {
         // not a JSON chat request
       }
       if (lowered.includes(CANCEL_MARKER)) {
         await new Promise((resolve) => setTimeout(resolve, 5_000));
+      }
+      if (callsShell) {
+        res.writeHead(200, { "cache-control": "no-cache", connection: "keep-alive", "content-type": "text/event-stream" });
+        const toolCall = { index: 0, id: "call_1", type: "function", function: { name: "shell", arguments: JSON.stringify({ command: "echo hi" }) } };
+        res.write(`data: ${JSON.stringify({ id: "chatcmpl-paperclip", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", tool_calls: [toolCall] }, finish_reason: null }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: "chatcmpl-paperclip", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`);
+        res.end("data: [DONE]\n\n");
+        return;
       }
       // A prompt carrying the marker makes the model stop at its output cap
       // instead of a natural end of turn.
@@ -213,7 +226,8 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
 
     // The provider lives in the user's opencode.json, not in a Paperclip-only
     // env var, so plain `opencode models` sees it too.
-    const fixtureConfig = {
+    baseEnv = privateEnv("main");
+    fixtureConfig = {
       provider: {
         "paperclip-fixture": {
           npm: "@ai-sdk/openai-compatible",
@@ -223,7 +237,6 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
         },
       },
     };
-    baseEnv = privateEnv("main");
     await writeOpenCodeConfig(baseEnv, fixtureConfig);
 
     // The session guards only arm on the per-agent database the adapter names
@@ -629,6 +642,37 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     expect(mainRequests.length).toBeGreaterThan(0);
     expect(mainRequests[0]!.tools.some((name) => /paperclip-fixture_echo$/i.test(name))).toBe(true);
     expect(JSON.stringify(result)).not.toContain("acceptance-mcp-bearer");
+  }, 90_000);
+
+  it("auto-rejects a permission request like `opencode run` instead of waiting for a reply", async () => {
+    const askEnv = privateEnv("permission-ask");
+    await writeOpenCodeConfig(askEnv, { ...fixtureConfig, permissions: [{ action: "shell", resource: "*", effect: "ask" }] });
+    const result = await execute(context({
+      runId: "acceptance-permission",
+      config: {
+        command: binary,
+        cliVersion,
+        cwd: workspace,
+        model,
+        timeoutSec: 60,
+        graceSec: 2,
+        dangerouslySkipPermissions: false,
+        promptTemplate: `${SHELL_CALL_MARKER}: run the shell tool once`,
+        env: askEnv,
+      },
+    }));
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(0);
+    const stdout = String(result.resultJson?.stdout ?? "");
+    const toolUses = stdout
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { type?: string; part?: { tool?: string; state?: { status?: string; error?: string } } })
+      .filter((event) => event.type === "tool_use");
+    const shell = toolUses.find((event) => event.part?.tool === "shell");
+    expect(shell?.part?.state?.status).toBe("error");
+    expect(shell?.part?.state?.error).toContain("cannot ask the user for permission");
+    expect(String(result.resultJson?.stderr ?? "")).toMatch(/! permission requested: shell \(.*\); auto-rejecting/);
   }, 90_000);
 
   it("rejects an invalid model before launching the real binary", async () => {

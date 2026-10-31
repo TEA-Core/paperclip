@@ -49,6 +49,20 @@ const server = http.createServer(async (req, res) => {
     if (!rest && req.method === "GET") {
       return id === "ses_known" || id === "ses_fake" ? json(200, { data: { id } }) : json(404, { _tag: "SessionNotFoundError", message: `Session not found: ${id}` });
     }
+    const permissionReply = /^\/permission\/([^/]+)\/reply$/.exec(rest ?? "");
+    if (permissionReply && req.method === "POST") {
+      if (process.env.FAKE_PERMISSION_REPLY_STATUS) return json(Number(process.env.FAKE_PERMISSION_REPLY_STATUS), { _tag: "ReplyFailed" });
+      res.writeHead(204);
+      res.end();
+      const base = { sessionID: id, assistantMessageID: "msg_a" };
+      setTimeout(() => {
+        push("permission.replied", { sessionID: id, requestID: permissionReply[1], reply: "reject" });
+        push("session.tool.failed", { ...base, id: "call_1", error: { type: "permission.rejected", message: JSON.parse(body).message } });
+        push("session.step.ended", { ...base, finish: "stop", tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0 });
+        push("session.execution.succeeded", { sessionID: id });
+      }, 10);
+      return;
+    }
     if (rest === "/model") {
       res.writeHead(204);
       return res.end();
@@ -57,12 +71,28 @@ const server = http.createServer(async (req, res) => {
       if (process.env.FAKE_PROMPT_STATUS) return json(Number(process.env.FAKE_PROMPT_STATUS), { _tag: "PromptRejected" });
       json(200, { data: { id: "msg_1" } });
       const base = { sessionID: id, assistantMessageID: "msg_a" };
+      if (process.env.FAKE_PERMISSION === "1") {
+        setTimeout(() => {
+          push("session.execution.started", { sessionID: id });
+          push("session.step.started", base);
+          push("session.tool.input.started", { ...base, id: "call_1", name: "shell" });
+          push("session.tool.called", { ...base, id: "call_1", input: { command: "echo hi" }, executed: false });
+          push("permission.asked", { id: "per_1", sessionID: id, action: "shell", resources: ["echo hi"], save: ["echo *"], source: { type: "tool", messageID: "msg_a", id: "call_1" } });
+          push("permission.asked", { id: "per_other", sessionID: "ses_other", action: "shell", resources: ["rm -rf /"], save: [], source: { type: "tool", messageID: "msg_x", id: "call_x" } });
+        }, 50);
+        return;
+      }
       setTimeout(() => {
         push("session.execution.started", { sessionID: id });
         push("session.step.started", base);
         push("session.text.ended", { ...base, ordinal: 0, text: `fake reply${leakToken ? ` ${password} ${leakToken}` : ""}${"x".repeat(Number(process.env.FAKE_BIG_TEXT_BYTES ?? 0))}` });
         push("session.step.ended", { ...base, finish: "stop", tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 1, write: 0 } }, cost: 0 });
         if (process.env.FAKE_HANG_TURN === "1") return;
+        if (process.env.FAKE_ENDS_MID_TURN === "close-stream") {
+          for (const res of clients) res.end();
+          return;
+        }
+        if (process.env.FAKE_ENDS_MID_TURN === "exit") process.exit(0);
         if (process.env.FAKE_FAIL === "1") push("session.execution.failed", { sessionID: id, error: { type: "output-limit", message: process.env.FAKE_FAIL_MESSAGE ?? "capped" } });
         else push("session.execution.succeeded", { sessionID: id });
       }, 50);

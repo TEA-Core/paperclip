@@ -1031,7 +1031,7 @@ describe("execute — OpenCode V2 serve transport", () => {
   const token = "serve-runtime-mcp-secret";
   const mcpServer = { name: "Paperclip projects", url: "https://paperclip.example/mcp", token, connectionId: "connection-serve" };
 
-  async function runServe(fake: Record<string, string> = {}) {
+  async function runServe(fake: Record<string, string> = {}, { mcp = true }: { mcp?: boolean } = {}) {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-v2-serve-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "opencode");
@@ -1059,7 +1059,7 @@ describe("execute — OpenCode V2 serve transport", () => {
           env: { OPENCODE_ALLOW_ALL_MODELS: "1", FAKE_LOG: logFile, FAKE_MCP_NAME: mcpServer.name, ...fake },
         },
         context: {},
-        runtimeMcp: { getServers: () => [mcpServer] },
+        runtimeMcp: { getServers: () => (mcp ? [mcpServer] : []) },
         onLog: async (_stream, chunk) => { logs.push(chunk); },
         onMeta: async (value) => { metadata.push(value as (typeof metadata)[number]); },
       });
@@ -1081,8 +1081,19 @@ describe("execute — OpenCode V2 serve transport", () => {
     expect(requests.some((entry) => entry.path === "/api/session/ses_fake/prompt")).toBe(true);
     expect(metadata[0]?.commandArgs?.slice(0, 5)).toEqual(["serve", "--hostname", "127.0.0.1", "--port", "0"]);
     expect(metadata[0]?.commandNotes?.join("\n")).toContain("opencode serve");
+    expect(metadata[0]?.commandNotes?.join("\n")).toContain("waits for mcp.resources.changed from 1 injected MCP server(s)");
     expect(logs).not.toContain("one-shot");
     expect(JSON.stringify({ logs, result })).not.toContain(token);
+  });
+
+  it("does not describe a readiness gate when no MCP server was injected", async () => {
+    const { result, metadata } = await runServe({}, { mcp: false });
+
+    expect(result.exitCode).toBe(0);
+    const notes = metadata[0]?.commandNotes?.join("\n") ?? "";
+    expect(notes).toContain("opencode serve");
+    expect(notes).toContain("no MCP server was injected");
+    expect(notes).not.toContain("mcp.resources.changed");
   });
 
   it("reports a failed turn's provider message as the errorMessage", async () => {
