@@ -198,7 +198,7 @@ import {
 } from "./origins.js";
 import { withRecoveryContext } from "./status-only-context.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
-import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../issue-assignee-review-gate.js";
+import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, resolveCanonicalWikiMaintainerAgentId, wikiHandoffWriteWouldViolate } from "../issue-assignee-review-gate.js";
 import { loadConfig } from "../../config.js";
 import {
   canAgentSatisfyIssueWorkspaceSettings,
@@ -1214,7 +1214,9 @@ export function isRecoveryBounceTargetLive(
 export type RecoveryReassignmentRefusalReason =
   | "review_stage_self_satisfy"
   | "pending_stage_participant_displaced"
-  | "reassignment_target_not_live";
+  | "reassignment_target_not_live"
+  | "wiki_handoff_non_canonical_assignee"
+  | "wiki_handoff_self_satisfy";
 
 export interface RecoveryReassignmentDecision {
   assigneeAgentId: string | null;
@@ -1279,6 +1281,7 @@ export function decideRecoveryReassignment(input: {
   reviewStageSelfSatisfies: boolean;
   /** Optional so existing callers keep compiling; defaults to "does not displace". */
   pendingStageParticipantDisplaced?: boolean;
+  wikiHandoffViolation?: "wiki_handoff_non_canonical_assignee" | "wiki_handoff_self_satisfy" | null;
   recoveryOwnerLive: boolean;
 }): RecoveryReassignmentDecision {
   const effectiveCurrent = input.currentAssigneeAgentId;
@@ -1289,6 +1292,15 @@ export function decideRecoveryReassignment(input: {
       refused: false,
       refusalReason: null,
       refusedAssigneeAgentId: null,
+      keptAssigneeAgentId: effectiveCurrent,
+    };
+  }
+  if (input.wikiHandoffViolation) {
+    return {
+      assigneeAgentId: effectiveCurrent,
+      refused: true,
+      refusalReason: input.wikiHandoffViolation,
+      refusedAssigneeAgentId: candidate,
       keptAssigneeAgentId: effectiveCurrent,
     };
   }
@@ -4472,6 +4484,8 @@ export function recoveryService(
     issue: {
       id: string;
       identifier?: string | null;
+      title?: string | null;
+      description?: string | null;
       companyId: string;
       assigneeAgentId: string | null;
       executionPolicy: unknown;
@@ -4508,10 +4522,22 @@ export function recoveryService(
       (await isAgentInvokable(targetAgent, runner)) &&
       !(await hasConsecutiveWakeFailuresForAgent(candidate, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES, runner));
 
+    const canonicalMaintainerAgentId = await resolveCanonicalWikiMaintainerAgentId(
+      runner,
+      issue.companyId,
+      issue,
+    );
+    const wikiHandoffViolation = wikiHandoffWriteWouldViolate({
+      canonicalMaintainerAgentId,
+      incomingAssigneeAgentId: candidate,
+      executionPolicy: issue.executionPolicy,
+      executionState: issue.executionState,
+    });
     const decision = decideRecoveryReassignment({
       currentAssigneeAgentId: effectiveCurrent,
       recoveryOwnerAgentId,
       reviewStageSelfSatisfies,
+      wikiHandoffViolation: wikiHandoffViolation?.reason ?? null,
       pendingStageParticipantDisplaced: wouldDisplacePendingStageParticipant({
         executionState: issue.executionState,
         currentAssigneeAgentId: effectiveCurrent,
@@ -4539,6 +4565,21 @@ export function recoveryService(
           keptAssigneeAgentId: decision.keptAssigneeAgentId,
         },
         "recovery reassignment refused: it would move the card off its pending review stage participant (orphaned-stage deadlock); keeping current assignee",
+      );
+    } else if (
+      decision.refused &&
+      (decision.refusalReason === "wiki_handoff_non_canonical_assignee" ||
+        decision.refusalReason === "wiki_handoff_self_satisfy")
+    ) {
+      logger.warn(
+        {
+          issueId: issue.id,
+          identifier: issue.identifier,
+          refusedAssigneeAgentId: decision.refusedAssigneeAgentId,
+          keptAssigneeAgentId: decision.keptAssigneeAgentId,
+          refusalReason: decision.refusalReason,
+        },
+        "recovery reassignment refused: Wiki handoff write would violate the canonical maintainer or review-stage invariant; keeping current assignee",
       );
     } else if (decision.refused && decision.refusalReason === "reassignment_target_not_live") {
       logger.warn(

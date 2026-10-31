@@ -15,6 +15,8 @@ import {
   issueInboxArchives,
   issueRecoveryActions,
   issues,
+  pluginManagedResources,
+  plugins,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -23,9 +25,13 @@ import {
 import { logger } from "../middleware/logger.js";
 import {
   assertAssigneeWriteDoesNotSelfSatisfyReviewStage,
+  assertWikiHandoffWriteIntegrity,
   findSelfSatisfyingReviewStage,
+  resolveCanonicalWikiMaintainerAgentId,
+  wikiHandoffWriteWouldViolate,
 } from "../services/issue-assignee-review-gate.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { decideRecoveryReassignment } from "../services/recovery/service.js";
 
 const GATE_STAGE_ID = "11111111-1111-4111-8111-111111111111";
 const ASSIGNEE_ID = "22222222-2222-4222-8222-222222222222";
@@ -335,7 +341,9 @@ describeEmbeddedPostgres("recovery reassignment self-satisfiable review stage gu
     await db.delete(environments);
     await db.delete(issueInboxArchives);
     await db.delete(issues);
+    await db.delete(pluginManagedResources);
     await db.delete(agents);
+    await db.delete(plugins);
     await db.delete(companies);
   });
 
@@ -504,5 +512,378 @@ describeEmbeddedPostgres("recovery reassignment self-satisfiable review stage gu
     const [afterEscalate] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
     expect(afterEscalate?.status).toBe("blocked");
     expect(afterEscalate?.assigneeAgentId).toBe(managerId);
+  });
+});
+
+describe("wiki handoff write integrity (SUP-21752, pure helpers)", () => {
+  const WINNING_AGENT = "11111111-1111-4111-8111-111111111111";
+  const INTRUDER_AGENT = "22222222-2222-4222-8222-222222222222";
+  const CANONICAL = "33333333-3333-4333-8333-333333333333";
+  const STAGE_ID = "44444444-4444-4444-8444-444444444444";
+
+  function policy(participantIds: string[]) {
+    return policyWithStages([
+      {
+        id: STAGE_ID,
+        type: "review",
+        approvalsNeeded: 1,
+        participants: participantIds.map((agentId) => ({
+          id: randomUUID(),
+          type: "agent",
+          agentId,
+        })),
+      },
+    ]);
+  }
+
+  function state(currentAgentId: string) {
+    return incompleteState({
+      currentStageId: STAGE_ID,
+      currentParticipant: { type: "agent", agentId: currentAgentId, userId: null },
+    });
+  }
+
+  it("rejects the recurrence shape: a non-canonical write on a Wiki handoff", () => {
+    expect(
+      wikiHandoffWriteWouldViolate({
+        canonicalMaintainerAgentId: CANONICAL,
+        incomingAssigneeAgentId: INTRUDER_AGENT,
+        executionPolicy: policy([INTRUDER_AGENT]),
+        executionState: state(INTRUDER_AGENT),
+      }),
+    ).toEqual({ reason: "wiki_handoff_non_canonical_assignee" });
+  });
+
+  it("rejects the d328e99a self-reassignment shape: canonical write stays, intruder write does not", () => {
+    // SUP-21631 / SUP-21750 d328e99a: e9675a12 (canonical) -> 38ca3dab while
+    // 38ca3dab is the sole pending review participant. The first write that
+    // substitutes the assignee must already be refused.
+    expect(
+      wikiHandoffWriteWouldViolate({
+        canonicalMaintainerAgentId: CANONICAL,
+        incomingAssigneeAgentId: INTRUDER_AGENT,
+        executionPolicy: policy([INTRUDER_AGENT, WINNING_AGENT]),
+        executionState: state(INTRUDER_AGENT),
+      }),
+    ).toEqual({ reason: "wiki_handoff_non_canonical_assignee" });
+  });
+
+  it("rejects the SUP-21591 self-approvable shape: canonical assignee is the sole stage participant", () => {
+    expect(
+      wikiHandoffWriteWouldViolate({
+        canonicalMaintainerAgentId: CANONICAL,
+        incomingAssigneeAgentId: CANONICAL,
+        executionPolicy: policy([CANONICAL]),
+        executionState: state(CANONICAL),
+      }),
+    ).toEqual({ reason: "wiki_handoff_self_satisfy" });
+  });
+
+  it("allows the canonical maintainer when another participant can clear the stage", () => {
+    expect(
+      wikiHandoffWriteWouldViolate({
+        canonicalMaintainerAgentId: CANONICAL,
+        incomingAssigneeAgentId: CANONICAL,
+        executionPolicy: policy([CANONICAL, INTRUDER_AGENT]),
+        executionState: state(CANONICAL),
+      }),
+    ).toBeNull();
+  });
+
+  it("is a no-op when there is no canonical binding", () => {
+    expect(
+      wikiHandoffWriteWouldViolate({
+        canonicalMaintainerAgentId: null,
+        incomingAssigneeAgentId: INTRUDER_AGENT,
+        executionPolicy: policy([INTRUDER_AGENT]),
+        executionState: state(INTRUDER_AGENT),
+      }),
+    ).toBeNull();
+  });
+
+  it("routes a wiki-handoff refusal through decideRecoveryReassignment unchanged", () => {
+    const decision = decideRecoveryReassignment({
+      currentAssigneeAgentId: CANONICAL,
+      recoveryOwnerAgentId: INTRUDER_AGENT,
+      reviewStageSelfSatisfies: false,
+      recoveryOwnerLive: true,
+      wikiHandoffViolation: "wiki_handoff_non_canonical_assignee",
+    });
+    expect(decision).toMatchObject({
+      assigneeAgentId: CANONICAL,
+      refused: true,
+      refusalReason: "wiki_handoff_non_canonical_assignee",
+      refusedAssigneeAgentId: INTRUDER_AGENT,
+      keptAssigneeAgentId: CANONICAL,
+    });
+  });
+});
+
+describeEmbeddedPostgres("wiki handoff canonical resolution (SUP-21752)", () => {
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let db: ReturnType<typeof createDb>;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-wiki-handoff-gate-");
+    db = createDb(tempDb.connectionString);
+  }, 30_000);
+
+  afterEach(async () => {
+    await db.delete(issueRecoveryActions);
+    await db.delete(issueComments);
+    await db.delete(environmentLeases);
+    await db.delete(activityLog);
+    await db.delete(heartbeatRunEvents);
+    await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
+    await db.delete(environments);
+    await db.delete(issueInboxArchives);
+    await db.delete(issues);
+    await db.delete(pluginManagedResources);
+    await db.delete(agents);
+    await db.delete(plugins);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  const CANONICAL = "33333333-3333-4333-8333-333333333333";
+  const INTRUDER = "22222222-2222-4222-8222-222222222222";
+
+  async function seedCanonicalBinding(companyId: string) {
+    const pluginId = randomUUID();
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      packageName: "@paperclipai/plugin-llm-wiki",
+      version: "0.1.0",
+      apiVersion: 1,
+      categories: [],
+      manifestJson: {} as never,
+      status: "ready",
+      installOrder: 1,
+    });
+    await db.insert(pluginManagedResources).values({
+      companyId,
+      pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      resourceKind: "agent",
+      resourceKey: "wiki-maintainer",
+      resourceId: CANONICAL,
+      defaultsJson: {},
+    });
+  }
+
+  async function seedHandoffCompany() {
+    const companyId = randomUUID();
+    const maintainerId = CANONICAL;
+    const intruderId = INTRUDER;
+    const prefix = `WIKI${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Wiki Handoff Co",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: maintainerId,
+        companyId,
+        name: "Wiki Maintainer",
+        role: "knowledge-maintainer",
+        status: "paused",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: intruderId,
+        companyId,
+        name: "coder-LE",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ] as never);
+    await seedCanonicalBinding(companyId);
+    return { companyId, maintainerId, intruderId, prefix };
+  }
+
+  it("resolves the canonical maintainer only for a Wiki handoff title via the managed plugin key", async () => {
+    const { companyId, maintainerId } = await seedHandoffCompany();
+    await expect(
+      resolveCanonicalWikiMaintainerAgentId(db, companyId, {
+        title: "[PPC ER] Weekly Report — handoff to Wiki Maintainer",
+        description: null,
+      }),
+    ).resolves.toBe(maintainerId);
+    await expect(
+      resolveCanonicalWikiMaintainerAgentId(db, companyId, {
+        title: "Ordinary issue",
+        description: null,
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it("rejects a non-canonical assignee write on a Wiki handoff (recurrence shape d1743569/0e1fe94b/0f1e8f3b)", async () => {
+    const { companyId, intruderId } = await seedHandoffCompany();
+    await expect(
+      assertWikiHandoffWriteIntegrity({
+        db,
+        companyId,
+        issue: {
+          title: "[PPC ER] Weekly Report — 2026-10-26 — handoff to Wiki Maintainer",
+          description: "Canonical wiki path wiki/projects/example/reports/2026-10-26.md",
+          executionPolicy: null,
+          executionState: null,
+        },
+        incomingAssigneeAgentId: intruderId,
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        guard: "assignee_review_gate",
+        subGuard: "wiki_handoff",
+        reason: "wiki_handoff_non_canonical_assignee",
+        pluginKey: "paperclipai.plugin-llm-wiki",
+        resourceKey: "wiki-maintainer",
+      },
+    });
+  });
+
+  it("rejects the d328e99a self-approvable shape even when the write targets the canonical maintainer", async () => {
+    const { companyId, maintainerId } = await seedHandoffCompany();
+    const stageId = GATE_STAGE_ID;
+    await expect(
+      assertWikiHandoffWriteIntegrity({
+        db,
+        companyId,
+        issue: {
+          title: "[PPC ER] Weekly Report — 2026-10-29 — handoff to Wiki Maintainer",
+          description: null,
+          executionPolicy: policyWithStages([
+            {
+              id: stageId,
+              type: "review",
+              approvalsNeeded: 1,
+              participants: [{ id: randomUUID(), type: "agent", agentId: maintainerId, userId: null }],
+            },
+          ]),
+          executionState: incompleteState({ currentStageId: stageId }),
+        },
+        incomingAssigneeAgentId: maintainerId,
+      }),
+    ).rejects.toMatchObject({ status: 422 });
+  });
+
+  it("allows the canonical maintainer when another participant can clear the stage", async () => {
+    const { companyId, maintainerId, intruderId } = await seedHandoffCompany();
+    const stageId = GATE_STAGE_ID;
+    await expect(
+      assertWikiHandoffWriteIntegrity({
+        db,
+        companyId,
+        issue: {
+          title: "[PPC ER] Weekly Report — handoff to Wiki Maintainer",
+          description: null,
+          executionPolicy: policyWithStages([
+            {
+              id: stageId,
+              type: "review",
+              approvalsNeeded: 1,
+              participants: [
+                { id: randomUUID(), type: "agent", agentId: maintainerId, userId: null },
+                { id: randomUUID(), type: "agent", agentId: intruderId, userId: null },
+              ],
+            },
+          ]),
+          executionState: incompleteState({ currentStageId: stageId }),
+        },
+        incomingAssigneeAgentId: maintainerId,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("recovery keeps the canonical maintainer when the recovery owner is not canonical", async () => {
+    const { companyId, maintainerId, intruderId, prefix } = await seedHandoffCompany();
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, maintainerId));
+    const issueId = randomUUID();
+    const stageId = GATE_STAGE_ID;
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "[PPC ER] Weekly Report — handoff to Wiki Maintainer",
+      description: null,
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: maintainerId,
+      issueNumber: 7,
+      identifier: `${prefix}-7`,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          {
+            id: stageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "agent", agentId: maintainerId, userId: null }],
+          },
+        ],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: maintainerId, userId: null },
+        returnAssignee: { type: "agent", agentId: maintainerId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue!,
+      previousStatus: "in_review",
+      latestRun: {
+        id: randomUUID(),
+        agentId: intruderId,
+        status: "failed",
+        error: "adapter failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+      } as const,
+      comment: "Automatic continuation recovery failed.",
+      recoveryOwnerAgentId: intruderId,
+    });
+
+    expect(updated).not.toBeNull();
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after?.status).toBe("blocked");
+    expect(after?.assigneeAgentId).toBe(maintainerId);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        refusedAssigneeAgentId: intruderId,
+        keptAssigneeAgentId: maintainerId,
+        refusalReason: "wiki_handoff_non_canonical_assignee",
+      }),
+      expect.stringContaining("Wiki handoff"),
+    );
+    warnSpy.mockRestore();
   });
 });

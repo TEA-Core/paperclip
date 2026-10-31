@@ -196,3 +196,185 @@ describeEmbeddedPostgres("plugin-host updatePolicy issue guard", () => {
     services.dispose();
   });
 });
+
+describeEmbeddedPostgres("plugin-host wiki handoff issue update guard (SUP-21752)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  const CANONICAL = "33333333-3333-4333-8333-333333333333";
+  const INTRUDER = "22222222-2222-4222-8222-222222222222";
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-wiki-handoff-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterEach(async () => {
+    const { pluginManagedResources: pmr, plugins: plg } = await import("@paperclipai/db");
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(pmr);
+    await db.delete(agents);
+    await db.delete(companies);
+    await db.delete(plg);
+    await db.delete(projects);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedWikiHandoff() {
+    const { pluginManagedResources: pmr, plugins: plg } = await import("@paperclipai/db");
+    const company = await createCompany(db, "WKH");
+    const pluginRowId = randomUUID();
+    await db.insert(plg).values({
+      id: pluginRowId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      packageName: "@paperclipai/plugin-llm-wiki",
+      version: "0.1.0",
+      apiVersion: 1,
+      categories: [],
+      manifestJson: {} as never,
+      status: "ready",
+      installOrder: 1,
+    });
+    await db.insert(agents).values([
+      {
+        id: CANONICAL,
+        companyId: company.id,
+        name: "Wiki Maintainer",
+        role: "knowledge-maintainer",
+        status: "paused",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: INTRUDER,
+        companyId: company.id,
+        name: "coder-LE",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ] as never);
+    await db.insert(pmr).values({
+      companyId: company.id,
+      pluginId: pluginRowId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      resourceKind: "agent",
+      resourceKey: "wiki-maintainer",
+      resourceId: CANONICAL,
+      defaultsJson: {},
+    });
+    const issue = await db
+      .insert(issues)
+      .values({
+        companyId: company.id,
+        title: "[PPC ER] Weekly Report — handoff to Wiki Maintainer",
+        description: "Canonical wiki path wiki/projects/example/reports/2026-10-29.md",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: CANONICAL,
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    return { company, issue };
+  }
+
+  it("rejects a plugin-host update that moves a Wiki handoff off the canonical maintainer", async () => {
+    const { company, issue } = await seedWikiHandoff();
+    const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
+
+    await expect(
+      services.issues.update({
+        issueId: issue.id,
+        companyId: company.id,
+        patch: { assigneeAgentId: INTRUDER },
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        subGuard: "wiki_handoff",
+        reason: "wiki_handoff_non_canonical_assignee",
+      },
+    });
+
+    const row = await db.query.issues.findFirst({ where: (i, { eq }) => eq(i.id, issue.id) });
+    expect(row!.assigneeAgentId).toBe(CANONICAL);
+    services.dispose();
+  });
+
+  it("rejects a plugin-host assignee write that self-satisfies an incomplete review stage on any issue", async () => {
+    const { company } = await seedWikiHandoff();
+    const stageId = randomUUID();
+    const issue = await db
+      .insert(issues)
+      .values({
+        companyId: company.id,
+        title: "Ordinary guarded issue",
+        status: "in_review",
+        priority: "medium",
+        assigneeAgentId: CANONICAL,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [
+            {
+              id: stageId,
+              type: "review",
+              approvalsNeeded: 1,
+              participants: [{ id: randomUUID(), type: "agent", agentId: INTRUDER, userId: null }],
+            },
+          ],
+        } as never,
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: INTRUDER, userId: null },
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        } as never,
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
+    await expect(
+      services.issues.update({
+        issueId: issue.id,
+        companyId: company.id,
+        patch: { assigneeAgentId: INTRUDER },
+      }),
+    ).rejects.toMatchObject({ status: 422 });
+
+    const row = await db.query.issues.findFirst({ where: (i, { eq }) => eq(i.id, issue.id) });
+    expect(row!.assigneeAgentId).toBe(CANONICAL);
+    services.dispose();
+  });
+
+  it("allows a plugin-host update that keeps the canonical maintainer", async () => {
+    const { company, issue } = await seedWikiHandoff();
+    const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
+
+    const updated = await services.issues.update({
+      issueId: issue.id,
+      companyId: company.id,
+      patch: { description: "Updated by the wiki plugin host" },
+    });
+    expect(updated.assigneeAgentId).toBe(CANONICAL);
+    expect(updated.description).toBe("Updated by the wiki plugin host");
+    services.dispose();
+  });
+});

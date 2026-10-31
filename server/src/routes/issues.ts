@@ -422,7 +422,7 @@ import {
 } from "../services/issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
 import { applyReviewEscalationDecision } from "../services/issue-stage-decision.js";
-import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, findSelfSatisfyingReviewStage } from "../services/issue-assignee-review-gate.js";
+import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, assertWikiHandoffWriteIntegrity, findSelfSatisfyingReviewStage } from "../services/issue-assignee-review-gate.js";
 import {
   type CallerSeat,
   type RefusalCaller,
@@ -19005,6 +19005,21 @@ export function issueRoutes(
             : { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
       });
     }
+    await assertWikiHandoffWriteIntegrity({
+      db,
+      companyId: existing.companyId,
+      issue: {
+        title: updateFields.title ?? existing.title,
+        description: updateFields.description ?? existing.description,
+        executionPolicy: nextExecutionPolicy,
+        executionState: existing.executionState,
+      },
+      incomingAssigneeAgentId: requestedAssigneeAgentId ?? null,
+      refusalContext:
+        req.actor.type === "board"
+          ? undefined
+          : { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
+    });
     if (updateFields.executionPolicy !== undefined) {
       const prevReturnAssignee = previousExecutionPolicy?.returnAssigneeAgentId ?? null;
       const nextReturnAssignee = nextExecutionPolicy?.returnAssigneeAgentId ?? null;

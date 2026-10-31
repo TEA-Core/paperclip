@@ -1,4 +1,7 @@
 import type { IssueExecutionStage } from "@paperclipai/shared";
+import { and, eq } from "drizzle-orm";
+import type { Db } from "@paperclipai/db";
+import { pluginManagedResources } from "@paperclipai/db";
 import { unprocessable } from "../errors.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import {
@@ -136,3 +139,110 @@ export function assertAssigneeWriteDoesNotSelfSatisfyReviewStage(input: {
   const nextAction = seatAuthorityNextAction(callerSeat);
   throw unprocessable(`${message}. ${nextAction}`, { ...details, callerSeat, nextAction });
 }
+
+export const WIKI_LLM_WIKI_PLUGIN_KEY = "paperclipai.plugin-llm-wiki" as const;
+export const WIKI_MAINTAINER_AGENT_KEY = "wiki-maintainer" as const;
+
+export function isWikiHandoffTitle(title: unknown): boolean {
+  return (
+    typeof title === "string" &&
+    title.trim().toLowerCase().includes("handoff to wiki maintainer")
+  );
+}
+
+export async function resolveCanonicalWikiMaintainerAgentId(
+  db: Db,
+  companyId: string,
+  issue: { title?: string | null; description?: string | null } | null | undefined,
+): Promise<string | null> {
+  if (!issue?.title?.trim() && !issue?.description?.trim()) return null;
+  if (!isWikiHandoffTitle(issue.title)) {
+    const description = issue.description ?? "";
+    if (!description.toLowerCase().includes("handoff to wiki maintainer")) return null;
+  }
+  const rows = await db
+    .select({ resourceId: pluginManagedResources.resourceId })
+    .from(pluginManagedResources)
+    .where(
+      and(
+        eq(pluginManagedResources.companyId, companyId),
+        eq(pluginManagedResources.pluginKey, WIKI_LLM_WIKI_PLUGIN_KEY),
+        eq(pluginManagedResources.resourceKind, "agent"),
+        eq(pluginManagedResources.resourceKey, WIKI_MAINTAINER_AGENT_KEY),
+      ),
+    )
+    .then((found) => found);
+  return rows[0]?.resourceId ?? null;
+}
+
+export async function assertWikiHandoffWriteIntegrity(input: {
+  db: Db | { select: unknown };
+  companyId: string;
+  issue: {
+    title?: string | null;
+    description?: string | null;
+    executionPolicy?: unknown;
+    executionState?: unknown;
+  };
+  incomingAssigneeAgentId: string | null | undefined;
+  refusalContext?: { caller: RefusalCaller; issue: RefusalIssue | null };
+}): Promise<void> {
+  const canonicalMaintainerAgentId = await resolveCanonicalWikiMaintainerAgentId(
+    input.db as Db,
+    input.companyId,
+    input.issue,
+  );
+  if (!canonicalMaintainerAgentId) return;
+  const incoming = typeof input.incomingAssigneeAgentId === "string" && input.incomingAssigneeAgentId.length > 0
+    ? input.incomingAssigneeAgentId
+    : null;
+  if (incoming !== canonicalMaintainerAgentId) {
+    throw unprocessable(
+      "Refusing assigneeAgentId write on a Wiki handoff: the resulting assignee is not the canonical Wiki Maintainer managed by plugin paperclipai.plugin-llm-wiki (resourceKey wiki-maintainer)",
+      {
+        guard: "assignee_review_gate",
+        subGuard: "wiki_handoff",
+        reason: incoming === null ? "wiki_handoff_unassigned" : "wiki_handoff_non_canonical_assignee",
+        pluginKey: WIKI_LLM_WIKI_PLUGIN_KEY,
+        resourceKey: WIKI_MAINTAINER_AGENT_KEY,
+        canonicalMaintainerAgentId,
+        assigneeAgentId: incoming,
+      },
+    );
+  }
+  assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
+    executionPolicy: input.issue.executionPolicy,
+    executionState: input.issue.executionState,
+    incomingAssigneeAgentId: input.incomingAssigneeAgentId,
+    refusalContext: input.refusalContext,
+  });
+}
+
+export function wikiHandoffWriteWouldViolate(input: {
+  canonicalMaintainerAgentId: string | null | undefined;
+  incomingAssigneeAgentId: string | null | undefined;
+  executionPolicy: unknown;
+  executionState: unknown;
+}): { reason: "wiki_handoff_non_canonical_assignee" | "wiki_handoff_self_satisfy" } | null {
+  const canonical = typeof input.canonicalMaintainerAgentId === "string" && input.canonicalMaintainerAgentId.length > 0
+    ? input.canonicalMaintainerAgentId
+    : null;
+  if (!canonical) return null;
+  const incoming = typeof input.incomingAssigneeAgentId === "string" && input.incomingAssigneeAgentId.length > 0
+    ? input.incomingAssigneeAgentId
+    : null;
+  if (incoming !== canonical) return { reason: "wiki_handoff_non_canonical_assignee" };
+  if (
+    findSelfSatisfyingReviewStage({
+      executionPolicy: input.executionPolicy,
+      executionState: input.executionState,
+      incomingAssigneeAgentId: incoming,
+    })
+  ) {
+    return { reason: "wiki_handoff_self_satisfy" };
+  }
+  return null;
+}
+
+export type WikiHandoffViolationReason =
+  "wiki_handoff_non_canonical_assignee" | "wiki_handoff_self_satisfy";
