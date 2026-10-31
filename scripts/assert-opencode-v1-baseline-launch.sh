@@ -4,7 +4,7 @@
 # Runs INSIDE a container built from the production image (docker-build-assert
 # job mounts this script plus the fixture and invokes it). Proves end to end
 # that the rebuilt image still:
-#   1. resolves /usr/local/bin/opencode to the pinned V1 (1.18.33),
+#   1. resolves /usr/local/bin/opencode to the pinned V1 (1.19.5),
 #   2. auto-loads the V1 router plugin from the agent's staged XDG config
 #      (byte-identical fixture of the fleet plugin from
 #      TEA-Core/sectoid-stack-admin paperclip-docker/config/opencode-plugin/,
@@ -31,7 +31,7 @@ log() { echo "[v1-baseline] $*"; }
 # 1. the unchanged V1 agent path still resolves to the pinned version
 test "$(command -v opencode)" = /usr/local/bin/opencode
 V1_VERSION="$($V1_BIN --version)"
-test "$V1_VERSION" = "1.18.33" || fail "V1 version drifted: $V1_VERSION"
+test "$V1_VERSION" = "1.19.5" || fail "V1 version drifted: $V1_VERSION"
 log "V1 pinned version OK: $V1_VERSION"
 
 # 2. stage the adapter-shaped runtime config: XDG_CONFIG_HOME/opencode with
