@@ -1,10 +1,7 @@
 // opencode plugin: builds every provider from the live router at startup.
-//   roles  -> GET {control}/api/rules  -> provider router-<seat> at /{seat}/v1
-//   models -> GET {ingress}/v1/models  -> provider router      at /v1
-// Only router providers are enabled. If a fetch fails the last good copy of
-// that half is used, so a slow control API does not empty the model list.
-// Source of truth: sectoid-stack-admin paperclip-docker/config/opencode-plugin/,
-// installed by scripts/seed-opencode-config.sh. See opencode/README.md.
+// Roles and served models are fetched independently. Only router providers are
+// enabled. If a fetch fails the last good copy of that half is used, so a slow
+// control API does not empty the model list.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";

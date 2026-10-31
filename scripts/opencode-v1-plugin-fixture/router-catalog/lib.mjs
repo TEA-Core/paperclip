@@ -19,13 +19,9 @@ const MODELS_OUTPUT = 32768;
 const IDENTITY_HEADERS = {
   "X-Paperclip-Run": "PAPERCLIP_WORKSPACE_CWD",
   "X-Paperclip-Run-Id": "PAPERCLIP_RUN_ID",
-  // The Paperclip issue this turn belongs to, recorded verbatim into
-  // decisions.issue_key. The router has accepted this header since 25d4d4c and
-  // infers nothing from the run path, so the column stays empty until something
-  // sends it. Paperclip #838 injects the var into the opencode server's env;
-  // this is the other half. Left unset rather than
-  // empty when a run has no issue (an idle heartbeat poll legitimately has
-  // none), so absent reads as absent rather than as a blank key.
+  // The issue this turn belongs to is forwarded when available. Leave it
+  // unset rather than empty when a run has no issue, so absent reads as absent
+  // rather than as a blank key.
   "X-Paperclip-Issue": "PAPERCLIP_ISSUE_IDENTIFIER",
 };
 
