@@ -680,8 +680,8 @@ jobs:
       # The static pins (scripts/__tests__/dockerfile-opencode-pins.test.mjs)
       # prove the binaries are installed at the pinned versions; this step
       # proves the agent still launches on the rebuilt image. The unchanged V1
-      # binary auto-loads the V1 router plugin (fixture of the fleet plugin
-      # from TEA-Core/sectoid-stack-admin, sha256-pinned in the same test),
+      # binary auto-loads the V1 router plugin (fixture of the fleet plugin,
+      # sha256-pinned in the same test),
       # builds the router providers from a live catalog served on loopback,
       # and completes a full agent turn through the router provider as the
       # agent principal (node-agent, uid 1001).

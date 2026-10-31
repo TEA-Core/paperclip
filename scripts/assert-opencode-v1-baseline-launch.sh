@@ -10,7 +10,7 @@
 #      endpoint defaults replaced by placeholders; the probe sets both router
 #      URLs, see scripts/__tests__/dockerfile-opencode-pins.test.mjs),
 #   3. builds the router providers from a live catalog (stub router served on
-#      loopback: /api/rules + /v1/models + OpenAI-style completions),
+#      loopback: rules + models + OpenAI-style completions),
 #   4. completes a full agent turn through the router provider as the agent
 #      principal (node-agent, uid 1001) using only the image's own binaries.
 #
