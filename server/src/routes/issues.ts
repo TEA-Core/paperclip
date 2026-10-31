@@ -726,6 +726,26 @@ function applyCreateIssueStatusDefault(
   next();
 }
 
+function captureCreateIssueExecutionPolicyIntent(
+  req: Request,
+  res: Response,
+  next: () => void,
+) {
+  const body = req.body;
+  const policy =
+    body && typeof body === "object" && !Array.isArray(body)
+      ? (body as Record<string, unknown>).executionPolicy
+      : undefined;
+  res.locals.createIssueExecutionPolicyStagesExplicit =
+    policy !== null &&
+    typeof policy === "object" &&
+    !Array.isArray(policy) &&
+    Object.prototype.hasOwnProperty.call(policy, "stages") &&
+    Array.isArray((policy as Record<string, unknown>).stages) &&
+    ((policy as Record<string, unknown>).stages as unknown[]).length === 0;
+  next();
+}
+
 function noopTaskWatchdogService(): TaskWatchdogService {
   return {
     getActiveForIssue: async () => null,
@@ -16396,6 +16416,7 @@ export function issueRoutes(
   router.post(
     "/companies/:companyId/issues",
     applyCreateIssueStatusDefault,
+    captureCreateIssueExecutionPolicyIntent,
     validateIssueMutationBody(createIssueSchema),
     async (req, res) => {
       const companyId = req.params.companyId as string;
@@ -16658,8 +16679,18 @@ export function issueRoutes(
         companyId,
         createAssignmentScope,
       );
+      // SUP-22098: an explicitly-supplied stage-less policy ("no ladder") must
+      // survive the public create path. Omitting `preserveEmptyPolicy` here
+      // collapsed an explicit `executionPolicy.stages: []` to null, and the
+      // project default then injected a review ladder the caller expressly
+      // declined. Omitted/`null` policies still normalize to null (the option
+      // is a no-op for null input), so default inheritance is unchanged.
       const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(
         createBody.executionPolicy,
+        {
+          preserveEmptyPolicy:
+            res.locals.createIssueExecutionPolicyStagesExplicit === true,
+        },
       );
       const createReturnAssigneeAgentId =
         normalizedExecutionPolicy?.returnAssigneeAgentId ?? null;
@@ -16780,6 +16811,8 @@ export function issueRoutes(
         actorRunId: actor.runId,
         actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
         trustExplicitResponsibleUserId: actor.actorType === "user",
+        trustExplicitExecutionPolicy:
+          res.locals.createIssueExecutionPolicyStagesExplicit === true,
         watchdogActorRunId: actor.runId,
         onDeduplicated: (reason: "idempotency_key" | "recent_open_title") => {
           deduplicationReason = reason;
