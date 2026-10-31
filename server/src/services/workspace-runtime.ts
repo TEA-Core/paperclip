@@ -9429,17 +9429,25 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     Object.assign(env, buildManagedWorkspaceGuestEnv(managedWorkspaceIdentity));
   }
 
-  if (exposureConfig) {
-    // Paperclip dev-runtime-specific hardening. Other managed processes are
-    // still rejected by the broker unless /proc proves loopback-only listeners.
-    //
-    // Three independent layers force the loopback bind, because a guest checkout
-    // can be arbitrarily old (PAP-17256): the `--bind loopback` argv
-    // added above, these env vars for a runner that reads them, and HOST for one
-    // old enough to ignore both and infer its bind mode from HOST alone.
+  // The loopback bind is forced on a managed Paperclip dev runtime whether or
+  // not managed HTTPS exposure resolved. Without exposure there is no broker to
+  // reject an off-loopback listener, but the child still inherits the control
+  // plane's bind environment: a container-wide HOST outranks the guest config
+  // file's server.host, so a local_trusted guest resolves bind=lan and exits
+  // with `local_trusted requires server.bind=loopback` (SUP-22143). These are
+  // the env-var layers of the PAP-17256 hardening — PAPERCLIP_BIND /
+  // PAPERCLIP_BIND_HOST for a runner that reads them, and HOST for one old
+  // enough to ignore both and infer its bind mode from HOST alone; the
+  // `--bind loopback` argv layer above stays exposure-only. Exposed
+  // non-Paperclip services keep the same env they always had.
+  if (exposureConfig || isPaperclipDevRuntimeService({ serviceName, command })) {
     env.PAPERCLIP_BIND = RUNTIME_EXPOSURE_BIND_MODE;
     env.PAPERCLIP_BIND_HOST = RUNTIME_EXPOSURE_BIND_HOST;
     env.HOST = RUNTIME_EXPOSURE_BIND_HOST;
+  }
+  if (exposureConfig) {
+    // Exposure-only hardening. Other managed processes are still rejected by
+    // the broker unless /proc proves loopback-only listeners.
     env.PAPERCLIP_VITE_HMR_PROTOCOL = "wss";
     env.PAPERCLIP_MANAGED_RUNTIME_EXPOSURE = "tailscale_https";
     env.PAPERCLIP_ALLOWED_HOSTNAMES = exposureHostname!;
