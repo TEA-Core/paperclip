@@ -90,14 +90,14 @@ test("OpenCode V2 is installed off PATH at a pinned version and digest", () => {
   );
 });
 
-test("V1 router-plugin fixture is the pinned fleet copy (baseline launch evidence)", () => {
+test("V1 router-plugin fixture matches its pinned digest (baseline launch evidence)", () => {
   // The public fixture replaces deployment-specific endpoint defaults with
   // placeholders and omits internal operational details. Keep its digest
   // pinned so the baseline launch assertion fails on silent fixture drift.
   const fixtureDir = path.join(repoRoot, "scripts", "opencode-v1-plugin-fixture");
   const pins = [
-    ["plugin/router-catalog.js", "c6f21d830b476416f935f03820467eba3991d5ebe9f839e0d8299d8e835a441a"],
-    ["router-catalog/lib.mjs", "9eac63e3f5109ddb35e9ceff77910e55092caed842b08374529343a215284a61"],
+    ["plugin/router-catalog.js", "be4968117047b36f7a1974f1096f865602a183402edf9549d4cfce618a0263af"],
+    ["router-catalog/lib.mjs", "98cc7f9795d0e33c56e93b0f4688e869b1bf5bc6478898d86e782a18c05a5b68"],
   ];
   for (const [rel, sha] of pins) {
     const digest = createHash("sha256")
@@ -106,7 +106,7 @@ test("V1 router-plugin fixture is the pinned fleet copy (baseline launch evidenc
     assert.equal(
       digest,
       sha,
-      `scripts/opencode-v1-plugin-fixture/${rel} drifted from the pinned fleet revision`,
+      `scripts/opencode-v1-plugin-fixture/${rel} drifted from its pinned digest`,
     );
   }
 });

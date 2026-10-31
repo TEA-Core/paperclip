@@ -1,7 +1,7 @@
 // opencode plugin: builds every provider from the live router at startup.
 // Roles and served models are fetched independently. Only router providers are
 // enabled. If a fetch fails the last good copy of that half is used, so a slow
-// control API does not empty the model list.
+// fetch does not empty the model list.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -19,7 +19,7 @@ async function getJSON(url) {
   return res.json();
 }
 
-// Only what buildCatalog reads; the rules response also carries prices, caps and notes.
+// Only what buildCatalog reads from the response.
 function trimRules(rules) {
   const roles = {};
   for (const [k, r] of Object.entries(rules.roles ?? {})) {

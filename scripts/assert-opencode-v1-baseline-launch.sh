@@ -1,5 +1,5 @@
 #!/bin/sh
-# SUP-19143 acceptance probe: baseline V1 agent launch with the V1 router plugin.
+# Acceptance probe: baseline V1 agent launch with the V1 router plugin.
 #
 # Runs INSIDE a container built from the production image (docker-build-assert
 # job mounts this script plus the fixture and invokes it). Proves end to end
@@ -47,8 +47,8 @@ cat > "$STAGE/config/opencode/opencode.json" <<'JSON'
   "permission": { "external_directory": "allow" }
 }
 JSON
-# The agent principal must own everything it writes (SUP-13484: opencode
-# creates state under HOME and config at startup).
+# The agent principal must own everything it writes (opencode creates state
+# under HOME and config at startup).
 if getent passwd node-agent >/dev/null 2>&1; then
   chown -R node-agent:node-agent "$STAGE"
 fi
@@ -59,7 +59,7 @@ cat > "$STAGE/stub-router.mjs" <<'STUB'
 import http from "node:http";
 const PORT = Number(process.env.STUB_ROUTER_PORT || 18080);
 const RULES = {
-  roles: { "coder-default": { targets: [{ provider: "stub-rung", maxContextTokens: 262144 }] } },
+  roles: { "coder-default": { targets: [{ provider: "stub-target", maxContextTokens: 262144 }] } },
   pools: {},
 };
 const MODELS = { data: [{ id: "coder", context_length: 262144, name: "coder (stub)" }] };
