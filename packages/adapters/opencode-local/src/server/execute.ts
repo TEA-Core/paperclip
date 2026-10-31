@@ -77,10 +77,12 @@ import {
 } from "./models.js";
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
 import {
+  createOpenCodeV2SessionByteMeasurer,
   describeOpenCodeDatabaseGrowthSpare,
   describeOpenCodeDatabaseGrowthTrip,
   formatBytes,
   readOpenCodeSessionIdFromChunk,
+  readOpenCodeV2SessionState,
   resolveOpenCodeDatabaseGrowthLimitBytes,
   resolveOpenCodeDatabasePath,
   resolveOpenCodeDatabasePollIntervalMs,
@@ -517,6 +519,7 @@ export type OpenCodeSessionResumeDecision =
       sessionId: string | null;
       reason:
         | "no_session"
+        | "session_missing"
         | "unknown_cwd"
         | "cwd_mismatch"
         | "execution_target_mismatch"
@@ -659,12 +662,20 @@ export function resolveOpenCodeSessionResume(input: {
    * to DEFAULT_OPENCODE_SESSION_RESUME_MAX_BYTES when omitted.
    */
   maxSessionTranscriptBytes?: number;
+  /**
+   * False when a V2 database was read successfully and holds no such session.
+   * undefined = not checked (V1, or the read failed), which skips the gate.
+   */
+  sessionExists?: boolean;
 }): OpenCodeSessionResumeDecision {
   if (input.sessionId.length === 0) {
     return { resume: false, sessionId: null, reason: "no_session" };
   }
   if (!input.executionTargetMatches) {
     return { resume: false, sessionId: input.sessionId, reason: "execution_target_mismatch" };
+  }
+  if (input.sessionExists === false) {
+    return { resume: false, sessionId: input.sessionId, reason: "session_missing" };
   }
   if (input.sessionCwd.length === 0) {
     return { resume: false, sessionId: input.sessionId, reason: "unknown_cwd" };
@@ -1189,12 +1200,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // preserving the previous resume behaviour.
     const sessionResumeMaxBytes = resolveOpenCodeSessionResumeMaxBytes({ env: runtimeEnv });
     let sessionTranscriptBytes: number | null = null;
+    let sessionExists: boolean | undefined;
+    let resumeSessionCwd = runtimeSessionCwd;
     if (runtimeSessionId && openCodeDatabaseFile && !executionTargetIsRemote) {
       const sessionTranscriptDbPath = resolveOpenCodeDatabasePath({
         databaseFile: openCodeDatabaseFile,
         env: runtimeEnv,
       });
-      if (sessionTranscriptDbPath) {
+      if (sessionTranscriptDbPath && openCodeV2) {
+        // SUP-19141: a V2 database has no V1 `part`/`message` rows, so the V1
+        // measure would return null and skip the size gate without a word.
+        const v2State = await readOpenCodeV2SessionState(sessionTranscriptDbPath, runtimeSessionId);
+        if (v2State.ok) {
+          sessionTranscriptBytes = v2State.state.transcriptBytes;
+          sessionExists = v2State.state.exists;
+          // The database records the directory the session is rooted at; prefer
+          // it to the copy carried in saved session params.
+          if (v2State.state.cwd) resumeSessionCwd = v2State.state.cwd;
+        } else {
+          await onLog(
+            "stderr",
+            `[paperclip] OpenCode V2 session state unavailable for "${runtimeSessionId}" at ${sessionTranscriptDbPath}: ${v2State.error}. The resume size cap and session-existence check were NOT applied.\n`,
+          );
+        }
+      } else if (sessionTranscriptDbPath) {
         sessionTranscriptBytes = await measureOpenCodeSessionTranscriptBytes(
           sessionTranscriptDbPath,
           runtimeSessionId,
@@ -1203,16 +1232,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     const resumeDecision = resolveOpenCodeSessionResume({
       sessionId: runtimeSessionId,
-      sessionCwd: runtimeSessionCwd,
+      sessionCwd: resumeSessionCwd,
       executionCwd: effectiveExecutionCwd,
       executionTargetMatches: adapterExecutionTargetSessionMatches(
         runtimeRemoteExecution,
         runtimeExecutionTarget,
       ),
+      sessionExists,
       sessionTranscriptBytes,
       maxSessionTranscriptBytes: sessionResumeMaxBytes,
     });
     const sessionId = resumeDecision.resume ? resumeDecision.sessionId : null;
+    if (!resumeDecision.resume && resumeDecision.reason === "session_missing") {
+      await onLog(
+        "stdout",
+        `[paperclip] OpenCode V2 session "${runtimeSessionId}" is absent from its database and will not be resumed. Starting a fresh session.\n`,
+      );
+    }
     if (!resumeDecision.resume && resumeDecision.reason === "execution_target_mismatch") {
       await onLog(
         "stdout",
@@ -1226,7 +1262,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     } else if (!resumeDecision.resume && resumeDecision.reason === "cwd_mismatch") {
       await onLog(
         "stdout",
-        `[paperclip] OpenCode session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
+        `[paperclip] OpenCode session "${runtimeSessionId}" was saved for cwd "${resumeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
       );
     } else if (!resumeDecision.resume && resumeDecision.reason === "session_too_large") {
       // SUP-14964: make the size-based fresh-session start observable in the run
@@ -1427,6 +1463,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             limitBytes: databaseGuardLimitBytes,
             pollIntervalMs: databaseGuardPollIntervalMs,
             sessionId: resumeSessionId,
+            // SUP-19141: a V2 database keeps a session in session_v2/session_message;
+            // the default measurer reads V1 tables and would attribute nothing.
+            measureSessionBytes: openCodeV2
+              ? createOpenCodeV2SessionByteMeasurer((message) => {
+                  void onLog("stderr", `[paperclip] ${message}\n`);
+                })
+              : undefined,
             onSpare: (spare) => {
               void onLog("stdout", `[paperclip] ${describeOpenCodeDatabaseGrowthSpare(spare)}\n`);
             },

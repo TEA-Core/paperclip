@@ -334,6 +334,19 @@ describe("resolveOpenCodeSessionResume", () => {
     ).toEqual({ resume: false, sessionId: null, reason: "no_session" });
   });
 
+  // SUP-19141: a V2 database that was read and lacks the session is proof the
+  // session cannot be resumed; "not checked" (undefined) must not decline.
+  it("declines a session the V2 database does not hold, but not one that was never checked", () => {
+    const input = { ...base, sessionId: "ses_123", sessionCwd: "/workspaces/wt-a" };
+    expect(resolveOpenCodeSessionResume({ ...input, sessionExists: false })).toEqual({
+      resume: false,
+      sessionId: "ses_123",
+      reason: "session_missing",
+    });
+    expect(resolveOpenCodeSessionResume({ ...input, sessionExists: true })).toEqual({ resume: true, sessionId: "ses_123" });
+    expect(resolveOpenCodeSessionResume(input)).toEqual({ resume: true, sessionId: "ses_123" });
+  });
+
   // SUP-14964: the resume decision is bounded by the session's replayed
   // transcript size. The default cap is 4,000,000 bytes (~889K estimated tokens
   // against the 1,048,576-token route ceiling, ~15% headroom) -- see the

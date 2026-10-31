@@ -1,7 +1,7 @@
 import { execFile, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createServer, type Server } from "node:http";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,7 +13,15 @@ import {
   ensureOpenCodeModelConfiguredAndAvailable,
   resetOpenCodeModelsCacheForTests,
 } from "./models.js";
-import { execute } from "./execute.js";
+import {
+  createOpenCodeV2SessionByteMeasurer,
+  readOpenCodeV2SessionState,
+  resolveOpenCodeDatabasePath,
+  startOpenCodeDatabaseGrowthGuard,
+  type OpenCodeDatabaseGrowthSpare,
+  type OpenCodeDatabaseGrowthTrip,
+} from "./db-guard.js";
+import { execute, resolveOpenCodeDatabaseFile } from "./execute.js";
 import { testEnvironment } from "./test.js";
 import { OPENCODE_V2_CLI_VERSION } from "../index.js";
 import { parseOpenCodeCliVersion } from "./version.js";
@@ -72,6 +80,7 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
   let workspace: string;
   let server: Server;
   let baseEnv: Record<string, string>;
+  let guardEnv: Record<string, string>;
   let emptyCatalogEnv: Record<string, string>;
   let binary: string;
   let cliVersion: string;
@@ -158,8 +167,7 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
 
     // The provider lives in the user's opencode.json, not in a Paperclip-only
     // env var, so plain `opencode models` sees it too.
-    baseEnv = privateEnv("main");
-    await writeOpenCodeConfig(baseEnv, {
+    const fixtureConfig = {
       provider: {
         "paperclip-fixture": {
           npm: "@ai-sdk/openai-compatible",
@@ -168,7 +176,18 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
           models: { "acceptance-model": { name: "Paperclip acceptance model" } },
         },
       },
-    });
+    };
+    baseEnv = privateEnv("main");
+    await writeOpenCodeConfig(baseEnv, fixtureConfig);
+
+    // The session guards only arm on the per-agent database the adapter names
+    // itself, which it does only when no OPENCODE_DB is configured.
+    guardEnv = privateEnv("guard");
+    delete guardEnv.OPENCODE_DB;
+    // privateEnv copies the runner's environment; its PWD would root every session
+    // at the runner's directory instead of the workspace the run is spawned in.
+    delete guardEnv.PWD;
+    await writeOpenCodeConfig(guardEnv, fixtureConfig);
 
     // Restricting OpenCode to a provider that does not exist yields a real,
     // exit-0, empty `opencode models` catalog.
@@ -300,6 +319,184 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     expect(second.errorMessage).toBeNull();
     expect(commandArgs[0]).toEqual(expect.arrayContaining(["--standalone", "--session", first.sessionId as string]));
   }, 90_000);
+
+  // SUP-19141: the session guards read the database this very binary wrote, not
+  // a hand-built schema, so a column or table the pinned build changes fails here.
+  async function runSession(
+    runId: string,
+    options: { sessionId?: string | null; sessionParams?: Record<string, unknown> | null; env?: Record<string, string> } = {},
+  ) {
+    const logs: string[] = [];
+    const commandArgs: string[][] = [];
+    const result = await execute(context({
+      runId,
+      runtime: {
+        sessionId: options.sessionId ?? null,
+        sessionParams: options.sessionParams ?? null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        command: binary,
+        cliVersion,
+        cwd: workspace,
+        model,
+        dangerouslySkipPermissions: true,
+        env: { ...guardEnv, ...(options.env ?? {}) },
+      },
+      onLog: async (_stream, chunk) => {
+        logs.push(chunk);
+      },
+      onMeta: async (meta) => {
+        commandArgs.push((meta.commandArgs ?? []).filter((arg): arg is string => typeof arg === "string"));
+      },
+    }));
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionId).toEqual(expect.any(String));
+    return { result, sessionId: result.sessionId as string, log: logs.join(""), args: commandArgs[0] ?? [] };
+  }
+
+  function guardDatabasePath(): string {
+    const file = resolveOpenCodeDatabaseFile({ agentId: "acceptance-agent", env: guardEnv });
+    const resolved = file ? resolveOpenCodeDatabasePath({ databaseFile: file, env: guardEnv }) : null;
+    if (!resolved) throw new Error("The adapter did not name a per-agent database for the guard environment.");
+    return resolved;
+  }
+
+  async function openDatabase(readOnly: boolean) {
+    const { DatabaseSync } = await import("node:sqlite");
+    return new DatabaseSync(guardDatabasePath(), { readOnly });
+  }
+
+  // Grow one session's transcript by `bytes` through the real session_message table.
+  async function padSession(sessionId: string, bytes: number) {
+    const db = await openDatabase(false);
+    try {
+      const next = db.prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM session_message WHERE session_id = ?").get(sessionId);
+      const now = Date.now();
+      db.prepare(
+        "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, 'user', ?, ?, ?, ?)",
+      ).run(`pad_${sessionId}_${now}`, sessionId, Number(next?.seq), now, now, JSON.stringify({ text: "x".repeat(bytes) }));
+    } finally {
+      db.close();
+    }
+  }
+
+  it("reads existence, directory, size and final message from a database the binary wrote", async () => {
+    const { sessionId } = await runSession("acceptance-state");
+    const dbPath = guardDatabasePath();
+    const read = await readOpenCodeV2SessionState(dbPath, sessionId);
+    if (!read.ok) throw new Error(`probe failed against the real database: ${read.error}`);
+    expect(read.state.exists).toBe(true);
+    expect(await realpath(read.state.cwd as string)).toBe(await realpath(workspace));
+    expect(read.state.messageCount).toBeGreaterThanOrEqual(2);
+    expect(read.state.transcriptBytes).toBeGreaterThan(0);
+    expect(read.state.finalMessage).toBe("fixture response");
+
+    const db = await openDatabase(true);
+    try {
+      const raw = db.prepare("SELECT SUM(LENGTH(CAST(data AS BLOB))) AS bytes FROM session_message WHERE session_id = ?").get(sessionId);
+      expect(read.state.transcriptBytes).toBe(Number(raw?.bytes));
+    } finally {
+      db.close();
+    }
+
+    const absent = await readOpenCodeV2SessionState(dbPath, "ses_does_not_exist");
+    expect(absent).toEqual({
+      ok: true,
+      state: { exists: false, cwd: null, messageCount: 0, transcriptBytes: 0, finalMessage: null },
+    });
+  }, 90_000);
+
+  it("reports an unreadable or non-V2 database as an error instead of a measurement", async () => {
+    const missing = await readOpenCodeV2SessionState(path.join(rootDir, "no-such.db"), "ses_x");
+    expect(missing.ok).toBe(false);
+    const { DatabaseSync } = await import("node:sqlite");
+    const v1Shaped = path.join(rootDir, "v1-shaped.db");
+    const db = new DatabaseSync(v1Shaped);
+    db.exec("CREATE TABLE message (id text PRIMARY KEY, session_id text, data text)");
+    db.close();
+    const nonV2 = await readOpenCodeV2SessionState(v1Shaped, "ses_x");
+    expect(nonV2.ok).toBe(false);
+    if (!nonV2.ok) expect(nonV2.error).toMatch(/session_v2/);
+
+    const unavailable: string[] = [];
+    const measure = createOpenCodeV2SessionByteMeasurer((message) => unavailable.push(message));
+    expect(await measure(v1Shaped, "ses_x")).toBeNull();
+    expect(unavailable).toHaveLength(1);
+    expect(unavailable[0]).toContain("ses_x");
+  });
+
+  it("resumes from the recorded session directory and starts fresh for a session the database lacks", async () => {
+    const { sessionId } = await runSession("acceptance-dbcwd");
+    // No cwd in the saved params: a V1 session would be refused as unknown_cwd,
+    // but V2 proves the directory from session_v2.
+    const resumed = await runSession("acceptance-dbcwd-resume", { sessionId });
+    expect(resumed.args).toEqual(expect.arrayContaining(["--session", sessionId]));
+
+    const missing = await runSession("acceptance-missing", {
+      sessionId: "ses_not_in_this_database",
+      sessionParams: { sessionId: "ses_not_in_this_database", cwd: workspace },
+    });
+    expect(missing.args).not.toContain("--session");
+    expect(missing.log).toContain("is absent from its database");
+  }, 120_000);
+
+  it("starts a fresh session when the real transcript exceeds the resume cap", async () => {
+    const { sessionId } = await runSession("acceptance-cap-seed");
+    const capped = await runSession("acceptance-cap", {
+      sessionId,
+      env: { PAPERCLIP_OPENCODE_SESSION_MAX_BYTES: "1" },
+    });
+    expect(capped.args).not.toContain("--session");
+    expect(capped.log).toContain("resume cap");
+    expect(capped.sessionId).not.toBe(sessionId);
+
+    const uncapped = await runSession("acceptance-cap-off", { sessionId });
+    expect(uncapped.args).toEqual(expect.arrayContaining(["--session", sessionId]));
+  }, 120_000);
+
+  it("attributes growth to the run's own session and spares it for a sibling's growth", async () => {
+    const own = (await runSession("acceptance-own")).sessionId;
+    const sibling = (await runSession("acceptance-sibling")).sessionId;
+    expect(sibling).not.toBe(own);
+    const limitBytes = 200_000;
+    const spares: OpenCodeDatabaseGrowthSpare[] = [];
+    const trips: OpenCodeDatabaseGrowthTrip[] = [];
+    const unavailable: string[] = [];
+    const guard = startOpenCodeDatabaseGrowthGuard({
+      databasePath: guardDatabasePath(),
+      limitBytes,
+      pollIntervalMs: 50,
+      sessionId: own,
+      measureSessionBytes: createOpenCodeV2SessionByteMeasurer((message) => unavailable.push(message)),
+      onSpare: (spare) => spares.push(spare),
+      onTrip: (trip) => trips.push(trip),
+    });
+    try {
+      // The guard polls a real file on a real interval; fake timers cannot drive
+      // SQLite I/O, so this waits on the observed condition, bounded at 10s.
+      const until = async (done: () => boolean) => {
+        for (let i = 0; i < 200 && !done(); i += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(done()).toBe(true);
+      };
+      // Let the guard take its baseline before anything grows.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await padSession(sibling, limitBytes * 2);
+      await until(() => spares.length > 0);
+      expect(trips).toHaveLength(0);
+      expect(spares[0]?.attribution.sessionId).toBe(own);
+      expect(spares[0]?.attribution.growthBytes).toBe(0);
+
+      await padSession(own, limitBytes * 2);
+      await until(() => trips.length > 0);
+      expect(trips[0]?.attribution?.sessionId).toBe(own);
+      expect(trips[0]?.attribution?.growthBytes).toBeGreaterThanOrEqual(limitBytes * 2);
+      expect(unavailable).toEqual([]);
+    } finally {
+      guard.stop();
+    }
+  }, 120_000);
 
   it("reports a forced output cap as a failure, not as an exit-0 success", async () => {
     const result = await execute(context({
