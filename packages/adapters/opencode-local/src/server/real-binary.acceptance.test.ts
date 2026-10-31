@@ -32,8 +32,9 @@ import { parseOpenCodeCliVersion } from "./version.js";
 // the `opencode` bin name collides with V1), provisioned by
 // `../../scripts/provision-opencode-v2-binary.mjs` at the version
 // `OPENCODE_V2_CLI_VERSION` pins. Every home, XDG dir and the database is
-// private to the run, and every launch is `--standalone`, so the shared managed
-// OpenCode service is never touched.
+// private to the run, and the adapter drives a private loopback `opencode serve`
+// (per-run port and password) for local V2 runs, so the shared managed OpenCode
+// service is never touched.
 //
 // Reproduce it from a clean checkout with one command — `pnpm
 // test:opencode-v2-acceptance`, which is what the `OpenCode V2 acceptance`
@@ -72,6 +73,12 @@ const model = "paperclip-fixture/acceptance-model";
 // Prompt markers the fixture reacts to; they travel through `promptTemplate`.
 const CANCEL_MARKER = "paperclip-acceptance-cancel";
 const FORCE_LENGTH_MARKER = "paperclip-acceptance-force-length";
+// A prompt carrying one of these markers makes the model call that tool once.
+const SHELL_CALL_MARKER = "paperclip-acceptance-shell-call";
+const QUESTION_CALL_MARKER = "paperclip-acceptance-question-call";
+const QUESTION_ARGS = {
+  questions: [{ question: "Which option?", header: "Pick one", options: [{ label: "A", description: "first" }, { label: "B", description: "second" }] }],
+};
 
 const execFileAsync = promisify(execFile);
 
@@ -81,10 +88,14 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
   let server: Server;
   let baseEnv: Record<string, string>;
   let guardEnv: Record<string, string>;
+  let fixtureConfig: Record<string, unknown>;
   let emptyCatalogEnv: Record<string, string>;
   let binary: string;
   let cliVersion: string;
   let savedAllowAllModels: string | undefined;
+  // Every request that carried tools, i.e. a main-agent request (title requests carry none).
+  const mainRequests: Array<{ tools: string[]; messageCount: number }> = [];
+  let mcpServer: Server;
 
   function privateEnv(name: string): Record<string, string> {
     const home = path.join(rootDir, name);
@@ -146,8 +157,31 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
       let body = "";
       for await (const chunk of req) body += chunk;
       const lowered = body.toLowerCase();
+      let toolCall: { name: string; args: unknown } | null = null;
+      try {
+        const parsed = JSON.parse(body) as { tools?: Array<{ function?: { name?: string } }>; messages?: Array<{ role?: string }> };
+        if ((parsed.tools ?? []).length > 0) {
+          mainRequests.push({
+            tools: (parsed.tools ?? []).map((tool) => tool.function?.name ?? ""),
+            messageCount: (parsed.messages ?? []).length,
+          });
+          const answered = (parsed.messages ?? []).some((message) => message.role === "tool");
+          if (!answered && lowered.includes(SHELL_CALL_MARKER)) toolCall = { name: "shell", args: { command: "echo hi" } };
+          if (!answered && lowered.includes(QUESTION_CALL_MARKER)) toolCall = { name: "question", args: QUESTION_ARGS };
+        }
+      } catch {
+        // not a JSON chat request
+      }
       if (lowered.includes(CANCEL_MARKER)) {
         await new Promise((resolve) => setTimeout(resolve, 5_000));
+      }
+      if (toolCall) {
+        res.writeHead(200, { "cache-control": "no-cache", connection: "keep-alive", "content-type": "text/event-stream" });
+        const call = { index: 0, id: "call_1", type: "function", function: { name: toolCall.name, arguments: JSON.stringify(toolCall.args) } };
+        res.write(`data: ${JSON.stringify({ id: "chatcmpl-paperclip", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", tool_calls: [call] }, finish_reason: null }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: "chatcmpl-paperclip", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`);
+        res.end("data: [DONE]\n\n");
+        return;
       }
       // A prompt carrying the marker makes the model stop at its output cap
       // instead of a natural end of turn.
@@ -165,9 +199,41 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("Acceptance fixture did not expose a TCP port.");
 
+    // A Streamable HTTP MCP server that lists one tool, the shape of the
+    // Paperclip project-tools route.
+    mcpServer = createServer(async (req, res) => {
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      if (req.method !== "POST") {
+        res.statusCode = 404;
+        res.end();
+        return;
+      }
+      const message = JSON.parse(raw) as { id?: unknown; method?: string };
+      if (message.method === "notifications/initialized") {
+        res.statusCode = 202;
+        res.end();
+        return;
+      }
+      const reply = (result: unknown) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null, result }));
+      };
+      if (message.method === "initialize") {
+        reply({ protocolVersion: "2025-03-26", capabilities: { tools: { listChanged: false } }, serverInfo: { name: "fixture", version: "1" } });
+      } else if (message.method === "tools/list") {
+        reply({ tools: [{ name: "echo", description: "Echo a value.", inputSchema: { type: "object", properties: {} } }] });
+      } else {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null, error: { code: -32601, message: "Method not found" } }));
+      }
+    });
+    await new Promise<void>((resolve) => mcpServer.listen(0, "127.0.0.1", resolve));
+
     // The provider lives in the user's opencode.json, not in a Paperclip-only
     // env var, so plain `opencode models` sees it too.
-    const fixtureConfig = {
+    baseEnv = privateEnv("main");
+    fixtureConfig = {
       provider: {
         "paperclip-fixture": {
           npm: "@ai-sdk/openai-compatible",
@@ -177,7 +243,6 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
         },
       },
     };
-    baseEnv = privateEnv("main");
     await writeOpenCodeConfig(baseEnv, fixtureConfig);
 
     // The session guards only arm on the per-agent database the adapter names
@@ -199,6 +264,7 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     if (savedAllowAllModels === undefined) delete process.env.OPENCODE_ALLOW_ALL_MODELS;
     else process.env.OPENCODE_ALLOW_ALL_MODELS = savedAllowAllModels;
     await new Promise<void>((resolve) => server?.close(() => resolve()));
+    await new Promise<void>((resolve) => mcpServer?.close(() => resolve()));
     await rm(rootDir, { recursive: true, force: true });
   });
 
@@ -317,7 +383,12 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     }));
     expect(second.exitCode).toBe(0);
     expect(second.errorMessage).toBeNull();
-    expect(commandArgs[0]).toEqual(expect.arrayContaining(["--standalone", "--session", first.sessionId as string]));
+    expect(commandArgs[0]).toEqual(expect.arrayContaining(["serve", `<resume session ${first.sessionId as string}>`]));
+    // Same session, and the model saw the first run's turn: the second main
+    // request carries strictly more messages than the first.
+    expect(second.sessionId).toBe(first.sessionId);
+    expect(mainRequests.length).toBeGreaterThanOrEqual(2);
+    expect(mainRequests.at(-1)!.messageCount).toBeGreaterThan(mainRequests[0]!.messageCount);
   }, 90_000);
 
   // SUP-19141: the session guards read the database this very binary wrote, not
@@ -468,13 +539,13 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     // No cwd in the saved params: a V1 session would be refused as unknown_cwd,
     // but V2 proves the directory from session_v2.
     const resumed = await runSession("acceptance-dbcwd-resume", { sessionId });
-    expect(resumed.args).toEqual(expect.arrayContaining(["--session", sessionId]));
+    expect(resumed.args).toContain(`<resume session ${sessionId}>`);
 
     const missing = await runSession("acceptance-missing", {
       sessionId: "ses_not_in_this_database",
       sessionParams: { sessionId: "ses_not_in_this_database", cwd: workspace },
     });
-    expect(missing.args).not.toContain("--session");
+    expect(missing.args).not.toContain("<resume session ses_not_in_this_database>");
     expect(missing.log).toContain("is absent from its database");
   }, 120_000);
 
@@ -484,12 +555,12 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
       sessionId,
       env: { PAPERCLIP_OPENCODE_SESSION_MAX_BYTES: "1" },
     });
-    expect(capped.args).not.toContain("--session");
+    expect(capped.args).not.toContain(`<resume session ${sessionId}>`);
     expect(capped.log).toContain("resume cap");
     expect(capped.sessionId).not.toBe(sessionId);
 
     const uncapped = await runSession("acceptance-cap-off", { sessionId });
-    expect(uncapped.args).toEqual(expect.arrayContaining(["--session", sessionId]));
+    expect(uncapped.args).toContain(`<resume session ${sessionId}>`);
   }, 120_000);
 
   it("attributes growth to the run's own session and spares it for a sibling's growth", async () => {
@@ -556,6 +627,111 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     const stdout = String(result.resultJson?.stdout ?? "");
     expect(stdout).toContain("output-limit");
     expect(stdout).toContain('"type":"error"');
+  }, 90_000);
+
+  it("puts an injected MCP server's tool in the first main-agent request", async () => {
+    mainRequests.length = 0;
+    const address = mcpServer.address();
+    if (!address || typeof address === "string") throw new Error("MCP fixture did not expose a TCP port.");
+    const result = await execute(context({
+      runId: "acceptance-mcp",
+      runtimeMcp: {
+        getServers: () => [{
+          name: "paperclip-fixture",
+          url: `http://127.0.0.1:${address.port}/mcp`,
+          token: "acceptance-mcp-bearer",
+          connectionId: "acceptance-connection",
+        }],
+      },
+    }));
+    expect(result.exitCode).toBe(0);
+    expect(mainRequests.length).toBeGreaterThan(0);
+    expect(mainRequests[0]!.tools.some((name) => /paperclip-fixture_echo$/i.test(name))).toBe(true);
+    expect(JSON.stringify(result)).not.toContain("acceptance-mcp-bearer");
+  }, 90_000);
+
+  it("fails the readiness gate with the MCP server's reported status when it cannot connect", async () => {
+    const denied = createServer((_req, res) => {
+      res.statusCode = 401;
+      res.end("denied");
+    });
+    await new Promise<void>((resolve) => denied.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = denied.address();
+      if (!address || typeof address === "string") throw new Error("Denied MCP fixture did not expose a TCP port.");
+      mainRequests.length = 0;
+      const result = await execute(context({
+        runId: "acceptance-mcp-denied",
+        runtimeMcp: {
+          getServers: () => [{
+            name: "paperclip-denied",
+            url: `http://127.0.0.1:${address.port}/mcp`,
+            token: "acceptance-denied-bearer",
+            connectionId: "acceptance-denied-connection",
+          }],
+        },
+      }));
+      expect(result.exitCode).toBe(1);
+      expect(result.errorMessage).toContain("did not report mcp.resources.changed for MCP server(s) paperclip-denied");
+      expect(result.errorMessage).toContain("paperclip-denied: needs_auth");
+      expect(mainRequests).toHaveLength(0);
+      expect(JSON.stringify(result)).not.toContain("acceptance-denied-bearer");
+    } finally {
+      await new Promise<void>((resolve) => denied.close(() => resolve()));
+    }
+  }, 60_000);
+
+  it("auto-rejects a permission request like `opencode run` instead of waiting for a reply", async () => {
+    const askEnv = privateEnv("permission-ask");
+    await writeOpenCodeConfig(askEnv, { ...fixtureConfig, permissions: [{ action: "shell", resource: "*", effect: "ask" }] });
+    const result = await execute(context({
+      runId: "acceptance-permission",
+      config: {
+        command: binary,
+        cliVersion,
+        cwd: workspace,
+        model,
+        timeoutSec: 60,
+        graceSec: 2,
+        dangerouslySkipPermissions: false,
+        promptTemplate: `${SHELL_CALL_MARKER}: run the shell tool once`,
+        env: askEnv,
+      },
+    }));
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(0);
+    const stdout = String(result.resultJson?.stdout ?? "");
+    const toolUses = stdout
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { type?: string; part?: { tool?: string; state?: { status?: string; error?: string } } })
+      .filter((event) => event.type === "tool_use");
+    const shell = toolUses.find((event) => event.part?.tool === "shell");
+    expect(shell?.part?.state?.status).toBe("error");
+    expect(shell?.part?.state?.error).toContain("cannot ask the user for permission");
+    expect(String(result.resultJson?.stderr ?? "")).toMatch(/! permission requested: shell \(.*\); auto-rejecting/);
+  }, 90_000);
+
+  it("cancels the question tool and ends the run as a failure instead of waiting for an answer", async () => {
+    const result = await execute(context({
+      runId: "acceptance-question",
+      config: {
+        command: binary,
+        cliVersion,
+        cwd: workspace,
+        model,
+        timeoutSec: 60,
+        graceSec: 2,
+        dangerouslySkipPermissions: true,
+        promptTemplate: `${QUESTION_CALL_MARKER}: ask the user one question`,
+        env: baseEnv,
+      },
+    }));
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("that a non-interactive run cannot answer");
+    expect(String(result.resultJson?.stderr ?? "")).toMatch(/! question requested: .*; cancelling/);
+    expect(String(result.resultJson?.stdout ?? "")).toContain("The user dismissed this question");
   }, 90_000);
 
   it("rejects an invalid model before launching the real binary", async () => {

@@ -69,6 +69,12 @@ import {
   parseOpenCodeJsonl,
 } from "./parse.js";
 import {
+  OPENCODE_SERVE_MCP_READY_TIMEOUT_MS,
+  OPENCODE_SERVE_MCP_SETTLE_MS,
+  buildOpenCodeServeArgs,
+  runOpenCodeServeProcess,
+} from "./serve-transport.js";
+import {
   ensureOpenCodeModelConfiguredAndAvailable,
   isTruthyEnvFlag,
   verifyOpenCodeCliVersion,
@@ -1432,15 +1438,58 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         autoApprovePermissions: asBoolean(config.dangerouslySkipPermissions, true),
       });
 
+    // Local V2 runs go through `opencode serve` so the adapter can wait for its
+    // injected MCP servers before the first prompt (see serve-transport.ts).
+    // Remote targets cannot reach a loopback server, and explicit extraArgs are
+    // `opencode run` flags, so both keep the one-shot `run` path.
+    const oneShotReason = !openCodeV2
+      ? null
+      : executionTargetIsRemote
+        ? "the execution target is remote"
+        : extraArgs.length > 0
+          ? asStringArray(config.extraArgs).length > 0
+            ? "extraArgs are configured"
+            : "args are configured"
+          : null;
+    const useServeTransport = openCodeV2 && oneShotReason === null;
+    if (useServeTransport) {
+      commandNotes.push(
+        `Running OpenCode V2 through a private \`opencode serve\` (loopback, per-run port and password); ` +
+          (runtimeMcpServers.length > 0
+            ? `the first prompt waits for mcp.resources.changed from ${runtimeMcpServers.length} injected MCP server(s) plus ` +
+              `${OPENCODE_SERVE_MCP_SETTLE_MS} ms (timer-based gate, fails the run after ${OPENCODE_SERVE_MCP_READY_TIMEOUT_MS / 1000}s).`
+            : `no MCP server was injected, so the first prompt does not wait.`),
+      );
+      if (printLogs) {
+        const warning =
+          "PAPERCLIP_OPENCODE_PRINT_LOGS is not applied on the serve path (opencode serve rejects --standalone, " +
+          "so --print-logs cannot be passed); OpenCode's own logs stay in its log file.";
+        commandNotes.push(warning);
+        await onLog("stdout", `[paperclip] Warning: ${warning}\n`);
+      }
+    } else if (oneShotReason) {
+      const warning =
+        `OpenCode V2 is using the one-shot \`opencode run\` path because ${oneShotReason}; ` +
+        `Paperclip-named MCP tools may be missing from the first request (upstream anomalyco/opencode#60893).`;
+      commandNotes.push(warning);
+      await onLog("stdout", `[paperclip] Warning: ${warning}\n`);
+    }
+
     const runAttempt = async (resumeSessionId: string | null) => {
-      const args = buildArgs(resumeSessionId);
+      const args = useServeTransport ? buildOpenCodeServeArgs() : buildArgs(resumeSessionId);
       if (onMeta) {
         await onMeta({
           adapterType: "opencode_local",
           command: resolvedCommand,
           cwd: effectiveExecutionCwd,
           commandNotes,
-          commandArgs: [...args, `<stdin prompt ${prompt.length} chars>`],
+          commandArgs: useServeTransport
+            ? [
+                ...args,
+                ...(resumeSessionId ? [`<resume session ${resumeSessionId}>`] : []),
+                `<api prompt ${prompt.length} chars>`,
+              ]
+            : [...args, `<stdin prompt ${prompt.length} chars>`],
           env: loggedEnv,
           prompt,
           promptMetrics,
@@ -1508,18 +1557,34 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : null;
 
       try {
-        const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
-          cwd,
-          env: preparedRuntimeConfig.env,
-          stdin: prompt,
-          timeoutSec,
-          graceSec,
-          onSpawn,
-          onRuntimeProgress: ctx.onRuntimeProgress,
-          onLog: earlyAbortOnLog,
-          runLogTail: paperclipBridge?.runLogTail,
-          settleRunDisposition: paperclipBridge?.settleRunDisposition,
-        });
+        const proc = useServeTransport
+          ? await runOpenCodeServeProcess({
+              runId,
+              command,
+              cwd,
+              env: preparedRuntimeConfig.env,
+              timeoutSec,
+              graceSec,
+              prompt,
+              model,
+              variant,
+              resumeSessionId,
+              mcpServers: runtimeMcpServers.map((server) => ({ name: server.name, token: server.token })),
+              onSpawn,
+              onLog: earlyAbortOnLog,
+            })
+          : await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
+              cwd,
+              env: preparedRuntimeConfig.env,
+              stdin: prompt,
+              timeoutSec,
+              graceSec,
+              onSpawn,
+              onRuntimeProgress: ctx.onRuntimeProgress,
+              onLog: earlyAbortOnLog,
+              runLogTail: paperclipBridge?.runLogTail,
+              settleRunDisposition: paperclipBridge?.settleRunDisposition,
+            });
         return {
           proc,
           rawStderr: proc.stderr,

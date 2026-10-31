@@ -1307,6 +1307,56 @@ DB backups are not full instance filesystem backups. For full local disaster
 recovery, also back up local storage files and the local encrypted secrets key if
 those providers are enabled.
 
+## OpenCode V2 Server Transport and the Paperclip MCP Gate
+
+A local `opencode_local` run on OpenCode V2 does not use a one-shot
+`opencode run`. A one-shot `run` builds its first model request before a
+`codemode:false` remote MCP server's tools have been listed, so the Paperclip
+project tools were missing from it (upstream issue
+https://github.com/anomalyco/opencode/issues/60893). The adapter instead starts a
+private `opencode serve` on a kernel-assigned loopback port with a per-run
+`OPENCODE_SERVER_PASSWORD`, waits for the MCP servers it injected, and only then
+creates (or resumes) the session and sends the prompt. The server is always
+stopped at the end of the attempt; the password and MCP bearer tokens are
+redacted from run logs and results. The server's events are mapped onto the
+`run --format json` line shape, so result parsing is unchanged. A permission
+request from any session of that private server (child and subagent sessions
+included) is rejected the way a headless `opencode run` rejects it (stderr line
+`! permission requested: ...; auto-rejecting`, the tool call fails and the model
+continues), so a run never waits on a reply; allowing actions stays the job of
+the `dangerouslySkipPermissions` allow-list. A `question` tool form from any
+session is cancelled the same way (stderr line `! question requested: ...;
+cancelling`); unlike a headless `run`, which lets the model continue, the server
+ends that turn as interrupted, so the run fails with a message that the model
+asked a question a non-interactive run cannot answer. The event stream is read
+with `node:http` so a long silent tool call does not hit a body timeout, and
+`PAPERCLIP_OPENCODE_PRINT_LOGS` is not applied on this path (`opencode serve`
+rejects `--standalone`); a run with it set logs a warning saying so.
+
+The gate waits for `mcp.resources.changed` on `GET /api/event` from every
+injected MCP server, settles 1000 ms, and fails the run (exit 1, no session
+created) if the event has not arrived within 15 s. The failure message lists
+each injected server's status as `GET /api/mcp` reports it (for example
+`needs_auth` or `failed`); that is a diagnostic and does not change the gate.
+**The gate is timer-based by necessity**: OpenCode 2.2.4 exposes no endpoint or
+event that says a new session will see an MCP server's tools, and the event
+precedes tool availability by a short unmarked interval (lab: prompting right
+after the event carried the tools in 0 of 5 runs; +100, +250 and +500 ms carried
+them in 5 of 5). On a loaded host
+the settle can be too short and the run starts without its Paperclip tools; the
+host rehearsal must measure that failure rate under load. The event fires with
+`OPENCODE_DISABLE_MODELS_FETCH=true` as well, so that variable does not affect
+the gate.
+
+Remote execution targets cannot reach a loopback server and runs with explicit
+`extraArgs` or `args` (which are `opencode run` flags) keep the one-shot `run`
+path, with its first-request MCP race. Such a run adds a command note and one
+warning log line naming the reason. Real-binary proof:
+`pnpm test:opencode-v2-acceptance` (adapter suite plus
+`server/src/__tests__/opencode-v2-paperclip-mcp.acceptance.test.ts`, which asserts
+the four Paperclip project tools are in the first main-agent request against the
+real `/api/mcp/project-tools` route).
+
 ## OpenCode Database Janitor
 
 The `opencode_local` adapter runs each agent against its own SQLite database

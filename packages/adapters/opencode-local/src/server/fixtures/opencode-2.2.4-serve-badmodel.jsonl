@@ -1,0 +1,2 @@
+{"id":"evt_19252d248001Cfhd6oY0hnsCae","type":"session.execution.started","data":{"sessionID":"ses_e6dad2dc5ffe0K19ZozmWiWP2G"}}
+{"id":"evt_19252d25b001JO5FFt59jOSx3L","type":"session.execution.failed","data":{"sessionID":"ses_e6dad2dc5ffe0K19ZozmWiWP2G","error":{"type":"provider.no-route","message":"Model unavailable: fx/nope"}}}
