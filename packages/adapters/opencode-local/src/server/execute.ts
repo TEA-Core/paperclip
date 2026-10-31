@@ -663,7 +663,8 @@ export function resolveOpenCodeSessionResume(input: {
   executionTargetMatches: boolean;
   /**
    * Measured bytes of the session's replayed transcript (see
-   * measureOpenCodeSessionTranscriptBytes). null/undefined = not measured, which
+   * measureOpenCodeSessionTranscriptBytes, or readOpenCodeV2SessionState on a V2
+   * database). null/undefined = not measured, which
    * skips the size gate so the session behaves exactly as it did before this
    * change.
    */
