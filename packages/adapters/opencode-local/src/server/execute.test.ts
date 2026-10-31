@@ -773,6 +773,89 @@ describe("execute — OpenCode V2 output cap", () => {
   });
 });
 
+// SUP-19141: an unreadable V2 database logs a warning and resumes uncapped by
+// design for now; fail-closed versus a V1-table fallback is decided at the E8
+// rehearsal (SUP-19145). This pins that behavior so it cannot become accidental.
+describe("execute — OpenCode V2 session state unavailable", () => {
+  const sessionId = "ses_v2unavailable";
+
+  async function resumeWithDatabase(prepareDatabase?: (databasePath: string) => Promise<void>) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-v2-unavailable-"));
+    const workspace = path.join(root, "workspace");
+    const dataHome = path.join(root, "data");
+    const databasePath = path.join(dataHome, "opencode", "opencode-agent-agent-v2-unavailable.db");
+    const commandPath = path.join(root, "opencode");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.mkdir(path.dirname(databasePath), { recursive: true });
+    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '2.2.4\\n'; fi\n", "utf8");
+    await fs.chmod(commandPath, 0o755);
+    await prepareDatabase?.(databasePath);
+    runAdapterExecutionTargetProcessMock.mockReset();
+    runAdapterExecutionTargetProcessMock.mockImplementation(async () =>
+      probeResult({ stdout: JSON.stringify({ type: "text", sessionID: sessionId, part: { text: "done" } }) }),
+    );
+    const logs: Array<{ stream: string; chunk: string }> = [];
+    try {
+      const result = await execute({
+        runId: "run-v2-unavailable",
+        agent: { id: "agent-v2-unavailable", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+        runtime: { sessionId, sessionParams: { sessionId, cwd: workspace }, sessionDisplayId: null, taskKey: null },
+        config: {
+          command: commandPath,
+          cliVersion: "2.2.4",
+          cwd: workspace,
+          model: "openai/gpt-5",
+          env: {
+            OPENCODE_ALLOW_ALL_MODELS: "1",
+            XDG_DATA_HOME: dataHome,
+            // A 1-byte cap would decline any measurable session, so a resume proves the cap was skipped.
+            PAPERCLIP_OPENCODE_SESSION_MAX_BYTES: "1",
+            PAPERCLIP_OPENCODE_DB_GROWTH_LIMIT_MB: "0",
+          },
+        },
+        context: {},
+        onLog: async (stream, chunk) => { logs.push({ stream, chunk }); },
+      });
+      const runCall = runAdapterExecutionTargetProcessMock.mock.calls.find((call) => call[3]?.[0] === "run");
+      return { result, logs, runArgs: runCall?.[3] as string[] | undefined };
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
+
+  const unavailable = (logs: Array<{ stream: string; chunk: string }>) =>
+    logs.filter((entry) => entry.chunk.includes("OpenCode V2 session state unavailable"));
+
+  it("warns with the cause and resumes without the cap when the database file is missing", async () => {
+    const { result, logs, runArgs } = await resumeWithDatabase();
+
+    expect(result.exitCode).toBe(0);
+    const warnings = unavailable(logs);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].stream).toBe("stderr");
+    expect(warnings[0].chunk).toContain("cause: missing or unreadable database file");
+    expect(warnings[0].chunk).toContain("WITHOUT the resume size cap and WITHOUT the session-existence check");
+    expect(runArgs).toEqual(expect.arrayContaining(["--session", sessionId]));
+  });
+
+  it("warns with the cause and resumes without the cap when the database has no V2 session tables", async () => {
+    const { result, logs, runArgs } = await resumeWithDatabase(async (databasePath) => {
+      const { DatabaseSync } = await import("node:sqlite");
+      const db = new DatabaseSync(databasePath);
+      db.exec("CREATE TABLE part (id text PRIMARY KEY, session_id text NOT NULL, data text NOT NULL)");
+      db.close();
+    });
+
+    expect(result.exitCode).toBe(0);
+    const warnings = unavailable(logs);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].stream).toBe("stderr");
+    expect(warnings[0].chunk).toContain("cause: no such table");
+    expect(warnings[0].chunk).toContain("WITHOUT the resume size cap and WITHOUT the session-existence check");
+    expect(runArgs).toEqual(expect.arrayContaining(["--session", sessionId]));
+  });
+});
+
 describe("execute — OpenCode V2 native MCP", () => {
   it("projects runtime MCP servers into the staged native config before the first prompt", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-v2-mcp-"));
