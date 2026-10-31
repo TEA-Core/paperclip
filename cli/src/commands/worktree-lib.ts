@@ -4,7 +4,7 @@ import type { PaperclipConfig } from "../config/schema.js";
 import { expandHomePrefix } from "../config/home.js";
 
 export const DEFAULT_WORKTREE_HOME = "~/.paperclip-worktrees";
-export const WORKTREE_SEED_MODES = ["minimal", "full"] as const;
+export const WORKTREE_SEED_MODES = ["minimal", "minimal-no-secrets", "full"] as const;
 export const WORKTREE_SEED_MANIFEST = "seed-manifest.json";
 export const WORKTREE_SEED_PENDING_MARKER = "seed-pending";
 export const WORKTREE_SEED_COMPLETE_MARKER = "seed-complete";
@@ -72,6 +72,25 @@ const MINIMAL_WORKTREE_NULLIFIED_COLUMNS: Record<string, string[]> = {
   issues: ["checkout_run_id", "execution_run_id"],
 };
 
+const MINIMAL_NO_SECRETS_WORKTREE_EXCLUDED_TABLES = [
+  "company_secret_bindings",
+  "company_secret_proposals",
+  "company_secret_provider_configs",
+  "company_secret_versions",
+  "company_secrets",
+  "managed_agent_profiles",
+  "secret_access_events",
+  "secrets_directory_observations",
+  "user_secret_declarations",
+  "user_secret_definitions",
+];
+
+// `secret_id` lives on routine_triggers (the only nullable FK into company_secrets
+// on a table that is still copied); nullifying it keeps restored rows FK-clean.
+const MINIMAL_NO_SECRETS_WORKTREE_NULLIFIED_COLUMNS: Record<string, string[]> = {
+  routine_triggers: ["secret_id"],
+};
+
 export type WorktreeLocalPaths = {
   cwd: string;
   repoConfigDir: string;
@@ -122,12 +141,20 @@ export function resolveWorktreeSeedPlan(mode: WorktreeSeedMode): WorktreeSeedPla
       nullifyColumns: {},
     };
   }
+  const excludedTables = [...MINIMAL_WORKTREE_EXCLUDED_TABLES];
+  const nullifyColumns: Record<string, string[]> = {
+    ...MINIMAL_WORKTREE_NULLIFIED_COLUMNS,
+  };
+  if (mode === "minimal-no-secrets") {
+    excludedTables.push(...MINIMAL_NO_SECRETS_WORKTREE_EXCLUDED_TABLES);
+    for (const [table, columns] of Object.entries(MINIMAL_NO_SECRETS_WORKTREE_NULLIFIED_COLUMNS)) {
+      nullifyColumns[table] = [...(nullifyColumns[table] ?? []), ...columns];
+    }
+  }
   return {
     mode,
-    excludedTables: [...MINIMAL_WORKTREE_EXCLUDED_TABLES],
-    nullifyColumns: {
-      ...MINIMAL_WORKTREE_NULLIFIED_COLUMNS,
-    },
+    excludedTables,
+    nullifyColumns,
   };
 }
 
