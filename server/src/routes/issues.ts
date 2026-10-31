@@ -16658,8 +16658,15 @@ export function issueRoutes(
         companyId,
         createAssignmentScope,
       );
+      // SUP-22098: an explicitly-supplied stage-less policy ("no ladder") must
+      // survive the public create path. Omitting `preserveEmptyPolicy` here
+      // collapsed an explicit `executionPolicy.stages: []` to null, and the
+      // project default then injected a review ladder the caller expressly
+      // declined. Omitted/`null` policies still normalize to null (the option
+      // is a no-op for null input), so default inheritance is unchanged.
       const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(
         createBody.executionPolicy,
+        { preserveEmptyPolicy: true },
       );
       const createReturnAssigneeAgentId =
         normalizedExecutionPolicy?.returnAssigneeAgentId ?? null;
@@ -16780,6 +16787,11 @@ export function issueRoutes(
         actorRunId: actor.runId,
         actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
         trustExplicitResponsibleUserId: actor.actorType === "user",
+        // SUP-22098: the policy above was preserved as an explicit "no ladder"
+        // shape; `issues.create()` re-normalizes it, so it must opt into the
+        // same preserve or the empty policy collapses back to null and the
+        // project default is injected. Mirrors routine dispatch (SUP-17459).
+        trustExplicitExecutionPolicy: createBody.executionPolicy != null,
         watchdogActorRunId: actor.runId,
         onDeduplicated: (reason: "idempotency_key" | "recent_open_title") => {
           deduplicationReason = reason;
