@@ -1055,6 +1055,51 @@ describeEmbeddedPostgres("summary slot service", () => {
       expect(revisions.revisions[1]!.body).toContain("First summary for this scope.");
     });
 
+    it("rejects a write when the generation run changes while the write waits for the slot lock", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const otherAgentId = await seedPlainAgent(companyId);
+      const { svc, generationIssueId, runId } = await startGeneration(companyId, projectId, summarizerAgentId);
+      const otherRunId = await seedRun(companyId, otherAgentId, generationIssueId);
+      const [slot] = await db
+        .select()
+        .from(summarySlots)
+        .where(
+          and(
+            eq(summarySlots.companyId, companyId),
+            eq(summarySlots.scopeKind, "project"),
+            eq(summarySlots.scopeId, projectId),
+            eq(summarySlots.slotKey, "header"),
+          ),
+        );
+      let releaseSlotLock!: () => void;
+      const slotLockReleased = new Promise<void>((resolve) => {
+        releaseSlotLock = resolve;
+      });
+      const slotLockTransaction = db.transaction(async (tx) => {
+        await tx.select().from(summarySlots).where(eq(summarySlots.id, slot!.id)).for("update");
+        await slotLockReleased;
+      });
+
+      const writePromise = svc.write(
+        { ...projectSelector(companyId, projectId), markdown: "# Stale write", generationIssueId },
+        { agentId: summarizerAgentId, runId },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await db
+        .update(issues)
+        .set({ checkoutRunId: otherRunId })
+        .where(eq(issues.id, generationIssueId));
+      releaseSlotLock();
+      await slotLockTransaction;
+
+      await expect(writePromise).rejects.toMatchObject({
+        status: 403,
+        message: "Summary write must run from the linked generation task",
+      });
+    });
+
     it("serializes concurrent writes for the same slot into sequential revisions instead of leaking a revision unique-index violation", async () => {
       const companyId = await seedCompany();
       const projectId = await seedProject(companyId);

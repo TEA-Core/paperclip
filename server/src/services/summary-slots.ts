@@ -894,7 +894,21 @@ export function summarySlotService(db: Db) {
         throw conflict("Summary generation was superseded by a newer task");
       }
 
+      const currentGenerationIssue = await tx
+        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(and(eq(issues.id, input.generationIssueId!), eq(issues.companyId, sel.companyId)))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      const runStillMatches =
+        currentGenerationIssue?.checkoutRunId === actor.runId ||
+        currentGenerationIssue?.executionRunId === actor.runId;
+      if (!runStillMatches) {
+        throw forbidden("Summary write must run from the linked generation task");
+      }
+
       let documentRow: typeof documents.$inferSelect;
+
       let revisionRow: typeof documentRevisions.$inferSelect;
 
       const existingDocument = currentSlot?.documentId
