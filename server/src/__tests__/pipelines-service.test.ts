@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { desc, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -24,6 +24,7 @@ import {
   projectWorkspaces,
   projects,
   routineRuns,
+  routineRevisions,
   routines,
 } from "@paperclipai/db";
 import {
@@ -1478,6 +1479,63 @@ describeEmbeddedPostgres("pipelineService", () => {
       executionWorkspacePreference: "reuse_existing",
       executionWorkspaceSettings: { mode: "isolated_workspace" },
     });
+  });
+
+  it("carries routine deliveryRequirement through pipeline automation revision snapshots and restore", async () => {
+    const { company, pipeline, byKey } = await seedPipeline();
+    const routineSeed = await seedRoutine(company.id, "Automation seed");
+    const stageId = byKey.get("in_progress")!.id;
+
+    const firstSave = await svc.updateStage({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      stageId,
+      patch: {
+        config: {
+          automation: {
+            assigneeAgentId: routineSeed.assigneeAgentId,
+            instructionsBody: "Draft from {{body}}.",
+          },
+        },
+      },
+      actor: userActor,
+    });
+    const routineId = (firstSave.config as { onEnter?: { routineId?: string } }).onEnter?.routineId;
+    expect(routineId).toBeTruthy();
+
+    const routinesSvc = routineService(db, { heartbeat: noopHeartbeat });
+    const updated = await routinesSvc.update(routineId!, { deliveryRequirement: "record_only" }, {});
+    expect(updated?.deliveryRequirement).toBe("record_only");
+
+    await svc.updateStage({
+      companyId: company.id,
+      pipelineId: pipeline.id,
+      stageId,
+      patch: {
+        config: {
+          automation: {
+            assigneeAgentId: routineSeed.assigneeAgentId,
+            instructionsBody: "Updated instructions for {{case_title}}.",
+          },
+        },
+      },
+      actor: userActor,
+    });
+
+    const [pipelineRevision] = await db
+      .select()
+      .from(routineRevisions)
+      .where(eq(routineRevisions.routineId, routineId!))
+      .orderBy(desc(routineRevisions.revisionNumber));
+    expect(pipelineRevision).toBeTruthy();
+    const snapshot = pipelineRevision!.snapshot as {
+      routine?: { deliveryRequirement?: string | null };
+    };
+    expect(snapshot.routine?.deliveryRequirement).toBe("record_only");
+
+    await routinesSvc.update(routineId!, { title: "Later routine edit" }, {});
+    const restored = await routinesSvc.restoreRevision(routineId!, pipelineRevision!.id, {});
+    expect(restored.routine.deliveryRequirement).toBe("record_only");
   });
 
   it("defaults, preserves, and interpolates pipeline automation issue title templates", async () => {
