@@ -274,6 +274,25 @@ describeEmbeddedPostgres("delivery receipt migration", () => {
 
       // --- Happy path: one receipt + one dedicated link. ---
       const receiptId = await insertReceipt(sql, { companyId, sourceIssueId: issueId, idempotencyKey: "idem-1" });
+      const [validatedReceipt] = await sql<{ head_sha: string }[]>`
+        SELECT "head_sha" FROM ${sql(RECEIPTS)} WHERE "id" = ${receiptId}
+      `;
+      expect(validatedReceipt?.head_sha).toMatch(/^[0-9a-f]{40}$/);
+      for (const [length, headSha] of [
+        [39, "a".repeat(39)],
+        [41, "a".repeat(41)],
+        [64, "a".repeat(64)],
+      ] as const) {
+        await expect(
+          insertReceipt(sql, {
+            companyId,
+            sourceIssueId: issueId,
+            idempotencyKey: `invalid-head-${length}`,
+            headSha,
+          }),
+        ).rejects.toMatchObject({ code: "23514" });
+      }
+
       await sql`
         INSERT INTO ${sql(LINKS)} (
           "company_id", "receipt_id", "source_issue_id", "external_object_id",
@@ -339,6 +358,22 @@ describeEmbeddedPostgres("delivery receipt migration", () => {
           'github', 'acme', 'widgets', 579, ${values.headSha}
         )
       `;
+
+      for (const [length, headSha, receiptHeadSha] of [
+        [39, "a".repeat(39), "2".repeat(40)],
+        [41, "a".repeat(41), "3".repeat(40)],
+        [64, "a".repeat(64), "4".repeat(40)],
+      ] as const) {
+        const boundaryReceiptId = await insertReceipt(sql, {
+          companyId,
+          sourceIssueId: issueId,
+          idempotencyKey: `invalid-link-head-${length}`,
+          headSha: receiptHeadSha,
+        });
+        await expect(insertLinkRaw({ receiptId: boundaryReceiptId, externalObjectId: objectId, headSha })).rejects.toMatchObject({
+          code: "23514",
+        });
+      }
 
       // Missing receipt.
       await expect(
