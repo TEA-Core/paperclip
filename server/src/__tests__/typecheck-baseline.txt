@@ -1158,7 +1158,6 @@ server/src/__tests__/qa-routine-secrets-e2e.test.ts(316,7): TS2741
 server/src/__tests__/qa-routine-secrets-e2e.test.ts(375,7): TS2741
 server/src/__tests__/qa-routine-secrets-e2e.test.ts(431,7): TS2741
 server/src/__tests__/question-response-delivery.test.ts(1281,60): TS2345
-server/src/__tests__/recovery-blocked-without-blockers-sweep.test.ts(313,17): TS2769
 server/src/__tests__/recovery-no-live-path-strands.test.ts(1763,7): TS2769
 server/src/__tests__/recovery-no-live-path-strands.test.ts(962,7): TS2769
 server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(140,44): TS2322
@@ -1171,8 +1170,6 @@ server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(349,44): TS2322
 server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(393,44): TS2322
 server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(428,44): TS2322
 server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(471,44): TS2322
-server/src/__tests__/recovery-stale-recovery-action-wake-sweep.test.ts(212,12): TS18047
-server/src/__tests__/recovery-stillborn-assigned-backlog-sweep.test.ts(307,7): TS2769
 server/src/__tests__/recovery-stranded-action-sweep.test.ts(130,7): TS2769
 server/src/__tests__/recovery-stranded-action-sweep.test.ts(190,40): TS2493
 server/src/__tests__/recovery-stranded-action-sweep.test.ts(191,12): TS2532

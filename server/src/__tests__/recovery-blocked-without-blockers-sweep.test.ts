@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -310,7 +310,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     const wakeups = await db
       .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.contextSnapshot, issueId))
+      .where(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`)
       .then((rows) => rows.length);
     expect(wakeups).toBe(0);
   });
