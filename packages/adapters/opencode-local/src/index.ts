@@ -116,7 +116,8 @@ Notes:
   the Paperclip MCP tools are in the first request; remote targets and runs with \
   \`extraArgs\` or \`args\` keep: opencode run --standalone --format json ... \
   (see doc/DEVELOPING.md, OpenCode V2 Server Transport).
-- Sessions are resumed with --session when stored session cwd matches current cwd.
+- Sessions are resumed (--session on the one-shot run path, the stored session id \
+  over the serve API otherwise) when stored session cwd matches current cwd.
 - The adapter sets OPENCODE_DISABLE_PROJECT_CONFIG=true to prevent OpenCode from \
   writing an opencode.json config file into the project working directory. Model \
   selection is passed via the --model CLI flag instead.
