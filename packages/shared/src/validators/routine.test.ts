@@ -100,6 +100,16 @@ describe("routine validators", () => {
     expect(() => updateRoutineSchema.parse({ activityGateScope: "agent" })).toThrow();
   });
 
+  it("accepts and rejects routine delivery requirement values", () => {
+    expect(updateRoutineSchema.parse({ deliveryRequirement: "record_only" })).toMatchObject({
+      deliveryRequirement: "record_only",
+    });
+    expect(updateRoutineSchema.parse({ deliveryRequirement: null })).toMatchObject({
+      deliveryRequirement: null,
+    });
+    expect(() => updateRoutineSchema.parse({ deliveryRequirement: "inferred" })).toThrow();
+  });
+
   it("accepts date variables with valid YYYY-MM-DD defaults", () => {
     expect(routineVariableSchema.parse({
       name: "startDate",

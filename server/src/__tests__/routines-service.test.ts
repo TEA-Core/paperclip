@@ -2750,4 +2750,49 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     expect(run).toMatchObject({ source: "webhook", status: "issue_created" });
   });
+
+  it("carries a routine-level delivery requirement onto spawned execution issues", async () => {
+    const { companyId, agentId, projectId, routine, svc } = await seedFixture();
+
+    const recordOnlyRoutine = await svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "record-only digest",
+        description: "Report-only digest",
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "coalesce_if_active",
+        catchUpPolicy: "skip_missed",
+        variables: [],
+        deliveryRequirement: "record_only",
+      },
+      {},
+    );
+    expect(recordOnlyRoutine.deliveryRequirement).toBe("record_only");
+
+    const updated = await svc.update(routine.id, { deliveryRequirement: "record_only" }, {});
+    expect(updated?.deliveryRequirement).toBe("record_only");
+    const cleared = await svc.update(routine.id, { deliveryRequirement: null }, {});
+    expect(cleared?.deliveryRequirement).toBeNull();
+
+    const recordOnlyRun = await svc.runRoutine(recordOnlyRoutine.id, { source: "manual" });
+    const recordOnlyIssue = await db
+      .select({ deliveryRequirement: issues.deliveryRequirement })
+      .from(issues)
+      .where(eq(issues.id, recordOnlyRun.linkedIssueId!))
+      .then((rows) => rows[0] ?? null);
+    expect(recordOnlyIssue?.deliveryRequirement).toBe("record_only");
+
+    const defaultRun = await svc.runRoutine(routine.id, { source: "manual" });
+    const defaultIssue = await db
+      .select({ deliveryRequirement: issues.deliveryRequirement })
+      .from(issues)
+      .where(eq(issues.id, defaultRun.linkedIssueId!))
+      .then((rows) => rows[0] ?? null);
+    expect(defaultIssue?.deliveryRequirement).toBe("repository_delivery");
+  });
 });
