@@ -308,9 +308,9 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(row?.status).toBe("blocked");
 
     const wakeups = await db
-      .select({ id: heartbeatRuns.id })
-      .from(heartbeatRuns)
-      .where(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`)
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`)
       .then((rows) => rows.length);
     expect(wakeups).toBe(0);
   });
