@@ -1338,10 +1338,11 @@ injected MCP server, settles 1000 ms, and fails the run (exit 1, no session
 created) if the event has not arrived within 15 s. The failure message lists
 each injected server's status as `GET /api/mcp` reports it (for example
 `needs_auth` or `failed`); that is a diagnostic and does not change the gate.
-**The gate is timer-based by necessity**: OpenCode 2.2.4 exposes no endpoint or event that says a new session
-will see an MCP server's tools, and the event precedes tool availability by a
-short unmarked interval (lab: prompting right after the event carried the tools
-in 0 of 5 runs; +100, +250 and +500 ms carried them in 5 of 5). On a loaded host
+**The gate is timer-based by necessity**: OpenCode 2.2.4 exposes no endpoint or
+event that says a new session will see an MCP server's tools, and the event
+precedes tool availability by a short unmarked interval (lab: prompting right
+after the event carried the tools in 0 of 5 runs; +100, +250 and +500 ms carried
+them in 5 of 5). On a loaded host
 the settle can be too short and the run starts without its Paperclip tools; the
 host rehearsal must measure that failure rate under load. The event fires with
 `OPENCODE_DISABLE_MODELS_FETCH=true` as well, so that variable does not affect
