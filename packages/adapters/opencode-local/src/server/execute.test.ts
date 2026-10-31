@@ -746,7 +746,9 @@ describe("execute — OpenCode V2 output cap", () => {
         runId: "run-v2-cap",
         agent: { id: "agent-v2-cap", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
         runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
-        config: { command: commandPath, cliVersion: "2.2.4", cwd: root, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+        // Caller args select the one-shot `run` path, which this test stubs; the
+        // `opencode serve` path is covered by serve-transport.test.ts and the real-binary suite.
+        config: { command: commandPath, cliVersion: "2.2.4", cwd: root, model: "openai/gpt-5", extraArgs: ["--print-logs"], env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
         context: {},
         onLog: async () => {},
       });
@@ -929,7 +931,7 @@ describe("execute — OpenCode V2 native MCP", () => {
         runId: "run-v2-mcp",
         agent: { id: "agent-v2-mcp", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
         runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
-        config: { command: commandPath, cwd: workspace, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+        config: { command: commandPath, cwd: workspace, model: "openai/gpt-5", extraArgs: ["--print-logs"], env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
         context: {},
         runtimeMcp: { getServers },
         onLog: async (_stream, chunk) => { logs.push(chunk); },

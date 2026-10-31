@@ -32,8 +32,9 @@ import { parseOpenCodeCliVersion } from "./version.js";
 // the `opencode` bin name collides with V1), provisioned by
 // `../../scripts/provision-opencode-v2-binary.mjs` at the version
 // `OPENCODE_V2_CLI_VERSION` pins. Every home, XDG dir and the database is
-// private to the run, and every launch is `--standalone`, so the shared managed
-// OpenCode service is never touched.
+// private to the run, and the adapter drives a private loopback `opencode serve`
+// (per-run port and password) for local V2 runs, so the shared managed OpenCode
+// service is never touched.
 //
 // Reproduce it from a clean checkout with one command — `pnpm
 // test:opencode-v2-acceptance`, which is what the `OpenCode V2 acceptance`
@@ -85,6 +86,9 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
   let binary: string;
   let cliVersion: string;
   let savedAllowAllModels: string | undefined;
+  // Every request that carried tools, i.e. a main-agent request (title requests carry none).
+  const mainRequests: Array<{ tools: string[]; messageCount: number }> = [];
+  let mcpServer: Server;
 
   function privateEnv(name: string): Record<string, string> {
     const home = path.join(rootDir, name);
@@ -146,6 +150,17 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
       let body = "";
       for await (const chunk of req) body += chunk;
       const lowered = body.toLowerCase();
+      try {
+        const parsed = JSON.parse(body) as { tools?: Array<{ function?: { name?: string } }>; messages?: unknown[] };
+        if ((parsed.tools ?? []).length > 0) {
+          mainRequests.push({
+            tools: (parsed.tools ?? []).map((tool) => tool.function?.name ?? ""),
+            messageCount: (parsed.messages ?? []).length,
+          });
+        }
+      } catch {
+        // not a JSON chat request
+      }
       if (lowered.includes(CANCEL_MARKER)) {
         await new Promise((resolve) => setTimeout(resolve, 5_000));
       }
@@ -164,6 +179,37 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("Acceptance fixture did not expose a TCP port.");
+
+    // A Streamable HTTP MCP server that lists one tool, the shape of the
+    // Paperclip project-tools route.
+    mcpServer = createServer(async (req, res) => {
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      if (req.method !== "POST") {
+        res.statusCode = 404;
+        res.end();
+        return;
+      }
+      const message = JSON.parse(raw) as { id?: unknown; method?: string };
+      if (message.method === "notifications/initialized") {
+        res.statusCode = 202;
+        res.end();
+        return;
+      }
+      const reply = (result: unknown) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null, result }));
+      };
+      if (message.method === "initialize") {
+        reply({ protocolVersion: "2025-03-26", capabilities: { tools: { listChanged: false } }, serverInfo: { name: "fixture", version: "1" } });
+      } else if (message.method === "tools/list") {
+        reply({ tools: [{ name: "echo", description: "Echo a value.", inputSchema: { type: "object", properties: {} } }] });
+      } else {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null, error: { code: -32601, message: "Method not found" } }));
+      }
+    });
+    await new Promise<void>((resolve) => mcpServer.listen(0, "127.0.0.1", resolve));
 
     // The provider lives in the user's opencode.json, not in a Paperclip-only
     // env var, so plain `opencode models` sees it too.
@@ -199,6 +245,7 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     if (savedAllowAllModels === undefined) delete process.env.OPENCODE_ALLOW_ALL_MODELS;
     else process.env.OPENCODE_ALLOW_ALL_MODELS = savedAllowAllModels;
     await new Promise<void>((resolve) => server?.close(() => resolve()));
+    await new Promise<void>((resolve) => mcpServer?.close(() => resolve()));
     await rm(rootDir, { recursive: true, force: true });
   });
 
@@ -317,7 +364,12 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     }));
     expect(second.exitCode).toBe(0);
     expect(second.errorMessage).toBeNull();
-    expect(commandArgs[0]).toEqual(expect.arrayContaining(["--standalone", "--session", first.sessionId as string]));
+    expect(commandArgs[0]).toEqual(expect.arrayContaining(["serve", `<resume session ${first.sessionId as string}>`]));
+    // Same session, and the model saw the first run's turn: the second main
+    // request carries strictly more messages than the first.
+    expect(second.sessionId).toBe(first.sessionId);
+    expect(mainRequests.length).toBeGreaterThanOrEqual(2);
+    expect(mainRequests.at(-1)!.messageCount).toBeGreaterThan(mainRequests[0]!.messageCount);
   }, 90_000);
 
   // SUP-19141: the session guards read the database this very binary wrote, not
@@ -556,6 +608,27 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     const stdout = String(result.resultJson?.stdout ?? "");
     expect(stdout).toContain("output-limit");
     expect(stdout).toContain('"type":"error"');
+  }, 90_000);
+
+  it("puts an injected MCP server's tool in the first main-agent request", async () => {
+    mainRequests.length = 0;
+    const address = mcpServer.address();
+    if (!address || typeof address === "string") throw new Error("MCP fixture did not expose a TCP port.");
+    const result = await execute(context({
+      runId: "acceptance-mcp",
+      runtimeMcp: {
+        getServers: () => [{
+          name: "paperclip-fixture",
+          url: `http://127.0.0.1:${address.port}/mcp`,
+          token: "acceptance-mcp-bearer",
+          connectionId: "acceptance-connection",
+        }],
+      },
+    }));
+    expect(result.exitCode).toBe(0);
+    expect(mainRequests.length).toBeGreaterThan(0);
+    expect(mainRequests[0]!.tools.some((name) => /paperclip-fixture_echo$/i.test(name))).toBe(true);
+    expect(JSON.stringify(result)).not.toContain("acceptance-mcp-bearer");
   }, 90_000);
 
   it("rejects an invalid model before launching the real binary", async () => {

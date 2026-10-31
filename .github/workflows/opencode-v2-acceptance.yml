@@ -22,6 +22,7 @@ on:
   pull_request:
     paths:
       - "packages/adapters/opencode-local/**"
+      - "server/src/__tests__/opencode-v2-paperclip-mcp.acceptance.test.ts"
       - ".github/workflows/opencode-v2-acceptance.yml"
       - "package.json"
   schedule:
