@@ -19,6 +19,13 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import {
+  DONE_TIER_STRUCTURED_FORMS,
+  DONE_TIER_TIER1_DELEGATED_JSON,
+  DONE_TIER_TIER1_LANDED_JSON,
+  DONE_TIER_TIER2_JSON,
+  TIER1_FORM,
+} from "../services/done-transition-guard.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
@@ -408,6 +415,25 @@ describeEmbeddedPostgres("issue created without parent audit row (SUP-15668)", (
     expect(remedy).toContain("non-terminal");
     expect(remedy).toContain("PATCH /api/issues/{id}");
     expect(remedy).not.toContain("in this same request body");
+    // SUP-21328 AC1/AC3: the create door must advertise the SAME accepted literals
+    // the PATCH door does — the structured doneTier shapes plus both whole Tier 1
+    // prose forms — so the SUP-15787 remedy/parser agreement cannot drift on the
+    // door nobody was asserting. SUP-21474 is the precedent: an interpolated
+    // literal was cut on one door and only the other door's test would notice.
+    expect(remedy).toContain('"doneTier":');
+    expect(remedy).toContain(DONE_TIER_STRUCTURED_FORMS);
+    expect(remedy).toContain(DONE_TIER_TIER2_JSON);
+    expect(remedy).toContain(DONE_TIER_TIER1_LANDED_JSON);
+    expect(remedy).toContain(DONE_TIER_TIER1_DELEGATED_JSON);
+    expect(remedy).toContain('"Closed at Tier 2 (live): <probe evidence>"');
+    expect(remedy).toContain(TIER1_FORM);
+    expect(remedy).toContain(
+      '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."',
+    );
+    expect(remedy).toContain(
+      '"Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; landing obligation transferred to done-close-landing-backstop, not yet discharged; <why Tier 2 was not probed>. Liveness unverified."',
+    );
+    expect(remedy).not.toContain("Liveness unverified. — per");
   });
 
   it("still returns 201 and persists the issue when the audit insert fails for an agent top-level create", async () => {
