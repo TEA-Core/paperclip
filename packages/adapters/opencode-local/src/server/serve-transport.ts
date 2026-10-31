@@ -39,6 +39,8 @@ export const OPENCODE_SERVE_MCP_READY_TIMEOUT_MS = 15_000;
 /** Settle after the event; 0 ms failed 5/5 in the lab, 100+ ms passed 5/5. */
 export const OPENCODE_SERVE_MCP_SETTLE_MS = 1_000;
 const SERVE_START_TIMEOUT_MS = 30_000;
+/** Longest wait for the MCP status read that explains a failed readiness gate. */
+const MCP_STATUS_READ_TIMEOUT_MS = 1_000;
 const SERVER_USERNAME = "opencode";
 // The text `opencode run` gives the model when it auto-rejects a permission request.
 const PERMISSION_REJECT_MESSAGE =
@@ -232,6 +234,31 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     return { status: response.status, text: await response.text() };
   };
 
+  // `GET /api/mcp` only starts MCP on the first call; the servers' own states
+  // appear in it a moment later. Read it once a gate has failed, to say why.
+  const describeMcpStatus = async () => {
+    const readTimer = timeout(MCP_STATUS_READ_TIMEOUT_MS);
+    let entries: unknown[] = [];
+    try {
+      const reply = await Promise.race([request("/api/mcp"), readTimer.promise]);
+      const data = reply === "timeout" ? null : parseObject(safeJson(reply.text)).data;
+      if (Array.isArray(data)) entries = data;
+    } catch {
+      // A diagnostic only: the gate has already failed without it.
+    } finally {
+      readTimer.cancel();
+    }
+    const statusByName = new Map(entries.map((entry) => [asString(parseObject(entry).name, ""), parseObject(parseObject(entry).status)]));
+    return input.mcpServers
+      .map((server) => {
+        const status = statusByName.get(server.name);
+        if (!status) return `${server.name}: not reported`;
+        const error = asString(status.error, "").slice(0, 200);
+        return `${server.name}: ${asString(status.status, "unknown")}${error ? ` (${error})` : ""}`;
+      })
+      .join("; ");
+  };
+
   // `opencode run` auto-rejects a permission request because it cannot ask
   // anyone; a server waits for a reply forever, so the transport gives the same
   // answer. Allowing is the job of the configured allow-list, never of this.
@@ -257,17 +284,20 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
   const handleEvent = async (envelope: unknown) => {
     const event = parseObject(envelope);
     const data = parseObject(event.data);
-    if (asString(event.type, "") === "mcp.resources.changed") {
+    const type = asString(event.type, "");
+    if (type === "mcp.resources.changed") {
       const name = asString(data.server, "");
       if (name) seenResourceServers.add(name);
       for (const wake of readyWaiters.splice(0)) wake();
       return;
     }
-    if (!boundSessionId || asString(data.sessionID, "") !== boundSessionId) return;
-    if (asString(event.type, "") === "permission.asked") {
+    // The server is private to this run, so a child or subagent session's
+    // request is the run's too and would hold the turn open just the same.
+    if (type === "permission.asked") {
       void rejectPermission(data);
       return;
     }
+    if (!boundSessionId || asString(data.sessionID, "") !== boundSessionId) return;
     const mapped = mapOpenCodeServeEvent(envelope, eventState);
     for (const line of mapped.lines) await emit("stdout", `${redact(line)}\n`);
     if (mapped.outcome === "failed") {
@@ -367,7 +397,8 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
         if (remaining <= 0) {
           throw new ServeTransportError(
             `OpenCode did not report mcp.resources.changed for MCP server(s) ${missing().join(", ")} within ` +
-              `${readyTimeoutMs / 1000}s; the run was not started because it would have begun without its Paperclip tools.`,
+              `${readyTimeoutMs / 1000}s (reported status: ${await describeMcpStatus()}); ` +
+              `the run was not started because it would have begun without its Paperclip tools.`,
           );
         }
         const wake = deferred<void>();

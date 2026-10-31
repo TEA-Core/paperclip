@@ -40,7 +40,7 @@ const server = http.createServer(async (req, res) => {
     if (mcpName && process.env.FAKE_NO_MCP_EVENT !== "1") {
       setTimeout(() => push("mcp.resources.changed", { server: mcpName }), 100);
     }
-    return json(200, { location: { directory: process.cwd() }, data: [] });
+    return json(200, { location: { directory: process.cwd() }, data: JSON.parse(process.env.FAKE_MCP_STATUS ?? "[]") });
   }
   if (req.url === "/api/session" && req.method === "POST") return json(200, { data: { id: "ses_fake" } });
   const sessionMatch = /^\/api\/session\/([^/]+)(\/.*)?$/.exec(req.url);
@@ -57,6 +57,7 @@ const server = http.createServer(async (req, res) => {
       const base = { sessionID: id, assistantMessageID: "msg_a" };
       setTimeout(() => {
         push("permission.replied", { sessionID: id, requestID: permissionReply[1], reply: "reject" });
+        if (id !== "ses_fake") return;
         push("session.tool.failed", { ...base, id: "call_1", error: { type: "permission.rejected", message: JSON.parse(body).message } });
         push("session.step.ended", { ...base, finish: "stop", tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0 });
         push("session.execution.succeeded", { sessionID: id });

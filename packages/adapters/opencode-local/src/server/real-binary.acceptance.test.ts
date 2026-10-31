@@ -644,6 +644,37 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     expect(JSON.stringify(result)).not.toContain("acceptance-mcp-bearer");
   }, 90_000);
 
+  it("fails the readiness gate with the MCP server's reported status when it cannot connect", async () => {
+    const denied = createServer((_req, res) => {
+      res.statusCode = 401;
+      res.end("denied");
+    });
+    await new Promise<void>((resolve) => denied.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = denied.address();
+      if (!address || typeof address === "string") throw new Error("Denied MCP fixture did not expose a TCP port.");
+      mainRequests.length = 0;
+      const result = await execute(context({
+        runId: "acceptance-mcp-denied",
+        runtimeMcp: {
+          getServers: () => [{
+            name: "paperclip-denied",
+            url: `http://127.0.0.1:${address.port}/mcp`,
+            token: "acceptance-denied-bearer",
+            connectionId: "acceptance-denied-connection",
+          }],
+        },
+      }));
+      expect(result.exitCode).toBe(1);
+      expect(result.errorMessage).toContain("did not report mcp.resources.changed for MCP server(s) paperclip-denied");
+      expect(result.errorMessage).toContain("paperclip-denied: needs_auth");
+      expect(mainRequests).toHaveLength(0);
+      expect(JSON.stringify(result)).not.toContain("acceptance-denied-bearer");
+    } finally {
+      await new Promise<void>((resolve) => denied.close(() => resolve()));
+    }
+  }, 60_000);
+
   it("auto-rejects a permission request like `opencode run` instead of waiting for a reply", async () => {
     const askEnv = privateEnv("permission-ask");
     await writeOpenCodeConfig(askEnv, { ...fixtureConfig, permissions: [{ action: "shell", resource: "*", effect: "ask" }] });

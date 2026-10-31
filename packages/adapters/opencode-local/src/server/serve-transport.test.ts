@@ -101,6 +101,22 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
     await expectServerStopped();
   });
 
+  it("names each MCP server's reported status when the gate times out", async () => {
+    const status = JSON.stringify([{ name: "Paperclip projects", status: { status: "needs_auth", error: "requires a login" }, integrationID: "mcp_1" }]);
+    const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_NO_MCP_EVENT: "1", FAKE_MCP_STATUS: status }), mcpReadyTimeoutMs: 600 }));
+
+    expect(result.exitCode).toBe(1);
+    const message = parseOpenCodeJsonl(result.stdout).errorMessage;
+    expect(message).toContain("within 0.6s (reported status: Paperclip projects: needs_auth (requires a login));");
+    expect(result.stderr).toContain("Paperclip projects: needs_auth (requires a login)");
+  });
+
+  it("says a server is not reported when the status read lists nothing for it", async () => {
+    const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_NO_MCP_EVENT: "1" }), mcpReadyTimeoutMs: 600 }));
+
+    expect(parseOpenCodeJsonl(result.stdout).errorMessage).toContain("(reported status: Paperclip projects: not reported);");
+  });
+
   it("bounds the MCP touch request by the same readiness deadline", async () => {
     const startedAt = Date.now();
     const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_HANG_MCP: "1" }), mcpReadyTimeoutMs: 500 }));
@@ -193,10 +209,8 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toContain("! permission requested: shell (echo hi); auto-rejecting\n");
-    expect(result.stderr).not.toContain("rm -rf");
-    const replies = (await requests()).filter((entry) => entry.path.includes("/permission/"));
-    expect(replies.map((entry) => entry.path)).toEqual(["/api/session/ses_fake/permission/per_1/reply"]);
-    expect(JSON.parse(replies[0]!.body)).toEqual({ decision: "reject", message: REJECT_MESSAGE });
+    const reply = (await requests()).find((entry) => entry.path === "/api/session/ses_fake/permission/per_1/reply")!;
+    expect(JSON.parse(reply.body)).toEqual({ decision: "reject", message: REJECT_MESSAGE });
     const toolUse = result.stdout
       .split("\n")
       .filter(Boolean)
@@ -205,6 +219,19 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
     expect(toolUse?.part?.tool).toBe("shell");
     expect(toolUse?.part?.state).toMatchObject({ status: "error", error: REJECT_MESSAGE });
     await expectServerStopped();
+  });
+
+  it("rejects a child session's permission request too, to the child's own session id", async () => {
+    const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_PERMISSION: "1" }), timeoutSec: 0 }));
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain("! permission requested: shell (rm -rf /); auto-rejecting\n");
+    const replies = (await requests()).filter((entry) => entry.path.includes("/permission/"));
+    expect(replies.map((entry) => entry.path).sort()).toEqual([
+      "/api/session/ses_fake/permission/per_1/reply",
+      "/api/session/ses_other/permission/per_other/reply",
+    ]);
+    for (const reply of replies) expect(JSON.parse(reply.body)).toEqual({ decision: "reject", message: REJECT_MESSAGE });
   });
 
   it("fails the run instead of hanging when a permission reply is refused", async () => {

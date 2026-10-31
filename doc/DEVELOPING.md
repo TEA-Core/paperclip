@@ -1320,15 +1320,18 @@ creates (or resumes) the session and sends the prompt. The server is always
 stopped at the end of the attempt; the password and MCP bearer tokens are
 redacted from run logs and results. The server's events are mapped onto the
 `run --format json` line shape, so result parsing is unchanged. A permission
-request for the run's session is rejected the way a headless `opencode run`
-rejects it (stderr line `! permission requested: ...; auto-rejecting`, the tool
-call fails and the model continues), so a run never waits on a reply; allowing
-actions stays the job of the `dangerouslySkipPermissions` allow-list.
+request from any session of that private server (child and subagent sessions
+included) is rejected the way a headless `opencode run` rejects it (stderr line
+`! permission requested: ...; auto-rejecting`, the tool call fails and the model
+continues), so a run never waits on a reply; allowing actions stays the job of
+the `dangerouslySkipPermissions` allow-list.
 
 The gate waits for `mcp.resources.changed` on `GET /api/event` from every
 injected MCP server, settles 1000 ms, and fails the run (exit 1, no session
-created) if the event has not arrived within 15 s. **The gate is timer-based by
-necessity**: OpenCode 2.2.4 exposes no endpoint or event that says a new session
+created) if the event has not arrived within 15 s. The failure message lists
+each injected server's status as `GET /api/mcp` reports it (for example
+`needs_auth` or `failed`); that is a diagnostic and does not change the gate.
+**The gate is timer-based by necessity**: OpenCode 2.2.4 exposes no endpoint or event that says a new session
 will see an MCP server's tools, and the event precedes tool availability by a
 short unmarked interval (lab: prompting right after the event carried the tools
 in 0 of 5 runs; +100, +250 and +500 ms carried them in 5 of 5). On a loaded host
