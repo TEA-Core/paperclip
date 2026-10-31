@@ -40,7 +40,7 @@ const LEGACY_SEED_COMPLETE_BASENAME = "seed-complete";
 type SeedManifestSummary = {
   state: WorkspaceSeedReadinessState;
   phase: string | null;
-  mode: "minimal" | "full" | null;
+  mode: "minimal" | "minimal-no-secrets" | "full" | null;
   failurePhase: string | null;
 };
 
@@ -73,7 +73,11 @@ function readSeedManifestSummary(markerDir: string): SeedManifestSummary {
         ? rawState
         : "unknown";
     const phase = typeof manifest.phase === "string" ? manifest.phase : null;
-    const mode = manifest.seedMode === "minimal" || manifest.seedMode === "full" ? manifest.seedMode : null;
+    const mode = manifest.seedMode === "minimal"
+      || manifest.seedMode === "minimal-no-secrets"
+      || manifest.seedMode === "full"
+      ? manifest.seedMode
+      : null;
     return {
       state,
       phase,
