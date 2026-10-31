@@ -2524,9 +2524,14 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
   });
 
   writeConfig(targetConfig, paths.configPath);
+  // This marker is the authoritative handoff for a deferred `ensure-seeded`
+  // run: it must carry the resolved seed mode and target instance rather than
+  // re-deriving defaults, or a minimal-no-secrets selection silently downgrades.
   markWorktreeSeedPending({
     configPath: paths.configPath,
     sourceConfigPath,
+    targetInstanceId: instanceId,
+    seedMode,
   });
   const sourceEnvEntries = readPaperclipEnvEntries(resolvePaperclipEnvFile(sourceConfigPath));
   const existingAgentJwtSecret =
