@@ -1,8 +1,10 @@
-import { execFile } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { AdapterExecutionContext, AdapterEnvironmentTestContext } from "@paperclipai/adapter-utils";
@@ -16,16 +18,48 @@ import { testEnvironment } from "./test.js";
 import { OPENCODE_V2_CLI_VERSION } from "../index.js";
 import { parseOpenCodeCliVersion } from "./version.js";
 
-// Drives a real OpenCode V2 binary (`@opencode/cli`, called by its absolute
-// `cli-<platform>/bin/opencode` path because the package's own `opencode` bin
-// name collides with V1) against a local OpenAI-compatible fixture. Every home,
-// XDG dir and the database is private to the run, and every launch is
-// `--standalone`, so the shared managed OpenCode service is never touched.
+// Drives a real OpenCode V2 binary against a local OpenAI-compatible fixture.
+// The binary is the platform package's own executable
+// (`@opencode/cli-<platform>/bin/opencode`, referenced by absolute path because
+// the `opencode` bin name collides with V1), provisioned by
+// `../../scripts/provision-opencode-v2-binary.mjs` at the version
+// `OPENCODE_V2_CLI_VERSION` pins. Every home, XDG dir and the database is
+// private to the run, and every launch is `--standalone`, so the shared managed
+// OpenCode service is never touched.
 //
-//   PAPERCLIP_OPENCODE_V2_ACCEPTANCE=1 PAPERCLIP_OPENCODE_V2_BINARY=<abs path> \
-//     vitest run src/server/real-binary.acceptance.test.ts
+// Reproduce it from a clean checkout with one command — `pnpm
+// test:opencode-v2-acceptance`, which is what the `OpenCode V2 acceptance`
+// workflow runs. `PAPERCLIP_OPENCODE_V2_BINARY` overrides the provisioned
+// binary; the default `pnpm test` run skips this file because it must neither
+// fetch a ~250 MB binary nor launch real processes.
+//
+// Opting in without a usable binary fails the suite instead of skipping it, so
+// an unenforced run cannot look like a passing one.
 const enabled = process.env.PAPERCLIP_OPENCODE_V2_ACCEPTANCE === "1";
-const binary = process.env.PAPERCLIP_OPENCODE_V2_BINARY?.trim() ?? "";
+const suppliedBinary = process.env.PAPERCLIP_OPENCODE_V2_BINARY?.trim() ?? "";
+// Provisioning fetches and unpacks the pinned release; the default 5s hook
+// budget is far too small for a cold cache.
+const PROVISION_BUDGET_MS = 11 * 60_000;
+
+function provisionBinary(): string {
+  const script = fileURLToPath(
+    new URL("../../scripts/provision-opencode-v2-binary.mjs", import.meta.url),
+  );
+  const result = spawnSync(process.execPath, [script], {
+    encoding: "utf8",
+    timeout: PROVISION_BUDGET_MS,
+  });
+  const detail = `${result.stderr ?? ""}${result.stdout ?? ""}`.trim();
+  if (result.error) throw new Error(`OpenCode V2 provisioning crashed: ${result.error.message}`);
+  if (result.status !== 0) {
+    throw new Error(`OpenCode V2 acceptance binary could not be provisioned: ${detail}`);
+  }
+  const parsed = JSON.parse(detail.split("\n").at(-1) ?? "{}") as { binary?: unknown };
+  if (typeof parsed.binary !== "string" || !existsSync(parsed.binary)) {
+    throw new Error(`OpenCode V2 provisioning did not return a readable binary: ${detail}`);
+  }
+  return parsed.binary;
+}
 const model = "paperclip-fixture/acceptance-model";
 // Prompt markers the fixture reacts to; they travel through `promptTemplate`.
 const CANCEL_MARKER = "paperclip-acceptance-cancel";
@@ -33,12 +67,13 @@ const FORCE_LENGTH_MARKER = "paperclip-acceptance-force-length";
 
 const execFileAsync = promisify(execFile);
 
-const suite = describe.skipIf(!enabled || !binary)("OpenCode V2 real-binary acceptance", () => {
+const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", () => {
   let rootDir: string;
   let workspace: string;
   let server: Server;
   let baseEnv: Record<string, string>;
   let emptyCatalogEnv: Record<string, string>;
+  let binary: string;
   let cliVersion: string;
   let savedAllowAllModels: string | undefined;
 
@@ -71,6 +106,12 @@ const suite = describe.skipIf(!enabled || !binary)("OpenCode V2 real-binary acce
   }
 
   beforeAll(async () => {
+    binary = suppliedBinary;
+    if (binary && !existsSync(binary)) {
+      throw new Error(`PAPERCLIP_OPENCODE_V2_BINARY points at "${binary}", which is not readable.`);
+    }
+    if (!binary) binary = provisionBinary();
+
     // The adapter falls back to process.env when the run env omits the flag.
     savedAllowAllModels = process.env.OPENCODE_ALLOW_ALL_MODELS;
     delete process.env.OPENCODE_ALLOW_ALL_MODELS;
@@ -133,7 +174,7 @@ const suite = describe.skipIf(!enabled || !binary)("OpenCode V2 real-binary acce
     // exit-0, empty `opencode models` catalog.
     emptyCatalogEnv = privateEnv("empty-catalog");
     await writeOpenCodeConfig(emptyCatalogEnv, { enabled_providers: ["paperclip-no-such-provider"] });
-  });
+  }, PROVISION_BUDGET_MS);
 
   afterAll(async () => {
     if (savedAllowAllModels === undefined) delete process.env.OPENCODE_ALLOW_ALL_MODELS;
