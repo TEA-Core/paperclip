@@ -778,6 +778,23 @@ describe("execute — OpenCode V2 output cap", () => {
 // rehearsal (SUP-19145). This pins that behavior so it cannot become accidental.
 describe("execute — OpenCode V2 session state unavailable", () => {
   const sessionId = "ses_v2unavailable";
+  const hostDatabaseEnv = ["OPENCODE_DB", "PAPERCLIP_OPENCODE_SHARED_DB"] as const;
+  const inheritedDatabaseEnv: Partial<Record<(typeof hostDatabaseEnv)[number], string>> = {};
+
+  beforeEach(() => {
+    for (const name of hostDatabaseEnv) {
+      inheritedDatabaseEnv[name] = process.env[name];
+      delete process.env[name];
+    }
+  });
+
+  afterEach(() => {
+    for (const name of hostDatabaseEnv) {
+      const inherited = inheritedDatabaseEnv[name];
+      if (inherited === undefined) delete process.env[name];
+      else process.env[name] = inherited;
+    }
+  });
 
   async function resumeWithDatabase(
     prepareDatabase?: (databasePath: string) => Promise<void>,
