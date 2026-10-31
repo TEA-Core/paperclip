@@ -408,6 +408,42 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     });
   }, 90_000);
 
+  it("keeps size and existence but returns no final message when the newest assistant row is oversized", async () => {
+    const { sessionId } = await runSession("acceptance-final-bound");
+    const dbPath = guardDatabasePath();
+    const before = await readOpenCodeV2SessionState(dbPath, sessionId);
+    if (!before.ok) throw new Error(`probe failed against the real database: ${before.error}`);
+    expect(before.state.finalMessage).toBe("fixture response");
+
+    const db = await openDatabase(false);
+    let addedBytes: number;
+    try {
+      const row = db
+        .prepare(
+          "SELECT id, data FROM session_message WHERE session_id = ? AND type = 'assistant' " +
+            "AND json_extract(data, '$.time.completed') IS NOT NULL ORDER BY seq DESC LIMIT 1",
+        )
+        .get(sessionId);
+      if (!row) throw new Error("The real session has no completed assistant row to enlarge.");
+      const original = String(row.data);
+      const enlarged = JSON.stringify({
+        ...JSON.parse(original),
+        content: [{ type: "text", text: "x".repeat(2 * 1024 * 1024) }],
+      });
+      db.prepare("UPDATE session_message SET data = ? WHERE id = ?").run(enlarged, row.id);
+      addedBytes = Buffer.byteLength(enlarged) - Buffer.byteLength(original);
+    } finally {
+      db.close();
+    }
+
+    const after = await readOpenCodeV2SessionState(dbPath, sessionId);
+    if (!after.ok) throw new Error(`probe failed against the enlarged database: ${after.error}`);
+    expect(after.state.exists).toBe(true);
+    expect(after.state.messageCount).toBe(before.state.messageCount);
+    expect(after.state.transcriptBytes).toBe(before.state.transcriptBytes + addedBytes);
+    expect(after.state.finalMessage).toBeNull();
+  }, 90_000);
+
   it("reports an unreadable or non-V2 database as an error instead of a measurement", async () => {
     const missing = await readOpenCodeV2SessionState(path.join(rootDir, "no-such.db"), "ses_x");
     expect(missing.ok).toBe(false);

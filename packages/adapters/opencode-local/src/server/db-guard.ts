@@ -313,10 +313,11 @@ export async function readOpenCodeV2SessionState(
         .prepare(
           "SELECT CASE WHEN LENGTH(CAST(data AS BLOB)) <= ? THEN data END AS data " +
             "FROM session_message WHERE session_id = ? AND type = 'assistant' " +
-            "AND CASE WHEN json_valid(data) THEN json_extract(data, '$.time.completed') END IS NOT NULL " +
+            "AND CASE WHEN LENGTH(CAST(data AS BLOB)) > ? THEN 1 " +
+            "WHEN json_valid(data) THEN json_extract(data, '$.time.completed') IS NOT NULL ELSE 0 END " +
             "ORDER BY seq DESC LIMIT 1",
         )
-        .get(FINAL_MESSAGE_MAX_BYTES, sessionId);
+        .get(FINAL_MESSAGE_MAX_BYTES, sessionId, FINAL_MESSAGE_MAX_BYTES);
       let finalMessage: string | null = null;
       if (typeof completed?.data === "string") {
         const parsed = JSON.parse(completed.data) as {
