@@ -249,7 +249,7 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
     const stored = await db.select().from(issues).where(eq(issues.id, res.body.id));
     const storedPolicy = stored[0]?.executionPolicy as { stages?: unknown[] } | null;
     expect(storedPolicy).toMatchObject({ mode: "normal" });
-    expect(storedPolicy?.stages ?? []).toHaveLength(0);
+    expect(storedPolicy?.stages).toEqual([]);
   });
 
   it("still injects the project default executionPolicy when the create omits one", async () => {
