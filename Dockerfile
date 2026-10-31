@@ -269,8 +269,8 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   # package postinstall. --allow-scripts pins that permission explicitly (npm
   # warns on every uncovered lifecycle script) so a future npm that starts
   # enforcing allowScripts cannot silently swap in the stub that errors.
-  && npm install --global --omit=dev --allow-scripts=opencode-ai @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai@1.18.33 @google/gemini-cli@latest supabase@latest @moonshot-ai/kimi-code@latest \
-  && test "$(/usr/local/bin/opencode --version)" = "1.18.33" \
+  && npm install --global --omit=dev --allow-scripts=opencode-ai @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai@1.19.5 @google/gemini-cli@latest supabase@latest @moonshot-ai/kimi-code@latest \
+  && test "$(/usr/local/bin/opencode --version)" = "1.19.5" \
   && test "$(command -v opencode)" = "/usr/local/bin/opencode" \
   # npm links global bins as symlinks into lib/node_modules, so readlink -f
   # lands on the package's bin/opencode.exe, never on /usr/local/bin/opencode
@@ -308,12 +308,12 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
 # version. Executable by the agent principal (other-execute); not writable.
 #
 # OPENCODE_V2_SHA256 is the linux/x64 postinstall output verified on the host
-# for @opencode/cli@2.0.26 (ELF reports `opencode v2.0.26`). arm64 and musl
+# for @opencode/cli@2.2.4 (ELF reports `opencode v2.2.4`). arm64 and musl
 # builds hash their own postinstall output into the same file. The expected
 # value is asserted only when the build target is linux/amd64.
-ARG OPENCODE_V2_VERSION=2.0.26
-ARG OPENCODE_V2_PACKAGE=@opencode/cli@2.0.26
-ARG OPENCODE_V2_SHA256=d9123b9bcdb0a31f7ab9fe9812b58a9dc1768ad6d97e7b276dff1181813218c9
+ARG OPENCODE_V2_VERSION=2.2.4
+ARG OPENCODE_V2_PACKAGE=@opencode/cli@2.2.4
+ARG OPENCODE_V2_SHA256=25facd7099c19018e83dce858f3ab922cd2d49ad29b144bc36968418ca6eb5aa
 RUN npm install --global --omit=dev --allow-scripts=@opencode/cli --prefix /opt/opencode-v2 "${OPENCODE_V2_PACKAGE}" \
   && test "$(/opt/opencode-v2/bin/opencode --version)" = "opencode v${OPENCODE_V2_VERSION}" \
   && test "$(/opt/opencode-v2/bin/opencode2 --version)" = "opencode v${OPENCODE_V2_VERSION}" \
@@ -326,7 +326,7 @@ RUN npm install --global --omit=dev --allow-scripts=@opencode/cli --prefix /opt/
   && chown -R root:root /opt/opencode-v2 \
   && chmod -R a-w /opt/opencode-v2 \
   && chmod -R a+rX /opt/opencode-v2 \
-  && test "$(/usr/local/bin/opencode --version)" = "1.18.33" \
+  && test "$(/usr/local/bin/opencode --version)" = "1.19.5" \
   && test ! -e /usr/local/bin/opencode2
 
 # CodeGraph CLI — agent code-exploration index (doctrine/exploration.md: CodeGraph FIRST)
@@ -483,7 +483,7 @@ RUN if getent passwd "${AGENT_UID}" >/dev/null \
    # build time /paperclip is owned by node, so probe with HOME=/tmp. Runtime
    # mounts /paperclip writable for the agent principal.
    && test "$(gosu node-agent env HOME=/tmp /opt/opencode-v2/bin/opencode --version)" = "opencode v${OPENCODE_V2_VERSION}" \
-   && test "$(gosu node /usr/local/bin/opencode --version)" = "1.18.33"
+   && test "$(gosu node /usr/local/bin/opencode --version)" = "1.19.5"
 
 COPY --from=build /app /app
 # SUP-12903: root-own the entire runtime tree so uid-1000 agent runs cannot

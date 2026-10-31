@@ -14,20 +14,20 @@ const instructions = dockerfile
 const productionStage = instructions.slice(instructions.indexOf("FROM base AS production"));
 
 test("PATH OpenCode stays the pinned V1 package and is version-checked", () => {
-  assert.match(productionStage, /opencode-ai@1\.18\.33/);
+  assert.match(productionStage, /opencode-ai@1\.19\.5/);
   assert.doesNotMatch(
     productionStage,
-    /npm install --global[^\n]*\sopencode-ai(?!@1\.18\.33)\b/,
+    /npm install --global[^\n]*\sopencode-ai(?!@1\.19\.5)\b/,
   );
   // npm 11 ships a stub bin/opencode.exe; the real binary only exists after
   // the postinstall runs, so the install must carry an explicit allow-scripts.
   assert.match(
     productionStage,
-    /npm install --global[^\n]*--allow-scripts=opencode-ai[^\n]*opencode-ai@1\.18\.33/,
+    /npm install --global[^\n]*--allow-scripts=opencode-ai[^\n]*opencode-ai@1\.19\.5/,
   );
   assert.match(
     productionStage,
-    /test "\$\(\/usr\/local\/bin\/opencode --version\)" = "1\.18\.33"/,
+    /test "\$\(\/usr\/local\/bin\/opencode --version\)" = "1\.19\.5"/,
   );
   // npm links global bins as symlinks into lib/node_modules, so the resolution
   // check must accept that layout instead of demanding a real file at
@@ -44,8 +44,8 @@ test("PATH OpenCode stays the pinned V1 package and is version-checked", () => {
 });
 
 test("OpenCode V2 is installed off PATH at a pinned version and digest", () => {
-  assert.match(productionStage, /OPENCODE_V2_VERSION=2\.0\.26/);
-  assert.match(productionStage, /OPENCODE_V2_PACKAGE=@opencode\/cli@2\.0\.26/);
+  assert.match(productionStage, /OPENCODE_V2_VERSION=2\.2\.4/);
+  assert.match(productionStage, /OPENCODE_V2_PACKAGE=@opencode\/cli@2\.2\.4/);
   assert.match(
     productionStage,
     /npm install --global --omit=dev --allow-scripts=@opencode\/cli --prefix \/opt\/opencode-v2/,
@@ -60,7 +60,7 @@ test("OpenCode V2 is installed off PATH at a pinned version and digest", () => {
   );
   assert.match(
     productionStage,
-    /OPENCODE_V2_SHA256=d9123b9bcdb0a31f7ab9fe9812b58a9dc1768ad6d97e7b276dff1181813218c9/,
+    /OPENCODE_V2_SHA256=25facd7099c19018e83dce858f3ab922cd2d49ad29b144bc36968418ca6eb5aa/,
   );
   assert.match(
     productionStage,
@@ -132,7 +132,7 @@ test("CI launches the baseline V1 agent with the V1 router plugin on every PR", 
   assert.match(probe, /V1_BIN="\$\{V1_BIN:-\/usr\/local\/bin\/opencode\}"/);
   assert.match(probe, /V1_LAUNCH_GOSU="\$\{V1_LAUNCH_GOSU-gosu node-agent\}"/);
   assert.match(probe, /test "\$\(command -v opencode\)" = \/usr\/local\/bin\/opencode/);
-  assert.match(probe, /test "\$V1_VERSION" = "1\.18\.33"/);
+  assert.match(probe, /test "\$V1_VERSION" = "1\.19\.5"/);
   assert.match(probe, /--model router\/coder/);
   assert.doesNotMatch(probe, /opencode-v2/);
 });
