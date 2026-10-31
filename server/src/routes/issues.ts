@@ -18930,8 +18930,10 @@ export function issueRoutes(
     // request-time read and the locked write, so a non-null value here forces
     // the update onto the transactional path and is re-asserted against the
     // locked row inside that transaction (see the re-check before `updateIssue`).
+    const executionPolicyWriteRequested = req.body.executionPolicy !== undefined;
     let invariantPolicyToRecheck: ReturnType<typeof resolvePatchExecutionPolicy> = null;
-    if (req.body.executionPolicy !== undefined) {
+    let executionPolicyNeedsLockedRevalidation = false;
+    if (executionPolicyWriteRequested) {
       // SUP-13634: a PATCH must not strip the close ladder. An explicitly
       // empty stages array, or an explicit null over a non-null stored
       // policy, is rejected before any write or reviewer/approver detach
@@ -18958,21 +18960,13 @@ export function issueRoutes(
         raw: req.body.executionPolicy,
         currentPolicy: previousExecutionPolicy,
         stagesKeyAbsent,
+        storedStagesExplicitlyEmpty: storedExecutionPolicyStagesExplicitEmpty,
         executionState: parsedExecutionState,
         rearmPointer: rearmExecutionPolicyRequested,
       });
-      // Mirror of the assert's gating above: only the paths that actually
-      // enforce INV-LADDER-1 pre-transaction are re-checked under the lock.
-      // A §4 re-arm rewrites the pointer and a preserved-stages omission
-      // cannot insert anything, so neither needs the locked re-check.
-      if (
-        !rearmExecutionPolicyRequested &&
-        !stagesKeyAbsent &&
-        parsedExecutionState?.currentStageId &&
-        normalizedExecutionPolicy !== null &&
-        normalizedExecutionPolicy.stages.length > 0
-      ) {
+      if (!rearmExecutionPolicyRequested && !stagesKeyAbsent && normalizedExecutionPolicy !== null) {
         invariantPolicyToRecheck = normalizedExecutionPolicy;
+        executionPolicyNeedsLockedRevalidation = true;
       }
       // requestedAssigneeAgentId is the assignee AFTER this PATCH, so a PATCH that
       // moves the assignee off the collision in the same body is accepted.
@@ -20065,6 +20059,7 @@ export function issueRoutes(
       || deliveryIdentityWorkspaceBranchWrite
       || parentEdgeWriteRequested
       || invariantPolicyToRecheck !== null
+      || executionPolicyNeedsLockedRevalidation
       || (
         missingApprovalStageGap !== null
         && requestedTransitionStatus === "done"
@@ -20255,13 +20250,51 @@ export function issueRoutes(
           // invariant is re-run against the locked row. A stale validation must
           // not admit a stage inserted behind a pointer that has since
           // advanced. Throwing 422 aborts the transaction with no partial write.
-          if (invariantPolicyToRecheck !== null) {
+          if (executionPolicyNeedsLockedRevalidation) {
             const lockedForInvariant = await svc.getByIdForUpdate(id, tx);
             if (!lockedForInvariant) return null;
-            assertNoStageInsertedBehindPointer({
-              policy: invariantPolicyToRecheck,
-              executionState: parseIssueExecutionState(lockedForInvariant.executionState),
+            if (!isDeepStrictEqual(lockedForInvariant.executionPolicy ?? null, storedExecutionPolicyRaw)) {
+              throw conflict("Execution policy changed before this PATCH acquired the update lock; retry the policy update", {
+                code: "execution_policy_stale",
+              });
+            }
+            const lockedStoredPolicyRaw = lockedForInvariant.executionPolicy ?? null;
+            const lockedStoredStagesExplicitlyEmpty =
+              lockedStoredPolicyRaw !== null &&
+              Array.isArray(lockedStoredPolicyRaw.stages) &&
+              lockedStoredPolicyRaw.stages.length === 0;
+            const lockedPreviousPolicy = normalizeIssueExecutionPolicy(lockedStoredPolicyRaw, {
+              preserveEmptyPolicy: lockedStoredStagesExplicitlyEmpty,
             });
+            const lockedStagesKeyAbsent =
+              req.body.executionPolicy !== null &&
+              typeof req.body.executionPolicy === "object" &&
+              !Array.isArray(req.body.executionPolicy) &&
+              !("stages" in (req.body.executionPolicy as Record<string, unknown>));
+            const lockedResolvedPolicy = resolvePatchExecutionPolicy({
+              raw: req.body.executionPolicy,
+              currentPolicy: lockedPreviousPolicy,
+              stagesKeyAbsent: lockedStagesKeyAbsent,
+              storedStagesExplicitlyEmpty: lockedStoredStagesExplicitlyEmpty,
+              executionState: parseIssueExecutionState(lockedForInvariant.executionState),
+              rearmPointer: rearmExecutionPolicyRequested,
+            });
+            assertPatchableExecutionPolicyWrite({
+              raw: req.body.executionPolicy,
+              currentPolicy: lockedPreviousPolicy,
+              stagesExplicitlyEmpty: Boolean(
+                (req as unknown as Record<string, unknown>).executionPolicyStagesExplicitlyEmpty,
+              ),
+              stagesKeyAbsent: lockedStagesKeyAbsent,
+              executionState: parseIssueExecutionState(lockedForInvariant.executionState),
+              rearmPointer: rearmExecutionPolicyRequested,
+            });
+            if (lockedResolvedPolicy !== null) {
+              assertNoStageInsertedBehindPointer({
+                policy: lockedResolvedPolicy,
+                executionState: parseIssueExecutionState(lockedForInvariant.executionState),
+              });
+            }
           }
 
           if (deliveryIdentityWorkspaceBranchWrite && existing.executionWorkspaceId) {

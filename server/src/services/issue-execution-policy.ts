@@ -713,6 +713,7 @@ export function resolvePatchExecutionPolicy(input: {
   raw: unknown;
   currentPolicy: IssueExecutionPolicy | null;
   stagesKeyAbsent: boolean;
+  storedStagesExplicitlyEmpty?: boolean;
   /** SUP-16525: the issue's stored execution state. When present with a
    *  non-null currentStageId, INV-LADDER-1 rejects stage inserts behind the
    *  live pointer (including a shifted/mismatched duplicated pointer). */
@@ -722,7 +723,14 @@ export function resolvePatchExecutionPolicy(input: {
    *  rewrite, so the preservation invariant must not refuse it. */
   rearmPointer?: boolean;
 }): IssueExecutionPolicy | null {
-  const { raw, currentPolicy, stagesKeyAbsent, executionState, rearmPointer } = input;
+  const {
+    raw,
+    currentPolicy,
+    stagesKeyAbsent,
+    storedStagesExplicitlyEmpty = false,
+    executionState,
+    rearmPointer,
+  } = input;
   if (raw === null) return null;
   if (typeof raw !== "object" || Array.isArray(raw)) return null;
 
@@ -732,16 +740,11 @@ export function resolvePatchExecutionPolicy(input: {
     stagesKeyAbsent && storedStages !== null
       ? { ...(raw as Record<string, unknown>), stages: storedStages }
       : raw;
-  // SUP-22135: a stored policy that is already explicitly stage-less is the
-  // SUP-22098 shape — "no ladder, on purpose". A policy-bearing PATCH that the
-  // SUP-13925 guard admitted over it (a faithful `stages: []` round-trip, or a
-  // partial write whose defaulted `stages` are empty) must resolve back to
-  // that stage-less shape; without the preserve the normalizer collapses the
-  // bare-empty body to null and the write silently destroys the stored policy.
-  // Gated on the STORED shape only: `currentPolicy === null` keeps today's
-  // semantics (an explicit empty over no stored policy stays the guard's to
-  // refuse), and a stored ladder rides the SUP-15377 carry-forward above.
-  const preserveStoredEmptyPolicy = currentPolicy !== null && currentPolicy.stages.length === 0;
+  // SUP-22135: preserve only a policy whose raw stored representation explicitly
+  // carried `stages: []`; legacy monitor-only rows without that key normalize to
+  // null and retain their historical default-inheritance behavior.
+  const preserveStoredEmptyPolicy =
+    storedStagesExplicitlyEmpty && currentPolicy !== null && currentPolicy.stages.length === 0;
   const resolved = normalizeIssueExecutionPolicy(
     effectiveRaw,
     preserveStoredEmptyPolicy ? { preserveEmptyPolicy: true } : undefined,

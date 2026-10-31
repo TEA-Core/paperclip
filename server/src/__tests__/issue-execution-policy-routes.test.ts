@@ -1884,6 +1884,7 @@ describe("issue execution policy routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
+      expect.anything(),
     );
     const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
     expect(updatePatch.status).toBeUndefined();
@@ -2387,6 +2388,47 @@ describe("issue execution policy routes", () => {
         expect(((call as unknown[])[1] as { action?: string }).action).not.toBe("issue.reviewers_updated");
         expect(((call as unknown[])[1] as { action?: string }).action).not.toBe("issue.approvers_updated");
       }
+    });
+
+    it("rejects a policy PATCH when the locked row has changed since the request snapshot", async () => {
+      const issueId = randomUUID();
+      const issue = ladderIssue(issueId);
+      const replacement = normalizeIssueExecutionPolicy({
+        stages: [
+          {
+            type: "review",
+            participants: [{ type: "agent", agentId: "55555555-5555-4555-8555-555555555555" }],
+          },
+          {
+            type: "approval",
+            participants: [{ type: "user", userId: "cto-user" }],
+          },
+        ],
+      })!;
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.getByIdForUpdate.mockResolvedValue({
+        ...issue,
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [
+            {
+              type: "review",
+              participants: [{ type: "agent", agentId: "66666666-6666-4666-8666-666666666666" }],
+            },
+            {
+              type: "approval",
+              participants: [{ type: "user", userId: "cto-user" }],
+            },
+          ],
+        }),
+      });
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionPolicy: replacement });
+
+      expect(res.status).toBe(409);
+      expect(res.body.details).toMatchObject({ code: "execution_policy_stale" });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
     it("still allows a full replacement policy so repaired ladders can be re-PATCHed", async () => {
