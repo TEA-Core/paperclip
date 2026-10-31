@@ -1709,6 +1709,38 @@ describe("worktree helpers", () => {
     }
   });
 
+  it("preserves the minimal-no-secrets seed mode and target instance in the deferred seed marker", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-deferred-marker-"));
+    const repoRoot = path.join(tempRoot, "repo");
+    const originalCwd = process.cwd();
+
+    try {
+      fs.mkdirSync(repoRoot, { recursive: true });
+      process.chdir(repoRoot);
+
+      await worktreeInitCommand({
+        seed: false,
+        seedMode: "minimal-no-secrets",
+        instance: "sup-22160-deferred-marker",
+        fromConfig: path.join(tempRoot, "missing", "config.json"),
+        home: path.join(tempRoot, ".paperclip-worktrees"),
+      });
+
+      const manifest = readWorktreeSeedManifest(path.join(repoRoot, ".paperclip", "config.json"));
+      expect(manifest).not.toBeNull();
+      expect(manifest?.state).toBe("pending");
+      // The deferred marker is the authoritative handoff to a later
+      // `ensure-seeded` run: it must keep the explicitly selected no-secrets
+      // mode and target identity instead of re-deriving defaults, or deferred
+      // seeding would fall back to minimal and copy production secret tables.
+      expect(manifest?.seedMode).toBe("minimal-no-secrets");
+      expect(manifest?.targetInstanceId).toBe("sup-22160-deferred-marker");
+    } finally {
+      process.chdir(originalCwd);
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it("preserves repo-managed worktree checkouts when --force re-runs from the source repo", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-force-preserve-"));
     const repoRoot = path.join(tempRoot, "repo");
