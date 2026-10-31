@@ -61,6 +61,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # The server acceptance suite imports plugin-loader, which resolves
+      # @paperclipai/plugin-sdk from dist/; `pnpm install` does not produce it.
+      - name: Build @paperclipai/plugin-sdk (TypeScript only)
+        run: pnpm --filter @paperclipai/plugin-sdk build
+
       - name: Cache provisioned OpenCode binary
         uses: actions/cache@v6
         with:

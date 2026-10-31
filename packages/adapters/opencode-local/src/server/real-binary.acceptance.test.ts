@@ -539,13 +539,13 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     // No cwd in the saved params: a V1 session would be refused as unknown_cwd,
     // but V2 proves the directory from session_v2.
     const resumed = await runSession("acceptance-dbcwd-resume", { sessionId });
-    expect(resumed.args).toEqual(expect.arrayContaining(["--session", sessionId]));
+    expect(resumed.args).toContain(`<resume session ${sessionId}>`);
 
     const missing = await runSession("acceptance-missing", {
       sessionId: "ses_not_in_this_database",
       sessionParams: { sessionId: "ses_not_in_this_database", cwd: workspace },
     });
-    expect(missing.args).not.toContain("--session");
+    expect(missing.args).not.toContain("<resume session ses_not_in_this_database>");
     expect(missing.log).toContain("is absent from its database");
   }, 120_000);
 
@@ -555,12 +555,12 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
       sessionId,
       env: { PAPERCLIP_OPENCODE_SESSION_MAX_BYTES: "1" },
     });
-    expect(capped.args).not.toContain("--session");
+    expect(capped.args).not.toContain(`<resume session ${sessionId}>`);
     expect(capped.log).toContain("resume cap");
     expect(capped.sessionId).not.toBe(sessionId);
 
     const uncapped = await runSession("acceptance-cap-off", { sessionId });
-    expect(uncapped.args).toEqual(expect.arrayContaining(["--session", sessionId]));
+    expect(uncapped.args).toContain(`<resume session ${sessionId}>`);
   }, 120_000);
 
   it("attributes growth to the run's own session and spares it for a sibling's growth", async () => {

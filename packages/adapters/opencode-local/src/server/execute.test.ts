@@ -780,7 +780,9 @@ describe("execute — OpenCode V2 output cap", () => {
 // design for now; fail-closed versus a V1-table fallback is decided at the E8
 // rehearsal (SUP-19145). This pins that behavior so it cannot become accidental.
 describe("execute — OpenCode V2 session state unavailable", () => {
-  const sessionId = "ses_v2unavailable";
+  // The serve fake reports this id as an existing session, so a resume reaches the prompt.
+  const sessionId = "ses_known";
+  const fakeServer = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "fake-opencode-serve.mjs");
   const hostDatabaseEnv = ["OPENCODE_DB", "PAPERCLIP_OPENCODE_SHARED_DB"] as const;
   const inheritedDatabaseEnv: Partial<Record<(typeof hostDatabaseEnv)[number], string>> = {};
 
@@ -810,14 +812,16 @@ describe("execute — OpenCode V2 session state unavailable", () => {
     const commandPath = path.join(root, "opencode");
     await fs.mkdir(workspace, { recursive: true });
     await fs.mkdir(path.dirname(databasePath), { recursive: true });
-    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '2.2.4\\n'; fi\n", "utf8");
+    await fs.writeFile(
+      commandPath,
+      `#!/bin/sh\nif [ "$1" = "--version" ]; then printf '2.2.4\\n'; exit 0; fi\nexec "${process.execPath}" "${fakeServer}" "$@"\n`,
+      "utf8",
+    );
     await fs.chmod(commandPath, 0o755);
     await prepareDatabase?.(databasePath);
     runAdapterExecutionTargetProcessMock.mockReset();
-    runAdapterExecutionTargetProcessMock.mockImplementation(async () =>
-      probeResult({ stdout: JSON.stringify({ type: "text", sessionID: sessionId, part: { text: "done" } }) }),
-    );
     const logs: Array<{ stream: string; chunk: string }> = [];
+    const commandArgs: string[][] = [];
     try {
       const result = await execute({
         runId: "run-v2-unavailable",
@@ -834,14 +838,15 @@ describe("execute — OpenCode V2 session state unavailable", () => {
             // A 1-byte cap would decline any measurable session, so a resume proves the cap was skipped.
             PAPERCLIP_OPENCODE_SESSION_MAX_BYTES: "1",
             PAPERCLIP_OPENCODE_DB_GROWTH_LIMIT_MB: "0",
+            FAKE_LOG: path.join(root, "requests.jsonl"),
             ...extraEnv,
           },
         },
         context: {},
         onLog: async (stream, chunk) => { logs.push({ stream, chunk }); },
+        onMeta: async (meta) => { commandArgs.push((meta.commandArgs ?? []).filter((arg): arg is string => typeof arg === "string")); },
       });
-      const runCall = runAdapterExecutionTargetProcessMock.mock.calls.find((call) => call[3]?.[0] === "run");
-      return { result, logs, runArgs: runCall?.[3] as string[] | undefined };
+      return { result, logs, runArgs: commandArgs[0] };
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -859,7 +864,7 @@ describe("execute — OpenCode V2 session state unavailable", () => {
     expect(warnings[0].stream).toBe("stderr");
     expect(warnings[0].chunk).toContain("unable to open database file");
     expect(warnings[0].chunk).toContain("WITHOUT the resume size cap and WITHOUT the session-existence check");
-    expect(runArgs).toEqual(expect.arrayContaining(["--session", sessionId]));
+    expect(runArgs).toContain(`<resume session ${sessionId}>`);
   });
 
   it("warns with the cause and resumes without the cap when the database has no V2 session tables", async () => {
@@ -876,7 +881,7 @@ describe("execute — OpenCode V2 session state unavailable", () => {
     expect(warnings[0].stream).toBe("stderr");
     expect(warnings[0].chunk).toContain("no such table: session_v2");
     expect(warnings[0].chunk).toContain("WITHOUT the resume size cap and WITHOUT the session-existence check");
-    expect(runArgs).toEqual(expect.arrayContaining(["--session", sessionId]));
+    expect(runArgs).toContain(`<resume session ${sessionId}>`);
   });
 
   it("warns once that an explicit OPENCODE_DB leaves the V2 session unguarded, and still resumes", async () => {
@@ -891,7 +896,7 @@ describe("execute — OpenCode V2 session state unavailable", () => {
     expect(warnings[0].chunk).toContain("WITHOUT the resume size cap");
     expect(warnings[0].chunk).toContain("WITHOUT the growth guard");
     expect(logs.some((entry) => entry.chunk.includes("session state unavailable"))).toBe(false);
-    expect(runArgs).toEqual(expect.arrayContaining(["--session", sessionId]));
+    expect(runArgs).toContain(`<resume session ${sessionId}>`);
   });
 });
 
