@@ -1105,6 +1105,182 @@ describeEmbeddedPostgres("externalObjectService", () => {
     }
   });
 
+  it("recovers a capped terminal not_found GitHub pull request on a slow cadence instead of disarming it forever (SUP-22042)", async () => {
+    const { companyId, issueId } = await createIssue();
+    const fetch = vi.fn(async () => notFoundPullRequestResponse());
+    // `tokenProvider: null` is the runtime spelling of "anonymous" (the
+    // provider's hasOwnProperty check treats null and undefined differently);
+    // the declared option type omits null, so assert to keep the runtime value.
+    const svc = externalObjectService(db, { github: { fetch, tokenProvider: null as unknown as undefined } });
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    // Burn the whole SUP-16283 fast budget: the SUP-20766 shape — a real,
+    // delivered PR whose 404 window outlasted 5 × 300s of re-resolves.
+    await svc.refreshObject(object.id, { companyId, force: true });
+    let clock = Date.now();
+    for (let i = 0; i < 12; i++) {
+      clock += 400_000;
+      if ((await svc.refreshDueObjects(companyId, 50, new Date(clock))).length === 0) break;
+    }
+    const capped = await db.select().from(externalObjects).then((rows) => rows[0]!);
+    expect(capped.statusKey).toBe("not_found");
+    expect(capped.isTerminal).toBe(true);
+    expect(capped.data.notFoundRetries).toBe(5);
+
+    // Inside the recovery interval the sweep leaves the capped row alone.
+    clock += 60 * 60 * 1000;
+    expect(await svc.refreshDueObjects(companyId, 50, new Date(clock))).toEqual([]);
+
+    // Past the interval the row is selected again: still 404, so it re-probes
+    // exactly once and re-arms the slow cadence (no probe storm).
+    clock += 6 * 60 * 60 * 1000;
+    const probed = await svc.refreshDueObjects(companyId, 50, new Date(clock));
+    expect(probed).toHaveLength(1);
+    expect(fetch).toHaveBeenCalledTimes(6);
+    const stillCapped = await db.select().from(externalObjects).then((rows) => rows[0]!);
+    expect(stillCapped.isTerminal).toBe(true);
+    expect(stillCapped.data.notFoundRetries).toBe(6);
+    expect(stillCapped.nextRefreshAt!.getTime()).toBeGreaterThan(clock);
+    expect(stillCapped.nextRefreshAt!.getTime() - clock).toBeGreaterThanOrEqual(5 * 60 * 60 * 1000);
+    expect(stillCapped.nextRefreshAt!.getTime() - clock).toBeLessThanOrEqual(7 * 60 * 60 * 1000);
+
+    // The PR reappears: the next probe hydrates the row and restores the
+    // delivery identity merge-arming consumes.
+    fetch.mockImplementation(async () => openPullRequestResponse());
+    clock = stillCapped.nextRefreshAt!.getTime() + 1_000;
+    const refreshed = await svc.refreshDueObjects(companyId, 50, new Date(clock));
+    expect(refreshed).toHaveLength(1);
+    expect(refreshed[0]!.refreshed).toBe(true);
+    expect(refreshed[0]!.object.isTerminal).toBe(false);
+    expect(refreshed[0]!.object.liveness).toBe("fresh");
+
+    const hydrated = await db.select().from(externalObjects).then((rows) => rows[0]!);
+    expect(hydrated.statusKey).toBe("open");
+    expect(hydrated.isTerminal).toBe(false);
+    expect(hydrated.data.headRef).toBe("SUP-16041-delivery");
+    expect(hydrated.data.headSha).toBe("abc123def456");
+    expect(hydrated.data.notFoundRetries).toBeUndefined();
+
+    // The restored head is readable by the delivery-identity surface again.
+    const linked = await resolveLinkedPullRequests(db, companyId, issueId);
+    expect(linked).toHaveLength(1);
+    expect(linked[0]!.headRefName).toBe("SUP-16041-delivery");
+    expect(linked[0]!.cachedState).toBe("open");
+  });
+
+  it("keeps genuine terminal states and capped non-PR not_found rows out of the recovery path (SUP-22042)", async () => {
+    const { companyId, issueId } = await createIssue();
+    const fetch = vi.fn(async () => notFoundPullRequestResponse());
+    const svc = externalObjectService(db, { github: { fetch, tokenProvider: null as unknown as undefined } });
+    await svc.syncIssue(issueId);
+    const base = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    // The freshly synced base row is non-terminal and due; park it outside this
+    // test's sweep window so only the seeded rows below can be selected.
+    await db
+      .update(externalObjects)
+      .set({ nextRefreshAt: new Date(Date.now() + 100 * 24 * 60 * 60 * 1000) })
+      .where(eq(externalObjects.id, base.id));
+
+    const due = new Date(0);
+    await db.insert(externalObjects).values([
+      // Merged PR: genuinely final.
+      {
+        ...base,
+        id: randomUUID(),
+        externalId: "acme/app#pull/51",
+        sanitizedCanonicalUrl: "https://github.com/acme/app/pull/51",
+        canonicalIdentityHash: "hash51",
+        statusKey: "merged",
+        statusLabel: "Merged",
+        statusCategory: "succeeded",
+        statusTone: "success",
+        isTerminal: true,
+        data: { provider: "github", state: "closed", merged: true },
+        nextRefreshAt: due,
+      },
+      // Closed PR: genuinely final.
+      {
+        ...base,
+        id: randomUUID(),
+        externalId: "acme/app#pull/52",
+        sanitizedCanonicalUrl: "https://github.com/acme/app/pull/52",
+        canonicalIdentityHash: "hash52",
+        statusKey: "closed",
+        statusLabel: "Closed",
+        statusCategory: "closed",
+        statusTone: "muted",
+        isTerminal: true,
+        data: { provider: "github", state: "closed" },
+        nextRefreshAt: due,
+      },
+      // Capped not_found GitHub ISSUE: no delivery identity, keeps the
+      // SUP-16283 cap.
+      {
+        ...base,
+        id: randomUUID(),
+        externalId: "acme/app#issues/53",
+        objectType: "issue",
+        sanitizedCanonicalUrl: "https://github.com/acme/app/issues/53",
+        canonicalIdentityHash: "hash53",
+        statusKey: "not_found",
+        isTerminal: true,
+        data: { provider: "github", notFound: true, notFoundRetries: 9 },
+        nextRefreshAt: due,
+      },
+    ]);
+
+    const refreshed = await svc.refreshDueObjects(companyId, 50, new Date(Date.now() + 1_000));
+
+    expect(refreshed).toEqual([]);
+    expect(fetch).not.toHaveBeenCalled();
+    const rows = await db.select().from(externalObjects);
+    expect(rows.find((row) => row.externalId === "acme/app#pull/51")?.isTerminal).toBe(true);
+    expect(rows.find((row) => row.externalId === "acme/app#issues/53")?.data.notFoundRetries).toBe(9);
+  });
+
+  it("keeps the restored head identity readable across every headRefFromData-tolerated shape (SUP-22042)", async () => {
+    const { companyId, issueId } = await createIssue();
+    const fetch = vi.fn(async () => notFoundPullRequestResponse());
+    const svc = externalObjectService(db, { github: { fetch, tokenProvider: null as unknown as undefined } });
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+    await svc.refreshObject(object.id, { companyId, force: true });
+
+    fetch.mockImplementation(async () => openPullRequestResponse());
+    await svc.refreshDueObjects(companyId, 50, new Date(Date.now() + 400_000));
+    const hydrated = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    // Canonical flat shape the provider restores on recovery.
+    expect(hydrated.data.headRef).toBe("SUP-16041-delivery");
+    expect((await resolveLinkedPullRequests(db, companyId, issueId))[0]!.headRefName).toBe("SUP-16041-delivery");
+
+    // Legacy nested `data.head.ref` rows stay readable to delivery arming.
+    await db
+      .update(externalObjects)
+      .set({
+        data: {
+          provider: "github",
+          state: "open",
+          draft: false,
+          head: { ref: "SUP-16041-delivery", sha: "abc123def456" },
+          base: { ref: "main" },
+        },
+      })
+      .where(eq(externalObjects.id, object.id));
+    expect((await resolveLinkedPullRequests(db, companyId, issueId))[0]!.headRefName).toBe("SUP-16041-delivery");
+
+    // Legacy flat `data.headRefName` rows stay readable too.
+    await db
+      .update(externalObjects)
+      .set({
+        data: { provider: "github", state: "open", draft: false, headRefName: "SUP-16041-delivery" },
+      })
+      .where(eq(externalObjects.id, object.id));
+    expect((await resolveLinkedPullRequests(db, companyId, issueId))[0]!.headRefName).toBe("SUP-16041-delivery");
+  });
+
   it("refreshes due objects in nextRefreshAt order so the backlog is not starved", async () => {
     const { companyId, issueId } = await createIssue();
     const resolve = vi.fn(async () => ({
@@ -1408,7 +1584,7 @@ describeEmbeddedPostgres("externalObjectService", () => {
 
     const updated = await db.select().from(externalObjects).then((rows) => rows[0]!);
     const expectedBackoff = 30 * 24 * 60 * 60 * 1000;
-    expect(updated.nextRefreshAt.getTime() - Date.now()).toBeGreaterThanOrEqual(expectedBackoff * 0.9);
+    expect(updated.nextRefreshAt!.getTime() - Date.now()).toBeGreaterThanOrEqual(expectedBackoff * 0.9);
   });
 
   it("does not re-sweep a no_resolver object on the next due pass", async () => {
