@@ -726,6 +726,26 @@ function applyCreateIssueStatusDefault(
   next();
 }
 
+function captureCreateIssueExecutionPolicyIntent(
+  req: Request,
+  res: Response,
+  next: () => void,
+) {
+  const body = req.body;
+  const policy =
+    body && typeof body === "object" && !Array.isArray(body)
+      ? (body as Record<string, unknown>).executionPolicy
+      : undefined;
+  res.locals.createIssueExecutionPolicyStagesExplicit =
+    policy !== null &&
+    typeof policy === "object" &&
+    !Array.isArray(policy) &&
+    Object.prototype.hasOwnProperty.call(policy, "stages") &&
+    Array.isArray((policy as Record<string, unknown>).stages) &&
+    ((policy as Record<string, unknown>).stages as unknown[]).length === 0;
+  next();
+}
+
 function noopTaskWatchdogService(): TaskWatchdogService {
   return {
     getActiveForIssue: async () => null,
@@ -16396,6 +16416,7 @@ export function issueRoutes(
   router.post(
     "/companies/:companyId/issues",
     applyCreateIssueStatusDefault,
+    captureCreateIssueExecutionPolicyIntent,
     validateIssueMutationBody(createIssueSchema),
     async (req, res) => {
       const companyId = req.params.companyId as string;
@@ -16666,7 +16687,10 @@ export function issueRoutes(
       // is a no-op for null input), so default inheritance is unchanged.
       const normalizedExecutionPolicy = normalizeIssueExecutionPolicy(
         createBody.executionPolicy,
-        { preserveEmptyPolicy: true },
+        {
+          preserveEmptyPolicy:
+            res.locals.createIssueExecutionPolicyStagesExplicit === true,
+        },
       );
       const createReturnAssigneeAgentId =
         normalizedExecutionPolicy?.returnAssigneeAgentId ?? null;
@@ -16787,11 +16811,8 @@ export function issueRoutes(
         actorRunId: actor.runId,
         actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
         trustExplicitResponsibleUserId: actor.actorType === "user",
-        // SUP-22098: the policy above was preserved as an explicit "no ladder"
-        // shape; `issues.create()` re-normalizes it, so it must opt into the
-        // same preserve or the empty policy collapses back to null and the
-        // project default is injected. Mirrors routine dispatch (SUP-17459).
-        trustExplicitExecutionPolicy: createBody.executionPolicy != null,
+        trustExplicitExecutionPolicy:
+          res.locals.createIssueExecutionPolicyStagesExplicit === true,
         watchdogActorRunId: actor.runId,
         onDeduplicated: (reason: "idempotency_key" | "recent_open_title") => {
           deduplicationReason = reason;

@@ -279,6 +279,30 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
     expect(storedPolicy?.stages?.[0]?.participants?.[0]?.agentId).toBe(reviewerAgentId);
   });
 
+  it("inherits the project default when executionPolicy omits stages", async () => {
+    const { companyId, closerAgentId, reviewerAgentId } = await seedCompanyWithAgents();
+    const projectId = await seedProjectWithDefaultPolicy(companyId, reviewerAgentId);
+
+    const res = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Partial policy inherits the default",
+        status: "todo",
+        assigneeAgentId: closerAgentId,
+        projectId,
+        deliveryRequirement: "record_only",
+        executionPolicy: { mode: "normal" },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.executionPolicy?.stages).toEqual([
+      expect.objectContaining({
+        type: "review",
+        participants: [expect.objectContaining({ type: "agent", agentId: reviewerAgentId })],
+      }),
+    ]);
+  });
+
   it("accepts a board PATCH that changes delivery classification", async () => {
     const { companyId, closerAgentId } = await seedCompanyWithAgents();
     const created = await request(createApp(companyId))
