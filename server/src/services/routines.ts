@@ -630,6 +630,7 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
     variables: routine.variables ?? [],
     env: routine.env ?? null,
     executionPolicy: routine.executionPolicy ?? null,
+    deliveryRequirement: routine.deliveryRequirement ?? null,
     executionWorkspacePreference: routine.executionWorkspacePreference ?? null,
     responsibleUserId: routine.responsibleUserId ?? null,
   };
@@ -2158,6 +2159,9 @@ export function routineService(
             originFingerprint: dispatchFingerprint,
             billingCode: issueBillingCode,
             executionPolicy: input.routine.executionPolicy ?? null,
+            // SUP-22127: a routine-level delivery requirement rides onto the
+            // spawned execution issue; null keeps the issue create default.
+            deliveryRequirement: input.routine.deliveryRequirement ?? undefined,
             // SUP-17459: when the routine declares a policy, an explicitly-empty
             // ladder (`stages: []`) must be honoured as "no ladder" on the card
             // instead of collapsing to null and inheriting the project default.
@@ -2486,6 +2490,7 @@ export function routineService(
             variables,
             env,
             executionPolicy: input.executionPolicy ?? null,
+            deliveryRequirement: input.deliveryRequirement ?? null,
             executionWorkspacePreference: input.executionWorkspacePreference ?? null,
             responsibleUserId,
             createdByAgentId: actor.agentId ?? null,
@@ -2627,6 +2632,9 @@ export function routineService(
           variables: nextVariables,
           env: nextEnv,
           executionPolicy: patch.executionPolicy === undefined ? locked.executionPolicy : patch.executionPolicy,
+          deliveryRequirement: patch.deliveryRequirement === undefined
+            ? locked.deliveryRequirement
+            : patch.deliveryRequirement,
           executionWorkspacePreference: finalPreference,
           responsibleUserId: locked.responsibleUserId ?? responsibleUserId,
           updatedByAgentId: actor.agentId ?? null,
@@ -2694,6 +2702,7 @@ export function routineService(
             variables: candidate.variables,
             env: candidate.env,
             executionPolicy: candidate.executionPolicy,
+            deliveryRequirement: candidate.deliveryRequirement,
             executionWorkspacePreference: candidate.executionWorkspacePreference,
             responsibleUserId: candidate.responsibleUserId,
             updatedByAgentId: actor.agentId ?? null,
@@ -3046,6 +3055,7 @@ export function routineService(
             variables: routineSnapshot.variables,
             env: routineSnapshot.env,
             executionPolicy: routineSnapshot.executionPolicy ?? null,
+            deliveryRequirement: routineSnapshot.deliveryRequirement ?? null,
             executionWorkspacePreference: routineSnapshot.executionWorkspacePreference ?? null,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,

@@ -2101,6 +2101,13 @@
       "when": 1792897455846,
       "tag": "0301_routine_execution_workspace_preference",
       "breakpoints": true
+    },
+    {
+      "idx": 300,
+      "version": "7",
+      "when": 1793454697922,
+      "tag": "0302_routine_delivery_requirement",
+      "breakpoints": true
     }
   ]
 }
