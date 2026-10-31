@@ -728,12 +728,6 @@ export function buildOpenCodeRunArgs(input: {
   return args;
 }
 
-function describeOpenCodeV2StateUnavailableCause(error: string): string {
-  if (/no such table/i.test(error)) return "no such table";
-  if (/unable to open database file/i.test(error)) return "missing or unreadable database file";
-  return "other";
-}
-
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
   const executionTarget = readAdapterExecutionTarget({
@@ -1226,7 +1220,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         } else {
           await onLog(
             "stderr",
-            `[paperclip] WARNING: OpenCode V2 session state unavailable for "${runtimeSessionId}" at ${sessionTranscriptDbPath} (cause: ${describeOpenCodeV2StateUnavailableCause(v2State.error)}; ${v2State.error}). The session is resumed WITHOUT the resume size cap and WITHOUT the session-existence check.\n`,
+            `[paperclip] WARNING: OpenCode V2 session state unavailable for "${runtimeSessionId}" at ${sessionTranscriptDbPath}: ${v2State.error}. The session is resumed WITHOUT the resume size cap and WITHOUT the session-existence check.\n`,
           );
         }
       } else if (sessionTranscriptDbPath) {

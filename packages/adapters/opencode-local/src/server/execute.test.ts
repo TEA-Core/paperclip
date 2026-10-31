@@ -833,7 +833,7 @@ describe("execute — OpenCode V2 session state unavailable", () => {
     const warnings = unavailable(logs);
     expect(warnings).toHaveLength(1);
     expect(warnings[0].stream).toBe("stderr");
-    expect(warnings[0].chunk).toContain("cause: missing or unreadable database file");
+    expect(warnings[0].chunk).toContain("unable to open database file");
     expect(warnings[0].chunk).toContain("WITHOUT the resume size cap and WITHOUT the session-existence check");
     expect(runArgs).toEqual(expect.arrayContaining(["--session", sessionId]));
   });
@@ -850,7 +850,7 @@ describe("execute — OpenCode V2 session state unavailable", () => {
     const warnings = unavailable(logs);
     expect(warnings).toHaveLength(1);
     expect(warnings[0].stream).toBe("stderr");
-    expect(warnings[0].chunk).toContain("cause: no such table");
+    expect(warnings[0].chunk).toContain("no such table: session_v2");
     expect(warnings[0].chunk).toContain("WITHOUT the resume size cap and WITHOUT the session-existence check");
     expect(runArgs).toEqual(expect.arrayContaining(["--session", sessionId]));
   });
