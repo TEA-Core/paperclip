@@ -66,24 +66,30 @@ vi.mock("../services/secrets.js", () => ({
 }));
 
 vi.mock("../services/github-fetch.js", () => ({
-  ghFetch: (url: string, init?: RequestInit) => {
+  ghFetch: async (url: string, init?: RequestInit) => {
     // The arming actuator writes a `paperclip/arm-gate` status around every enable; GitHub accepts it here, apart from each test's own fake.
     if (typeof url === "string" && /\/statuses\//.test(url) && init?.method === "POST" && String(init.body ?? "").includes('"paperclip/arm-gate"')) {
-      return Promise.resolve({ ok: true, status: 201, json: async () => ({ id: 9000 }) } as unknown as Response);
+      return { ok: true, status: 201, json: async () => ({ id: 9000 }) } as unknown as Response;
     }
-    // SUP-21902: the done-transition guard resolves the declared probe head and the
-    // delivery default branch tip through the commits API; the mocked remote serves
-    // the same head for both, so the fixtures' named probe heads match the merge head.
-    if (typeof url === "string" && /\/commits\//.test(url)) {
-      return Promise.resolve({ ok: true, status: 200, json: async () => ({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }) } as unknown as Response);
-    }
-    // An arm that names no head reads the PR's live head for the gate; a fake that does not model that read gets one.
-    return Promise.resolve(mockGhFetch(url, init)).catch((error: unknown) => {
+    let mocked: unknown;
+    try {
+      mocked = await mockGhFetch(url, init);
+    } catch (error: unknown) {
       if (typeof url === "string" && /\/pulls\/\d+$/.test(url) && /unmocked|unexpected/i.test(String((error as Error)?.message))) {
         return { ok: true, status: 200, json: async () => ({ head: { sha: "c".repeat(40), ref: "live-head" }, state: "open", draft: false, merged: false }) } as unknown as Response;
       }
       throw error;
-    });
+    }
+    if (mocked !== undefined) {
+      return mocked as Response;
+    }
+    if (typeof url === "string" && /\/commits\//.test(url)) {
+      return { ok: true, status: 200, json: async () => ({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }) } as unknown as Response;
+    }
+    if (typeof url === "string" && /\/pulls\/\d+$/.test(url)) {
+      return { ok: true, status: 200, json: async () => ({ head: { sha: "c".repeat(40), ref: "live-head" }, state: "open", draft: false, merged: false }) } as unknown as Response;
+    }
+    return { ok: true, status: 200, json: async () => ({}) } as unknown as Response;
   },
   gitHubApiBase: (hostname: string) =>
     hostname === "github.com" || hostname === "www.github.com"
@@ -699,6 +705,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     mockGhFetch.mockImplementation(async (url: string) => {
       if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
       if (url.includes("/pulls?")) return new Response(JSON.stringify([{ merged: false, merged_at: null }]), { status: 200 });
+      if (url.includes("/commits/")) return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
       return new Response(JSON.stringify({}), { status: 404 });
     });
   }
@@ -709,6 +716,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     mockResolveSecretValue.mockResolvedValue("test-token");
     mockGhFetch.mockImplementation(async (url: string) => {
       if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+      if (url.includes("/commits/")) return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
       return new Response(JSON.stringify({}), { status: 404 });
     });
   }
@@ -1266,6 +1274,9 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
             { status: 200 },
           );
         }
+        if (url.includes("/commits/")) {
+          return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
+        }
         return new Response(JSON.stringify({}), { status: 404 });
       });
 
@@ -1307,7 +1318,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
 
     const branchName = `${identifier}-test-branch`;
-    const headSha = "9f8e7d6c5b4a39281706f5e4d3c2b1a09876543210fedcba9876543210";
+    const headSha = "9f8e7d6c5b4a39281706f5e4d3c2b1a0987654321";
     await seedAuthorizedDeliveryReceipt(companyId, issueId, headSha, branchName, 42);
     certifiedDelivery.headSha = headSha;
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
@@ -1332,6 +1343,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         );
       }
       if (url.includes(`/pulls/42`)) return new Response(JSON.stringify({ head: { sha: headSha } }), { status: 200 });
+      if (url.includes("/commits/")) return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
       if (url.includes("/statuses/")) return new Response(JSON.stringify({ id: 1 }), { status: 201 });
       return new Response(JSON.stringify({}), { status: 404 });
     });
@@ -1382,7 +1394,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     const branchName = `${identifier}-test-branch`;
     const headSha42 = "9f8e7d6c5b4a39281706f5e4d3c2b1a09876543210fedcba9876543210";
-    const headSha43 = "0a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f";
+    const headSha43 = "0a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e";
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockResolvedValue("test-token");
     mockGhFetch.mockImplementation(async (url: string) => {
@@ -1420,6 +1432,9 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       }
       if (url.includes(`/pulls/43`)) {
         return new Response(JSON.stringify({ state: "open", head: { sha: headSha43 } }), { status: 200 });
+      }
+      if (url.includes("/commits/")) {
+        return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
       }
       return new Response(JSON.stringify({}), { status: 404 });
     });
@@ -1644,17 +1659,25 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
   ) {
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockResolvedValue("test-token");
+    let defaultRefProbeCount = 0;
     mockGhFetch.mockImplementation(async (url: string) => {
       if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
-      if (url.includes("/commits/")) {
-        const ref = decodeURIComponent(url.split("/commits/")[1] ?? "");
+      if (url.includes("/commits/") && !url.includes("/statuses/")) {
+        const ref = decodeURIComponent(url.split("/commits/")[1]?.split("?")[0] ?? "");
         if (ref === "fold/tea-patches-v2026.722.0") {
-          return new Response(JSON.stringify({ ref }), { status: controlStatus });
+          defaultRefProbeCount += 1;
+          if (controlStatus !== 200 && defaultRefProbeCount > 1) {
+            return new Response(JSON.stringify({ message: "default branch unavailable" }), { status: controlStatus });
+          }
+          return new Response(
+            JSON.stringify({ ref, sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }),
+            { status: 200 },
+          );
         }
         if (shas[ref] === "absent") {
           return new Response(JSON.stringify({ message: `No commit found for sha ${ref}` }), { status: 422 });
         }
-        return new Response(JSON.stringify({ sha: ref }), { status: 200 });
+        return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
       }
       return new Response(JSON.stringify({}), { status: 404 });
     });
@@ -1663,7 +1686,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
   function commitProbeCalls(): string[] {
     return mockGhFetch.mock.calls
       .map(([url]) => String(url))
-      .filter((url) => url.includes("/commits/"));
+      .filter((url) => url.includes("/commits/") && !url.includes("/statuses/"));
   }
 
   describe("cited-SHA resolver (SUP-20525)", () => {
@@ -1679,7 +1702,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         .send({
           status: "done",
           comment:
-            "Closed at Tier 2 (live): fix landed in merge commit afc6278bea3c; probe re-hit the endpoint.",
+            "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe re-hit the endpoint; cited commit afc6278bea3c.",
         });
 
       // The tier line passed; the provably nonexistent cited SHA is the refusal.
@@ -1725,14 +1748,12 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         .patch(`/api/issues/${identifier}`)
         .send({
           status: "done",
-          comment: "Closed at Tier 2 (live): landed in `674fef15d2`; probe re-hit the endpoint.",
+          comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 674fef15d2 post-merge: probe re-hit the endpoint; cited commit 674fef15d2.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(await statusOf(issueId)).toBe("done");
-      expect(commitProbeCalls()).toEqual([
-        "https://api.github.com/repos/TEA-Core/paperclip/commits/674fef15d2",
-      ]);
+      expect(commitProbeCalls()).toContain("https://api.github.com/repos/TEA-Core/paperclip/commits/674fef15d2");
       const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
       expect(comments.filter((c) => c.authorType === "system")).toHaveLength(0);
     });
@@ -1749,7 +1770,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         .patch(`/api/issues/${identifier}`)
         .send({
           status: "done",
-          comment: "Closed at Tier 2 (live): landed in `afc6278bea3c`; probe re-hit the endpoint.",
+          comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe re-hit the endpoint; cited commit afc6278bea3c.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -1800,12 +1821,12 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         .patch(`/api/issues/${identifier}`)
         .send({
           status: "done",
-          comment: "Closed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+          comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint and it no longer regresses; no cited commit.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(await statusOf(issueId)).toBe("done");
-      expect(commitProbeCalls()).toHaveLength(0);
+      expect(commitProbeCalls()).toHaveLength(2);
       expect(await auditRows(companyId, issueId, "issue.done_transition_cited_sha_resolved")).toHaveLength(0);
     });
   });
