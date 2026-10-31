@@ -134,12 +134,14 @@ cd "$STAGE/home"
 agent_env="HOME=$STAGE/home XDG_CONFIG_HOME=$STAGE/config XDG_CACHE_HOME=$STAGE/home/.cache PAPERCLIP_ROUTER_URL=$ROUTER PAPERCLIP_ROUTER_CONTROL_URL=$ROUTER OPENCODE_ALLOW_ALL_MODELS=true"
 
 # 4. plugin load + provider registration (the adapter's own probe command)
+# shellcheck disable=SC2086 # agent_env is a deliberate NAME=value word list for env(1)
 MODELS_OUT="$($V1_LAUNCH_GOSU env $agent_env "$V1_BIN" models)" || fail "opencode models failed"
 echo "$MODELS_OUT" | grep -q '^router/coder$' || fail "router/coder missing from models: $MODELS_OUT"
 echo "$MODELS_OUT" | grep -q '^router-coder/coder-default$' || fail "role provider missing from models: $MODELS_OUT"
 log "V1 router plugin registered: $(echo "$MODELS_OUT" | tr '\n' ' ')"
 
 # 5. full agent turn through the router provider as the agent principal
+# shellcheck disable=SC2086 # agent_env is a deliberate NAME=value word list for env(1)
 $V1_LAUNCH_GOSU env $agent_env "$V1_BIN" run --format json --model router/coder \
   "Reply with exactly: OK" > "$STAGE/run.out" 2> "$STAGE/run.err" \
   || { tail -20 "$STAGE/run.err" >&2; fail "baseline agent run failed"; }
