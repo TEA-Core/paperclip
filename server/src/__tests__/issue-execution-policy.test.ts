@@ -452,6 +452,57 @@ describe("resolvePatchExecutionPolicy (SUP-15377)", () => {
   });
 });
 
+describe("resolvePatchExecutionPolicy explicit-empty preservation (SUP-22135)", () => {
+  const stageLessPolicy = () =>
+    normalizeIssueExecutionPolicy({ mode: "normal", commentRequired: true, stages: [] }, { preserveEmptyPolicy: true })!;
+
+  it("keeps an explicit `stages: []` round-trip over a stored stage-less policy non-null", () => {
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [] },
+      currentPolicy: stageLessPolicy(),
+      stagesKeyAbsent: false,
+    });
+    // Before SUP-22135 the normalizer collapsed the bare-empty body to null,
+    // silently wiping the stored SUP-22098 shape.
+    expect(resolved).not.toBeNull();
+    expect(resolved!.stages).toEqual([]);
+    expect(resolved!.mode).toBe("normal");
+  });
+
+  it("keeps a stage-less partial write (stages key absent) non-null", () => {
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "auto", commentRequired: true },
+      currentPolicy: stageLessPolicy(),
+      stagesKeyAbsent: true,
+    });
+    expect(resolved).not.toBeNull();
+    expect(resolved!.stages).toEqual([]);
+    expect(resolved!.mode).toBe("auto");
+  });
+
+  it("still collapses a bare-empty body over a null stored policy (default inheritance unchanged)", () => {
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [] },
+      currentPolicy: null,
+      stagesKeyAbsent: false,
+    });
+    expect(resolved).toBeNull();
+  });
+
+  it("still carries the stored ladder forward on stages omission (SUP-15377 unchanged)", () => {
+    const stored = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+    })!;
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true },
+      currentPolicy: stored,
+      stagesKeyAbsent: true,
+    });
+    expect(resolved!.stages.length).toBe(1);
+    expect(resolved!.stages[0]!.id).toBe(stored.stages[0]!.id);
+  });
+});
+
 describe("parseIssueExecutionState", () => {
   it("returns null for null/undefined", () => {
     expect(parseIssueExecutionState(null)).toBeNull();

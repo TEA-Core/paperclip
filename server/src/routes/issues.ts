@@ -18907,7 +18907,23 @@ export function issueRoutes(
       }
       await assertCanReArmExecutionPolicy(access, req, existing.companyId, existing.assigneeAgentId, true);
     }
-    const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
+    // SUP-22135: parse the STORED policy with the same explicit-empty preserve
+    // the fixed create path writes (SUP-22098). Without it a stored
+    // `stages: []` collapses to null here, so the SUP-13925 round-trip guard
+    // refuses a faithful `stages: []` PATCH (`currentPolicy === null`) and a
+    // stage-less partial policy write resolves to null and silently wipes the
+    // stored shape. The gate mirrors the create-side raw gating: only a stored
+    // column that explicitly carries `stages: []` is preserved — a legacy
+    // stage-less row keeps normalizing to null, so default-inheritance
+    // semantics are unchanged.
+    const storedExecutionPolicyRaw = existing.executionPolicy ?? null;
+    const storedExecutionPolicyStagesExplicitEmpty =
+      storedExecutionPolicyRaw !== null &&
+      Array.isArray(storedExecutionPolicyRaw.stages) &&
+      storedExecutionPolicyRaw.stages.length === 0;
+    const previousExecutionPolicy = normalizeIssueExecutionPolicy(storedExecutionPolicyRaw, {
+      preserveEmptyPolicy: storedExecutionPolicyStagesExplicitEmpty,
+    });
     // SUP-16525: set when this PATCH writes an executionPolicy that must satisfy
     // INV-LADDER-1 against the *live* pointer. The assert in the block below
     // reads `existing.executionState`; the pointer can move between that

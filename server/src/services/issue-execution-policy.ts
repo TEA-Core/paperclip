@@ -687,9 +687,16 @@ export function assertPatchableExecutionPolicyWrite(input: {
  * the ladder.
  *
  * A caller that genuinely wants a stage-less policy must send `stages: []`
- * explicitly; `assertPatchableExecutionPolicyWrite` still refuses that over a
- * stored ladder. Over an already stage-less policy, omission is a no-op (there
- * is nothing to preserve), matching the SUP-13925 monitor-only round-trip.
+  * explicitly; `assertPatchableExecutionPolicyWrite` still refuses that over a
+  * stored ladder. Over an already stage-less policy, omission is a no-op (there
+  * is nothing to preserve), matching the SUP-13925 monitor-only round-trip.
+  *
+  * SUP-22135: over a stored policy that is ALREADY explicitly stage-less, every
+  * guard-admitted body (explicit `stages: []` round-trip or a partial write
+  * whose defaulted stages are empty) resolves to that same stage-less shape —
+  * it never collapses to null and wipes the stored policy. A null stored policy
+  * still normalizes bare-empty bodies to null; default inheritance is
+  * unaffected.
  *
  * A malformed non-object body is returned as `null` rather than thrown: the
  * route has already validated the body against the schema before calling this,
@@ -725,7 +732,20 @@ export function resolvePatchExecutionPolicy(input: {
     stagesKeyAbsent && storedStages !== null
       ? { ...(raw as Record<string, unknown>), stages: storedStages }
       : raw;
-  const resolved = normalizeIssueExecutionPolicy(effectiveRaw);
+  // SUP-22135: a stored policy that is already explicitly stage-less is the
+  // SUP-22098 shape — "no ladder, on purpose". A policy-bearing PATCH that the
+  // SUP-13925 guard admitted over it (a faithful `stages: []` round-trip, or a
+  // partial write whose defaulted `stages` are empty) must resolve back to
+  // that stage-less shape; without the preserve the normalizer collapses the
+  // bare-empty body to null and the write silently destroys the stored policy.
+  // Gated on the STORED shape only: `currentPolicy === null` keeps today's
+  // semantics (an explicit empty over no stored policy stays the guard's to
+  // refuse), and a stored ladder rides the SUP-15377 carry-forward above.
+  const preserveStoredEmptyPolicy = currentPolicy !== null && currentPolicy.stages.length === 0;
+  const resolved = normalizeIssueExecutionPolicy(
+    effectiveRaw,
+    preserveStoredEmptyPolicy ? { preserveEmptyPolicy: true } : undefined,
+  );
 
   // Preserve-on-omit carries the stored stages forward unchanged, so no insert
   // is possible on that path; only an explicit `stages` body can move the
