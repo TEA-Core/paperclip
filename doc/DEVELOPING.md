@@ -1324,7 +1324,14 @@ request from any session of that private server (child and subagent sessions
 included) is rejected the way a headless `opencode run` rejects it (stderr line
 `! permission requested: ...; auto-rejecting`, the tool call fails and the model
 continues), so a run never waits on a reply; allowing actions stays the job of
-the `dangerouslySkipPermissions` allow-list.
+the `dangerouslySkipPermissions` allow-list. A `question` tool form from any
+session is cancelled the same way (stderr line `! question requested: ...;
+cancelling`); unlike a headless `run`, which lets the model continue, the server
+ends that turn as interrupted, so the run fails with a message that the model
+asked a question a non-interactive run cannot answer. The event stream is read
+with `node:http` so a long silent tool call does not hit a body timeout, and
+`PAPERCLIP_OPENCODE_PRINT_LOGS` is not applied on this path (`opencode serve`
+rejects `--standalone`); a run with it set logs a warning saying so.
 
 The gate waits for `mcp.resources.changed` on `GET /api/event` from every
 injected MCP server, settles 1000 ms, and fails the run (exit 1, no session

@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import http from "node:http";
 import {
   appendWithCap,
   asString,
@@ -133,15 +134,22 @@ function safeJson(text: string): unknown {
 /** A failure the transport reports to the run log; the run then exits 1. */
 class ServeTransportError extends Error {}
 
-async function* readEventStream(response: Response, signal: AbortSignal): AsyncGenerator<unknown> {
-  const reader = response.body!.getReader();
+/** Opens the SSE stream with `node:http`, which has no body timeout, so a long silent tool call keeps it alive. */
+function openEventStream(url: string, authorization: string, signal: AbortSignal) {
+  return new Promise<{ status: number; chunks: AsyncIterable<Uint8Array> }>((resolve, reject) => {
+    const request = http.get(url, { headers: { Authorization: authorization }, signal }, (response) => {
+      resolve({ status: response.statusCode ?? 0, chunks: response });
+    });
+    request.on("error", reject);
+  });
+}
+
+async function* readEventStream(chunks: AsyncIterable<Uint8Array>, signal: AbortSignal): AsyncGenerator<unknown> {
   const decoder = new TextDecoder();
   let buffer = "";
   try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) return;
-      buffer += decoder.decode(value, { stream: true });
+    for await (const chunk of chunks) {
+      buffer += decoder.decode(chunk, { stream: true });
       let index: number;
       while ((index = buffer.indexOf("\n")) >= 0) {
         const line = buffer.slice(0, index).replace(/\r$/, "");
@@ -220,6 +228,7 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
   let outcome: OpenCodeServeTurnOutcome | null = null;
   let failure: string | null = null;
   let boundSessionId: string | null = null;
+  let cancelledQuestion: string | null = null;
   const seenResourceServers = new Set<string>();
   const readyWaiters: Array<() => void> = [];
   const eventState = createOpenCodeServeEventState();
@@ -259,26 +268,47 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
       .join("; ");
   };
 
-  // `opencode run` auto-rejects a permission request because it cannot ask
-  // anyone; a server waits for a reply forever, so the transport gives the same
-  // answer. Allowing is the job of the configured allow-list, never of this.
-  const rejectPermission = async (data: Record<string, unknown>) => {
-    const requestId = asString(data.id, "");
-    const resources = Array.isArray(data.resources) ? data.resources.map((resource) => String(resource)) : [];
-    await emit("stderr", redact(`! permission requested: ${asString(data.action, "")} (${resources.join(", ")}); auto-rejecting\n`));
+  // A headless `opencode run` answers an interactive request itself because
+  // nobody can; a server waits for a reply forever, so the transport answers
+  // too. Allowing or answering is never done here: that is the job of the
+  // configured allow-list.
+  const answerRequest = async (notice: string, path: string, init: RequestInit, failureMessage: string) => {
+    await emit("stderr", redact(`${notice}\n`));
     try {
-      const reply = await request(
-        `/api/session/${encodeURIComponent(asString(data.sessionID, ""))}/permission/${encodeURIComponent(requestId)}/reply`,
-        { method: "POST", body: JSON.stringify({ decision: "reject", message: PERMISSION_REJECT_MESSAGE }) },
-      );
+      const reply = await request(path, init);
       if (reply.status >= 300) throw new Error(`HTTP ${reply.status}`);
     } catch (error) {
       if (abort.signal.aborted) return;
       // An unanswered request would hold the turn open until the wall clock.
-      failure = redact(`OpenCode permission request ${requestId} could not be rejected: ${error instanceof Error ? error.message : String(error)}`);
+      failure = redact(`${failureMessage}: ${error instanceof Error ? error.message : String(error)}`);
       await reportFailure(failure);
       turnDone.resolve("failed");
     }
+  };
+
+  const rejectPermission = (data: Record<string, unknown>) => {
+    const requestId = asString(data.id, "");
+    const resources = Array.isArray(data.resources) ? data.resources.map((resource) => String(resource)) : [];
+    return answerRequest(
+      `! permission requested: ${asString(data.action, "")} (${resources.join(", ")}); auto-rejecting`,
+      `/api/session/${encodeURIComponent(asString(data.sessionID, ""))}/permission/${encodeURIComponent(requestId)}/reply`,
+      { method: "POST", body: JSON.stringify({ decision: "reject", message: PERMISSION_REJECT_MESSAGE }) },
+      `OpenCode permission request ${requestId} could not be rejected`,
+    );
+  };
+
+  const cancelQuestion = (form: Record<string, unknown>) => {
+    const formId = asString(form.id, "");
+    const field = parseObject(Array.isArray(form.fields) ? form.fields[0] : null);
+    const label = asString(field.title, "") || asString(form.title, "") || "question";
+    const detail = asString(field.description, "");
+    cancelledQuestion = label;
+    return answerRequest(
+      `! question requested: ${label}${detail ? ` (${detail})` : ""}; cancelling`,
+      `/api/session/${encodeURIComponent(asString(form.sessionID, ""))}/form/${encodeURIComponent(formId)}`,
+      { method: "DELETE" },
+      `OpenCode question ${formId} could not be cancelled`,
+    );
   };
 
   const handleEvent = async (envelope: unknown) => {
@@ -295,6 +325,11 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     // request is the run's too and would hold the turn open just the same.
     if (type === "permission.asked") {
       void rejectPermission(data);
+      return;
+    }
+    if (type === "form.created") {
+      const form = parseObject(data.form);
+      if (asString(parseObject(form.metadata).kind, "") === "question") void cancelQuestion(form);
       return;
     }
     if (!boundSessionId || asString(data.sessionID, "") !== boundSessionId) return;
@@ -333,7 +368,11 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     // the run. A server that died on its own (timeout, cancel, crash) keeps its.
     const endedByTurn = outcome !== null || failure !== null;
     if (outcome === "interrupted" && !proc.timedOut) {
-      await reportFailure("OpenCode session was interrupted before it finished");
+      await reportFailure(
+        cancelledQuestion
+          ? `OpenCode asked a question (${cancelledQuestion}) that a non-interactive run cannot answer; it was cancelled and the run stopped`
+          : "OpenCode session was interrupted before it finished",
+      );
     }
     if (!endedByTurn && !proc.timedOut) {
       await reportFailure("OpenCode ended before the turn finished (event stream closed or server exited)");
@@ -360,11 +399,11 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
 
     // Subscribe before anything can happen so no event is missed. The server
     // sends `server.connected` first once the subscription is live.
-    const stream = await fetch(`${base}/api/event`, { headers: { Authorization: authorization }, signal: abort.signal });
-    if (!stream.ok || !stream.body) throw new ServeTransportError(`OpenCode event stream unavailable: HTTP ${stream.status}`);
+    const stream = await openEventStream(`${base}/api/event`, authorization, abort.signal);
+    if (stream.status < 200 || stream.status >= 300) throw new ServeTransportError(`OpenCode event stream unavailable: HTTP ${stream.status}`);
     const connected = deferred<void>();
     const pump = (async () => {
-      for await (const envelope of readEventStream(stream, abort.signal)) {
+      for await (const envelope of readEventStream(stream.chunks, abort.signal)) {
         if (asString(parseObject(envelope).type, "") === "server.connected") connected.resolve();
         await handleEvent(envelope);
       }

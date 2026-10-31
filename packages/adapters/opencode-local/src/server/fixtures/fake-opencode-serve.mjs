@@ -64,6 +64,21 @@ const server = http.createServer(async (req, res) => {
       }, 10);
       return;
     }
+    const formDelete = /^\/form\/([^/]+)$/.exec(rest ?? "");
+    if (formDelete && req.method === "DELETE") {
+      if (process.env.FAKE_FORM_DELETE_STATUS) return json(Number(process.env.FAKE_FORM_DELETE_STATUS), { _tag: "DeleteFailed" });
+      res.writeHead(204);
+      res.end();
+      const base = { sessionID: id, assistantMessageID: "msg_a" };
+      setTimeout(() => {
+        push("form.cancelled", { sessionID: id, formID: formDelete[1] });
+        if (id !== "ses_fake") return;
+        push("session.tool.failed", { ...base, id: "call_q", error: { type: "aborted", message: "The user dismissed this question" } });
+        push("session.step.failed", { ...base, error: { message: "Step interrupted" } });
+        push("session.execution.interrupted", { sessionID: id });
+      }, 10);
+      return;
+    }
     if (rest === "/model") {
       res.writeHead(204);
       return res.end();
@@ -72,6 +87,25 @@ const server = http.createServer(async (req, res) => {
       if (process.env.FAKE_PROMPT_STATUS) return json(Number(process.env.FAKE_PROMPT_STATUS), { _tag: "PromptRejected" });
       json(200, { data: { id: "msg_1" } });
       const base = { sessionID: id, assistantMessageID: "msg_a" };
+      if (process.env.FAKE_QUESTION === "1") {
+        const form = (formId, sessionID, kind) => ({
+          id: formId,
+          sessionID,
+          title: "Questions",
+          metadata: { kind, tool: { messageID: "msg_a", id: "call_q" } },
+          fields: [{ key: "q1", title: "Pick one", description: "Which option?", type: "select", options: [{ label: "A" }], custom: false }],
+        });
+        setTimeout(() => {
+          push("session.execution.started", { sessionID: id });
+          push("session.step.started", base);
+          push("session.tool.input.started", { ...base, id: "call_q", name: "question" });
+          push("session.tool.called", { ...base, id: "call_q", input: { questions: [] }, executed: false });
+          push("form.created", { form: form("frm_1", id, "question") });
+          push("form.created", { form: form("frm_other", "ses_other", "question") });
+          push("form.created", { form: form("frm_text", id, "text") });
+        }, 50);
+        return;
+      }
       if (process.env.FAKE_PERMISSION === "1") {
         setTimeout(() => {
           push("session.execution.started", { sessionID: id });

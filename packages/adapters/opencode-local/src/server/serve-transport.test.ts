@@ -238,8 +238,35 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
     const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_PERMISSION: "1", FAKE_PERMISSION_REPLY_STATUS: "500" }), timeoutSec: 0 }));
 
     expect(result.exitCode).toBe(1);
-    expect(parseOpenCodeJsonl(result.stdout).errorMessage).toContain("permission request per_1 could not be rejected: HTTP 500");
+    expect(parseOpenCodeJsonl(result.stdout).errorMessage).toMatch(/permission request per_(1|other) could not be rejected: HTTP 500/);
     expect(result.stderr).toContain("! permission requested: shell (echo hi); auto-rejecting");
+    await expectServerStopped();
+  });
+
+  it("cancels a question form from any session and ends the run as a failure that names the question", async () => {
+    const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_QUESTION: "1" }), timeoutSec: 0 }));
+
+    expect(result.exitCode).toBe(1);
+    expect(result.timedOut).toBe(false);
+    const deletes = (await requests()).filter((entry) => entry.method === "DELETE");
+    expect(deletes.map((entry) => entry.path).sort()).toEqual([
+      "/api/session/ses_fake/form/frm_1",
+      "/api/session/ses_other/form/frm_other",
+    ]);
+    expect(result.stderr.match(/! question requested: Pick one \(Which option\?\); cancelling\n/g)).toHaveLength(2);
+    expect(parseOpenCodeJsonl(result.stdout).errorMessage).toBe(
+      "OpenCode asked a question (Pick one) that a non-interactive run cannot answer; it was cancelled and the run stopped",
+    );
+    expect(result.stdout).toContain("The user dismissed this question");
+    await expectServerStopped();
+  });
+
+  it("fails the run instead of hanging when a question cannot be cancelled", async () => {
+    const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_QUESTION: "1", FAKE_FORM_DELETE_STATUS: "500" }), timeoutSec: 0 }));
+
+    expect(result.exitCode).toBe(1);
+    expect(parseOpenCodeJsonl(result.stdout).errorMessage).toContain("could not be cancelled: HTTP 500");
+    expect(result.stderr).toContain("! question requested: Pick one (Which option?); cancelling");
     await expectServerStopped();
   });
 

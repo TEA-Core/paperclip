@@ -73,8 +73,12 @@ const model = "paperclip-fixture/acceptance-model";
 // Prompt markers the fixture reacts to; they travel through `promptTemplate`.
 const CANCEL_MARKER = "paperclip-acceptance-cancel";
 const FORCE_LENGTH_MARKER = "paperclip-acceptance-force-length";
-// A prompt carrying this marker makes the model call the shell tool once.
+// A prompt carrying one of these markers makes the model call that tool once.
 const SHELL_CALL_MARKER = "paperclip-acceptance-shell-call";
+const QUESTION_CALL_MARKER = "paperclip-acceptance-question-call";
+const QUESTION_ARGS = {
+  questions: [{ question: "Which option?", header: "Pick one", options: [{ label: "A", description: "first" }, { label: "B", description: "second" }] }],
+};
 
 const execFileAsync = promisify(execFile);
 
@@ -153,7 +157,7 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
       let body = "";
       for await (const chunk of req) body += chunk;
       const lowered = body.toLowerCase();
-      let callsShell = false;
+      let toolCall: { name: string; args: unknown } | null = null;
       try {
         const parsed = JSON.parse(body) as { tools?: Array<{ function?: { name?: string } }>; messages?: Array<{ role?: string }> };
         if ((parsed.tools ?? []).length > 0) {
@@ -161,7 +165,9 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
             tools: (parsed.tools ?? []).map((tool) => tool.function?.name ?? ""),
             messageCount: (parsed.messages ?? []).length,
           });
-          callsShell = lowered.includes(SHELL_CALL_MARKER) && !(parsed.messages ?? []).some((message) => message.role === "tool");
+          const answered = (parsed.messages ?? []).some((message) => message.role === "tool");
+          if (!answered && lowered.includes(SHELL_CALL_MARKER)) toolCall = { name: "shell", args: { command: "echo hi" } };
+          if (!answered && lowered.includes(QUESTION_CALL_MARKER)) toolCall = { name: "question", args: QUESTION_ARGS };
         }
       } catch {
         // not a JSON chat request
@@ -169,10 +175,10 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
       if (lowered.includes(CANCEL_MARKER)) {
         await new Promise((resolve) => setTimeout(resolve, 5_000));
       }
-      if (callsShell) {
+      if (toolCall) {
         res.writeHead(200, { "cache-control": "no-cache", connection: "keep-alive", "content-type": "text/event-stream" });
-        const toolCall = { index: 0, id: "call_1", type: "function", function: { name: "shell", arguments: JSON.stringify({ command: "echo hi" }) } };
-        res.write(`data: ${JSON.stringify({ id: "chatcmpl-paperclip", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", tool_calls: [toolCall] }, finish_reason: null }] })}\n\n`);
+        const call = { index: 0, id: "call_1", type: "function", function: { name: toolCall.name, arguments: JSON.stringify(toolCall.args) } };
+        res.write(`data: ${JSON.stringify({ id: "chatcmpl-paperclip", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", tool_calls: [call] }, finish_reason: null }] })}\n\n`);
         res.write(`data: ${JSON.stringify({ id: "chatcmpl-paperclip", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`);
         res.end("data: [DONE]\n\n");
         return;
@@ -704,6 +710,28 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     expect(shell?.part?.state?.status).toBe("error");
     expect(shell?.part?.state?.error).toContain("cannot ask the user for permission");
     expect(String(result.resultJson?.stderr ?? "")).toMatch(/! permission requested: shell \(.*\); auto-rejecting/);
+  }, 90_000);
+
+  it("cancels the question tool and ends the run as a failure instead of waiting for an answer", async () => {
+    const result = await execute(context({
+      runId: "acceptance-question",
+      config: {
+        command: binary,
+        cliVersion,
+        cwd: workspace,
+        model,
+        timeoutSec: 60,
+        graceSec: 2,
+        dangerouslySkipPermissions: true,
+        promptTemplate: `${QUESTION_CALL_MARKER}: ask the user one question`,
+        env: baseEnv,
+      },
+    }));
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("that a non-interactive run cannot answer");
+    expect(String(result.resultJson?.stderr ?? "")).toMatch(/! question requested: .*; cancelling/);
+    expect(String(result.resultJson?.stdout ?? "")).toContain("The user dismissed this question");
   }, 90_000);
 
   it("rejects an invalid model before launching the real binary", async () => {

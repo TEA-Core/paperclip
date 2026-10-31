@@ -1086,6 +1086,21 @@ describe("execute — OpenCode V2 serve transport", () => {
     expect(JSON.stringify({ logs, result })).not.toContain(token);
   });
 
+  it("says PAPERCLIP_OPENCODE_PRINT_LOGS is not applied on the serve path, once", async () => {
+    const { result, logs, metadata } = await runServe({ PAPERCLIP_OPENCODE_PRINT_LOGS: "1" });
+
+    expect(result.exitCode).toBe(0);
+    expect(logs.match(/Warning: PAPERCLIP_OPENCODE_PRINT_LOGS is not applied on the serve path/g)).toHaveLength(1);
+    expect(metadata[0]?.commandNotes?.filter((note) => note.includes("PAPERCLIP_OPENCODE_PRINT_LOGS is not applied on the serve path"))).toHaveLength(1);
+  });
+
+  it("stays quiet about PAPERCLIP_OPENCODE_PRINT_LOGS when it is not set", async () => {
+    const { logs, metadata } = await runServe();
+
+    expect(logs).not.toContain("PAPERCLIP_OPENCODE_PRINT_LOGS");
+    expect(metadata[0]?.commandNotes?.join("\n")).not.toContain("PAPERCLIP_OPENCODE_PRINT_LOGS");
+  });
+
   it("does not describe a readiness gate when no MCP server was injected", async () => {
     const { result, metadata } = await runServe({}, { mcp: false });
 

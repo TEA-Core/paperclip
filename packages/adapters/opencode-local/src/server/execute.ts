@@ -1460,6 +1460,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               `${OPENCODE_SERVE_MCP_SETTLE_MS} ms (timer-based gate, fails the run after ${OPENCODE_SERVE_MCP_READY_TIMEOUT_MS / 1000}s).`
             : `no MCP server was injected, so the first prompt does not wait.`),
       );
+      if (printLogs) {
+        const warning =
+          "PAPERCLIP_OPENCODE_PRINT_LOGS is not applied on the serve path (opencode serve rejects --standalone, " +
+          "so --print-logs cannot be passed); OpenCode's own logs stay in its log file.";
+        commandNotes.push(warning);
+        await onLog("stdout", `[paperclip] Warning: ${warning}\n`);
+      }
     } else if (oneShotReason) {
       const warning =
         `OpenCode V2 is using the one-shot \`opencode run\` path because ${oneShotReason}; ` +
