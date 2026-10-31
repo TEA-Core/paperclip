@@ -424,7 +424,7 @@ RUN if getent passwd "${AGENT_UID}" >/dev/null \
      fi \
   && groupadd -g ${AGENTS_GID} agents \
   && groupadd -g ${AGENT_GID} node-agent \
-   && useradd -u ${AGENT_UID} -g ${AGENT_GID} -G agents -M -d /paperclip -s /usr/sbin/nologin node-agent \
+  && useradd -u ${AGENT_UID} -g ${AGENT_GID} -G agents -M -d /paperclip -s /usr/sbin/nologin node-agent \
   # Both principals share `agents` so they can write the same worktrees; the
   # server needs it to chgrp new checkouts (SUP-12530).
   && usermod -aG agents node \
@@ -474,16 +474,16 @@ RUN if getent passwd "${AGENT_UID}" >/dev/null \
        [ "$(capsh --keep=1 --user=node --inh=cap_kill,cap_fowner --addamb=cap_kill,cap_fowner \
               --shell=/bin/sh -- -c 'echo "$(id -u) $(sed -n "s/^CapAmb:[[:space:]]*//p" /proc/self/status)"')" \
          = "$(id -u node) 0000000000000028" ]; \
-      else \
-        echo "SKIP capsh grant probe: cap_kill/cap_fowner not both in the builder's bounding set (capsh presence is still asserted)"; \
-      fi \
-   && gosu node-agent test -x /opt/opencode-v2/bin/opencode \
-   && gosu node-agent test ! -w /opt/opencode-v2/bin/opencode \
-   # V2 (bun) creates $HOME/.local/share/opencode/log even for --version; at
-   # build time /paperclip is owned by node, so probe with HOME=/tmp. Runtime
-   # mounts /paperclip writable for the agent principal.
-   && test "$(gosu node-agent env HOME=/tmp /opt/opencode-v2/bin/opencode --version)" = "opencode v${OPENCODE_V2_VERSION}" \
-   && test "$(gosu node /usr/local/bin/opencode --version)" = "1.19.5"
+     else \
+       echo "SKIP capsh grant probe: cap_kill/cap_fowner not both in the builder's bounding set (capsh presence is still asserted)"; \
+     fi \
+  && gosu node-agent test -x /opt/opencode-v2/bin/opencode \
+  && gosu node-agent test ! -w /opt/opencode-v2/bin/opencode \
+  # V2 (bun) creates $HOME/.local/share/opencode/log even for --version; at
+  # build time /paperclip is owned by node, so probe with HOME=/tmp. Runtime
+  # mounts /paperclip writable for the agent principal.
+  && test "$(gosu node-agent env HOME=/tmp /opt/opencode-v2/bin/opencode --version)" = "opencode v${OPENCODE_V2_VERSION}" \
+  && test "$(gosu node /usr/local/bin/opencode --version)" = "1.19.5"
 
 COPY --from=build /app /app
 # SUP-12903: root-own the entire runtime tree so uid-1000 agent runs cannot

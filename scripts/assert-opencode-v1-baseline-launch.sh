@@ -6,7 +6,7 @@
 # that the rebuilt image still:
 #   1. resolves /usr/local/bin/opencode to the pinned V1 (1.19.5),
 #   2. auto-loads the V1 router plugin from the agent's staged XDG config
-#      (sha256-pinned fixture of the fleet plugin with its internal router
+#      (sha256-pinned fixture of the V1 router plugin with its router
 #      endpoint defaults replaced by placeholders; the probe sets both router
 #      URLs, see scripts/__tests__/dockerfile-opencode-pins.test.mjs),
 #   3. builds the router providers from a live catalog (stub router served on

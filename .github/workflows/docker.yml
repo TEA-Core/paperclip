@@ -15,8 +15,8 @@ on:
   # the new tag ref instead. The tag mapping below keys off github.ref either
   # way.
   workflow_dispatch:
-  # Fork-only: the docker-build-assert job below runs the hardening probes on
-  # a PR-built image. Every publishing job carries an explicit
+  # Fork-only: the docker-build-assert job below runs the hardening and V1
+  # launch probes on a PR-built image. Every publishing job carries an explicit
   # `github.event_name != 'pull_request'` guard so a PR never pushes to ghcr.
   pull_request:
     paths:
@@ -680,11 +680,10 @@ jobs:
       # The static pins (scripts/__tests__/dockerfile-opencode-pins.test.mjs)
       # prove the binaries are installed at the pinned versions; this step
       # proves the agent still launches on the rebuilt image. The unchanged V1
-      # binary auto-loads the V1 router plugin (fixture of the fleet plugin,
-      # sha256-pinned in the same test),
-      # builds the router providers from a live catalog served on loopback,
-      # and completes a full agent turn through the router provider as the
-      # agent principal (node-agent, uid 1001).
+      # binary auto-loads the V1 router plugin (sha256-pinned fixture, same
+      # test), builds the router providers from a live catalog served on
+      # loopback, and completes a full agent turn through the router provider
+      # as the agent principal (node-agent, uid 1001).
       - name: Assert baseline V1 agent launch with the V1 router plugin
         run: |
           docker run --rm \
