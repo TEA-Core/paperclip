@@ -875,6 +875,13 @@ export function summarySlotService(db: Db) {
 
     const now = new Date();
     const result = await db.transaction(async (tx) => {
+      const currentGenerationIssue = await tx
+        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(and(eq(issues.id, input.generationIssueId!), eq(issues.companyId, sel.companyId)))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+
       // The linked slot row is the serialization boundary for document
       // revision allocation. Hold a row lock so concurrent writers for the
       // same slot queue up and re-read the latest document state only after
@@ -894,12 +901,6 @@ export function summarySlotService(db: Db) {
         throw conflict("Summary generation was superseded by a newer task");
       }
 
-      const currentGenerationIssue = await tx
-        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
-        .from(issues)
-        .where(and(eq(issues.id, input.generationIssueId!), eq(issues.companyId, sel.companyId)))
-        .for("update")
-        .then((rows) => rows[0] ?? null);
       const runStillMatches =
         currentGenerationIssue?.checkoutRunId === actor.runId ||
         currentGenerationIssue?.executionRunId === actor.runId;
