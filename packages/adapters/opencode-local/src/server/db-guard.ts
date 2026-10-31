@@ -239,6 +239,132 @@ export async function measureOpenCodeSessionBytes(
   }
 }
 
+/**
+ * What the V2 (2.x) session tables say about one session. V2 stores a session
+ * in `session_v2` and its transcript in `session_message`; the V1 `part`,
+ * `message` and `event` tables the functions above read are not written for it,
+ * so a V1-only reader returns null on a V2 database and silently skips every
+ * size gate (SUP-19141). The two queries below are the probe verified against
+ * 2.0.26, 2.1.4, 2.2.3 and 2.2.4 databases.
+ */
+export type OpenCodeV2SessionState = {
+  exists: boolean;
+  /** `session_v2.directory`, the workspace the session is rooted at. */
+  cwd: string | null;
+  messageCount: number;
+  /** Bytes of the session's replayed transcript (`session_message.data`). */
+  transcriptBytes: number;
+  /** Text of the newest completed assistant message, or null when none completed or it exceeds 1 MiB. */
+  finalMessage: string | null;
+};
+
+export type OpenCodeV2SessionReadResult =
+  | { ok: true; state: OpenCodeV2SessionState }
+  | { ok: false; error: string };
+
+type SqliteStatement = { get: (...params: unknown[]) => Record<string, unknown> | undefined };
+type SqliteModule = {
+  DatabaseSync: new (
+    path: string,
+    options?: { readOnly?: boolean },
+  ) => { prepare: (sql: string) => SqliteStatement; close: () => void };
+};
+
+/** Largest newest-assistant row `readOpenCodeV2SessionState` will load to read its final message. */
+const FINAL_MESSAGE_MAX_BYTES = 1024 * 1024;
+
+function toFiniteNumber(value: unknown): number {
+  if (typeof value === "bigint") return Number(value);
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+/**
+ * Read one V2 session's existence, workspace, transcript size and final
+ * message. Read-only. Unlike the V1 readers it never degrades to a quiet null:
+ * a database that cannot be opened, a missing table or a driver that is not
+ * there comes back as `{ ok: false, error }` so the caller can say so.
+ */
+export async function readOpenCodeV2SessionState(
+  databasePath: string,
+  sessionId: string,
+): Promise<OpenCodeV2SessionReadResult> {
+  if (sessionId.trim().length === 0) return { ok: false, error: "session id is empty" };
+  try {
+    // Dynamic on purpose, like the V1 readers: node:sqlite may be absent from the
+    // host's Node, and that must surface as `ok: false`, not a module-load crash.
+    const sqlite = (await import("node:sqlite")) as unknown as SqliteModule;
+    const db = new sqlite.DatabaseSync(databasePath, { readOnly: true });
+    try {
+      const session = db.prepare("SELECT directory FROM session_v2 WHERE id = ?").get(sessionId);
+      if (!session) {
+        return {
+          ok: true,
+          state: { exists: false, cwd: null, messageCount: 0, transcriptBytes: 0, finalMessage: null },
+        };
+      }
+      const totals = db
+        .prepare(
+          "SELECT COUNT(*) AS messages, SUM(LENGTH(CAST(data AS BLOB))) AS bytes FROM session_message WHERE session_id = ?",
+        )
+        .get(sessionId);
+      // json_valid guards json_extract, which raises on malformed text and would
+      // otherwise fail the whole probe for one bad row.
+      const completed = db
+        .prepare(
+          "SELECT CASE WHEN LENGTH(CAST(data AS BLOB)) <= ? THEN data END AS data " +
+            "FROM session_message WHERE session_id = ? AND type = 'assistant' " +
+            "AND CASE WHEN LENGTH(CAST(data AS BLOB)) > ? THEN 1 " +
+            "WHEN json_valid(data) THEN json_extract(data, '$.time.completed') IS NOT NULL ELSE 0 END " +
+            "ORDER BY seq DESC LIMIT 1",
+        )
+        .get(FINAL_MESSAGE_MAX_BYTES, sessionId, FINAL_MESSAGE_MAX_BYTES);
+      let finalMessage: string | null = null;
+      if (typeof completed?.data === "string") {
+        const parsed = JSON.parse(completed.data) as {
+          content?: Array<{ type?: unknown; text?: unknown }>;
+        };
+        finalMessage = Array.isArray(parsed.content)
+          ? parsed.content
+              .filter((part) => part?.type === "text" && typeof part.text === "string")
+              .map((part) => part.text as string)
+              .join("")
+          : "";
+      }
+      return {
+        ok: true,
+        state: {
+          exists: true,
+          cwd: typeof session.directory === "string" ? session.directory : null,
+          messageCount: toFiniteNumber(totals?.messages),
+          transcriptBytes: toFiniteNumber(totals?.bytes),
+          finalMessage,
+        },
+      };
+    } finally {
+      db.close();
+    }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * Per-session byte measure for the growth guard on a V2 database. A failed read
+ * is reported through `onUnavailable` and returned as null, which the guard
+ * already treats as "cannot attribute" and answers by judging the file total
+ * alone, the conservative direction.
+ */
+export function createOpenCodeV2SessionByteMeasurer(
+  onUnavailable: (message: string) => void,
+): (databasePath: string, sessionId: string) => Promise<number | null> {
+  return async (databasePath, sessionId) => {
+    const result = await readOpenCodeV2SessionState(databasePath, sessionId);
+    if (result.ok) return result.state.transcriptBytes;
+    onUnavailable(`OpenCode V2 session size unavailable for "${sessionId}": ${result.error}`);
+    return null;
+  };
+}
+
 export function formatBytes(bytes: number): string {
   if (bytes < BYTES_PER_MB) return `${bytes} B`;
   return `${(bytes / BYTES_PER_MB).toFixed(1)} MB`;
