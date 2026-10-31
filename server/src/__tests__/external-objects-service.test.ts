@@ -1108,7 +1108,10 @@ describeEmbeddedPostgres("externalObjectService", () => {
   it("recovers a capped terminal not_found GitHub pull request on a slow cadence instead of disarming it forever (SUP-22042)", async () => {
     const { companyId, issueId } = await createIssue();
     const fetch = vi.fn(async () => notFoundPullRequestResponse());
-    const svc = externalObjectService(db, { github: { fetch, tokenProvider: null } });
+    // `tokenProvider: null` is the runtime spelling of "anonymous" (the
+    // provider's hasOwnProperty check treats null and undefined differently);
+    // the declared option type omits null, so assert to keep the runtime value.
+    const svc = externalObjectService(db, { github: { fetch, tokenProvider: null as unknown as undefined } });
     await svc.syncIssue(issueId);
     const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
 
@@ -1169,7 +1172,7 @@ describeEmbeddedPostgres("externalObjectService", () => {
   it("keeps genuine terminal states and capped non-PR not_found rows out of the recovery path (SUP-22042)", async () => {
     const { companyId, issueId } = await createIssue();
     const fetch = vi.fn(async () => notFoundPullRequestResponse());
-    const svc = externalObjectService(db, { github: { fetch, tokenProvider: null } });
+    const svc = externalObjectService(db, { github: { fetch, tokenProvider: null as unknown as undefined } });
     await svc.syncIssue(issueId);
     const base = await db.select().from(externalObjects).then((rows) => rows[0]!);
 
@@ -1240,7 +1243,7 @@ describeEmbeddedPostgres("externalObjectService", () => {
   it("keeps the restored head identity readable across every headRefFromData-tolerated shape (SUP-22042)", async () => {
     const { companyId, issueId } = await createIssue();
     const fetch = vi.fn(async () => notFoundPullRequestResponse());
-    const svc = externalObjectService(db, { github: { fetch, tokenProvider: null } });
+    const svc = externalObjectService(db, { github: { fetch, tokenProvider: null as unknown as undefined } });
     await svc.syncIssue(issueId);
     const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
     await svc.refreshObject(object.id, { companyId, force: true });
@@ -1581,7 +1584,7 @@ describeEmbeddedPostgres("externalObjectService", () => {
 
     const updated = await db.select().from(externalObjects).then((rows) => rows[0]!);
     const expectedBackoff = 30 * 24 * 60 * 60 * 1000;
-    expect(updated.nextRefreshAt.getTime() - Date.now()).toBeGreaterThanOrEqual(expectedBackoff * 0.9);
+    expect(updated.nextRefreshAt!.getTime() - Date.now()).toBeGreaterThanOrEqual(expectedBackoff * 0.9);
   });
 
   it("does not re-sweep a no_resolver object on the next due pass", async () => {
