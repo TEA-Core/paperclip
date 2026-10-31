@@ -5421,6 +5421,18 @@ describe("evaluateDoneTierDeclaration", () => {
       })).toBe("Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #123 via done-close-landing-backstop — Landing delegated. Liveness unverified.");
     });
 
+    it("renders a record-only Tier 1 close with no SHA, PR, landed, or landing-delegated claim", () => {
+      const rendered = renderDoneTierDeclaration(null, {
+        tier: "tier1",
+        reason: "No repository landing exists",
+        landing: { mode: "noRepositoryLanding" },
+      });
+      expect(rendered).toBe(
+        "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — No repository landing exists. Liveness unverified.",
+      );
+      expect(rendered).not.toMatch(/[0-9a-f]{7,40}|PR #|landed-at-tip|landing-delegated/i);
+    });
+
     it("preserves the body when the existing Tier 2 declaration matches", () => {
       const body = "Context\n\nClosed at Tier 2 (live): existing evidence\n\nFollow-up";
       expect(renderDoneTierDeclaration(body, {
@@ -5520,6 +5532,31 @@ describe("evaluateDoneTierDeclaration", () => {
   });
 
   describe("Tier 1 via accompanying comment", () => {
+    it("accepts no-repository-landing only when the issue is record_only", async () => {
+      const comment =
+        "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — No repository landing exists. Liveness unverified.";
+      const accepted = await evaluateDoneTierDeclaration(
+        mockDb,
+        { ...tierIssue, deliveryRequirement: "record_only" },
+        comment,
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(accepted.allowed).toBe(true);
+      expect(accepted.tier).toBe("tier1");
+
+      const refused = await evaluateDoneTierDeclaration(
+        mockDb,
+        { ...tierIssue, deliveryRequirement: "repository_delivery" },
+        comment,
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(refused.allowed).toBe(false);
+      expect(refused.tier).toBe(null);
+      expect(refused.reason).toContain("record_only");
+    });
+
     it("refuses a syntactically complete Tier 1 line that is only arbitrary prose", async () => {
       const result = await evaluateDoneTierDeclaration(
         mockDb,
@@ -5548,15 +5585,17 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(ghFetchMock).not.toHaveBeenCalled();
     });
 
-    it("SUP-21328: accepted Tier 1 forms advertise both landed-at-tip and landing-delegated", () => {
+    it("SUP-21328: accepted Tier 1 forms advertise landed-at-tip, landing-delegated, and no-repository-landing", () => {
       expect(TIER1_FORM).toContain("landed-at-tip <sha>");
       expect(TIER1_FORM).toContain("landing-delegated PR #<N>");
       expect(TIER1_FORM).toContain("done-close-landing-backstop");
+      expect(TIER1_FORM).toContain("no-repository-landing");
+      expect(TIER1_FORM).toContain("record_only issues only");
     });
 
     it("SUP-21328: each advertised Tier 1 prose form reaches the landing-token pre-check", async () => {
       const forms = TIER1_FORM.split('" or "').map((form) => form.replace(/^"|"$/g, ""));
-      expect(forms).toHaveLength(2);
+      expect(forms).toHaveLength(3);
       for (const form of forms) {
         const result = await evaluateDoneTierDeclaration(
           mockDb,
@@ -5567,6 +5606,27 @@ describe("evaluateDoneTierDeclaration", () => {
         );
         expect(result.reason).not.toContain("missing a landing-state token");
       }
+      // The record-only form is advertised with its restriction: on a non-record_only
+      // issue it must be refused by the record_only gate, never by a missing token.
+      const recordOnlyForm = forms[2]!;
+      const refused = await evaluateDoneTierDeclaration(
+        mockDb,
+        { ...tierIssue, deliveryRequirement: "repository_delivery" },
+        recordOnlyForm,
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(refused.allowed).toBe(false);
+      expect(refused.reason).toContain("record_only");
+      const accepted = await evaluateDoneTierDeclaration(
+        mockDb,
+        { ...tierIssue, deliveryRequirement: "record_only" },
+        recordOnlyForm,
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(accepted.allowed).toBe(true);
+      expect(accepted.tier).toBe("tier1");
     });
 
     it("SUP-21328: missing-tier remedy names structured doneTier with an exact JSON form per tier", async () => {
@@ -5594,6 +5654,7 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("landed-at-tip <sha>");
       expect(result.reason).toContain("landing-delegated PR #<N>");
+      expect(result.reason).toContain("no-repository-landing");
 
       const route = readFileSync(new URL("../routes/issues.ts", import.meta.url), "utf8");
       expect(route).toContain("DONE_TIER_STRUCTURED_FORMS");
@@ -5618,6 +5679,9 @@ describe("evaluateDoneTierDeclaration", () => {
       );
       expect(remedy).toContain(
         '"Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; landing obligation transferred to done-close-landing-backstop, not yet discharged; <why Tier 2 was not probed>. Liveness unverified."',
+      );
+      expect(remedy).toContain(
+        '"Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — <why Tier 2 was not probed>; accepted on record_only issues only. Liveness unverified."',
       );
       expect(TIER1_FORM.startsWith('"')).toBe(true);
       expect(TIER1_FORM.endsWith('"')).toBe(true);
