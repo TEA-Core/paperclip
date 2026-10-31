@@ -1334,8 +1334,9 @@ host rehearsal must measure that failure rate under load. The event fires with
 the gate.
 
 Remote execution targets cannot reach a loopback server and runs with explicit
-`extraArgs` (which are `opencode run` flags) keep the one-shot `run` path, with
-its first-request MCP race. Real-binary proof:
+`extraArgs` or `args` (which are `opencode run` flags) keep the one-shot `run`
+path, with its first-request MCP race. Such a run adds a command note and one
+warning log line naming the reason. Real-binary proof:
 `pnpm test:opencode-v2-acceptance` (adapter suite plus
 `server/src/__tests__/opencode-v2-paperclip-mcp.acceptance.test.ts`, which asserts
 the four Paperclip project tools are in the first main-agent request against the

@@ -1442,13 +1442,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // injected MCP servers before the first prompt (see serve-transport.ts).
     // Remote targets cannot reach a loopback server, and explicit extraArgs are
     // `opencode run` flags, so both keep the one-shot `run` path.
-    const useServeTransport = openCodeV2 && !executionTargetIsRemote && extraArgs.length === 0;
+    const oneShotReason = !openCodeV2
+      ? null
+      : executionTargetIsRemote
+        ? "the execution target is remote"
+        : extraArgs.length > 0
+          ? asStringArray(config.extraArgs).length > 0
+            ? "extraArgs are configured"
+            : "args are configured"
+          : null;
+    const useServeTransport = openCodeV2 && oneShotReason === null;
     if (useServeTransport) {
       commandNotes.push(
         `Running OpenCode V2 through a private \`opencode serve\` (loopback, per-run port and password); ` +
           `the first prompt waits for mcp.resources.changed from ${runtimeMcpServers.length} injected MCP server(s) plus ` +
           `${OPENCODE_SERVE_MCP_SETTLE_MS} ms (timer-based gate, fails the run after ${OPENCODE_SERVE_MCP_READY_TIMEOUT_MS / 1000}s).`,
       );
+    } else if (oneShotReason) {
+      const warning =
+        `OpenCode V2 is using the one-shot \`opencode run\` path because ${oneShotReason}; ` +
+        `Paperclip-named MCP tools may be missing from the first request (upstream anomalyco/opencode#60893).`;
+      commandNotes.push(warning);
+      await onLog("stdout", `[paperclip] Warning: ${warning}\n`);
     }
 
     const runAttempt = async (resumeSessionId: string | null) => {

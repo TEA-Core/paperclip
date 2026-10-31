@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { runAdapterExecutionTargetProcessMock, ensureCommandResolvableMock, ensureRuntimeCommandInstalledMock } = vi.hoisted(() => ({
@@ -1022,6 +1023,150 @@ describe("execute — OpenCode V2 native MCP", () => {
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("execute — OpenCode V2 serve transport", () => {
+  const fakeServer = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "fake-opencode-serve.mjs");
+  const token = "serve-runtime-mcp-secret";
+  const mcpServer = { name: "Paperclip projects", url: "https://paperclip.example/mcp", token, connectionId: "connection-serve" };
+
+  async function runServe(fake: Record<string, string> = {}) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-v2-serve-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "opencode");
+    const logFile = path.join(root, "requests.jsonl");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(
+      commandPath,
+      `#!/bin/sh\nif [ "$1" = "--version" ]; then printf '2.2.4\\n'; exit 0; fi\nexec "${process.execPath}" "${fakeServer}" "$@"\n`,
+      "utf8",
+    );
+    await fs.chmod(commandPath, 0o755);
+    runAdapterExecutionTargetProcessMock.mockReset();
+    const logs: string[] = [];
+    const metadata: Array<{ commandNotes?: string[]; commandArgs?: string[] }> = [];
+    try {
+      const result = await execute({
+        runId: `run-v2-serve-${Math.random().toString(36).slice(2)}`,
+        agent: { id: "agent-v2-serve", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          command: commandPath,
+          cliVersion: "2.2.4",
+          cwd: workspace,
+          model: "openai/gpt-5",
+          env: { OPENCODE_ALLOW_ALL_MODELS: "1", FAKE_LOG: logFile, FAKE_MCP_NAME: mcpServer.name, ...fake },
+        },
+        context: {},
+        runtimeMcp: { getServers: () => [mcpServer] },
+        onLog: async (_stream, chunk) => { logs.push(chunk); },
+        onMeta: async (value) => { metadata.push(value as (typeof metadata)[number]); },
+      });
+      const requests = (await fs.readFile(logFile, "utf8").catch(() => ""))
+        .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as { method: string; path: string });
+      return { result, logs: logs.join(""), metadata, requests };
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
+
+  it("runs a local V2 agent through a private opencode serve", async () => {
+    const { result, logs, metadata, requests } = await runServe();
+
+    expect(result.exitCode).toBe(0);
+    expect(result.summary).toBe("fake reply");
+    expect(result.sessionId).toBe("ses_fake");
+    expect(runAdapterExecutionTargetProcessMock).not.toHaveBeenCalled();
+    expect(requests.some((entry) => entry.path === "/api/session/ses_fake/prompt")).toBe(true);
+    expect(metadata[0]?.commandArgs?.slice(0, 5)).toEqual(["serve", "--hostname", "127.0.0.1", "--port", "0"]);
+    expect(metadata[0]?.commandNotes?.join("\n")).toContain("opencode serve");
+    expect(logs).not.toContain("one-shot");
+    expect(JSON.stringify({ logs, result })).not.toContain(token);
+  });
+
+  it("reports a failed turn's provider message as the errorMessage", async () => {
+    const { result } = await runServe({ FAKE_FAIL: "1" });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toBe("capped");
+  });
+
+  it("classifies a terminal billing failure on the serve transport", async () => {
+    const { result } = await runServe({ FAKE_FAIL: "1", FAKE_FAIL_MESSAGE: "insufficient quota for model gpt-5" });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("Terminal provider billing/usage error: insufficient quota for model gpt-5");
+  });
+
+  it("reports a transport failure instead of the server banner", async () => {
+    const { result } = await runServe({ FAKE_PROMPT_STATUS: "500" });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("OpenCode rejected the prompt: HTTP 500");
+    expect(result.errorMessage).not.toContain("listening on");
+  });
+});
+
+describe("execute — OpenCode V2 one-shot fallback is visible", () => {
+  const warningPattern = /Warning: OpenCode V2 is using the one-shot `opencode run` path because (.+?); Paperclip-named MCP tools may be missing from the first request \(upstream anomalyco\/opencode#60893\)\./;
+
+  async function runOneShot(config: Record<string, unknown>, extra: Record<string, unknown> = {}, version = "2.2.4") {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-v2-oneshot-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "opencode");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(commandPath, `#!/bin/sh\nif [ "$1" = "--version" ]; then printf '${version}\\n'; fi\n`, "utf8");
+    await fs.chmod(commandPath, 0o755);
+    runAdapterExecutionTargetProcessMock.mockReset();
+    runAdapterExecutionTargetProcessMock.mockImplementation(async (_runId: string, _target: unknown, _command: string, args: string[]) =>
+      args[0] === "--version"
+        ? probeResult({ stdout: `${version}\n` })
+        : probeResult({ stdout: JSON.stringify({ type: "text", sessionID: "session-oneshot", part: { text: "done" } }) }));
+    const logs: string[] = [];
+    const metadata: Array<{ commandNotes?: string[] }> = [];
+    try {
+      const result = await execute({
+        runId: "run-v2-oneshot",
+        agent: { id: "agent-v2-oneshot", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: commandPath, cwd: workspace, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" }, ...config },
+        context: {},
+        onLog: async (_stream, chunk) => { logs.push(chunk); },
+        onMeta: async (value) => { metadata.push(value as (typeof metadata)[number]); },
+        ...extra,
+      } as AdapterExecutionContext);
+      return { result, logs, notes: metadata[0]?.commandNotes ?? [] };
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
+
+  it.each([
+    ["extraArgs", { cliVersion: "2.2.4", extraArgs: ["--print-logs"] }, {}, "extraArgs are configured"],
+    ["args", { cliVersion: "2.2.4", args: ["--print-logs"] }, {}, "args are configured"],
+    [
+      "a remote target",
+      { cliVersion: "2.2.4", command: "opencode" },
+      { executionTarget: { kind: "remote", transport: "sandbox", providerKey: "fixture", remoteCwd: "/remote/workspace" } },
+      "the execution target is remote",
+    ],
+  ])("says so in a command note and one warning log line when %s keeps the run path", async (_label, config, extra, reason) => {
+    const { result, logs, notes } = await runOneShot(config, extra);
+
+    expect(result.exitCode).toBe(0);
+    expect(runAdapterExecutionTargetProcessMock.mock.calls.some((call) => (call[3] as string[])[0] === "run")).toBe(true);
+    const warnings = logs.filter((chunk) => warningPattern.test(chunk));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]!.match(warningPattern)![1]).toBe(reason);
+    expect(notes.filter((note) => note.includes("one-shot `opencode run` path") && note.includes(reason) && note.includes("opencode#60893"))).toHaveLength(1);
+  });
+
+  it("does not warn for OpenCode V1", async () => {
+    const { logs, notes } = await runOneShot({ extraArgs: ["--print-logs"] }, {}, "1.17.9");
+
+    expect(logs.some((chunk) => chunk.includes("one-shot"))).toBe(false);
+    expect(notes.some((note) => note.includes("one-shot"))).toBe(false);
   });
 });
 

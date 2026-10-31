@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { MAX_CAPTURE_BYTES } from "@paperclipai/adapter-utils/server-utils";
 import { parseOpenCodeJsonl } from "./parse.js";
 import {
   buildOpenCodeServeArgs,
@@ -38,12 +39,21 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
     return raw.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as { at: number; method: string; path: string; body: string });
   }
 
+  function serverEnv(extra: Record<string, string> = {}) {
+    return { PATH: process.env.PATH ?? "", FAKE_LOG: logFile, FAKE_MCP_NAME: "Paperclip projects", ...extra };
+  }
+
+  async function expectServerStopped() {
+    const port = await fs.readFile(`${logFile}.port`, "utf8");
+    await expect(fetch(`http://127.0.0.1:${port}/api/info`)).rejects.toThrow();
+  }
+
   function input(overrides: Partial<OpenCodeServeInput> & { env?: Record<string, string> } = {}): OpenCodeServeInput {
     return {
       runId: `serve-${Math.random().toString(36).slice(2)}`,
       command,
       cwd: root,
-      env: { PATH: process.env.PATH ?? "", FAKE_LOG: logFile, FAKE_MCP_NAME: "Paperclip projects", ...overrides.env },
+      env: serverEnv(),
       timeoutSec: 30,
       graceSec: 2,
       prompt: "do the thing",
@@ -79,11 +89,25 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
   });
 
   it("fails closed without creating a session when an MCP server never reports", async () => {
-    const result = await runOpenCodeServeProcess(input({ env: { PATH: process.env.PATH ?? "", FAKE_LOG: logFile, FAKE_NO_MCP_EVENT: "1", FAKE_MCP_NAME: "Paperclip projects" }, mcpReadyTimeoutMs: 600 }));
+    const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_NO_MCP_EVENT: "1" }), mcpReadyTimeoutMs: 600 }));
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("did not report mcp.resources.changed for MCP server(s) Paperclip projects within 0.6s");
     expect(result.stderr).toContain("without its Paperclip tools");
+    expect(result.stderr).not.toContain("listening on");
+    // The clear text is a stdout `error` event so it becomes the run's errorMessage.
+    expect(parseOpenCodeJsonl(result.stdout).errorMessage).toContain("did not report mcp.resources.changed for MCP server(s) Paperclip projects");
     expect((await requests()).some((entry) => entry.path.startsWith("/api/session"))).toBe(false);
+    await expectServerStopped();
+  });
+
+  it("bounds the MCP touch request by the same readiness deadline", async () => {
+    const startedAt = Date.now();
+    const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_HANG_MCP: "1" }), mcpReadyTimeoutMs: 500 }));
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
+    expect(result.exitCode).toBe(1);
+    expect(parseOpenCodeJsonl(result.stdout).errorMessage).toContain("did not answer its MCP status request within 0.5s");
+    expect((await requests()).some((entry) => entry.path.startsWith("/api/session"))).toBe(false);
+    await expectServerStopped();
   });
 
   it("does not wait when no MCP server was injected", async () => {
@@ -93,15 +117,17 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
   });
 
   it("maps a failed turn to exit 1 with the error in the stream", async () => {
-    const result = await runOpenCodeServeProcess(input({ env: { PATH: process.env.PATH ?? "", FAKE_LOG: logFile, FAKE_FAIL: "1", FAKE_MCP_NAME: "Paperclip projects" } }));
+    const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_FAIL: "1" }) }));
     expect(result.exitCode).toBe(1);
     expect(parseOpenCodeJsonl(result.stdout).errorMessage).toBe("capped");
+    expect(result.stderr).toContain("capped");
   });
 
   it("reports an unknown resume session without prompting", async () => {
     const result = await runOpenCodeServeProcess(input({ resumeSessionId: "ses_missing" }));
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toMatch(/session ses_missing not found/i);
+    expect(parseOpenCodeJsonl(result.stdout).errorMessage).toMatch(/session ses_missing not found/i);
     expect((await requests()).some((entry) => entry.path.endsWith("/prompt"))).toBe(false);
   });
 
@@ -115,20 +141,55 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
     expect(seen.some((entry) => entry.path === "/api/session" && entry.method === "POST")).toBe(false);
   });
 
-  it("never leaks the server password or the MCP bearer token into logs or results", async () => {
-    // The fake echoes nothing secret itself, so exercise the redactor on a
-    // line the server could print and on the real password the run used.
-    const result = await runOpenCodeServeProcess(input());
+  it("never leaks the server password, its Authorization header or the MCP bearer token", async () => {
+    // The fake echoes all three into its output, its stderr and an event text.
+    const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_SECRET: TOKEN }) }));
+    expect(result.exitCode).toBe(0);
+    const password = await fs.readFile(`${logFile}.password`, "utf8");
+    const credential = Buffer.from(`opencode:${password}`).toString("base64");
     const everything = `${result.stdout}${result.stderr}${logs.join("")}`;
-    expect(everything).not.toContain(TOKEN);
+    expect(everything).toContain("[redacted]");
+    expect(result.stderr).toContain("authorization=Basic [redacted]");
+    for (const secret of [TOKEN, password, credential]) expect(everything).not.toContain(secret);
     expect(redactOpenCodeServeSecrets(`Authorization: Bearer ${TOKEN} x`, [TOKEN])).toBe("Authorization: Bearer [redacted] x");
+  });
+
+  it("caps captured output like the one-shot path", async () => {
+    const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_BIG_TEXT_BYTES: String(MAX_CAPTURE_BYTES + 1_000_000) }) }));
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.length).toBeLessThanOrEqual(MAX_CAPTURE_BYTES);
+  });
+
+  it("keeps the wall-clock timeout and frees the server", async () => {
+    const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_HANG_TURN: "1" }), timeoutSec: 1 }));
+    expect(result.timedOut).toBe(true);
+    await expectServerStopped();
+  });
+
+  it("escalates to SIGKILL when the server ignores SIGTERM", async () => {
+    const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_IGNORE_SIGTERM: "1" }), graceSec: 1 }));
+    expect(result.exitCode).toBe(0);
+    expect(result.timedOut).toBe(false);
+    await expectServerStopped();
+  });
+
+  it("still stops the server when the log sink rejects", async () => {
+    const result = await runOpenCodeServeProcess(
+      input({
+        env: serverEnv({ FAKE_NO_MCP_EVENT: "1" }),
+        mcpReadyTimeoutMs: 400,
+        onLog: async () => {
+          throw new Error("log store unavailable");
+        },
+      }),
+    );
+    expect(result.exitCode).toBe(1);
+    await expectServerStopped();
   });
 
   it("stops the server it started and frees its port", async () => {
     await runOpenCodeServeProcess(input());
-    const port = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(logs.join(""))?.[1];
-    expect(port).toBeTruthy();
-    await expect(fetch(`http://127.0.0.1:${port}/api/info`)).rejects.toThrow();
+    await expectServerStopped();
   });
 });
 

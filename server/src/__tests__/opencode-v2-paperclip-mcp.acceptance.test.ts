@@ -10,7 +10,7 @@ import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { OPENCODE_V2_CLI_VERSION } from "@paperclipai/adapter-opencode-local";
 import { execute } from "@paperclipai/adapter-opencode-local/server";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
-import { getEmbeddedPostgresTestSupport } from "./helpers/embedded-postgres.js";
+import { getEmbeddedPostgresTestSupport, type EmbeddedPostgresTestSupport } from "./helpers/embedded-postgres.js";
 import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
 
 // Real OpenCode V2 binary + real adapter (private `opencode serve` transport) +
@@ -23,7 +23,7 @@ import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
 // that catches the gate being too short. Opt-in like the adapter's own
 // real-binary suite (`pnpm test:opencode-v2-acceptance`).
 const enabled = process.env.PAPERCLIP_OPENCODE_V2_ACCEPTANCE === "1";
-const support = enabled ? await getEmbeddedPostgresTestSupport() : { supported: false };
+const support: EmbeddedPostgresTestSupport = enabled ? await getEmbeddedPostgresTestSupport() : { supported: false };
 const PROJECT_TOOL_NAMES = ["create_project", "create_task", "list_project_repositories", "list_projects"];
 const SERVER_NAME = "Paperclip projects";
 const model = "paperclip-fixture/acceptance-model";
@@ -45,7 +45,7 @@ function provisionBinary(): string {
   return parsed.binary;
 }
 
-(enabled && support.supported ? describe : describe.skip)("OpenCode V2 + real Paperclip MCP endpoint", () => {
+describe.skipIf(!enabled)("OpenCode V2 + real Paperclip MCP endpoint", () => {
   let api: Awaited<ReturnType<typeof startRunnerApiTestServer>>;
   let rootDir: string;
   let modelServer: Server;
@@ -57,6 +57,11 @@ function provisionBinary(): string {
   let savedAllowAll: string | undefined;
 
   beforeAll(async () => {
+    // Opting in on a runner without embedded Postgres must fail, not skip: a
+    // skipped suite reports green without having checked the first request.
+    if (!support.supported) {
+      throw new Error(`OpenCode V2 + Paperclip MCP acceptance needs embedded Postgres: ${support.reason ?? "unsupported on this runner"}`);
+    }
     process.env.PAPERCLIP_AGENT_JWT_SECRET = randomUUID();
     savedAllowAll = process.env.OPENCODE_ALLOW_ALL_MODELS;
     delete process.env.OPENCODE_ALLOW_ALL_MODELS;
@@ -95,7 +100,7 @@ function provisionBinary(): string {
     if (savedAllowAll !== undefined) process.env.OPENCODE_ALLOW_ALL_MODELS = savedAllowAll;
     await new Promise<void>((resolve) => modelServer?.close(() => resolve()));
     await api?.close();
-    await rm(rootDir, { recursive: true, force: true });
+    if (rootDir) await rm(rootDir, { recursive: true, force: true });
   });
 
   async function runOnce(label: string) {

@@ -1,11 +1,14 @@
 // Minimal stand-in for `opencode serve` (2.2.4 API subset) used by serve-transport.test.ts.
 // Records every request to FAKE_LOG so tests can assert order and timing.
-import { appendFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import http from "node:http";
 
 const password = process.env.OPENCODE_SERVER_PASSWORD ?? "";
 const log = (entry) => appendFileSync(process.env.FAKE_LOG, `${JSON.stringify({ at: Date.now(), ...entry })}\n`);
 const mcpName = process.env.FAKE_MCP_NAME ?? "";
+// Lets a test plant secrets the server could leak: the per-run password, the
+// Authorization header it receives, and this token.
+const leakToken = process.env.FAKE_SECRET ?? "";
 const clients = new Set();
 const push = (type, data) => {
   for (const res of clients) res.write(`data: ${JSON.stringify({ id: `evt_${Math.random()}`, type, data })}\n\n`);
@@ -20,6 +23,7 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ _tag: "UnauthorizedError" }));
   }
   log({ method: req.method, path: req.url, body });
+  if (leakToken) console.error(`debug request ${req.url} authorization=${req.headers.authorization} password=${password} token=${leakToken}`);
   const json = (status, value) => {
     res.writeHead(status, { "content-type": "application/json" });
     res.end(JSON.stringify(value));
@@ -32,6 +36,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.url === "/api/mcp") {
+    if (process.env.FAKE_HANG_MCP === "1") return;
     if (mcpName && process.env.FAKE_NO_MCP_EVENT !== "1") {
       setTimeout(() => push("mcp.resources.changed", { server: mcpName }), 100);
     }
@@ -49,14 +54,16 @@ const server = http.createServer(async (req, res) => {
       return res.end();
     }
     if (rest === "/prompt") {
+      if (process.env.FAKE_PROMPT_STATUS) return json(Number(process.env.FAKE_PROMPT_STATUS), { _tag: "PromptRejected" });
       json(200, { data: { id: "msg_1" } });
       const base = { sessionID: id, assistantMessageID: "msg_a" };
       setTimeout(() => {
         push("session.execution.started", { sessionID: id });
         push("session.step.started", base);
-        push("session.text.ended", { ...base, ordinal: 0, text: "fake reply" });
+        push("session.text.ended", { ...base, ordinal: 0, text: `fake reply${leakToken ? ` ${password} ${leakToken}` : ""}${"x".repeat(Number(process.env.FAKE_BIG_TEXT_BYTES ?? 0))}` });
         push("session.step.ended", { ...base, finish: "stop", tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 1, write: 0 } }, cost: 0 });
-        if (process.env.FAKE_FAIL === "1") push("session.execution.failed", { sessionID: id, error: { type: "output-limit", message: "capped" } });
+        if (process.env.FAKE_HANG_TURN === "1") return;
+        if (process.env.FAKE_FAIL === "1") push("session.execution.failed", { sessionID: id, error: { type: "output-limit", message: process.env.FAKE_FAIL_MESSAGE ?? "capped" } });
         else push("session.execution.succeeded", { sessionID: id });
       }, 50);
       return;
@@ -66,6 +73,12 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(0, "127.0.0.1", () => {
-  console.log(`server listening on http://127.0.0.1:${server.address().port}`);
+  const { port } = server.address();
+  writeFileSync(`${process.env.FAKE_LOG}.port`, String(port));
+  writeFileSync(`${process.env.FAKE_LOG}.password`, password);
+  console.log(`server listening on http://127.0.0.1:${port}`);
+  if (leakToken) console.log(`debug banner password=${password} token=${leakToken}`);
 });
-process.on("SIGTERM", () => process.exit(0));
+process.on("SIGTERM", () => {
+  if (process.env.FAKE_IGNORE_SIGTERM !== "1") process.exit(0);
+});

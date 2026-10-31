@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import {
+  appendWithCap,
   asString,
   parseObject,
   runChildProcess,
@@ -10,6 +11,7 @@ import {
 import {
   createOpenCodeServeEventState,
   mapOpenCodeServeEvent,
+  parseOpenCodeJsonl,
   type OpenCodeServeTurnOutcome,
 } from "./parse.js";
 
@@ -152,17 +154,28 @@ async function* readEventStream(response: Response, signal: AbortSignal): AsyncG
 
 export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promise<RunProcessResult> {
   const password = randomBytes(24).toString("hex");
-  const secrets = [password, ...input.mcpServers.map((server) => server.token)];
+  const credential = Buffer.from(`${SERVER_USERNAME}:${password}`).toString("base64");
+  const secrets = [password, credential, ...input.mcpServers.map((server) => server.token)];
   const redact = (text: string) => redactOpenCodeServeSecrets(text, secrets);
-  const authorization = `Basic ${Buffer.from(`${SERVER_USERNAME}:${password}`).toString("base64")}`;
+  const authorization = `Basic ${credential}`;
   const readyTimeoutMs = input.mcpReadyTimeoutMs ?? OPENCODE_SERVE_MCP_READY_TIMEOUT_MS;
 
   let stdout = "";
   let stderr = "";
   const emit = async (stream: "stdout" | "stderr", text: string) => {
-    if (stream === "stdout") stdout += text;
-    else stderr += text;
-    await input.onLog(stream, text);
+    if (stream === "stdout") stdout = appendWithCap(stdout, text);
+    else stderr = appendWithCap(stderr, text);
+    // A failing log sink must not change the run result or skip the cleanup.
+    await input.onLog(stream, text).catch((err: unknown) =>
+      console.warn({ err, runId: input.runId }, "failed to append OpenCode serve log chunk"),
+    );
+  };
+  // `toResult` takes errorMessage from the parsed stdout `error` event, the same
+  // place `opencode run` reports a failure, and classifies from stderr.
+  const reportFailure = async (message: string) => {
+    const text = redact(message);
+    await emit("stdout", `${JSON.stringify({ type: "error", error: { message: text } })}\n`);
+    await emit("stderr", `[paperclip] ${text}\n`);
   };
 
   const port = deferred<number>();
@@ -179,7 +192,10 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
       serverOutput += chunk;
       const match = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(serverOutput);
       if (match) port.resolve(Number(match[1]));
-      await emit("stderr", redact(chunk));
+      // The banner would otherwise be the first stderr line, which is what
+      // `toResult` quotes when a run fails without a parsed error.
+      const diagnostics = chunk.replace(/^.*listening on http:\/\/127\.0\.0\.1:\d+.*(?:\r?\n|$)/m, "");
+      if (diagnostics) await emit("stderr", redact(diagnostics));
     },
   });
   const serverExit = server.then(
@@ -209,6 +225,10 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     if (!boundSessionId || asString(data.sessionID, "") !== boundSessionId) return;
     const mapped = mapOpenCodeServeEvent(envelope, eventState);
     for (const line of mapped.lines) await emit("stdout", `${redact(line)}\n`);
+    if (mapped.outcome === "failed") {
+      const message = parseOpenCodeJsonl(mapped.lines.join("\n")).errorMessage;
+      if (message) await emit("stderr", `${redact(message)}\n`);
+    }
     if (mapped.outcome) {
       outcome = mapped.outcome;
       turnDone.resolve(mapped.outcome);
@@ -219,10 +239,18 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     abort.abort();
     const running = runningProcesses.get(input.runId);
     if (running) signalRunningProcess(running, "SIGTERM");
+    // Only runChildProcess's own deadline otherwise escalates, so a server that
+    // ignores SIGTERM would hold the run (and its port) until the wall clock.
+    const grace = timeout(Math.max(1, input.graceSec) * 1000);
+    const stopped = await Promise.race([serverExit, grace.promise]);
+    grace.cancel();
+    if (stopped === "timeout") {
+      const lingering = runningProcesses.get(input.runId);
+      if (lingering) signalRunningProcess(lingering, "SIGKILL");
+    }
     const settled = await serverExit;
     if (!settled.ok) {
-      const message = redact(settled.error instanceof Error ? settled.error.message : String(settled.error));
-      await emit("stderr", `[paperclip] ${message}\n`);
+      await reportFailure(settled.error instanceof Error ? settled.error.message : String(settled.error));
       return { exitCode: 1, signal: null, timedOut: false, stdout, stderr, pid: null, startedAt: null };
     }
     const proc = settled.value;
@@ -230,7 +258,7 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     // the run. A server that died on its own (timeout, cancel, crash) keeps its.
     const endedByTurn = outcome !== null || failure !== null;
     if (outcome === "interrupted" && !proc.timedOut) {
-      await emit("stderr", "OpenCode session was interrupted before it finished\n");
+      await reportFailure("OpenCode session was interrupted before it finished");
     }
     return {
       ...proc,
@@ -241,6 +269,7 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     };
   };
 
+  let exitCodeOnTurnEnd = 1;
   try {
     const startTimer = timeout(SERVE_START_TIMEOUT_MS);
     const started = await Promise.race([port.promise, serverExited, startTimer.promise]);
@@ -281,11 +310,19 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     if (connectResult !== "connected") throw new ServeTransportError(`OpenCode event stream did not connect (${connectResult})`);
 
     // First location-scoped request: this is what makes OpenCode start MCP.
-    await request("/api/mcp");
+    // The readiness deadline covers it, so a request that blocks while the MCP
+    // servers come up cannot outlast the bound.
+    const deadline = Date.now() + readyTimeoutMs;
+    const touchTimer = timeout(readyTimeoutMs);
+    const touched = await Promise.race([request("/api/mcp").then(() => "touched" as const), serverExited, touchTimer.promise]);
+    touchTimer.cancel();
+    if (touched === "server-exited") throw new ServeTransportError("OpenCode server stopped while starting its MCP servers");
+    if (touched === "timeout") {
+      throw new ServeTransportError(`OpenCode did not answer its MCP status request within ${readyTimeoutMs / 1000}s; the run was not started.`);
+    }
 
     if (input.mcpServers.length > 0) {
       const missing = () => input.mcpServers.filter((entry) => !seenResourceServers.has(entry.name)).map((entry) => entry.name);
-      const deadline = Date.now() + readyTimeoutMs;
       while (missing().length > 0) {
         const remaining = deadline - Date.now();
         if (remaining <= 0) {
@@ -313,11 +350,7 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     if (input.resumeSessionId) {
       sessionId = input.resumeSessionId;
       const existing = await request(`/api/session/${encodeURIComponent(sessionId)}`);
-      if (existing.status === 404) {
-        await emit("stderr", `OpenCode session ${sessionId} not found (unknown session)\n`);
-        failure = "unknown session";
-        return await finish(1);
-      }
+      if (existing.status === 404) throw new ServeTransportError(`OpenCode session ${sessionId} not found (unknown session)`);
       if (existing.status !== 200) throw new ServeTransportError(`OpenCode could not load session ${sessionId}: HTTP ${existing.status}`);
       const switched = await request(`/api/session/${encodeURIComponent(sessionId)}/model`, {
         method: "POST",
@@ -348,10 +381,10 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     // The turn ends with `session.execution.*`, or the server dies first
     // (wall-clock timeout, external cancel, crash) and the stream closes.
     await Promise.race([turnDone.promise, serverExited, pumpEnded]);
-    return await finish(outcome === "succeeded" ? 0 : 1);
+    exitCodeOnTurnEnd = outcome === "succeeded" ? 0 : 1;
   } catch (error) {
     failure = redact(error instanceof Error ? error.message : String(error));
-    await emit("stderr", `[paperclip] ${failure}\n`);
-    return await finish(1);
+    await reportFailure(failure);
   }
+  return await finish(exitCodeOnTurnEnd);
 }
