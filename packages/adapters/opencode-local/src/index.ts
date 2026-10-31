@@ -112,7 +112,10 @@ Notes:
   \`opencode models\` to list available options in provider/model format.
 - Paperclip requires an explicit \`model\` value for \`opencode_local\` agents.
 - Runs are executed with: opencode run --format json ...
-- Opt-in V2 runs use: opencode run --standalone --format json ...
+- Opt-in V2 runs use a private loopback \`opencode serve\` (per-run port and password) so \
+  the Paperclip MCP tools are in the first request; remote targets and runs with \
+  \`extraArgs\` or \`args\` keep: opencode run --standalone --format json ... \
+  (see doc/DEVELOPING.md, OpenCode V2 Server Transport).
 - Sessions are resumed with --session when stored session cwd matches current cwd.
 - The adapter sets OPENCODE_DISABLE_PROJECT_CONFIG=true to prevent OpenCode from \
   writing an opencode.json config file into the project working directory. Model \

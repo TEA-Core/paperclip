@@ -1,16 +1,17 @@
 name: OpenCode V2 acceptance
 
 # The opencode_local adapter drives a real OpenCode 2.x binary, and the only
-# proof that the V2 argument shape, model discovery and output-cap handling
-# still work against that binary lives in
-# `packages/adapters/opencode-local/src/server/real-binary.acceptance.test.ts`.
+# proof that the V2 argument shape, model discovery, output-cap handling and the
+# `opencode serve` MCP gate still work against that binary lives in
+# `packages/adapters/opencode-local/src/server/real-binary.acceptance.test.ts`
+# and `server/src/__tests__/opencode-v2-paperclip-mcp.acceptance.test.ts`.
 # Unit tests fake the binary, so a V2 regression is invisible to them.
 #
-# That suite is opt-in (`PAPERCLIP_OPENCODE_V2_ACCEPTANCE=1`) because the default
+# Those suites are opt-in (`PAPERCLIP_OPENCODE_V2_ACCEPTANCE=1`) because the default
 # `pnpm test` lane must neither download a ~250 MB binary nor launch real
 # processes. Opt-in is only honest when something actually opts in, so this
 # workflow is that something: it provisions the pinned release through
-# `pnpm opencode:v2-acceptance:provision` and runs the suite. Failing here is a
+# `pnpm opencode:v2-acceptance:provision` and runs the suites. Failing here is a
 # real signal -- the suite fails closed when the binary cannot be provisioned,
 # rather than skipping and reporting green.
 #
