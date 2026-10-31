@@ -98,7 +98,7 @@ vi.mock("./models.js", async (importOriginal) => {
 });
 
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { runningProcesses, sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
+import { isSpawnEnvelopeTooLargeError, runningProcesses, sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 import * as serverUtils from "@paperclipai/adapter-utils/server-utils";
 
 import {
@@ -1128,6 +1128,12 @@ describe("execute — OpenCode V2 serve transport", () => {
 
     expect(result.exitCode).toBe(1);
     expect(result.errorMessage).toContain("Terminal provider billing/usage error: insufficient quota for model gpt-5");
+  });
+
+  it("propagates a spawn refusal out of execute so heartbeat can classify it", async () => {
+    const refusal = await runServe({ OVERSIZE_ENV: "x".repeat(140_000) }).catch((error: unknown) => error);
+
+    expect(isSpawnEnvelopeTooLargeError(refusal)).toBe(true);
   });
 
   it("reports a transport failure instead of the server banner", async () => {

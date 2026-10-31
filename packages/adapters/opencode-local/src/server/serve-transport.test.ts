@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { MAX_CAPTURE_BYTES } from "@paperclipai/adapter-utils/server-utils";
+import { MAX_CAPTURE_BYTES, isSpawnEnvelopeTooLargeError } from "@paperclipai/adapter-utils/server-utils";
 import { parseOpenCodeJsonl } from "./parse.js";
 import {
   buildOpenCodeServeArgs,
@@ -277,6 +277,17 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
     expect(result.exitCode).toBe(1);
     expect(parseOpenCodeJsonl(result.stdout).errorMessage).toContain("ended before the turn finished");
     await expectServerStopped();
+  });
+
+  it("lets a spawn refusal escape like the one-shot path instead of turning it into an exit-1 result", async () => {
+    const refusal = await runOpenCodeServeProcess(input({ env: serverEnv({ OVERSIZE_ENV: "x".repeat(140_000) }) })).catch((error: unknown) => error);
+
+    expect(isSpawnEnvelopeTooLargeError(refusal)).toBe(true);
+    expect((await requests()).length).toBe(0);
+  });
+
+  it("lets a failed command launch escape instead of turning it into an exit-1 result", async () => {
+    await expect(runOpenCodeServeProcess(input({ command: path.join(root, "no-such-opencode") }))).rejects.toThrow(/Failed to start command/);
   });
 
   it("stops the server it started and frees its port", async () => {

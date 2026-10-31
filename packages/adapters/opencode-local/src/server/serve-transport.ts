@@ -359,10 +359,7 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
       if (lingering) signalRunningProcess(lingering, "SIGKILL");
     }
     const settled = await serverExit;
-    if (!settled.ok) {
-      await reportFailure(settled.error instanceof Error ? settled.error.message : String(settled.error));
-      return { exitCode: 1, signal: null, timedOut: false, stdout, stderr, pid: null, startedAt: null };
-    }
+    if (!settled.ok) throw settled.error;
     const proc = settled.value;
     // We stop the server after the turn, so its exit status says nothing about
     // the run. A server that died on its own (timeout, cancel, crash) keeps its.
