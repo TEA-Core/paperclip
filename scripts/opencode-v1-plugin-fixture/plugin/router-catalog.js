@@ -19,7 +19,7 @@ async function getJSON(url) {
   return res.json();
 }
 
-// Only what buildCatalog reads; /api/rules also carries prices, caps and notes.
+// Only what buildCatalog reads; the rules response also carries prices, caps and notes.
 function trimRules(rules) {
   const roles = {};
   for (const [k, r] of Object.entries(rules.roles ?? {})) {

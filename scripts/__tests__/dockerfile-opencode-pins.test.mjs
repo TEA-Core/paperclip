@@ -96,8 +96,8 @@ test("V1 router-plugin fixture is the pinned fleet copy (baseline launch evidenc
   // pinned so the baseline launch assertion fails on silent fixture drift.
   const fixtureDir = path.join(repoRoot, "scripts", "opencode-v1-plugin-fixture");
   const pins = [
-    ["plugin/router-catalog.js", "a23a25f613b6ce12b3582c53202b7f222b0bbd22ade4ebe6af97a57b6f0f5d0c"],
-    ["router-catalog/lib.mjs", "14c9f10bb0c1abc592c0d81d45433dcb5533424f65aa0d9aac566d81e452feb5"],
+    ["plugin/router-catalog.js", "c6f21d830b476416f935f03820467eba3991d5ebe9f839e0d8299d8e835a441a"],
+    ["router-catalog/lib.mjs", "9eac63e3f5109ddb35e9ceff77910e55092caed842b08374529343a215284a61"],
   ];
   for (const [rel, sha] of pins) {
     const digest = createHash("sha256")

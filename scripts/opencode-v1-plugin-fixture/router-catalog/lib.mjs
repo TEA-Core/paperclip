@@ -12,9 +12,8 @@ const MODELS_OUTPUT = 32768;
 // Header -> env var carrying the router's conversation identity. opencode
 // interpolates "{env:VAR}" only while it loads the static config file, so a
 // plugin that returns the template gets it passed through to the provider
-// verbatim. The router then reads "{env:PAPERCLIP_RUN_ID}" as a run id, which
-// is the same string for every request from a role: one immortal conversation
-// per role, whose pin ratchet holds the whole role on the escalation rung.
+// verbatim. The router would then read "{env:PAPERCLIP_RUN_ID}" as a literal run
+// id, the same string for every request, so the identity would be wrong.
 // Expand here instead.
 const IDENTITY_HEADERS = {
   "X-Paperclip-Run": "PAPERCLIP_WORKSPACE_CWD",
@@ -50,8 +49,8 @@ function openaiCompatible(name, baseURL, headers) {
 
 // Smallest window any rung declares. Disabled targets and paused pools count:
 // either can come back without opencode restarting, and a turn sized for a
-// bigger rung then overflows it. Same bound as opencode-model-limits-audit.sh,
-// so the generated config cannot trip OVERDECL.
+// bigger rung then overflows it. Same bound as the config audit, so the
+// generated config stays valid.
 function smallestRungWindow(targets) {
   const windows = targets.map((t) => t.maxContextTokens ?? 0).filter((w) => w > 0);
   return windows.length ? Math.min(...windows) : 0;
