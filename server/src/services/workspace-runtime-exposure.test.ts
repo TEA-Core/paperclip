@@ -124,6 +124,27 @@ setInterval(() => {}, 1000);
 `;
 
 /**
+ * A guest with no `--bind` argv whose bind mode comes from the environment,
+ * the way the real checkout resolves it through config precedence:
+ * `PAPERCLIP_BIND` first, then the config file, then `HOST` (SUP-22143). It
+ * records the spawn env it saw next to itself, so the tests can assert what
+ * the control plane actually passed rather than trusting the start to succeed.
+ */
+const ENV_BIND_GUEST = `
+import http from "node:http";
+import { writeFileSync } from "node:fs";
+const p = Number(process.env.PORT);
+writeFileSync(new URL("./env-probe.json", import.meta.url), JSON.stringify({
+  host: process.env.HOST ?? null,
+  bind: process.env.PAPERCLIP_BIND ?? null,
+  bindHost: process.env.PAPERCLIP_BIND_HOST ?? null,
+}));
+const health = (rq, r) => { if (rq.url === "/api/health") { r.setHeader("content-type","application/json"); r.end(JSON.stringify({status:"ok"})); return true; } return false; };
+http.createServer((rq, r) => { if (health(rq, r)) return; r.statusCode = 200; r.end("ok"); }).listen(p, "127.0.0.1");
+setInterval(() => {}, 1000);
+`;
+
+/**
  * A guest that prints a synthetic `EADDRINUSE` line for its assigned port with no
  * host listener behind it, then exits. It models guest-controlled output that
  * claims a collision the host cannot confirm. The runtime must not quarantine the
@@ -189,6 +210,7 @@ beforeAll(async () => {
   await fs.writeFile(path.join(guestDir, "dev-runner.mjs"), PRE_MANAGED_EXPOSURE_GUEST);
   await fs.writeFile(path.join(guestDir, "dev-runner-legacy.mjs"), ALWAYS_WILDCARD_GUEST);
   await fs.writeFile(path.join(guestDir, "dev-runner-wildcard-hmr.mjs"), WILDCARD_HMR_GUEST);
+  await fs.writeFile(path.join(guestDir, "dev-runner-env-probe.mjs"), ENV_BIND_GUEST);
   await fs.writeFile(
     path.join(guestDir, "dev-runner-bind-conflict.mjs"),
     'process.stderr.write("local_trusted requires server.bind=loopback\\n"); process.exit(1);\n',
@@ -731,6 +753,92 @@ describe("loopback bind is forced on the guest, not merely requested (PAP-17256)
     }))).rejects.toThrow(
       /deployment\/bind conflict: local_trusted requires server\.bind=loopback.*output: local_trusted requires server\.bind=loopback/s,
     );
+  }, 20_000);
+});
+
+/**
+ * SUP-22143: the deployed regression. On a broker-less host (auto mode,
+ * `isBrokerAvailable()` false) exposure resolves null, and the loopback bind
+ * env used to be set only inside the exposure branch. The spawned guest then
+ * inherited the control-plane container's `HOST=0.0.0.0`, outranked its config
+ * file's `server.host`, resolved `bind=lan`, and a `local_trusted` guest exited
+ * with `local_trusted requires server.bind=loopback` on every start.
+ */
+describe("loopback bind env is forced even when HTTPS exposure is unavailable (SUP-22143)", () => {
+  const probePath = () => path.join(guestDir, "env-probe.json");
+
+  async function readGuestEnvProbe(): Promise<{ host: string | null; bind: string | null; bindHost: string | null }> {
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      try {
+        return JSON.parse(await fs.readFile(probePath(), "utf8")) as {
+          host: string | null;
+          bind: string | null;
+          bindHost: string | null;
+        };
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+    throw new Error("guest env probe was never written");
+  }
+
+  it("forces the loopback bind env on a paperclip-dev service when exposure resolves null", async () => {
+    const { broker, calls } = createBroker();
+    // The broker-less host shape: auto mode with no broker socket.
+    installDeps({ broker, isBrokerAvailable: async () => false });
+
+    // The control-plane container exports HOST=0.0.0.0; the child used to
+    // inherit it verbatim through the sanitized base env.
+    const previousHost = process.env.HOST;
+    process.env.HOST = "0.0.0.0";
+    try {
+      await fs.rm(probePath(), { force: true });
+      const [runtime] = await startRuntimeServicesForWorkspaceControl(startInput({
+        serviceName: "paperclip-dev",
+        command: guestCommand("dev-runner-env-probe.mjs"),
+        expose: LEGACY_HTTP_EXPOSE,
+        port: { type: "auto", envKey: "PORT" },
+      }));
+
+      // The start really took the no-exposure path.
+      expect(calls).toEqual([]);
+      expect(runtime.exposure ?? null).toBeNull();
+
+      const probe = await readGuestEnvProbe();
+      expect(probe.host).toBe("127.0.0.1");
+      expect(probe.bind).toBe("loopback");
+      expect(probe.bindHost).toBe("127.0.0.1");
+    } finally {
+      if (previousHost === undefined) delete process.env.HOST;
+      else process.env.HOST = previousHost;
+    }
+  }, 20_000);
+
+  it("leaves a non-Paperclip service's bind env untouched on the same broker-less host", async () => {
+    const { broker, calls } = createBroker();
+    installDeps({ broker, isBrokerAvailable: async () => false });
+
+    const previousHost = process.env.HOST;
+    process.env.HOST = "0.0.0.0";
+    try {
+      await fs.rm(probePath(), { force: true });
+      const [runtime] = await startRuntimeServicesForWorkspaceControl(startInput({
+        serviceName: "preview",
+        command: guestCommand("dev-runner-env-probe.mjs"),
+        expose: LEGACY_HTTP_EXPOSE,
+        port: { type: "auto", envKey: "PORT" },
+      }));
+
+      expect(calls).toEqual([]);
+      expect(runtime.exposure ?? null).toBeNull();
+
+      const probe = await readGuestEnvProbe();
+      expect(probe.bind).toBeNull();
+      expect(probe.bindHost).toBeNull();
+    } finally {
+      if (previousHost === undefined) delete process.env.HOST;
+      else process.env.HOST = previousHost;
+    }
   }, 20_000);
 });
 
