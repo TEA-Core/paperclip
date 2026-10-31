@@ -97,6 +97,7 @@ import {
   USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS,
 } from "./issue-interaction-kinds.js";
 import { logActivityInTransaction, publishActivity, type ActivityPublication } from "./activity-log.js";
+import { evaluateDoneTransitionGuardForBackstopClose } from "./done-transition-guard.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import {
   assertIssueReviewVerdictActorAllowed,
@@ -2112,6 +2113,46 @@ export function issueThreadInteractionService(
         result: expired.result,
       });
 
+    let nativeCompletionCloseComment: string | null = null;
+    let nativeCompletionGuardStatus: string | null = null;
+    let nativeCompletionGuardStatusVersion: number | null = null;
+    if (isNativeCompletionReview(args.current)) {
+      const [guardIssue] = await db
+        .select()
+        .from(issues)
+        .where(
+          and(
+            eq(issues.id, args.issue.id),
+            eq(issues.companyId, args.issue.companyId),
+          ),
+        )
+        .limit(1);
+      if (!guardIssue) throw notFound("Issue not found");
+      const guardVerdict = await evaluateDoneTransitionGuardForBackstopClose({
+        db,
+        issue: guardIssue,
+        actorId: args.actor.agentId ?? args.actor.userId ?? "native-completion-review",
+        closeComment: null,
+        structuredDoneTier: args.input.doneTier ?? null,
+        listComments: (issueId) =>
+          issueService(db).listComments(issueId, { order: "desc", limit: 100 }),
+      });
+      if (!guardVerdict.allowed || guardVerdict.doneTierSkipAudit) {
+        throw unprocessable(
+          guardVerdict.allowed
+            ? "A native completion review requires a done-tier declaration"
+            : guardVerdict.reason,
+          {
+            code: guardVerdict.allowed
+              ? "done_transition_missing_tier_declaration"
+              : guardVerdict.code,
+          },
+        );
+      }
+      nativeCompletionCloseComment = guardVerdict.closeComment;
+      nativeCompletionGuardStatus = guardIssue.status;
+      nativeCompletionGuardStatusVersion = guardIssue.statusVersion;
+    }
     const now = new Date();
     const postCommitActivityPublications: ActivityPublication[] = [];
     const result = await db.transaction(async (tx) => {
@@ -2122,22 +2163,11 @@ export function issueThreadInteractionService(
       // before expiring linked proposals, so keep issue -> proposal ->
       // interaction as the shared lifecycle order.
       const issueContext = await tx
-        .select({
-          id: issues.id,
-          companyId: issues.companyId,
-          status: issues.status,
-          workMode: issues.workMode,
-          assigneeAgentId: issues.assigneeAgentId,
-          assigneeUserId: issues.assigneeUserId,
-          reviewPolicy: issues.reviewPolicy,
-          createdByAgentId: issues.createdByAgentId,
-          createdByUserId: issues.createdByUserId,
-          executionState: issues.executionState,
-        })
+        .select()
         .from(issues)
         .where(eq(issues.id, args.issue.id))
         .for("update")
-        .then((rows: IssueResolutionContext[]) => rows[0] ?? null);
+        .then((rows) => rows[0] ?? null);
 
       if (!issueContext || issueContext.companyId !== args.issue.companyId) {
         throw notFound("Issue not found");
@@ -2171,6 +2201,16 @@ export function issueThreadInteractionService(
         lockedCurrent,
         args.actor,
       );
+
+      if (
+        isNativeCompletionReview(lockedCurrent) &&
+        (issueContext.status !== nativeCompletionGuardStatus ||
+          issueContext.statusVersion !== nativeCompletionGuardStatusVersion)
+      ) {
+        throw conflict(
+          "Issue changed while the native completion review was being checked; retry the acceptance",
+        );
+      }
 
       const interaction = hydrateInteraction(lockedCurrent);
       const selectedOptionIds =
@@ -2245,16 +2285,31 @@ export function issueThreadInteractionService(
           )).limit(1);
         // Each explicit reviewer must be able to answer independently. Completing
         // on the first answer would cancel the other pending decisions.
-        const completedIssue = otherPending.length > 0 || issueContext.status !== "in_review" ? null : await issueService(db).update(
-          args.issue.id,
-          {
-            status: "done",
-            actorAgentId: args.actor.agentId ?? null,
-            actorUserId: args.actor.userId ?? null,
-          },
-          tx,
-          postCommitActivityPublications,
-        );
+        const completedIssue = otherPending.length > 0 || issueContext.status !== "in_review" ? null : await (async () => {
+          if (nativeCompletionCloseComment) {
+            await issueService(db).addComment(
+              args.issue.id,
+              nativeCompletionCloseComment,
+              {
+                agentId: args.actor.agentId ?? undefined,
+                userId: args.actor.userId ?? undefined,
+                runId: args.actor.runId ?? null,
+              },
+              {},
+              tx,
+            );
+          }
+          return issueService(db).update(
+            args.issue.id,
+            {
+              status: "done",
+              actorAgentId: args.actor.agentId ?? null,
+              actorUserId: args.actor.userId ?? null,
+            },
+            tx,
+            postCommitActivityPublications,
+          );
+        })();
         if (completedIssue) {
           continuationIssue = {
             id: completedIssue.id,

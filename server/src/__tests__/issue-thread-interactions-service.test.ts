@@ -5239,4 +5239,149 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       assigneeUserId: null,
     });
   });
+
+  async function seedNativeCompletionReview(title = "Native completion") {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const reviewerAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title,
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Reviewer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title,
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: reviewerAgentId,
+      deliveryRequirement: "record_only",
+    });
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "none",
+      payload: {
+        version: 1,
+        prompt: "Approve completion?",
+        acceptLabel: "Approve completion",
+        rejectLabel: "Continue work",
+        allowDeclineReason: true,
+        target: {
+          type: "custom",
+          key: "native_completion_review",
+          revisionId: randomUUID(),
+          label: "Completion decision",
+        },
+      },
+    }, {
+      agentId: reviewerAgentId,
+    });
+    return { companyId, goalId, issueId, reviewerAgentId, interactionId: created.id };
+  }
+
+  it("refuses a native completion accept that has no done-tier declaration", async () => {
+    const { companyId, goalId, issueId, reviewerAgentId, interactionId } =
+      await seedNativeCompletionReview();
+
+    await expect(interactionsSvc.acceptInteraction({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, interactionId, {}, {
+      userId: "local-board",
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "done_transition_missing_tier_declaration" },
+    });
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [interaction] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
+    expect(issue?.status).toBe("in_review");
+    expect(interaction?.status).toBe("pending");
+  });
+
+  it("persists structured done-tier evidence when a native completion accept closes the card", async () => {
+    const { companyId, goalId, issueId, reviewerAgentId, interactionId } =
+      await seedNativeCompletionReview();
+
+    const accepted = await interactionsSvc.acceptInteraction({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, interactionId, {
+      doneTier: {
+        tier: "tier2",
+        probeEvidence: "record-only native completion verified by the reviewer",
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    expect(accepted.continuationIssue?.status).toBe("done");
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((comment) =>
+      comment.body.includes("Closed at Tier 2 (live): record-only native completion verified by the reviewer"),
+    )).toBe(true);
+  });
+
+  it("rejects native completion when the issue changes after the guard preflight", async () => {
+    const { companyId, goalId, issueId, interactionId } =
+      await seedNativeCompletionReview();
+
+    await expect(interactionsSvc.acceptInteraction(
+      { id: issueId, companyId, goalId, projectId: null },
+      interactionId,
+      {
+        doneTier: {
+          tier: "tier2",
+          probeEvidence: "record-only native completion verified by the reviewer",
+        },
+      },
+      { userId: "local-board" },
+      {
+        beforeResolveInTransaction: async () => {
+          await db
+            .update(issues)
+            .set({ status: "in_progress" })
+            .where(eq(issues.id, issueId));
+        },
+      },
+    )).rejects.toMatchObject({ status: 409 });
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [interaction] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interactionId));
+    expect(issue?.status).toBe("in_progress");
+    expect(interaction?.status).toBe("pending");
+  });
 });
