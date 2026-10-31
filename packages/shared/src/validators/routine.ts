@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  ISSUE_DELIVERY_REQUIREMENTS,
   ISSUE_PRIORITIES,
   ROUTINE_ACTIVITY_GATE_POLICIES,
   ROUTINE_ACTIVITY_GATE_SCOPES,
@@ -85,6 +86,7 @@ export const createRoutineSchema = z.object({
   variables: z.array(routineVariableSchema).optional().default([]),
   env: envConfigSchema.optional().nullable(),
   executionPolicy: issueExecutionPolicySchema.optional().nullable(),
+  deliveryRequirement: z.enum(ISSUE_DELIVERY_REQUIREMENTS).optional().nullable(),
   executionWorkspacePreference: routineExecutionWorkspacePreferenceSchema.optional().nullable(),
 });
 
@@ -114,6 +116,7 @@ export const routineRevisionSnapshotRoutineV1Schema = z.object({
   variables: z.array(routineVariableSchema),
   env: envConfigSchema.nullable().default(null),
   executionPolicy: issueExecutionPolicySchema.nullable().default(null),
+  deliveryRequirement: z.enum(ISSUE_DELIVERY_REQUIREMENTS).nullable().optional(),
   executionWorkspacePreference: routineExecutionWorkspacePreferenceSchema.nullable().optional(),
   responsibleUserId: z.string().nullable().default(null),
 }).strict();
