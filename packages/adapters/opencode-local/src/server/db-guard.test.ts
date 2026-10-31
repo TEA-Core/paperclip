@@ -8,6 +8,7 @@ import {
   measureOpenCodeDatabaseBytes,
   measureOpenCodeSessionBytes,
   readOpenCodeSessionIdFromChunk,
+  readOpenCodeV2SessionState,
   resolveOpenCodeDataDir,
   resolveOpenCodeDatabaseGrowthLimitBytes,
   resolveOpenCodeDatabasePath,
@@ -684,5 +685,51 @@ describe("startOpenCodeDatabaseGrowthGuard session attribution", () => {
     expect(new Set(asked)).toEqual(new Set(["ses_fromstdout"]));
     expect(spares[0].attribution.sessionId).toBe("ses_fromstdout");
     expect(trips).toEqual([]);
+  });
+});
+
+// The 2.2.4 acceptance suite covers the probe against binary-written rows; this
+// covers the one shape the binary cannot be made to write cheaply: a final
+// assistant row far past the size the probe is willing to load.
+describe("readOpenCodeV2SessionState final-message size bound", () => {
+  const completedAssistant = (text: string) =>
+    JSON.stringify({ time: { completed: 1 }, content: [{ type: "text", text }] });
+
+  async function makeV2Database(finalText: string) {
+    const { DatabaseSync } = await import("node:sqlite");
+    const dir = await makeTempDir();
+    const databasePath = path.join(dir, "opencode-agent-agent-1.db");
+    const db = new DatabaseSync(databasePath);
+    db.exec(`
+      CREATE TABLE session_v2 (id text PRIMARY KEY, directory text NOT NULL);
+      CREATE TABLE session_message (
+        id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL,
+        seq integer NOT NULL, data text NOT NULL
+      );
+      INSERT INTO session_v2 VALUES ('ses_v2', '/workspace');
+    `);
+    const insert = db.prepare("INSERT INTO session_message VALUES (?, 'ses_v2', ?, ?, ?)");
+    insert.run("m1", "user", 1, JSON.stringify({ text: "hello" }));
+    insert.run("m2", "assistant", 2, completedAssistant("earlier answer"));
+    insert.run("m3", "assistant", 3, completedAssistant(finalText));
+    db.close();
+    return databasePath;
+  }
+
+  it("reads the final message of a normal-sized row", async () => {
+    const read = await readOpenCodeV2SessionState(await makeV2Database("final answer"), "ses_v2");
+    if (!read.ok) throw new Error(read.error);
+    expect(read.state.finalMessage).toBe("final answer");
+  });
+
+  it("keeps existence and size but returns no final message when the newest row is over the bound", async () => {
+    const huge = "x".repeat(2 * 1024 * 1024);
+    const read = await readOpenCodeV2SessionState(await makeV2Database(huge), "ses_v2");
+    if (!read.ok) throw new Error(read.error);
+    expect(read.state.exists).toBe(true);
+    expect(read.state.cwd).toBe("/workspace");
+    expect(read.state.messageCount).toBe(3);
+    expect(read.state.transcriptBytes).toBeGreaterThan(huge.length);
+    expect(read.state.finalMessage).toBeNull();
   });
 });

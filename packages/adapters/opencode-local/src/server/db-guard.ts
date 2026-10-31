@@ -254,7 +254,7 @@ export type OpenCodeV2SessionState = {
   messageCount: number;
   /** Bytes of the session's replayed transcript (`session_message.data`). */
   transcriptBytes: number;
-  /** Text of the newest completed assistant message, or null when none completed. */
+  /** Text of the newest completed assistant message, or null when none completed or it exceeds 1 MiB. */
   finalMessage: string | null;
 };
 
@@ -269,6 +269,9 @@ type SqliteModule = {
     options?: { readOnly?: boolean },
   ) => { prepare: (sql: string) => SqliteStatement; close: () => void };
 };
+
+/** Largest newest-assistant row `readOpenCodeV2SessionState` will load to read its final message. */
+const FINAL_MESSAGE_MAX_BYTES = 1024 * 1024;
 
 function toFiniteNumber(value: unknown): number {
   if (typeof value === "bigint") return Number(value);
@@ -308,15 +311,15 @@ export async function readOpenCodeV2SessionState(
       // otherwise fail the whole probe for one bad row.
       const completed = db
         .prepare(
-          "SELECT data FROM session_message WHERE session_id = ? AND type = 'assistant' " +
+          "SELECT CASE WHEN LENGTH(CAST(data AS BLOB)) <= ? THEN data END AS data " +
+            "FROM session_message WHERE session_id = ? AND type = 'assistant' " +
             "AND CASE WHEN json_valid(data) THEN json_extract(data, '$.time.completed') END IS NOT NULL " +
             "ORDER BY seq DESC LIMIT 1",
         )
-        .get(sessionId);
+        .get(FINAL_MESSAGE_MAX_BYTES, sessionId);
       let finalMessage: string | null = null;
-      if (completed) {
-        const raw = completed.data;
-        const parsed = JSON.parse(typeof raw === "string" ? raw : String(raw)) as {
+      if (typeof completed?.data === "string") {
+        const parsed = JSON.parse(completed.data) as {
           content?: Array<{ type?: unknown; text?: unknown }>;
         };
         finalMessage = Array.isArray(parsed.content)
