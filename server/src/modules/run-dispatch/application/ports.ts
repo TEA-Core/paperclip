@@ -15,6 +15,16 @@ export type ListDueRetriesInput = {
   limit: number;
 };
 
+export type StaleQueuedRun = {
+  runId: string;
+  companyId: string;
+};
+
+export type ListStaleQueuedRunsInput = {
+  cutoff: Date;
+  limit: number;
+};
+
 export type EvaluateScheduledRetryGateInput = {
   runId: string;
   companyId: string;
@@ -26,6 +36,7 @@ export type EvaluateScheduledRetryGateInput = {
 export interface ScheduledRetryReader {
   evaluateScheduledRetryGate(input: EvaluateScheduledRetryGateInput): Promise<GateDecision>;
   listDueRetries(input: ListDueRetriesInput): Promise<DueRetryRun[]>;
+  listStaleQueuedRuns(input: ListStaleQueuedRunsInput): Promise<StaleQueuedRun[]>;
 }
 
 export type PromoteOrCancelDueRetryInput = {

@@ -327,7 +327,10 @@ async function seedBranchContainmentRun(
   const expectedBranch = `${sourceIdentifier}-recorded`;
   const actualBranch = `${sourceIdentifier}-actual`;
   const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
-  const now = new Date("2026-07-07T00:00:00.000Z");
+  // SUP-21903: the real-clock stale sweep cancels queued runs older than
+  // MAX_QUEUED_ISSUE_RUN_AGE_MS, so seeded rows must be anchored to a fresh
+  // clock instead of a fixed past date.
+  const now = new Date();
 
   await instanceSettingsService(db).updateExperimental({
     enableIsolatedWorkspaces: true,
