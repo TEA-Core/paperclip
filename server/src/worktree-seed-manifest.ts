@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 
-const WORKTREE_SEED_MODES = new Set(["minimal", "full"]);
+const WORKTREE_SEED_MODES = new Set(["minimal", "minimal-no-secrets", "full"]);
 
 type SeedDiagnostic = {
   phase?: unknown;
