@@ -779,7 +779,10 @@ describe("execute — OpenCode V2 output cap", () => {
 describe("execute — OpenCode V2 session state unavailable", () => {
   const sessionId = "ses_v2unavailable";
 
-  async function resumeWithDatabase(prepareDatabase?: (databasePath: string) => Promise<void>) {
+  async function resumeWithDatabase(
+    prepareDatabase?: (databasePath: string) => Promise<void>,
+    extraEnv: Record<string, string> = {},
+  ) {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-v2-unavailable-"));
     const workspace = path.join(root, "workspace");
     const dataHome = path.join(root, "data");
@@ -811,6 +814,7 @@ describe("execute — OpenCode V2 session state unavailable", () => {
             // A 1-byte cap would decline any measurable session, so a resume proves the cap was skipped.
             PAPERCLIP_OPENCODE_SESSION_MAX_BYTES: "1",
             PAPERCLIP_OPENCODE_DB_GROWTH_LIMIT_MB: "0",
+            ...extraEnv,
           },
         },
         context: {},
@@ -852,6 +856,21 @@ describe("execute — OpenCode V2 session state unavailable", () => {
     expect(warnings[0].stream).toBe("stderr");
     expect(warnings[0].chunk).toContain("no such table: session_v2");
     expect(warnings[0].chunk).toContain("WITHOUT the resume size cap and WITHOUT the session-existence check");
+    expect(runArgs).toEqual(expect.arrayContaining(["--session", sessionId]));
+  });
+
+  it("warns once that an explicit OPENCODE_DB leaves the V2 session unguarded, and still resumes", async () => {
+    const { result, logs, runArgs } = await resumeWithDatabase(undefined, { OPENCODE_DB: "shared.db" });
+
+    expect(result.exitCode).toBe(0);
+    const warnings = logs.filter((entry) => entry.chunk.includes("database file is not adapter-resolved"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].stream).toBe("stderr");
+    expect(warnings[0].chunk).toContain("explicit OPENCODE_DB");
+    expect(warnings[0].chunk).toContain("WITHOUT the existence check");
+    expect(warnings[0].chunk).toContain("WITHOUT the resume size cap");
+    expect(warnings[0].chunk).toContain("WITHOUT the growth guard");
+    expect(logs.some((entry) => entry.chunk.includes("session state unavailable"))).toBe(false);
     expect(runArgs).toEqual(expect.arrayContaining(["--session", sessionId]));
   });
 });

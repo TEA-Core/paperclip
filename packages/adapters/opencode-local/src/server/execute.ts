@@ -321,6 +321,17 @@ export function resolveOpenCodeDatabaseFile(input: {
   return `${OPENCODE_DB_AGENT_PREFIX}${agentId.replace(/[^a-zA-Z0-9._-]/g, "-")}.db`;
 }
 
+function describeOpenCodeDatabaseNotAdapterResolved(input: {
+  env: Record<string, string>;
+  executionTargetIsRemote: boolean;
+}): string {
+  if (input.executionTargetIsRemote) return "remote execution target";
+  if (isTruthyEnvFlag(input.env.PAPERCLIP_OPENCODE_SHARED_DB ?? process.env.PAPERCLIP_OPENCODE_SHARED_DB)) {
+    return "shared database (PAPERCLIP_OPENCODE_SHARED_DB)";
+  }
+  return "explicit OPENCODE_DB";
+}
+
 function parseModelProvider(model: string | null): string | null {
   if (!model) return null;
   const trimmed = model.trim();
@@ -1202,6 +1213,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     let sessionTranscriptBytes: number | null = null;
     let sessionExists: boolean | undefined;
     let resumeSessionCwd = runtimeSessionCwd;
+    if (openCodeV2 && (!openCodeDatabaseFile || executionTargetIsRemote)) {
+      await onLog(
+        "stderr",
+        `[paperclip] WARNING: OpenCode V2 database file is not adapter-resolved (${describeOpenCodeDatabaseNotAdapterResolved({ env, executionTargetIsRemote })}). The V2 session is resumed WITHOUT the existence check, WITHOUT the resume size cap and WITHOUT the growth guard.\n`,
+      );
+    }
     if (runtimeSessionId && openCodeDatabaseFile && !executionTargetIsRemote) {
       const sessionTranscriptDbPath = resolveOpenCodeDatabasePath({
         databaseFile: openCodeDatabaseFile,
