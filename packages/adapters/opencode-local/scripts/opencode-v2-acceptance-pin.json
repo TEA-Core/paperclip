@@ -1,0 +1,21 @@
+{
+  "version": "2.2.4",
+  "platforms": {
+    "linux-x64": {
+      "package": "@opencode/cli-linux-x64",
+      "integrity": "sha512-rWbnCOP/nIN8ILAt0hcuw51sNbuX+zcImSCX7tPUCsaYgVNLcZ73whfW4lYc04ZMPhxeySooN0IvfLvnsaJfgQ=="
+    },
+    "linux-arm64": {
+      "package": "@opencode/cli-linux-arm64",
+      "integrity": "sha512-MGwrdyOLJ2YMhAl9k/JTpjLHp8yCqw6gqDKT0GMOgPu56oMOZSaMUUg8hJK3Fq27uGOFQLiUtA3sbhdQg3lFAA=="
+    },
+    "darwin-x64": {
+      "package": "@opencode/cli-darwin-x64",
+      "integrity": "sha512-7J4n3pwqJAKMpKfDA54qMFrY5jHSy2RSMg314vpJKNvzB94mKxdwRlh0dD+AyIlOtf+1Retdkw6BkJSOVRKRKQ=="
+    },
+    "darwin-arm64": {
+      "package": "@opencode/cli-darwin-arm64",
+      "integrity": "sha512-5osdn6iEB389vLnooBA8Y/vn7aWoKEnB8Bzf9rE5Wyo39enqN19xozXzNL564tQCqmoYzjx8OmGShgkJgtszhQ=="
+    }
+  }
+}
