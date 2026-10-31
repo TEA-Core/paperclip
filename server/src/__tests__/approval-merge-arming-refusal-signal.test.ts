@@ -50,6 +50,25 @@ const mockArmMergeOnApproval = vi.hoisted(() => vi.fn());
 const mockResolveApprovalDecisionHead = vi.hoisted(() => vi.fn());
 const mockPublishApprovalStatus = vi.hoisted(() => vi.fn());
 
+const mockGetByName = vi.hoisted(() => vi.fn());
+const mockResolveSecretValue = vi.hoisted(() => vi.fn());
+vi.mock("../services/secrets.js", () => ({
+  secretService: () => ({ getByName: mockGetByName, resolveSecretValue: mockResolveSecretValue }),
+}));
+// SUP-21902: the done-transition guard resolves the declared probe head and the
+// delivery default branch tip through the commits API; the mocked remote serves
+// the same head for both, so the fixtures' named probe heads match the merge head.
+vi.mock("../services/github-fetch.js", () => ({
+  ghFetch: (url: string) =>
+    typeof url === "string" && /\/commits\//.test(url)
+      ? Promise.resolve({ ok: true, status: 200, json: async () => ({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }) } as unknown as Response)
+      : Promise.resolve(new Response(JSON.stringify({}), { status: 404 })),
+  gitHubApiBase: (hostname: string) =>
+    hostname === "github.com" || hostname === "www.github.com"
+      ? "https://api.github.com"
+      : `https://${hostname}/api/v3`,
+}));
+
 vi.mock("../services/merge-arming.js", async (importOriginal) => {
   const orig = await importOriginal<typeof import("../services/merge-arming.js")>();
   return {
@@ -321,12 +340,15 @@ describeEmbeddedPostgres("approval-arming refusal on a closing transition (SUP-1
 
   /** Approves the single (final) stage through the PATCH decision door. */
   async function approveClosingStage(identifier: string) {
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+
     return request(app)
       .patch(`/api/issues/${identifier}`)
       .send({
         status: "done",
         comment:
-          "Closed at Tier 2 (live): decision approved the only review stage and the patched path is live.\n\nkind: review\ndecision: approved",
+          "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: decision approved the only review stage and the patched path is live.\n\nkind: review\ndecision: approved",
       });
   }
 

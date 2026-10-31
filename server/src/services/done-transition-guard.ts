@@ -85,7 +85,12 @@ const TIER_1_PREFIX = "Closed at Tier 1 (landed, not liveness-probed):";
 const TIER_1_SUFFIX = "Liveness unverified.";
 // Machine-checkable accepted forms, embedded verbatim in every rejection message so the
 // 422 remedy and the parser always agree on the exact literal (SUP-15787).
-const TIER2_FORM = '"Closed at Tier 2 (live): <probe evidence>"';
+// SUP-21902: the Tier 2 form is self-verifying — the evidence must name the probe
+// command, the probe head/commit it ran against, and a post-merge predicate, because
+// the guard resolves the named head and compares it with the delivery merge head at
+// close time. Arbitrary non-empty prose is no longer accepted Tier 2 evidence.
+const TIER2_FORM =
+  '"Closed at Tier 2 (live): probe `<probe command>` head <probe head sha> post-merge: <post-merge predicate>"';
 export const TIER1_FORM =
   '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."' +
   ' or "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
@@ -95,7 +100,7 @@ export const TIER1_FORM =
 // agent-writable close doors. The missing-tier remedy names these verbatim so the
 // 422 remedy and the structured parser always agree (SUP-15787 invariant).
 export const DONE_TIER_TIER2_JSON =
-  '"doneTier": { "tier": "tier2", "probeEvidence": "<consumer-surface probe output>" }';
+  '"doneTier": { "tier": "tier2", "probeEvidence": "probe `<probe command>` head <probe head sha> post-merge: <post-merge predicate>" }';
 export const DONE_TIER_TIER1_LANDED_JSON =
   '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landedAtTip", "mergeCommit": "<sha>" } }';
 export const DONE_TIER_TIER1_DELEGATED_JSON =
@@ -303,6 +308,48 @@ async function githubBranchExists(
   } catch {
     return { outcome: "error" };
   }
+}
+
+/**
+ * SUP-21902: resolve a named git ref (a sha, or a branch such as the default
+ * branch) to the commit sha it currently points at in the remote repository.
+ * The Tier 2 origin predicate resolves BOTH the probe head named in the close
+ * declaration and the delivery default-branch tip through this single probe so
+ * the two shas are comparable. Outcome classes mirror `githubBranchExists`:
+ * a 200 with a sha is positive resolution; 404 is positive NON-resolution (the
+ * ref does not exist on the remote); 401/403 classifies as auth failure; every
+ * other outcome (network failure, unexpected status, unparseable body) throws
+ * so callers can distinguish "unresolvable" from "could not be verified".
+ */
+async function resolveGitHubRefHeadSha(
+  hostname: string,
+  owner: string,
+  repo: string,
+  ref: string,
+  token: string,
+): Promise<string | null> {
+  const apiBase = gitHubApiBase(hostname);
+  const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(ref)}`;
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": "paperclip-done-transition-guard",
+    "x-github-api-version": "2022-11-28",
+    authorization: `Bearer ${token}`,
+  };
+  const response = await ghFetch(url, { headers });
+  if (response.status === 404) return null;
+  if (response.status === 401 || response.status === 403) {
+    throw new GitHubAuthError(response.status, `GitHub commits API returned ${response.status}`);
+  }
+  if (!response.ok) {
+    throw new Error(`GitHub commits API returned ${response.status}`);
+  }
+  const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+  const sha = body?.sha;
+  if (typeof sha !== "string" || !/^[0-9a-f]{40}$/i.test(sha)) {
+    throw new Error("GitHub commits API returned no commit sha");
+  }
+  return sha.toLowerCase();
 }
 
 function runGit(args: string[], cwd: string): Promise<string> {
@@ -998,6 +1045,161 @@ async function proveLandedAtTip(
   return acceptTier1(reason, sameRun);
 }
 
+// Tier 2 origin predicate (SUP-21902). A matched Tier 2 sentence is accepted only when
+// its probe evidence carries the machine-checkable shape
+//   probe `<command>` head <sha> post-merge: <predicate>
+// and a close-time resolver proves the origin claim:
+//  - the named head resolves in the delivery repository (a 404 is the
+//    `head_unresolvable` refusal, not an allow);
+//  - the resolved probe head equals the delivery merge head — the sha the delivery
+//    default branch points at right now — so pre-merge probe output (any head that is
+//    not the merge head) is refused;
+//  - an unresolvable default branch, a missing credential, or a provider failure is
+//    "could not be verified" and fails closed, mirroring the Tier 1 landing proof.
+// Arbitrary non-empty prose is malformed evidence under this contract, never live proof.
+const TIER2_PROBE_SHAPE_RE = /^probe `([^`]+)` head ([0-9a-f]{7,40}) post-merge: (.+)$/i;
+
+function refuseTier2(reason: string): DoneTierDeclarationResult {
+  return {
+    allowed: false,
+    reason,
+    tier: null,
+    skipped: false,
+    skipReason: null,
+  };
+}
+
+function acceptTier2(evidence: string, sameRun: boolean): DoneTierDeclarationResult {
+  const prefix = sameRun
+    ? "Tier 2 declaration found in same-run comment: "
+    : "Tier 2 declaration found: ";
+  return {
+    allowed: true,
+    reason: `${prefix}${evidence.slice(0, 200)}`,
+    tier: "tier2",
+    skipped: false,
+    skipReason: null,
+  };
+}
+
+function unverifiedTier2(err: unknown): string {
+  const detail = err instanceof Error ? err.message : "unknown";
+  return `Tier 2 declaration could not be verified against the delivery merge head (${detail}). Accepted form: ${TIER2_FORM}`;
+}
+
+async function proveTier2Live(
+  db: Db,
+  issue: {
+    id: string;
+    companyId: string;
+    projectId?: string | null;
+    projectWorkspaceId?: string | null;
+    executionWorkspaceId?: string | null;
+  },
+  evidence: string,
+  sameRun: boolean,
+): Promise<DoneTierDeclarationResult> {
+  const shape = TIER2_PROBE_SHAPE_RE.exec(evidence.trim());
+  if (!shape) {
+    return refuseTier2(
+      "Tier 2 declaration probe evidence is not in the machine-checkable shape that names the " +
+        "probe command, probe head, and post-merge predicate; non-empty prose is not live proof. " +
+        `Accepted form: ${TIER2_FORM}`,
+    );
+  }
+  const probeHead = shape[2]!.toLowerCase();
+  let ctx: IssueRepoContext | null;
+  try {
+    const fields = await loadTier1RepoFields(db, issue);
+    ctx = await resolveIssueRepoContext(db, {
+      companyId: issue.companyId,
+      projectId: fields.projectId,
+      projectWorkspaceId: fields.projectWorkspaceId,
+      executionWorkspaceId: fields.executionWorkspaceId,
+    });
+  } catch (err) {
+    return refuseTier2(unverifiedTier2(err));
+  }
+  if (!ctx?.repoUrl || !ctx.defaultRef) {
+    return refuseTier2(
+      "Tier 2 declaration could not be verified: no repository default branch is resolvable, " +
+        "so no delivery merge head exists to match the probe head against. " +
+        `Accepted form: ${TIER2_FORM}`,
+    );
+  }
+  const parsed = parseRepoUrl(ctx.repoUrl);
+  if (!parsed) {
+    return refuseTier2(
+      "Tier 2 declaration could not be verified: repository URL is not a GitHub repository. " +
+        `Accepted form: ${TIER2_FORM}`,
+    );
+  }
+  let token: string | null;
+  try {
+    const tokenResult = await resolveGitHubToken(db, issue.companyId);
+    token = tokenResult.token;
+  } catch (err) {
+    return refuseTier2(unverifiedTier2(err));
+  }
+  if (!token) {
+    return refuseTier2(
+      "Tier 2 declaration could not be verified: GitHub credential is not configured. " +
+        `Accepted form: ${TIER2_FORM}`,
+    );
+  }
+  let probeHeadResolved: string | null;
+  try {
+    probeHeadResolved = await resolveGitHubRefHeadSha(
+      parsed.hostname,
+      parsed.owner,
+      parsed.repo,
+      probeHead,
+      token,
+    );
+  } catch (err) {
+    return refuseTier2(unverifiedTier2(err));
+  }
+  if (probeHeadResolved === null) {
+    return refuseTier2(
+      `Tier 2 declaration head ${probeHead} is unresolvable in ${parsed.owner}/${parsed.repo} ` +
+        `(head_unresolvable); the named probe head does not exist on the remote, so the probe ` +
+        "evidence cannot be attributed to the delivery merge head. " +
+        `Accepted form: ${TIER2_FORM}`,
+    );
+  }
+  const defaultBranch = ctx.defaultRef.startsWith("origin/") && ctx.defaultRef.length > "origin/".length
+    ? ctx.defaultRef.slice("origin/".length)
+    : ctx.defaultRef;
+  let mergeHead: string | null;
+  try {
+    mergeHead = await resolveGitHubRefHeadSha(
+      parsed.hostname,
+      parsed.owner,
+      parsed.repo,
+      defaultBranch,
+      token,
+    );
+  } catch (err) {
+    return refuseTier2(unverifiedTier2(err));
+  }
+  if (mergeHead === null) {
+    return refuseTier2(
+      `Tier 2 declaration could not be verified: delivery default branch ${ctx.defaultRef} is ` +
+        `unresolvable in ${parsed.owner}/${parsed.repo}, so no delivery merge head exists to ` +
+        "match the probe head against.",
+    );
+  }
+  if (probeHeadResolved !== mergeHead) {
+    return refuseTier2(
+      `Tier 2 declaration head ${probeHead} (resolved ${probeHeadResolved}) does not match the ` +
+        `delivery merge head ${mergeHead} that ${ctx.defaultRef} points at; the probe did not run ` +
+        "against the delivery merge head, so pre-merge probe output is not live proof. " +
+        `Accepted form: ${TIER2_FORM}`,
+    );
+  }
+  return acceptTier2(evidence.trim(), sameRun);
+}
+
 async function proveTier1Landing(
   db: Db,
   issue: {
@@ -1094,13 +1296,10 @@ export async function evaluateDoneTierDeclaration(
   if (accompanyingComment && accompanyingComment.trim().length > 0) {
     const tier2 = parseTier2Declaration(accompanyingComment);
     if (tier2.kind === "matched") {
-      return {
-        allowed: true,
-        reason: `Tier 2 declaration found: ${tier2.evidence.slice(0, 200)}`,
-        tier: "tier2",
-        skipped: false,
-        skipReason: null,
-      };
+      // SUP-21902: a matched Tier 2 sentence is no longer accepted on its face —
+      // the origin predicate resolves the named probe head and compares it with
+      // the delivery merge head before the close is allowed.
+      return proveTier2Live(db, issue, tier2.evidence, false);
     }
     const tier1 = parseTier1Declaration(accompanyingComment);
     if (tier1.kind === "matched") {
@@ -1182,13 +1381,10 @@ export async function evaluateDoneTierDeclaration(
 
   const tier2 = parseTier2Declaration(sameRunComment.body);
   if (tier2.kind === "matched") {
-    return {
-      allowed: true,
-      reason: `Tier 2 declaration found in same-run comment: ${tier2.evidence.slice(0, 200)}`,
-      tier: "tier2",
-      skipped: false,
-      skipReason: null,
-    };
+    // SUP-21902: same-run Tier 2 declarations face the same origin predicate as
+    // accompanying-comment ones — a pre-merge or unresolvable head is refused
+    // identically on both doors.
+    return proveTier2Live(db, issue, tier2.evidence, true);
   }
 
   const tier1 = parseTier1Declaration(sameRunComment.body);

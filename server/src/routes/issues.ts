@@ -5408,13 +5408,13 @@ export function issueRoutes(
         ? "An issue cannot be created already done with a done-tier declaration: createIssueSchema accepts neither a close comment nor the structured doneTier field. Create the issue in a non-terminal status first, then close it via PATCH /api/issues/{id} with the structured doneTier field in the same request body: " +
           `${DONE_TIER_STRUCTURED_FORMS}` +
           `. Alternatively, include a done-tier declaration in the close comment: ` +
-          `"Closed at Tier 2 (live): <probe evidence>"` +
+          `"Closed at Tier 2 (live): probe \`<probe command>\` head <probe head sha> post-merge: <post-merge predicate>"` +
           ` or ${TIER1_FORM}` +
           ` — per SUP-12693.`
         : "Provide a done-tier declaration, preferably as the structured doneTier field in this same request body: " +
           `${DONE_TIER_STRUCTURED_FORMS}` +
           `. Alternatively, include a done-tier declaration in the close comment: ` +
-          `"Closed at Tier 2 (live): <probe evidence>"` +
+          `"Closed at Tier 2 (live): probe \`<probe command>\` head <probe head sha> post-merge: <post-merge predicate>"` +
           ` or ${TIER1_FORM}` +
           ` — per SUP-12693.`;
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
