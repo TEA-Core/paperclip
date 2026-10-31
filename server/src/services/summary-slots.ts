@@ -850,8 +850,7 @@ export function summarySlotService(db: Db) {
     if (!ownedRun) {
       throw forbidden("Summary write must run from the linked generation task");
     }
-    const runMatches =
-      issueRef.row.checkoutRunId === runId || issueRef.row.executionRunId === runId;
+    const runMatches = (issueRef.row.executionRunId ?? issueRef.row.checkoutRunId) === runId;
     if (!runMatches) {
       throw forbidden("Summary write must run from the linked generation task");
     }
@@ -902,8 +901,7 @@ export function summarySlotService(db: Db) {
       }
 
       const runStillMatches =
-        currentGenerationIssue?.checkoutRunId === actor.runId ||
-        currentGenerationIssue?.executionRunId === actor.runId;
+        (currentGenerationIssue?.executionRunId ?? currentGenerationIssue?.checkoutRunId ?? null) === actor.runId;
       if (!runStillMatches) {
         throw forbidden("Summary write must run from the linked generation task");
       }

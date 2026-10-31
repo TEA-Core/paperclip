@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -1066,20 +1066,37 @@ describeEmbeddedPostgres("summary slot service", () => {
       const issueLockReleased = new Promise<void>((resolve) => {
         releaseIssueLock = resolve;
       });
+      let markIssueLockAcquired!: () => void;
+      const issueLockAcquired = new Promise<void>((resolve) => {
+        markIssueLockAcquired = resolve;
+      });
       const issueLockTransaction = db.transaction(async (tx) => {
         await tx.select().from(issues).where(eq(issues.id, generationIssueId)).for("update");
+        markIssueLockAcquired();
         await tx
           .update(issues)
           .set({ checkoutRunId: otherRunId })
           .where(eq(issues.id, generationIssueId));
         await issueLockReleased;
       });
+      await issueLockAcquired;
 
       const writePromise = svc.write(
         { ...projectSelector(companyId, projectId), markdown: "# Stale write", generationIssueId },
         { agentId: summarizerAgentId, runId },
       );
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      let writeWaitingForIssueLock = false;
+      for (let i = 0; i < 100; i += 1) {
+        const waiting = await db.execute(
+          sql`select 1 from pg_stat_activity where cardinality(pg_blocking_pids(pid)) > 0 and query ilike '%for update%'`,
+        );
+        if (waiting.length > 0) {
+          writeWaitingForIssueLock = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(writeWaitingForIssueLock).toBe(true);
       releaseIssueLock();
       await issueLockTransaction;
 
