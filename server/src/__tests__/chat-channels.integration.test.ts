@@ -225,10 +225,12 @@ function waitFor<T>(
 // The Discord Gateway lease cases need an owner whose lease has expired. A
 // 200 ms real-time TTL raced the owner's own runtime initialization, which
 // throws "Another Paperclip server owns this Discord Gateway connection" once
-// the lease lapses mid-setup on a slow runner. Keep the production TTL and
-// cross it by moving Date alone; the afterEach restores real timers.
+// the lease lapses mid-setup on a slow runner. Keep the production 15 s TTL and
+// cross it by moving Date alone; the afterEach restores real timers. The jump
+// stays under the service's 60 s staleness thresholds so in-flight delivery and
+// action rows are not treated as stale and replayed.
 function expireDiscordGatewayLeases() {
-  const jumpedTo = new Date(Date.now() + 60_000);
+  const jumpedTo = new Date(Date.now() + 20_000);
   vi.useFakeTimers({ toFake: ["Date"], shouldAdvanceTime: true });
   vi.setSystemTime(jumpedTo);
 }
@@ -1100,14 +1102,16 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       // failure into a cascade across the remaining 380-odd cases.
       try {
         if (fixtureCompanies.size > 0) {
-          // The next case's service sweeps every endpoint in this shared
-          // database, not just its own. A receipt-reaction action left
-          // received/retryable by this case is picked up by that sweep, which
-          // takes the retired endpoint's 90 s credential-mutation lease; if
-          // the sweep does not finish, the dead lease makes every following
-          // case's global sweep poll for CREDENTIAL_MUTATION_LEASE_WAIT_MS
-          // (10 s), past the 5 s setup poll budget. Retire this case's
-          // pending actions and leases so nothing here is adoptable later.
+          // Instrumented full-file runs showed the global receipt-reaction
+          // sweep (processPendingDeliveries without a delivery id, called from
+          // the first waitFor in qualifySetupRoundTrip) blocked on a leaked
+          // 'credentials' chat_endpoint_leases row (90 s TTL, never renewed)
+          // on a foreign Slack endpoint, while receipt_reaction chat_actions
+          // rows from earlier cases stayed received/failed. Retire this case's
+          // pending actions and leases so they cannot leak into later cases.
+          // Attributing CI failure #2 (the second waitFor, which passes a
+          // delivery id and skips the global sweeps) to this cleanup alone is
+          // not proven.
           await db.update(chatActions).set({ status: "cancelled" })
             .where(and(
               inArray(chatActions.companyId, [...fixtureCompanies]),
