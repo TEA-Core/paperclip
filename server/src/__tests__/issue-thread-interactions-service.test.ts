@@ -5370,7 +5370,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         beforeResolveInTransaction: async () => {
           await db
             .update(issues)
-            .set({ status: "in_progress" })
+            .set({ status: "in_progress", updatedAt: new Date() })
             .where(eq(issues.id, issueId));
         },
       },
@@ -5382,6 +5382,42 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       .from(issueThreadInteractions)
       .where(eq(issueThreadInteractions.id, interactionId));
     expect(issue?.status).toBe("in_progress");
+    expect(interaction?.status).toBe("pending");
+  });
+
+  it("rejects native completion when executionPolicy changes after the guard preflight", async () => {
+    const { companyId, goalId, issueId, interactionId } =
+      await seedNativeCompletionReview();
+
+    await expect(interactionsSvc.acceptInteraction(
+      { id: issueId, companyId, goalId, projectId: null },
+      interactionId,
+      {
+        doneTier: {
+          tier: "tier2",
+          probeEvidence: "record-only native completion verified by the reviewer",
+        },
+      },
+      { userId: "local-board" },
+      {
+        beforeResolveInTransaction: async () => {
+          await db
+            .update(issues)
+            .set({
+              executionPolicy: { mode: "normal", stages: [] },
+              updatedAt: new Date(),
+            })
+            .where(eq(issues.id, issueId));
+        },
+      },
+    )).rejects.toMatchObject({ status: 409 });
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [interaction] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interactionId));
+    expect(issue?.status).toBe("in_review");
     expect(interaction?.status).toBe("pending");
   });
 });

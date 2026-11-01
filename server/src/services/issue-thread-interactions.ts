@@ -2114,8 +2114,7 @@ export function issueThreadInteractionService(
       });
 
     let nativeCompletionCloseComment: string | null = null;
-    let nativeCompletionGuardStatus: string | null = null;
-    let nativeCompletionGuardStatusVersion: number | null = null;
+    let nativeCompletionGuardUpdatedAt: Date | null = null;
     if (isNativeCompletionReview(args.current)) {
       const [guardIssue] = await db
         .select()
@@ -2150,8 +2149,7 @@ export function issueThreadInteractionService(
         );
       }
       nativeCompletionCloseComment = guardVerdict.closeComment;
-      nativeCompletionGuardStatus = guardIssue.status;
-      nativeCompletionGuardStatusVersion = guardIssue.statusVersion;
+      nativeCompletionGuardUpdatedAt = guardIssue.updatedAt;
     }
     const now = new Date();
     const postCommitActivityPublications: ActivityPublication[] = [];
@@ -2204,8 +2202,7 @@ export function issueThreadInteractionService(
 
       if (
         isNativeCompletionReview(lockedCurrent) &&
-        (issueContext.status !== nativeCompletionGuardStatus ||
-          issueContext.statusVersion !== nativeCompletionGuardStatusVersion)
+        issueContext.updatedAt.getTime() !== nativeCompletionGuardUpdatedAt?.getTime()
       ) {
         throw conflict(
           "Issue changed while the native completion review was being checked; retry the acceptance",
