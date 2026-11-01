@@ -2264,6 +2264,25 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["missing", []],
+    ["non-running", [{ id: ownerRunId, companyId, agentId: ownerAgentId, status: "succeeded" }]],
+    ["different agent", [{ id: ownerRunId, companyId, agentId: peerAgentId, status: "running" }]],
+  ])("does not suppress the assignment wake when the creator run is %s", async (_caseName, runRows) => {
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: makeAgent(ownerAgentId) });
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({}, runRows),
+    );
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Self-assigned root without a live matching run", assigneeAgentId: ownerAgentId });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+  });
+
   it("suppresses assignment wakes for live creator self-assigned accepted-plan children", async () => {
     mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: makeAgent(ownerAgentId) });
     mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));

@@ -23394,6 +23394,7 @@ export function issueRoutes(
 
       for (const createdIssue of createdIssues) {
         if (
+          interaction.kind === "suggest_tasks" &&
           await shouldSuppressCreatorSelfAssignmentWake(
             issue.companyId,
             actor,
