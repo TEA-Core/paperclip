@@ -9,6 +9,8 @@ import {
   documentRevisions,
   documents,
   executionWorkspaces,
+  externalObjectMentions,
+  externalObjects,
   goals,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -5419,5 +5421,72 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       .where(eq(issueThreadInteractions.id, interactionId));
     expect(issue?.status).toBe("in_review");
     expect(interaction?.status).toBe("pending");
+  });
+
+  it("rejects native completion when linked delivery state changes after the guard preflight", async () => {
+    const { companyId, goalId, issueId, interactionId } =
+      await seedNativeCompletionReview("Native completion delivery");
+
+    // repository_delivery runs the guard's linked-PR zone; the seeded card has
+    // no execution workspace, so the preflight guard still allows the close
+    // via its no-repo-context fallback.
+    await db
+      .update(issues)
+      .set({ deliveryRequirement: "repository_delivery" })
+      .where(eq(issues.id, issueId));
+
+    await expect(interactionsSvc.acceptInteraction(
+      { id: issueId, companyId, goalId, projectId: null },
+      interactionId,
+      {
+        doneTier: {
+          tier: "tier2",
+          probeEvidence: "repository delivery native completion verified by the reviewer",
+        },
+      },
+      { userId: "local-board" },
+      {
+        beforeResolveInTransaction: async () => {
+          // Pause-after-preflight mutation of a guard-relevant non-issue-row
+          // input: an open linked PR mention appears for the card. The issue
+          // row's status, statusVersion, and updatedAt are untouched, so the
+          // previous updatedAt-only staleness check could not see this — the
+          // guard's verdict is now stale (it would refuse on the open PR).
+          const [externalObject] = await db
+            .insert(externalObjects)
+            .values({
+              companyId,
+              providerKey: "github",
+              objectType: "pull_request",
+              externalId: "octo-org/repo#pull/55",
+              data: { state: "open", draft: false, title: "Deliver the card" },
+            })
+            .returning();
+          await db.insert(externalObjectMentions).values({
+            companyId,
+            sourceIssueId: issueId,
+            sourceKind: "description",
+            objectId: externalObject.id,
+            objectType: "pull_request",
+            providerKey: "github",
+          });
+        },
+      },
+    )).rejects.toMatchObject({ status: 409 });
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [interaction] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interactionId));
+    expect(issue?.status).toBe("in_review");
+    expect(interaction?.status).toBe("pending");
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(
+      comments.some((comment) => comment.body.includes("Closed at Tier")),
+    ).toBe(false);
   });
 });

@@ -20,8 +20,9 @@ import {
   companies,
   documents,
   heartbeatRuns,
-  runIdentityContexts,
   issueComments,
+  issueExecutionDecisions,
+  runIdentityContexts,
   issueDocuments,
   issueQuestionResponseDeliveries,
   issueThreadInteractions,
@@ -97,7 +98,15 @@ import {
   USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS,
 } from "./issue-interaction-kinds.js";
 import { logActivityInTransaction, publishActivity, type ActivityPublication } from "./activity-log.js";
-import { evaluateDoneTransitionGuardForBackstopClose } from "./done-transition-guard.js";
+import {
+  countLadderedChildren,
+  evaluateDoneTransitionGuardForBackstopClose,
+} from "./done-transition-guard.js";
+import {
+  resolveCardDeliveryBranchOwnership,
+  resolveIssueRepoContext,
+  resolveLinkedPullRequestsWithState,
+} from "./merge-arming.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import {
   assertIssueReviewVerdictActorAllowed,
@@ -1935,6 +1944,149 @@ async function expireStaleRequestConfirmationTarget(
   return expired;
 }
 
+/**
+ * SUP-21908 (redo, SUP-22297): the authoritative snapshot of every DB-backed
+ * input the shared done-transition guard consumed when
+ * `acceptRequestConfirmation` preflighted a native completion close. The
+ * issue row alone (status/statusVersion/updatedAt) is NOT a revision for the
+ * guard's other inputs — linked delivery/PR mention rows, execution-decision
+ * rows, the comment window, laddered-child rows, and the workspace context
+ * can all mutate without touching the issue row. The acceptance transaction
+ * re-captures this snapshot after taking the issue lock and refuses the close
+ * on any drift, so a stale preflight verdict can no longer be committed.
+ *
+ * Deliberately excluded: GitHub live state (branch ahead-of-base, merged-PR
+ * lookups, hydration) and credential resolution — those are external to every
+ * database transaction and cannot be validated by the acceptance transaction
+ * itself; drift there is indistinguishable from ordinary external state
+ * change. Everything the guard reads from Postgres is captured.
+ */
+type NativeCompletionGuardInputSnapshot = {
+  issue: {
+    status: string;
+    statusVersion: number;
+    updatedAtMs: number;
+    identifier: string | null;
+    parentId: string | null;
+    createdByAgentId: string | null;
+    projectId: string | null;
+    projectWorkspaceId: string | null;
+    executionWorkspaceId: string | null;
+    deliveryRequirement: string | null;
+    executionPolicy: string | null;
+    executionState: string | null;
+  };
+  decisions: Array<{ id: string; stageId: string; outcome: string; createdAtMs: number }>;
+  comments: Array<{ id: string; updatedAtMs: number }>;
+  linkedPullRequests: Array<Record<string, unknown>>;
+  ladderedChildren: {
+    count: number;
+    identifiers: string[];
+    excludedChildIdentifiers: string[];
+  };
+  repoContext: Record<string, unknown> | null;
+  deliveryBranchOwnership: Record<string, unknown>;
+};
+
+async function captureNativeCompletionGuardInputs(
+  db: Db,
+  issue: typeof issues.$inferSelect,
+): Promise<NativeCompletionGuardInputSnapshot> {
+  const [
+    decisionRows,
+    commentRows,
+    linkedPullRequests,
+    ladderedChildren,
+    repoContext,
+    deliveryBranchOwnership,
+  ] = await Promise.all([
+    db
+      .select({
+        id: issueExecutionDecisions.id,
+        stageId: issueExecutionDecisions.stageId,
+        outcome: issueExecutionDecisions.outcome,
+        createdAt: issueExecutionDecisions.createdAt,
+      })
+      .from(issueExecutionDecisions)
+      .where(
+        and(
+          eq(issueExecutionDecisions.companyId, issue.companyId),
+          eq(issueExecutionDecisions.issueId, issue.id),
+        ),
+      )
+      .then((rows) =>
+        rows
+          .map((row) => ({
+            id: row.id,
+            stageId: row.stageId,
+            outcome: row.outcome,
+            createdAtMs: row.createdAt.getTime(),
+          }))
+          .sort((a, b) => (a.id < b.id ? -1 : 1)),
+      ),
+    // The same latest-100 window the guard's `listComments` callback reads.
+    db
+      .select({
+        id: issueComments.id,
+        updatedAt: issueComments.updatedAt,
+      })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issue.id))
+      .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+      .limit(100)
+      .then((rows) =>
+        rows.map((row) => ({ id: row.id, updatedAtMs: row.updatedAt.getTime() })),
+      ),
+    // The guard's own cached linked-PR reader, so the snapshot can never drift
+    // from what `resolveLinkedPullRequestsWithState` feeds the guard.
+    resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, {
+      includeDrafts: true,
+    }).then((prs) =>
+      prs
+        .map((pr) => ({ ...pr }))
+        .sort((a, b) =>
+          a.displayName === b.displayName
+            ? a.id < b.id
+              ? -1
+              : 1
+            : a.displayName < b.displayName
+              ? -1
+              : 1,
+        ),
+    ),
+    countLadderedChildren(db, issue.companyId, issue.id).then((census) => ({
+      count: census.count,
+      identifiers: [...census.identifiers].sort(),
+      excludedChildIdentifiers: [...census.excludedChildIdentifiers].sort(),
+    })),
+    resolveIssueRepoContext(db, issue),
+    resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id),
+  ]);
+
+  return {
+    issue: {
+      status: issue.status,
+      statusVersion: issue.statusVersion,
+      updatedAtMs: issue.updatedAt.getTime(),
+      identifier: issue.identifier,
+      parentId: issue.parentId,
+      createdByAgentId: issue.createdByAgentId,
+      projectId: issue.projectId,
+      projectWorkspaceId: issue.projectWorkspaceId,
+      executionWorkspaceId: issue.executionWorkspaceId,
+      deliveryRequirement: issue.deliveryRequirement,
+      executionPolicy: JSON.stringify(issue.executionPolicy ?? null),
+      executionState: JSON.stringify(issue.executionState ?? null),
+    },
+    decisions: decisionRows,
+    comments: commentRows,
+    linkedPullRequests,
+    ladderedChildren,
+    repoContext: repoContext === null ? null : { ...repoContext },
+    deliveryBranchOwnership: { ...deliveryBranchOwnership },
+  };
+}
+
 export function issueThreadInteractionService(
   db: Db,
   opts: IssueThreadInteractionServiceOptions = {},
@@ -2114,7 +2266,8 @@ export function issueThreadInteractionService(
       });
 
     let nativeCompletionCloseComment: string | null = null;
-    let nativeCompletionGuardUpdatedAt: Date | null = null;
+    let nativeCompletionGuardInputs: NativeCompletionGuardInputSnapshot | null =
+      null;
     if (isNativeCompletionReview(args.current)) {
       const [guardIssue] = await db
         .select()
@@ -2149,7 +2302,10 @@ export function issueThreadInteractionService(
         );
       }
       nativeCompletionCloseComment = guardVerdict.closeComment;
-      nativeCompletionGuardUpdatedAt = guardIssue.updatedAt;
+      nativeCompletionGuardInputs = await captureNativeCompletionGuardInputs(
+        db,
+        guardIssue,
+      );
     }
     const now = new Date();
     const postCommitActivityPublications: ActivityPublication[] = [];
@@ -2200,13 +2356,25 @@ export function issueThreadInteractionService(
         args.actor,
       );
 
-      if (
-        isNativeCompletionReview(lockedCurrent) &&
-        issueContext.updatedAt.getTime() !== nativeCompletionGuardUpdatedAt?.getTime()
-      ) {
-        throw conflict(
-          "Issue changed while the native completion review was being checked; retry the acceptance",
+      if (isNativeCompletionReview(lockedCurrent)) {
+        // SUP-21908 redo (SUP-22297): the preflight verdict is only
+        // authoritative for the exact DB state it was computed from. Re-read
+        // every DB-backed guard input under the issue lock and refuse the
+        // close if ANY of them drifted — an issue-row revision alone does not
+        // cover linked delivery/PR rows, decision rows, comments, laddered
+        // children, or the workspace context.
+        const lockedGuardInputs = await captureNativeCompletionGuardInputs(
+          tx as unknown as Db,
+          issueContext,
         );
+        if (
+          nativeCompletionGuardInputs === null ||
+          !isDeepStrictEqual(lockedGuardInputs, nativeCompletionGuardInputs)
+        ) {
+          throw conflict(
+            "Issue changed while the native completion review was being checked; retry the acceptance",
+          );
+        }
       }
 
       const interaction = hydrateInteraction(lockedCurrent);
