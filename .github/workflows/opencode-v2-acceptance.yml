@@ -1,0 +1,79 @@
+name: OpenCode V2 acceptance
+
+# The opencode_local adapter drives a real OpenCode 2.x binary, and the only
+# proof that the V2 argument shape, model discovery, output-cap handling and the
+# `opencode serve` MCP gate still work against that binary lives in
+# `packages/adapters/opencode-local/src/server/real-binary.acceptance.test.ts`
+# and `server/src/__tests__/opencode-v2-paperclip-mcp.acceptance.test.ts`.
+# Unit tests fake the binary, so a V2 regression is invisible to them.
+#
+# Those suites are opt-in (`PAPERCLIP_OPENCODE_V2_ACCEPTANCE=1`) because the default
+# `pnpm test` lane must neither download a ~250 MB binary nor launch real
+# processes. Opt-in is only honest when something actually opts in, so this
+# workflow is that something: it provisions the pinned release through
+# `pnpm opencode:v2-acceptance:provision` and runs the suites. Failing here is a
+# real signal -- the suite fails closed when the binary cannot be provisioned,
+# rather than skipping and reporting green.
+#
+# The scheduled run is the drift guard: OpenCode ships outside this repository,
+# so a pin bump or an upstream behaviour change is caught by the schedule even
+# when nothing in `packages/adapters/opencode-local` changed.
+
+on:
+  pull_request:
+    paths:
+      - "packages/adapters/opencode-local/**"
+      - "server/src/__tests__/opencode-v2-paperclip-mcp.acceptance.test.ts"
+      - ".github/workflows/opencode-v2-acceptance.yml"
+      - "package.json"
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opencode-v2-acceptance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  real_binary:
+    name: Real-binary acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The server acceptance suite imports plugin-loader, which resolves
+      # @paperclipai/plugin-sdk from dist/; `pnpm install` does not produce it.
+      - name: Build @paperclipai/plugin-sdk (TypeScript only)
+        run: pnpm --filter @paperclipai/plugin-sdk build
+
+      - name: Cache provisioned OpenCode binary
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/paperclip/opencode-v2-acceptance
+          key: opencode-v2-acceptance-${{ runner.os }}-${{ hashFiles('packages/adapters/opencode-local/scripts/opencode-v2-acceptance-pin.json') }}
+
+      - name: Provision the pinned OpenCode V2 binary
+        run: pnpm opencode:v2-acceptance:provision
+
+      - name: Run real-binary acceptance
+        run: pnpm test:opencode-v2-acceptance

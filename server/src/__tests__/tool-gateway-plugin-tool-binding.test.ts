@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -22,7 +24,8 @@ import {
   toolPolicies,
 } from "@paperclipai/db";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
-import { createToolGatewayService } from "../services/tool-gateway.js";
+import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
+import { toolGatewayRoutes } from "../routes/tool-gateway.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -31,6 +34,8 @@ import {
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 type TestDb = ReturnType<typeof createDb>;
+
+const wikiReadPageContent = "# Wiki page\n\nRead-back body.";
 
 // Two ready plugins with one tool each. The namespaced tool name is
 // "<pluginKey>:<toolName>", so the plugin keys are "a.b" and "c.d".
@@ -67,16 +72,46 @@ function twoPluginDispatcher(): PluginToolDispatcher {
         parametersSchema: { type: "object" },
         pluginId: "plugin-c",
       },
+      {
+        name: "a.b:wiki_read_page",
+        displayName: "Read Wiki Page",
+        description: "A schema-strict wiki read tool.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            companyId: { type: "string" },
+            wikiId: { type: "string" },
+            path: { type: "string" },
+          },
+          required: ["companyId", "wikiId", "path"],
+          additionalProperties: false,
+        },
+        pluginId: "plugin-a",
+      },
     ],
     getTool: () => null,
-    executeTool: async () => ({
-      pluginId: "plugin-a",
-      toolName: "alpha",
-      result: { data: { ok: true } },
-    }),
+    executeTool: async (tool) => {
+      if (tool === "a.b:wiki_read_page") {
+        return {
+          pluginId: "plugin-a",
+          toolName: "wiki_read_page",
+          result: {
+            content: wikiReadPageContent,
+            data: {
+              hash: createHash("sha256").update(wikiReadPageContent).digest("hex"),
+            },
+          },
+        };
+      }
+      return {
+        pluginId: "plugin-a",
+        toolName: "alpha",
+        result: { data: { ok: true } },
+      };
+    },
     registerPluginTools: () => {},
     unregisterPluginTools: () => {},
-    toolCount: () => 4,
+    toolCount: () => 5,
     getRegistry: () => {
       throw new Error("not implemented");
     },
@@ -155,6 +190,12 @@ async function allowBothPluginTools(db: TestDb, companyId: string) {
     name: "Allow wiki_append_log",
     policyType: "allow",
     selectors: { toolName: "wiki_append_log" },
+  });
+  await db.insert(toolPolicies).values({
+    companyId,
+    name: "Allow a.b:wiki_read_page",
+    policyType: "allow",
+    selectors: { toolName: "a.b:wiki_read_page" },
   });
 }
 
@@ -426,5 +467,204 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
       parameters: {},
       runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
     })).rejects.toMatchObject({ status: 404, reasonCode: "tool_not_found" });
+  });
+
+  it("rejects schema-invalid plugin tool arguments with 422 naming the missing field", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    const error = await gateway
+      .executeTool({
+        sessionToken: session.token,
+        tool: "a.b:wiki_read_page",
+        parameters: { wikiId: "main", path: "index.md" },
+      })
+      .then(
+        () => {
+          throw new Error("Expected the schema-invalid call to be rejected");
+        },
+        (caught) => caught as ToolGatewayHttpError,
+      );
+    expect(error).toBeInstanceOf(ToolGatewayHttpError);
+    expect(error.status).toBe(422);
+    expect(error.reasonCode).toBe("invalid_tool_arguments");
+    expect(error.message).toContain("companyId");
+    expect(error.details).toMatchObject({
+      issues: [expect.objectContaining({ field: "companyId" })],
+    });
+
+    // Schema rejection happens before invocation recording: no failed call,
+    // no audit noise for a client mistake.
+    const invocations = await db.select().from(toolInvocations);
+    expect(invocations).toEqual([]);
+  });
+
+  it("returns a flat plugin tool result envelope on tools/call", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    const outcome = await gateway.executeTool({
+      sessionToken: session.token,
+      tool: "a.b:wiki_read_page",
+      parameters: { companyId: company.id, wikiId: "main", path: "index.md" },
+    });
+
+    expect(outcome).toMatchObject({ status: "completed", tool: "a.b:wiki_read_page" });
+    const result = outcome.result as Record<string, unknown>;
+    // Documented wire contract: result.content / result.data directly — not
+    // the dispatcher envelope nested under result.result.
+    expect(result).toMatchObject({
+      content: wikiReadPageContent,
+      data: {
+        hash: createHash("sha256").update(wikiReadPageContent).digest("hex"),
+      },
+    });
+    expect(result).not.toHaveProperty("result");
+    expect(result).not.toHaveProperty("pluginId");
+  });
+
+  it("serves the tools/call HTTP route with the 422 and flat-result contract", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+    const app = express();
+    app.use(express.json());
+    app.use("/api", toolGatewayRoutes(db, gateway));
+
+    const missingCompanyId = await request(app)
+      .post("/api/tool-gateway/tools/call")
+      .set("x-paperclip-tool-gateway-token", session.token)
+      .send({ tool: "a.b:wiki_read_page", parameters: { wikiId: "main", path: "index.md" } });
+    expect(missingCompanyId.status).toBe(422);
+    expect(missingCompanyId.body).toMatchObject({
+      error: expect.stringContaining("companyId"),
+      reasonCode: "invalid_tool_arguments",
+    });
+
+    const valid = await request(app)
+      .post("/api/tool-gateway/tools/call")
+      .set("x-paperclip-tool-gateway-token", session.token)
+      .send({
+        tool: "a.b:wiki_read_page",
+        parameters: { companyId: company.id, wikiId: "main", path: "index.md" },
+      });
+    expect(valid.status).toBe(200);
+    expect(valid.body.result).toMatchObject({
+      content: wikiReadPageContent,
+      data: { hash: expect.any(String) },
+    });
+    expect(valid.body.result).not.toHaveProperty("result");
+    expect(createHash("sha256").update(valid.body.result.content).digest("hex")).toBe(
+      valid.body.result.data.hash,
+    );
+  });
+
+  it("rejects schema-invalid plugin tool arguments on the direct plugin execute path", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+
+    const error = await gateway
+      .executePluginTool({
+        actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
+        tool: "a.b:wiki_read_page",
+        parameters: { wikiId: "main", path: "index.md" },
+        runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+      })
+      .then(
+        () => {
+          throw new Error("Expected the schema-invalid plugin execute to be rejected");
+        },
+        (caught) => caught as ToolGatewayHttpError,
+      );
+    expect(error).toBeInstanceOf(ToolGatewayHttpError);
+    expect(error.status).toBe(422);
+    expect(error.reasonCode).toBe("invalid_tool_arguments");
+    expect(error.message).toContain("companyId");
+
+    // Schema rejection happens before invocation recording: no failed call,
+    // no audit noise for a client mistake.
+    const invocations = await db.select().from(toolInvocations);
+    expect(invocations).toEqual([]);
+  });
+
+  it("replays an idempotent tools/call with the same flat result projection", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    const parameters = { companyId: company.id, wikiId: "main", path: "index.md" };
+    const first = await gateway.executeTool({
+      sessionToken: session.token,
+      tool: "a.b:wiki_read_page",
+      parameters,
+      idempotencyKey: "replay-flat-contract",
+    });
+    expect(first.status).toBe("completed");
+
+    const replay = await gateway.executeTool({
+      sessionToken: session.token,
+      tool: "a.b:wiki_read_page",
+      parameters,
+      idempotencyKey: "replay-flat-contract",
+    });
+    expect(replay.status).toBe("replayed");
+    expect(replay.invocationId).toBe(first.invocationId);
+    // The replay carries the persisted result payload with the flat
+    // {content, data} shape — not the stored summary wrapper that would
+    // otherwise surface as {summary, sha256, ...}.
+    expect(replay.result).toEqual(first.result);
+    const replayedResult = replay.result as Record<string, unknown>;
+    expect(replayedResult).not.toHaveProperty("summary");
+    expect(replayedResult).not.toHaveProperty("result");
+    expect(replayedResult).not.toHaveProperty("pluginId");
+  });
+
+  it("replays a side-effecting plugin execute with the stored envelope projection", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+    const input = {
+      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: "a.b:wiki_append_log",
+      parameters: { path: "log/index.md", content: "same entry" },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+    };
+
+    const first = await gateway.executePluginTool(input);
+    // Side-effecting tools auto-key on their arguments; the identical call
+    // replays instead of dispatching twice.
+    const replay = await gateway.executePluginTool(input);
+
+    expect(replay).toEqual(first);
+    expect(replay).toMatchObject({
+      pluginId: "plugin-a",
+      toolName: "alpha",
+      result: { data: { ok: true } },
+    });
+    const invocations = await db.select().from(toolInvocations);
+    expect(invocations).toHaveLength(1);
   });
 });

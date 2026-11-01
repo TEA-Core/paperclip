@@ -67,7 +67,7 @@ import {
   prepareEmbeddedPostgresNativeRuntime,
 } from "@paperclipai/db";
 import type { Command } from "commander";
-import { ensureAgentJwtSecret, ensureToolActionSigningSecret, loadPaperclipEnvFile, mergePaperclipEnvEntries, readPaperclipEnvEntries, resolvePaperclipEnvFile } from "../config/env.js";
+import { ensureAgentJwtSecret, ensureDecisionSigningSecret, ensureToolActionSigningSecret, loadPaperclipEnvFile, mergePaperclipEnvEntries, readDecisionSigningSecretFromEnvFile, readPaperclipEnvEntries, resolvePaperclipEnvFile } from "../config/env.js";
 import { expandHomePrefix } from "../config/home.js";
 import type { PaperclipConfig } from "../config/schema.js";
 import { readConfig, resolveConfigPath, writeConfig } from "../config/store.js";
@@ -2437,6 +2437,11 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
     );
   }
 
+  // Captured before the --force wipe below: a valid per-worktree
+  // decision-signing key survives re-init, so a regenerate does not silently
+  // rotate the worktree's decision signatures (SUP-22126).
+  const preservedDecisionSigningSecret = readDecisionSigningSecretFromEnvFile(paths.envPath);
+
   if (opts.force) {
     // Only remove the specific files we're about to rewrite, not the whole
     // repoConfigDir — that directory can contain sibling state such as
@@ -2521,6 +2526,7 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
   );
   ensureAgentJwtSecret(paths.configPath);
   ensureToolActionSigningSecret(paths.configPath);
+  ensureDecisionSigningSecret(paths.configPath, preservedDecisionSigningSecret);
   loadPaperclipEnvFile(paths.configPath);
   const copiedGitHooks = copyGitHooksToWorktreeGitDir(cwd);
 

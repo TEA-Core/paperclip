@@ -44,6 +44,10 @@ export const SANDBOX_INSTALL_COMMAND =
 
 export const DEFAULT_OPENCODE_LOCAL_MODEL = "openai/gpt-5.2-codex";
 
+// The one OpenCode V2 CLI version the adapter drives. 2.2.3+ is required for
+// `error type=output-limit`, and 2.2.0+ for a position-agnostic `--standalone`.
+export const OPENCODE_V2_CLI_VERSION = "2.2.4";
+
 export function isValidOpenCodeModelId(value: unknown): value is string {
   if (typeof value !== "string") return false;
   const trimmed = value.trim();
@@ -83,7 +87,7 @@ Core fields:
 - dangerouslySkipPermissions (boolean, optional): inject a runtime OpenCode config that allows \`external_directory\` access without interactive prompts; defaults to true for unattended Paperclip runs
 - promptTemplate (string, optional): run prompt template
 - command (string, optional): defaults to "opencode"
-- cliVersion (string, optional): exact opt-in OpenCode CLI version; 2.0.26 enables V2 arguments and standalone execution
+- cliVersion (string, optional): exact OpenCode CLI version; only ${OPENCODE_V2_CLI_VERSION} is accepted and it enables V2 arguments and standalone execution. When omitted, the adapter probes \`command --version\`: a 1.x binary runs as V1, a detected 2.x binary other than ${OPENCODE_V2_CLI_VERSION} is refused, and a version that cannot be determined (probe failed, timed out, or empty or unparseable output) is treated as V1
 - extraArgs (string[], optional): additional CLI args
 - env (object, optional): KEY=VALUE environment variables
 - skillIsolation (string, optional): "shared" (default) or "desired-only". "shared"
@@ -108,8 +112,12 @@ Notes:
   \`opencode models\` to list available options in provider/model format.
 - Paperclip requires an explicit \`model\` value for \`opencode_local\` agents.
 - Runs are executed with: opencode run --format json ...
-- Opt-in V2 runs use: opencode run --standalone --format json ...
-- Sessions are resumed with --session when stored session cwd matches current cwd.
+- Opt-in V2 runs use a private loopback \`opencode serve\` (per-run port and password) so \
+  the Paperclip MCP tools are in the first request; remote targets and runs with \
+  \`extraArgs\` or \`args\` keep: opencode run --standalone --format json ... \
+  (see doc/DEVELOPING.md, OpenCode V2 Server Transport).
+- Sessions are resumed (--session on the one-shot run path, the stored session id \
+  over the serve API otherwise) when stored session cwd matches current cwd.
 - The adapter sets OPENCODE_DISABLE_PROJECT_CONFIG=true to prevent OpenCode from \
   writing an opencode.json config file into the project working directory. Model \
   selection is passed via the --model CLI flag instead.

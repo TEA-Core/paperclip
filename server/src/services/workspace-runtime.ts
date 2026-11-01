@@ -4916,9 +4916,36 @@ async function restoreBaseRepoToDefaultRef(input: {
     return { restored: false, warnings, rescueRefs };
   }
 
-  const checkout = await runGit(["checkout", "--force", shortDefault], input.repoRoot)
-    .then(() => true)
-    .catch(() => false);
+  // SUP-22022: the checkout must land on the configured base ref's commit.
+  // `git checkout --force <shortDefault>` resolves refs/heads/<branch>, so a
+  // same-named local branch that is stale (or diverged) would move the repo —
+  // which on the managed reuse path can be an execution worktree itself —
+  // backward off the base tip. Only a local branch that already points at the
+  // base ref's commit may take the checkout; anything else detaches at that
+  // commit without mutating the stale branch ref.
+  const baseRefTargetSha = await resolveBaseRefSha(input.repoRoot, input.baseRef);
+  const localBranchSha = await runGit(
+    ["rev-parse", "--verify", "--quiet", `refs/heads/${shortDefault}`],
+    input.repoRoot,
+  )
+    .then((value) => value.trim() || null)
+    .catch(() => null);
+  const staleLocalBranch = Boolean(baseRefTargetSha && localBranchSha && localBranchSha !== baseRefTargetSha);
+  const checkoutCommand = staleLocalBranch
+    ? `git checkout --force --detach ${baseRefTargetSha}`
+    : `git checkout --force ${shortDefault}`;
+  const checkout = staleLocalBranch
+    ? await runGit(["checkout", "--force", "--detach", baseRefTargetSha!], input.repoRoot)
+        .then(() => true)
+        .catch(() => false)
+    : await runGit(["checkout", "--force", shortDefault], input.repoRoot)
+        .then(() => true)
+        .catch(() => false);
+  if (checkout && staleLocalBranch) {
+    warnings.push(
+      `base repo was detached at ${input.baseRef} (${baseRefTargetSha?.slice(0, 12)}) because local branch "${shortDefault}" is stale at ${localBranchSha?.slice(0, 12)} and does not point at the configured base ref`,
+    );
+  }
   let restored = checkout;
   if (!checkout) {
     // The default branch can be held by an agent worktree, which is its own bug
@@ -4941,12 +4968,13 @@ async function restoreBaseRepoToDefaultRef(input: {
   if (input.recorder) {
     await input.recorder.recordOperation({
       phase: "worktree_prepare",
-      command: `git checkout --force ${shortDefault}`,
+      command: checkoutCommand,
       cwd: input.repoRoot,
       metadata: {
         baseRepoHygiene: true,
         repoRoot: input.repoRoot,
         baseRef: input.baseRef,
+        baseRefSha: baseRefTargetSha,
         reasons: input.decision.reasons,
         rescueRefs,
         restored,
@@ -9401,17 +9429,25 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     Object.assign(env, buildManagedWorkspaceGuestEnv(managedWorkspaceIdentity));
   }
 
-  if (exposureConfig) {
-    // Paperclip dev-runtime-specific hardening. Other managed processes are
-    // still rejected by the broker unless /proc proves loopback-only listeners.
-    //
-    // Three independent layers force the loopback bind, because a guest checkout
-    // can be arbitrarily old (PAP-17256): the `--bind loopback` argv
-    // added above, these env vars for a runner that reads them, and HOST for one
-    // old enough to ignore both and infer its bind mode from HOST alone.
+  // The loopback bind is forced on a managed Paperclip dev runtime whether or
+  // not managed HTTPS exposure resolved. Without exposure there is no broker to
+  // reject an off-loopback listener, but the child still inherits the control
+  // plane's bind environment: a container-wide HOST outranks the guest config
+  // file's server.host, so a local_trusted guest resolves bind=lan and exits
+  // with `local_trusted requires server.bind=loopback` (SUP-22143). These are
+  // the env-var layers of the PAP-17256 hardening — PAPERCLIP_BIND /
+  // PAPERCLIP_BIND_HOST for a runner that reads them, and HOST for one old
+  // enough to ignore both and infer its bind mode from HOST alone; the
+  // `--bind loopback` argv layer above stays exposure-only. Exposed
+  // non-Paperclip services keep the same env they always had.
+  if (exposureConfig || isPaperclipDevRuntimeService({ serviceName, command })) {
     env.PAPERCLIP_BIND = RUNTIME_EXPOSURE_BIND_MODE;
     env.PAPERCLIP_BIND_HOST = RUNTIME_EXPOSURE_BIND_HOST;
     env.HOST = RUNTIME_EXPOSURE_BIND_HOST;
+  }
+  if (exposureConfig) {
+    // Exposure-only hardening. Other managed processes are still rejected by
+    // the broker unless /proc proves loopback-only listeners.
     env.PAPERCLIP_VITE_HMR_PROTOCOL = "wss";
     env.PAPERCLIP_MANAGED_RUNTIME_EXPOSURE = "tailscale_https";
     env.PAPERCLIP_ALLOWED_HOSTNAMES = exposureHostname!;

@@ -206,7 +206,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
   it("refresh stamps every row merged with mergedAt + mergeCommitSha sourced from GitHub", async () => {
     const service = prDeliveryService(db, {
       resolvePullRequestDetails: vi.fn(async () => ({
-        state: "merged",
+        state: "merged" as const,
         headRef: "carrier-branch",
         headSha: "abc123",
         mergedAt: "2026-08-31T17:26:58Z",
@@ -236,7 +236,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
   it("refresh records delivered net LOC plus raw additions/deletions when the snapshot carries them", async () => {
     const service = prDeliveryService(db, {
       resolvePullRequestDetails: vi.fn(async () => ({
-        state: "merged",
+        state: "merged" as const,
         headRef: "carrier-branch",
         headSha: "abc123",
         mergedAt: "2026-08-31T17:26:58Z",
@@ -262,7 +262,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
   it("refresh records no LOC when the snapshot lacks additions/deletions (never a 0)", async () => {
     const service = prDeliveryService(db, {
       resolvePullRequestDetails: vi.fn(async () => ({
-        state: "merged",
+        state: "merged" as const,
         headRef: "carrier-branch",
         headSha: "abc123",
         mergedAt: "2026-08-31T17:26:58Z",
@@ -290,7 +290,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
   it("refresh records a genuine zero-diff as deliveredNetLoc 0, distinct from absent", async () => {
     const service = prDeliveryService(db, {
       resolvePullRequestDetails: vi.fn(async () => ({
-        state: "merged",
+        state: "merged" as const,
         headRef: "carrier-branch",
         headSha: "abc123",
         mergedAt: "2026-08-31T17:26:58Z",
@@ -314,7 +314,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
   it("never merges an open PR: rows stay ready_for_review with no mergedAt", async () => {
     const service = prDeliveryService(db, {
       resolvePullRequestDetails: vi.fn(async () => ({
-        state: "open",
+        state: "open" as const,
         headRef: "carrier-branch",
         headSha: "abc123",
       })),
@@ -337,7 +337,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
   it("refresh is a no-op for issues that never recorded a delivery row", async () => {
     const service = prDeliveryService(db, {
       resolvePullRequestDetails: vi.fn(async () => ({
-        state: "merged",
+        state: "merged" as const,
         headRef: "carrier-branch",
         headSha: "abc123",
         mergedAt: "2026-08-31T17:26:58Z",
@@ -400,7 +400,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
   it("sweepMergeState flips every delivery row to merged with mergedAt + mergeCommitSha", async () => {
     const service = prDeliveryService(db, {
       resolvePullRequestDetails: vi.fn(async () => ({
-        state: "merged",
+        state: "merged" as const,
         headRef: "carrier-branch",
         headSha: "abc123",
         mergedAt: "2026-08-31T17:26:58Z",
@@ -429,7 +429,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
   it("sweepMergeState records delivered net LOC when the snapshot carries it", async () => {
     const service = prDeliveryService(db, {
       resolvePullRequestDetails: vi.fn(async () => ({
-        state: "merged",
+        state: "merged" as const,
         headRef: "carrier-branch",
         headSha: "abc123",
         mergedAt: "2026-08-31T17:26:58Z",
@@ -456,7 +456,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
   it("sweepMergeState never merges an open PR and stamps a cooldown marker", async () => {
     const service = prDeliveryService(db, {
       resolvePullRequestDetails: vi.fn(async () => ({
-        state: "open",
+        state: "open" as const,
         headRef: "carrier-branch",
         headSha: "abc123",
       })),
@@ -477,7 +477,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
 
   it("sweepMergeState honors the cooldown: a just-checked row is not re-resolved", async () => {
     const resolve = vi.fn(async () => ({
-      state: "open",
+      state: "open" as const,
       headRef: "carrier-branch",
       headSha: "abc123",
     }));
@@ -494,7 +494,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
   it("recordAtOpen + recordCarrierFanOut never downgrade a merged row on re-delivery", async () => {
     const service = prDeliveryService(db, {
       resolvePullRequestDetails: vi.fn(async () => ({
-        state: "merged",
+        state: "merged" as const,
         headRef: "carrier-branch",
         headSha: "abc123",
         mergedAt: "2026-08-31T17:26:58Z",
@@ -539,7 +539,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
           throw new Error("transient GitHub API failure");
         }
         return {
-          state: "merged",
+          state: "merged" as const,
           headRef: "carrier-branch",
           headSha: "abc123",
           mergedAt: "2026-08-31T17:26:58Z",
@@ -647,7 +647,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
   it("logs an updated activity entry when refresh flips every row to merged", async () => {
     const service = prDeliveryService(db, {
       resolvePullRequestDetails: vi.fn(async () => ({
-        state: "merged",
+        state: "merged" as const,
         headRef: "carrier-branch",
         headSha: "abc123",
         mergedAt: "2026-08-31T17:26:58Z",
@@ -672,7 +672,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
   it("logs no activity when a refresh resolves the PR as open (no row mutation)", async () => {
     const service = prDeliveryService(db, {
       resolvePullRequestDetails: vi.fn(async () => ({
-        state: "open",
+        state: "open" as const,
         headRef: "carrier-branch",
         headSha: "abc123",
       })),
@@ -687,7 +687,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
   it("logs an updated activity entry when the sweep flips a row to merged", async () => {
     const service = prDeliveryService(db, {
       resolvePullRequestDetails: vi.fn(async () => ({
-        state: "merged",
+        state: "merged" as const,
         headRef: "carrier-branch",
         headSha: "abc123",
         mergedAt: "2026-08-31T17:26:58Z",

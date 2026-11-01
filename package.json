@@ -42,6 +42,8 @@
     "release:rollback": "./scripts/rollback-latest.sh",
     "release:bootstrap-package": "node scripts/bootstrap-npm-package.mjs",
     "opencode:db-janitor": "node scripts/opencode-db-janitor.mjs",
+    "opencode:v2-acceptance:provision": "node packages/adapters/opencode-local/scripts/provision-opencode-v2-binary.mjs",
+    "test:opencode-v2-acceptance": "PAPERCLIP_OPENCODE_V2_ACCEPTANCE=1 vitest run packages/adapters/opencode-local/src/server/real-binary.acceptance.test.ts server/src/__tests__/opencode-v2-paperclip-mcp.acceptance.test.ts",
     "test:opencode-db-janitor": "node --test scripts/__tests__/opencode-db-janitor.test.mjs",
     "check:tokens": "node scripts/check-forbidden-tokens.mjs",
     "check:token-gates": "node scripts/check-token-gates.mjs",

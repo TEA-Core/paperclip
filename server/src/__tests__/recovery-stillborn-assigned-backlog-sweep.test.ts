@@ -310,7 +310,7 @@ describeEmbeddedPostgres("recovery sweep reconcileStillbornAssignedBacklog", () 
       kind: "request_confirmation",
       status: "pending",
       continuationPolicy: "wake_assignee",
-      payload: {},
+      payload: { version: 1, prompt: "Continue?" },
     });
 
     const result = await makeSweep().reconcileStillbornAssignedBacklog();

@@ -42,6 +42,19 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
   startAdapterExecutionTargetPaperclipBridge: vi.fn(async () => null),
 }));
 
+// The process runner is mocked, but a bare `opencode` would still be probed for
+// `--version` with a real child process and resolve to the host's PATH binary.
+vi.mock("./version.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./version.js")>();
+  return {
+    ...actual,
+    probeOpenCodeCliVersion: (input: Parameters<typeof actual.probeOpenCodeCliVersion>[0]) =>
+      input.target?.kind !== "remote" && input.command === "opencode"
+        ? Promise.resolve(null)
+        : actual.probeOpenCodeCliVersion(input),
+  };
+});
+
 vi.mock("@paperclipai/adapter-utils/server-utils", async () => {
   const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/server-utils")>(
     "@paperclipai/adapter-utils/server-utils",
@@ -56,7 +69,6 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async () => {
 });
 
 vi.mock("./models.js", () => ({
-  OPENCODE_V2_CLI_VERSION: "2.0.26",
   ensureOpenCodeModelConfiguredAndAvailable: vi.fn(async () => []),
   isTruthyEnvFlag: (value: unknown) => value === "true" || value === "1",
   parseOpenCodeModelsOutput: () => [],

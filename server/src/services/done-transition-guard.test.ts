@@ -5598,6 +5598,12 @@ describe("evaluateDoneTierDeclaration", () => {
       const route = readFileSync(new URL("../routes/issues.ts", import.meta.url), "utf8");
       expect(route).toContain("DONE_TIER_STRUCTURED_FORMS");
       expect(route).toContain("structured doneTier field");
+      // AC1 says "on both doors". The remedy is built once but branches on
+      // input.createDoor, so one interpolation per branch is the machine-checkable
+      // shape of that promise: a future edit that names the structured field on
+      // only one door drops a count and fails here, not in production.
+      expect((route.match(/\$\{DONE_TIER_STRUCTURED_FORMS\}/g) ?? []).length).toBeGreaterThanOrEqual(2);
+      expect((route.match(/\$\{TIER1_FORM\}/g) ?? []).length).toBeGreaterThanOrEqual(2);
     });
 
     it("SUP-21474: routes remedy interpolates TIER1_FORM un-cut so both Tier 1 forms keep balanced quotes", () => {

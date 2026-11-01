@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -1055,6 +1055,57 @@ describeEmbeddedPostgres("summary slot service", () => {
       expect(revisions.revisions[1]!.body).toContain("First summary for this scope.");
     });
 
+    it("rejects a write when the generation run changes while the write waits for the issue lock", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const otherAgentId = await seedPlainAgent(companyId);
+      const { svc, generationIssueId, runId } = await startGeneration(companyId, projectId, summarizerAgentId);
+      const otherRunId = await seedRun(companyId, otherAgentId, generationIssueId);
+      let releaseIssueLock!: () => void;
+      const issueLockReleased = new Promise<void>((resolve) => {
+        releaseIssueLock = resolve;
+      });
+      let markIssueLockAcquired!: () => void;
+      const issueLockAcquired = new Promise<void>((resolve) => {
+        markIssueLockAcquired = resolve;
+      });
+      const issueLockTransaction = db.transaction(async (tx) => {
+        await tx.select().from(issues).where(eq(issues.id, generationIssueId)).for("update");
+        markIssueLockAcquired();
+        await tx
+          .update(issues)
+          .set({ checkoutRunId: otherRunId })
+          .where(eq(issues.id, generationIssueId));
+        await issueLockReleased;
+      });
+      await issueLockAcquired;
+
+      const writePromise = svc.write(
+        { ...projectSelector(companyId, projectId), markdown: "# Stale write", generationIssueId },
+        { agentId: summarizerAgentId, runId },
+      );
+      let writeWaitingForIssueLock = false;
+      for (let i = 0; i < 100; i += 1) {
+        const waiting = await db.execute(
+          sql`select 1 from pg_stat_activity where cardinality(pg_blocking_pids(pid)) > 0 and query ilike '%for update%'`,
+        );
+        if (waiting.length > 0) {
+          writeWaitingForIssueLock = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(writeWaitingForIssueLock).toBe(true);
+      releaseIssueLock();
+      await issueLockTransaction;
+
+      await expect(writePromise).rejects.toMatchObject({
+        status: 403,
+        message: "Summary write must run from the linked generation task",
+      });
+    });
+
     it("serializes concurrent writes for the same slot into sequential revisions instead of leaking a revision unique-index violation", async () => {
       const companyId = await seedCompany();
       const projectId = await seedProject(companyId);
@@ -1426,6 +1477,40 @@ describeEmbeddedPostgres("summary slot service", () => {
           { agentId: summarizerAgentId, runId: randomUUID() },
         ),
       ).rejects.toMatchObject({ status: 403 });
+    });
+
+    it("rejects a Summarizer write presenting another agent's run id even when that run is stamped on the generation issue", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const otherAgentId = await seedPlainAgent(companyId);
+      const svc = summarySlotService(db);
+      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      const generationIssueId = generated.generatingIssue.id;
+      const otherRunId = await seedRun(companyId, otherAgentId, generationIssueId);
+      await db
+        .update(issues)
+        .set({ checkoutRunId: otherRunId })
+        .where(eq(issues.id, generationIssueId));
+
+      await expect(
+        svc.write(
+          { ...projectSelector(companyId, projectId), markdown: "# Stolen run", generationIssueId },
+          { agentId: summarizerAgentId, runId: otherRunId },
+        ),
+      ).rejects.toMatchObject({ status: 403 });
+
+      const ownRunId = await seedRun(companyId, summarizerAgentId, generationIssueId);
+      await db
+        .update(issues)
+        .set({ checkoutRunId: ownRunId })
+        .where(eq(issues.id, generationIssueId));
+      await expect(
+        svc.write(
+          { ...projectSelector(companyId, projectId), markdown: "# Own run", generationIssueId },
+          { agentId: summarizerAgentId, runId: ownRunId },
+        ),
+      ).resolves.toMatchObject({ slot: { generatingIssueId: generationIssueId } });
     });
 
     it("rejects using one generation task to write a different slot", async () => {

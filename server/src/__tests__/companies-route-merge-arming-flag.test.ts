@@ -67,7 +67,9 @@ describeMergeArmingFlag("PATCH /api/companies/:companyId mergeArmingEnabled (SUP
 
   it("rejects an agent PATCH of mergeArmingEnabled and the flag stays false", async () => {
     const svc = companyService(db);
-    expect((await svc.getById(companyId)).mergeArmingEnabled).toBe(false);
+    const company = await svc.getById(companyId);
+    expect(company).not.toBeNull();
+    expect(company!.mergeArmingEnabled).toBe(false);
 
     const ceoAgent = await insertCeoAgent();
     const agentApp = createApp({
@@ -84,7 +86,9 @@ describeMergeArmingFlag("PATCH /api/companies/:companyId mergeArmingEnabled (SUP
     expect(res.status).toBe(400);
     expect(res.body.error).toContain("mergeArmingEnabled");
 
-    expect((await svc.getById(companyId)).mergeArmingEnabled).toBe(false);
+    const updatedCompany = await svc.getById(companyId);
+    expect(updatedCompany).not.toBeNull();
+    expect(updatedCompany!.mergeArmingEnabled).toBe(false);
   });
 
   it("accepts a board PATCH of mergeArmingEnabled=true and persists it", async () => {
@@ -108,6 +112,8 @@ describeMergeArmingFlag("PATCH /api/companies/:companyId mergeArmingEnabled (SUP
     expect(reRead.body.mergeArmingEnabled).toBe(true);
 
     const svc = companyService(db);
-    expect((await svc.getById(companyId)).mergeArmingEnabled).toBe(true);
+    const company = await svc.getById(companyId);
+    expect(company).not.toBeNull();
+    expect(company!.mergeArmingEnabled).toBe(true);
   });
 });

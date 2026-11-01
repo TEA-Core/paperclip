@@ -228,3 +228,122 @@ export function isOpenCodeTransientStatementError(stderr: string): boolean {
   const lower = stderr.toLowerCase();
   return lower.includes("failed to execute statement") || lower.includes("unexpected server error");
 }
+
+/**
+ * Terminal outcome of one `opencode serve` turn, from the `session.execution.*` events.
+ */
+export type OpenCodeServeTurnOutcome = "succeeded" | "failed" | "interrupted";
+
+/** Per-turn state the event mapper needs to stitch a tool call back together. */
+export interface OpenCodeServeEventState {
+  toolNames: Map<string, string>;
+  toolInputs: Map<string, unknown>;
+}
+
+export function createOpenCodeServeEventState(): OpenCodeServeEventState {
+  return { toolNames: new Map(), toolInputs: new Map() };
+}
+
+function serveToolErrorText(data: Record<string, unknown>): string {
+  const text = errorText(data.error ?? data.message).trim();
+  return text || "Tool call failed";
+}
+
+/**
+ * Map one `GET /api/event` envelope from an OpenCode V2 server (`{ type, data }`)
+ * onto the JSONL lines `opencode run --format json` prints, so the one parser
+ * (`parseOpenCodeJsonl`) and every consumer of the run stdout keep a single
+ * contract on both transports.
+ *
+ * Events for other sessions and event types that carry no run result (inbox,
+ * instructions, project/provider/mcp updates, deltas) map to nothing.
+ */
+export function mapOpenCodeServeEvent(
+  envelope: unknown,
+  state: OpenCodeServeEventState,
+): { lines: string[]; outcome: OpenCodeServeTurnOutcome | null } {
+  const event = parseObject(envelope);
+  const type = asString(event.type, "");
+  const data = parseObject(event.data);
+  const sessionID = asString(data.sessionID, "");
+  const messageID = asString(data.assistantMessageID, "");
+  const line = (value: Record<string, unknown>) => JSON.stringify({ ...value, sessionID });
+  const none = { lines: [] as string[], outcome: null };
+
+  if (!type.startsWith("session.") || !sessionID) return none;
+
+  switch (type) {
+    case "session.step.started":
+      return { lines: [line({ type: "step_start", part: { type: "step-start", messageID } })], outcome: null };
+    case "session.text.ended": {
+      const ordinal = asNumber(data.ordinal, 0);
+      return {
+        lines: [line({
+          type: "text",
+          part: { type: "text", id: `${messageID}:${ordinal}`, messageID, text: asString(data.text, "") },
+        })],
+        outcome: null,
+      };
+    }
+    case "session.tool.input.started": {
+      const id = asString(data.id, "");
+      if (id) state.toolNames.set(id, asString(data.name, ""));
+      return none;
+    }
+    case "session.tool.called": {
+      const id = asString(data.id, "");
+      if (id) state.toolInputs.set(id, data.input);
+      return none;
+    }
+    case "session.tool.success":
+    case "session.tool.failed": {
+      const id = asString(data.id, "");
+      const failed = type === "session.tool.failed";
+      const content = Array.isArray(data.content) ? data.content : [];
+      const output = content
+        .map((item) => asString(parseObject(item).text, ""))
+        .filter(Boolean)
+        .join("\n");
+      return {
+        lines: [line({
+          type: "tool_use",
+          part: {
+            type: "tool",
+            tool: state.toolNames.get(id) ?? "",
+            callID: id,
+            messageID,
+            state: failed
+              ? { status: "error", input: state.toolInputs.get(id), error: serveToolErrorText(data) }
+              : { status: "completed", input: state.toolInputs.get(id), output },
+          },
+        })],
+        outcome: null,
+      };
+    }
+    case "session.step.ended":
+      return {
+        lines: [line({
+          type: "step_finish",
+          part: {
+            type: "step-finish",
+            messageID,
+            reason: asString(data.finish, ""),
+            tokens: data.tokens,
+            cost: asNumber(data.cost, 0),
+          },
+        })],
+        outcome: null,
+      };
+    case "session.execution.failed":
+      return {
+        lines: [line({ type: "error", error: parseObject(data.error) })],
+        outcome: "failed",
+      };
+    case "session.execution.succeeded":
+      return { lines: [], outcome: "succeeded" };
+    case "session.execution.interrupted":
+      return { lines: [], outcome: "interrupted" };
+    default:
+      return none;
+  }
+}

@@ -1,6 +1,7 @@
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
+import { OPENCODE_V2_CLI_VERSION } from "../index.js";
 
 export type OpenCodeCliVersion = {
   version: string;
@@ -16,8 +17,21 @@ export function parseOpenCodeCliVersion(value: string): OpenCodeCliVersion | nul
   return { version, major, supported: major === 1 || major === 2 };
 }
 
-export function usesOpenCodeV2Cli(version: OpenCodeCliVersion | null): boolean {
-  return version?.major === 2;
+// The single V2 rule: a CLI version string (configured or detected) is V2 when
+// its major version is 2. Argv shape, runtime config, MCP projection and model
+// discovery all key off this; OPENCODE_V2_CLI_VERSION only gates acceptance of a
+// version that is known. A version that cannot be determined (probe failed, timed
+// out, or empty or unparseable output) is not V2 here, so callers treat it as V1.
+export function isOpenCodeV2CliVersion(version: string | null | undefined): boolean {
+  return typeof version === "string" && parseOpenCodeCliVersion(version)?.major === 2;
+}
+
+export function unsupportedOpenCodeV2CliVersionMessage(version: string): string {
+  return `Unsupported OpenCode CLI version: ${version}. Use ${OPENCODE_V2_CLI_VERSION} for V2 opt-in or omit cliVersion for V1.`;
+}
+
+export function unsupportedDetectedOpenCodeV2CliVersionMessage(command: string, version: string): string {
+  return `Unsupported OpenCode CLI version: ${version} reported by ${command}. Install ${OPENCODE_V2_CLI_VERSION} or point command at a V1 binary.`;
 }
 
 export function allowsUnsupportedOpenCodeVersion(environment: NodeJS.ProcessEnv): boolean {

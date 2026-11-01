@@ -233,7 +233,7 @@ describeEmbeddedPostgres("agent service remove with decision/watchdog/ownership 
       companyId,
       issueId,
       kind: "request_confirmation",
-      payload: {},
+      payload: { version: 1, prompt: "Confirm" },
       createdByAgentId: agentId,
       resolvedByAgentId: agentId,
     });

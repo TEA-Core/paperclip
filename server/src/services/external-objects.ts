@@ -126,10 +126,25 @@ export function isExternalObjectStuck(
 // of being terminal forever:
 //   backoff: nextRefreshAt advances by the refresh TTL (300s) after each re-check
 //   cap:     after NOT_FOUND_MAX_RETRIES `not_found` re-resolves the row is
-//            treated as genuinely absent and stops being swept.
+//            treated as genuinely absent and stops being swept — except the
+//            SUP-22042 recovery tier below, which keeps GitHub pull-request
+//            rows selectable on a slow cadence.
 // The counter lives in `data.notFoundRetries`; a later successful resolve carries
 // the provider's data (which drops the counter) and clears `isTerminal`.
 const NOT_FOUND_MAX_RETRIES = 5;
+
+// SUP-22042: the fast budget above (5 × 300s ≈ 25 minutes) is far shorter than
+// real transient-404 windows (token rotation, repo transfer, replication lag),
+// and a row that exhausted it was excluded from the sweep FOREVER — permanently
+// hiding a delivered PR's head identity behind a terminal `not_found` row
+// (SUP-20766). A `not_found` row that carries a delivery identity (GitHub pull
+// request) therefore stays selectable past the cap on a slow recovery cadence:
+// the resolve path writes `nextRefreshAt = now + NOT_FOUND_RECOVERY_INTERVAL_SECONDS`
+// once the fast budget is spent, so a genuinely-absent PR costs one probe per
+// interval while a longer transient 404 heals within one. Genuinely final
+// terminal states (merged/closed) and non-PR `not_found` rows keep their
+// SUP-16283 treatment and are NOT part of this recovery path.
+const NOT_FOUND_RECOVERY_INTERVAL_SECONDS = 6 * 60 * 60;
 
 function sourceWhere(input: ExternalObjectSourceContext) {
   const conditions = [
@@ -973,9 +988,17 @@ export function externalObjectService(
     // and clears `isTerminal`.
     const nextStatusKey = snapshot.statusKey ?? object.statusKey;
     const isNotFoundResolve = nextStatusKey === "not_found";
+    const nextNotFoundRetries = readNotFoundRetries(object.data) + 1;
     const nextData = isNotFoundResolve
-      ? { ...(snapshot.data ?? object.data), notFoundRetries: readNotFoundRetries(object.data) + 1 }
+      ? { ...(snapshot.data ?? object.data), notFoundRetries: nextNotFoundRetries }
       : snapshot.data ?? object.data;
+    // SUP-22042: once the fast re-resolve budget is spent, a `not_found`
+    // resolve backs off to the slow recovery cadence instead of leaving the row
+    // permanently disarmed — the row itself stays sweep-eligible (see
+    // refreshDueObjectsUnchecked) and is re-probed once per interval.
+    const nextRefreshSeconds = isNotFoundResolve && nextNotFoundRetries >= NOT_FOUND_MAX_RETRIES
+      ? Math.max(NOT_FOUND_RECOVERY_INTERVAL_SECONDS, snapshot.ttlSeconds ?? DEFAULT_REFRESH_TTL_SECONDS)
+      : snapshot.ttlSeconds ?? DEFAULT_REFRESH_TTL_SECONDS;
     const patch = {
       displayKey: snapshot.displayKey ?? object.displayKey,
       iconKey: snapshot.iconKey ?? object.iconKey,
@@ -994,7 +1017,7 @@ export function externalObjectService(
       lastErrorAt: null,
       lastErrorCode: null,
       lastErrorMessage: null,
-      nextRefreshAt: addSeconds(now, snapshot.ttlSeconds ?? DEFAULT_REFRESH_TTL_SECONDS),
+      nextRefreshAt: addSeconds(now, nextRefreshSeconds),
       refreshStartedAt: null,
       refreshToken: null,
       updatedAt: now,
@@ -1177,11 +1200,25 @@ export function externalObjectService(
           // this it would be excluded forever and the row's missing headRef would
           // permanently disarm the delivery-identity gate. Genuinely-absent
           // objects stop after NOT_FOUND_MAX_RETRIES re-resolves.
+          //
+          // SUP-22042 recovery tier: a capped `not_found` row that carries a
+          // delivery identity (GitHub pull request) REMAINS selectable past the
+          // fast budget, on the slow NOT_FOUND_RECOVERY_INTERVAL_SECONDS cadence
+          // the resolve path writes — so a transient 404 longer than the fast
+          // budget cannot permanently hide a delivered PR's head (SUP-20766).
+          // Genuinely final terminal states (merged/closed) never match
+          // `not_found`, and non-PR or non-GitHub `not_found` rows keep the
+          // SUP-16283 cap and stay excluded once their budget is spent.
           or(
             eq(externalObjects.isTerminal, false),
             and(
               eq(externalObjects.statusKey, "not_found"),
               sql`(coalesce((${externalObjects.data} ->> 'notFoundRetries')::int, 0) < ${NOT_FOUND_MAX_RETRIES})`,
+            ),
+            and(
+              eq(externalObjects.providerKey, "github"),
+              eq(externalObjects.objectType, "pull_request"),
+              eq(externalObjects.statusKey, "not_found"),
             ),
           ),
           lte(externalObjects.nextRefreshAt, now),

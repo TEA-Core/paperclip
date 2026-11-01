@@ -270,7 +270,7 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     await seedFailedFinalizeOp({ companyId, executionWorkspaceId: wsId });
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
 
     expect(result.reported).toBe(1);
     expect(result.findings.length).toBe(1);
@@ -290,7 +290,7 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     await seedFailedFinalizeOp({ companyId, executionWorkspaceId: wsId });
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
 
     expect(result.reported).toBe(1);
     expect(result.findings.length).toBe(1);
@@ -315,7 +315,7 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     await seedActiveRun({ companyId, agentId, executionWorkspaceId: wsId });
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
 
     expect(result.reported).toBe(0);
     expect(result.findings).toEqual([]);
@@ -329,7 +329,7 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     await seedSucceededFinalizeOp({ companyId, executionWorkspaceId: wsId });
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
 
     expect(result.reported).toBe(0);
     expect(result.findings).toEqual([]);
@@ -343,7 +343,7 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     await seedFailedFinalizeOp({ companyId, executionWorkspaceId: wsId });
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
 
     expect(result.reported).toBe(1);
 
@@ -363,7 +363,7 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     await seedFailedFinalizeOp({ companyId, executionWorkspaceId: wsId });
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
 
     expect(result.reported).toBe(1);
 
@@ -391,7 +391,7 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     await seedFailedFinalizeOp({ companyId, executionWorkspaceId: wsId });
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
 
     expect(result.reported).toBe(1);
     expect(result.findings.length).toBe(1);
@@ -409,7 +409,7 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     const dependentId = await seedDependent({ companyId, agentId, blockerId, status: "blocked" });
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
 
     expect(result.reported).toBe(0);
     expect(result.findings).toEqual([]);
@@ -437,7 +437,7 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     await seedDependent({ companyId, agentId, blockerId, status: "blocked" });
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
 
     expect(result.reported).toBe(1);
     expect(result.findings).toHaveLength(1);
@@ -461,7 +461,7 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     });
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
 
     expect(result.reported).toBe(0);
     expect(result.findings).toEqual([]);
@@ -486,7 +486,7 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     expect(readiness!.isDependencyReady).toBe(false);
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
     expect(result.reported).toBe(1);
 
     const readinessMapAfter = await svc.listDependencyReadiness(companyId, [dependentId]);
@@ -523,7 +523,7 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
       .then((rows) => rows[0]);
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
     expect(result.reported).toBe(1);
 
     const opsAfter = await db
@@ -581,7 +581,7 @@ describeEmbeddedPostgres("unfinalizable-workspace-barrier", () => {
     ]);
 
     const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers({ companyId });
+    const result = await heartbeat.reconcileUnfinalizableWorkspaceBarriers();
 
     expect(result.reported).toBe(1);
     expect(result.findings.length).toBe(1);

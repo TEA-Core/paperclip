@@ -54,11 +54,12 @@ describe("boundContextSnapshot (pure)", () => {
     expect(jsonByteLength(oversized)).toBeGreaterThan(CONTEXT_SNAPSHOT_MAX_BYTES);
 
     const result = boundContextSnapshot(oversized);
+    const wake = result.paperclipWake as { issue?: { description?: string } } | undefined;
 
     expect(jsonByteLength(result)).toBeLessThanOrEqual(CONTEXT_SNAPSHOT_MAX_BYTES);
     expect(result[CONTEXT_SNAPSHOT_TRUNCATION_MARKER]).toBeTruthy();
     expect(result.paperclipWake).toBeDefined();
-    expect(result.paperclipWake?.issue?.description).toContain(CONTEXT_SNAPSHOT_TRUNCATION_MARKER);
+    expect(wake?.issue?.description).toContain(CONTEXT_SNAPSHOT_TRUNCATION_MARKER);
     for (const key of CONTEXT_SNAPSHOT_PRESERVED_KEYS) {
       if (key in oversized) expect(result[key]).toBe(oversized[key]);
     }

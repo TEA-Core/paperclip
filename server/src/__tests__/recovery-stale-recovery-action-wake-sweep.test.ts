@@ -209,6 +209,10 @@ describeEmbeddedPostgres("reconcileStaleRecoveryActionWakes", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, action.id));
     expect(updated.attemptCount).toBe(2);
+    expect(updated.lastAttemptAt).not.toBeNull();
+    if (updated.lastAttemptAt === null) {
+      throw new Error("expected lastAttemptAt to be set");
+    }
     expect(updated.lastAttemptAt.getTime()).toBeGreaterThan(staleAt.getTime());
 
     expect(enqueueWakeup).toHaveBeenCalledTimes(1);

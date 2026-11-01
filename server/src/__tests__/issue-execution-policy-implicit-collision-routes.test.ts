@@ -10,6 +10,7 @@ import {
   createDb,
   heartbeatRuns,
   issues,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -204,6 +205,102 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(res.body.deliveryRequirement).toBe("record_only");
+  });
+
+  // SUP-22098: a project default exists so these tests prove the collision —
+  // before the fix an explicit `stages: []` collapsed to null at the route and
+  // the default injected a review ladder the caller expressly declined
+  // (SUP-22093).
+  async function seedProjectWithDefaultPolicy(companyId: string, reviewerAgentId: string) {
+    const projectId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Default-injecting project",
+      status: "in_progress",
+      defaultExecutionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [stageGatedBy("review", reviewerAgentId)],
+      } as unknown as Record<string, unknown>,
+    });
+    return projectId;
+  }
+
+  it("persists an explicit empty executionPolicy.stages on a record-only public create", async () => {
+    const { companyId, closerAgentId, reviewerAgentId } = await seedCompanyWithAgents();
+    const projectId = await seedProjectWithDefaultPolicy(companyId, reviewerAgentId);
+
+    const res = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "No ladder, on purpose",
+        status: "todo",
+        assigneeAgentId: closerAgentId,
+        projectId,
+        deliveryRequirement: "record_only",
+        executionPolicy: { mode: "normal", commentRequired: true, stages: [] },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.deliveryRequirement).toBe("record_only");
+    expect(res.body.executionPolicy).toMatchObject({ mode: "normal", stages: [] });
+
+    const stored = await db.select().from(issues).where(eq(issues.id, res.body.id));
+    const storedPolicy = stored[0]?.executionPolicy as { stages?: unknown[] } | null;
+    expect(storedPolicy).toMatchObject({ mode: "normal" });
+    expect(storedPolicy?.stages).toEqual([]);
+  });
+
+  it("still injects the project default executionPolicy when the create omits one", async () => {
+    const { companyId, closerAgentId, reviewerAgentId } = await seedCompanyWithAgents();
+    const projectId = await seedProjectWithDefaultPolicy(companyId, reviewerAgentId);
+
+    const res = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Omitted policy inherits the default",
+        status: "todo",
+        assigneeAgentId: closerAgentId,
+        projectId,
+        deliveryRequirement: "record_only",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.executionPolicy?.stages).toEqual([
+      expect.objectContaining({
+        type: "review",
+        participants: [expect.objectContaining({ type: "agent", agentId: reviewerAgentId })],
+      }),
+    ]);
+
+    const stored = await db.select().from(issues).where(eq(issues.id, res.body.id));
+    const storedPolicy = stored[0]?.executionPolicy as { stages?: { participants?: { agentId?: string }[] }[] } | null;
+    expect(storedPolicy?.stages?.[0]?.participants?.[0]?.agentId).toBe(reviewerAgentId);
+  });
+
+  it("inherits the project default when executionPolicy omits stages", async () => {
+    const { companyId, closerAgentId, reviewerAgentId } = await seedCompanyWithAgents();
+    const projectId = await seedProjectWithDefaultPolicy(companyId, reviewerAgentId);
+
+    const res = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Partial policy inherits the default",
+        status: "todo",
+        assigneeAgentId: closerAgentId,
+        projectId,
+        deliveryRequirement: "record_only",
+        executionPolicy: { mode: "normal" },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.executionPolicy?.stages).toEqual([
+      expect.objectContaining({
+        type: "review",
+        participants: [expect.objectContaining({ type: "agent", agentId: reviewerAgentId })],
+      }),
+    ]);
   });
 
   it("accepts a board PATCH that changes delivery classification", async () => {
