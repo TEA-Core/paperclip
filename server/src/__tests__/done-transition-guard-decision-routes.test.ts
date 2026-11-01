@@ -907,6 +907,30 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(mockGhFetch).not.toHaveBeenCalled();
   });
 
+  it("PATCH: record_only Tier 1 close with no repository landing is accepted; repository_delivery refuses it (SUP-21992)", async () => {
+    const doneTier = {
+      tier: "tier1" as const,
+      reason: "No repository landing exists",
+      landing: { mode: "noRepositoryLanding" as const },
+    };
+    for (const [prefix, deliveryRequirement, expectedStatus] of [
+      ["D21992A", "record_only", 200],
+      ["D21992B", "repository_delivery", 422],
+    ] as const) {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview(prefix, { deliveryRequirement });
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Closing a record that has no pull request.", doneTier });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(expectedStatus);
+      expect(await statusOf(issueId)).toBe(expectedStatus === 200 ? "done" : "in_review");
+      if (expectedStatus === 422) expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    }
+  });
+
   it("PATCH: record_only close skips repository delivery; repository_delivery keeps it (SUP-21258)", async () => {
     for (const [prefix, deliveryRequirement, expectedStatus] of [
       ["D21258B", "record_only", 200],
