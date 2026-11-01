@@ -1,13 +1,15 @@
-#
-#   node scripts/check-server-test-typecheck.mjs --update
-# Each line is `<file>(<line>,<column>): <TS code>` with the diagnostic
 # Recorded type errors for server/src/__tests__/tsconfig.json (baseline).
-# Regenerate from the repository root:
-# These are pre-existing upstream test-type errors, not fork regressions;
-# `pnpm run check:server-test-typecheck`.
-# disappearing, not to a reworded message.
+#
+# Each line is `<file>(<line>,<column>): <TS code>` with the diagnostic
 # message stripped, so the baseline reacts to an error appearing, moving or
+# disappearing, not to a reworded message.
+#
+# These are pre-existing upstream test-type errors, not fork regressions;
 # see SUP-16604. Any error that is NOT listed here fails
+# `pnpm run check:server-test-typecheck`.
+#
+# Regenerate from the repository root:
+#   node scripts/check-server-test-typecheck.mjs --update
 packages/paperclip-runner/src/contracts/native-execution.test.ts(172,20): TS2352
 packages/paperclip-runner/src/contracts/native-execution.test.ts(309,20): TS2352
 packages/paperclip-runner/src/contracts/native-execution.test.ts(79,90): TS2345
@@ -540,7 +542,6 @@ server/src/__tests__/execution-workspaces-service.test.ts(4813,26): TS2532
 server/src/__tests__/execution-workspaces-service.test.ts(4824,33): TS2532
 server/src/__tests__/external-objects-service.test.ts(1001,62): TS2322
 server/src/__tests__/external-objects-service.test.ts(1052,62): TS2322
-server/src/__tests__/external-objects-service.test.ts(1411,12): TS18047
 server/src/__tests__/external-objects-service.test.ts(280,70): TS2322
 server/src/__tests__/external-objects-service.test.ts(343,77): TS2322
 server/src/__tests__/external-objects-service.test.ts(390,77): TS2322
@@ -689,31 +690,6 @@ server/src/__tests__/inbox-archive-routes.test.ts(158,23): TS2502
 server/src/__tests__/instance-settings-routes.test.ts(1181,49): TS2345
 server/src/__tests__/instrumentation.test.ts(310,70): TS2307
 server/src/__tests__/invite-test-resolution-route.test.ts(69,7): TS2322
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(1186,51): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(1212,51): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(1237,51): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2312,63): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2353,53): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2377,53): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2840,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2856,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2887,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2908,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2938,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2958,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2983,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3004,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3032,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3062,74): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3086,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3125,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3150,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3170,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3235,74): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3291,74): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3310,31): TS7006
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(406,9): TS7022
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(570,76): TS2345
 server/src/__tests__/issue-attachment-routes.test.ts(143,7): TS2322
 server/src/__tests__/issue-attachment-routes.test.ts(535,14): TS2345
 server/src/__tests__/issue-attachment-routes.test.ts(553,14): TS2345
@@ -1040,7 +1016,6 @@ server/src/__tests__/native-status-arbiter-corpus.test.ts(1454,60): TS18047
 server/src/__tests__/native-status-arbiter-corpus.test.ts(1458,11): TS2345
 server/src/__tests__/native-status-arbiter-corpus.test.ts(2115,7): TS2322
 server/src/__tests__/onboarding-seed-route.test.ts(58,82): TS2345
-server/src/__tests__/openapi-routes.test.ts(1616,27): TS7006
 server/src/__tests__/openclaw-gateway-adapter.test.ts(608,47): TS2741
 server/src/__tests__/paperclip-semantic-conformance.test.ts(36,13): TS2749
 server/src/__tests__/permissions-upgrade-boundary-routes.test.ts(52,5): TS2322
@@ -1158,30 +1133,7 @@ server/src/__tests__/qa-routine-secrets-e2e.test.ts(316,7): TS2741
 server/src/__tests__/qa-routine-secrets-e2e.test.ts(375,7): TS2741
 server/src/__tests__/qa-routine-secrets-e2e.test.ts(431,7): TS2741
 server/src/__tests__/question-response-delivery.test.ts(1281,60): TS2345
-server/src/__tests__/recovery-no-live-path-strands.test.ts(1763,7): TS2769
-server/src/__tests__/recovery-no-live-path-strands.test.ts(962,7): TS2769
-server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(140,44): TS2322
-server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(158,18): TS2339
-server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(195,44): TS2322
-server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(229,44): TS2322
-server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(275,44): TS2322
-server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(315,44): TS2322
-server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(349,44): TS2322
-server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(393,44): TS2322
-server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(428,44): TS2322
-server/src/__tests__/recovery-pending-review-rearm-sweep.test.ts(471,44): TS2322
-server/src/__tests__/recovery-stranded-action-sweep.test.ts(130,7): TS2769
-server/src/__tests__/recovery-stranded-action-sweep.test.ts(190,40): TS2493
-server/src/__tests__/recovery-stranded-action-sweep.test.ts(191,12): TS2532
-server/src/__tests__/recovery-stranded-action-sweep.test.ts(191,40): TS2493
-server/src/__tests__/recovery-stranded-action-sweep.test.ts(192,12): TS2532
-server/src/__tests__/recovery-stranded-action-sweep.test.ts(192,40): TS2493
-server/src/__tests__/recovery-stranded-action-sweep.test.ts(298,40): TS2493
-server/src/__tests__/recovery-stranded-action-sweep.test.ts(299,12): TS2532
-server/src/__tests__/recovery-stranded-action-sweep.test.ts(299,40): TS2493
 server/src/__tests__/routable-blocked.test.ts(72,35): TS2493
-server/src/__tests__/routine-execution-supersede.test.ts(108,7): TS2741
-server/src/__tests__/routine-execution-supersede.test.ts(124,7): TS2741
 server/src/__tests__/routine-run-telemetry.test.ts(143,7): TS2741
 server/src/__tests__/routines-service.test.ts(1007,28): TS2352
 server/src/__tests__/routines-service.test.ts(1010,45): TS2322
@@ -1399,6 +1351,7 @@ server/src/__tests__/workspace-runtime-https-live-exercise.test.ts(174,9): TS274
 server/src/__tests__/workspace-runtime-https-live-exercise.test.ts(187,11): TS2741
 server/src/__tests__/workspace-runtime-https-live-exercise.test.ts(246,9): TS2353
 server/src/__tests__/workspace-runtime-https-live-exercise.test.ts(84,19): TS2339
+server/src/__tests__/workspace-runtime.test.ts(10105,105): TS2741
 server/src/__tests__/workspace-runtime.test.ts(11267,9): TS2353
 server/src/__tests__/workspace-runtime.test.ts(13172,5): TS2322
 server/src/__tests__/workspace-runtime.test.ts(466,3): TS2741
@@ -1406,7 +1359,6 @@ server/src/__tests__/workspace-runtime.test.ts(5099,12): TS18047
 server/src/__tests__/workspace-runtime.test.ts(5100,12): TS18047
 server/src/__tests__/workspace-runtime.test.ts(546,34): TS2554
 server/src/__tests__/workspace-runtime.test.ts(9941,7): TS2741
-server/src/__tests__/workspace-runtime.test.ts(10105,105): TS2741
 server/src/__tests__/worktree-config.test.ts(1194,7): TS2741
 server/src/__tests__/worktree-config.test.ts(1211,7): TS2741
 server/src/__tests__/write-build-stamp.test.ts(3,36): TS7016

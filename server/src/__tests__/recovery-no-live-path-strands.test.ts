@@ -959,13 +959,12 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
       ...fixture,
     });
     await db.insert(issueThreadInteractions).values({
-      id: randomUUID(),
       companyId,
       issueId,
       kind: "request_confirmation",
       status: "pending",
       continuationPolicy: "wake_assignee",
-      payload: {},
+      payload: { version: 1, prompt: "Confirm the pending work." },
     });
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
@@ -1760,13 +1759,12 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
       executionState: null,
     });
     await db.insert(issueThreadInteractions).values({
-      id: randomUUID(),
       companyId,
       issueId,
       kind: "request_confirmation",
       status: "pending",
       continuationPolicy: "wake_assignee",
-      payload: {},
+      payload: { version: 1, prompt: "Confirm the pending work." },
     });
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
