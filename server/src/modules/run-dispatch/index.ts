@@ -6,6 +6,7 @@ import {
   createEvaluateScheduledRetryGate,
   createPromoteDueScheduledRetries,
   createPromoteScheduledRetry,
+  createSweepStaleQueuedRuns,
 } from "./application/use-cases.js";
 import type { RunDispatchWriter, ScheduledRetryReader } from "./application/ports.js";
 
@@ -71,6 +72,10 @@ export function createRunDispatch(db: Db, deps: RunDispatchDeps = {}) {
     }),
     cancelStaleQueuedRun: createCancelStaleQueuedRun({
       writer: adapter,
+    }),
+    sweepStaleQueuedRuns: createSweepStaleQueuedRuns({
+      reader: adapter,
+      cancelStaleQueuedRun: createCancelStaleQueuedRun({ writer: adapter }),
     }),
     dispatchResolvedInteractionIfCurrent: createDispatchResolvedInteractionIfCurrent({
       writer: adapter,
