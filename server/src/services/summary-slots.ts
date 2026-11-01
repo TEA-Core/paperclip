@@ -5,6 +5,7 @@ import {
   documentRevisions,
   documents,
   executionWorkspaces,
+  heartbeatRuns,
   issues,
   projectWorkspaces,
   projects,
@@ -835,8 +836,24 @@ export function summarySlotService(db: Db) {
       throw forbidden("Generation task does not target this summary slot");
     }
     const runId = actor.runId ?? null;
-    const runMatches =
-      !!runId && (issueRef.row.checkoutRunId === runId || issueRef.row.executionRunId === runId);
+    if (!runId) {
+      throw forbidden("Summary write must run from the linked generation task");
+    }
+    const ownedRun = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.id, runId),
+          eq(heartbeatRuns.companyId, sel.companyId),
+          eq(heartbeatRuns.agentId, actor.agentId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (!ownedRun) {
+      throw forbidden("Summary write must run from the linked generation task");
+    }
+    const runMatches = (issueRef.row.executionRunId ?? issueRef.row.checkoutRunId) === runId;
     if (!runMatches) {
       throw forbidden("Summary write must run from the linked generation task");
     }
@@ -860,6 +877,13 @@ export function summarySlotService(db: Db) {
 
     const now = new Date();
     const result = await db.transaction(async (tx) => {
+      const currentGenerationIssue = await tx
+        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(and(eq(issues.id, input.generationIssueId!), eq(issues.companyId, sel.companyId)))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+
       // The linked slot row is the serialization boundary for document
       // revision allocation. Hold a row lock so concurrent writers for the
       // same slot queue up and re-read the latest document state only after
@@ -879,7 +903,14 @@ export function summarySlotService(db: Db) {
         throw conflict("Summary generation was superseded by a newer task");
       }
 
+      const runStillMatches =
+        (currentGenerationIssue?.executionRunId ?? currentGenerationIssue?.checkoutRunId ?? null) === actor.runId;
+      if (!runStillMatches) {
+        throw forbidden("Summary write must run from the linked generation task");
+      }
+
       let documentRow: typeof documents.$inferSelect;
+
       let revisionRow: typeof documentRevisions.$inferSelect;
 
       const existingDocument = currentSlot?.documentId
