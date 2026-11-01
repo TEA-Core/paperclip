@@ -140,6 +140,10 @@ import {
 } from "../issue-execution-policy.js";
 import { isMonitorableIssueShape } from "./host-restart-strand-sweep.js";
 import {
+  REVIEW_PARTICIPANT_LIVE_WINDOW_MS,
+  participantRanSince,
+} from "./participant-liveness.js";
+import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeIdempotencyKey,
   buildIssueBlockersResolvedWakeStateKey,
@@ -6169,6 +6173,27 @@ export function recoveryService(
           result.skipped += 1;
           continue;
         }
+        // SUP-22272: the guards above key on THIS card's live paths, but the
+        // parent incident (SUP-21921) had the review participant heartbeating
+        // on other cards while this detector re-minted its action and churned
+        // attemptCount to 5/5. A participant that has run anywhere since the
+        // stage was armed — max(pendingSince, now - 6h) — is live, not wedged:
+        // suppress the mint. The window is the expiry; with no participant run
+        // for 6h this detector mints exactly as before, so a genuinely wedged
+        // reviewer still surfaces.
+        if (
+          participantOwnerAgentId &&
+          (await participantRanSince(
+            db,
+            issue.companyId,
+            participantOwnerAgentId,
+            pendingSinceMs ?? issue.updatedAt.getTime(),
+            REVIEW_PARTICIPANT_LIVE_WINDOW_MS,
+          ))
+        ) {
+          result.skipped += 1;
+          continue;
+        }
         // Idempotency is scoped to the exact wedge identity (stage + participant).
         // The fingerprint is globally unique among active actions, so equality
         // pins the wedge on its own — independent of the shared
@@ -6954,6 +6979,25 @@ export function recoveryService(
         if (!participantAgentId || !pendingExecutionState) {
           const msSinceUpdate = now.getTime() - issue.updatedAt.getTime();
           if (msSinceUpdate < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
+            result.skipped += 1;
+            continue;
+          }
+          // SUP-22272: this branch fires when no pending participant pointer
+          // exists, so the recovery target is the assignee (delivery makes the
+          // review participant the assignee). If that agent has run anywhere —
+          // max(updatedAt, now - 6h) — the verdict is likely in flight and a
+          // board mint is churn (parent SUP-21921): suppress. After 6h without
+          // a run the mint proceeds exactly as before.
+          if (
+            issue.assigneeAgentId &&
+            (await participantRanSince(
+              db,
+              issue.companyId,
+              issue.assigneeAgentId,
+              issue.updatedAt.getTime(),
+              REVIEW_PARTICIPANT_LIVE_WINDOW_MS,
+            ))
+          ) {
             result.skipped += 1;
             continue;
           }
