@@ -1249,6 +1249,126 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(fixture.armCalls).toEqual([]);
   });
 
+  // SUP-22287: arm the SUP-21863 shape against the REAL access service — an
+  // armed review stage whose current participant is a reviewer agent that is
+  // NOT the issue assignee (the assignee stays on the delivery owner), so the
+  // boundary decision for the participant's verdict PATCH is a plain
+  // `deny_missing_grant` (no code) unless the policy overrides below install a
+  // harder denial. `unassigned: true` drops the assignee entirely so the
+  // boundary decision is an allow instead.
+  async function armedParticipantVerdict(options: {
+    executionPolicyExtra?: Record<string, unknown>;
+    unassigned?: boolean;
+  } = {}) {
+    const fixture = await pendingDelivery();
+    const deliveryOwnerId = (await fixture.read()).createdByAgentId!;
+    const reviewer = await seedAgent(db, fixture.company.id);
+    const [reviewerRun] = await db.insert(heartbeatRuns).values({
+      companyId: fixture.company.id, agentId: reviewer.id, status: "running",
+      contextSnapshot: { issueId: fixture.issue.id },
+    }).returning();
+    await db.update(issues).set({
+      assigneeAgentId: options.unassigned ? null : deliveryOwnerId,
+      assigneeUserId: null,
+      executionPolicy: {
+        mode: "normal",
+        stages: [{
+          id: fixture.stageId, type: "review",
+          participants: [{ type: "agent", agentId: reviewer.id, userId: null }],
+        }],
+        ...options.executionPolicyExtra,
+      },
+      executionState: {
+        status: "pending", currentStageId: fixture.stageId, currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewer.id, userId: null },
+        returnAssignee: { type: "agent", agentId: deliveryOwnerId },
+        completedStageIds: [], skippedStageIds: [],
+        lastDecisionId: null, lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, fixture.issue.id));
+    return {
+      fixture,
+      reviewer,
+      app: createApp(db, agentActor(fixture.company, reviewer, reviewerRun!.id)),
+      comment: "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): the stage participant re-ran the close against the armed card and the delivery ref is unchanged.",
+    };
+  }
+
+  it("defers an armed participant verdict past a plain missing-grant boundary denial (SUP-22287)", async () => {
+    const { fixture, reviewer, app, comment } = await armedParticipantVerdict();
+    const response = await request(app).patch(`/api/issues/${fixture.issue.id}`)
+      .send({ status: "done", comment });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.status).toBe("done");
+    expect(stored.executionState).toMatchObject({
+      lastDecisionOutcome: "approved", completedStageIds: [fixture.stageId],
+    });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([
+      expect.objectContaining({
+        outcome: "approved", stageId: fixture.stageId, actorAgentId: reviewer.id,
+      }),
+    ]);
+  });
+
+  it("defers an armed participant verdict when the boundary decision allows the write (SUP-22287)", async () => {
+    const { fixture, reviewer, app, comment } = await armedParticipantVerdict({ unassigned: true });
+    const response = await request(app).patch(`/api/issues/${fixture.issue.id}`)
+      .send({ status: "done", comment });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.status).toBe("done");
+    expect(stored.executionState).toMatchObject({
+      lastDecisionOutcome: "approved", completedStageIds: [fixture.stageId],
+    });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([
+      expect.objectContaining({
+        outcome: "approved", stageId: fixture.stageId, actorAgentId: reviewer.id,
+      }),
+    ]);
+  });
+
+  it("keeps a low-trust boundary denial enforced for an exact armed participant verdict (SUP-22287)", async () => {
+    const { fixture, app, comment } = await armedParticipantVerdict({
+      executionPolicyExtra: {
+        authorizationPolicy: {
+          trustBoundary: { mode: "low_trust_review", issueIds: [randomUUID()] },
+        },
+      },
+    });
+    const response = await request(app).patch(`/api/issues/${fixture.issue.id}`)
+      .send({ status: "done", comment });
+    expect(response.status, JSON.stringify(response.body)).toBe(403);
+    expect(response.body.details).toMatchObject({ code: "issue_write_actor_class_excluded" });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_review");
+    expect(stored.executionState).toMatchObject({
+      status: "pending", completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+    });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(await db.select().from(issueComments)).toEqual([]);
+    expect(fixture.writes).toEqual([]);
+  });
+
+  it("keeps a policy-restricted denial enforced for an exact armed participant verdict (SUP-22287)", async () => {
+    const { fixture, app, comment } = await armedParticipantVerdict({
+      executionPolicyExtra: { authorizationPolicy: { trustPreset: "low_trust_review" } },
+    });
+    const response = await request(app).patch(`/api/issues/${fixture.issue.id}`)
+      .send({ status: "done", comment });
+    expect(response.status, JSON.stringify(response.body)).toBe(403);
+    expect(response.body.details).toMatchObject({ code: "issue_write_actor_class_excluded" });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_review");
+    expect(stored.executionState).toMatchObject({
+      status: "pending", completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+    });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(await db.select().from(issueComments)).toEqual([]);
+    expect(fixture.writes).toEqual([]);
+  });
+
   it.each([
     ["title", "NEW.title := 'Renamed while the run was cancelled';"],
     ["execution policy", `NEW.execution_policy := NEW.execution_policy || '{"commentRequired": true}'::jsonb;`],
