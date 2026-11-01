@@ -5489,4 +5489,138 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       comments.some((comment) => comment.body.includes("Closed at Tier")),
     ).toBe(false);
   });
+
+  it("rejects native completion when a guard-referenced agent identity changes after the guard preflight", async () => {
+    // SUP-22307 (`stale-native-guard-agent-name`): the ADR-072 close-ladder
+    // shape check resolves stage participants through the mutable `agents`
+    // table, so a rename can invalidate the preflight verdict without moving
+    // the issue row, any decision row, or the child census. Seed a laddered
+    // parent whose close ladder is genuinely satisfied by three named stage
+    // participants plus two laddered children, so the guard's ladder-shape
+    // zone actually consumes the agent identity rows.
+    const { companyId, goalId, issueId, interactionId } =
+      await seedNativeCompletionReview("Native completion agent identity");
+
+    const ladderAgents = [
+      { id: randomUUID(), name: "support-QAE" },
+      { id: randomUUID(), name: "coder-LE" },
+      { id: randomUUID(), name: "exec-CTO" },
+    ];
+    for (const ladderAgent of ladderAgents) {
+      await db.insert(agents).values({
+        id: ladderAgent.id,
+        companyId,
+        name: ladderAgent.name,
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+    }
+    const stageIds = [randomUUID(), randomUUID(), randomUUID()];
+    const completedExecutionState = (completedStageIds: string[]) => ({
+      status: "completed" as const,
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      deliveryAuthor: null,
+      reviewRequest: null,
+      completedStageIds,
+      skippedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      changesRequestedCount: 0,
+    });
+    await db
+      .update(issues)
+      .set({
+        executionPolicy: {
+          mode: "normal",
+          stages: [
+            {
+              id: stageIds[0],
+              type: "review",
+              participants: [{ type: "agent", agentId: ladderAgents[0].id }],
+            },
+            {
+              id: stageIds[1],
+              type: "review",
+              participants: [{ type: "agent", agentId: ladderAgents[1].id }],
+            },
+            {
+              id: stageIds[2],
+              type: "approval",
+              participants: [{ type: "agent", agentId: ladderAgents[2].id }],
+            },
+          ],
+        },
+        executionState: completedExecutionState(stageIds),
+      })
+      .where(eq(issues.id, issueId));
+    // Two decomposition children with a rung each arm the guard's
+    // `countLadderedChildren >= 2` ladder-shape zone (ADR-072 mechanism D).
+    for (const childIndex of [1, 2]) {
+      const childStageId = randomUUID();
+      await db.insert(issues).values({
+        id: randomUUID(),
+        companyId,
+        goalId,
+        title: `Native completion child ${childIndex}`,
+        status: "done",
+        priority: "medium",
+        parentId: issueId,
+        executionPolicy: {
+          mode: "normal",
+          stages: [{ id: childStageId, type: "review" }],
+        },
+        executionState: completedExecutionState([childStageId]),
+      });
+    }
+
+    await expect(interactionsSvc.acceptInteraction(
+      { id: issueId, companyId, goalId, projectId: null },
+      interactionId,
+      {
+        doneTier: {
+          tier: "tier2",
+          probeEvidence: "record-only native completion verified by the reviewer",
+        },
+      },
+      { userId: "local-board" },
+      {
+        beforeResolveInTransaction: async () => {
+          // Pause-after-preflight mutation of a guard-relevant input that no
+          // previously captured row records: rename the first ladder rung's
+          // agent. The issue row (status, statusVersion, updatedAt), the
+          // decision rows, comments, linked delivery state, and the child
+          // census are all untouched, so the pre-snapshot compared equal and
+          // committed a verdict that is now stale (the renamed rung no longer
+          // matches the required `review:support-QAE` agent key).
+          await db
+            .update(agents)
+            .set({ name: "renamed-away-from-support-qae" })
+            .where(eq(agents.id, ladderAgents[0].id));
+        },
+      },
+    )).rejects.toMatchObject({ status: 409 });
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [interaction] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interactionId));
+    expect(issue?.status).toBe("in_review");
+    expect(interaction?.status).toBe("pending");
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(
+      comments.some((comment) => comment.body.includes("Closed at Tier")),
+    ).toBe(false);
+  });
 });

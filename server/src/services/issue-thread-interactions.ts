@@ -98,6 +98,7 @@ import {
   USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS,
 } from "./issue-interaction-kinds.js";
 import { logActivityInTransaction, publishActivity, type ActivityPublication } from "./activity-log.js";
+import { resolveGatedPrincipal } from "./approval-status-reconciler.js";
 import {
   countLadderedChildren,
   evaluateDoneTransitionGuardForBackstopClose,
@@ -1960,6 +1961,13 @@ async function expireStaleRequestConfirmationTarget(
  * database transaction and cannot be validated by the acceptance transaction
  * itself; drift there is indistinguishable from ordinary external state
  * change. Everything the guard reads from Postgres is captured.
+ *
+ * SUP-22307 (`stale-native-guard-agent-name`): the ADR-072 ladder-shape check
+ * resolves stage participants, the gated principal, and recorded decision
+ * actors through the mutable `agents` table (`normalizeAgentUrlKey(name)`), so
+ * an agent rename can invalidate the preflight verdict without moving any
+ * decision-row identifier or the issue row. The referenced agent identity rows
+ * are captured here and compared under the same lock.
  */
 type NativeCompletionGuardInputSnapshot = {
   issue: {
@@ -1976,7 +1984,13 @@ type NativeCompletionGuardInputSnapshot = {
     executionPolicy: string | null;
     executionState: string | null;
   };
-  decisions: Array<{ id: string; stageId: string; outcome: string; createdAtMs: number }>;
+  decisions: Array<{
+    id: string;
+    stageId: string;
+    outcome: string;
+    actorAgentId: string | null;
+    createdAtMs: number;
+  }>;
   comments: Array<{ id: string; updatedAtMs: number }>;
   linkedPullRequests: Array<Record<string, unknown>>;
   ladderedChildren: {
@@ -1986,6 +2000,7 @@ type NativeCompletionGuardInputSnapshot = {
   };
   repoContext: Record<string, unknown> | null;
   deliveryBranchOwnership: Record<string, unknown>;
+  referencedAgents: Array<{ id: string; name: string }>;
 };
 
 async function captureNativeCompletionGuardInputs(
@@ -2005,6 +2020,7 @@ async function captureNativeCompletionGuardInputs(
         id: issueExecutionDecisions.id,
         stageId: issueExecutionDecisions.stageId,
         outcome: issueExecutionDecisions.outcome,
+        actorAgentId: issueExecutionDecisions.actorAgentId,
         createdAt: issueExecutionDecisions.createdAt,
       })
       .from(issueExecutionDecisions)
@@ -2020,6 +2036,7 @@ async function captureNativeCompletionGuardInputs(
             id: row.id,
             stageId: row.stageId,
             outcome: row.outcome,
+            actorAgentId: row.actorAgentId,
             createdAtMs: row.createdAt.getTime(),
           }))
           .sort((a, b) => (a.id < b.id ? -1 : 1)),
@@ -2063,6 +2080,65 @@ async function captureNativeCompletionGuardInputs(
     resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id),
   ]);
 
+  // SUP-22307 (`stale-native-guard-agent-name`): the ADR-072 ladder-shape check
+  // resolves stage participants, the gated principal, and recorded decision
+  // actors through the mutable `agents` table (`normalizeAgentUrlKey(name)`),
+  // so an agent rename can invalidate the preflight verdict without moving any
+  // identifier captured above. Collect every agent id the guard can reach for
+  // this issue — policy stage participants, the guard's own gated-principal
+  // reader, and the decision actors (a deliberate superset of the check's
+  // latest-per-stage view; the underlying rows are already compared, so the
+  // superset can only surface as one safe retry, never a missed drift) — and
+  // snapshot the identity rows themselves. Missing rows stay absent, matching
+  // the guard's `Map.get` → undefined miss behavior.
+  const referencedAgentIds = new Set<string>();
+  const policyObject =
+    issue.executionPolicy != null && typeof issue.executionPolicy === "object"
+      ? (issue.executionPolicy as Record<string, unknown>)
+      : {};
+  const policyStages = Array.isArray(policyObject.stages) ? policyObject.stages : [];
+  for (const stage of policyStages) {
+    if (stage == null || typeof stage !== "object") continue;
+    const participants = (stage as { participants?: unknown }).participants;
+    if (!Array.isArray(participants)) continue;
+    for (const participant of participants) {
+      if (participant == null || typeof participant !== "object") continue;
+      if ((participant as { type?: unknown }).type !== "agent") continue;
+      const agentId = (participant as { agentId?: unknown }).agentId;
+      if (typeof agentId === "string") referencedAgentIds.add(agentId);
+    }
+  }
+  const stateObject =
+    issue.executionState != null && typeof issue.executionState === "object"
+      ? (issue.executionState as Record<string, unknown>)
+      : {};
+  for (const agentId of resolveGatedPrincipal(
+    policyObject,
+    stateObject,
+    issue.createdByAgentId,
+  ).agentIds) {
+    referencedAgentIds.add(agentId);
+  }
+  for (const decision of decisionRows) {
+    if (decision.actorAgentId) referencedAgentIds.add(decision.actorAgentId);
+  }
+  const referencedAgents =
+    referencedAgentIds.size > 0
+      ? (
+          await db
+            .select({ id: agents.id, name: agents.name })
+            .from(agents)
+            .where(
+              and(
+                inArray(agents.id, [...referencedAgentIds]),
+                eq(agents.companyId, issue.companyId),
+              ),
+            )
+        )
+          .map((row) => ({ id: row.id, name: row.name }))
+          .sort((a, b) => (a.id < b.id ? -1 : 1))
+      : [];
+
   return {
     issue: {
       status: issue.status,
@@ -2084,6 +2160,7 @@ async function captureNativeCompletionGuardInputs(
     ladderedChildren,
     repoContext: repoContext === null ? null : { ...repoContext },
     deliveryBranchOwnership: { ...deliveryBranchOwnership },
+    referencedAgents,
   };
 }
 
