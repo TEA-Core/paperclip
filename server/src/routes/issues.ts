@@ -4528,12 +4528,16 @@ export function issueRoutes(
   type FinalDeliveryPrefetch = {
     status: string;
     updatedAtMs: number;
+    assigneeAgentId: string | null;
+    assigneeUserId: string | null;
+    executionPolicy: unknown;
     binding: string;
     resolution: FinalDeliveryResolution;
   };
   type FinalDeliveryIssue = Pick<typeof issueRows.$inferSelect,
     "id" | "companyId" | "projectId" | "projectWorkspaceId" | "executionWorkspaceId" |
-    "executionPolicy" | "executionState" | "identifier" | "issueNumber" | "deliveryRequirement"
+    "executionPolicy" | "executionState" | "identifier" | "issueNumber" | "deliveryRequirement" |
+    "assigneeAgentId" | "assigneeUserId"
   >;
   const FINAL_DELIVERY_PREFLIGHT_TIMEOUT_MS = 20_000;
 
@@ -4599,7 +4603,13 @@ export function issueRoutes(
   async function prefetchFinalDelivery(
     issue: FinalDeliveryIssue & { status: string; updatedAt: Date },
   ): Promise<FinalDeliveryPrefetch> {
-    const snapshot = { status: issue.status, updatedAtMs: new Date(issue.updatedAt).getTime() };
+    const snapshot = {
+      status: issue.status,
+      updatedAtMs: new Date(issue.updatedAt).getTime(),
+      assigneeAgentId: issue.assigneeAgentId ?? null,
+      assigneeUserId: issue.assigneeUserId ?? null,
+      executionPolicy: issue.executionPolicy ?? null,
+    };
     const binding = await readFinalDeliveryBinding(db, issue);
     return { ...snapshot, binding, resolution: await resolveFinalDeliveryResolution(issue) };
   }
@@ -4640,6 +4650,9 @@ export function issueRoutes(
         !prefetched ||
         prefetched.status !== issue.status ||
         prefetched.updatedAtMs !== new Date(issue.updatedAt as Date).getTime() ||
+        prefetched.assigneeAgentId !== (issue.assigneeAgentId ?? null) ||
+        prefetched.assigneeUserId !== (issue.assigneeUserId ?? null) ||
+        !isDeepStrictEqual(prefetched.executionPolicy, issue.executionPolicy ?? null) ||
         prefetched.binding !== lockedBinding ||
         (certifiedPr &&
           (lockedRepo?.owner.toLowerCase() !== certifiedPr.owner.toLowerCase() ||

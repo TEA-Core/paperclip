@@ -695,6 +695,85 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(fixture.writes).toEqual([]);
   });
 
+  it("refuses a PATCH final verdict when the assignee changes after external preflight", async () => {
+    const fixture = await pendingDelivery({ holdPull: true, mergeArmingEnabled: true });
+    const other = await seedAgent(db, fixture.company.id);
+    const receipts = await db.select().from(issueDeliveryReceipts)
+      .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id));
+    const approval = fixture.approve().then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, approval, async () => {
+      await db.update(issues).set({ assigneeAgentId: other.id, assigneeUserId: null })
+        .where(eq(issues.id, fixture.issue.id));
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_review");
+    expect(stored.assigneeAgentId).toBe(other.id);
+    expect(stored.assigneeUserId).toBeNull();
+    expect(stored.executionState).toMatchObject({
+      status: "pending", completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+    });
+    expect(stored.executionState?.approvalStatus).toBeUndefined();
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(await db.select().from(issueDeliveryReceipts)
+      .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id))).toEqual(receipts);
+    expect(fixture.writes).toEqual([]);
+    expect(fixture.armCalls).toEqual([]);
+  });
+
+  it("refuses a PATCH final verdict when the execution policy changes after external preflight", async () => {
+    const fixture = await pendingDelivery({ holdPull: true, mergeArmingEnabled: true });
+    const initial = await fixture.read();
+    const racedPolicy = {
+      ...(initial.executionPolicy as Record<string, unknown>),
+      commentRequired: true,
+    };
+    const receipts = await db.select().from(issueDeliveryReceipts)
+      .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id));
+    const approval = fixture.approve().then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, approval, async () => {
+      await db.update(issues).set({ executionPolicy: racedPolicy })
+        .where(eq(issues.id, fixture.issue.id));
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_review");
+    expect(stored.executionPolicy).toEqual(racedPolicy);
+    expect(stored.executionState).toMatchObject({
+      status: "pending", completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+    });
+    expect(stored.executionState?.approvalStatus).toBeUndefined();
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(await db.select().from(issueDeliveryReceipts)
+      .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id))).toEqual(receipts);
+    expect(fixture.writes).toEqual([]);
+    expect(fixture.armCalls).toEqual([]);
+  });
+
+  it("records a record-only final approval without a delivery verdict when an override is supplied", async () => {
+    const fixture = await pendingDelivery({ deliveryRequirement: "record_only", missing: true });
+    const response = await fixture.approve({
+      doneTransitionOverride: {
+        disposition: "merged-elsewhere",
+        reason: "Deliverable merged elsewhere; this card has no deliverable head of its own.",
+      },
+    });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.status).toBe("done");
+    expect(stored.deliveryRequirement).toBe("record_only");
+    expect(stored.executionState).toMatchObject({
+      completedStageIds: [fixture.stageId], lastDecisionOutcome: "approved",
+    });
+    expect(
+      (stored.executionState?.approvalStatus as Record<string, unknown> | undefined)?.finalDelivery,
+    ).toBeUndefined();
+    expect(fixture.writes).toEqual([]);
+  });
+
   it("refuses a final board verdict when the delivery binding changes during the preflight without touching the issue row", async () => {
     const previous = process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
     process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "true";
