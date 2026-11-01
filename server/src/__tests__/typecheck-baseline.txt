@@ -1,13 +1,15 @@
-#
-#   node scripts/check-server-test-typecheck.mjs --update
-# Each line is `<file>(<line>,<column>): <TS code>` with the diagnostic
 # Recorded type errors for server/src/__tests__/tsconfig.json (baseline).
-# Regenerate from the repository root:
-# These are pre-existing upstream test-type errors, not fork regressions;
-# `pnpm run check:server-test-typecheck`.
-# disappearing, not to a reworded message.
+#
+# Each line is `<file>(<line>,<column>): <TS code>` with the diagnostic
 # message stripped, so the baseline reacts to an error appearing, moving or
+# disappearing, not to a reworded message.
+#
+# These are pre-existing upstream test-type errors, not fork regressions;
 # see SUP-16604. Any error that is NOT listed here fails
+# `pnpm run check:server-test-typecheck`.
+#
+# Regenerate from the repository root:
+#   node scripts/check-server-test-typecheck.mjs --update
 packages/paperclip-runner/src/contracts/native-execution.test.ts(172,20): TS2352
 packages/paperclip-runner/src/contracts/native-execution.test.ts(309,20): TS2352
 packages/paperclip-runner/src/contracts/native-execution.test.ts(79,90): TS2345
@@ -540,7 +542,6 @@ server/src/__tests__/execution-workspaces-service.test.ts(4813,26): TS2532
 server/src/__tests__/execution-workspaces-service.test.ts(4824,33): TS2532
 server/src/__tests__/external-objects-service.test.ts(1001,62): TS2322
 server/src/__tests__/external-objects-service.test.ts(1052,62): TS2322
-server/src/__tests__/external-objects-service.test.ts(1411,12): TS18047
 server/src/__tests__/external-objects-service.test.ts(280,70): TS2322
 server/src/__tests__/external-objects-service.test.ts(343,77): TS2322
 server/src/__tests__/external-objects-service.test.ts(390,77): TS2322
@@ -689,31 +690,6 @@ server/src/__tests__/inbox-archive-routes.test.ts(158,23): TS2502
 server/src/__tests__/instance-settings-routes.test.ts(1181,49): TS2345
 server/src/__tests__/instrumentation.test.ts(310,70): TS2307
 server/src/__tests__/invite-test-resolution-route.test.ts(69,7): TS2322
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(1186,51): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(1212,51): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(1237,51): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2312,63): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2353,53): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2377,53): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2840,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2856,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2887,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2908,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2938,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2958,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(2983,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3004,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3032,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3062,74): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3086,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3125,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3150,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3170,72): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3235,74): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3291,74): TS2345
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(3310,31): TS7006
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(406,9): TS7022
-server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(570,76): TS2345
 server/src/__tests__/issue-attachment-routes.test.ts(143,7): TS2322
 server/src/__tests__/issue-attachment-routes.test.ts(535,14): TS2345
 server/src/__tests__/issue-attachment-routes.test.ts(553,14): TS2345
@@ -876,81 +852,81 @@ server/src/__tests__/issue-thread-interaction-routes.test.ts(1360,56): TS2493
 server/src/__tests__/issue-thread-interaction-routes.test.ts(1360,60): TS2339
 server/src/__tests__/issue-thread-interaction-routes.test.ts(1995,62): TS2493
 server/src/__tests__/issue-thread-interaction-routes.test.ts(3614,7): TS2353
-server/src/__tests__/issue-thread-interactions-service.test.ts(1211,80): TS2345
-server/src/__tests__/issue-thread-interactions-service.test.ts(1232,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(1263,8): TS2345
-server/src/__tests__/issue-thread-interactions-service.test.ts(1318,8): TS2345
-server/src/__tests__/issue-thread-interactions-service.test.ts(1357,8): TS2345
-server/src/__tests__/issue-thread-interactions-service.test.ts(1417,8): TS2345
-server/src/__tests__/issue-thread-interactions-service.test.ts(1605,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(1610,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(1619,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(1624,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(1694,35): TS2345
-server/src/__tests__/issue-thread-interactions-service.test.ts(1698,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(1701,35): TS2345
-server/src/__tests__/issue-thread-interactions-service.test.ts(1704,40): TS2345
-server/src/__tests__/issue-thread-interactions-service.test.ts(1707,35): TS2345
-server/src/__tests__/issue-thread-interactions-service.test.ts(1786,62): TS2345
-server/src/__tests__/issue-thread-interactions-service.test.ts(1787,62): TS2345
+server/src/__tests__/issue-thread-interactions-service.test.ts(1213,80): TS2345
+server/src/__tests__/issue-thread-interactions-service.test.ts(1234,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(1265,8): TS2345
+server/src/__tests__/issue-thread-interactions-service.test.ts(1320,8): TS2345
+server/src/__tests__/issue-thread-interactions-service.test.ts(1359,8): TS2345
+server/src/__tests__/issue-thread-interactions-service.test.ts(1419,8): TS2345
+server/src/__tests__/issue-thread-interactions-service.test.ts(1607,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(1612,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(1621,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(1626,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(1696,35): TS2345
+server/src/__tests__/issue-thread-interactions-service.test.ts(1700,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(1703,35): TS2345
+server/src/__tests__/issue-thread-interactions-service.test.ts(1706,40): TS2345
+server/src/__tests__/issue-thread-interactions-service.test.ts(1709,35): TS2345
 server/src/__tests__/issue-thread-interactions-service.test.ts(1788,62): TS2345
-server/src/__tests__/issue-thread-interactions-service.test.ts(1933,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(1979,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2018,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2044,9): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2111,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2164,9): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2266,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2278,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2297,85): TS2345
-server/src/__tests__/issue-thread-interactions-service.test.ts(2308,8): TS2345
-server/src/__tests__/issue-thread-interactions-service.test.ts(2319,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2377,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2436,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2477,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2604,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2653,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2753,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2802,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2845,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2895,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2947,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2959,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2979,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(2996,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(3017,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(3063,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(3093,7): TS2769
-server/src/__tests__/issue-thread-interactions-service.test.ts(3131,7): TS2769
-server/src/__tests__/issue-thread-interactions-service.test.ts(3160,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(3188,80): TS2353
-server/src/__tests__/issue-thread-interactions-service.test.ts(3201,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(3257,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(3293,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(3362,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(3473,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(3626,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(3650,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(3740,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(3958,9): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(4369,9): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(4401,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(4444,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(4479,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(4512,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(4544,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(4576,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(4605,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(4644,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(4698,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(4726,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(4760,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(4791,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(4822,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(4859,7): TS2322
-server/src/__tests__/issue-thread-interactions-service.test.ts(558,7): TS2345
-server/src/__tests__/issue-thread-interactions-service.test.ts(626,9): TS2345
-server/src/__tests__/issue-thread-interactions-service.test.ts(680,7): TS2345
+server/src/__tests__/issue-thread-interactions-service.test.ts(1789,62): TS2345
+server/src/__tests__/issue-thread-interactions-service.test.ts(1790,62): TS2345
+server/src/__tests__/issue-thread-interactions-service.test.ts(1935,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(1981,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2020,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2046,9): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2113,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2166,9): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2268,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2280,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2299,85): TS2345
+server/src/__tests__/issue-thread-interactions-service.test.ts(2310,8): TS2345
+server/src/__tests__/issue-thread-interactions-service.test.ts(2321,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2379,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2438,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2479,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2606,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2655,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2755,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2804,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2847,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2897,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2949,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2961,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2981,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(2998,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(3019,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(3065,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(3095,7): TS2769
+server/src/__tests__/issue-thread-interactions-service.test.ts(3133,7): TS2769
+server/src/__tests__/issue-thread-interactions-service.test.ts(3162,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(3190,80): TS2353
+server/src/__tests__/issue-thread-interactions-service.test.ts(3203,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(3259,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(3295,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(3364,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(3475,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(3628,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(3652,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(3742,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(3960,9): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(4371,9): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(4403,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(4446,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(4481,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(4514,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(4546,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(4578,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(4607,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(4646,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(4700,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(4728,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(4762,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(4793,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(4824,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(4861,7): TS2322
+server/src/__tests__/issue-thread-interactions-service.test.ts(560,7): TS2345
+server/src/__tests__/issue-thread-interactions-service.test.ts(628,9): TS2345
+server/src/__tests__/issue-thread-interactions-service.test.ts(682,7): TS2345
 server/src/__tests__/issue-thread-interactions-telemetry.test.ts(148,7): TS2322
 server/src/__tests__/issue-thread-interactions-telemetry.test.ts(173,7): TS2322
 server/src/__tests__/issue-thread-interactions-telemetry.test.ts(268,7): TS2322
@@ -1040,7 +1016,6 @@ server/src/__tests__/native-status-arbiter-corpus.test.ts(1454,60): TS18047
 server/src/__tests__/native-status-arbiter-corpus.test.ts(1458,11): TS2345
 server/src/__tests__/native-status-arbiter-corpus.test.ts(2115,7): TS2322
 server/src/__tests__/onboarding-seed-route.test.ts(58,82): TS2345
-server/src/__tests__/openapi-routes.test.ts(1616,27): TS7006
 server/src/__tests__/openclaw-gateway-adapter.test.ts(608,47): TS2741
 server/src/__tests__/paperclip-semantic-conformance.test.ts(36,13): TS2749
 server/src/__tests__/permissions-upgrade-boundary-routes.test.ts(52,5): TS2322
@@ -1399,6 +1374,7 @@ server/src/__tests__/workspace-runtime-https-live-exercise.test.ts(174,9): TS274
 server/src/__tests__/workspace-runtime-https-live-exercise.test.ts(187,11): TS2741
 server/src/__tests__/workspace-runtime-https-live-exercise.test.ts(246,9): TS2353
 server/src/__tests__/workspace-runtime-https-live-exercise.test.ts(84,19): TS2339
+server/src/__tests__/workspace-runtime.test.ts(10105,105): TS2741
 server/src/__tests__/workspace-runtime.test.ts(11267,9): TS2353
 server/src/__tests__/workspace-runtime.test.ts(13172,5): TS2322
 server/src/__tests__/workspace-runtime.test.ts(466,3): TS2741
@@ -1406,7 +1382,6 @@ server/src/__tests__/workspace-runtime.test.ts(5099,12): TS18047
 server/src/__tests__/workspace-runtime.test.ts(5100,12): TS18047
 server/src/__tests__/workspace-runtime.test.ts(546,34): TS2554
 server/src/__tests__/workspace-runtime.test.ts(9941,7): TS2741
-server/src/__tests__/workspace-runtime.test.ts(10105,105): TS2741
 server/src/__tests__/worktree-config.test.ts(1194,7): TS2741
 server/src/__tests__/worktree-config.test.ts(1211,7): TS2741
 server/src/__tests__/write-build-stamp.test.ts(3,36): TS7016
