@@ -2134,6 +2134,7 @@ async function captureNativeCompletionGuardInputs(
                 eq(agents.companyId, issue.companyId),
               ),
             )
+            .for("share")
         )
           .map((row) => ({ id: row.id, name: row.name }))
           .sort((a, b) => (a.id < b.id ? -1 : 1))
