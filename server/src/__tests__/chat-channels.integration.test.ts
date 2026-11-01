@@ -222,6 +222,17 @@ function waitFor<T>(
   });
 }
 
+// The Discord Gateway lease cases need an owner whose lease has expired. A
+// 200 ms real-time TTL raced the owner's own runtime initialization, which
+// throws "Another Paperclip server owns this Discord Gateway connection" once
+// the lease lapses mid-setup on a slow runner. Keep the production TTL and
+// cross it by moving Date alone; the afterEach restores real timers.
+function expireDiscordGatewayLeases() {
+  const jumpedTo = new Date(Date.now() + 60_000);
+  vi.useFakeTimers({ toFake: ["Date"], shouldAdvanceTime: true });
+  vi.setSystemTime(jumpedTo);
+}
+
 // How long the fixture wake below keeps re-driving an admission transaction that
 // keeps losing the chat_endpoints NOWAIT race. retryChatControlAdmission on its
 // own gives up only after 51 attempts x 100 ms (~5.1 s), which alone outlasts
@@ -1081,6 +1092,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         console.warn("chat fixture service shutdown failed", reason);
       if (shutdownFailures.length > 0) throw shutdownFailures[0];
     } finally {
+      vi.useRealTimers();
       // The registries must be emptied even when the database cleanup below
       // rejects. They are shared across cases, so leaving a failed test's
       // entries in place makes the NEXT afterEach shut down this test's
@@ -1088,6 +1100,24 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       // failure into a cascade across the remaining 380-odd cases.
       try {
         if (fixtureCompanies.size > 0) {
+          // The next case's service sweeps every endpoint in this shared
+          // database, not just its own. A receipt-reaction action left
+          // received/retryable by this case is picked up by that sweep, which
+          // takes the retired endpoint's 90 s credential-mutation lease; if
+          // the sweep does not finish, the dead lease makes every following
+          // case's global sweep poll for CREDENTIAL_MUTATION_LEASE_WAIT_MS
+          // (10 s), past the 5 s setup poll budget. Retire this case's
+          // pending actions and leases so nothing here is adoptable later.
+          await db.update(chatActions).set({ status: "cancelled" })
+            .where(and(
+              inArray(chatActions.companyId, [...fixtureCompanies]),
+              or(
+                inArray(chatActions.status, ["received", "processing"]),
+                and(eq(chatActions.status, "failed"), sql`coalesce(${chatActions.result}->>'retryable', 'false') = 'true'`),
+              ),
+            ));
+          await db.delete(chatEndpointLeases)
+            .where(inArray(chatEndpointLeases.companyId, [...fixtureCompanies]));
           await db.update(chatEndpoints).set({ status: "paused" })
             .where(and(inArray(chatEndpoints.companyId, [...fixtureCompanies]), eq(chatEndpoints.status, "active")));
           // The milestone scanner also considers paused endpoints while their
@@ -9438,7 +9468,6 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const { callbacks, endpoint, runtime, service, wakeup } =
       await configuredDiscordEndpoint(fixture, {
         discordGatewayLeaseRenewalIntervalMs: 60_000,
-        discordGatewayLeaseTtlMs: 200,
       });
     const ownedRuntime = runtime.endpoints.get(endpoint.id);
     if (!ownedRuntime)
@@ -9454,7 +9483,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       );
     if (!leaseBeforePause) throw new Error("Expected Discord Gateway lease");
 
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    expireDiscordGatewayLeases();
     const messageId = "555555555555555601";
     const channel = makeThread({
       channelId: "333333333333333333",
@@ -9515,7 +9544,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .where(eq(issueComments.companyId, fixture.companyId))
       .then((rows) => rows.length);
     const wakeupCountBefore = wakeup.mock.calls.length;
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    expireDiscordGatewayLeases();
     const emoji = {
       name: "thumbsup",
       toJSON: () => "👍",
@@ -9588,7 +9617,6 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const ownerRuntime = new FakeChatSdkRuntime();
     const owner = createService(ownerRuntime, providerFetch, {
       discordGatewayLeaseRenewalIntervalMs: 60_000,
-      discordGatewayLeaseTtlMs: 200,
     });
     const endpoint = await owner.service.create(
       fixture.companyId,
@@ -9618,7 +9646,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
 
     const standbyRuntime = new FakeChatSdkRuntime();
     const standby = createService(standbyRuntime, providerFetch);
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    expireDiscordGatewayLeases();
     const reconciled = await standby.service.reconcileProviderRuntimes();
     expect(reconciled).toMatchObject({ ownedElsewhere: 0, failed: 0 });
     expect(reconciled.local).toBe(reconciled.eligible);
@@ -9713,7 +9741,6 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const ownerRuntime = new FakeChatSdkRuntime();
     const owner = createService(ownerRuntime, providerFetch, {
       discordGatewayLeaseRenewalIntervalMs: 60_000,
-      discordGatewayLeaseTtlMs: 200,
       discordGatewayMessageAdmissionBarrier: async () => {
         if (!holdOldCallbacks) return;
         messageAdmissionEntered();
@@ -9850,7 +9877,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const standbyRuntime = new FakeChatSdkRuntime();
     const standby = createService(standbyRuntime, providerFetch);
     try {
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      expireDiscordGatewayLeases();
       const reconciled = await standby.service.reconcileProviderRuntimes();
       expect(reconciled).toMatchObject({ ownedElsewhere: 0, failed: 0 });
       const freshCallbacks = standbyRuntime.configurations.get(
