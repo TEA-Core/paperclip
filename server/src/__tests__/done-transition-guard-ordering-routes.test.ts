@@ -726,6 +726,34 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
     expect(statusRows[0]?.status).toBe("done");
   });
 
+  it("decision-only override allows a Tier 0 close with open linked PRs", async () => {
+    const { companyId, agentId, issueId, identifier } = await seedIssue("DECISIONONLY");
+    currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
+
+    await seedLinkedPrs(companyId, issueId, [
+      { owner: "TEA-Core", repo: "paperclip", number: 275, state: "open", draft: false },
+    ]);
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        doneTransitionOverride: {
+          disposition: "decision-only-no-repository-deliverable",
+          reason: "The recorded decision has no repository deliverable.",
+        },
+        comment: "Closed at Tier 0 (decision-only): The recorded decision has no repository deliverable.",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const statusRows = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(statusRows[0]?.status).toBe("done");
+  });
+
   it("no linked PRs allows done transition to proceed to tier declaration check (green path)", async () => {
     const { companyId, agentId, issueId, identifier } = await seedIssue("NOPR");
     currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
