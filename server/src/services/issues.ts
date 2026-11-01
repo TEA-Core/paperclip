@@ -11903,8 +11903,21 @@ export function issueService(db: Db) {
         // Routes already normalize (and redact) before reaching the service, so the
         // only writers still carrying a raw `monitor.externalRef` here are internal
         // ones that need to read it back — see normalizeIssueExecutionPolicy.
-        const normalizedPolicy = normalizeIssueExecutionPolicy(issueData.executionPolicy ?? null, {
+        // SUP-22135: an explicitly stage-less policy ("no ladder", SUP-22098)
+        // must survive this write boundary too. The PATCH route resolves the
+        // policy with explicit-empty preservation, but this re-normalization
+        // collapsed `stages: []` back to null and wiped the stored shape.
+        // Gated on the incoming object's own raw `stages` array (the
+        // SUP-22098 raw-stages gate), so every other writer — including ones
+        // passing `null` — keeps today's semantics unchanged.
+        const incomingPolicyRaw = issueData.executionPolicy ?? null;
+        const incomingStagesExplicitEmpty =
+          incomingPolicyRaw !== null &&
+          Array.isArray(incomingPolicyRaw.stages) &&
+          incomingPolicyRaw.stages.length === 0;
+        const normalizedPolicy = normalizeIssueExecutionPolicy(incomingPolicyRaw, {
           preserveMonitorExternalRef: true,
+          preserveEmptyPolicy: incomingStagesExplicitEmpty,
         });
         const normalizedPolicyRecord = (normalizedPolicy as Record<string, unknown> | null) ?? null;
         issueData.executionPolicy = normalizedPolicyRecord;

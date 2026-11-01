@@ -687,9 +687,16 @@ export function assertPatchableExecutionPolicyWrite(input: {
  * the ladder.
  *
  * A caller that genuinely wants a stage-less policy must send `stages: []`
- * explicitly; `assertPatchableExecutionPolicyWrite` still refuses that over a
- * stored ladder. Over an already stage-less policy, omission is a no-op (there
- * is nothing to preserve), matching the SUP-13925 monitor-only round-trip.
+  * explicitly; `assertPatchableExecutionPolicyWrite` still refuses that over a
+  * stored ladder. Over an already stage-less policy, omission is a no-op (there
+  * is nothing to preserve), matching the SUP-13925 monitor-only round-trip.
+  *
+  * SUP-22135: over a stored policy that is ALREADY explicitly stage-less, every
+  * guard-admitted body (explicit `stages: []` round-trip or a partial write
+  * whose defaulted stages are empty) resolves to that same stage-less shape —
+  * it never collapses to null and wipes the stored policy. A null stored policy
+  * still normalizes bare-empty bodies to null; default inheritance is
+  * unaffected.
  *
  * A malformed non-object body is returned as `null` rather than thrown: the
  * route has already validated the body against the schema before calling this,
@@ -706,6 +713,7 @@ export function resolvePatchExecutionPolicy(input: {
   raw: unknown;
   currentPolicy: IssueExecutionPolicy | null;
   stagesKeyAbsent: boolean;
+  storedStagesExplicitlyEmpty?: boolean;
   /** SUP-16525: the issue's stored execution state. When present with a
    *  non-null currentStageId, INV-LADDER-1 rejects stage inserts behind the
    *  live pointer (including a shifted/mismatched duplicated pointer). */
@@ -715,7 +723,14 @@ export function resolvePatchExecutionPolicy(input: {
    *  rewrite, so the preservation invariant must not refuse it. */
   rearmPointer?: boolean;
 }): IssueExecutionPolicy | null {
-  const { raw, currentPolicy, stagesKeyAbsent, executionState, rearmPointer } = input;
+  const {
+    raw,
+    currentPolicy,
+    stagesKeyAbsent,
+    storedStagesExplicitlyEmpty = false,
+    executionState,
+    rearmPointer,
+  } = input;
   if (raw === null) return null;
   if (typeof raw !== "object" || Array.isArray(raw)) return null;
 
@@ -725,7 +740,15 @@ export function resolvePatchExecutionPolicy(input: {
     stagesKeyAbsent && storedStages !== null
       ? { ...(raw as Record<string, unknown>), stages: storedStages }
       : raw;
-  const resolved = normalizeIssueExecutionPolicy(effectiveRaw);
+  // SUP-22135: preserve only a policy whose raw stored representation explicitly
+  // carried `stages: []`; legacy monitor-only rows without that key normalize to
+  // null and retain their historical default-inheritance behavior.
+  const preserveStoredEmptyPolicy =
+    storedStagesExplicitlyEmpty && currentPolicy !== null && currentPolicy.stages.length === 0;
+  const resolved = normalizeIssueExecutionPolicy(
+    effectiveRaw,
+    preserveStoredEmptyPolicy ? { preserveEmptyPolicy: true } : undefined,
+  );
 
   // Preserve-on-omit carries the stored stages forward unchanged, so no insert
   // is possible on that path; only an explicit `stages` body can move the

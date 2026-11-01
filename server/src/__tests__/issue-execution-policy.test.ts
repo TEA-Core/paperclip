@@ -396,6 +396,7 @@ describe("resolvePatchExecutionPolicy (SUP-15377)", () => {
       raw: { mode: "normal", commentRequired: true, monitor },
       currentPolicy: stored,
       stagesKeyAbsent: true,
+      storedStagesExplicitlyEmpty: false,
     });
     expect(resolved).not.toBeNull();
     expect(resolved!.stages.length).toBe(1);
@@ -412,6 +413,7 @@ describe("resolvePatchExecutionPolicy (SUP-15377)", () => {
       raw: { mode: "normal", commentRequired: true, monitor },
       currentPolicy: stored,
       stagesKeyAbsent: true,
+      storedStagesExplicitlyEmpty: false,
     });
     expect(resolved!.stages).toEqual([]);
     expect(resolved!.monitor?.nextCheckAt).toBe(monitor.nextCheckAt);
@@ -449,6 +451,87 @@ describe("resolvePatchExecutionPolicy (SUP-15377)", () => {
     expect(resolvePatchExecutionPolicy({ raw: "nope", currentPolicy: reviewOnlyPolicy(), stagesKeyAbsent: true })).toBeNull();
     expect(resolvePatchExecutionPolicy({ raw: null, currentPolicy: reviewOnlyPolicy(), stagesKeyAbsent: true })).toBeNull();
     expect(resolvePatchExecutionPolicy({ raw: [1, 2], currentPolicy: reviewOnlyPolicy(), stagesKeyAbsent: true })).toBeNull();
+  });
+});
+
+describe("resolvePatchExecutionPolicy explicit-empty preservation (SUP-22135)", () => {
+  const stageLessPolicy = () =>
+    normalizeIssueExecutionPolicy({ mode: "normal", commentRequired: true, stages: [] }, { preserveEmptyPolicy: true })!;
+
+  it("keeps an explicit `stages: []` round-trip over a stored stage-less policy non-null", () => {
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [] },
+      currentPolicy: stageLessPolicy(),
+      stagesKeyAbsent: false,
+      storedStagesExplicitlyEmpty: true,
+    });
+    // Before SUP-22135 the normalizer collapsed the bare-empty body to null,
+    // silently wiping the stored SUP-22098 shape.
+    expect(resolved).not.toBeNull();
+    expect(resolved!.stages).toEqual([]);
+    expect(resolved!.mode).toBe("normal");
+  });
+
+  it("keeps a stage-less partial write (stages key absent) non-null", () => {
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "auto", commentRequired: true },
+      currentPolicy: stageLessPolicy(),
+      stagesKeyAbsent: true,
+      storedStagesExplicitlyEmpty: true,
+    });
+    expect(resolved).not.toBeNull();
+    expect(resolved!.stages).toEqual([]);
+    expect(resolved!.mode).toBe("auto");
+  });
+
+  it("still collapses a bare-empty body over a null stored policy (default inheritance unchanged)", () => {
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [] },
+      currentPolicy: null,
+      stagesKeyAbsent: false,
+      storedStagesExplicitlyEmpty: false,
+    });
+    expect(resolved).toBeNull();
+  });
+
+  it("still carries the stored ladder forward on stages omission (SUP-15377 unchanged)", () => {
+    const stored = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+    })!;
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true },
+      currentPolicy: stored,
+      stagesKeyAbsent: true,
+      storedStagesExplicitlyEmpty: false,
+    });
+    expect(resolved!.stages.length).toBe(1);
+    expect(resolved!.stages[0]!.id).toBe(stored.stages[0]!.id);
+  });
+
+  it("does not preserve a legacy monitor-only policy without a raw stages key", () => {
+    const stored = normalizeIssueExecutionPolicy({ monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" } })!;
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "auto", commentRequired: true, stages: [] },
+      currentPolicy: stored,
+      stagesKeyAbsent: false,
+      storedStagesExplicitlyEmpty: false,
+    });
+    expect(resolved).toBeNull();
+  });
+
+  it("preserves a stored policy only when the raw stages key was explicitly empty", () => {
+    const stored = normalizeIssueExecutionPolicy(
+      { mode: "normal", monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" }, stages: [] },
+      { preserveEmptyPolicy: true },
+    )!;
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [] },
+      currentPolicy: stored,
+      stagesKeyAbsent: false,
+      storedStagesExplicitlyEmpty: true,
+    });
+    expect(resolved).not.toBeNull();
+    expect(resolved!.stages).toEqual([]);
   });
 });
 
@@ -1107,7 +1190,7 @@ describe("issue execution policy transitions", () => {
           assigneeAgentId: qaAgentId,
           assigneeUserId: null,
           executionPolicy: policy,
-          executionState: rearm.patch.executionState,
+          executionState: rearm.patch.executionState as IssueExecutionState,
         },
         policy,
         requestedStatus: "done",
@@ -3376,6 +3459,7 @@ describe("issue execution policy transitions", () => {
         currentStageType: "review",
         currentParticipant: { type: "agent", agentId: qaAgentId },
         returnAssignee: { type: "agent", agentId: coderAgentId },
+        reviewRequest: null,
         completedStageIds: [],
         lastDecisionId: null,
         lastDecisionOutcome: null,
@@ -3577,7 +3661,7 @@ describe("return-assignee exclusion is absolute (reverses SUP-10602 allowSelfAsF
             assigneeAgentId: qaAgentId,
             assigneeUserId: null,
             executionPolicy: policy,
-            executionState: result.patch.executionState,
+            executionState: result.patch.executionState as IssueExecutionState,
           },
           policy,
           requestedStatus: "done",
