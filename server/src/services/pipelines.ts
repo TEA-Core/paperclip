@@ -1177,11 +1177,10 @@ function routineRevisionSnapshotRoutine(routine: typeof routines.$inferSelect): 
     catchUpPolicy: routine.catchUpPolicy as RoutineRevisionSnapshotV1["routine"]["catchUpPolicy"],
     activityGatePolicy: routine.activityGatePolicy as RoutineRevisionSnapshotV1["routine"]["activityGatePolicy"],
     activityGateScope: routine.activityGateScope as RoutineRevisionSnapshotV1["routine"]["activityGateScope"],
-    originKind: routine.originKind,
-    originId: routine.originId,
     variables: routine.variables ?? [],
     env: routine.env ?? null,
     executionPolicy: routine.executionPolicy ?? null,
+    deliveryRequirement: routine.deliveryRequirement ?? null,
     executionWorkspacePreference: routine.executionWorkspacePreference ?? null,
     responsibleUserId: routine.responsibleUserId ?? null,
   };

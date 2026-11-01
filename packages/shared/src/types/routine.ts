@@ -1,4 +1,5 @@
 import type {
+  IssueDeliveryRequirement,
   IssueOriginKind,
   IssuePriority,
   RoutineActivityGatePolicy,
@@ -90,6 +91,7 @@ export interface Routine {
   variables: RoutineVariable[];
   env?: RoutineEnvConfig | null;
   executionPolicy?: Record<string, unknown> | null;
+  deliveryRequirement?: IssueDeliveryRequirement | null;
   executionWorkspacePreference?: string | null;
   latestRevisionId: string | null;
   latestRevisionNumber: number;
@@ -137,6 +139,7 @@ export interface RoutineRevisionSnapshotRoutineV1 {
   variables: RoutineVariable[];
   env: RoutineEnvConfig | null;
   executionPolicy?: Record<string, unknown> | null;
+  deliveryRequirement?: IssueDeliveryRequirement | null;
   executionWorkspacePreference?: string | null;
   responsibleUserId: string | null;
 }

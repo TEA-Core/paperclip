@@ -1,0 +1,2 @@
+ALTER TABLE "routines" ADD COLUMN "delivery_requirement" text;--> statement-breakpoint
+ALTER TABLE "routines" ADD CONSTRAINT "routines_delivery_requirement_check" CHECK ("routines"."delivery_requirement" in ('repository_delivery', 'record_only'));
