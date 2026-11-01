@@ -154,6 +154,7 @@ import {
 } from "./parent-edge-close-ladder-gate.js";
 import { edgeCarriesLadderCarveOutLabel } from "./laddered-child-eligibility.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { assertWikiHandoffWriteIntegrity } from "./issue-assignee-review-gate.js";
 import {
   type CurrentUserRedactionOptions,
   redactCurrentUserText,
@@ -12073,6 +12074,14 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        if (issueData.assigneeAgentId !== undefined) {
+          await assertWikiHandoffWriteIntegrity({
+            db: tx as Db,
+            companyId: receiptExisting.companyId,
+            issue: receiptExisting,
+            incomingAssigneeAgentId: issueData.assigneeAgentId,
+          });
+        }
         if (actorAgentId && patch.status === "done") {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });
