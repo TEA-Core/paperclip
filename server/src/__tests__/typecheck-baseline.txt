@@ -718,7 +718,6 @@ server/src/__tests__/issue-attachment-routes.test.ts(143,7): TS2322
 server/src/__tests__/issue-attachment-routes.test.ts(535,14): TS2345
 server/src/__tests__/issue-attachment-routes.test.ts(553,14): TS2345
 server/src/__tests__/issue-attachment-routes.test.ts(631,14): TS2345
-server/src/__tests__/issue-blocked-without-blockers-signal-routes.test.ts(184,14): TS2493
 server/src/__tests__/issue-blocker-attention.test.ts(1008,34): TS2339
 server/src/__tests__/issue-blocker-attention.test.ts(1015,33): TS2339
 server/src/__tests__/issue-blocker-attention.test.ts(1028,61): TS2339
@@ -820,16 +819,6 @@ server/src/__tests__/issue-comment-reopen-routes.test.ts(911,49): TS2339
 server/src/__tests__/issue-comment-reopen-routes.test.ts(936,45): TS2493
 server/src/__tests__/issue-comment-reopen-routes.test.ts(936,49): TS2339
 server/src/__tests__/issue-comment-reopen-routes.test.ts(951,51): TS2345
-server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(587,52): TS2345
-server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(617,54): TS2345
-server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(638,52): TS2345
-server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(662,52): TS2345
-server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(680,54): TS2345
-server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(697,52): TS2345
-server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(717,52): TS2345
-server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(740,52): TS2345
-server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(761,52): TS2345
-server/src/__tests__/issue-duplicate-run-write-refusal.test.ts(797,52): TS2345
 server/src/__tests__/issue-execution-policy-routes.test.ts(1096,7): TS2322
 server/src/__tests__/issue-execution-policy-routes.test.ts(391,24): TS2741
 server/src/__tests__/issue-execution-policy-routes.test.ts(393,48): TS2739
