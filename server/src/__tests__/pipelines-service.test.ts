@@ -134,6 +134,7 @@ describeEmbeddedPostgres("pipelineService", () => {
       status: "active",
       concurrencyPolicy: "always_enqueue",
       catchUpPolicy: "skip_missed",
+      variables: [],
     }, {});
   }
 
@@ -1616,7 +1617,7 @@ describeEmbeddedPostgres("pipelineService", () => {
       pipelineId: pipeline.id,
       caseKey: "pulpit-opinion",
       title: "Pulpit opinion piece",
-      body: "Agentic work should be composed, not rebuilt",
+      summary: "Agentic work should be composed, not rebuilt",
       actor: userActor,
     });
     const moved = await svc.transitionCase({
