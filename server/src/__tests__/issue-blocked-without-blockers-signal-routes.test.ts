@@ -3,7 +3,7 @@ import request from "supertest";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
-const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
+const mockLogActivity = vi.hoisted(() => vi.fn(async (_db: unknown, _input: unknown) => undefined));
 const mockLoggerWarn = vi.hoisted(() => vi.fn());
 const mockIssueService = vi.hoisted(() => ({
   getAncestors: vi.fn(),
