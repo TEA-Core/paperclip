@@ -2473,16 +2473,22 @@ describe("worktree helpers", () => {
           companyId,
           agentId,
           JSON.stringify({
-            provider: "claude_managed",
-            managedProfileId: "production-managed-profile",
-            model: "old-model",
-            env: { API_KEY: { type: "secret_ref", secretId } },
+            name: "Secret-bearing agent",
+            adapterType: "claude_managed",
+            adapterConfig: {
+              managedProfileId: "production-managed-profile",
+              model: "old-model",
+              env: { API_KEY: { type: "secret_ref", secretId } },
+            },
           }),
           JSON.stringify({
-            provider: "claude_managed",
-            agentCoreProfileId: "production-core-profile",
-            model: "claude-sonnet-5",
-            env: { TOKEN: "plaintext-token" },
+            name: "Secret-bearing agent",
+            adapterType: "claude_managed",
+            adapterConfig: {
+              agentCoreProfileId: "production-core-profile",
+              model: "claude-sonnet-5",
+              env: { TOKEN: "plaintext-token" },
+            },
           }),
         ],
       );
@@ -2637,8 +2643,24 @@ describe("worktree helpers", () => {
           [agentRevisionId],
         );
         expect(agentRevisionRows).toEqual([{
-          beforeConfig: { model: "old-model", env: {} },
-          afterConfig: { model: "claude-sonnet-5", env: {} },
+          beforeConfig: {
+            name: "Secret-bearing agent",
+            adapterType: "claude_managed",
+            adapterConfig: {
+              managedProfileId: "production-managed-profile",
+              model: "old-model",
+              env: {},
+            },
+          },
+          afterConfig: {
+            name: "Secret-bearing agent",
+            adapterType: "claude_managed",
+            adapterConfig: {
+              agentCoreProfileId: "production-core-profile",
+              model: "claude-sonnet-5",
+              env: {},
+            },
+          },
         }]);
         const projectRows = await targetDb.$client.unsafe<{
           env: Record<string, unknown> | null;
