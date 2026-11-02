@@ -4731,11 +4731,23 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     } as unknown as Express.Request["actor"];
   }
 
+  function boardActor(companyId: string): Express.Request["actor"] {
+    return {
+      type: "board",
+      userId: USER_ID,
+      companyIds: [companyId],
+      memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+      source: "cloud_tenant",
+    } as unknown as Express.Request["actor"];
+  }
+
   interface SeedOpts {
     executionRunId?: string | null;
     status?: string;
     strategyType?: "project_primary" | "git_worktree";
     deliveryBranch?: string | null;
+    /** Seed the card with no execution workspace at all (execution_workspace_id NULL). */
+    noWorkspace?: boolean;
     /**
      * SUP-15909: make the execution-workspace row a real `shared_workspace` row
      * OWNED BY ANOTHER issue, carrying the given carrier branch — the ADR-083
@@ -4788,6 +4800,7 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
       name: "Primary",
       cwd: "/tmp/test",
       isPrimary: true,
+      repoUrl: REPO_URL,
       createdAt: now,
       updatedAt: now,
     });
@@ -4829,23 +4842,25 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
         projectWorkspaceId,
       });
     }
-    await db.insert(executionWorkspaces).values({
-      id: executionWorkspaceId,
-      companyId,
-      projectId,
-      ...(carrierOwnerIssueId
-        ? { mode: "shared_workspace", sourceIssueId: carrierOwnerIssueId }
-        : { mode: "isolated" }),
-      strategyType: opts.strategyType ?? "git_worktree",
-      name: "card-ws",
-      status: "active",
-      branchName: opts.strategyType === "project_primary"
-        ? opts.deliveryBranch ?? null
-        : opts.sharedWorkspaceOwnerBranch ?? "SUP-14824-branch",
-      repoUrl: REPO_URL,
-      createdAt: now,
-      updatedAt: now,
-    });
+    if (!opts.noWorkspace) {
+      await db.insert(executionWorkspaces).values({
+        id: executionWorkspaceId,
+        companyId,
+        projectId,
+        ...(carrierOwnerIssueId
+          ? { mode: "shared_workspace", sourceIssueId: carrierOwnerIssueId }
+          : { mode: "isolated" }),
+        strategyType: opts.strategyType ?? "git_worktree",
+        name: "card-ws",
+        status: "active",
+        branchName: opts.strategyType === "project_primary"
+          ? opts.deliveryBranch ?? null
+          : opts.sharedWorkspaceOwnerBranch ?? "SUP-14824-branch",
+        repoUrl: REPO_URL,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -4858,7 +4873,7 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
       createdByUserId: USER_ID,
       projectId,
       projectWorkspaceId,
-      executionWorkspaceId,
+      executionWorkspaceId: opts.noWorkspace ? null : executionWorkspaceId,
       executionRunId: opts.executionRunId ?? null,
       // ADR-091 D1 (SUP-15909): wire the carrier owner as a genuine strict ancestor
       // (the card's parent) so the shared-workspace carrier row passes the ADR-083
@@ -5153,6 +5168,112 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
       .from(issues)
       .where(eq(issues.id, issueId));
     expect(row!.status).toBe("in_progress");
+    expect((row!.executionState ?? {})?.delivery).toBeUndefined();
+  });
+
+  it("allows the board to refresh deliveryIdentity on a card already in_review", async () => {
+    const { companyId, issueId } = await seedIssue({ status: "in_review" });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14824-branch",
+          headSha: OTHER_HEAD_SHA,
+          prNumber: PR_NUMBER,
+          prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [row] = await db
+      .select({ executionState: issues.executionState, status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(row!.status).toBe("in_review");
+    const delivery = (row!.executionState ?? {})?.delivery as Record<string, unknown> | undefined;
+    expect(delivery).toBeDefined();
+    expect(delivery!.branch).toBe("SUP-14824-branch");
+    expect(delivery!.headSha).toBe(OTHER_HEAD_SHA);
+    expect(delivery!.prNumber).toBe(PR_NUMBER);
+    expect(delivery!.refreshedByBoard).toBe(true);
+  });
+
+  it("still rejects an agent refreshing deliveryIdentity on a card already in_review", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({
+      executionRunId: runId,
+      status: "in_review",
+    });
+    currentActor = agentActor(companyId, agentId, runId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14824-branch",
+          headSha: OTHER_HEAD_SHA,
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_write_rejected");
+    const [row] = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect((row!.executionState ?? {})?.delivery).toBeUndefined();
+  });
+
+  it("allows the board to record deliveryIdentity on an in_review card with no execution workspace", async () => {
+    const { companyId, issueId } = await seedIssue({ status: "in_review", noWorkspace: true });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14824-branch",
+          headSha: HEAD_SHA,
+          prNumber: PR_NUMBER,
+          prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [row] = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const delivery = (row!.executionState ?? {})?.delivery as Record<string, unknown> | undefined;
+    expect(delivery).toBeDefined();
+    expect(delivery!.branch).toBe("SUP-14824-branch");
+  });
+
+  it("still rejects the board refreshing deliveryIdentity with a foreign branch", async () => {
+    const { companyId, issueId } = await seedIssue({ status: "in_review" });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-999-foreign-branch",
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_branch_write_rejected");
+    const [row] = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
     expect((row!.executionState ?? {})?.delivery).toBeUndefined();
   });
 });

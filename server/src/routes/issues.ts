@@ -13688,6 +13688,7 @@ export function issueRoutes(
       // read pre-tx; it stays board-gated by assertBoard.
       let doneTierResolutionNote = resolutionNote ?? null;
       let structuredDoneTierRendered = false;
+      let recoveryOverrideAccepted = false;
       if (sourceIssueStatus === "done" && existing.status !== "done") {
         const preTxsRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
           existing.companyId,
@@ -13746,6 +13747,7 @@ export function issueRoutes(
           res.status(recoveryDoneOutcome.status).json(recoveryDoneOutcome.body);
           return;
         }
+        recoveryOverrideAccepted = recoveryDoneOutcome.overrideAccepted === true;
       }
       const result = await db.transaction(async (tx) => {
         const lockedIssue = await tx
@@ -14036,6 +14038,7 @@ export function issueRoutes(
               };
             }
             await preflightTerminalApproval(lockedIssue, transition.patch, transition.decision, executionPolicy, {
+              overrideAccepted: recoveryOverrideAccepted,
               locked: { prefetch: finalDeliveryPrefetch, tx: tx as unknown as Db },
             });
             Object.assign(updateFields, transition.patch);
@@ -19427,7 +19430,14 @@ export function issueRoutes(
         && actor.runId != null
         && (existing.executionRunId === actor.runId || existing.checkoutRunId === actor.runId);
       const enteringReview = existing.status !== "in_review" && updateFields.status === "in_review";
-      if (!holdsLease || !enteringReview) {
+      // Board refresh: the board is the full-control operator, so it may
+      // re-record or refresh delivery on a card already in review (a redo
+      // push that moved the PR head, or a workspace that drifted). Agents
+      // still need the lease-holding run entering review. Every ownership
+      // check below (project repo, control-plane branch) still applies.
+      const boardDeliveryRefresh =
+        req.actor.type === "board" && (enteringReview || existing.status === "in_review");
+      if ((!holdsLease || !enteringReview) && !boardDeliveryRefresh) {
         res.status(422).json({
           error: "deliveryIdentity may only be written by the lease-holding run on a transition into in_review",
           code: "delivery_identity_write_rejected",
@@ -19495,12 +19505,29 @@ export function issueRoutes(
         && branchOwnership.branch === null
         && deliveryWorkspace?.strategyType === "project_primary"
         && !deliveryWorkspace.branchName;
+      // Board refresh may stamp the recorded branch onto a workspace row that
+      // lost it (any strategy), repairing drift instead of needing a DB write.
+      const canStampRecordedBranch =
+        canRecordProjectPrimaryBranch
+        || (boardDeliveryRefresh
+          && branchOwnership.legitimate
+          && branchOwnership.branch === null
+          && deliveryWorkspace !== undefined
+          && !deliveryWorkspace.branchName);
+      // Board refresh on a card with no execution workspace at all: the board
+      // attests the record and approval-time exact-PR verification proves the
+      // bound PR. Agents still cannot create such a record.
+      const boardOrphanDeliveryRecord = boardDeliveryRefresh && !existing.executionWorkspaceId;
       const recordedBranchMismatch =
-        (!canRecordProjectPrimaryBranch && branchOwnership.branch === null)
+        (!canStampRecordedBranch && !boardOrphanDeliveryRecord && branchOwnership.branch === null)
         || (branchOwnership.branch !== null
           // Git refs are case-sensitive: the recorded branch must equal the control-plane branch exactly.
           && requestedDeliveryIdentity.branch !== branchOwnership.branch);
-      if (!canRecordProjectPrimaryBranch && (!branchOwnership.legitimate || recordedBranchMismatch)) {
+      if (
+        !canStampRecordedBranch
+        && !boardOrphanDeliveryRecord
+        && (!branchOwnership.legitimate || recordedBranchMismatch)
+      ) {
         const branchReason =
           branchOwnership.branch === null
             ? "card has no execution-workspace delivery branch to validate the recorded branch against"
@@ -19533,9 +19560,10 @@ export function issueRoutes(
           ...requestedDeliveryIdentity,
           recordedByRunId: actor.runId,
           recordedAt: new Date().toISOString(),
+          ...(boardDeliveryRefresh ? { refreshedByBoard: true } : {}),
         },
       };
-      deliveryIdentityWorkspaceBranchWrite = canRecordProjectPrimaryBranch;
+      deliveryIdentityWorkspaceBranchWrite = canStampRecordedBranch;
     }
 
     const nextStatus = updateFields.status ?? existing.status;
