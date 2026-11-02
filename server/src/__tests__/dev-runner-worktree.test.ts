@@ -10,6 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  applyWorktreeSecretsMasterKeyEnvOverrides,
   bootstrapDevRunnerWorktreeEnv,
   isWorktreeSeedPending,
   isLinkedGitWorktreeCheckout,
@@ -126,6 +127,32 @@ describe("dev-runner worktree env bootstrap", () => {
     fs.writeFileSync(path.join(root, ".git"), "gitdir: /tmp/paperclip/.git/worktrees/feature\n", "utf8");
 
     expect(isLinkedGitWorktreeCheckout(root)).toBe(true);
+  });
+
+  it("overrides inherited master-key settings from the local worktree env", () => {
+    const root = createTempRoot("paperclip-dev-runner-worktree-master-key-");
+    fs.mkdirSync(path.join(root, ".paperclip"), { recursive: true });
+    fs.writeFileSync(path.join(root, ".git"), "gitdir: /tmp/paperclip/.git/worktrees/feature\n", "utf8");
+    fs.writeFileSync(
+      resolveWorktreeEnvFilePath(root),
+      [
+        "PAPERCLIP_SECRETS_MASTER_KEY=local-master-key",
+        "PAPERCLIP_SECRETS_MASTER_KEY_FILE=/tmp/local-master.key",
+        "UNRELATED=local-value",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    expect(applyWorktreeSecretsMasterKeyEnvOverrides(root, {
+      PAPERCLIP_SECRETS_MASTER_KEY: "inherited-master-key",
+      PAPERCLIP_SECRETS_MASTER_KEY_FILE: "/tmp/inherited-master.key",
+      UNRELATED: "inherited-value",
+    })).toEqual({
+      PAPERCLIP_SECRETS_MASTER_KEY: "local-master-key",
+      PAPERCLIP_SECRETS_MASTER_KEY_FILE: "/tmp/local-master.key",
+      UNRELATED: "inherited-value",
+    });
   });
 
   it("loads repo-local Paperclip env for initialized worktrees without overriding explicit env", () => {

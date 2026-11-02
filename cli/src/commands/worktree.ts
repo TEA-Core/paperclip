@@ -1640,6 +1640,28 @@ async function inspectVerifiedSeedDatabase(
   }
 }
 
+async function scrubSeededSecretReferences(
+  connectionString: string,
+  seedMode: WorktreeSeedMode,
+): Promise<void> {
+  if (seedMode !== "minimal-no-secrets") return;
+
+  const db = createDb(connectionString);
+  try {
+    await db.execute(sql`
+      update agents
+      set adapter_config = jsonb_set(
+        adapter_config - 'provider' - 'managedProfileId' - 'agentCoreProfileId' - 'env',
+        '{env}',
+        '{}'::jsonb,
+        true
+      )
+    `);
+  } finally {
+    await db.$client?.end?.({ timeout: 5 }).catch(() => undefined);
+  }
+}
+
 async function seedWorktreeDatabase(input: {
   sourceConfigPath: string;
   sourceConfig: PaperclipConfig;
@@ -1660,9 +1682,6 @@ async function seedWorktreeDatabase(input: {
     sourceConfig: input.sourceConfig,
     sourceEnvEntries,
   });
-  if (seededMasterKey) {
-    mergePaperclipEnvEntries({ PAPERCLIP_SECRETS_MASTER_KEY: seededMasterKey }, input.targetPaths.envPath);
-  }
   let sourceHandle: EmbeddedPostgresHandle | null = null;
   let targetHandle: EmbeddedPostgresHandle | null = null;
 
@@ -1726,6 +1745,7 @@ async function seedWorktreeDatabase(input: {
     input.onPhase?.("migrations", "started");
     await applyPendingMigrations(targetConnectionString);
     input.onPhase?.("migrations", "succeeded");
+    await scrubSeededSecretReferences(targetConnectionString, input.seedMode);
     input.onPhase?.("execution_quarantine", "started");
     const executionQuarantine = input.preserveLiveWork
       ? { ...EMPTY_SEEDED_WORKTREE_EXECUTION_QUARANTINE_SUMMARY }
@@ -1759,6 +1779,9 @@ async function seedWorktreeDatabase(input: {
       "succeeded",
       `Validated migration ${targetValidation.summary.migrationRevision}.`,
     );
+    if (seededMasterKey) {
+      mergePaperclipEnvEntries({ PAPERCLIP_SECRETS_MASTER_KEY: seededMasterKey }, input.targetPaths.envPath);
+    }
 
     return {
       backupSummary: formatDatabaseBackupResult(backup),

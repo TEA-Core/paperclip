@@ -67,6 +67,22 @@ export function resolveWorktreeEnvFilePath(rootDir: string): string {
   return path.join(resolveWorktreeStateDir(rootDir), ".env");
 }
 
+export function applyWorktreeSecretsMasterKeyEnvOverrides(
+  rootDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  if (!isLinkedGitWorktreeCheckout(rootDir)) return env;
+
+  const envPath = resolveWorktreeEnvFilePath(rootDir);
+  if (!existsSync(envPath)) return env;
+
+  const entries = parseEnvFile(readFileSync(envPath, "utf8"));
+  for (const key of ["PAPERCLIP_SECRETS_MASTER_KEY", "PAPERCLIP_SECRETS_MASTER_KEY_FILE"] as const) {
+    if (key in entries) env[key] = entries[key];
+  }
+  return env;
+}
+
 export function isWorktreeSeedPending(rootDir: string): boolean {
   // SUP-14087 partitions the marker dir per uid; upstream's seed-manifest
   // verification runs inside that partition rather than a fixed `.paperclip`.
@@ -146,6 +162,7 @@ export function bootstrapDevRunnerWorktreeEnv(
     if (typeof env[key] === "string" && env[key]!.trim().length > 0) continue;
     env[key] = value;
   }
+  applyWorktreeSecretsMasterKeyEnvOverrides(rootDir, env);
 
   return {
     envPath,
