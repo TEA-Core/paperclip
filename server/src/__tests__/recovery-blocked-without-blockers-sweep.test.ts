@@ -53,6 +53,21 @@ vi.mock("../adapters/index.ts", async () => {
   };
 });
 
+const mockMonitorTransitionFailure = vi.hoisted(() => ({ error: null as Error | null }));
+vi.mock("../services/issue-execution-policy.ts", async () => {
+  const actual = await vi.importActual<typeof import("../services/issue-execution-policy.ts")>(
+    "../services/issue-execution-policy.ts",
+  );
+  return {
+    ...actual,
+    applyIssueMonitorPolicyTransition: (...args: Parameters<typeof actual.applyIssueMonitorPolicyTransition>) => {
+      if (mockMonitorTransitionFailure.error) throw mockMonitorTransitionFailure.error;
+      return actual.applyIssueMonitorPolicyTransition(...args);
+    },
+  };
+});
+
+import { HttpError } from "../errors.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { hasUsableUnblockDescriptor, isBlockedWithoutBlockers } from "../services/recovery/service.ts";
@@ -1909,6 +1924,132 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       .from(issueComments)
       .where(eq(issueComments.issueId, issueId));
     expect(commentsAfterSecondPass).toHaveLength(commentsAfterFirstPass.length);
+  });
+
+  function exhaustedMonitorExecutionState(attemptCount: number) {
+    return {
+      status: "idle",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      deliveryAuthor: null,
+      reviewRequest: null,
+      completedStageIds: [],
+      skippedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      monitor: {
+        status: "triggered",
+        nextCheckAt: null,
+        lastTriggeredAt: "2026-11-01T12:08:00.000Z",
+        attemptCount,
+        notes: null,
+        scheduledBy: "assignee",
+        kind: null,
+        serviceName: null,
+        externalRef: null,
+        timeoutAt: null,
+        maxAttempts: 3,
+        recoveryPolicy: null,
+        clearedAt: null,
+        clearReason: null,
+      },
+    };
+  }
+
+  it("startup recovery sweeps complete when a blocked card and an escalated-exhausted card both have monitor_attempt_count >= 3", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
+    const blockedIssueId = randomUUID();
+    const drainIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockedIssueId,
+      companyId,
+      title: "Blocked card whose monitor already fired three times",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      monitorAttemptCount: 10,
+      monitorScheduledBy: "assignee",
+      executionState: exhaustedMonitorExecutionState(10),
+      updatedAt: oldDate(),
+    });
+    await db.insert(issues).values({
+      id: drainIssueId,
+      companyId,
+      title: "Escalated-exhausted card whose monitor already fired three times",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      monitorAttemptCount: 12,
+      monitorScheduledBy: "assignee",
+      executionState: exhaustedMonitorExecutionState(12),
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, blockedIssueId);
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, drainIssueId);
+
+    const heartbeat = heartbeatService(db);
+    await expect(heartbeat.reconcileBlockedWithoutBlockers()).resolves.toBeDefined();
+    await expect(heartbeat.reconcileExhaustedRecoveryDrain()).resolves.toBeDefined();
+  });
+
+  it("bounds-exhausted board monitor re-arm falls through instead of throwing from the drain", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Escalated-exhausted card with an exhausted monitor",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      monitorAttemptCount: 3,
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    mockMonitorTransitionFailure.error = new HttpError(422, "Monitor bounds are already exhausted", {
+      clearReason: "max_attempts_exhausted",
+    });
+    try {
+      const heartbeat = heartbeatService(db);
+      await expect(heartbeat.reconcileExhaustedRecoveryDrain()).resolves.toBeDefined();
+    } finally {
+      mockMonitorTransitionFailure.error = null;
+    }
+    const [issue] = await db
+      .select({ monitorNextCheckAt: issues.monitorNextCheckAt })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(issue.monitorNextCheckAt).toBeNull();
+  });
+
+  it("board monitor re-arm rethrows non-422 transition errors from the drain", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Escalated-exhausted card with a failing monitor transition",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      monitorAttemptCount: 3,
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    mockMonitorTransitionFailure.error = new HttpError(500, "monitor transition exploded");
+    try {
+      const heartbeat = heartbeatService(db);
+      await expect(heartbeat.reconcileExhaustedRecoveryDrain()).rejects.toThrow(
+        "monitor transition exploded",
+      );
+    } finally {
+      mockMonitorTransitionFailure.error = null;
+    }
   });
 
   it("SUP-21344-review: a due self-armed board monitor is claimed by the monitor tick, not re-armed by the drain", async () => {

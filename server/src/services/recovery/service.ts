@@ -78,7 +78,7 @@ import {
   nativeRunnerOwnershipNotHeldCondition,
 } from "../native-runtime/native-runner-ownership.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
-import { forbidden, notFound } from "../../errors.js";
+import { HttpError, forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import {
   isPidAlive,
@@ -9080,15 +9080,40 @@ export function recoveryService(
         recoveryPolicy: null,
       },
     };
-    const transition = applyIssueMonitorPolicyTransition({
-      issue: input.issue,
-      policy,
-      previousPolicy: normalized,
-      requestedStatus: input.issue.status,
-      requestedAssigneePatch: {},
-      actor: { agentId: null, userId: null },
-      monitorExplicitlyUpdated: true,
-    });
+    let transition: ReturnType<typeof applyIssueMonitorPolicyTransition>;
+    try {
+      transition = applyIssueMonitorPolicyTransition({
+        issue: input.issue,
+        policy,
+        previousPolicy: normalized,
+        requestedStatus: input.issue.status,
+        requestedAssigneePatch: {},
+        actor: { agentId: null, userId: null },
+        monitorExplicitlyUpdated: true,
+      });
+    } catch (err) {
+      // A bounds-exhausted re-arm must never kill the sweep (at startup that
+      // exits the server): treat it as "no monitor armed" so callers fall
+      // through to their existing recovery-issue path. Anything else is a
+      // real failure and must surface.
+      if (
+        err instanceof HttpError &&
+        err.status === 422 &&
+        (err.message === "Monitor bounds are already exhausted" ||
+          (typeof err.details === "object" &&
+            err.details !== null &&
+            "clearReason" in err.details &&
+            ((err.details as { clearReason?: unknown }).clearReason === "max_attempts_exhausted" ||
+              (err.details as { clearReason?: unknown }).clearReason === "timeout_exceeded")))
+      ) {
+        logger.warn(
+          { issueId: input.issue.id, recoveryActionId: input.recoveryActionId },
+          "exhausted recovery monitor re-arm refused: monitor bounds exhausted",
+        );
+        return null;
+      }
+      throw err;
+    }
     // Never claim a wake from flat columns the transition did not schedule:
     // if the policy module did not write a monitor check time, nothing was armed.
     if (transition.patch.monitorNextCheckAt === undefined || transition.patch.monitorNextCheckAt === null) {
