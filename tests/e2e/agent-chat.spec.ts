@@ -1,3 +1,5 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { createLocalAgentJwt } from "../../server/src/agent-auth-jwt";
 import {
@@ -6,6 +8,7 @@ import {
   type APIRequestContext,
   type Page,
 } from "@playwright/test";
+import { seedTier2Credential, seedTier2Project } from "./fixtures/tier2-delivery";
 
 test.use({ trace: "retain-on-failure" });
 test.setTimeout(120_000);
@@ -465,6 +468,7 @@ test("split handoff commits relevant plans before execution and never creates ch
 }) => {
   const f = await setup(request);
   try {
+    await seedTier2Credential(request, f.company.id);
     await page.goto(f.route);
     await send(page, {
       action: "handoff",
@@ -852,6 +856,7 @@ test("plan approval hands the preserved revision to an assigned project task", a
 }) => {
   const f = await setup(request);
   try {
+    await seedTier2Credential(request, f.company.id);
     await page.goto(f.route);
     await page.getByTestId("task-chat-composer-mode").click();
     await page
@@ -919,11 +924,13 @@ test("shared questions resume and existing project reuse creates no project card
   request,
 }) => {
   const f = await setup(request);
+  const projectCwd = await mkdtemp(path.join(os.tmpdir(), "paperclip-chat-project-"));
   try {
-    const project = await json(
-      await request.post(`/api/companies/${f.company.id}/projects`, {
-        data: { name: "Garden club" },
-      }),
+    const project = await seedTier2Project(
+      request,
+      f.company.id,
+      "Garden club",
+      projectCwd,
     );
     await page.goto(f.route);
     await send(page, { action: "question" });
@@ -978,6 +985,7 @@ test("shared questions resume and existing project reuse creates no project card
     ).toBe("in_review");
   } finally {
     await f.restore();
+    await rm(projectCwd, { recursive: true, force: true });
   }
 });
 

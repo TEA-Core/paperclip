@@ -15,6 +15,7 @@ import {
   issueComments,
   issueDeliveryReceipts,
   issueExecutionDecisions,
+  issueWorkProducts,
   issues,
   projectWorkspaces,
   projects,
@@ -47,6 +48,12 @@ vi.mock("../services/github-fetch.js", () => ({
     // The arming actuator writes a `paperclip/arm-gate` status around every enable; GitHub accepts it here, apart from each test's own fake.
     if (typeof url === "string" && /\/statuses\//.test(url) && init?.method === "POST" && String(init.body ?? "").includes('"paperclip/arm-gate"')) {
       return Promise.resolve({ ok: true, status: 201, json: async () => ({ id: 9000 }) } as unknown as Response);
+    }
+    // SUP-21902: the done-transition guard resolves the declared probe head and the
+    // delivery default branch tip through the commits API; the mocked remote serves
+    // the same head for both, so the fixtures' named probe heads match the merge head.
+    if (typeof url === "string" && /\/commits\//.test(url)) {
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }) } as unknown as Response);
     }
     // An arm that names no head reads the PR's live head for the gate; a fake that does not model that read gets one.
     return Promise.resolve(mockGhFetch(url, init)).catch((error: unknown) => {
@@ -309,6 +316,14 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
       .update(executionWorkspaces)
       .set({ sourceIssueId: issueId })
       .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    // SUP-21902: recorded delivery merge commit for the Tier 2 origin guard.
+    await db.insert(issueWorkProducts).values({
+      companyId, issueId, type: "pull_request", provider: "github",
+      externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+      reviewState: "none", isPrimary: true, healthStatus: "unknown",
+      metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    });
 
     await db.insert(issueExecutionDecisions).values({
       companyId,
@@ -403,7 +418,7 @@ describeEmbeddedPostgres("approval arming fires the real actuator through transp
       .send({
         status: "done",
         comment:
-          "Stage approved.\nClosed at Tier 2 (live): review stage approved and the patched path is live.\n\nkind: review\ndecision: approved",
+          "Stage approved.\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: review stage approved and the patched path is live.\n\nkind: review\ndecision: approved",
       });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(await statusOf(issueId)).toBe("done");

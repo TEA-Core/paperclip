@@ -12,6 +12,7 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issueRecoveryActions,
+  issueWorkProducts,
   issues,
   projectWorkspaces,
   projects,
@@ -65,7 +66,13 @@ vi.mock("../services/secrets.js", () => ({
 }));
 
 vi.mock("../services/github-fetch.js", () => ({
-  ghFetch: mockGhFetch,
+  // SUP-21902: the done-transition guard resolves the declared probe head and the
+  // delivery default branch tip through the commits API; the mocked remote serves
+  // the same head for both, so the fixtures' named probe heads match the merge head.
+  ghFetch: (url: string, init?: RequestInit) =>
+    typeof url === "string" && /\/commits\//.test(url)
+      ? Promise.resolve({ ok: true, status: 200, json: async () => ({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }) } as unknown as Response)
+      : mockGhFetch(url, init),
   gitHubApiBase: (hostname: string) =>
     hostname === "github.com" || hostname === "www.github.com"
       ? "https://api.github.com"
@@ -325,6 +332,14 @@ describeEmbeddedPostgres(
         .update(executionWorkspaces)
         .set({ sourceIssueId: issueId })
         .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    // SUP-21902: recorded delivery merge commit for the Tier 2 origin guard.
+    await db.insert(issueWorkProducts).values({
+      companyId, issueId, type: "pull_request", provider: "github",
+      externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+      reviewState: "none", isPrimary: true, healthStatus: "unknown",
+      metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    });
 
       if (opts.withRecoveryAction) {
         await db.insert(issueRecoveryActions).values({
@@ -394,7 +409,7 @@ describeEmbeddedPostgres(
 
     const liveCloseComment =
       "Looks good.\n\nkind: review\ndecision: approved\n\n" +
-      "Closed at Tier 2 (live): the stage participant re-ran the close against the " +
+      "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: the stage participant re-ran the close against the " +
       "armed card and the delivery ref is unchanged.";
 
     it("AC1': an assignee cannot waive its own conflicting run lock via the management grant", async () => {

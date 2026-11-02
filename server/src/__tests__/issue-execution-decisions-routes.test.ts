@@ -13,6 +13,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueExecutionDecisions,
+  issueWorkProducts,
   issues,
   projects,
   executionWorkspaces,
@@ -44,7 +45,13 @@ import type * as GitHubCredential from "../services/github-credential.js";
 const github = vi.hoisted(() => vi.fn<typeof fetch>());
 vi.mock("../services/github-fetch.js", async (original) => ({
   ...await original<typeof GitHubFetch>(),
-  ghFetch: github,
+  // SUP-21902: the done-transition guard resolves the declared probe head and the
+  // delivery default branch tip through the commits API; the mocked remote serves
+  // the same head for both, so the fixtures' named probe heads match the merge head.
+  ghFetch: (url: string, init?: RequestInit) =>
+    typeof url === "string" && /\/commits\//.test(url)
+      ? Promise.resolve({ ok: true, status: 200, json: async () => ({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }) } as unknown as Response)
+      : github(url, init),
 }));
 vi.mock("../services/github-credential.js", async (original) => {
   const actual = await original<typeof GitHubCredential>();
@@ -1256,10 +1263,18 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         returnAssignee: { type: "agent", agentId: authorId, userId: null },
       },
     }).where(eq(issues.id, fixture.issue.id));
+    // SUP-21902: recorded delivery merge commit for the Tier 2 origin guard.
+    await db.insert(issueWorkProducts).values({
+      companyId: fixture.company.id, issueId: fixture.issue.id, type: "pull_request", provider: "github",
+      externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+      reviewState: "none", isPrimary: true, healthStatus: "unknown",
+      metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    });
     return {
       app: createApp(db, agentActor(fixture.company, author!, actorRun!.id)),
       actorRun: actorRun!,
-      comment: "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): the stage participant re-ran the close against the armed card and the delivery ref is unchanged.",
+      comment: "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: the stage participant re-ran the close against the armed card and the delivery ref is unchanged.",
     };
   }
 

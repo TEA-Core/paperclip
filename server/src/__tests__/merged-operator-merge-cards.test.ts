@@ -7,11 +7,15 @@ import {
   agents,
   companies,
   createDb,
+  executionWorkspaces,
   goals,
   issueComments,
   issueRelations,
+  issueWorkProducts,
   issues,
+  projects,
 } from "@paperclipai/db";
+import { logger } from "../middleware/logger.js";
 import { buildIssueBlockersResolvedWakeStateKey, ISSUE_BLOCKERS_RESOLVED_WAKE_REASON, type IssueBlockersResolvedWakeup } from "../services/issue-dependency-wakeups.js";
 import {
   createMergedOperatorMergeCardPullRequestResolver,
@@ -38,12 +42,38 @@ vi.mock("../services/github-credential.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/github-credential.js")>();
   return {
     ...actual,
+    // SUP-21902: the done-transition guard resolves a company GitHub token to
+    // verify the Tier 2 probe head; the fixture always has one.
+    resolveGitHubToken: async () => ({
+      token: "test-token",
+      scope: "company",
+      secretName: "GITHUB_TOKEN",
+    }),
     resolveGitHubTokenForRepo: async () =>
       credentialMock.tokenForTest
         ? { token: credentialMock.tokenForTest, scope: "company", secretName: "GITHUB_TOKEN" }
         : { token: null, reason: "no GitHub token bound in fixture" },
   };
 });
+
+// SUP-21902: the guard resolves the declared probe head through the commits
+// API; the mocked card repo knows exactly one commit (this delivery's recorded
+// merge commit), so a SHA-shaped head that does not exist in the card's repo
+// gets GitHub's real answer: 422 "No commit found for SHA: <sha>".
+vi.mock("../services/github-fetch.js", () => ({
+  ghFetch: (url: string) => {
+    if (typeof url !== "string" || !/\/commits\//.test(url)) {
+      return Promise.resolve(new Response(JSON.stringify({ message: "Not Found" }), { status: 404 }));
+    }
+    return /\/commits\/c0cd56e43f9a81f360532f7b92fbf176798016ad$/.test(url)
+      ? Promise.resolve({ ok: true, status: 200, json: async () => ({ sha: "c0cd56e43f9a81f360532f7b92fbf176798016ad" }) } as unknown as Response)
+      : Promise.resolve(new Response(JSON.stringify({ message: `No commit found for SHA: ${url.split("/commits/")[1]}` }), { status: 422 }));
+  },
+  gitHubApiBase: (hostname: string) =>
+    hostname === "github.com" || hostname === "www.github.com"
+      ? "https://api.github.com"
+      : `https://${hostname}/api/v3`,
+}));
 
 // Durability seam: when set, logActivityInTransaction rejects for exactly one
 // action (the withhold audit row) so a test can prove that an audit failure
@@ -118,6 +148,7 @@ async function seedOperatorCard(
     dependentStatus?: string;
     dependentAssigneeAgentId?: string | null;
     withBlockingRelation?: boolean;
+    withRecordedMergeCommit?: boolean;
   },
 ): Promise<SweepFixture> {
   const cardId = randomUUID();
@@ -152,6 +183,65 @@ async function seedOperatorCard(
       type: "blocks",
     });
   }
+  // SUP-21902: bind the card to a synthetic repo-backed execution workspace and
+  // record this delivery's merge commit on a merged pull_request work product,
+  // so the Tier 2 origin guard can resolve the sweep's probe head and compare
+  // it with the recorded merge commit (no live branch-tip fallback).
+  const tier2ProjectId = randomUUID();
+  const tier2WorkspaceId = randomUUID();
+  const tier2Now = new Date();
+  await db.insert(projects).values({
+    id: tier2ProjectId,
+    companyId: fixture.companyId,
+    name: "Tier 2 Fixture Project",
+    status: "active",
+    createdAt: tier2Now,
+    updatedAt: tier2Now,
+  });
+  await db.insert(executionWorkspaces).values({
+    id: tier2WorkspaceId,
+    companyId: fixture.companyId,
+    projectId: tier2ProjectId,
+    projectWorkspaceId: null,
+    sourceIssueId: cardId,
+    mode: "isolated_workspace",
+    strategyType: "git_worktree",
+    name: "tier2-fixture-ws",
+    status: "active",
+    cwd: "/tmp/test",
+    repoUrl: "https://github.com/TEA-Core/paperclip",
+    baseRef: "fold/tea-patches-v2026.722.0",
+    branchName: "tier2-fixture-ws",
+    providerType: "git_worktree",
+    providerRef: "/tmp/test",
+    lastUsedAt: tier2Now,
+    openedAt: tier2Now,
+    createdAt: tier2Now,
+    updatedAt: tier2Now,
+  });
+  if (opts.withRecordedMergeCommit ?? true) await db.insert(issueWorkProducts).values({
+    companyId: fixture.companyId,
+    issueId: cardId,
+    type: "pull_request",
+    provider: "github",
+    externalId: "TEA-Core/paperclip#404",
+    title: "PR #404 TEA-Core/paperclip",
+    url: "https://github.com/TEA-Core/paperclip/pull/404",
+    status: "merged",
+    reviewState: "none",
+    isPrimary: true,
+    healthStatus: "unknown",
+    metadata: {
+      prNumber: 404,
+      repository: "TEA-Core/paperclip",
+      mergedAt: "2026-08-29T00:11:06Z",
+      mergeCommitSha: "c0cd56e43f9a81f360532f7b92fbf176798016ad",
+    },
+  });
+  await db
+    .update(issues)
+    .set({ projectId: tier2ProjectId, executionWorkspaceId: tier2WorkspaceId })
+    .where(eq(issues.id, cardId));
   return { ...fixture, cardId, dependentId };
 }
 
@@ -187,14 +277,22 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
   }, 20_000);
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     activityLogMock.failingAction = null;
     await db.delete(activityLog);
     await db.delete(agentWakeupRequests);
     await db.delete(issueComments);
     await db.delete(issueRelations);
+    await db.delete(issueWorkProducts);
     await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projects);
     await db.delete(goals);
     await db.delete(agents);
+    // Guard audit rows can land after the first activity_log delete (async
+    // post-commit writes from the close under test); clear again before the
+    // company delete they reference.
+    await db.delete(activityLog);
     await db.delete(companies);
   });
 
@@ -747,6 +845,165 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
     expect(comments[0]!.body).not.toContain("Closed at Tier 1");
   });
 
+  it("SUP-21902: defers by design a standalone card with no recorded merge commit (merge_commit_unrecorded)", async () => {
+    const { companyId, goalId, agentId } = await seedCompany(db);
+    const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
+      cardTitle: "Merge approved PR TEA-Core/paperclip#404 into fold/tea-patches-v2026.722.0",
+      cardDescription: mergeGateMarker([404]),
+      withRecordedMergeCommit: false,
+    });
+
+    const warn = vi.spyOn(logger, "warn");
+    const enqueueWakeup = vi.fn(async () => ({ id: "wake-1" }));
+    const service = createMergedOperatorMergeCardSweepService(db, {
+      resolvePullRequest: vi.fn(async () => ({ ...MERGED_EVIDENCE })),
+      enqueueWakeup,
+    });
+
+    await expect(service.sweepMergedOperatorMergeCards()).resolves.toEqual({
+      checked: 1,
+      candidates: 1,
+      closed: 0,
+      woken: 0,
+    });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(
+      await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, fixture.cardId))
+        .then((rows) => rows[0]?.status),
+    ).toBe("todo");
+    expect(
+      await db.select().from(issueComments).where(eq(issueComments.issueId, fixture.cardId)),
+    ).toHaveLength(0);
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        issueId: fixture.cardId,
+        reason: expect.stringContaining("merge_commit_unrecorded"),
+      }),
+      expect.stringContaining("done-transition guard refused the close"),
+    );
+  });
+
+  it("SUP-21902: a multi-PR gate names the most recently merged gate PR's merge commit as the probe head, not the first listed", async () => {
+    const { companyId, goalId, agentId } = await seedCompany(db);
+    const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
+      cardTitle: "Merge approved PRs TEA-Core/paperclip#404 and #405",
+      cardDescription: mergeGateMarker([404, 405]),
+    });
+
+    const earlierMerge = {
+      state: "merged" as const,
+      mergeCommitSha: "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      mergedAt: "2026-08-28T00:00:00Z",
+    };
+    const latestMerge = { ...MERGED_EVIDENCE, mergedAt: "2026-08-30T00:00:00Z" };
+    const service = createMergedOperatorMergeCardSweepService(db, {
+      resolvePullRequest: vi.fn(async (_companyId: string, reference: { number: number }) =>
+        reference.number === 404 ? { ...earlierMerge } : { ...latestMerge },
+      ),
+      enqueueWakeup: vi.fn(async () => ({ id: "wake-1" })),
+    });
+
+    await expect(service.sweepMergedOperatorMergeCards()).resolves.toEqual({
+      checked: 1,
+      candidates: 1,
+      closed: 1,
+      woken: 1,
+    });
+    expect(
+      await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, fixture.cardId))
+        .then((rows) => rows[0]?.status),
+    ).toBe("done");
+    const [comment] = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, fixture.cardId));
+    expect(comment!.body).toContain(`head ${latestMerge.mergeCommitSha} post-merge:`);
+    expect(comment!.body).not.toContain(`head ${earlierMerge.mergeCommitSha} post-merge:`);
+  });
+
+  it("SUP-21902: defers a card whose gate PR is in another repository (its merge commit is unresolvable in the card's repo)", async () => {
+    const { companyId, goalId, agentId } = await seedCompany(db);
+    const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
+      cardTitle: "Merge approved PR OtherOrg/other-repo#7",
+      cardDescription: "Merge-gate: OtherOrg/other-repo#7\n",
+    });
+
+    const warn = vi.spyOn(logger, "warn");
+    const enqueueWakeup = vi.fn(async () => ({ id: "wake-1" }));
+    const service = createMergedOperatorMergeCardSweepService(db, {
+      resolvePullRequest: vi.fn(async () => ({
+        state: "merged" as const,
+        mergeCommitSha: "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1",
+        mergedAt: "2026-08-29T00:11:06Z",
+      })),
+      enqueueWakeup,
+    });
+
+    await expect(service.sweepMergedOperatorMergeCards()).resolves.toEqual({
+      checked: 1,
+      candidates: 1,
+      closed: 0,
+      woken: 0,
+    });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(
+      await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, fixture.cardId))
+        .then((rows) => rows[0]?.status),
+    ).toBe("todo");
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        issueId: fixture.cardId,
+        reason: expect.stringContaining("head_unresolvable"),
+      }),
+      expect.stringContaining("done-transition guard refused the close"),
+    );
+  });
+
+  it("SUP-21902: defers and logs when the most recently merged gate PR carries no merge commit to name as the probe head", async () => {
+    const { companyId, goalId, agentId } = await seedCompany(db);
+    const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
+      cardTitle: "Merge approved PR TEA-Core/paperclip#404 into fold/tea-patches-v2026.722.0",
+      cardDescription: mergeGateMarker([404]),
+    });
+
+    const warn = vi.spyOn(logger, "warn");
+    const service = createMergedOperatorMergeCardSweepService(db, {
+      resolvePullRequest: vi.fn(async () => ({
+        state: "merged" as const,
+        mergeCommitSha: null,
+        mergedAt: MERGED_EVIDENCE.mergedAt,
+      })),
+      enqueueWakeup: vi.fn(async () => ({ id: "wake-1" })),
+    });
+
+    await expect(service.sweepMergedOperatorMergeCards()).resolves.toEqual({
+      checked: 1,
+      candidates: 1,
+      closed: 0,
+      woken: 0,
+    });
+    expect(
+      await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, fixture.cardId))
+        .then((rows) => rows[0]?.status),
+    ).toBe("todo");
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ issueId: fixture.cardId }),
+      expect.stringContaining("most recently merged gate pull request has no merge commit"),
+    );
+  });
+
   it("SUP-21910: a done-transition guard refusal defers the card instead of closing around the ladder", async () => {
     // Mechanism C: a card with an unsatisfied review ladder must not be
     // closed by the sweep even though its pull-request evidence is fully
@@ -814,10 +1071,20 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
       .where(eq(issueComments.issueId, fixture.cardId));
     expect(comments).toHaveLength(0);
 
-    const refusalAudits = await db
+    // The guard writes its refusal audit fire-and-forget (`void writeAuditLog`);
+    // with the commits API mocked the sweep now returns before that insert
+    // necessarily lands, so poll for the row instead of racing it.
+    let refusalAudits = await db
       .select()
       .from(activityLog)
       .where(eq(activityLog.entityId, fixture.cardId));
+    for (let attempt = 0; attempt < 50 && refusalAudits.length === 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      refusalAudits = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.entityId, fixture.cardId));
+    }
     expect(refusalAudits).toEqual(
       expect.arrayContaining([
         expect.objectContaining({

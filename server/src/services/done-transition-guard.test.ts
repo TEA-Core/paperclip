@@ -6,6 +6,7 @@ import {
   issueLabels as issueLabelsTable,
   issueRelations as issueRelationsTable,
   issues as issuesTable,
+  issueWorkProducts as issueWorkProductsTable,
   labels as labelsTable,
 } from "@paperclipai/db";
 import {
@@ -149,7 +150,7 @@ function filterLabelRowsByName(
  * `select().from().where()` resolves to the `executionWorkspaces` rows exactly
  * as the legacy positional chain did, so pre-existing tests are untouched.
  */
-function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[] }) {
+function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[]; issueWorkProducts?: Record<string, unknown>[] }) {
   // SUP-15233: the guard reads the issues table twice inside
   // countLadderedChildren: read 1 is the parent_id edge (decomposition
   // children), read 2 is the inArray re-read (blockedBy edge, only present in
@@ -205,6 +206,11 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     where: vi.fn().mockResolvedValue(rows.issueLabels ?? []),
     then: vi.fn().mockResolvedValue(rows.issueLabels ?? []),
   };
+  const workProductsChain = {
+    from: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
+    then: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
+  };
   const selectChain = {
     from: vi.fn().mockReturnThis(),
     where: vi.fn().mockResolvedValue(rows.executionWorkspaces ?? []),
@@ -240,6 +246,7 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
         if (table === issueExecutionDecisionsTable) return decisionsChain;
         if (table === labelsTable) return labelsChain;
         if (table === issueLabelsTable) return issueLabelsChain;
+        if (table === issueWorkProductsTable) return workProductsChain;
         const chain = chains[callCount] ?? selectChain;
         callCount++;
         return chain;
@@ -5468,12 +5475,160 @@ describe("evaluateDoneTierDeclaration", () => {
     });
   });
 
+  // SUP-21902 Tier 2 origin predicate fixtures: the probe head named in the
+  // declaration (short sha), the full delivery merge head the default branch
+  // resolves to, and an unrelated full sha for the mismatch regression.
+  const T2_PROBE_HEAD = "aaaaaaaaaa";
+  const T2_MERGE_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const T2_STRANGER_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const T2_DEFAULT_REF = "fold/tea-patches-v2026.722.0";
+
+  function tier2Line(evidence: string) {
+    return `Closed at Tier 2 (live): ${evidence}`;
+  }
+
+  function validTier2Evidence(head: string = T2_PROBE_HEAD) {
+    return `probe \`curl https://app.example.com/health\` head ${head} post-merge: health endpoint reports the fix is live`;
+  }
+
+  function repoBackedTierIssue() {
+    return {
+      ...tierIssue,
+      projectId: "project-1",
+      projectWorkspaceId: "pw-1",
+      executionWorkspaceId: "ew-1",
+    };
+  }
+
+  // Resolve `/commits/{ref}` URLs the way the origin predicate calls them: a
+  // listed ref maps to the sha it points at, `sha: null` is a 404 (unresolvable
+  // on the remote), and any other URL 404s so unrelated probes never satisfy
+  // the predicate by accident.
+  function mockRefHeadResolutions(
+    resolutions: Array<{ ref: string; sha: string | null; unprocessable?: string; status?: number }>,
+  ) {
+    ghFetchMock.mockImplementation(async (url: string) => {
+      const u = String(url);
+      if (!u.includes("/commits/")) return new Response(JSON.stringify({}), { status: 404 });
+      for (const { ref, sha, unprocessable, status } of resolutions) {
+        if (u.endsWith(`/commits/${encodeURIComponent(ref)}`)) {
+          if (status !== undefined) {
+            return new Response(JSON.stringify({ message: "provider error" }), { status });
+          }
+          if (unprocessable !== undefined) {
+            return new Response(JSON.stringify({ message: unprocessable }), { status: 422 });
+          }
+          return sha === null
+            ? new Response(JSON.stringify({ message: "Not Found" }), { status: 404 })
+            : new Response(JSON.stringify({ sha }), { status: 200 });
+        }
+      }
+      return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+    });
+  }
+
+  const T2_MERGED_AT = "2026-10-30T00:00:00.000Z";
+
+  function setupTier2OriginMocks(
+    recordedMergedPullRequests: Array<{ mergeCommitSha: string; mergedAt?: string }> = [
+      { mergeCommitSha: T2_MERGE_SHA, mergedAt: T2_MERGED_AT },
+    ],
+    workspaceRow: Partial<Record<string, unknown>> = {},
+  ) {
+    ghFetchMock.mockReset();
+    mockResolveGitHubToken.mockReset();
+    mockResolveGitHubToken.mockResolvedValue({
+      token: "test-token",
+      scope: "company",
+      secretName: "GITHUB_TOKEN",
+    });
+    setupDbMock({
+      executionWorkspaces: [mockExecutionWorkspaceRow(workspaceRow)],
+      issueWorkProducts: recordedMergedPullRequests.map((metadata) => ({ metadata })),
+    });
+  }
+
   describe("Tier 2 via accompanying comment", () => {
-    it("allows transition with well-formed Tier 2 declaration and non-empty evidence", async () => {
+    beforeEach(() => {
+      setupTier2OriginMocks();
+    });
+
+    it("SUP-21902: refuses a Tier 2 declaration whose evidence is arbitrary prose, not the probe/head/post-merge shape", async () => {
+      // Distinguishing test (mutated from the pre-SUP-21902 arbitrary-prose
+      // acceptance): non-empty prose matched the Tier 2 prefix and was accepted
+      // with no verification; under the origin predicate it is malformed
+      // evidence and the close fails closed before any GitHub call.
       const result = await evaluateDoneTierDeclaration(
         mockDb,
-        tierIssue,
-        "Closed at Tier 2 (live): probe output shows the fix is live.",
+        repoBackedTierIssue(),
+        tier2Line("probe output shows the fix is live."),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("machine-checkable");
+      expect(result.reason).toContain("post-merge predicate");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("SUP-21902: refuses a valid-shape Tier 2 declaration whose named head differs from the delivery merge head", async () => {
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_STRANGER_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain(T2_PROBE_HEAD);
+      expect(result.reason).toContain(T2_STRANGER_SHA);
+      expect(result.reason).toContain(T2_MERGE_SHA);
+      expect(result.reason).toContain("delivery merge head");
+      expect(result.reason).toContain("recorded for this delivery");
+      const commitsUrls = ghFetchMock.mock.calls.map(([url]) => String(url)).filter((url) => url.includes("/commits/"));
+      expect(commitsUrls.some((url) => url.endsWith(`/commits/${encodeURIComponent(T2_PROBE_HEAD)}`))).toBe(true);
+      // The comparison target is the recorded merge commit, never the live branch tip:
+      // the guard must not resolve the default branch at all.
+      expect(commitsUrls.some((url) => url.endsWith(`/commits/${encodeURIComponent(T2_DEFAULT_REF)}`))).toBe(false);
+    });
+
+    it("SUP-21902: refuses a Tier 2 declaration when no recorded delivery merge commit is available (merge_commit_unrecorded, no branch-tip fallback)", async () => {
+      setupTier2OriginMocks([]);
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("merge_commit_unrecorded");
+      expect(result.reason).toContain("no fallback to the live branch tip");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("SUP-21902: accepts a probe at the recorded merge commit even when the live branch tip has moved past it", async () => {
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_STRANGER_SHA },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
         null,
         () => Promise.resolve([]),
       );
@@ -5481,11 +5636,255 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.tier).toBe("tier2");
     });
 
-    it("allows transition with Tier 2 declaration and evidence on the following line", async () => {
+    it("SUP-21902: refuses a valid-shape Tier 2 declaration whose named head does not resolve (head_unresolvable)", async () => {
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: null },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
       const result = await evaluateDoneTierDeclaration(
         mockDb,
-        tierIssue,
-        "Some context\nClosed at Tier 2 (live):\nProbe output: fix confirmed live.",
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("head_unresolvable");
+      expect(result.reason).toContain(T2_PROBE_HEAD);
+    });
+
+    it("SUP-21902: GitHub's 422 \"No commit found\" for an unknown SHA-shaped head is head_unresolvable, not an unverifiable fault", async () => {
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: null, unprocessable: `No commit found for SHA: ${T2_PROBE_HEAD}` },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("head_unresolvable");
+      expect(result.reason).toContain(T2_PROBE_HEAD);
+    });
+
+    it("SUP-21902: any other 422 from the commits probe is an unverifiable fault, never head_unresolvable", async () => {
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: null, unprocessable: "Validation Failed" },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("could not be verified");
+      expect(result.reason).toContain("GitHub commits API returned 422");
+      expect(result.reason).not.toContain("head_unresolvable");
+    });
+
+    it("SUP-21902: a 401 or 403 from the head resolver refuses the close (never admits on a provider auth failure)", async () => {
+      for (const status of [401, 403]) {
+        mockRefHeadResolutions([{ ref: T2_PROBE_HEAD, sha: null, status }]);
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          repoBackedTierIssue(),
+          tier2Line(validTier2Evidence()),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("could not be verified");
+        expect(result.reason).not.toContain("head_unresolvable");
+      }
+    });
+
+    it("SUP-21902: accepts a valid post-merge Tier 2 declaration whose named head is the delivery merge head", async () => {
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("Tier 2 declaration found:");
+      expect(result.reason).toContain("post-merge:");
+    });
+
+    it("SUP-21902: refuses a valid-shape Tier 2 declaration on a card with no resolvable delivery repository (fail closed)", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        { ...tierIssue, projectId: null, projectWorkspaceId: null, executionWorkspaceId: null },
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("no delivery repository is resolvable");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("SUP-21902: accepts a probe at the recorded merge commit when the repository has no default branch ref (the predicate never reads it)", async () => {
+      setupTier2OriginMocks(undefined, { baseRef: null });
+      mockRefHeadResolutions([{ ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA }]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+    });
+
+    it("SUP-21902: a recorded merge commit shorter than 40 hex never matches, even when it is a prefix of the resolved probe head", async () => {
+      for (const shortRecorded of [T2_MERGE_SHA.slice(0, 7), T2_PROBE_HEAD, T2_MERGE_SHA.slice(0, 39)]) {
+        setupTier2OriginMocks([{ mergeCommitSha: shortRecorded, mergedAt: T2_MERGED_AT }]);
+        mockRefHeadResolutions([{ ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA }]);
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          repoBackedTierIssue(),
+          tier2Line(validTier2Evidence()),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("merge_commit_unrecorded");
+      }
+    });
+
+    it("SUP-21902: compares the probe head only with the most recent merged PR's commit (PR#1 at A, PR#2 at B: probe at A refused, probe at B allowed)", async () => {
+      // Newest row listed first so the outcome cannot depend on row order.
+      const recorded = [
+        { mergeCommitSha: T2_STRANGER_SHA, mergedAt: "2026-10-31T00:00:00.000Z" },
+        { mergeCommitSha: T2_MERGE_SHA, mergedAt: "2026-10-29T00:00:00.000Z" },
+      ];
+      const probeAtB = "bbbbbbbbbb";
+      const resolutions = [
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: probeAtB, sha: T2_STRANGER_SHA },
+      ];
+
+      setupTier2OriginMocks(recorded);
+      mockRefHeadResolutions(resolutions);
+      const atA = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence(T2_PROBE_HEAD)),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(atA.allowed).toBe(false);
+      expect(atA.tier).toBe(null);
+      expect(atA.reason).toContain(T2_STRANGER_SHA);
+      expect(atA.reason).toContain("recorded for this delivery");
+
+      setupTier2OriginMocks(recorded);
+      mockRefHeadResolutions(resolutions);
+      const atB = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence(probeAtB)),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(atB.allowed).toBe(true);
+      expect(atB.tier).toBe("tier2");
+    });
+
+    it("SUP-21902: refuses (merge_commit_unrecorded) when the most recent merged rows tie on mergedAt with different commits", async () => {
+      setupTier2OriginMocks([
+        { mergeCommitSha: T2_MERGE_SHA, mergedAt: T2_MERGED_AT },
+        { mergeCommitSha: T2_STRANGER_SHA, mergedAt: T2_MERGED_AT },
+      ]);
+      mockRefHeadResolutions([{ ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA }]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("merge_commit_unrecorded");
+    });
+
+    it("SUP-21902: refuses malformed Tier 2 shapes (missing probe command, head, or post-merge predicate) without GitHub calls", async () => {
+      for (const evidence of [
+        "curl https://app.example.com/health head aaaaaaaaaa post-merge: fix is live",
+        "probe `curl https://app.example.com/health` post-merge: fix is live",
+        "probe `curl https://app.example.com/health` head aaaaaaaaaa",
+      ]) {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          repoBackedTierIssue(),
+          tier2Line(evidence),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("machine-checkable");
+      }
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("SUP-21902: refuses Tier 2 shapes missing exactly one part (empty probe command, empty post-merge predicate) and a case-and-whitespace probe head", async () => {
+      for (const evidence of [
+        // Only the probe command text is missing (empty backticks); every
+        // other part of the shape is present, so dropping the command
+        // capture from the shape check would admit this.
+        "probe `` head aaaaaaaaaa post-merge: fix is live",
+        // Only the post-merge predicate is missing (empty after the colon);
+        // every other part is present, so allowing an empty predicate
+        // would admit this.
+        "probe `curl -sf https://tea-core.example/healthz` head aaaaaaaaaa post-merge:",
+        // Probe head carries whitespace inside it (and upper case), so it
+        // is not a resolvable hex ref; trimming or case-folding a captured
+        // head into a match would admit this.
+        "probe `curl -sf https://tea-core.example/healthz` head AAAA AAAA post-merge: fix is live",
+      ]) {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          repoBackedTierIssue(),
+          tier2Line(evidence),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("machine-checkable");
+      }
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("allows transition with Tier 2 declaration and evidence on the following line", async () => {
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        `Some context\nClosed at Tier 2 (live):\n${validTier2Evidence()}`,
         null,
         () => Promise.resolve([]),
       );
@@ -5572,7 +5971,7 @@ describe("evaluateDoneTierDeclaration", () => {
     it("SUP-21328: missing-tier remedy names structured doneTier with an exact JSON form per tier", async () => {
       expect(DONE_TIER_STRUCTURED_FORMS).toContain('"doneTier":');
       expect(DONE_TIER_TIER2_JSON).toBe(
-        '"doneTier": { "tier": "tier2", "probeEvidence": "<consumer-surface probe output>" }',
+        '"doneTier": { "tier": "tier2", "probeEvidence": "probe `<probe command>` head <probe head sha> post-merge: <post-merge predicate>" }',
       );
       expect(DONE_TIER_TIER1_LANDED_JSON).toBe(
         '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landedAtTip", "mergeCommit": "<sha>" } }',
@@ -5611,7 +6010,7 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(route).not.toContain("TIER1_FORM.slice(1, -1)");
       expect(route).toContain("` or ${TIER1_FORM}`");
 
-      const tier2Form = '"Closed at Tier 2 (live): <probe evidence>"';
+      const tier2Form = '"Closed at Tier 2 (live): probe `<probe command>` head <probe head sha> post-merge: <post-merge predicate>"';
       const remedy = `${tier2Form} or ${TIER1_FORM} — per SUP-12693.`;
       expect(remedy).toContain(
         '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."',
@@ -6235,16 +6634,41 @@ describe("evaluateDoneTierDeclaration", () => {
   });
 
   describe("no accompanying comment — same-run comment lookup", () => {
-    it("allows transition when same-run comment has Tier 2 declaration", async () => {
+    it("allows transition when the same-run comment's Tier 2 declaration names the delivery merge head", async () => {
+      setupTier2OriginMocks();
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
       const result = await evaluateDoneTierDeclaration(
         mockDb,
-        tierIssue,
+        repoBackedTierIssue(),
         null,
         "run-1",
-        () => Promise.resolve([mockComment("Closed at Tier 2 (live): probe evidence here.", "run-1")]),
+        () => Promise.resolve([mockComment(tier2Line(validTier2Evidence()), "run-1")]),
       );
       expect(result.allowed).toBe(true);
       expect(result.tier).toBe("tier2");
+      expect(result.reason).toContain("Tier 2 declaration found in same-run comment:");
+    });
+
+    it("SUP-21902: refuses a same-run Tier 2 declaration whose named head differs from the delivery merge head", async () => {
+      setupTier2OriginMocks();
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_STRANGER_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        null,
+        "run-1",
+        () => Promise.resolve([mockComment(tier2Line(validTier2Evidence()), "run-1")]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("delivery merge head");
+      expect(result.reason).toContain(T2_MERGE_SHA);
     });
 
     it("refuses a same-run Tier 1 substitution that is only arbitrary prose", async () => {
@@ -6324,16 +6748,19 @@ describe("evaluateDoneTierDeclaration", () => {
   });
 
   describe("ordering with SUP-12686", () => {
-    it("Tier 2 declaration in accompanying comment is accepted without GitHub API calls", async () => {
+    it("SUP-21902: malformed Tier 2 evidence is refused before any GitHub API call", async () => {
+      setupTier2OriginMocks();
       const result = await evaluateDoneTierDeclaration(
         mockDb,
-        tierIssue,
+        repoBackedTierIssue(),
         "Closed at Tier 2 (live): probe confirms fix.",
         null,
         () => Promise.resolve([]),
       );
-      expect(result.allowed).toBe(true);
-      expect(result.tier).toBe("tier2");
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("machine-checkable");
+      expect(ghFetchMock).not.toHaveBeenCalled();
     });
   });
 
@@ -6386,16 +6813,21 @@ describe("evaluateDoneTierDeclaration", () => {
     });
 
     it("accepts a Tier 2 declaration whose evidence follows one or more blank lines (resolves from the next non-empty line)", async () => {
+      setupTier2OriginMocks();
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
       const result = await evaluateDoneTierDeclaration(
         mockDb,
-        tierIssue,
-        "Closed at Tier 2 (live):\n\n\nProbe output: fix is live.",
+        repoBackedTierIssue(),
+        `Closed at Tier 2 (live):\n\n\n${validTier2Evidence()}`,
         null,
         () => Promise.resolve([]),
       );
       expect(result.allowed).toBe(true);
       expect(result.tier).toBe("tier2");
-      expect(result.reason).toContain("Probe output: fix is live.");
+      expect(result.reason).toContain(validTier2Evidence());
     });
 
     it("rejects a Tier 2 declaration followed only by blank lines, naming the missing evidence specifically", async () => {
@@ -6424,16 +6856,21 @@ describe("evaluateDoneTierDeclaration", () => {
       // an `indexOf` regression. The `lines.indexOf(line)` value-match on the
       // prefix is a provable no-op — see the scope/acceptance-correction block
       // below — so it is deliberately not labeled as such here.)
+      setupTier2OriginMocks();
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
       const result = await evaluateDoneTierDeclaration(
         mockDb,
-        tierIssue,
-        "Closed at Tier 2 (live):\n\nProbe: live at 2026-09-11\nProbe: live at 2026-09-11",
+        repoBackedTierIssue(),
+        `Closed at Tier 2 (live):\n\n${validTier2Evidence()}\n${validTier2Evidence()}`,
         null,
         () => Promise.resolve([]),
       );
       expect(result.allowed).toBe(true);
       expect(result.tier).toBe("tier2");
-      expect(result.reason).toContain("Probe: live at 2026-09-11");
+      expect(result.reason).toContain(validTier2Evidence().slice(0, 200));
     });
 
     // ───────────────────────────────────────────────────────────────────────

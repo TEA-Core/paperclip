@@ -379,10 +379,13 @@ export function createMergedOperatorMergeCardSweepService(
       // SUP-21901 / SUP-21910: this sweep is a backstop `done` writer, so the
       // close must pass the SAME shared done-transition guard the PATCH door
       // runs — no duplicated predicates. The sweep live-probed every gate pull
-      // request as merged, so the close carries a truthful structured Tier-2
-      // declaration whose probe evidence is that measurement; it renders into
+      // request as merged, so the close carries a structured Tier-2
+      // declaration whose probe evidence names that measurement; it renders into
       // the persisted close comment exactly like PATCH renders the structured
-      // doneTier field. Run BEFORE the advisory-lock transaction on an
+      // doneTier field. The sweep's own measurement is not sufficient: the guard
+      // also requires the card's own recorded merged pull_request work product
+      // to carry the named probe head as its merge commit, and defers the card
+      // otherwise. Run BEFORE the advisory-lock transaction on an
       // unlocked full-row read: the delivery guard probes GitHub and the tier
       // evaluator reads the comment store, and running either under the row
       // lock reproduces the FOR KEY SHARE deadlock the recovery door fix
@@ -394,15 +397,38 @@ export function createMergedOperatorMergeCardSweepService(
         .where(eq(issues.id, row.id))
         .limit(1);
       if (!guardIssue) continue;
-      const guardProbeEvidence = [
-        "all gate pull requests verified merged by the merged-operator merge-card sweep:",
-        ...references.map((reference) => {
+      // SUP-21902: Tier-2 evidence must be machine-checkable — name the probe
+      // command, the probe head (the merge commit of the most recently merged
+      // gate PR, mirroring the guard's most-recent recorded merge commit
+      // comparison), and the post-merge predicate. Without a merge commit
+      // there is no head to name, so the card defers instead of closing on
+      // prose.
+      const mergedAtMs = (reference: GitHubPullRequestReference) => {
+        const parsed = Date.parse(
+          evidence.get(pullRequestEvidenceKey(row.companyId, reference))?.mergedAt ?? "",
+        );
+        return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
+      };
+      const probeReference = references.reduce((latest, reference) =>
+        mergedAtMs(reference) > mergedAtMs(latest) ? reference : latest,
+      );
+      const probeItem = evidence.get(pullRequestEvidenceKey(row.companyId, probeReference))!;
+      if (!probeItem.mergeCommitSha) {
+        logger.warn(
+          { issueId: row.id },
+          "merged operator merge-card sweep: the most recently merged gate pull request has no merge commit to name as the Tier-2 probe head; deferring",
+        );
+        continue;
+      }
+      const guardProbeEvidence =
+        `probe \`merged-operator merge-card sweep gate PRs ${references.map((r) => `${r.owner}/${r.repo}#${r.number}`).join(", ")}\` ` +
+        `head ${probeItem.mergeCommitSha} post-merge: all gate pull requests verified merged by the merged-operator merge-card sweep: ` +
+        references.map((reference) => {
           const item = evidence.get(pullRequestEvidenceKey(row.companyId, reference))!;
           const mergedAt = item.mergedAt ? ` merged at ${item.mergedAt}` : "";
           const sha = item.mergeCommitSha ? `, merge commit ${item.mergeCommitSha}` : "";
           return `${reference.owner}/${reference.repo}#${reference.number}${mergedAt}${sha}`;
-        }),
-      ].join(" ");
+        }).join(" ");
       const guardVerdict = await evaluateDoneTransitionGuardForBackstopClose({
         db,
         issue: guardIssue,

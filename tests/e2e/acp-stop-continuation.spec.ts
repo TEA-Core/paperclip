@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test, expect, type APIResponse } from "@playwright/test";
+import { recordTier2MergedDelivery, seedTier2Project } from "./fixtures/tier2-delivery";
 
 async function json(response: APIResponse) {
   const body = await response.text();
@@ -31,9 +32,14 @@ for (const { unfinishedWrite, stopResponse } of [{ unfinishedWrite: false, stopR
           env: { PAPERCLIP_STOP_FIXTURE_ROOT: root, PAPERCLIP_STOP_FIXTURE_FINISH_TASK: "1", CLAUDE_CODE_OAUTH_TOKEN: "paperclip-e2e-fixture-placeholder", ...(unfinishedWrite ? { PAPERCLIP_STOP_FIXTURE_TOOL: "write" } : {}) },
         }, runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
       } }));
+      // SUP-21902: the fixture closes this task at Tier 2, so the task needs a repo-backed
+      // project, the company GitHub credential, and a recorded merged pull_request work product.
+      const project = await seedTier2Project(request, company.id, "ACP Stop repo", root);
       const issue = await json(await request.post(`/api/companies/${company.id}/issues`, { data: {
         title: "ACP Stop continuation", status: "backlog", assigneeAgentId: owner.id,
+        projectId: project.id, deliveryRequirement: "record_only",
       } }));
+      await recordTier2MergedDelivery(request, issue.id);
       await json(await request.patch(`/api/issues/${issue.id}`, { data: { status: "todo" } }));
       await expect.poll(async () => (await readFile(path.join(root, "prompts"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean).length, { timeout: 45_000 }).toBe(1);
       const [active] = await json(await request.get(`/api/issues/${issue.id}/live-runs`));
