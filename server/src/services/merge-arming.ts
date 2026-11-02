@@ -2012,6 +2012,21 @@ export interface CardDeliveryBranchOwnership {
  ownerIssueId: string | null;
  /** Named refusal reason when `legitimate` is false. */
  refusalReason: string | null;
+ /**
+  * True iff `legitimate` is false SOLELY because the ADR-083 carrier owner is
+  * already terminal (done/cancelled). A recorded bound PR that is proven
+  * merged on its base branch is a completed delivery in this shape, so
+  * `resolveDeliveryIdentity` may still return the binding for exact-PR
+  * verification instead of refusing outright.
+  */
+ carrierOwnerTerminal?: boolean;
+ /**
+  * True iff the card has no execution-workspace row at all
+  * (`execution_workspace_id` IS NULL). Distinct from a row that exists with a
+  * NULL branch_name: with no row there is no control-plane branch to
+  * contradict a recorded bound PR, which exact-PR verification then proves.
+  */
+ noExecutionWorkspace?: boolean;
 }
 
 /**
@@ -2077,6 +2092,7 @@ export async function resolveCardDeliveryBranchOwnership(
      legitimate: false,
      ownerIssueId: null,
      refusalReason: "card has no execution-workspace delivery branch to validate the recorded branch against",
+     noExecutionWorkspace: true,
    };
  }
  const [wsRow] = await db
@@ -2136,6 +2152,7 @@ export async function resolveCardDeliveryBranchOwnership(
         branchIsOwn: false,
         carrier: true,
         legitimate: false,
+        carrierOwnerTerminal: true,
         ownerIssueId: source,
         refusalReason:
           `ADR-083 carrier owner ${ownerRow?.identifier ?? source} is already ${ownerStatus}; a terminal owner can never stamp or promote this carrier, so the delivery is refused (SUP-16896). The commits remain on branch '${branch}' — re-file the work on a live card's branch, or have the board/operator disposition the orphan carrier PR.`,
@@ -2350,10 +2367,24 @@ export async function resolveDeliveryIdentity(
     // delivered (the SUP-15896 -> SUP-15908 laundering vector), so it fails closed —
     // never fall back to the workspace row.
     const branchOwnership = await resolveCardDeliveryBranchOwnership(db, companyId, issueId);
+    const hasBoundPr = prNumber !== null && prUrl !== null;
+    // A card with NO execution-workspace row has no control-plane branch that
+    // could contradict the record. Its recorded bound PR is still proven by
+    // exact-PR verification (live head ref, head SHA, or merged-on-base proof),
+    // so the binding may proceed; an agent cannot create this record through
+    // the write gate, which still requires a workspace-validated branch.
+    const orphanBoundDelivery = branchOwnership.noExecutionWorkspace === true && hasBoundPr;
+    // ADR-083 terminal carrier: the owner is done/cancelled, so it can never
+    // stamp again, but a recorded bound PR proven merged on its base branch
+    // IS the completed delivery. Returning the binding lets exact-PR
+    // verification decide; an unmerged or unproven PR still refuses there.
+    const terminalCarrierBoundDelivery =
+      branchOwnership.carrierOwnerTerminal === true && hasBoundPr;
     if (
-      branchOwnership.branch === null ||
-      // Git refs are case-sensitive: the recorded branch is an exact match, not case-folded.
-      branch !== branchOwnership.branch
+      !orphanBoundDelivery &&
+      (branchOwnership.branch === null ||
+        // Git refs are case-sensitive: the recorded branch is an exact match, not case-folded.
+        branch !== branchOwnership.branch)
     ) {
       return {
         branch: null,
@@ -2368,7 +2399,7 @@ export async function resolveDeliveryIdentity(
     // carrier-owner ancestor) is a foreign same-repo branch. Refuse to arm on it even
     // when the row is already in the DB — the gate asserts a named refusal, not just
     // the absence of a stamp.
-    if (!branchOwnership.legitimate) {
+    if (!branchOwnership.legitimate && !orphanBoundDelivery && !terminalCarrierBoundDelivery) {
       return {
         branch: null,
         repo: null,
