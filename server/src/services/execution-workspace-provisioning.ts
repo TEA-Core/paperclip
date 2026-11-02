@@ -304,6 +304,30 @@ export async function provisionIssueExecutionWorkspace(
   const existingExecutionWorkspace = requestedExecutionWorkspaceId
     ? await executionWorkspacesSvc.getById(requestedExecutionWorkspaceId)
     : null;
+  // A fresh workspace row must not drop the branch a recorded delivery was
+  // validated against. With no reuse preference every wake mints a new
+  // project_primary row whose realized branch is null, which orphaned the
+  // recorded delivery identity and looped final review on
+  // delivery_identity_unresolved. Carry the recorded branch onto the new row;
+  // the record was already ownership-gated when written, and approval-time
+  // exact-PR verification still proves the bound PR.
+  const [recordedDeliveryRow] = issueId
+    ? await db
+        .select({ executionState: issues.executionState })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+    : [];
+  const recordedDelivery = (
+    recordedDeliveryRow?.executionState as { delivery?: unknown } | null | undefined
+  )?.delivery;
+  const recordedDeliveryBranch =
+    recordedDelivery !== null &&
+    recordedDelivery !== undefined &&
+    typeof recordedDelivery === "object" &&
+    !Array.isArray(recordedDelivery) &&
+    typeof (recordedDelivery as { branch?: unknown }).branch === "string"
+      ? readNonEmptyString((recordedDelivery as { branch: string }).branch.trim())
+      : null;
   const nativeRecoveryExecutionWorkspaceId = resolveNativeRecoveryExecutionWorkspaceBinding({
     bindingId: requestedExecutionWorkspaceIdOverride,
     persistedWorkspaceFound: existingExecutionWorkspace !== null,
@@ -841,7 +865,9 @@ export async function provisionIssueExecutionWorkspace(
   };
   const pendingForwardBranchReconcile = executionWorkspace.pendingForwardBranchReconcile ?? null;
   const branchNameForInitialPersistence =
-    pendingForwardBranchReconcile?.recordedBranchName ?? executionWorkspace.branchName;
+    pendingForwardBranchReconcile?.recordedBranchName ??
+    executionWorkspace.branchName ??
+    recordedDeliveryBranch;
   try {
     persistedExecutionWorkspace =
       resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace && reusableExistingExecutionWorkspace

@@ -429,6 +429,248 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
     expect(issueRows[0]!.executionWorkspaceId).toBe(result.persistedExecutionWorkspace!.id);
   });
 
+  it("carries the recorded delivery branch onto a fresh project_primary workspace", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const issueIdentifier = `${issuePrefix}-1`;
+    const now = new Date("2026-07-07T00:00:00.000Z");
+    const RECORDED_BRANCH = `${issueIdentifier}-delivered`;
+
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-provisioning-carry-"));
+    tempRoots.push(tempRoot);
+    initTempGitRepo(tempRoot);
+
+    await instanceSettingsService(db).updateExperimental({
+      enableIsolatedWorkspaces: true,
+      enableWorkspaceBranchReconcileForward: false,
+      enableWorkspaceDirtyQuarantineRepair: false,
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Acme",
+      issuePrefix,
+      status: "active",
+      defaultResponsibleUserId: "responsible-user",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Provisioning carry test",
+      status: "active",
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        workspaceStrategy: { type: "project_primary" },
+      },
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      cwd: tempRoot,
+      isPrimary: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CarryAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_assigned",
+      },
+      responsibleUserId: "responsible-user",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Provisioning carry test issue",
+      status: "in_review",
+      workMode: "standard",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: runId,
+      executionRunId: runId,
+      executionAgentNameKey: "carryagent",
+      executionLockedAt: now,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: issueIdentifier,
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+      executionWorkspaceSettings: {
+        mode: "isolated_workspace",
+      },
+      executionState: {
+        delivery: {
+          repo: { owner: "TEA-Core", repo: "paperclip" },
+          branch: RECORDED_BRANCH,
+          headSha: "approved00000000000000000000000000000000001",
+        },
+      },
+      startedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const localEnvironment: Environment = {
+      id: "local-env",
+      name: "Local",
+      description: null,
+      driver: "local",
+      status: "active",
+      config: {},
+      envVars: {},
+      metadata: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const issueRef: ExecutionWorkspaceProvisioningIssueRef = {
+      id: issueId,
+      identifier: issueIdentifier,
+      title: "Provisioning carry test issue",
+      status: "in_review",
+      priority: "medium",
+      workMode: "standard",
+      description: null,
+      projectId,
+      projectWorkspaceId,
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
+    };
+
+    const run = await db.query.heartbeatRuns.findFirst({
+      where: eq(heartbeatRuns.id, runId),
+    });
+    expect(run).toBeDefined();
+
+    const agent = await db.query.agents.findFirst({
+      where: eq(agents.id, agentId),
+    });
+    expect(agent).toBeDefined();
+
+    const result = await provisionIssueExecutionWorkspace({
+      db,
+      run: run!,
+      agent: agent!,
+      issueId,
+      issueRef,
+      runId,
+      previousSessionParams: null,
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+      trustPreset: standardTrustResolution(),
+      isolatedWorkspacesEnabled: true,
+      selectedEnvironmentId: null,
+      selectedEnvironmentForConfig: null,
+      localEnvironment,
+      environmentSelectionSource: "local",
+      configSnapshot: null,
+      secretManifest: [],
+      projectExecutionWorkspacePolicy: {
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        allowIssueOverride: true,
+        workspaceStrategy: {
+          type: "project_primary",
+        },
+      },
+      issueExecutionWorkspaceSettings: { mode: "isolated_workspace" },
+      executionProjectId: projectId,
+      resolvedInstanceSettings: {
+        experimental: {
+          enableWorkspaceBranchReconcileForward: false,
+          enableWorkspaceDirtyQuarantineRepair: false,
+        },
+      },
+      mergedConfig: {},
+      executionPolicy: { executionMode: "standard" },
+      context: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      resolveWorkspace: async () =>
+        buildResolvedWorkspace({
+          cwd: tempRoot,
+          source: "project_primary",
+          projectId,
+          workspaceId: projectWorkspaceId,
+          repoUrl: null,
+          repoRef: null,
+        }),
+      resolveSessionConfig: async (_input) => ({
+        previousSessionParams: null,
+        resetTaskSession: true,
+        sessionResetReason: null,
+        sessionConfigFreshness: {
+          reset: true,
+          reasons: ["initial"],
+          changedCategories: [],
+          nextFingerprint: null,
+          storedFingerprint: null,
+        },
+        sessionConfigMetadata: buildTestSessionConfigMetadata(),
+      }),
+      runLifecycle: {
+        onExecutionWorkspaceOccupied: async () => {
+          throw new Error("should not be called for fresh provisioning");
+        },
+      },
+    });
+
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+    expect(result.persistedExecutionWorkspace).not.toBeNull();
+    expect(result.persistedExecutionWorkspace!.branchName).toBe(RECORDED_BRANCH);
+
+    const persistedRows = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, result.persistedExecutionWorkspace!.id));
+    expect(persistedRows).toHaveLength(1);
+    expect(persistedRows[0]!.branchName).toBe(RECORDED_BRANCH);
+  });
+
   it("returns a deferred result when the workspace is occupied by another run", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
