@@ -11003,6 +11003,20 @@ export function recoveryService(
     result.checked = candidates.length;
     for (const candidate of candidates) {
       const effectiveMaxAttempts = candidate.maxAttempts ?? MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
+      const wakePolicyType = readRecoveryWakePolicyType(candidate);
+
+      // This action was deliberately sent to the board because its pending
+      // participant cannot run. A different agent may be invokable, but
+      // reassigning the action to it recreates the failed recovery path.
+      // Board repair must explicitly restore/re-arm or reset the workflow.
+      if (
+        candidate.ownerType === "board" &&
+        wakePolicyType === "board_escalation" &&
+        readNonEmptyString(parseObject(candidate.wakePolicy).reason) === "pending_participant_unavailable"
+      ) {
+        result.nonWakeableSkipped += 1;
+        continue;
+      }
 
       // SUP-22273: for the two stranded-participant kinds a live owner is not
       // a wedge. If the owner agent — or, on a board-owned row, the pending
@@ -11072,7 +11086,6 @@ export function recoveryService(
 
       // Mirror the early-return guards in enqueueSourceScopedStrandedRecoveryWake
       // so we don't burn an attempt on actions that can never be re-fired.
-      const wakePolicyType = readRecoveryWakePolicyType(candidate);
       if (wakePolicyType === "monitor_only" || wakePolicyType === "manual_repair_required") {
         result.nonWakeableSkipped += 1;
         continue;
@@ -11086,19 +11099,6 @@ export function recoveryService(
         continue;
       }
       if (!candidate.ownerAgentId && wakePolicyType !== "board_escalation") {
-        result.nonWakeableSkipped += 1;
-        continue;
-      }
-
-      // This action was deliberately sent to the board because its pending
-      // participant cannot run. A different agent may be invokable, but
-      // reassigning the action to it recreates the failed recovery path.
-      // Board repair must explicitly restore/re-arm or reset the workflow.
-      if (
-        candidate.ownerType === "board" &&
-        wakePolicyType === "board_escalation" &&
-        readNonEmptyString(parseObject(candidate.wakePolicy).reason) === "pending_participant_unavailable"
-      ) {
         result.nonWakeableSkipped += 1;
         continue;
       }
