@@ -204,12 +204,14 @@ When resolving a card's delivery identity (`resolveDeliveryIdentity`), the
 control plane consults evidence in strict priority order:
 
 1. **Recorded delivery identity** (`issues.execution_state.delivery`) —
-   written at the `in_review` transition by the run that holds the issue's
-   lease. Contains `{ repo: { owner, repo }, branch, headSha, recordedByRunId,
-   recordedAt }`. When present and repo-resolvable (non-empty `repo.owner`,
-   `repo.repo`, `branch`, and `headSha`), the D1 gate compares the linked PR's
-   head against the **recorded** branch; the execution-workspace row is not
-   consulted for the branch half.
+   written only through the write path below (the lease-holding run entering
+   `in_review`, or a board refresh of a card already `in_review`). Contains
+   `{ repo: { owner, repo }, branch, headSha, recordedByRunId, recordedAt }`
+   plus an optional PR binding (`prNumber`, `prUrl`, `sourceIssueId`). When
+   present and repo-resolvable (non-empty `repo.owner`, `repo.repo`, `branch`,
+   and `headSha`), the D1 gate compares the linked PR's head against the
+   **recorded** branch; the execution-workspace row is not consulted for the
+   branch half.
 2. **Execution-workspace row** — when no recorded identity exists, the
    delivery identity falls back to the card's `execution_workspaces` row
    (`branchName` + `repoUrl`). This is the pre-D1 behavior, preserved
@@ -273,8 +275,9 @@ bound PR must be merged and its merge commit proven on the card's own
 control-plane base (the workspace `baseRef`, or the project workspace default
 ref), never the PR's self-reported base. A card that records no such base is
 refused. Ordinary bindings keep proving a merged PR against the PR's own base
-branch. An open PR on a dead carrier stays refused (SUP-16896). A merged-only binding is never a release
-target (`resolveReleaseDeliveryTarget`) and never feeds release-assurance.
+branch. An open PR on a dead carrier stays refused (SUP-16896). A merged-only
+binding is never a release target (`resolveReleaseDeliveryTarget`) and never
+feeds release-assurance.
 
 ### Guard B actor-resolution order (ADR-092 D3, SUP-14826)
 
