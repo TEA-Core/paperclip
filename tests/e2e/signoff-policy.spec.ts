@@ -1,4 +1,12 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { test, expect, request as pwRequest, type APIRequestContext } from "@playwright/test";
+import {
+  TIER2_RECORDED_MERGE_COMMIT,
+  recordTier2MergedDelivery,
+  seedTier2Project,
+} from "./fixtures/tier2-delivery";
 
 /**
  * E2E: Signoff execution policy flow.
@@ -24,6 +32,11 @@ import { test, expect, request as pwRequest, type APIRequestContext } from "@pla
 const PORT = Number(process.env.PAPERCLIP_E2E_PORT ?? 3199);
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 const COMPANY_NAME = `E2E-Signoff-${Date.now()}`;
+// SUP-21902: machine-checkable Tier 2 close line; the probe head is the merge commit
+// recordTier2MergedDelivery stamps on each issue.
+const TIER2_CLOSE_LINE =
+  "Closed at Tier 2 (live): probe `e2e signoff flow re-read the issue post-close on the live deployment` head " +
+  `${TIER2_RECORDED_MERGE_COMMIT} post-merge: verified done.`;
 
 interface AgentAuth {
   agentId: string;
@@ -35,6 +48,7 @@ interface AgentAuth {
 interface TestContext {
   companyId: string;
   projectId: string;
+  projectCwd: string;
   companyPrefix: string;
   executor: AgentAuth;
   reviewer: AgentAuth;
@@ -340,35 +354,13 @@ async function setupCompany(boardRequest: APIRequestContext): Promise<TestContex
   const companyId = company.id;
   const companyPrefix = company.issuePrefix ?? company.prefix ?? company.urlKey ?? "E2E";
 
-  // SUP-21902: synthetic repository, credential, and recorded-merge-commit
-  // setup for the Tier 2 closes below. The company carries a GITHUB_TOKEN
-  // secret whose value the server-side GitHub fixture
-  // (fixtures/agent-chat-github.mjs) answers deterministically, and a project
-  // whose primary workspace names the delivery repository, so the guard can
-  // resolve the declared probe head and compare it with the recorded merge
-  // commit on each issue's merged pull_request work product.
-  const secretRes = await boardRequest.post(`${BASE_URL}/api/companies/${companyId}/secrets`, {
-    data: { name: "GITHUB_TOKEN", value: "paperclip-e2e-signoff-fixture" },
-  });
-  expect(secretRes.ok()).toBe(true);
-  const projectRes = await boardRequest.post(`${BASE_URL}/api/companies/${companyId}/projects`, {
-    data: {
-      name: "E2E Signoff Repo",
-      workspace: {
-        name: "Primary",
-        sourceType: "git_repo",
-        repoUrl: "https://github.com/TEA-Core/paperclip",
-        repoRef: "fold/tea-patches-v2026.722.0",
-        defaultRef: "fold/tea-patches-v2026.722.0",
-        isPrimary: true,
-      },
-    },
-  });
-  if (!projectRes.ok()) {
-    throw new Error(`POST /api/companies/${companyId}/projects -> ${projectRes.status()}: ${await projectRes.text()}`);
-  }
-  const project = await projectRes.json();
-  const projectId = project.id;
+  // SUP-21902: synthetic repository and credential for the Tier 2 closes below.
+  // The project's primary workspace names the delivery repository and points at
+  // a local git directory: without a cwd every heartbeat run would clone the
+  // real repository from GitHub, which slows run binding enough to widen the
+  // run-lock races this suite already retries around.
+  const projectCwd = await mkdtemp(path.join(os.tmpdir(), "paperclip-signoff-project-"));
+  const projectId = (await seedTier2Project(boardRequest, companyId, "E2E Signoff Repo", projectCwd)).id;
 
   // Helper: hire/approve agent + API key + request context
   async function createAgent(name: string, role: string, title: string): Promise<AgentAuth> {
@@ -415,6 +407,7 @@ async function setupCompany(boardRequest: APIRequestContext): Promise<TestContex
   return {
     companyId,
     projectId,
+    projectCwd,
     companyPrefix,
     executor,
     reviewer,
@@ -447,24 +440,7 @@ async function createIssueWithPolicy(ctx: TestContext, title: string, stages?: u
   const issue = await res.json();
   ctx.issueIds.push(issue.id);
   // SUP-21902: record this delivery's merge commit for the Tier 2 origin guard.
-  const workProductRes = await ctx.boardRequest.post(`${BASE_URL}/api/issues/${issue.id}/work-products`, {
-    data: {
-      type: "pull_request",
-      provider: "github",
-      externalId: "TEA-Core/paperclip#404",
-      title: "PR #404 TEA-Core/paperclip",
-      url: "https://github.com/TEA-Core/paperclip/pull/404",
-      status: "merged",
-      isPrimary: true,
-      metadata: {
-        prNumber: 404,
-        repository: "TEA-Core/paperclip",
-        mergedAt: "2026-08-29T00:11:06Z",
-        mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19",
-      },
-    },
-  });
-  expect(workProductRes.ok()).toBe(true);
+  await recordTier2MergedDelivery(ctx.boardRequest, issue.id);
   return issue;
 }
 
@@ -497,6 +473,7 @@ test.describe("Signoff execution policy", () => {
     }
     await board.delete(`${BASE_URL}/api/companies/${ctx.companyId}`).catch(() => {});
     await board.dispose();
+    await rm(ctx.projectCwd, { recursive: true, force: true });
   });
 
   test("happy path: executor → review → approval → done", async ({ page }) => {
@@ -552,7 +529,7 @@ test.describe("Signoff execution policy", () => {
     // Step 5: Approver approves → should complete
     const step5Res = await agentPatch(
       ctx.boardRequest, ctx.approver, issueId,
-      { status: "done", comment: "Approved. Ship it.\n\nClosed at Tier 2 (live): probe `e2e signoff flow re-read the issue post-close on the live deployment` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: verified done." },
+      { status: "done", comment: `Approved. Ship it.\n\n${TIER2_CLOSE_LINE}` },
     );
     expect(step5Res.ok()).toBe(true);
     const step5Issue = await step5Res.json();
@@ -669,7 +646,7 @@ test.describe("Signoff execution policy", () => {
     // Reviewer approves → should complete immediately (no approval stage)
     const approveRes = await agentPatch(
       ctx.boardRequest, ctx.reviewer, issue.id,
-      { status: "done", comment: "LGTM.\n\nClosed at Tier 2 (live): probe `e2e signoff flow re-read the issue post-close on the live deployment` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: verified done." },
+      { status: "done", comment: `LGTM.\n\n${TIER2_CLOSE_LINE}` },
     );
     expect(approveRes.ok()).toBe(true);
     const doneIssue = await approveRes.json();

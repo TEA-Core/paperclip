@@ -10,7 +10,7 @@ const execFileAsync = promisify(execFile);
 // primary workspace names the delivery repository, and each issue records one
 // merged pull_request work product whose merge commit the Tier 2 probe head
 // must equal.
-const TIER2_RECORDED_MERGE_COMMIT = "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19";
+export const TIER2_RECORDED_MERGE_COMMIT = "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19";
 const TIER2_GITHUB_TOKEN_VALUE = "paperclip-e2e-signoff-fixture";
 const TIER2_REPO_URL = "https://github.com/TEA-Core/paperclip";
 const TIER2_DEFAULT_REF = "fold/tea-patches-v2026.722.0";
