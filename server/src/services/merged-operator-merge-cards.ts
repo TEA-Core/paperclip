@@ -379,10 +379,13 @@ export function createMergedOperatorMergeCardSweepService(
       // SUP-21901 / SUP-21910: this sweep is a backstop `done` writer, so the
       // close must pass the SAME shared done-transition guard the PATCH door
       // runs — no duplicated predicates. The sweep live-probed every gate pull
-      // request as merged, so the close carries a truthful structured Tier-2
-      // declaration whose probe evidence is that measurement; it renders into
+      // request as merged, so the close carries a structured Tier-2
+      // declaration whose probe evidence names that measurement; it renders into
       // the persisted close comment exactly like PATCH renders the structured
-      // doneTier field. Run BEFORE the advisory-lock transaction on an
+      // doneTier field. The sweep's own measurement is not sufficient: the guard
+      // also requires the card's own recorded merged pull_request work product
+      // to carry the named probe head as its merge commit, and defers the card
+      // otherwise. Run BEFORE the advisory-lock transaction on an
       // unlocked full-row read: the delivery guard probes GitHub and the tier
       // evaluator reads the comment store, and running either under the row
       // lock reproduces the FOR KEY SHARE deadlock the recovery door fix

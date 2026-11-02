@@ -1,4 +1,8 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { expect, type APIRequestContext, type APIResponse } from "@playwright/test";
+
+const execFileAsync = promisify(execFile);
 
 // SUP-21902: synthetic delivery for e2e journeys whose agents close a card at
 // Tier 2. The company GITHUB_TOKEN secret carries the value that
@@ -37,6 +41,9 @@ export async function seedTier2Credential(request: APIRequestContext, companyId:
 }
 
 export async function seedTier2Project(request: APIRequestContext, companyId: string, name: string, cwd: string) {
+  // A project with a git_repo workspace makes heartbeat require `.git` metadata in the launch cwd
+  // (missing_git_metadata); the callers pass bare mkdtemp directories, so initialise one.
+  await execFileAsync("git", ["init", "-q", cwd]);
   await seedTier2Credential(request, companyId);
   return json(
     await request.post(`/api/companies/${companyId}/projects`, {
