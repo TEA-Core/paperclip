@@ -1256,7 +1256,7 @@ describe("resolveRuntimeProvisionCommand", () => {
           version: 2,
           source: { instanceId: "source", configPath: "/source/config.json" },
           snapshotAt: "2026-08-18T00:00:00.000Z",
-          seedMode: "full",
+          seedMode: "minimal-no-secrets",
           migrationRevision: "0001",
           targetInstanceId: "target",
           phase: "complete",

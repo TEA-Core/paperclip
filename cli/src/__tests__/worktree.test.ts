@@ -42,6 +42,7 @@ import {
   readSourceAttachmentBody,
   rebindWorkspaceCwd,
   requiresWorktreeSeedCredentialAccount,
+  resolveSeededWorktreeMasterKey,
   resolveSourceConfigPath,
   resolveWorktreeReseedSource,
   resolveWorktreeReseedTargetPaths,
@@ -515,6 +516,40 @@ describe("worktree helpers", () => {
 
     expect(full.excludedTables).toEqual([]);
     expect(full.nullifyColumns).toEqual({});
+  });
+
+  it("plans minimal-no-secrets seeds that drop every secret table and nullify routine trigger secret refs", () => {
+    const plan = resolveWorktreeSeedPlan("minimal-no-secrets");
+
+    expect(plan.mode).toBe("minimal-no-secrets");
+    expect(plan.excludedTables).toHaveLength(18);
+    for (const table of [
+      "company_secret_bindings",
+      "company_secret_proposals",
+      "company_secret_provider_configs",
+      "company_secret_versions",
+      "company_secrets",
+      "managed_agent_profiles",
+      "secret_access_events",
+      "secrets_directory_observations",
+      "user_secret_declarations",
+      "user_secret_definitions",
+    ]) {
+      expect(plan.excludedTables).toContain(table);
+    }
+    // Everything minimal excludes is still excluded.
+    expect(plan.excludedTables).toContain("heartbeat_runs");
+    expect(plan.excludedTables).toContain("agent_task_sessions");
+    expect(plan.nullifyColumns.issues).toEqual(["checkout_run_id", "execution_run_id"]);
+    // The only nullable secret FK on a copied table is routine_triggers.secret_id.
+    expect(plan.nullifyColumns.routine_triggers).toEqual(["secret_id"]);
+    // Plugin and wiki registry tables stay copied.
+    expect(plan.excludedTables).not.toContain("plugins");
+    expect(plan.excludedTables.filter((table) => table.startsWith("plugin"))).toEqual([]);
+
+    const minimal = resolveWorktreeSeedPlan("minimal");
+    expect(minimal.excludedTables).not.toContain("company_secrets");
+    expect(minimal.nullifyColumns.routine_triggers).toBeUndefined();
   });
 
   it("requires the seed process to own the target embedded Postgres lifecycle", async () => {
@@ -1515,6 +1550,70 @@ describe("worktree helpers", () => {
     }
   });
 
+  it("mints a fresh secrets master key for minimal-no-secrets seeds without reading the source key", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-no-secrets-key-"));
+    const originalInlineMasterKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+    const originalKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    try {
+      delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+      delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+      const sourceConfigPath = path.join(tempRoot, "source", "config.json");
+      const sourceKeyPath = path.join(tempRoot, "source", "secrets", "master.key");
+      fs.mkdirSync(path.dirname(sourceKeyPath), { recursive: true });
+      fs.writeFileSync(sourceKeyPath, "source-secret-material", "utf8");
+      const sourceConfig = buildSourceConfig();
+      sourceConfig.secrets.localEncrypted.keyFilePath = sourceKeyPath;
+
+      const first = resolveSeededWorktreeMasterKey({
+        seedMode: "minimal-no-secrets",
+        sourceConfigPath,
+        sourceConfig,
+        sourceEnvEntries: { PAPERCLIP_SECRETS_MASTER_KEY: "inline-source-master-material" },
+      });
+      const second = resolveSeededWorktreeMasterKey({
+        seedMode: "minimal-no-secrets",
+        sourceConfigPath,
+        sourceConfig,
+        sourceEnvEntries: { PAPERCLIP_SECRETS_MASTER_KEY: "inline-source-master-material" },
+      });
+
+      expect(first).toBeTruthy();
+      expect(first).not.toBe("inline-source-master-material");
+      expect(first).not.toBe("source-secret-material");
+      expect(first).not.toBe(second);
+      expect(Buffer.from(first!, "base64").length).toBe(32);
+
+      // With the source key file gone, copy modes fail while minimal-no-secrets
+      // still succeeds — proving the source key path is never consulted.
+      const missingKeyConfig = buildSourceConfig();
+      missingKeyConfig.secrets.localEncrypted.keyFilePath = path.join(tempRoot, "source", "secrets", "missing.key");
+      expect(() => resolveSeededWorktreeMasterKey({
+        seedMode: "minimal",
+        sourceConfigPath,
+        sourceConfig: missingKeyConfig,
+        sourceEnvEntries: {},
+      })).toThrow("was not found");
+      expect(resolveSeededWorktreeMasterKey({
+        seedMode: "minimal-no-secrets",
+        sourceConfigPath,
+        sourceConfig: missingKeyConfig,
+        sourceEnvEntries: {},
+      })).toBeTruthy();
+    } finally {
+      if (originalInlineMasterKey === undefined) {
+        delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+      } else {
+        process.env.PAPERCLIP_SECRETS_MASTER_KEY = originalInlineMasterKey;
+      }
+      if (originalKeyFile === undefined) {
+        delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+      } else {
+        process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = originalKeyFile;
+      }
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it("persists the current agent jwt secret into the worktree env file", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-jwt-"));
     const repoRoot = path.join(tempRoot, "repo");
@@ -1606,6 +1705,38 @@ describe("worktree helpers", () => {
       } else {
         process.env.PAPERCLIP_DECISION_SIGNING_SECRET = originalDecisionSigningSecret;
       }
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves the minimal-no-secrets seed mode and target instance in the deferred seed marker", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-deferred-marker-"));
+    const repoRoot = path.join(tempRoot, "repo");
+    const originalCwd = process.cwd();
+
+    try {
+      fs.mkdirSync(repoRoot, { recursive: true });
+      process.chdir(repoRoot);
+
+      await worktreeInitCommand({
+        seed: false,
+        seedMode: "minimal-no-secrets",
+        instance: "sup-22160-deferred-marker",
+        fromConfig: path.join(tempRoot, "missing", "config.json"),
+        home: path.join(tempRoot, ".paperclip-worktrees"),
+      });
+
+      const manifest = readWorktreeSeedManifest(path.join(repoRoot, ".paperclip", "config.json"));
+      expect(manifest).not.toBeNull();
+      expect(manifest?.state).toBe("pending");
+      // The deferred marker is the authoritative handoff to a later
+      // `ensure-seeded` run: it must keep the explicitly selected no-secrets
+      // mode and target identity instead of re-deriving defaults, or deferred
+      // seeding would fall back to minimal and copy production secret tables.
+      expect(manifest?.seedMode).toBe("minimal-no-secrets");
+      expect(manifest?.targetInstanceId).toBe("sup-22160-deferred-marker");
+    } finally {
+      process.chdir(originalCwd);
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
   });
@@ -2253,6 +2384,219 @@ describe("worktree helpers", () => {
         delete process.env.PAPERCLIP_CONFIG;
       } else {
         process.env.PAPERCLIP_CONFIG = originalPaperclipConfig;
+      }
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  itEmbeddedPostgres("minimal-no-secrets reseed drops every secret row, nullifies trigger secret refs, and mints a fresh master key", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-no-secrets-e2e-"));
+    const repoRoot = path.join(tempRoot, "repo");
+    const sourceRoot = path.join(tempRoot, "source");
+    const homeDir = path.join(tempRoot, ".paperclip-worktrees");
+    const currentInstanceId = "no-secrets-worktree";
+    const currentPaths = resolveWorktreeLocalPaths({
+      cwd: repoRoot,
+      homeDir,
+      instanceId: currentInstanceId,
+    });
+    const sourcePaths = resolveWorktreeLocalPaths({
+      cwd: sourceRoot,
+      homeDir: path.join(tempRoot, ".paperclip-source"),
+      instanceId: "default",
+    });
+    const originalCwd = process.cwd();
+    const originalPaperclipConfig = process.env.PAPERCLIP_CONFIG;
+    const originalInlineMasterKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+    const originalKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    const currentDatabaseReservation = await reserveTestPort();
+    const currentDatabasePort = currentDatabaseReservation.port;
+    const sourceCluster = await startEmbeddedPostgresTestDatabase("paperclip-worktree-no-secrets-source-");
+    const sourceDbUrl = new URL(sourceCluster.connectionString);
+    sourceDbUrl.pathname = "/no_secrets_source";
+    let targetHandle: Awaited<ReturnType<typeof ensureEmbeddedPostgres>> | null = null;
+    delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+    delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+
+    try {
+      fs.mkdirSync(path.dirname(currentPaths.configPath), { recursive: true });
+      fs.mkdirSync(path.dirname(sourcePaths.configPath), { recursive: true });
+      fs.mkdirSync(path.dirname(sourcePaths.secretsKeyFilePath), { recursive: true });
+      fs.mkdirSync(repoRoot, { recursive: true });
+      fs.mkdirSync(sourceRoot, { recursive: true });
+
+      await ensurePostgresDatabase(sourceCluster.connectionString, "no_secrets_source");
+      const migrationsRoot = new URL("../../../packages/db/src/migrations/", import.meta.url).pathname;
+      const sourceClient = createDb(sourceDbUrl.toString());
+      await migrate(drizzle(sourceClient.$client), { migrationsFolder: migrationsRoot });
+      const { companyId } = await seedValidWorktreeSource(sourceDbUrl.toString());
+      const secretId = randomUUID();
+      const routineId = randomUUID();
+      const agentId = randomUUID();
+      await sourceClient.$client.unsafe(
+        `insert into "company_secrets" ("id", "company_id", "key", "name") values ($1, $2, $3, $4)`,
+        [secretId, companyId, "PROD_TOKEN", "Production token"],
+      );
+      await sourceClient.$client.unsafe(
+        `insert into "routines" ("id", "company_id", "title") values ($1, $2, $3)`,
+        [routineId, companyId, "Secret-bearing routine"],
+      );
+      await sourceClient.$client.unsafe(
+        `insert into "agents" ("id", "company_id", "name", "adapter_config") values ($1, $2, $3, $4::jsonb)`,
+        [
+          agentId,
+          companyId,
+          "Secret-bearing agent",
+          JSON.stringify({
+            provider: "claude_managed",
+            managedProfileId: "production-managed-profile",
+            model: "claude-sonnet-5",
+            env: { API_KEY: { type: "secret_ref", secretId } },
+          }),
+        ],
+      );
+      await sourceClient.$client.unsafe(
+        `insert into "routine_triggers" ("company_id", "routine_id", "kind", "secret_id") values ($1, $2, $3, $4)`,
+        [companyId, routineId, "schedule", secretId],
+      );
+      await sourceClient.$client.unsafe(
+        `insert into "plugins" ("plugin_key", "package_name", "version", "manifest_json") values ($1, $2, $3, $4::jsonb)`,
+        ["llm-wiki", "@paperclipai/llm-wiki", "1.0.0", JSON.stringify({ id: "llm-wiki" })],
+      );
+      await sourceClient.$client.end({ timeout: 5 });
+
+      const sourceConfig = buildSourceConfig();
+      sourceConfig.database = {
+        mode: "postgres",
+        embeddedPostgresDataDir: sourcePaths.embeddedPostgresDataDir,
+        embeddedPostgresPort: 54329,
+        backup: {
+          enabled: true,
+          intervalMinutes: 60,
+          retentionDays: 30,
+          dir: sourcePaths.backupDir,
+        },
+        connectionString: sourceDbUrl.toString(),
+      };
+      sourceConfig.logging.logDir = sourcePaths.logDir;
+      sourceConfig.storage.localDisk.baseDir = sourcePaths.storageDir;
+      sourceConfig.secrets.localEncrypted.keyFilePath = sourcePaths.secretsKeyFilePath;
+      fs.writeFileSync(sourcePaths.secretsKeyFilePath, "source-secret-material", "utf8");
+      fs.writeFileSync(sourcePaths.configPath, JSON.stringify(sourceConfig, null, 2), "utf8");
+      fs.writeFileSync(
+        path.join(path.dirname(sourcePaths.configPath), ".env"),
+        "PAPERCLIP_SECRETS_MASTER_KEY=inline-source-master-material\n",
+        "utf8",
+      );
+
+      const currentConfig = buildWorktreeConfig({
+        sourceConfig: buildSourceConfig(),
+        paths: currentPaths,
+        serverPort: 3115,
+        databasePort: currentDatabasePort,
+      });
+      fs.writeFileSync(currentPaths.configPath, JSON.stringify(currentConfig, null, 2), "utf8");
+      fs.writeFileSync(
+        currentPaths.envPath,
+        [
+          `PAPERCLIP_HOME=${homeDir}`,
+          `PAPERCLIP_INSTANCE_ID=${currentInstanceId}`,
+        ].join("\n"),
+        "utf8",
+      );
+
+      delete process.env.PAPERCLIP_CONFIG;
+      process.chdir(repoRoot);
+
+      await currentDatabaseReservation.release();
+
+      await worktreeReseedCommand({
+        fromConfig: sourcePaths.configPath,
+        seedMode: "minimal-no-secrets",
+        yes: true,
+      });
+
+      const rewrittenEnv = fs.readFileSync(currentPaths.envPath, "utf8");
+      const masterKeyMatch = rewrittenEnv.match(/^PAPERCLIP_SECRETS_MASTER_KEY=(.+)$/m);
+      expect(masterKeyMatch).not.toBeNull();
+      const seededKey = masterKeyMatch![1]!.trim();
+      expect(seededKey).not.toBe("source-secret-material");
+      expect(seededKey).not.toBe("inline-source-master-material");
+      expect(Buffer.from(seededKey, "base64").length).toBe(32);
+      expect(fs.existsSync(path.join(currentPaths.instanceRoot, "secrets", "master.key"))).toBe(false);
+      expect(fs.existsSync(path.join(currentPaths.instanceRoot, ".secrets", "master.key"))).toBe(false);
+
+      targetHandle = await ensureEmbeddedPostgres(
+        currentConfig.database.embeddedPostgresDataDir,
+        currentDatabasePort,
+      );
+      const targetDb = createDb(`postgres://paperclip:paperclip@127.0.0.1:${targetHandle.port}/paperclip`);
+      try {
+        for (const table of [
+          "company_secret_bindings",
+          "company_secret_proposals",
+          "company_secret_provider_configs",
+          "company_secret_versions",
+          "company_secrets",
+          "managed_agent_profiles",
+          "secret_access_events",
+          "secrets_directory_observations",
+          "user_secret_declarations",
+          "user_secret_definitions",
+        ]) {
+          const rows = await targetDb.$client.unsafe<{ n: number }[]>(
+            `select count(*)::int as n from "${table}"`,
+          );
+          expect(rows[0]?.n ?? -1).toBe(0);
+        }
+        const triggerRows = await targetDb.$client.unsafe<{ n: number }[]>(
+          `select count(*)::int as n from "routine_triggers"`,
+        );
+        expect(triggerRows[0]?.n ?? -1).toBe(1);
+        const liveSecretRefs = await targetDb.$client.unsafe<{ n: number }[]>(
+          `select count(*)::int as n from "routine_triggers" where "secret_id" is not null`,
+        );
+        expect(liveSecretRefs[0]?.n ?? -1).toBe(0);
+        const agentRows = await targetDb.$client.unsafe<{ adapterConfig: Record<string, unknown> }[]>(
+          `select "adapter_config" as "adapterConfig" from "agents" where "id" = $1`,
+          [agentId],
+        );
+        expect(agentRows).toEqual([{
+          adapterConfig: { model: "claude-sonnet-5", env: {} },
+        }]);
+        const pluginRows = await targetDb.$client.unsafe<{ n: number }[]>(
+          `select count(*)::int as n from "plugins"`,
+        );
+        expect(pluginRows[0]?.n ?? -1).toBe(1);
+        const issueRows = await targetDb.$client.unsafe<{ n: number }[]>(
+          `select count(*)::int as n from "issues"`,
+        );
+        expect((issueRows[0]?.n ?? 0) >= 1).toBe(true);
+      } finally {
+        await targetDb.$client?.end?.({ timeout: 5 }).catch(() => undefined);
+      }
+    } finally {
+      await currentDatabaseReservation.release();
+      if (targetHandle?.startedByThisProcess) {
+        await targetHandle.stop();
+      }
+      await closeRegisteredClients(sourceDbUrl.toString());
+      await sourceCluster.cleanup();
+      process.chdir(originalCwd);
+      if (originalPaperclipConfig === undefined) {
+        delete process.env.PAPERCLIP_CONFIG;
+      } else {
+        process.env.PAPERCLIP_CONFIG = originalPaperclipConfig;
+      }
+      if (originalInlineMasterKey === undefined) {
+        delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+      } else {
+        process.env.PAPERCLIP_SECRETS_MASTER_KEY = originalInlineMasterKey;
+      }
+      if (originalKeyFile === undefined) {
+        delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+      } else {
+        process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = originalKeyFile;
       }
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }

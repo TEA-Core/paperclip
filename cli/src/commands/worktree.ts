@@ -16,7 +16,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { Readable } from "node:stream";
 import * as p from "@clack/prompts";
@@ -1084,6 +1084,24 @@ export function copySeededSecretsKey(input: {
   return readFileSync(sourceKeyFilePath, "utf8");
 }
 
+export function generateSeededWorktreeSecretsKey(): string {
+  return randomBytes(32).toString("base64");
+}
+
+export function resolveSeededWorktreeMasterKey(input: {
+  seedMode: WorktreeSeedMode;
+  sourceConfigPath: string;
+  sourceConfig: PaperclipConfig;
+  sourceEnvEntries: Record<string, string>;
+}): string | null {
+  if (input.seedMode === "minimal-no-secrets") {
+    // The worktree must never inherit production secret material: generate a
+    // fresh master key instead of reading the source env or key file.
+    return generateSeededWorktreeSecretsKey();
+  }
+  return copySeededSecretsKey(input);
+}
+
 export async function ensureEmbeddedPostgres(
   dataDir: string,
   preferredPort: number,
@@ -1622,6 +1640,28 @@ async function inspectVerifiedSeedDatabase(
   }
 }
 
+async function scrubSeededSecretReferences(
+  connectionString: string,
+  seedMode: WorktreeSeedMode,
+): Promise<void> {
+  if (seedMode !== "minimal-no-secrets") return;
+
+  const db = createDb(connectionString);
+  try {
+    await db.execute(sql`
+      update agents
+      set adapter_config = jsonb_set(
+        adapter_config - 'provider' - 'managedProfileId' - 'agentCoreProfileId' - 'env',
+        '{env}',
+        '{}'::jsonb,
+        true
+      )
+    `);
+  } finally {
+    await db.$client?.end?.({ timeout: 5 }).catch(() => undefined);
+  }
+}
+
 async function seedWorktreeDatabase(input: {
   sourceConfigPath: string;
   sourceConfig: PaperclipConfig;
@@ -1636,14 +1676,12 @@ async function seedWorktreeDatabase(input: {
   const seedPlan = resolveWorktreeSeedPlan(input.seedMode);
   const sourceEnvFile = resolvePaperclipEnvFile(input.sourceConfigPath);
   const sourceEnvEntries = readPaperclipEnvEntries(sourceEnvFile);
-  const seededMasterKey = copySeededSecretsKey({
+  const seededMasterKey = resolveSeededWorktreeMasterKey({
+    seedMode: input.seedMode,
     sourceConfigPath: input.sourceConfigPath,
     sourceConfig: input.sourceConfig,
     sourceEnvEntries,
   });
-  if (seededMasterKey) {
-    mergePaperclipEnvEntries({ PAPERCLIP_SECRETS_MASTER_KEY: seededMasterKey }, input.targetPaths.envPath);
-  }
   let sourceHandle: EmbeddedPostgresHandle | null = null;
   let targetHandle: EmbeddedPostgresHandle | null = null;
 
@@ -1707,6 +1745,7 @@ async function seedWorktreeDatabase(input: {
     input.onPhase?.("migrations", "started");
     await applyPendingMigrations(targetConnectionString);
     input.onPhase?.("migrations", "succeeded");
+    await scrubSeededSecretReferences(targetConnectionString, input.seedMode);
     input.onPhase?.("execution_quarantine", "started");
     const executionQuarantine = input.preserveLiveWork
       ? { ...EMPTY_SEEDED_WORKTREE_EXECUTION_QUARANTINE_SUMMARY }
@@ -1740,6 +1779,9 @@ async function seedWorktreeDatabase(input: {
       "succeeded",
       `Validated migration ${targetValidation.summary.migrationRevision}.`,
     );
+    if (seededMasterKey) {
+      mergePaperclipEnvEntries({ PAPERCLIP_SECRETS_MASTER_KEY: seededMasterKey }, input.targetPaths.envPath);
+    }
 
     return {
       backupSummary: formatDatabaseBackupResult(backup),
@@ -2416,7 +2458,7 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
   );
   const seedMode = opts.seedMode ?? "minimal";
   if (!isWorktreeSeedMode(seedMode)) {
-    throw new Error(`Unsupported seed mode "${seedMode}". Expected one of: minimal, full.`);
+    throw new Error(`Unsupported seed mode "${seedMode}". Expected one of: minimal, minimal-no-secrets, full.`);
   }
   const instanceId = sanitizeWorktreeInstanceId(opts.instance ?? worktreeName);
   const paths = resolveWorktreeLocalPaths({
@@ -2505,9 +2547,14 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
   });
 
   writeConfig(targetConfig, paths.configPath);
+  // This marker is the authoritative handoff for a deferred `ensure-seeded`
+  // run: it must carry the resolved seed mode and target instance rather than
+  // re-deriving defaults, or a minimal-no-secrets selection silently downgrades.
   markWorktreeSeedPending({
     configPath: paths.configPath,
     sourceConfigPath,
+    targetInstanceId: instanceId,
+    seedMode,
   });
   const sourceEnvEntries = readPaperclipEnvEntries(resolvePaperclipEnvFile(sourceConfigPath));
   const existingAgentJwtSecret =
@@ -4273,7 +4320,7 @@ async function backupWorktreeReseedTarget(input: {
 async function runWorktreeReseed(opts: WorktreeReseedOptions): Promise<void> {
   const seedMode = opts.seedMode ?? "full";
   if (!isWorktreeSeedMode(seedMode)) {
-    throw new Error(`Unsupported seed mode "${seedMode}". Expected one of: minimal, full.`);
+    throw new Error(`Unsupported seed mode "${seedMode}". Expected one of: minimal, minimal-no-secrets, full.`);
   }
 
   const targetEndpoint = opts.to
@@ -4397,7 +4444,7 @@ export async function worktreeRepairCommand(opts: WorktreeRepairOptions): Promis
 
   const seedMode = opts.seedMode ?? "minimal";
   if (!isWorktreeSeedMode(seedMode)) {
-    throw new Error(`Unsupported seed mode "${seedMode}". Expected one of: minimal, full.`);
+    throw new Error(`Unsupported seed mode "${seedMode}". Expected one of: minimal, minimal-no-secrets, full.`);
   }
 
   const target = await ensureRepairTargetWorktree({
@@ -4492,7 +4539,7 @@ export function registerWorktreeCommands(program: Command): void {
     .option("--from-instance <id>", "Source instance id when deriving the source config", "default")
     .option("--server-port <port>", "Preferred server port", (value) => Number(value))
     .option("--db-port <port>", "Preferred embedded Postgres port", (value) => Number(value))
-    .option("--seed-mode <mode>", "Seed profile: minimal or full (default: minimal)", "minimal")
+    .option("--seed-mode <mode>", "Seed profile: minimal, minimal-no-secrets, or full (default: minimal)", "minimal")
     .option("--preserve-live-work", "Do not quarantine copied agent work or workspace runtime services in the seeded worktree", false)
     .option("--no-seed", "Skip database seeding from the source instance")
     .option("--force", "Replace existing repo-local config and isolated instance data", false)
@@ -4509,7 +4556,7 @@ export function registerWorktreeCommands(program: Command): void {
     .option("--from-instance <id>", "Source instance id when deriving the source config", "default")
     .option("--server-port <port>", "Preferred server port", (value) => Number(value))
     .option("--db-port <port>", "Preferred embedded Postgres port", (value) => Number(value))
-    .option("--seed-mode <mode>", "Seed profile: minimal or full (default: minimal)", "minimal")
+    .option("--seed-mode <mode>", "Seed profile: minimal, minimal-no-secrets, or full (default: minimal)", "minimal")
     .option("--preserve-live-work", "Do not quarantine copied agent work or workspace runtime services in the seeded worktree", false)
     .option("--no-seed", "Skip database seeding from the source instance")
     .option("--force", "Replace existing repo-local config and isolated instance data", false)
@@ -4559,7 +4606,7 @@ export function registerWorktreeCommands(program: Command): void {
     .option("--from-config <path>", "Source config.json to seed from")
     .option("--from-data-dir <path>", "Source PAPERCLIP_HOME used when deriving the source config")
     .option("--from-instance <id>", "Source instance id when deriving the source config")
-    .option("--seed-mode <mode>", "Seed profile: minimal or full (default: full)", "full")
+    .option("--seed-mode <mode>", "Seed profile: minimal, minimal-no-secrets, or full (default: full)", "full")
     .option("--preserve-live-work", "Do not quarantine copied agent work or workspace runtime services in the seeded worktree", false)
     .option("--yes", "Skip the destructive confirmation prompt", false)
     .option("--allow-live-target", "Override the guard that requires the target worktree DB to be stopped first", false)
@@ -4574,7 +4621,7 @@ export function registerWorktreeCommands(program: Command): void {
     .option("--from-config <path>", "Source config.json to seed from")
     .option("--from-data-dir <path>", "Source PAPERCLIP_HOME used when deriving the source config")
     .option("--from-instance <id>", "Source instance id when deriving the source config (default: default)")
-    .option("--seed-mode <mode>", "Seed profile: minimal or full (default: minimal)", "minimal")
+    .option("--seed-mode <mode>", "Seed profile: minimal, minimal-no-secrets, or full (default: minimal)", "minimal")
     .option("--preserve-live-work", "Do not quarantine copied agent work or workspace runtime services in the seeded worktree", false)
     .option("--no-seed", "Repair metadata only and skip reseeding when bootstrapping a missing worktree config", false)
     .option("--allow-live-target", "Override the guard that requires the target worktree DB to be stopped first", false)
