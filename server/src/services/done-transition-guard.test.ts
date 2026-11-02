@@ -5504,12 +5504,17 @@ describe("evaluateDoneTierDeclaration", () => {
   // listed ref maps to the sha it points at, `sha: null` is a 404 (unresolvable
   // on the remote), and any other URL 404s so unrelated probes never satisfy
   // the predicate by accident.
-  function mockRefHeadResolutions(resolutions: Array<{ ref: string; sha: string | null }>) {
+  function mockRefHeadResolutions(
+    resolutions: Array<{ ref: string; sha: string | null; unprocessable?: string }>,
+  ) {
     ghFetchMock.mockImplementation(async (url: string) => {
       const u = String(url);
       if (!u.includes("/commits/")) return new Response(JSON.stringify({}), { status: 404 });
-      for (const { ref, sha } of resolutions) {
+      for (const { ref, sha, unprocessable } of resolutions) {
         if (u.endsWith(`/commits/${encodeURIComponent(ref)}`)) {
+          if (unprocessable !== undefined) {
+            return new Response(JSON.stringify({ message: unprocessable }), { status: 422 });
+          }
           return sha === null
             ? new Response(JSON.stringify({ message: "Not Found" }), { status: 404 })
             : new Response(JSON.stringify({ sha }), { status: 200 });
@@ -5645,6 +5650,41 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.skipped).toBe(false);
       expect(result.reason).toContain("head_unresolvable");
       expect(result.reason).toContain(T2_PROBE_HEAD);
+    });
+
+    it("SUP-21902: GitHub's 422 \"No commit found\" for an unknown SHA-shaped head is head_unresolvable, not an unverifiable fault", async () => {
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: null, unprocessable: `No commit found for SHA: ${T2_PROBE_HEAD}` },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("head_unresolvable");
+      expect(result.reason).toContain(T2_PROBE_HEAD);
+    });
+
+    it("SUP-21902: any other 422 from the commits probe is an unverifiable fault, never head_unresolvable", async () => {
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: null, unprocessable: "Validation Failed" },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("could not be verified");
+      expect(result.reason).toContain("GitHub commits API returned 422");
+      expect(result.reason).not.toContain("head_unresolvable");
     });
 
     it("SUP-21902: accepts a valid post-merge Tier 2 declaration whose named head is the delivery merge head", async () => {

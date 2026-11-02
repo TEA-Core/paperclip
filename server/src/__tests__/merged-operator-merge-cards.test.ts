@@ -58,12 +58,17 @@ vi.mock("../services/github-credential.js", async (importOriginal) => {
 
 // SUP-21902: the guard resolves the declared probe head through the commits
 // API; the mocked card repo knows exactly one commit (this delivery's recorded
-// merge commit), so a head that does not exist in the card's repo 404s.
+// merge commit), so a SHA-shaped head that does not exist in the card's repo
+// gets GitHub's real answer: 422 "No commit found for SHA: <sha>".
 vi.mock("../services/github-fetch.js", () => ({
-  ghFetch: (url: string) =>
-    typeof url === "string" && /\/commits\/c0cd56e43f9a81f360532f7b92fbf176798016ad$/.test(url)
+  ghFetch: (url: string) => {
+    if (typeof url !== "string" || !/\/commits\//.test(url)) {
+      return Promise.resolve(new Response(JSON.stringify({ message: "Not Found" }), { status: 404 }));
+    }
+    return /\/commits\/c0cd56e43f9a81f360532f7b92fbf176798016ad$/.test(url)
       ? Promise.resolve({ ok: true, status: 200, json: async () => ({ sha: "c0cd56e43f9a81f360532f7b92fbf176798016ad" }) } as unknown as Response)
-      : Promise.resolve(new Response(JSON.stringify({ message: "Not Found" }), { status: 404 })),
+      : Promise.resolve(new Response(JSON.stringify({ message: `No commit found for SHA: ${url.split("/commits/")[1]}` }), { status: 422 }));
+  },
   gitHubApiBase: (hostname: string) =>
     hostname === "github.com" || hostname === "www.github.com"
       ? "https://api.github.com"

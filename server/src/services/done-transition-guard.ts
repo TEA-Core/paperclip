@@ -310,16 +310,24 @@ async function githubBranchExists(
   }
 }
 
+async function isNoCommitFoundResponse(response: Response): Promise<boolean> {
+  if (response.status !== 422) return false;
+  const body = await response.json().catch(() => null);
+  const message = (body as Record<string, unknown> | null)?.message;
+  return typeof message === "string" && /no commit found/i.test(message);
+}
+
 /**
  * SUP-21902: resolve a named git ref (a sha, or a branch) to the full commit
  * sha it points at in the remote repository. The Tier 2 origin predicate
  * resolves only the probe head named in the close declaration through this
  * probe, so it is comparable with the recorded delivery merge commit; the
  * default branch is never resolved. Outcome classes mirror `githubBranchExists`:
- * a 200 with a sha is positive resolution; 404 is positive NON-resolution (the
- * ref does not exist on the remote); 401/403 classifies as auth failure; every
- * other outcome (network failure, unexpected status, unparseable body) throws
- * so callers can distinguish "unresolvable" from "could not be verified".
+ * a 200 with a sha is positive resolution; 404, or a 422 "No commit found" (how
+ * GitHub answers a SHA-shaped ref it cannot resolve), is positive NON-resolution
+ * (the ref does not exist on the remote); 401/403 classifies as auth failure;
+ * every other outcome (network failure, unexpected status, unparseable body)
+ * throws so callers can distinguish "unresolvable" from "could not be verified".
  */
 async function resolveGitHubRefHeadSha(
   hostname: string,
@@ -337,7 +345,7 @@ async function resolveGitHubRefHeadSha(
     authorization: `Bearer ${token}`,
   };
   const response = await ghFetch(url, { headers });
-  if (response.status === 404) return null;
+  if (response.status === 404 || (await isNoCommitFoundResponse(response))) return null;
   if (response.status === 401 || response.status === 403) {
     throw new GitHubAuthError(response.status, `GitHub commits API returned ${response.status}`);
   }
@@ -1049,8 +1057,8 @@ async function proveLandedAtTip(
 // its probe evidence carries the machine-checkable shape
 //   probe `<command>` head <sha> post-merge: <predicate>
 // and a close-time resolver proves the origin claim:
-//  - the named head resolves in the delivery repository (a 404 is the
-//    `head_unresolvable` refusal, not an allow);
+//  - the named head resolves in the delivery repository (a 404, or a 422
+//    "No commit found", is the `head_unresolvable` refusal, not an allow);
 //  - the resolved probe head equals THIS DELIVERY'S RECORDED MERGE COMMIT — the
 //    full 40-hex `mergeCommitSha` stamped on the issue's MOST RECENT merged
 //    `pull_request` work product by pr-delivery (`metadata.mergeCommitSha`, sourced
@@ -1547,12 +1555,7 @@ async function githubCommitRefProbe(
     // GitHub answers a SHA-shaped ref it cannot resolve with 422 + "No commit
     // found for <ref>"; a 422 with any other message says nothing about the
     // ref's existence, so it must not be read as absence.
-    const body = await response.json().catch(() => null);
-    const message = (body as Record<string, unknown> | null)?.message;
-    if (typeof message === "string" && /no commit found/i.test(message)) {
-      return "absent";
-    }
-    return "error";
+    return (await isNoCommitFoundResponse(response)) ? "absent" : "error";
   }
   return "error";
 }
