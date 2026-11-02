@@ -14,6 +14,17 @@ const {
   startAdapterExecutionTargetPaperclipBridge,
 } = vi.hoisted(() => ({
   runChildProcess: vi.fn(async (_runId: string, _command: string, args: string[]) => {
+    if (args.includes("--version")) {
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "1.18.29\n",
+        stderr: "",
+        pid: 121,
+        startedAt: new Date().toISOString(),
+      };
+    }
     if (args.includes("models")) {
       return {
         exitCode: 0,
@@ -273,15 +284,25 @@ describe("opencode remote execution", () => {
   });
 
   it("fails before the remote run when the configured model is unavailable on the SSH target", async () => {
-    runChildProcess.mockImplementationOnce(async () => ({
-      exitCode: 0,
-      signal: null,
-      timedOut: false,
-      stdout: "openai/gpt-4.1\n",
-      stderr: "",
-      pid: 456,
-      startedAt: new Date().toISOString(),
-    }));
+    runChildProcess
+      .mockImplementationOnce(async () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "2.0.26\n",
+        stderr: "",
+        pid: 455,
+        startedAt: new Date().toISOString(),
+      }))
+      .mockImplementationOnce(async () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "openai/gpt-4.1\n",
+        stderr: "",
+        pid: 456,
+        startedAt: new Date().toISOString(),
+      }));
 
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-model-"));
     cleanupDirs.push(rootDir);
@@ -330,8 +351,17 @@ describe("opencode remote execution", () => {
       }),
     ).rejects.toThrow("Configured OpenCode model is unavailable on the remote execution target");
 
-    expect(runChildProcess).toHaveBeenCalledTimes(1);
-    expect((runChildProcess.mock.calls[0]?.[2] as string[] | undefined) ?? []).toEqual(["models"]);
+    // The CLI version probe and the model availability probe both issue
+    // `--version`; only assert the model listing call shape, not the count.
+    const versionCalls = runChildProcess.mock.calls.filter(
+      (entry) => Array.isArray(entry[2]) && entry[2][0] === "--version",
+    );
+    const modelCalls = runChildProcess.mock.calls.filter(
+      (entry) => Array.isArray(entry[2]) && entry[2].includes("models"),
+    );
+    expect(versionCalls.length).toBeGreaterThanOrEqual(1);
+    expect(modelCalls.length).toBe(1);
+    expect(modelCalls[0]?.[2]).toEqual(["models"]);
     expect(startAdapterExecutionTargetPaperclipBridge).not.toHaveBeenCalled();
   });
 

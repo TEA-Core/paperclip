@@ -14,15 +14,28 @@ const TIMED_OUT_STDOUT = [
 ].join("\n");
 
 const { runChildProcess, ensureCommandResolvable, resolveCommandForLogs } = vi.hoisted(() => ({
-  runChildProcess: vi.fn(async () => ({
-    exitCode: null,
-    signal: "SIGTERM",
-    timedOut: true,
-    stdout: TIMED_OUT_STDOUT,
-    stderr: "",
-    pid: 321,
-    startedAt: new Date().toISOString(),
-  })),
+  runChildProcess: vi.fn(async (_runId: string, _command: string, args: string[]) => {
+    if (args?.[0] === "--version") {
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "1.18.29\n",
+        stderr: "",
+        pid: 322,
+        startedAt: new Date().toISOString(),
+      };
+    }
+    return {
+      exitCode: null,
+      signal: "SIGTERM",
+      timedOut: true,
+      stdout: TIMED_OUT_STDOUT,
+      stderr: "",
+      pid: 321,
+      startedAt: new Date().toISOString(),
+    };
+  }),
   ensureCommandResolvable: vi.fn(async () => undefined),
   resolveCommandForLogs: vi.fn(async () => "opencode"),
 }));
@@ -120,7 +133,9 @@ describe("opencode timeout handling", () => {
     cleanupDirs.push(rootDir);
     expect(result.timedOut).toBe(true);
 
-    const call = runChildProcess.mock.calls[0] as unknown as
+    const call = (runChildProcess.mock.calls as unknown as unknown[][]).find(
+      (entry) => Array.isArray(entry[2]) && entry[2].includes("run"),
+    ) as
       | [string, string, string[], { env: Record<string, string>; stdin?: string }]
       | undefined;
     expect(call?.[3].env.PAPERCLIP_RUN_TIMEOUT_SEC).toBe("5400");
@@ -134,7 +149,9 @@ describe("opencode timeout handling", () => {
     cleanupDirs.push(rootDir);
     expect(result.timedOut).toBe(true);
 
-    const call = runChildProcess.mock.calls[0] as unknown as
+    const call = (runChildProcess.mock.calls as unknown as unknown[][]).find(
+      (entry) => Array.isArray(entry[2]) && entry[2].includes("run"),
+    ) as
       | [string, string, string[], { env: Record<string, string>; stdin?: string }]
       | undefined;
     expect(call?.[3].env.PAPERCLIP_RUN_DEADLINE_EPOCH).toBeUndefined();
