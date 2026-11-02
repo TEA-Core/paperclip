@@ -3578,6 +3578,13 @@ async function verifyLiveFinalDeliveryHead(
  * ambiguity — both fail closed. The one live head SHA is returned so the
  * caller re-runs the full live verification (containment, ownership, head
  * match) before accepting the carrier.
+ *
+ * SUP-22355: an explicitly mentioned PR that stays unreadable after the
+ * 401/403 credential rotation (any other failure — HTTP 429/404, network
+ * error — or no credential resolving its repository at all) makes the whole
+ * resolution `unresolvable` instead of silently dropping the candidate:
+ * uniqueness of the merged carrier is unprovable while any mention is
+ * unreadable, so a verified merged mention must not be accepted beside it.
  */
 async function resolveSingleMergedMentionCarrier(
   db: Db,
@@ -3597,18 +3604,32 @@ async function resolveSingleMergedMentionCarrier(
   }> = [];
   for (const pr of mentioned) {
     const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
+    // SUP-22355: a mention no credential can even attempt is unreadable —
+    // fail closed rather than skipping the candidate.
+    let unreadable: string | null = candidates.length === 0 ? "no credential resolves this repository" : null;
     for (let i = 0; i < candidates.length; i++) {
       const live = await fetchPullRequestHeadSha(candidates[i]!.token, pr.owner, pr.repo, pr.number);
-      if (live.ok && live.merged === true && live.headSha) {
-        mergedCarriers.push({
-          kind: "resolved",
-          headSha: live.headSha,
-          displayName: pr.displayName,
-          pr: { owner: pr.owner, repo: pr.repo, number: pr.number },
-        });
+      if (live.ok) {
+        unreadable = null;
+        if (live.merged === true && live.headSha) {
+          mergedCarriers.push({
+            kind: "resolved",
+            headSha: live.headSha,
+            displayName: pr.displayName,
+            pr: { owner: pr.owner, repo: pr.repo, number: pr.number },
+          });
+        }
+        break;
       }
-      if (!live.ok && (live.status === 401 || live.status === 403) && i < candidates.length - 1) continue;
+      unreadable = live.status === 0 ? "network error" : `HTTP ${live.status}`;
+      if ((live.status === 401 || live.status === 403) && i < candidates.length - 1) continue;
       break;
+    }
+    if (unreadable !== null) {
+      return {
+        kind: "unresolvable",
+        reason: `unreadable_mention: mentioned PR ${pr.displayName} could not be read after credential rotation (${unreadable}); merged-carrier uniqueness is unprovable`,
+      };
     }
   }
   if (mergedCarriers.length === 0) return { kind: "none" };

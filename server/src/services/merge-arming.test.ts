@@ -2075,6 +2075,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     const MERGE_SHA = "mergec000000000000000000000000000000000001";
     const COMPARE_URL = `https://api.github.com/repos/${OWNER}/${REPO}/compare/main...${MERGE_SHA}`;
     const PR_43_URL = `https://api.github.com/repos/${OWNER}/${REPO}/pulls/43`;
+    const PR_44_URL = `https://api.github.com/repos/${OWNER}/${REPO}/pulls/44`;
 
     function mergedMentionBody(overrides: Record<string, unknown> = {}) {
       return {
@@ -2173,6 +2174,30 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         expect(result.reason).toContain("ambiguous: multiple merged mentioned PRs (2)");
         expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
         expect(result.reason).toContain(`${OWNER}/${REPO}#43`);
+      }
+    });
+
+    // SUP-22355: an explicitly mentioned PR whose live read fails for a
+    // non-401/403 reason (here HTTP 429) must make the merged-carrier
+    // resolution unresolvable — uniqueness is unprovable while one mention
+    // is unreadable, so the other (fully verified) merged mention must NOT
+    // be accepted.
+    it("refuses when one mentioned PR is unreadable (HTTP 429) even as the other is a verified merged carrier", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, state: "closed" });
+      await insertMention(issueId, { number: 44, state: "closed", headRefName: "SUP-44-branch" });
+      installRoutes([
+        ...mergedCarrierRoutes(),
+        { url: PR_44_URL, body: { message: "rate limited" }, ok: false, status: 429 },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("unreadable_mention");
+        expect(result.reason).toContain(`${OWNER}/${REPO}#44`);
+        expect(result.reason).toContain("HTTP 429");
       }
     });
 
