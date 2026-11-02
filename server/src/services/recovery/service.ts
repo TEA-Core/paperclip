@@ -112,7 +112,11 @@ import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { authorizationService } from "../authorization.js";
 import { unadmittedChatWakeupCondition } from "../durable-chat-wakeup.js";
-import { DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS, issueRecoveryActionService } from "../issue-recovery-actions.js";
+import {
+  DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS,
+  OWNER_LIVE_SWEEP_HOLD_KINDS,
+  issueRecoveryActionService,
+} from "../issue-recovery-actions.js";
 import {
   legacyExecutionNeedsReconciliation,
   terminalizeLegacyExecution,
@@ -10950,6 +10954,10 @@ export function recoveryService(
   //   - terminal/missing source issues are dropped (nothing left to recover)
   //   - `monitor_only` / `manual_repair_required` policies and non-wakeable
   //     causes are skipped without burning an attempt
+  //   - SUP-22273: stranded-participant kinds (`stranded_assigned_issue`,
+  //     `review_stage_unarmed`) whose owner (or pending participant) ran
+  //     within the participant live window are held — no attempt burn, no
+  //     ceiling escalation — until the live window expires
   //   - ordinary `board_escalation` actions may be rerouted to an invokable
   //     owner; pending-participant board repairs stay manual across sweeps
   //   - attemptCount/lastAttemptAt are bumped under a compare-and-swap on the
@@ -10971,6 +10979,7 @@ export function recoveryService(
       skippedTerminalSource: 0,
       skippedBackoff: 0,
       skippedPauseHold: 0,
+      skippedOwnerLive: 0,
       enqueueFailed: 0,
       issueIds: [] as string[],
       actionIds: [] as string[],
@@ -10993,6 +11002,34 @@ export function recoveryService(
     result.checked = candidates.length;
     for (const candidate of candidates) {
       const effectiveMaxAttempts = candidate.maxAttempts ?? MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
+
+      // SUP-22273: for the two stranded-participant kinds a live owner is not
+      // a wedge. If the owner agent — or, on a board-owned row, the pending
+      // participant it was minted for — has run anywhere after this action's
+      // last attempt (within the participant live window), the sweep must
+      // neither burn an attempt nor escalate, including at the attempt
+      // ceiling: the parent incident (SUP-21921) churned ~20 live-reviewer
+      // cards to 5/5 -> board exactly that way. Checked before the
+      // exhaustion check so an at-ceiling row with a live owner is held
+      // rather than escalated. Expiry preserved: once no owner run falls in
+      // the window, the sweep counts attempts (and escalates at the ceiling)
+      // exactly as before.
+      const holdOwnerLiveAgentId =
+        OWNER_LIVE_SWEEP_HOLD_KINDS.has(candidate.kind) &&
+        (candidate.ownerAgentId ?? candidate.previousOwnerAgentId);
+      if (
+        holdOwnerLiveAgentId &&
+        (await participantRanSince(
+          db,
+          candidate.companyId,
+          holdOwnerLiveAgentId,
+          candidate.lastAttemptAt?.getTime() ?? 0,
+          REVIEW_PARTICIPANT_LIVE_WINDOW_MS,
+        ))
+      ) {
+        result.skippedOwnerLive += 1;
+        continue;
+      }
 
       if (candidate.attemptCount >= effectiveMaxAttempts) {
         result.maxAttemptsReached += 1;

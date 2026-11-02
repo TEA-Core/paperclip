@@ -9,6 +9,10 @@ import type {
   IssueRecoveryActionStatus,
 } from "@paperclipai/shared";
 import { isTerminalRecoveryAction } from "./issue-continuation-path.js";
+import {
+  REVIEW_PARTICIPANT_LIVE_WINDOW_MS,
+  participantRanSince,
+} from "./recovery/participant-liveness.js";
 
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
@@ -24,6 +28,22 @@ const MAX_UPSERT_RETRIES = 3;
  * source of truth instead of drifting apart.
  */
 export const DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS = 5;
+
+/**
+ * SUP-22273: recovery kinds whose attempt accounting must stand down while
+ * the action's owner agent (or, on a board-owned row, the pending
+ * participant it was minted for) has run within the participant live
+ * window. The stale-wake sweep holds these rows — no attempt burn, no
+ * exhaustion escalation — and a re-mint caps its inherited cumulativeDepth
+ * one below the ceiling, so a live owner cannot churn the fingerprint to
+ * the board (parent incident SUP-21921). Every other kind counts attempts
+ * exactly as before; a genuinely idle owner still walks to exhaustion once
+ * the live window expires.
+ */
+export const OWNER_LIVE_SWEEP_HOLD_KINDS: ReadonlySet<string> = new Set([
+  "stranded_assigned_issue",
+  "review_stage_unarmed",
+]);
 
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -449,6 +469,32 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
     return base;
   }
 
+  // SUP-22273: the liveness subject for a re-mint's owner-live depth cap. The
+  // incoming owner wins; a board-owned mint falls back to the row's recorded
+  // owner lineage (predecessor owner, then the recorded previous owner) so the
+  // pending participant a board row was minted for still answers the question.
+  // An explicit `attemptCount` is authoritative (see the clamp below) and
+  // bypasses the cap entirely.
+  async function remintOwnerRanSincePredecessor(
+    input: UpsertIssueRecoveryActionInput,
+    prev: IssueRecoveryAction,
+  ): Promise<boolean> {
+    if (input.attemptCount !== undefined) return false;
+    const agentId =
+      input.ownerAgentId ??
+      prev.ownerAgentId ??
+      input.previousOwnerAgentId ??
+      prev.previousOwnerAgentId;
+    if (!agentId) return false;
+    return participantRanSince(
+      db,
+      input.companyId,
+      agentId,
+      new Date(prev.updatedAt).getTime(),
+      REVIEW_PARTICIPANT_LIVE_WINDOW_MS,
+    );
+  }
+
   async function listActiveForIssues(companyId: string, sourceIssueIds: string[]) {
     if (sourceIssueIds.length === 0) return new Map<string, IssueRecoveryAction>();
     const rows = await db
@@ -825,7 +871,25 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
       // (`predecessorBudgetExhausted` true) keeps `runAgnosticRepark` false and
       // still wins — the SUP-13698 reset to attempt 1.
       const effectivePredecessorExhausted = predecessorBudgetExhausted && !runAgnosticRepark;
-      const carriedAttemptCount = effectivePredecessorExhausted ? 1 : cumulativeDepth + 1;
+      // SUP-22273: for the two stranded-participant kinds, an owner that ran
+      // since the predecessor's last update is live, not wedged. Cap the
+      // carried cumulative depth one below the effective ceiling so the
+      // successor is minted with at least one sweep attempt of headroom (and
+      // the run-agnostic exhausted-mint gate below cannot fire) instead of
+      // landing at the ceiling for the next sweep to escalate immediately.
+      // Owner idle since the predecessor: no cap — one genuinely idle window
+      // still walks the fingerprint to the board exactly as before. A real
+      // budget reset (`effectivePredecessorExhausted`) keeps minting at 1 and
+      // is never overridden by this cap.
+      const ownerLiveDepthCap =
+        prev != null &&
+        OWNER_LIVE_SWEEP_HOLD_KINDS.has(input.kind) &&
+        (await remintOwnerRanSincePredecessor(input, prev));
+      const carriedAttemptCount = effectivePredecessorExhausted
+        ? 1
+        : ownerLiveDepthCap
+          ? Math.min(cumulativeDepth + 1, Math.max(1, effectiveMaxAttempts - 1))
+          : cumulativeDepth + 1;
       // SUP-14151: clamp the carried count to the effective ceiling. The
       // predecessor-budget reset above only fires when the predecessor carries
       // a non-null maxAttempts; where it was null the count carried forward
