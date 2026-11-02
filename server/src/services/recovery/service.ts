@@ -10957,7 +10957,8 @@ export function recoveryService(
   //   - SUP-22273: stranded-participant kinds (`stranded_assigned_issue`,
   //     `review_stage_unarmed`) whose owner (or pending participant) ran
   //     within the participant live window are held — no attempt burn, no
-  //     ceiling escalation — until the live window expires
+  //     ceiling escalation — until the live window expires or the bounded
+  //     hold deadline passes
   //   - ordinary `board_escalation` actions may be rerouted to an invokable
   //     owner; pending-participant board repairs stay manual across sweeps
   //   - attemptCount/lastAttemptAt are bumped under a compare-and-swap on the
@@ -11013,12 +11014,14 @@ export function recoveryService(
       // exhaustion check so an at-ceiling row with a live owner is held
       // rather than escalated. Expiry preserved: once no owner run falls in
       // the window, the sweep counts attempts (and escalates at the ceiling)
-      // exactly as before.
+      // exactly as before. The hold also expires two live windows after the
+      // row's last update, which remains fixed while the row is held.
       const holdOwnerLiveAgentId =
         OWNER_LIVE_SWEEP_HOLD_KINDS.has(candidate.kind) &&
         (candidate.ownerAgentId ?? candidate.previousOwnerAgentId);
       if (
         holdOwnerLiveAgentId &&
+        candidate.updatedAt.getTime() + 2 * REVIEW_PARTICIPANT_LIVE_WINDOW_MS > now.getTime() &&
         (await participantRanSince(
           db,
           candidate.companyId,
