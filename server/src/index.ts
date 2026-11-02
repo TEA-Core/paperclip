@@ -128,6 +128,7 @@ import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
+import { applyWorktreeSecretsMasterKeyEnvOverridesFromRuntimeEnv } from "./dev-runner-worktree.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
 import { ensureDecisionSigningSecret, assertDecisionSigningKeyPathAtBoot, countStaleSignedDecisions } from "./services/decision-signing.js";
@@ -246,6 +247,11 @@ async function startServerWithDatabaseTeardown(
   // sentry.ts.
   await sentryReady;
   ensureDecisionSigningSecret();
+  // SUP-22348: a minimal-no-secrets worktree must never keep secrets master
+  // key values inherited from the parent process; the worktree env owns them.
+  // Must run before the secrets env defaults below so a deleted inherited
+  // key-file path can be re-defaulted from the worktree's own config.
+  applyWorktreeSecretsMasterKeyEnvOverridesFromRuntimeEnv(process.env);
   let config = loadConfig();
   initTelemetry({ enabled: config.telemetryEnabled });
   if (process.env.PAPERCLIP_SECRETS_PROVIDER === undefined) {

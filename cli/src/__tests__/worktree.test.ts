@@ -2433,13 +2433,24 @@ describe("worktree helpers", () => {
       const secretId = randomUUID();
       const routineId = randomUUID();
       const agentId = randomUUID();
+      const projectId = randomUUID();
+      const routineRevisionId = randomUUID();
+      const agentRevisionId = randomUUID();
       await sourceClient.$client.unsafe(
         `insert into "company_secrets" ("id", "company_id", "key", "name") values ($1, $2, $3, $4)`,
         [secretId, companyId, "PROD_TOKEN", "Production token"],
       );
       await sourceClient.$client.unsafe(
-        `insert into "routines" ("id", "company_id", "title") values ($1, $2, $3)`,
-        [routineId, companyId, "Secret-bearing routine"],
+        `insert into "routines" ("id", "company_id", "title", "env") values ($1, $2, $3, $4::jsonb)`,
+        [
+          routineId,
+          companyId,
+          "Secret-bearing routine",
+          JSON.stringify({
+            PROD_TOKEN: { type: "secret_ref", secretId },
+            LEGACY_TOKEN: "legacy-plaintext-token",
+          }),
+        ],
       );
       await sourceClient.$client.unsafe(
         `insert into "agents" ("id", "company_id", "name", "adapter_config") values ($1, $2, $3, $4::jsonb)`,
@@ -2452,6 +2463,60 @@ describe("worktree helpers", () => {
             managedProfileId: "production-managed-profile",
             model: "claude-sonnet-5",
             env: { API_KEY: { type: "secret_ref", secretId } },
+          }),
+        ],
+      );
+      await sourceClient.$client.unsafe(
+        `insert into "agent_config_revisions" ("id", "company_id", "agent_id", "before_config", "after_config") values ($1, $2, $3, $4::jsonb, $5::jsonb)`,
+        [
+          agentRevisionId,
+          companyId,
+          agentId,
+          JSON.stringify({
+            provider: "claude_managed",
+            managedProfileId: "production-managed-profile",
+            model: "old-model",
+            env: { API_KEY: { type: "secret_ref", secretId } },
+          }),
+          JSON.stringify({
+            provider: "claude_managed",
+            agentCoreProfileId: "production-core-profile",
+            model: "claude-sonnet-5",
+            env: { TOKEN: "plaintext-token" },
+          }),
+        ],
+      );
+      await sourceClient.$client.unsafe(
+        `insert into "projects" ("id", "company_id", "name", "env") values ($1, $2, $3, $4::jsonb)`,
+        [
+          projectId,
+          companyId,
+          "Secret-bearing project",
+          JSON.stringify({
+            ANTHROPIC_API_KEY: "plaintext-production-token",
+            WEBHOOK_SECRET: { type: "secret_ref", secretId },
+            USER_TOKEN: { type: "user_secret_ref", key: "user-declared-key" },
+          }),
+        ],
+      );
+      await sourceClient.$client.unsafe(
+        `insert into "routine_revisions" ("id", "company_id", "routine_id", "revision_number", "title", "snapshot") values ($1, $2, $3, $4, $5, $6::jsonb)`,
+        [
+          routineRevisionId,
+          companyId,
+          routineId,
+          1,
+          "Secret-bearing routine",
+          JSON.stringify({
+            version: 1,
+            routine: {
+              title: "Secret-bearing routine",
+              env: {
+                PROD_TOKEN: { type: "secret_ref", secretId },
+                LEGACY_TOKEN: "legacy-plaintext-token",
+              },
+            },
+            triggers: [],
           }),
         ],
       );
@@ -2564,6 +2629,60 @@ describe("worktree helpers", () => {
         expect(agentRows).toEqual([{
           adapterConfig: { model: "claude-sonnet-5", env: {} },
         }]);
+        const agentRevisionRows = await targetDb.$client.unsafe<{
+          beforeConfig: Record<string, unknown>;
+          afterConfig: Record<string, unknown>;
+        }[]>(
+          `select "before_config" as "beforeConfig", "after_config" as "afterConfig" from "agent_config_revisions" where "id" = $1`,
+          [agentRevisionId],
+        );
+        expect(agentRevisionRows).toEqual([{
+          beforeConfig: { model: "old-model", env: {} },
+          afterConfig: { model: "claude-sonnet-5", env: {} },
+        }]);
+        const projectRows = await targetDb.$client.unsafe<{
+          env: Record<string, unknown> | null;
+          name: string;
+        }[]>(
+          `select "env", "name" from "projects" where "id" = $1`,
+          [projectId],
+        );
+        expect(projectRows).toEqual([{ env: {}, name: "Secret-bearing project" }]);
+        const routineRows = await targetDb.$client.unsafe<{ env: Record<string, unknown> | null }[]>(
+          `select "env" from "routines" where "id" = $1`,
+          [routineId],
+        );
+        expect(routineRows).toEqual([{ env: {} }]);
+        const routineRevisionRows = await targetDb.$client.unsafe<{ snapshot: Record<string, unknown> }[]>(
+          `select "snapshot" from "routine_revisions" where "id" = $1`,
+          [routineRevisionId],
+        );
+        expect(routineRevisionRows).toEqual([{
+          snapshot: {
+            version: 1,
+            routine: { title: "Secret-bearing routine", env: {} },
+            triggers: [],
+          },
+        }]);
+        // P2: the scrub must not break later agent updates or revision writes.
+        await targetDb.$client.unsafe(
+          `update "agents" set "name" = $1 where "id" = $2`,
+          ["Renamed agent", agentId],
+        );
+        await targetDb.$client.unsafe(
+          `insert into "agent_config_revisions" ("company_id", "agent_id", "before_config", "after_config") values ($1, $2, $3::jsonb, $4::jsonb)`,
+          [
+            companyId,
+            agentId,
+            JSON.stringify({ model: "claude-sonnet-5", env: {} }),
+            JSON.stringify({ model: "claude-sonnet-5", env: {} }),
+          ],
+        );
+        const agentRevisionCount = await targetDb.$client.unsafe<{ n: number }[]>(
+          `select count(*)::int as n from "agent_config_revisions" where "agent_id" = $1`,
+          [agentId],
+        );
+        expect(agentRevisionCount[0]?.n ?? -1).toBe(2);
         const pluginRows = await targetDb.$client.unsafe<{ n: number }[]>(
           `select count(*)::int as n from "plugins"`,
         );
@@ -2580,6 +2699,129 @@ describe("worktree helpers", () => {
       if (targetHandle?.startedByThisProcess) {
         await targetHandle.stop();
       }
+      await closeRegisteredClients(sourceDbUrl.toString());
+      await sourceCluster.cleanup();
+      process.chdir(originalCwd);
+      if (originalPaperclipConfig === undefined) {
+        delete process.env.PAPERCLIP_CONFIG;
+      } else {
+        process.env.PAPERCLIP_CONFIG = originalPaperclipConfig;
+      }
+      if (originalInlineMasterKey === undefined) {
+        delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+      } else {
+        process.env.PAPERCLIP_SECRETS_MASTER_KEY = originalInlineMasterKey;
+      }
+      if (originalKeyFile === undefined) {
+        delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+      } else {
+        process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = originalKeyFile;
+      }
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  itEmbeddedPostgres("minimal-no-secrets seed failure leaves no fresh master key behind", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-no-secrets-fail-"));
+    const repoRoot = path.join(tempRoot, "repo");
+    const sourceRoot = path.join(tempRoot, "source");
+    const homeDir = path.join(tempRoot, ".paperclip-worktrees");
+    const currentInstanceId = "no-secrets-fail-worktree";
+    const currentPaths = resolveWorktreeLocalPaths({
+      cwd: repoRoot,
+      homeDir,
+      instanceId: currentInstanceId,
+    });
+    const sourcePaths = resolveWorktreeLocalPaths({
+      cwd: sourceRoot,
+      homeDir: path.join(tempRoot, ".paperclip-source"),
+      instanceId: "default",
+    });
+    const originalCwd = process.cwd();
+    const originalPaperclipConfig = process.env.PAPERCLIP_CONFIG;
+    const originalInlineMasterKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+    const originalKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    const currentDatabaseReservation = await reserveTestPort();
+    const currentDatabasePort = currentDatabaseReservation.port;
+    const sourceCluster = await startEmbeddedPostgresTestDatabase("paperclip-worktree-no-secrets-fail-source-");
+    const sourceDbUrl = new URL(sourceCluster.connectionString);
+    sourceDbUrl.pathname = "/no_secrets_source_fail";
+    delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+    delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+
+    try {
+      fs.mkdirSync(path.dirname(currentPaths.configPath), { recursive: true });
+      fs.mkdirSync(path.dirname(sourcePaths.configPath), { recursive: true });
+      fs.mkdirSync(path.dirname(sourcePaths.secretsKeyFilePath), { recursive: true });
+      fs.mkdirSync(repoRoot, { recursive: true });
+      fs.mkdirSync(sourceRoot, { recursive: true });
+
+      // Migrated but EMPTY source: the fresh master key is resolved before
+      // validation runs, so this failure path is exactly the regression the
+      // key-ordering fix guards.
+      await ensurePostgresDatabase(sourceCluster.connectionString, "no_secrets_source_fail");
+      const migrationsRoot = new URL("../../../packages/db/src/migrations/", import.meta.url).pathname;
+      const sourceClient = createDb(sourceDbUrl.toString());
+      await migrate(drizzle(sourceClient.$client), { migrationsFolder: migrationsRoot });
+      await sourceClient.$client.end({ timeout: 5 });
+
+      const sourceConfig = buildSourceConfig();
+      sourceConfig.database = {
+        mode: "postgres",
+        embeddedPostgresDataDir: sourcePaths.embeddedPostgresDataDir,
+        embeddedPostgresPort: 54329,
+        backup: {
+          enabled: true,
+          intervalMinutes: 60,
+          retentionDays: 30,
+          dir: sourcePaths.backupDir,
+        },
+        connectionString: sourceDbUrl.toString(),
+      };
+      sourceConfig.logging.logDir = sourcePaths.logDir;
+      sourceConfig.storage.localDisk.baseDir = sourcePaths.storageDir;
+      sourceConfig.secrets.localEncrypted.keyFilePath = sourcePaths.secretsKeyFilePath;
+      fs.writeFileSync(sourcePaths.secretsKeyFilePath, "source-secret-material", "utf8");
+      fs.writeFileSync(sourcePaths.configPath, JSON.stringify(sourceConfig, null, 2), "utf8");
+      fs.writeFileSync(
+        path.join(path.dirname(sourcePaths.configPath), ".env"),
+        "PAPERCLIP_SECRETS_MASTER_KEY=inline-source-master-material\n",
+        "utf8",
+      );
+
+      const currentConfig = buildWorktreeConfig({
+        sourceConfig: buildSourceConfig(),
+        paths: currentPaths,
+        serverPort: 3116,
+        databasePort: currentDatabasePort,
+      });
+      fs.writeFileSync(currentPaths.configPath, JSON.stringify(currentConfig, null, 2), "utf8");
+      fs.writeFileSync(
+        currentPaths.envPath,
+        [
+          `PAPERCLIP_HOME=${homeDir}`,
+          `PAPERCLIP_INSTANCE_ID=${currentInstanceId}`,
+        ].join("\n"),
+        "utf8",
+      );
+
+      delete process.env.PAPERCLIP_CONFIG;
+      process.chdir(repoRoot);
+
+      await currentDatabaseReservation.release();
+
+      await expect(worktreeReseedCommand({
+        fromConfig: sourcePaths.configPath,
+        seedMode: "minimal-no-secrets",
+        yes: true,
+      })).rejects.toThrow(/Seed validation|No auth user|No representative/);
+
+      const rewrittenEnv = fs.readFileSync(currentPaths.envPath, "utf8");
+      expect(rewrittenEnv).not.toMatch(/^PAPERCLIP_SECRETS_MASTER_KEY=/m);
+      expect(fs.existsSync(path.join(currentPaths.instanceRoot, "secrets", "master.key"))).toBe(false);
+      expect(fs.existsSync(path.join(currentPaths.instanceRoot, ".secrets", "master.key"))).toBe(false);
+    } finally {
+      await currentDatabaseReservation.release();
       await closeRegisteredClients(sourceDbUrl.toString());
       await sourceCluster.cleanup();
       process.chdir(originalCwd);
