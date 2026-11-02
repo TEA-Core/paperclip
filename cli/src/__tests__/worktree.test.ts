@@ -2432,6 +2432,7 @@ describe("worktree helpers", () => {
       const { companyId } = await seedValidWorktreeSource(sourceDbUrl.toString());
       const secretId = randomUUID();
       const routineId = randomUUID();
+      const agentId = randomUUID();
       await sourceClient.$client.unsafe(
         `insert into "company_secrets" ("id", "company_id", "key", "name") values ($1, $2, $3, $4)`,
         [secretId, companyId, "PROD_TOKEN", "Production token"],
@@ -2439,6 +2440,20 @@ describe("worktree helpers", () => {
       await sourceClient.$client.unsafe(
         `insert into "routines" ("id", "company_id", "title") values ($1, $2, $3)`,
         [routineId, companyId, "Secret-bearing routine"],
+      );
+      await sourceClient.$client.unsafe(
+        `insert into "agents" ("id", "company_id", "name", "adapter_config") values ($1, $2, $3, $4::jsonb)`,
+        [
+          agentId,
+          companyId,
+          "Secret-bearing agent",
+          JSON.stringify({
+            provider: "claude_managed",
+            managedProfileId: "production-managed-profile",
+            model: "claude-sonnet-5",
+            env: { API_KEY: { type: "secret_ref", secretId } },
+          }),
+        ],
       );
       await sourceClient.$client.unsafe(
         `insert into "routine_triggers" ("company_id", "routine_id", "kind", "secret_id") values ($1, $2, $3, $4)`,
@@ -2542,6 +2557,13 @@ describe("worktree helpers", () => {
           `select count(*)::int as n from "routine_triggers" where "secret_id" is not null`,
         );
         expect(liveSecretRefs[0]?.n ?? -1).toBe(0);
+        const agentRows = await targetDb.$client.unsafe<{ adapterConfig: Record<string, unknown> }[]>(
+          `select "adapter_config" as "adapterConfig" from "agents" where "id" = $1`,
+          [agentId],
+        );
+        expect(agentRows).toEqual([{
+          adapterConfig: { model: "claude-sonnet-5", env: {} },
+        }]);
         const pluginRows = await targetDb.$client.unsafe<{ n: number }[]>(
           `select count(*)::int as n from "plugins"`,
         );
