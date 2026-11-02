@@ -311,11 +311,11 @@ async function githubBranchExists(
 }
 
 /**
- * SUP-21902: resolve a named git ref (a sha, or a branch such as the default
- * branch) to the commit sha it currently points at in the remote repository.
- * The Tier 2 origin predicate resolves BOTH the probe head named in the close
- * declaration and the delivery default-branch tip through this single probe so
- * the two shas are comparable. Outcome classes mirror `githubBranchExists`:
+ * SUP-21902: resolve a named git ref (a sha, or a branch) to the full commit
+ * sha it points at in the remote repository. The Tier 2 origin predicate
+ * resolves only the probe head named in the close declaration through this
+ * probe, so it is comparable with the recorded delivery merge commit; the
+ * default branch is never resolved. Outcome classes mirror `githubBranchExists`:
  * a 200 with a sha is positive resolution; 404 is positive NON-resolution (the
  * ref does not exist on the remote); 401/403 classifies as auth failure; every
  * other outcome (network failure, unexpected status, unparseable body) throws
