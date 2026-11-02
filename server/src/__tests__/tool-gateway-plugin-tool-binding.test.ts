@@ -397,11 +397,14 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
     });
   });
 
-  it("rehashes redacted content inside the production plugin dispatch envelope", async () => {
+  it("preserves the on-disk hash and reports the projected hash in the production plugin dispatch envelope", async () => {
     const { company, agent, run } = await createAgentFixture(db, {});
     await allowBothPluginTools(db, company.id);
     const secret = "plugin-result-secret";
     const originalContent = `Authorization: Bearer ${secret}`;
+    const originalHash = createHash("sha256").update(originalContent).digest("hex");
+    const projectedContent = "Authorization: ***REDACTED***";
+    const projectedHash = createHash("sha256").update(projectedContent).digest("hex");
     const dispatcher = twoPluginDispatcher();
     const gateway = createToolGatewayService(db, {
       pluginToolDispatcher: {
@@ -412,7 +415,7 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
             ...result,
             result: {
               content: originalContent,
-              data: { hash: createHash("sha256").update(originalContent).digest("hex") },
+              data: { hash: originalHash },
             },
           };
         },
@@ -429,9 +432,12 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
       pluginId: "plugin-a",
       toolName: "alpha",
       result: {
-        content: "Authorization: ***REDACTED***",
+        content: projectedContent,
         data: {
-          hash: createHash("sha256").update("Authorization: ***REDACTED***").digest("hex"),
+          hash: originalHash,
+          projectedHash,
+          projectedSizeBytes: Buffer.byteLength(projectedContent, "utf8"),
+          redacted: true,
         },
         redacted: true,
         redactedFields: ["sensitive_value"],
@@ -448,11 +454,14 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
       typeof data !== "object" ||
       data === null ||
       !("hash" in data) ||
-      typeof data.hash !== "string"
+      typeof data.hash !== "string" ||
+      !("projectedHash" in data) ||
+      typeof data.projectedHash !== "string"
     ) {
-      throw new Error("Expected a plugin result with string content and hash data");
+      throw new Error("Expected a plugin result with string content, on-disk hash, and projected hash data");
     }
-    expect(createHash("sha256").update(content).digest("hex")).toBe(data.hash);
+    expect(data.hash).toBe(originalHash);
+    expect(data.projectedHash).toBe(createHash("sha256").update(content).digest("hex"));
     expect(content).not.toContain(secret);
   });
 

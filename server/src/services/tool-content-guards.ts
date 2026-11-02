@@ -243,7 +243,12 @@ export function validateToolContent(input: {
         redactedFields: [...new Set([...(Array.isArray(redactedResult.redactedFields) ? redactedResult.redactedFields : []), ...findings])],
       });
       if (isPlainObject(redactedResult.data) && typeof redactedResult.content === "string" && typeof redactedResult.data.hash === "string") {
-        redactedResult.data.hash = createHash("sha256").update(redactedResult.content, "utf8").digest("hex");
+        // `hash` describes the bytes a write CAS-checks (the plugin-supplied
+        // on-disk hash); never rewrite it to the projected content. Instead
+        // surface the projection explicitly so callers can tell the two apart.
+        redactedResult.data.redacted = true;
+        redactedResult.data.projectedHash = createHash("sha256").update(redactedResult.content, "utf8").digest("hex");
+        redactedResult.data.projectedSizeBytes = Buffer.byteLength(redactedResult.content, "utf8");
       }
     }
   }
