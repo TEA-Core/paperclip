@@ -1052,8 +1052,9 @@ async function proveLandedAtTip(
 //  - the named head resolves in the delivery repository (a 404 is the
 //    `head_unresolvable` refusal, not an allow);
 //  - the resolved probe head equals THIS DELIVERY'S RECORDED MERGE COMMIT — the
-//    `mergeCommitSha` stamped on the issue's merged `pull_request` work product by
-//    pr-delivery (`metadata.mergeCommitSha`, sourced from GitHub at merge time) —
+//    full 40-hex `mergeCommitSha` stamped on the issue's MOST RECENT merged
+//    `pull_request` work product by pr-delivery (`metadata.mergeCommitSha`, sourced
+//    from GitHub at merge time), compared by exact equality —
 //    NOT the live default-branch tip, which moves with every later merge and would
 //    let a probe at an earlier merge pass as proof of the current live surface;
 //  - when no recorded merge commit is available at close time the close fails
@@ -1092,18 +1093,20 @@ function unverifiedTier2(err: unknown): string {
 }
 
 /**
- * SUP-21902 (re-slice): this delivery's RECORDED merge commit(s), read from the
+ * SUP-21902 (re-slice): this delivery's RECORDED merge commit, read from the
  * merged `pull_request` work products pr-delivery stamps with
- * `metadata.mergeCommitSha` at merge time. Distinct recorded shas are returned
- * lowercased; a probe head matching any recorded merge commit for this issue
- * satisfies the equality leg (a carrier issue can record more than one merged
- * PR), while an empty result means the merge commit is not recorded and the
- * caller must fail closed rather than fall back to the live branch tip.
+ * `metadata.mergeCommitSha` at merge time. Only the MOST RECENT merged row
+ * (latest `metadata.mergedAt`) counts: a probe at an earlier merge commit of the
+ * same issue did not run against the whole delivery. The recorded value must be
+ * a full 40-hex sha. Returns null when there is no unique, well-formed most
+ * recent merge commit (none recorded, a malformed sha, or a tie between
+ * different shas), and the caller must fail closed rather than fall back to the
+ * live branch tip.
  */
-async function loadRecordedDeliveryMergeCommits(
+async function loadRecordedDeliveryMergeCommit(
   db: Db,
   issue: { id: string; companyId: string },
-): Promise<string[]> {
+): Promise<string | null> {
   const rows = await db
     .select({ metadata: issueWorkProducts.metadata })
     .from(issueWorkProducts)
@@ -1115,19 +1118,22 @@ async function loadRecordedDeliveryMergeCommits(
         eq(issueWorkProducts.status, "merged"),
       ),
     );
-  const shas = new Set<string>();
+  let latestMergedAt = Number.NEGATIVE_INFINITY;
+  let latestShas = new Set<string | null>();
   for (const row of rows) {
-    const sha = (row.metadata as Record<string, unknown> | null)?.mergeCommitSha;
-    if (typeof sha === "string" && /^[0-9a-f]{7,40}$/i.test(sha.trim())) {
-      shas.add(sha.trim().toLowerCase());
+    const metadata = (row.metadata ?? {}) as Record<string, unknown>;
+    const mergedAt = typeof metadata.mergedAt === "string" ? Date.parse(metadata.mergedAt) : Number.NaN;
+    const at = Number.isNaN(mergedAt) ? Number.NEGATIVE_INFINITY : mergedAt;
+    const sha = typeof metadata.mergeCommitSha === "string" ? metadata.mergeCommitSha.trim().toLowerCase() : "";
+    const recorded = /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+    if (at > latestMergedAt) {
+      latestMergedAt = at;
+      latestShas = new Set([recorded]);
+    } else if (at === latestMergedAt) {
+      latestShas.add(recorded);
     }
   }
-  return [...shas];
-}
-
-function recordedMergeCommitMatches(recorded: string, resolvedProbeHead: string): boolean {
-  if (recorded.length === 40) return recorded === resolvedProbeHead;
-  return resolvedProbeHead.startsWith(recorded);
+  return latestShas.size === 1 ? [...latestShas][0]! : null;
 }
 
 async function proveTier2Live(
@@ -1163,10 +1169,10 @@ async function proveTier2Live(
   } catch (err) {
     return refuseTier2(unverifiedTier2(err));
   }
-  if (!ctx?.repoUrl || !ctx.defaultRef) {
+  if (!ctx?.repoUrl) {
     return refuseTier2(
-      "Tier 2 declaration could not be verified: no repository default branch is resolvable, " +
-        "so no delivery merge head exists to match the probe head against. " +
+      "Tier 2 declaration could not be verified: no delivery repository is resolvable, " +
+        "so the probe head cannot be resolved against a delivery merge head. " +
         `Accepted form: ${TIER2_FORM}`,
     );
   }
@@ -1177,18 +1183,18 @@ async function proveTier2Live(
         `Accepted form: ${TIER2_FORM}`,
     );
   }
-  let recordedMergeCommits: string[];
+  let recordedMergeCommit: string | null;
   try {
-    recordedMergeCommits = await loadRecordedDeliveryMergeCommits(db, issue);
+    recordedMergeCommit = await loadRecordedDeliveryMergeCommit(db, issue);
   } catch (err) {
     return refuseTier2(unverifiedTier2(err));
   }
-  if (recordedMergeCommits.length === 0) {
+  if (recordedMergeCommit === null) {
     return refuseTier2(
       "Tier 2 declaration could not be verified: no recorded delivery merge commit is available " +
-        "for this issue (merge_commit_unrecorded); the recorded merge commit is the " +
-        "`mergeCommitSha` on a merged pull_request work product, and there is no fallback to " +
-        "the live branch tip. " +
+        "for this issue (merge_commit_unrecorded); the recorded merge commit is the full 40-hex " +
+        "`mergeCommitSha` on the most recent merged pull_request work product, and there is no " +
+        "fallback to the live branch tip. " +
         `Accepted form: ${TIER2_FORM}`,
     );
   }
@@ -1225,10 +1231,10 @@ async function proveTier2Live(
         `Accepted form: ${TIER2_FORM}`,
     );
   }
-  if (!recordedMergeCommits.some((recorded) => recordedMergeCommitMatches(recorded, probeHeadResolved))) {
+  if (probeHeadResolved !== recordedMergeCommit) {
     return refuseTier2(
       `Tier 2 declaration head ${probeHead} (resolved ${probeHeadResolved}) does not match the ` +
-        `delivery merge head ${recordedMergeCommits.join(", ")} recorded for this delivery; the probe did not run ` +
+        `delivery merge head ${recordedMergeCommit} recorded for this delivery; the probe did not run ` +
         "against this delivery's recorded merge commit, so pre-merge probe output is not live proof. " +
         `Accepted form: ${TIER2_FORM}`,
     );

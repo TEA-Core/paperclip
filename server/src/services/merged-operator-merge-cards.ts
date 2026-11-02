@@ -402,7 +402,13 @@ export function createMergedOperatorMergeCardSweepService(
       const probeReference = references.find((reference) =>
         evidence.get(pullRequestEvidenceKey(row.companyId, reference))?.mergeCommitSha,
       );
-      if (!probeReference) continue;
+      if (!probeReference) {
+        logger.warn(
+          { issueId: row.id },
+          "merged operator merge-card sweep: no gate pull request has a merge commit to name as the Tier-2 probe head; deferring",
+        );
+        continue;
+      }
       const probeItem = evidence.get(pullRequestEvidenceKey(row.companyId, probeReference))!;
       const guardProbeEvidence =
         `probe \`merged-operator merge-card sweep gate PRs ${references.map((r) => `${r.owner}/${r.repo}#${r.number}`).join(", ")}\` ` +

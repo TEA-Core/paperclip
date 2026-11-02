@@ -5519,7 +5519,14 @@ describe("evaluateDoneTierDeclaration", () => {
     });
   }
 
-  function setupTier2OriginMocks(recordedMergeCommits: string[] = [T2_MERGE_SHA]) {
+  const T2_MERGED_AT = "2026-10-30T00:00:00.000Z";
+
+  function setupTier2OriginMocks(
+    recordedMergedPullRequests: Array<{ mergeCommitSha: string; mergedAt?: string }> = [
+      { mergeCommitSha: T2_MERGE_SHA, mergedAt: T2_MERGED_AT },
+    ],
+    workspaceRow: Partial<Record<string, unknown>> = {},
+  ) {
     ghFetchMock.mockReset();
     mockResolveGitHubToken.mockReset();
     mockResolveGitHubToken.mockResolvedValue({
@@ -5528,10 +5535,8 @@ describe("evaluateDoneTierDeclaration", () => {
       secretName: "GITHUB_TOKEN",
     });
     setupDbMock({
-      executionWorkspaces: [mockExecutionWorkspaceRow()],
-      issueWorkProducts: recordedMergeCommits.map((sha) => ({
-        metadata: { mergeCommitSha: sha, mergedAt: "2026-10-30T00:00:00.000Z" },
-      })),
+      executionWorkspaces: [mockExecutionWorkspaceRow(workspaceRow)],
+      issueWorkProducts: recordedMergedPullRequests.map((metadata) => ({ metadata })),
     });
   }
 
@@ -5664,15 +5669,102 @@ describe("evaluateDoneTierDeclaration", () => {
     it("SUP-21902: refuses a valid-shape Tier 2 declaration on a card with no resolvable delivery repository (fail closed)", async () => {
       const result = await evaluateDoneTierDeclaration(
         mockDb,
-        tierIssue,
+        { ...tierIssue, projectId: null, projectWorkspaceId: null, executionWorkspaceId: null },
         tier2Line(validTier2Evidence()),
         null,
         () => Promise.resolve([]),
       );
       expect(result.allowed).toBe(false);
       expect(result.tier).toBe(null);
-      expect(result.reason).toContain("no repository default branch is resolvable");
+      expect(result.reason).toContain("no delivery repository is resolvable");
       expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("SUP-21902: accepts a probe at the recorded merge commit when the repository has no default branch ref (the predicate never reads it)", async () => {
+      setupTier2OriginMocks(undefined, { baseRef: null });
+      mockRefHeadResolutions([{ ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA }]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+    });
+
+    it("SUP-21902: a recorded merge commit shorter than 40 hex never matches, even when it is a prefix of the resolved probe head", async () => {
+      for (const shortRecorded of [T2_MERGE_SHA.slice(0, 7), T2_PROBE_HEAD, T2_MERGE_SHA.slice(0, 39)]) {
+        setupTier2OriginMocks([{ mergeCommitSha: shortRecorded, mergedAt: T2_MERGED_AT }]);
+        mockRefHeadResolutions([{ ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA }]);
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          repoBackedTierIssue(),
+          tier2Line(validTier2Evidence()),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("merge_commit_unrecorded");
+      }
+    });
+
+    it("SUP-21902: compares the probe head only with the most recent merged PR's commit (PR#1 at A, PR#2 at B: probe at A refused, probe at B allowed)", async () => {
+      // Newest row listed first so the outcome cannot depend on row order.
+      const recorded = [
+        { mergeCommitSha: T2_STRANGER_SHA, mergedAt: "2026-10-31T00:00:00.000Z" },
+        { mergeCommitSha: T2_MERGE_SHA, mergedAt: "2026-10-29T00:00:00.000Z" },
+      ];
+      const probeAtB = "bbbbbbbbbb";
+      const resolutions = [
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: probeAtB, sha: T2_STRANGER_SHA },
+      ];
+
+      setupTier2OriginMocks(recorded);
+      mockRefHeadResolutions(resolutions);
+      const atA = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence(T2_PROBE_HEAD)),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(atA.allowed).toBe(false);
+      expect(atA.tier).toBe(null);
+      expect(atA.reason).toContain(T2_STRANGER_SHA);
+      expect(atA.reason).toContain("recorded for this delivery");
+
+      setupTier2OriginMocks(recorded);
+      mockRefHeadResolutions(resolutions);
+      const atB = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence(probeAtB)),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(atB.allowed).toBe(true);
+      expect(atB.tier).toBe("tier2");
+    });
+
+    it("SUP-21902: refuses (merge_commit_unrecorded) when the most recent merged rows tie on mergedAt with different commits", async () => {
+      setupTier2OriginMocks([
+        { mergeCommitSha: T2_MERGE_SHA, mergedAt: T2_MERGED_AT },
+        { mergeCommitSha: T2_STRANGER_SHA, mergedAt: T2_MERGED_AT },
+      ]);
+      mockRefHeadResolutions([{ ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA }]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("merge_commit_unrecorded");
     });
 
     it("SUP-21902: refuses malformed Tier 2 shapes (missing probe command, head, or post-merge predicate) without GitHub calls", async () => {
