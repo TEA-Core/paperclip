@@ -154,7 +154,10 @@ import {
 } from "./parent-edge-close-ladder-gate.js";
 import { edgeCarriesLadderCarveOutLabel } from "./laddered-child-eligibility.js";
 import { instanceSettingsService } from "./instance-settings.js";
-import { assertWikiHandoffWriteIntegrity } from "./issue-assignee-review-gate.js";
+import {
+  assertAssigneeWriteDoesNotSelfSatisfyReviewStage,
+  assertWikiHandoffWriteIntegrity,
+} from "./issue-assignee-review-gate.js";
 import {
   type CurrentUserRedactionOptions,
   redactCurrentUserText,
@@ -12074,11 +12077,41 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        await assertWikiHandoffWriteIntegrity({
+          db: tx as Db,
+          companyId: receiptExisting.companyId,
+          issue: {
+            title:
+              issueData.title !== undefined ? issueData.title : receiptExisting.title,
+            description:
+              issueData.description !== undefined
+                ? issueData.description
+                : receiptExisting.description,
+            executionPolicy:
+              issueData.executionPolicy !== undefined
+                ? issueData.executionPolicy
+                : receiptExisting.executionPolicy,
+            executionState:
+              issueData.executionState !== undefined
+                ? issueData.executionState
+                : receiptExisting.executionState,
+          },
+          incomingAssigneeAgentId:
+            issueData.assigneeAgentId !== undefined
+              ? issueData.assigneeAgentId
+              : receiptExisting.assigneeAgentId,
+          checkReviewStage: false,
+        });
         if (issueData.assigneeAgentId !== undefined) {
-          await assertWikiHandoffWriteIntegrity({
-            db: tx as Db,
-            companyId: receiptExisting.companyId,
-            issue: receiptExisting,
+          assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
+            executionPolicy:
+              issueData.executionPolicy !== undefined
+                ? issueData.executionPolicy
+                : receiptExisting.executionPolicy,
+            executionState:
+              issueData.executionState !== undefined
+                ? issueData.executionState
+                : receiptExisting.executionState,
             incomingAssigneeAgentId: issueData.assigneeAgentId,
           });
         }

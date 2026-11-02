@@ -377,4 +377,30 @@ describeEmbeddedPostgres("plugin-host wiki handoff issue update guard (SUP-21752
     expect(updated.description).toBe("Updated by the wiki plugin host");
     services.dispose();
   });
+
+  it("uses the resulting description when clearing a handoff marker", async () => {
+    const { company } = await seedWikiHandoff();
+    const issue = await db
+      .insert(issues)
+      .values({
+        companyId: company.id,
+        title: "Ordinary issue",
+        description: "Discuss the handoff to Wiki Maintainer process",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: CANONICAL,
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
+
+    const updated = await services.issues.update({
+      issueId: issue.id,
+      companyId: company.id,
+      patch: { description: null, assigneeAgentId: INTRUDER },
+    });
+    expect(updated.assigneeAgentId).toBe(INTRUDER);
+    expect(updated.description).toBeNull();
+    services.dispose();
+  });
 });

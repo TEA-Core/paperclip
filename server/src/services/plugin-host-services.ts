@@ -71,8 +71,6 @@ import type { PluginEventBus } from "./plugin-event-bus.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { assertIssueExecutionPolicySatisfiable } from "./trust-preset-resolver.js";
-import { assertWikiHandoffWriteIntegrity, findSelfSatisfyingReviewStage } from "./issue-assignee-review-gate.js";
-import { unprocessable } from "../errors.js";
 import type { IncomingMessage, RequestOptions as HttpRequestOptions } from "node:http";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -1956,46 +1954,6 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         const existing = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
-        {
-          const patchPreview = params.patch as Record<string, unknown> | undefined;
-          const resultingAssignee = patchPreview && "assigneeAgentId" in patchPreview
-            ? (patchPreview.assigneeAgentId as string | null | undefined)
-            : existing.assigneeAgentId;
-          const resultingPolicy = patchPreview && patchPreview.executionPolicy !== undefined
-            ? patchPreview.executionPolicy
-            : existing.executionPolicy;
-          await assertWikiHandoffWriteIntegrity({
-            db,
-            companyId,
-            issue: {
-              title: (patchPreview?.title as string | undefined) ?? existing.title,
-              description: (patchPreview?.description as string | undefined) ?? existing.description,
-              executionPolicy: resultingPolicy,
-              executionState: existing.executionState,
-            },
-            incomingAssigneeAgentId: resultingAssignee,
-          });
-          if (patchPreview && "assigneeAgentId" in patchPreview) {
-            const finding = findSelfSatisfyingReviewStage({
-              executionPolicy: resultingPolicy,
-              executionState: existing.executionState,
-              incomingAssigneeAgentId: patchPreview.assigneeAgentId as string | null | undefined,
-            });
-            if (finding) {
-              throw unprocessable(
-                `Refusing assigneeAgentId write: ${finding.assigneeAgentId} is a participant of incomplete review stage ${finding.stageId} and the write would make the stage self-satisfiable, because it cannot be cleared without the assignee approving their own work (participants excluding the assignee: ${finding.participantsExcludingAssignee}, approvalsNeeded: ${finding.approvalsNeeded})`,
-                {
-                  guard: "assignee_review_gate",
-                  issueStageId: finding.stageId,
-                  stageType: finding.stageType,
-                  assigneeAgentId: finding.assigneeAgentId,
-                  participantsExcludingAssignee: finding.participantsExcludingAssignee,
-                  approvalsNeeded: finding.approvalsNeeded,
-                },
-              );
-            }
-          }
-        }
         const patch = { ...(params.patch as Record<string, unknown>) };
         const actorAgentId = typeof patch.actorAgentId === "string" ? patch.actorAgentId : null;
         const actorUserId = typeof patch.actorUserId === "string" ? patch.actorUserId : null;

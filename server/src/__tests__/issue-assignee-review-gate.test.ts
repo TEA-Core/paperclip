@@ -726,7 +726,7 @@ describeEmbeddedPostgres("wiki handoff canonical resolution (SUP-21752)", () => 
     await expect(
       resolveCanonicalWikiMaintainerAgentId(db, companyId, {
         title: "Ordinary issue",
-        description: null,
+        description: "Discuss the handoff to Wiki Maintainer process",
       }),
     ).resolves.toBeNull();
   });

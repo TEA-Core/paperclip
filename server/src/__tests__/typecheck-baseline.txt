@@ -983,7 +983,8 @@ server/src/__tests__/issues-service.test.ts(5333,30): TS2339
 server/src/__tests__/issues-service.test.ts(636,7): TS2769
 server/src/__tests__/issues-service.test.ts(6767,9): TS2769
 server/src/__tests__/issues-service.test.ts(8537,7): TS2769
-server/src/__tests__/issues-service.test.ts(8637,24): TS2741
+server/src/__tests__/issues-service.test.ts(8626,7): TS2769
+server/src/__tests__/issues-service.test.ts(8757,24): TS2741
 server/src/__tests__/join-request-dedupe.test.ts(101,54): TS4104
 server/src/__tests__/join-request-dedupe.test.ts(34,36): TS4104
 server/src/__tests__/join-request-dedupe.test.ts(60,36): TS4104

@@ -156,10 +156,7 @@ export async function resolveCanonicalWikiMaintainerAgentId(
   issue: { title?: string | null; description?: string | null } | null | undefined,
 ): Promise<string | null> {
   if (!issue?.title?.trim() && !issue?.description?.trim()) return null;
-  if (!isWikiHandoffTitle(issue.title)) {
-    const description = issue.description ?? "";
-    if (!description.toLowerCase().includes("handoff to wiki maintainer")) return null;
-  }
+  if (!isWikiHandoffTitle(issue.title)) return null;
   const rows = await db
     .select({ resourceId: pluginManagedResources.resourceId })
     .from(pluginManagedResources)
@@ -185,6 +182,7 @@ export async function assertWikiHandoffWriteIntegrity(input: {
     executionState?: unknown;
   };
   incomingAssigneeAgentId: string | null | undefined;
+  checkReviewStage?: boolean;
   refusalContext?: { caller: RefusalCaller; issue: RefusalIssue | null };
 }): Promise<void> {
   const canonicalMaintainerAgentId = await resolveCanonicalWikiMaintainerAgentId(
@@ -210,12 +208,14 @@ export async function assertWikiHandoffWriteIntegrity(input: {
       },
     );
   }
-  assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
-    executionPolicy: input.issue.executionPolicy,
-    executionState: input.issue.executionState,
-    incomingAssigneeAgentId: input.incomingAssigneeAgentId,
-    refusalContext: input.refusalContext,
-  });
+  if (input.checkReviewStage !== false) {
+    assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
+      executionPolicy: input.issue.executionPolicy,
+      executionState: input.issue.executionState,
+      incomingAssigneeAgentId: input.incomingAssigneeAgentId,
+      refusalContext: input.refusalContext,
+    });
+  }
 }
 
 export function wikiHandoffWriteWouldViolate(input: {

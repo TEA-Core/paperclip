@@ -18976,12 +18976,22 @@ export function issueRoutes(
       db,
       companyId: existing.companyId,
       issue: {
-        title: updateFields.title ?? existing.title,
-        description: updateFields.description ?? existing.description,
+        title:
+          updateFields.title !== undefined ? updateFields.title : existing.title,
+        description:
+          updateFields.description !== undefined
+            ? updateFields.description
+            : existing.description,
         executionPolicy: nextExecutionPolicy,
-        executionState: existing.executionState,
+        executionState:
+          updateFields.executionState !== undefined
+            ? updateFields.executionState
+            : existing.executionState,
       },
-      incomingAssigneeAgentId: requestedAssigneeAgentId ?? null,
+      incomingAssigneeAgentId:
+        updateFields.assigneeAgentId !== undefined
+          ? (updateFields.assigneeAgentId as string | null)
+          : existing.assigneeAgentId,
       refusalContext:
         req.actor.type === "board"
           ? undefined
