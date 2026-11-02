@@ -1774,15 +1774,110 @@ function countRedactionPlaceholders(contents: string): number {
   return count;
 }
 
+function countRedactionPlaceholdersInLine(line: string): number {
+  return line.includes(WIKI_REDACTION_PLACEHOLDER) ? countRedactionPlaceholders(line) : 0;
+}
+
+function firstLineWithRedactionPlaceholder(lines: string[]): number {
+  for (let index = 0; index < lines.length; index += 1) {
+    if (lines[index].includes(WIKI_REDACTION_PLACEHOLDER)) return index + 1;
+  }
+  return 0;
+}
+
+function refusePlaceholderWriteMessage(path: string, incomingCount: number, currentCount: number, lineNumber: number): string {
+  const location = lineNumber > 0 ? ` near line ${lineNumber}` : "";
+  return (
+    `Refusing to overwrite ${path}: contents carries redaction placeholder(s) absent from the current page ` +
+    `(${incomingCount} vs ${currentCount} on disk, unmatched position${location}); ` +
+    `re-read from disk bytes, do not write back projected content`
+  );
+}
+
+function alignIncomingLinesToDiskLines(diskLines: string[], incomingLines: string[]): number[] {
+  const matchForIncoming = new Array<number>(incomingLines.length).fill(-1);
+  const n = diskLines.length;
+  const m = incomingLines.length;
+  if (n === 0 || m === 0) return matchForIncoming;
+
+  let prefix = 0;
+  while (prefix < n && prefix < m && diskLines[prefix] === incomingLines[prefix]) {
+    matchForIncoming[prefix] = prefix;
+    prefix += 1;
+  }
+  let suffix = 0;
+  while (suffix < n - prefix && suffix < m - prefix && diskLines[n - 1 - suffix] === incomingLines[m - 1 - suffix]) {
+    matchForIncoming[m - 1 - suffix] = n - 1 - suffix;
+    suffix += 1;
+  }
+
+  const midN = n - prefix - suffix;
+  const midM = m - prefix - suffix;
+  if (midN <= 0 || midM <= 0 || midN * midM > 4_000_000) return matchForIncoming;
+
+  const table: Int32Array[] = Array.from({ length: midN + 1 }, () => new Int32Array(midM + 1));
+  for (let a = midN - 1; a >= 0; a -= 1) {
+    const row = table[a];
+    const below = table[a + 1];
+    const diskLine = diskLines[prefix + a];
+    for (let b = midM - 1; b >= 0; b -= 1) {
+      row[b] = diskLine === incomingLines[prefix + b] ? below[b + 1] + 1 : Math.max(below[b], row[b + 1]);
+    }
+  }
+  let a = 0;
+  let b = 0;
+  while (a < midN && b < midM) {
+    if (diskLines[prefix + a] === incomingLines[prefix + b]) {
+      matchForIncoming[prefix + b] = prefix + a;
+      a += 1;
+      b += 1;
+    } else if (table[a + 1][b] >= table[a][b + 1]) {
+      a += 1;
+    } else {
+      b += 1;
+    }
+  }
+  return matchForIncoming;
+}
+
 function assertNoNewRedactionPlaceholders(incomingContents: string, currentContents: string | null, path: string): void {
-  const incomingCount = countRedactionPlaceholders(incomingContents);
+  const incomingLines = incomingContents.split("\n");
+  let incomingCount = 0;
+  for (const line of incomingLines) incomingCount += countRedactionPlaceholdersInLine(line);
   if (incomingCount === 0) return;
-  const currentCount = currentContents == null ? 0 : countRedactionPlaceholders(currentContents);
-  if (incomingCount > currentCount) {
-    throw new Error(
-      `Refusing to overwrite ${path}: contents carries redaction placeholder(s) absent from the current page ` +
-        `(${incomingCount} vs ${currentCount} on disk); re-read from disk bytes, do not write back projected content`,
-    );
+
+  const diskLines = currentContents == null ? [] : currentContents.split("\n");
+  let currentCount = 0;
+  for (const line of diskLines) currentCount += countRedactionPlaceholdersInLine(line);
+  if (currentCount === 0) {
+    throw new Error(refusePlaceholderWriteMessage(path, incomingCount, 0, firstLineWithRedactionPlaceholder(incomingLines)));
+  }
+
+  const matchForIncoming = alignIncomingLinesToDiskLines(diskLines, incomingLines);
+  const m = incomingLines.length;
+  const n = diskLines.length;
+  let i = 0;
+  let diskPos = 0;
+  while (i < m) {
+    if (matchForIncoming[i] >= 0) {
+      diskPos = matchForIncoming[i] + 1;
+      i += 1;
+      continue;
+    }
+    let regionEnd = i;
+    while (regionEnd < m && matchForIncoming[regionEnd] === -1) regionEnd += 1;
+    const nextAnchorDisk = regionEnd < m ? matchForIncoming[regionEnd] : n;
+    const regionDiskLineCount = nextAnchorDisk - diskPos;
+    for (let r = 0; r < regionEnd - i; r += 1) {
+      const incomingLinePlaceholders = countRedactionPlaceholdersInLine(incomingLines[i + r]);
+      if (incomingLinePlaceholders === 0) continue;
+      const diskLinePlaceholders = r < regionDiskLineCount ? countRedactionPlaceholdersInLine(diskLines[diskPos + r]) : 0;
+      if (incomingLinePlaceholders > diskLinePlaceholders) {
+        throw new Error(refusePlaceholderWriteMessage(path, incomingCount, currentCount, i + r + 1));
+      }
+    }
+    i = regionEnd;
+    diskPos = nextAnchorDisk;
   }
 }
 

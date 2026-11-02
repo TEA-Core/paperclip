@@ -3604,6 +3604,74 @@ Duplicate headings receive stable suffixes.
     expect(files.get(path)).toBe(reduced.trimEnd());
   });
 
+  it("rejects an equal-count placeholder relocation and leaves the page byte-identical", async () => {
+    const harness = createTestHarness({ manifest });
+    const original = "# Access notes\n\napi_key: ***REDACTED***\n\nThe service is reached via the internal mesh gateway.\n";
+    const path = "wiki/reports/access-notes.md";
+    const files = new Map<string, string>([[path, original]]);
+    const writes: Array<{ path: string; contents: string }> = [];
+    harness.ctx.localFolders.readText = async (_companyId, _folderKey, relativePath) => {
+      const value = files.get(relativePath);
+      if (value == null) throw new Error("missing");
+      return value;
+    };
+    harness.ctx.localFolders.writeTextAtomic = async (_companyId, _folderKey, relativePath, contents) => {
+      writes.push({ path: relativePath, contents });
+      files.set(relativePath, contents);
+      return harness.ctx.localFolders.status(COMPANY_ID, "wiki-root");
+    };
+
+    await plugin.definition.setup(harness.ctx);
+
+    // Equal total count, but the placeholder moved from its on-disk line onto a line
+    // whose on-disk bytes carry real content. A correct CAS proves the guard fires first.
+    const relocated = "# Access notes\n\napi_key: rotated-inline\n\nThe service is reached via the internal mesh ***REDACTED***.\n";
+    expect(original.split("***REDACTED***").length - 1).toBe(1);
+    expect(relocated.split("***REDACTED***").length - 1).toBe(1);
+    await expect(
+      harness.executeTool("wiki_write_page", {
+        companyId: COMPANY_ID,
+        wikiId: "default",
+        path,
+        contents: relocated,
+        expectedHash: createHash("sha256").update(original, "utf8").digest("hex"),
+      }),
+    ).rejects.toThrow("contents carries redaction placeholder(s) absent from the current page");
+
+    expect(writes).toHaveLength(0);
+    expect(files.get(path)).toBe(original);
+  });
+
+  it("accepts keeping placeholder lines verbatim while editing unrelated lines", async () => {
+    const harness = createTestHarness({ manifest });
+    const original = "# Access notes\n\napi_key: ***REDACTED***\n\nThe service is reached via the internal mesh gateway.\n";
+    const path = "wiki/reports/access-notes-keep.md";
+    const files = new Map<string, string>([[path, original]]);
+    harness.ctx.localFolders.readText = async (_companyId, _folderKey, relativePath) => {
+      const value = files.get(relativePath);
+      if (value == null) throw new Error("missing");
+      return value;
+    };
+    harness.ctx.localFolders.writeTextAtomic = async (_companyId, _folderKey, relativePath, contents) => {
+      files.set(relativePath, contents);
+      return harness.ctx.localFolders.status(COMPANY_ID, "wiki-root");
+    };
+
+    await plugin.definition.setup(harness.ctx);
+
+    const edited = "# Access notes\n\napi_key: ***REDACTED***\n\nThe service is reached via the internal mesh gateway cluster.\n";
+    await expect(
+      harness.executeTool("wiki_write_page", {
+        companyId: COMPANY_ID,
+        wikiId: "default",
+        path,
+        contents: edited,
+        expectedHash: createHash("sha256").update(original, "utf8").digest("hex"),
+      }),
+    ).resolves.toBeTruthy();
+    expect(files.get(path)).toBe(edited.trimEnd());
+  });
+
   it("accepts a read-then-write CAS round trip on a page whose raw bytes include a redactable span", async () => {
     const harness = createTestHarness({ manifest });
     const raw = "# Secrets note\n\nHeader used: Bearer live-root-session\n";
