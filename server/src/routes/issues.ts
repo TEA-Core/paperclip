@@ -19210,7 +19210,10 @@ export function issueRoutes(
       updateFields.executionState !== undefined
         ? updateFields.executionState
         : existing.executionState;
-    if (normalizedAssigneeAgentId !== undefined) {
+    if (
+      typeof normalizedAssigneeAgentId === "string" &&
+      normalizedAssigneeAgentId.length > 0
+    ) {
       assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
         executionPolicy: nextExecutionPolicy,
         executionState: resultingExecutionState,
