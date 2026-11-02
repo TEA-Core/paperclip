@@ -739,7 +739,7 @@ function parseTier1Declaration(body: string): Tier1Parse {
 //  - `landing-delegated`: names a linked `PR #<N>` and `done-close-landing-backstop` as the
 //    post-merge carrier (the async worker itself is unchanged here).
 // TIER1_FORM is token-bearing so every emitted accepted form reaches the landing-token pre-check.
-// Tier 2 is a separate live-probe concern and is not checked here.
+// Tier 2 is a separate live-probe concern and is not checked here; see proveTier2Live.
 const LANDED_AT_TIP_TOKEN = "landed-at-tip";
 const LANDING_DELEGATED_TOKEN = "landing-delegated";
 const LANDING_BACKSTOP_CARRIER = "done-close-landing-backstop";
