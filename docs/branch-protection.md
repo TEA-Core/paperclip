@@ -227,14 +227,38 @@ to the execution-workspace row. The named reason identifies which field is
 missing so an operator can diagnose the write path.
 
 **Write path (control-plane consume-contract):** the `PATCH /issues/:id`
-route accepts a `deliveryIdentity` field. It is recorded only when:
+route accepts a `deliveryIdentity` field. It is recorded only when either:
 - the actor is an agent run holding the issue's lease (`executionRunId` or
-  `checkoutRunId` matches), and
-- the transition is **into** `in_review` (prior status was not `in_review`).
+  `checkoutRunId` matches) and the transition is **into** `in_review` (prior
+  status was not `in_review`), or
+- the actor is a **board** member and the card is **already** `in_review`
+  (board refresh: re-record `branch`/`headSha`/`prNumber` after a redo push
+  moved the PR head or the workspace drifted, instead of a database write).
 
 Any other actor or transition is rejected with `422 delivery_identity_write_rejected`
 and no partial write occurs. `recordedByRunId` and `recordedAt` are
 server-owned (set from the actor context), never client-supplied.
+
+Both write paths hold the same single rule: the recorded branch binds this card
+only when anchored to it. It must equal the card's control-plane delivery branch
+(or a legitimate ADR-083 carrier owner's branch), else `422
+delivery_identity_branch_write_rejected`. A board refresh also needs the card's
+identifier prefix on `branch` to stamp it onto this card's own `project_primary`
+row that has no branch, or to record a card with **no** execution workspace
+(that record must also bind a PR, `prNumber` and `prUrl`). Board attestation
+alone never turns an unanchored branch into the card's own branch. Workspace
+provisioning applies the same anchor when it carries the recorded branch onto a
+freshly minted workspace row (the recorded branch needs the card's identifier
+prefix, or must already be the branch of a row this card owns).
+
+**Merged-only bindings:** when the control plane cannot back the record with a
+live delivery branch, `resolveDeliveryIdentity` still returns the binding but
+marks it `requireMerged`. This covers a card with no execution workspace (anchored
+by identifier prefix) and an ADR-083 carrier whose owner is already done/cancelled.
+`resolveExactBoundPullRequest` then accepts it only as a completed delivery: the
+bound PR must be merged and proven on its base branch. An open PR on a dead
+carrier stays refused (SUP-16896). A merged-only binding is never a release
+target (`resolveReleaseDeliveryTarget`) and never feeds release-assurance.
 
 ### Guard B actor-resolution order (ADR-092 D3, SUP-14826)
 

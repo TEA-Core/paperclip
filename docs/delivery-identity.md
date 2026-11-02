@@ -15,7 +15,7 @@ Before approval status is published or merge arming proceeds, the server validat
 
 1. The source issue, when recorded, must be the current authorizing issue.
 2. `prUrl` must be the canonical URL for `repo` and `prNumber`.
-3. The exact pull request must exist, be open, and not be a draft.
+3. The exact pull request must exist, be open, and not be a draft. Exception: a merged-only binding (a card with no execution workspace, or an ADR-083 carrier whose owner is already done/cancelled) must instead be merged and proven on its base branch; an open PR is refused. See [Branch protection](branch-protection.md) for the write path and merged-only rule.
 4. Its live head branch must equal `branch`.
 5. Its live head SHA must equal `headSha`.
 6. The pull request repository must equal the project's delivery repository.
@@ -25,7 +25,7 @@ The exact pull request is selected by number and repository. Title text, issue-r
 
 ## Fail-closed cases
 
-The operation remains unarmed when the binding is incomplete, malformed, cross-repository, source-issue mismatched, ambiguous, stale, moved, closed, merged, replaced, draft, or unverifiable because no usable GitHub token is available. No approval status is written to a different PR, and no fallback resolution may authorize a merge for a bound card.
+The operation remains unarmed when the binding is incomplete, malformed, cross-repository, source-issue mismatched, ambiguous, stale, moved, closed, merged (except a merged-only binding), replaced, draft, or unverifiable because no usable GitHub token is available. No approval status is written to a different PR, and no fallback resolution may authorize a merge for a bound card.
 
 Cross-repository delivery remains unsupported by design. A deliverable must be filed under a project bound to its destination repository; recovery requires a fresh correctly projected delivery and review.
 
