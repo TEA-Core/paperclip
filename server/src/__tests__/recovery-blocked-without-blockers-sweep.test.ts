@@ -1993,42 +1993,13 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     const heartbeat = heartbeatService(db);
     await expect(heartbeat.reconcileBlockedWithoutBlockers()).resolves.toBeDefined();
     await expect(heartbeat.reconcileExhaustedRecoveryDrain()).resolves.toBeDefined();
-  });
 
-  it("fresh board monitor armed by the drain resets the persisted monitor attempt counters", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
-    const issueId = randomUUID();
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      title: "Escalated-exhausted card re-armed with a fresh board monitor",
-      status: "in_review",
-      priority: "high",
-      assigneeAgentId: agentId,
-      monitorAttemptCount: 12,
-      monitorScheduledBy: "assignee",
-      executionState: exhaustedMonitorExecutionState(12),
-      updatedAt: oldDate(),
-    });
-    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
-
-    const heartbeat = heartbeatService(db);
-    const result = await heartbeat.reconcileExhaustedRecoveryDrain();
-    expect(result.monitorArmed).toBe(1);
-
-    const [issue] = await db
-      .select({
-        monitorAttemptCount: issues.monitorAttemptCount,
-        monitorNextCheckAt: issues.monitorNextCheckAt,
-        executionState: issues.executionState,
-      })
-      .from(issues)
-      .where(eq(issues.id, issueId));
-    expect(issue.monitorNextCheckAt).not.toBeNull();
-    expect(issue.monitorAttemptCount).toBe(0);
-    expect(issue.executionState).toMatchObject({
-      monitor: { status: "scheduled", attemptCount: 0, scheduledBy: "board" },
-    });
+    const actions = await db
+      .select({ recoveryIssueId: issueRecoveryActions.recoveryIssueId })
+      .from(issueRecoveryActions)
+      .where(inArray(issueRecoveryActions.sourceIssueId, [blockedIssueId, drainIssueId]));
+    expect(actions).toHaveLength(2);
+    for (const action of actions) expect(action.recoveryIssueId).not.toBeNull();
   });
 
   it("bounds-exhausted board monitor re-arm falls through instead of throwing from the drain", async () => {
@@ -2051,7 +2022,9 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     });
     try {
       const heartbeat = heartbeatService(db);
-      await expect(heartbeat.reconcileExhaustedRecoveryDrain()).resolves.toBeDefined();
+      const result = await heartbeat.reconcileExhaustedRecoveryDrain();
+      expect(result.monitorArmed).toBe(0);
+      expect(result.recoveryIssueMinted).toBe(1);
     } finally {
       mockMonitorTransitionFailure.error = null;
     }
@@ -2060,6 +2033,40 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       .from(issues)
       .where(eq(issues.id, issueId));
     expect(issue.monitorNextCheckAt).toBeNull();
+    const [action] = await db
+      .select({ recoveryIssueId: issueRecoveryActions.recoveryIssueId })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action.recoveryIssueId).not.toBeNull();
+  });
+
+  it("board monitor re-arm rethrows a 422 without a clearReason from the drain", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Escalated-exhausted card with an invalid monitor shape",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      monitorAttemptCount: 3,
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    mockMonitorTransitionFailure.error = new HttpError(
+      422,
+      "Monitor can only be scheduled on issues assigned to an agent in in_progress or in_review",
+    );
+    try {
+      const heartbeat = heartbeatService(db);
+      await expect(heartbeat.reconcileExhaustedRecoveryDrain()).rejects.toThrow(
+        "Monitor can only be scheduled",
+      );
+    } finally {
+      mockMonitorTransitionFailure.error = null;
+    }
   });
 
   it("board monitor re-arm rethrows non-422 transition errors from the drain", async () => {

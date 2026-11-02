@@ -9096,23 +9096,16 @@ export function recoveryService(
       // exits the server): treat it as "no monitor armed" so callers fall
       // through to their existing recovery-issue path. Anything else is a
       // real failure and must surface.
-      if (
-        err instanceof HttpError &&
-        err.status === 422 &&
-        (err.message === "Monitor bounds are already exhausted" ||
-          (typeof err.details === "object" &&
-            err.details !== null &&
-            "clearReason" in err.details &&
-            ((err.details as { clearReason?: unknown }).clearReason === "max_attempts_exhausted" ||
-              (err.details as { clearReason?: unknown }).clearReason === "timeout_exceeded")))
-      ) {
-        logger.warn(
-          { issueId: input.issue.id, recoveryActionId: input.recoveryActionId },
-          "exhausted recovery monitor re-arm refused: monitor bounds exhausted",
-        );
-        return null;
-      }
-      throw err;
+      const clearReason =
+        err instanceof HttpError && err.status === 422 && typeof err.details === "object" && err.details !== null
+          ? (err.details as { clearReason?: unknown }).clearReason
+          : undefined;
+      if (typeof clearReason !== "string" || clearReason.length === 0) throw err;
+      logger.warn(
+        { issueId: input.issue.id, recoveryActionId: input.recoveryActionId, clearReason },
+        "exhausted recovery monitor re-arm refused: monitor bounds exhausted",
+      );
+      return null;
     }
     // Never claim a wake from flat columns the transition did not schedule:
     // if the policy module did not write a monitor check time, nothing was armed.

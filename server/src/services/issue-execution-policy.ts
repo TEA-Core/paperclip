@@ -298,16 +298,11 @@ function buildScheduledMonitorState(
   previous: IssueExecutionMonitorState | null,
   monitor: IssueExecutionMonitorPolicy,
 ): IssueExecutionMonitorState {
-  // Attempt-budget rule: a fresh board monitor gets its own attempt budget,
-  // so arming one resets the counter; an assignee-armed monitor keeps the
-  // persisted lifetime count, so its maxAttempts cap stays a lifetime cap.
-  // Clearing a monitor (buildClearedMonitorState) also resets the counter.
-  const attemptCount = monitor.scheduledBy === "board" ? 0 : (previous?.attemptCount ?? 0);
   return {
     status: "scheduled",
     nextCheckAt: monitor.nextCheckAt,
     lastTriggeredAt: previous?.lastTriggeredAt ?? null,
-    attemptCount,
+    attemptCount: previous?.attemptCount ?? 0,
     notes: monitor.notes ?? null,
     scheduledBy: monitor.scheduledBy,
     ...monitorMetadataFromPolicy(monitor),
@@ -342,10 +337,7 @@ function buildClearedMonitorState(input: {
     status: "cleared",
     nextCheckAt: null,
     lastTriggeredAt: input.previous?.lastTriggeredAt ?? null,
-    // Clearing a monitor resets its attempt counter: the next monitor armed
-    // on this issue starts a fresh budget instead of inheriting a lifetime
-    // count that can permanently exhaust its bounds.
-    attemptCount: 0,
+    attemptCount: input.previous?.attemptCount ?? 0,
     notes: input.previous?.notes ?? null,
     scheduledBy: input.previous?.scheduledBy ?? null,
     ...monitorMetadataFromState(input.previous),
@@ -1892,7 +1884,6 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
       patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
       patch.monitorNextCheckAt = null;
       patch.monitorWakeRequestedAt = null;
-      patch.monitorAttemptCount = 0;
       targetMonitorState = buildClearedMonitorState({
         previous: currentMonitorState,
         clearReason: invalidReason,
@@ -1901,12 +1892,7 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
     } else {
       const exhaustedReason = exhaustedMonitorClearReason({
         monitor: input.policy.monitor,
-        // A fresh board monitor gets its own budget (see
-        // buildScheduledMonitorState), so its bounds check starts from zero;
-        // timeout bounds still apply. Assignee monitors keep the lifetime
-        // count, so their cap is unchanged.
-        attemptCount:
-          input.policy.monitor.scheduledBy === "board" ? 0 : (currentMonitorState?.attemptCount ?? 0),
+        attemptCount: currentMonitorState?.attemptCount ?? 0,
         now: new Date(),
       });
       if (exhaustedReason) {
@@ -1917,12 +1903,10 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
       patch.monitorNotes = input.policy.monitor.notes ?? null;
       patch.monitorScheduledBy = input.policy.monitor.scheduledBy;
       targetMonitorState = buildScheduledMonitorState(currentMonitorState, input.policy.monitor);
-      patch.monitorAttemptCount = targetMonitorState.attemptCount;
     }
   } else if (previousPolicy?.monitor) {
     patch.monitorNextCheckAt = null;
     patch.monitorWakeRequestedAt = null;
-    patch.monitorAttemptCount = 0;
     patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy ?? previousPolicy);
     targetMonitorState = buildClearedMonitorState({
       previous: currentMonitorState,
@@ -2027,7 +2011,6 @@ export function buildIssueMonitorClearedPatch(input: {
     executionState: executionStateWithMonitor(existingState, nextMonitorState, input.issue.executionState) as Record<string, unknown> | null,
     monitorNextCheckAt: null,
     monitorWakeRequestedAt: null,
-    monitorAttemptCount: nextMonitorState.attemptCount,
   };
 }
 
