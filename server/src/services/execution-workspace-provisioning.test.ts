@@ -429,7 +429,10 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
     expect(issueRows[0]!.executionWorkspaceId).toBe(result.persistedExecutionWorkspace!.id);
   });
 
-  async function provisionWithRecordedDeliveryBranch(recordedBranchFor: (issueIdentifier: string) => string) {
+  async function provisionWithRecordedDeliveryBranch(
+    recordedBranchFor: (issueIdentifier: string, ancestorIdentifier: string) => string,
+    opts: { boundToDeadAncestorCarrier?: boolean } = {},
+  ) {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const projectWorkspaceId = randomUUID();
@@ -439,7 +442,10 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const issueIdentifier = `${issuePrefix}-1`;
     const now = new Date("2026-07-07T00:00:00.000Z");
-    const RECORDED_BRANCH = recordedBranchFor(issueIdentifier);
+    const ancestorIdentifier = `${issuePrefix}-2`;
+    const RECORDED_BRANCH = recordedBranchFor(issueIdentifier, ancestorIdentifier);
+    const ancestorIssueId = randomUUID();
+    const carrierWorkspaceId = randomUUID();
 
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-provisioning-carry-"));
     tempRoots.push(tempRoot);
@@ -522,11 +528,45 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       updatedAt: now,
     });
 
+    if (opts.boundToDeadAncestorCarrier) {
+      await db.insert(issues).values({
+        id: ancestorIssueId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Dead ancestor carrier owner",
+        status: "done",
+        priority: "medium",
+        issueNumber: 2,
+        identifier: ancestorIdentifier,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await db.insert(executionWorkspaces).values({
+        id: carrierWorkspaceId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        sourceIssueId: ancestorIssueId,
+        mode: "shared_workspace",
+        strategyType: "project_primary",
+        name: RECORDED_BRANCH,
+        status: "active",
+        cwd: tempRoot,
+        branchName: RECORDED_BRANCH,
+        providerType: "local_fs",
+        providerRef: tempRoot,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
     await db.insert(issues).values({
       id: issueId,
       companyId,
       projectId,
       projectWorkspaceId,
+      ...(opts.boundToDeadAncestorCarrier ? { parentId: ancestorIssueId } : {}),
       title: "Provisioning carry test issue",
       status: "in_review",
       workMode: "standard",
@@ -539,7 +579,7 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       responsibleUserId: "responsible-user",
       issueNumber: 1,
       identifier: issueIdentifier,
-      executionWorkspaceId: null,
+      executionWorkspaceId: opts.boundToDeadAncestorCarrier ? carrierWorkspaceId : null,
       executionWorkspacePreference: null,
       executionWorkspaceSettings: {
         mode: "isolated_workspace",
@@ -579,7 +619,7 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       description: null,
       projectId,
       projectWorkspaceId,
-      executionWorkspaceId: null,
+      executionWorkspaceId: opts.boundToDeadAncestorCarrier ? carrierWorkspaceId : null,
       executionWorkspacePreference: null,
     };
 
@@ -658,7 +698,7 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       },
     });
 
-    return { result, recordedBranch: RECORDED_BRANCH };
+    return { result, recordedBranch: RECORDED_BRANCH, carrierWorkspaceId, issueId };
   }
 
   it("carries the recorded delivery branch onto a fresh project_primary workspace", async () => {
@@ -693,6 +733,31 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       .where(eq(executionWorkspaces.id, result.persistedExecutionWorkspace!.id));
     expect(persistedRows).toHaveLength(1);
     expect(persistedRows[0]!.branchName).not.toBe("OTHERCARD-9-delivered");
+  });
+
+  it("does not carry a dead ancestor's carrier branch onto a fresh row for a child bound to that carrier", async () => {
+    const { result, recordedBranch, carrierWorkspaceId, issueId } = await provisionWithRecordedDeliveryBranch(
+      (_issueIdentifier, ancestorIdentifier) => `${ancestorIdentifier}-carrier`,
+      { boundToDeadAncestorCarrier: true },
+    );
+
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+    expect(result.persistedExecutionWorkspace).not.toBeNull();
+    expect(result.persistedExecutionWorkspace!.branchName).not.toBe(recordedBranch);
+
+    const carrierRows = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, carrierWorkspaceId));
+    expect(carrierRows).toHaveLength(1);
+    expect(carrierRows[0]!.branchName).toBe(recordedBranch);
+
+    const childWorkspaceRows = await db
+      .select({ branchName: executionWorkspaces.branchName })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.sourceIssueId, issueId));
+    expect(childWorkspaceRows.every((row) => row.branchName !== recordedBranch)).toBe(true);
   });
 
   it("returns a deferred result when the workspace is occupied by another run", async () => {

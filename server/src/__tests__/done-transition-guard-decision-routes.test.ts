@@ -18,6 +18,7 @@ import {
   issueDeliveryReceipts,
   issueLabels,
   issueExecutionDecisions,
+  issueRecoveryActions,
   issueWorkProducts,
   issues,
   labels,
@@ -1502,6 +1503,89 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(await db.select().from(issueExecutionDecisions)
       .where(eq(issueExecutionDecisions.issueId, issueId))).toEqual(beforeDecisions);
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toEqual([]);
+  });
+
+  describe("recovery-resolution done door final delivery preflight (SUP-21598)", () => {
+    async function seedRecoveryActionFor(companyId: string, issueId: string, agentId: string, runId: string) {
+      const now = new Date();
+      await db.insert(issueRecoveryActions).values({
+        id: randomUUID(),
+        companyId,
+        sourceIssueId: issueId,
+        recoveryIssueId: null,
+        kind: "missing_disposition",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: agentId,
+        ownerUserId: null,
+        previousOwnerAgentId: null,
+        returnOwnerAgentId: null,
+        cause: "successful_run_missing_issue_disposition",
+        fingerprint: `missing-disposition:${issueId}`,
+        evidence: { runId },
+        nextAction: "Choose a valid issue disposition.",
+        wakePolicy: null,
+        monitorPolicy: null,
+        attemptCount: 1,
+        maxAttempts: null,
+        timeoutAt: null,
+        lastAttemptAt: now,
+        outcome: null,
+        resolutionNote: null,
+        resolvedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
+    const closeBody = {
+      outcome: "restored",
+      sourceIssueStatus: "done",
+      resolutionNote: "Delivered on a sibling card's PR; closing this card.",
+      doneTier: {
+        tier: "tier2",
+        probeEvidence: "probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: GET /api/health returned 200 after the sibling PR landed.",
+      },
+    };
+
+    it("refuses the terminal approval with no delivery verdict when no override is supplied", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("R21598A");
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockUnmergedBranch();
+      certifiedDelivery.useRealPreflight = true;
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send(closeBody);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("approval_final_delivery_preflight");
+      expect(await statusOf(issueId)).toBe("in_review");
+    });
+
+    it("lets an accepted merged-elsewhere doneTransitionOverride clear the preflight and close the card", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("R21598B");
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockUnmergedBranch();
+      certifiedDelivery.useRealPreflight = true;
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          ...closeBody,
+          doneTransitionOverride: {
+            disposition: "merged-elsewhere",
+            reason: "The change landed on a sibling card's PR; nothing is left on this branch.",
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+    });
   });
 
   it("PATCH: a decision-carrying close refused by mechanism D carries the mechanism's own remedy, not merge-first (ADR-103 M3)", async () => {

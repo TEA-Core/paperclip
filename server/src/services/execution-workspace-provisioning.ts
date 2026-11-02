@@ -331,13 +331,17 @@ export async function provisionIssueExecutionWorkspace(
       ? readNonEmptyString((recordedDelivery as { branch: string }).branch.trim())
       : null;
   const recordedDeliveryIdentifier = readNonEmptyString(issueRef?.identifier);
+  const existingWorkspaceSourceIssueId = existingExecutionWorkspace?.sourceIssueId?.trim() ?? "";
+  const existingWorkspaceOwnedByCard =
+    existingWorkspaceSourceIssueId === "" || existingWorkspaceSourceIssueId === issueId;
   const recordedDeliveryBranch =
     recordedDeliveryBranchCandidate !== null &&
     ((recordedDeliveryIdentifier !== null &&
       recordedDeliveryBranchCandidate
         .toLowerCase()
         .startsWith(`${recordedDeliveryIdentifier.toLowerCase()}-`)) ||
-      recordedDeliveryBranchCandidate === existingExecutionWorkspace?.branchName)
+      (existingWorkspaceOwnedByCard &&
+        recordedDeliveryBranchCandidate === existingExecutionWorkspace?.branchName))
       ? recordedDeliveryBranchCandidate
       : null;
   const nativeRecoveryExecutionWorkspaceId = resolveNativeRecoveryExecutionWorkspaceBinding({

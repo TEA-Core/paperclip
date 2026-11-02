@@ -19500,20 +19500,23 @@ export function issueRoutes(
               eq(executionWorkspaces.companyId, existing.companyId),
             ))
         : [];
+      // The board stamp holds the same single rule as every other site: the
+      // recorded branch binds this card only when anchored to it (its
+      // identifier prefix) and the row is one this card owns. Board attestation
+      // alone never turns an unanchored branch into the card's own branch.
+      const recordedBranchAnchoredToCard =
+        existing.identifier != null
+        && isDeliveredByCardIdentifierPrefix(
+          { ...projectRepo, headRefName: requestedDeliveryIdentity.branch },
+          projectRepo,
+          existing.identifier,
+        );
       const canRecordProjectPrimaryBranch =
         branchOwnership.legitimate
         && branchOwnership.branch === null
         && deliveryWorkspace?.strategyType === "project_primary"
-        && !deliveryWorkspace.branchName;
-      // Board refresh may stamp the recorded branch onto a workspace row that
-      // lost it (any strategy), repairing drift instead of needing a DB write.
-      const canStampRecordedBranch =
-        canRecordProjectPrimaryBranch
-        || (boardDeliveryRefresh
-          && branchOwnership.legitimate
-          && branchOwnership.branch === null
-          && deliveryWorkspace !== undefined
-          && !deliveryWorkspace.branchName);
+        && !deliveryWorkspace.branchName
+        && (!boardDeliveryRefresh || (branchOwnership.branchIsOwn && recordedBranchAnchoredToCard));
       // Board refresh on a card with no execution workspace at all: the record
       // must bind a PR and carry this card's identifier prefix, the same anchor
       // resolveDeliveryIdentity requires, so the write never returns 200 for a
@@ -19523,19 +19526,14 @@ export function issueRoutes(
         && !existing.executionWorkspaceId
         && requestedDeliveryIdentity.prNumber !== undefined
         && requestedDeliveryIdentity.prUrl !== undefined
-        && existing.identifier != null
-        && isDeliveredByCardIdentifierPrefix(
-          { ...projectRepo, headRefName: requestedDeliveryIdentity.branch },
-          projectRepo,
-          existing.identifier,
-        );
+        && recordedBranchAnchoredToCard;
       const recordedBranchMismatch =
-        (!canStampRecordedBranch && !boardOrphanDeliveryRecord && branchOwnership.branch === null)
+        (!canRecordProjectPrimaryBranch && !boardOrphanDeliveryRecord && branchOwnership.branch === null)
         || (branchOwnership.branch !== null
           // Git refs are case-sensitive: the recorded branch must equal the control-plane branch exactly.
           && requestedDeliveryIdentity.branch !== branchOwnership.branch);
       if (
-        !canStampRecordedBranch
+        !canRecordProjectPrimaryBranch
         && !boardOrphanDeliveryRecord
         && (!branchOwnership.legitimate || recordedBranchMismatch)
       ) {
@@ -19571,10 +19569,9 @@ export function issueRoutes(
           ...requestedDeliveryIdentity,
           recordedByRunId: actor.runId,
           recordedAt: new Date().toISOString(),
-          ...(boardDeliveryRefresh ? { refreshedByBoard: true } : {}),
         },
       };
-      deliveryIdentityWorkspaceBranchWrite = canStampRecordedBranch;
+      deliveryIdentityWorkspaceBranchWrite = canRecordProjectPrimaryBranch;
     }
 
     const nextStatus = updateFields.status ?? existing.status;
@@ -20382,6 +20379,7 @@ export function issueRoutes(
               .where(and(
                 eq(executionWorkspaces.id, existing.executionWorkspaceId),
                 eq(executionWorkspaces.companyId, existing.companyId),
+                eq(executionWorkspaces.strategyType, "project_primary"),
                 isNull(executionWorkspaces.branchName),
               ));
           }
