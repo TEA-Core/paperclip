@@ -34,6 +34,7 @@ interface AgentAuth {
 
 interface TestContext {
   companyId: string;
+  projectId: string;
   companyPrefix: string;
   executor: AgentAuth;
   reviewer: AgentAuth;
@@ -339,6 +340,36 @@ async function setupCompany(boardRequest: APIRequestContext): Promise<TestContex
   const companyId = company.id;
   const companyPrefix = company.issuePrefix ?? company.prefix ?? company.urlKey ?? "E2E";
 
+  // SUP-21902: synthetic repository, credential, and recorded-merge-commit
+  // setup for the Tier 2 closes below. The company carries a GITHUB_TOKEN
+  // secret whose value the server-side GitHub fixture
+  // (fixtures/agent-chat-github.mjs) answers deterministically, and a project
+  // whose primary workspace names the delivery repository, so the guard can
+  // resolve the declared probe head and compare it with the recorded merge
+  // commit on each issue's merged pull_request work product.
+  const secretRes = await boardRequest.post(`${BASE_URL}/api/companies/${companyId}/secrets`, {
+    data: { name: "GITHUB_TOKEN", value: "paperclip-e2e-signoff-fixture" },
+  });
+  expect(secretRes.ok()).toBe(true);
+  const projectRes = await boardRequest.post(`${BASE_URL}/api/companies/${companyId}/projects`, {
+    data: {
+      name: "E2E Signoff Repo",
+      workspace: {
+        name: "Primary",
+        sourceType: "git_repo",
+        repoUrl: "https://github.com/TEA-Core/paperclip",
+        repoRef: "fold/tea-patches-v2026.722.0",
+        defaultRef: "fold/tea-patches-v2026.722.0",
+        isPrimary: true,
+      },
+    },
+  });
+  if (!projectRes.ok()) {
+    throw new Error(`POST /api/companies/${companyId}/projects -> ${projectRes.status()}: ${await projectRes.text()}`);
+  }
+  const project = await projectRes.json();
+  const projectId = project.id;
+
   // Helper: hire/approve agent + API key + request context
   async function createAgent(name: string, role: string, title: string): Promise<AgentAuth> {
     const agentRes = await boardRequest.post(`${BASE_URL}/api/companies/${companyId}/agent-hires`, {
@@ -383,6 +414,7 @@ async function setupCompany(boardRequest: APIRequestContext): Promise<TestContex
 
   return {
     companyId,
+    projectId,
     companyPrefix,
     executor,
     reviewer,
@@ -402,12 +434,37 @@ async function createIssueWithPolicy(ctx: TestContext, title: string, stages?: u
       title,
       status: "in_progress",
       assigneeAgentId: ctx.executor.agentId,
+      projectId: ctx.projectId,
+      // SUP-21902: this suite exercises the signoff stage ladder, not the
+      // repository delivery preflight; record-only delivery means the final
+      // close owes only the Tier 2 probe-head predicate (verified against
+      // the synthetic repo/recorded merge commit seeded above).
+      deliveryRequirement: "record_only",
       executionPolicy: { stages: stages ?? defaultStages },
     },
   });
   expect(res.ok()).toBe(true);
   const issue = await res.json();
   ctx.issueIds.push(issue.id);
+  // SUP-21902: record this delivery's merge commit for the Tier 2 origin guard.
+  const workProductRes = await ctx.boardRequest.post(`${BASE_URL}/api/issues/${issue.id}/work-products`, {
+    data: {
+      type: "pull_request",
+      provider: "github",
+      externalId: "TEA-Core/paperclip#404",
+      title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404",
+      status: "merged",
+      isPrimary: true,
+      metadata: {
+        prNumber: 404,
+        repository: "TEA-Core/paperclip",
+        mergedAt: "2026-08-29T00:11:06Z",
+        mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19",
+      },
+    },
+  });
+  expect(workProductRes.ok()).toBe(true);
   return issue;
 }
 
@@ -495,7 +552,7 @@ test.describe("Signoff execution policy", () => {
     // Step 5: Approver approves → should complete
     const step5Res = await agentPatch(
       ctx.boardRequest, ctx.approver, issueId,
-      { status: "done", comment: "Approved. Ship it.\n\nClosed at Tier 2 (live): e2e signoff flow re-read the issue post-close on the live deployment and verified done." },
+      { status: "done", comment: "Approved. Ship it.\n\nClosed at Tier 2 (live): probe `e2e signoff flow re-read the issue post-close on the live deployment` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: verified done." },
     );
     expect(step5Res.ok()).toBe(true);
     const step5Issue = await step5Res.json();
@@ -612,7 +669,7 @@ test.describe("Signoff execution policy", () => {
     // Reviewer approves → should complete immediately (no approval stage)
     const approveRes = await agentPatch(
       ctx.boardRequest, ctx.reviewer, issue.id,
-      { status: "done", comment: "LGTM.\n\nClosed at Tier 2 (live): e2e signoff flow re-read the issue post-close on the live deployment and verified done." },
+      { status: "done", comment: "LGTM.\n\nClosed at Tier 2 (live): probe `e2e signoff flow re-read the issue post-close on the live deployment` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: verified done." },
     );
     expect(approveRes.ok()).toBe(true);
     const doneIssue = await approveRes.json();
