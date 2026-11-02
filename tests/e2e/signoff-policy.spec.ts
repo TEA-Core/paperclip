@@ -183,6 +183,29 @@ async function getIssueRunLockState(board: APIRequestContext, issueId: string): 
   };
 }
 
+/**
+ * Run id a lock-race retry should PATCH under: the issue's current lock holder
+ * when that run belongs to `agent`, else the agent's own invoked run.
+ *
+ * A reassignment can leave another agent's still-running run holding the lock
+ * for a moment. The server rejects an agent token carrying a run id that is not
+ * that agent's (403 `cross_issue_influence_run_context_required`), which is not
+ * a 409, so adopting the holder blindly ends the retry loop on a transient lock.
+ * Under the agent's own run id the PATCH stays a 409 until the lock is released.
+ */
+async function lockRunIdForAgent(
+  board: APIRequestContext,
+  agent: AgentAuth,
+  issueRunLock: IssueRunLockState,
+  ownRunId: string,
+) {
+  const holderRunId = issueRunLock.checkoutRunId ?? issueRunLock.executionRunId;
+  if (!holderRunId || holderRunId === ownRunId) return ownRunId;
+  const holderRes = await board.get(`${BASE_URL}/api/heartbeat-runs/${holderRunId}`);
+  if (!holderRes.ok()) return ownRunId;
+  return (await holderRes.json()).agentId === agent.agentId ? holderRunId : ownRunId;
+}
+
 async function retryAgentPatchWithCurrentLockOnConflict(
   board: APIRequestContext,
   agent: AgentAuth,
@@ -198,7 +221,7 @@ async function retryAgentPatchWithCurrentLockOnConflict(
     const issueRunLock = await getIssueRunLockState(board, issueId);
     if (issueRunLock.assigneeAgentId !== agent.agentId) return res;
 
-    const lockedRunId = issueRunLock.checkoutRunId ?? issueRunLock.executionRunId ?? fallbackRunId;
+    const lockedRunId = await lockRunIdForAgent(board, agent, issueRunLock, fallbackRunId);
     res = await agent.request.patch(`${BASE_URL}/api/issues/${issueId}`, {
       headers: { "X-Paperclip-Run-Id": lockedRunId },
       data: patchData,
@@ -251,8 +274,7 @@ async function agentPatch(
     // A 409 on an issue no longer assigned to us is a genuine rejection, not a
     // run-lock race — leave it for the caller to assert on.
     if (issueRunLock.assigneeAgentId !== agent.agentId) break;
-    const retryRunId = issueRunLock.checkoutRunId ?? issueRunLock.executionRunId ?? runId;
-    res = await patchWith(retryRunId);
+    res = await patchWith(await lockRunIdForAgent(board, agent, issueRunLock, runId));
   }
   return res;
 }
