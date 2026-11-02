@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test, expect, type APIResponse } from "@playwright/test";
+import { recordTier2MergedDelivery, seedTier2Project } from "./fixtures/tier2-delivery";
 import { and, eq } from "../../server/node_modules/drizzle-orm/index.js";
 import { createDb, closeRegisteredClients, heartbeatRuns, issueRecoveryActions, issues, issueComments, agentWakeupRequests, authUsers, companyMemberships } from "../../packages/db/src/index.ts";
 
@@ -56,10 +57,15 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
           env: { PAPERCLIP_STOP_FIXTURE_ROOT: root, PAPERCLIP_STOP_FIXTURE_FINISH_TASK: "1", CLAUDE_CODE_OAUTH_TOKEN: "paperclip-e2e-fixture-placeholder" } },
         runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
       } }));
+      // SUP-21902: the fixture closes this task at Tier 2, so the task needs a repo-backed
+      // project, the company GitHub credential, and a recorded merged pull_request work product.
+      const project = await seedTier2Project(request, company.id, "Legacy recovery repo", root);
       const issue = await json(await request.post(`/api/companies/${company.id}/issues`, { data: {
         title: "Continue after startup failure", description: "Answer the pending follow-up once.",
         status: "backlog", assigneeAgentId: agent.id,
+        projectId: project.id, deliveryRequirement: "record_only",
       } }));
+      await recordTier2MergedDelivery(request, issue.id);
       const sourceRunId = randomUUID();
       // Seed the historical incident, then exercise all recovery through the UI.
       // No adapter.invoke or new dispatch identity exists on this pre-upgrade run.

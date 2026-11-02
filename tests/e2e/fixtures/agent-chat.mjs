@@ -1,5 +1,10 @@
 // Deterministic provider: all effects use the real run-authenticated APIs/MCP transport.
 // No DB writes, mocked Paperclip responses, provider calls, or outside workspaces.
+// SUP-21902: synthetic delivery shared with tests/e2e/fixtures/tier2-delivery.ts and answered
+// by tests/e2e/fixtures/agent-chat-github.mjs.
+const DELIVERY_REPO_URL = "https://github.com/TEA-Core/paperclip";
+const DELIVERY_DEFAULT_REF = "fold/tea-patches-v2026.722.0";
+const RECORDED_MERGE_COMMIT = "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19";
 const base = process.env.PAPERCLIP_API_URL;
 const headers = {
   Authorization: `Bearer ${process.env.PAPERCLIP_API_KEY}`,
@@ -38,12 +43,30 @@ if (!task.conversationAgentId) {
   // done-transition guard at all, so its bare close comment leaves every handed-off chat task
   // stuck short of `done`. Same adaptation the fork already carries on
   // scripts/mcp-fixtures/servers/acp-stop-agent.mjs. A handed-off chat task has no deliverable
-  // head, so Tier 1 would need a landing proof (landed-at-tip / landing-delegated) the fixture cannot supply, hence Tier 2; no assertion in tests/e2e/agent-chat.spec.ts
-  // reads this comment body, and that spec stays byte-identical to upstream.
+  // head, so Tier 1 would need a landing proof (landed-at-tip / landing-delegated) the fixture cannot supply, hence Tier 2.
+  // SUP-21902 makes Tier 2 machine-checkable: the close names a probe head that the guard compares
+  // with the merge commit recorded on the task's merged pull_request work product, recorded here
+  // against the synthetic delivery repository the handoff project is created with. No assertion
+  // in tests/e2e/agent-chat.spec.ts reads this comment body.
+  await api(`/issues/${task.id}/work-products`, "POST", {
+    type: "pull_request",
+    provider: "github",
+    externalId: "TEA-Core/paperclip#404",
+    title: "PR #404 TEA-Core/paperclip",
+    url: "https://github.com/TEA-Core/paperclip/pull/404",
+    status: "merged",
+    isPrimary: true,
+    metadata: {
+      prNumber: 404,
+      repository: "TEA-Core/paperclip",
+      mergedAt: "2026-08-29T00:11:06Z",
+      mergeCommitSha: RECORDED_MERGE_COMMIT,
+    },
+  });
   await api(`/issues/${task.id}`, "PATCH", {
     status: "done",
     comment:
-      "Execution finished with its initial plan.\n\nClosed at Tier 2 (live): the deterministic chat handoff fixture ran to completion and the issue re-read as done.",
+      `Execution finished with its initial plan.\n\nClosed at Tier 2 (live): probe \`deterministic chat handoff fixture run\` head ${RECORDED_MERGE_COMMIT} post-merge: the issue re-read as done.`,
   });
   process.exit(0);
 }
@@ -142,7 +165,19 @@ if (command.action === "hold") {
       name: command.name ?? "Fixture project",
       repositoryUrls: command.urls,
       repositoryIds: command.ids,
-      workspace: command.workspace,
+      workspace:
+        command.workspace ??
+        (command.action === "handoff" && !command.urls && !command.ids
+          ? {
+              name: "Primary",
+              sourceType: "git_repo",
+              repoUrl: DELIVERY_REPO_URL,
+              repoRef: DELIVERY_DEFAULT_REF,
+              defaultRef: DELIVERY_DEFAULT_REF,
+              cwd: process.cwd(),
+              isPrimary: true,
+            }
+          : undefined),
       idempotencyKey: command.key ?? current.id,
     };
     const project = command.projectId
