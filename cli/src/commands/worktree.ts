@@ -1657,6 +1657,43 @@ async function scrubSeededSecretReferences(
         true
       )
     `);
+    // SUP-22348: agent revisions store the same adapter_config snapshots, so
+    // they carry the same secret references and must get the same scrub.
+    await db.execute(sql`
+      update agent_config_revisions
+      set
+        before_config = jsonb_set(
+          before_config - 'provider' - 'managedProfileId' - 'agentCoreProfileId' - 'env',
+          '{env}',
+          '{}'::jsonb,
+          true
+        ),
+        after_config = jsonb_set(
+          after_config - 'provider' - 'managedProfileId' - 'agentCoreProfileId' - 'env',
+          '{env}',
+          '{}'::jsonb,
+          true
+        )
+    `);
+    // SUP-22348: retained env columns can hold plaintext values and
+    // secret_ref/user_secret_ref bindings; every binding form is secret
+    // material, so the env map is emptied while non-secret fields survive.
+    await db.execute(sql`
+      update projects
+      set env = '{}'::jsonb
+      where env is not null and env <> '{}'::jsonb
+    `);
+    await db.execute(sql`
+      update routines
+      set env = '{}'::jsonb
+      where env is not null and env <> '{}'::jsonb
+    `);
+    await db.execute(sql`
+      update routine_revisions
+      set snapshot = jsonb_set(snapshot, '{routine,env}', '{}'::jsonb, true)
+      where snapshot ? 'routine'
+        and snapshot -> 'routine' -> 'env' is distinct from '{}'::jsonb
+    `);
   } finally {
     await db.$client?.end?.({ timeout: 5 }).catch(() => undefined);
   }

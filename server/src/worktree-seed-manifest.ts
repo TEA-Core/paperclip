@@ -52,3 +52,20 @@ export function hasVerifiedWorktreeSeedManifest(manifestPath: string): boolean {
     return false;
   }
 }
+
+/**
+ * SUP-22348: the minimal-no-secrets env semantics need the seed mode at master
+ * key override time. Only a verified, complete manifest is trusted — an
+ * unverified or failed manifest must never authorize deleting inherited env
+ * values.
+ */
+export function readVerifiedWorktreeSeedMode(manifestPath: string): string | null {
+  if (!existsSync(manifestPath)) return null;
+  try {
+    const manifest: unknown = JSON.parse(readFileSync(manifestPath, "utf8"));
+    if (!isVerifiedWorktreeSeedManifest(manifest)) return null;
+    return String((manifest as Record<string, unknown>).seedMode);
+  } catch {
+    return null;
+  }
+}

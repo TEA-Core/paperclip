@@ -155,6 +155,97 @@ describe("dev-runner worktree env bootstrap", () => {
     });
   });
 
+  it("deletes inherited master-key settings absent from a minimal-no-secrets worktree env", () => {
+    const root = createTempRoot("paperclip-dev-runner-worktree-master-key-no-secrets-");
+    const stateDir = path.join(root, ".paperclip");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(root, ".git"), "gitdir: /tmp/paperclip/.git/worktrees/feature\n", "utf8");
+    fs.writeFileSync(
+      path.join(stateDir, ".env"),
+      [
+        "PAPERCLIP_SECRETS_MASTER_KEY=local-master-key",
+        "UNRELATED=local-value",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(stateDir, "seed-manifest.json"),
+      JSON.stringify({
+        version: 2,
+        source: { instanceId: "source", configPath: "/source/config.json" },
+        snapshotAt: "2026-08-18T00:00:00.000Z",
+        seedMode: "minimal-no-secrets",
+        migrationRevision: "0001",
+        targetInstanceId: "target",
+        phase: "complete",
+        state: "verified",
+        attemptId: "attempt",
+        startedAt: "2026-08-18T00:00:00.000Z",
+        finishedAt: "2026-08-18T00:01:00.000Z",
+        diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-08-18T00:01:00.000Z" }],
+      }),
+      "utf8",
+    );
+
+    const result = applyWorktreeSecretsMasterKeyEnvOverrides(root, {
+      PAPERCLIP_SECRETS_MASTER_KEY: "inherited-master-key",
+      PAPERCLIP_SECRETS_MASTER_KEY_FILE: "/tmp/inherited-master.key",
+      UNRELATED: "inherited-value",
+    });
+    expect(result).toEqual({
+      PAPERCLIP_SECRETS_MASTER_KEY: "local-master-key",
+      UNRELATED: "inherited-value",
+    });
+    expect("PAPERCLIP_SECRETS_MASTER_KEY_FILE" in result).toBe(false);
+  });
+
+  it("keeps inherited master-key settings absent from the env outside minimal-no-secrets", () => {
+    const root = createTempRoot("paperclip-dev-runner-worktree-master-key-minimal-");
+    const stateDir = path.join(root, ".paperclip");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(root, ".git"), "gitdir: /tmp/paperclip/.git/worktrees/feature\n", "utf8");
+    fs.writeFileSync(
+      path.join(stateDir, ".env"),
+      [
+        "UNRELATED=local-value",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    const inheritedEnv = {
+      PAPERCLIP_SECRETS_MASTER_KEY: "inherited-master-key",
+      PAPERCLIP_SECRETS_MASTER_KEY_FILE: "/tmp/inherited-master.key",
+      UNRELATED: "inherited-value",
+    };
+
+    const verifiedManifest = {
+      version: 2,
+      source: { instanceId: "source", configPath: "/source/config.json" },
+      snapshotAt: "2026-08-18T00:00:00.000Z",
+      seedMode: "minimal",
+      migrationRevision: "0001",
+      targetInstanceId: "target",
+      phase: "complete",
+      state: "verified",
+      attemptId: "attempt",
+      startedAt: "2026-08-18T00:00:00.000Z",
+      finishedAt: "2026-08-18T00:01:00.000Z",
+      diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-08-18T00:01:00.000Z" }],
+    };
+
+    fs.writeFileSync(path.join(stateDir, "seed-manifest.json"), JSON.stringify(verifiedManifest), "utf8");
+    expect(applyWorktreeSecretsMasterKeyEnvOverrides(root, { ...inheritedEnv })).toEqual(inheritedEnv);
+
+    // An unverified manifest must never authorize deleting inherited values.
+    fs.writeFileSync(
+      path.join(stateDir, "seed-manifest.json"),
+      JSON.stringify({ ...verifiedManifest, seedMode: "minimal-no-secrets", state: "failed" }),
+      "utf8",
+    );
+    expect(applyWorktreeSecretsMasterKeyEnvOverrides(root, { ...inheritedEnv })).toEqual(inheritedEnv);
+  });
+
   it("loads repo-local Paperclip env for initialized worktrees without overriding explicit env", () => {
     const root = createTempRoot("paperclip-dev-runner-worktree-env-");
     fs.mkdirSync(path.join(root, ".paperclip"), { recursive: true });
