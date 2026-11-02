@@ -1664,13 +1664,13 @@ async function scrubSeededSecretReferences(
       set
         before_config = jsonb_set(
           before_config - 'provider' - 'managedProfileId' - 'agentCoreProfileId' - 'env',
-          '{env}',
+          '{adapterConfig,env}',
           '{}'::jsonb,
           true
         ),
         after_config = jsonb_set(
           after_config - 'provider' - 'managedProfileId' - 'agentCoreProfileId' - 'env',
-          '{env}',
+          '{adapterConfig,env}',
           '{}'::jsonb,
           true
         )
