@@ -154,6 +154,9 @@ export async function applyReviewEscalationDecision(args: {
   }
   updateFields.actorAgentId = actor.agentId ?? null;
   updateFields.actorUserId = actor.userId ?? null;
+  if (transition.workflowControlledAssignment) {
+    updateFields.workflowControlledAssignment = true;
+  }
 
   // The `done` close writes into the same transaction as the decision row, so the
   // update needs a post-commit queue: issue-service refuses a human completion in

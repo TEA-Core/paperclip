@@ -27,6 +27,8 @@ import {
   issues,
   projectWorkspaces,
   projects,
+  plugins,
+  pluginManagedResources,
   workspaceOperations,
   toolApplications,
   toolConnections,
@@ -8492,6 +8494,223 @@ describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
       .from(issueComments)
       .where(eq(issueComments.createdByRunId, runId));
     expect(duplicates).toHaveLength(1);
+  });
+});
+
+describeEmbeddedPostgres("issueService.update Wiki handoff guard", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-update-wiki-handoff-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(pluginManagedResources);
+    await db.delete(issues);
+    await db.delete(agents);
+    await db.delete(plugins);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("rejects a direct service reassignment to a non-canonical agent", async () => {
+    const companyId = randomUUID();
+    const pluginId = randomUUID();
+    const canonicalAgentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      packageName: "@paperclipai/plugin-llm-wiki",
+      version: "0.1.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {} as Record<string, unknown>,
+      status: "ready",
+      installOrder: 1,
+    });
+    await db.insert(agents).values([
+      {
+        id: canonicalAgentId,
+        companyId,
+        name: "Wiki Maintainer",
+        role: "engineer",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherAgentId,
+        companyId,
+        name: "Other Agent",
+        role: "engineer",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(pluginManagedResources).values({
+      companyId,
+      pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      resourceKind: "agent",
+      resourceKey: "wiki-maintainer",
+      resourceId: canonicalAgentId,
+      defaultsJson: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Handoff to Wiki Maintainer",
+      assigneeAgentId: canonicalAgentId,
+      executionPolicy: { mode: "normal", stages: [] },
+      executionState: null,
+    });
+
+    await expect(svc.update(issueId, { assigneeAgentId: otherAgentId })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_non_canonical_assignee" }),
+    });
+    await expect(svc.getById(issueId)).resolves.toMatchObject({ assigneeAgentId: canonicalAgentId });
+
+    await db
+      .update(issues)
+      .set({ title: "Ordinary issue", assigneeAgentId: otherAgentId })
+      .where(eq(issues.id, issueId));
+    await expect(svc.update(issueId, { title: "Handoff to Wiki Maintainer" })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({
+        reason: "wiki_handoff_non_canonical_assignee",
+        assigneeAgentId: otherAgentId,
+      }),
+    });
+    await expect(svc.getById(issueId)).resolves.toMatchObject({
+      title: "Ordinary issue",
+      assigneeAgentId: otherAgentId,
+    });
+  });
+
+  it("uses resulting execution state for direct assignee writes", async () => {
+    const companyId = randomUUID();
+    const pluginId = randomUUID();
+    const canonicalAgentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const stageId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      packageName: "@paperclipai/plugin-llm-wiki",
+      version: "0.1.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {} as Record<string, unknown>,
+      status: "ready",
+      installOrder: 1,
+    });
+    await db.insert(agents).values([
+      {
+        id: canonicalAgentId,
+        companyId,
+        name: "Wiki Maintainer",
+        role: "engineer",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherAgentId,
+        companyId,
+        name: "Other Agent",
+        role: "engineer",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(pluginManagedResources).values({
+      companyId,
+      pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      resourceKind: "agent",
+      resourceKey: "wiki-maintainer",
+      resourceId: canonicalAgentId,
+      defaultsJson: {},
+    });
+    const issue = await db
+      .insert(issues)
+      .values({
+        id: randomUUID(),
+        companyId,
+        title: "Handoff to Wiki Maintainer",
+        assigneeAgentId: canonicalAgentId,
+        executionPolicy: {
+          mode: "normal",
+          stages: [
+            {
+              id: stageId,
+              type: "review",
+              approvalsNeeded: 1,
+              participants: [{ type: "agent", agentId: canonicalAgentId, userId: null }],
+            },
+          ],
+        },
+        executionState: null,
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    await expect(
+      svc.update(issue.id, {
+        assigneeAgentId: canonicalAgentId,
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: canonicalAgentId, userId: null },
+          returnAssignee: null,
+          deliveryAuthor: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ guard: "assignee_review_gate" }),
+    });
   });
 });
 

@@ -930,7 +930,7 @@ export function applyExecutionPolicyReArm(input: {
     returnAssignee,
     changesRequestedCount: 0,
   });
-  return { patch };
+  return { patch, workflowControlledAssignment: true };
 }
 
 /**

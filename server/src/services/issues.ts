@@ -155,6 +155,10 @@ import {
 import { edgeCarriesLadderCarveOutLabel } from "./laddered-child-eligibility.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import {
+  assertAssigneeWriteDoesNotSelfSatisfyReviewStage,
+  assertWikiHandoffWriteIntegrity,
+} from "./issue-assignee-review-gate.js";
+import {
   type CurrentUserRedactionOptions,
   redactCurrentUserText,
   redactSecretTokens,
@@ -11609,6 +11613,13 @@ export function issueService(db: Db) {
          * from a request body.
          */
         systemWorkspaceBinding?: boolean;
+        /**
+         * Internal only. Set when the execution-policy transition owns the
+         * assignee written in this update. The persisted assignee is the active
+         * review participant, not an explicit request write, so the
+         * self-satisfying review-stage gate does not apply to it.
+         */
+        workflowControlledAssignment?: boolean;
         companyGuard?: string;
         /**
          * Internal only. Optimistic concurrency token for PATCH /api/issues/:id.
@@ -11665,6 +11676,7 @@ export function issueService(db: Db) {
         systemWorkspaceBinding,
         companyGuard,
         expectedUpdatedAt,
+        workflowControlledAssignment,
         ...issueData
       } = data;
       if (
@@ -12073,6 +12085,47 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        await assertWikiHandoffWriteIntegrity({
+          db: tx as Db,
+          companyId: receiptExisting.companyId,
+          issue: {
+            title:
+              issueData.title !== undefined ? issueData.title : receiptExisting.title,
+            description:
+              issueData.description !== undefined
+                ? issueData.description
+                : receiptExisting.description,
+            executionPolicy:
+              issueData.executionPolicy !== undefined
+                ? issueData.executionPolicy
+                : receiptExisting.executionPolicy,
+            executionState:
+              issueData.executionState !== undefined
+                ? issueData.executionState
+                : receiptExisting.executionState,
+          },
+          incomingAssigneeAgentId:
+            issueData.assigneeAgentId !== undefined
+              ? issueData.assigneeAgentId
+              : receiptExisting.assigneeAgentId,
+          checkReviewStage: false,
+        });
+        if (
+          issueData.assigneeAgentId !== undefined &&
+          !workflowControlledAssignment
+        ) {
+          assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
+            executionPolicy:
+              issueData.executionPolicy !== undefined
+                ? issueData.executionPolicy
+                : receiptExisting.executionPolicy,
+            executionState:
+              issueData.executionState !== undefined
+                ? issueData.executionState
+                : receiptExisting.executionState,
+            incomingAssigneeAgentId: issueData.assigneeAgentId,
+          });
+        }
         if (actorAgentId && patch.status === "done") {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });

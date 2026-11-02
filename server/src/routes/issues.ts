@@ -422,7 +422,7 @@ import {
 } from "../services/issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
 import { applyReviewEscalationDecision } from "../services/issue-stage-decision.js";
-import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, findSelfSatisfyingReviewStage } from "../services/issue-assignee-review-gate.js";
+import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, assertWikiHandoffWriteIntegrity, findSelfSatisfyingReviewStage } from "../services/issue-assignee-review-gate.js";
 import {
   type CallerSeat,
   type RefusalCaller,
@@ -12388,6 +12388,9 @@ export function issueRoutes(
           {
             ...result.patch,
             executionState: nextExecutionState,
+            ...(result.workflowControlledAssignment
+              ? { workflowControlledAssignment: true }
+              : {}),
             actorAgentId: null,
             actorUserId: boardUserId,
             boardApiKeyId: actor.boardApiKeyId,
@@ -13232,6 +13235,18 @@ export function issueRoutes(
             issue.createdByAgentId ?? null,
           ).agentIds.has(participantId as string)
         ) throw conflict("Pending participant cannot approve their own work");
+        await assertWikiHandoffWriteIntegrity({
+          db: tx as unknown as Db,
+          companyId: issue.companyId,
+          issue: {
+            title: issue.title,
+            description: issue.description,
+            executionPolicy: issue.executionPolicy,
+            executionState: state,
+          },
+          incomingAssigneeAgentId: participantId,
+          checkReviewStage: false,
+        });
 
         const [agent] = await tx.select().from(agents)
           .where(and(eq(agents.id, participantId as string), eq(agents.companyId, issue.companyId)))
@@ -14003,6 +14018,9 @@ export function issueRoutes(
               locked: { prefetch: finalDeliveryPrefetch, tx: tx as unknown as Db },
             });
             Object.assign(updateFields, transition.patch);
+            if (transition.workflowControlledAssignment) {
+              updateFields.workflowControlledAssignment = true;
+            }
             await assertInReviewReviewPath({
               existing: lockedIssue,
               updateFields,
@@ -19001,23 +19019,6 @@ export function issueRoutes(
       updateFields.executionPolicy !== undefined
         ? (updateFields.executionPolicy as NormalizedExecutionPolicy | null)
         : previousExecutionPolicy;
-    // SUP-13526: an explicit assigneeAgentId write must not land an assignee
-    // that is required to approve their own incomplete review stage. Runtime
-    // stage-transition assignee writes (review start selecting its active
-    // participant) are not request writes and are checked nowhere else.
-    if (normalizedAssigneeAgentId !== undefined) {
-      assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
-        executionPolicy: nextExecutionPolicy,
-        executionState: existing.executionState,
-        incomingAssigneeAgentId: normalizedAssigneeAgentId,
-        // A board caller gets the unchanged base message: changing the stage's
-        // participants is its own lawful repair, so the seat tail is wrong for it.
-        refusalContext:
-          req.actor.type === "board"
-            ? undefined
-            : { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
-      });
-    }
     if (updateFields.executionPolicy !== undefined) {
       const prevReturnAssignee = previousExecutionPolicy?.returnAssigneeAgentId ?? null;
       const nextReturnAssignee = nextExecutionPolicy?.returnAssigneeAgentId ?? null;
@@ -19242,6 +19243,53 @@ export function issueRoutes(
       };
     }
     Object.assign(updateFields, transition.patch);
+    // SUP-13526 / SUP-21752: check the assignee and execution state the write
+    // will persist. The gate is keyed on the request explicitly supplying an
+    // assignee; a workflow-owned assignment is exempt only when the request did
+    // not supply one. Otherwise a request could pair an explicit assignee with
+    // a workflow re-assertion and land a self-satisfying review seat.
+    const resultingAssigneeAgentId =
+      updateFields.assigneeAgentId !== undefined
+        ? (updateFields.assigneeAgentId as string | null)
+        : existing.assigneeAgentId;
+    const resultingExecutionState =
+      updateFields.executionState !== undefined
+        ? updateFields.executionState
+        : existing.executionState;
+    if (
+      typeof normalizedAssigneeAgentId === "string" &&
+      normalizedAssigneeAgentId.length > 0
+    ) {
+      assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
+        executionPolicy: nextExecutionPolicy,
+        executionState: resultingExecutionState,
+        incomingAssigneeAgentId: resultingAssigneeAgentId,
+        refusalContext:
+          req.actor.type === "board"
+            ? undefined
+            : { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
+      });
+    }
+    await assertWikiHandoffWriteIntegrity({
+      db,
+      companyId: existing.companyId,
+      issue: {
+        title:
+          updateFields.title !== undefined ? updateFields.title : existing.title,
+        description:
+          updateFields.description !== undefined
+            ? updateFields.description
+            : existing.description,
+        executionPolicy: nextExecutionPolicy,
+        executionState: resultingExecutionState,
+      },
+      incomingAssigneeAgentId: resultingAssigneeAgentId,
+      checkReviewStage: false,
+      refusalContext:
+        req.actor.type === "board"
+          ? undefined
+          : { caller: refusalCaller, issue: existing as unknown as RefusalIssue },
+    });
 
     // SUP-15543: authorized in-place re-provision of a mis-provisioned card's
     // execution workspace. When an authorized actor corrects the card's
@@ -19909,6 +19957,9 @@ export function issueRoutes(
     const postCommitIssueActions: IssuePostCommitAction[] = [];
     const issueUpdateData = {
       ...updateFields,
+      ...(transition.workflowControlledAssignment
+        ? { workflowControlledAssignment: true }
+        : {}),
       ...(deliveryIdentityWorkspaceBranchWrite && existing.executionWorkspaceId
         ? { executionWorkspaceId: existing.executionWorkspaceId }
         : {}),
@@ -24898,6 +24949,9 @@ export function issueRoutes(
       const updatePatch = {
         ...transition.patch,
         status: typeof transition.patch.status === "string" ? transition.patch.status : "done",
+        ...(transition.workflowControlledAssignment
+          ? { workflowControlledAssignment: true }
+          : {}),
         actorAgentId: actor.agentId ?? null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
         boardApiKeyId: actor.actorType === "user" ? actor.boardApiKeyId : null,
