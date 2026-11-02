@@ -13,6 +13,7 @@ import {
   issueComments,
   issueExecutionDecisions,
   issueRecoveryActions,
+  issueWorkProducts,
   issues,
   projectWorkspaces,
   projects,
@@ -317,6 +318,14 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
       .update(executionWorkspaces)
       .set({ sourceIssueId: issueId })
       .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    // SUP-21902: recorded delivery merge commit for the Tier 2 origin guard.
+    await db.insert(issueWorkProducts).values({
+      companyId, issueId, type: "pull_request", provider: "github",
+      externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+      reviewState: "none", isPrimary: true, healthStatus: "unknown",
+      metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    });
 
     // A pre-completed stage must be backed by a decision row or guard-b
     // (stage-without-decision) refuses the card before the merge-arming hook.
@@ -894,6 +903,14 @@ describeEmbeddedPostgres("approval-arming refusal suppresses merge arming (SUP-1
       .update(executionWorkspaces)
       .set({ sourceIssueId: issueId })
       .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    // SUP-21902: recorded delivery merge commit for the Tier 2 origin guard.
+    await db.insert(issueWorkProducts).values({
+      companyId, issueId, type: "pull_request", provider: "github",
+      externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+      reviewState: "none", isPrimary: true, healthStatus: "unknown",
+      metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    });
 
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({

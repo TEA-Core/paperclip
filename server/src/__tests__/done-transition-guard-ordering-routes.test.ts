@@ -16,6 +16,7 @@ import {
   issueComments,
   issueExecutionDecisions,
   issueRecoveryActions,
+  issueWorkProducts,
   issues,
   projectWorkspaces,
   projects,
@@ -245,6 +246,14 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       .update(executionWorkspaces)
       .set({ sourceIssueId: issueId })
       .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    // SUP-21902: recorded delivery merge commit for the Tier 2 origin guard.
+    await db.insert(issueWorkProducts).values({
+      companyId, issueId, type: "pull_request", provider: "github",
+      externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+      reviewState: "none", isPrimary: true, healthStatus: "unknown",
+      metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    });
 
     return {
       companyId,
@@ -1733,6 +1742,8 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       await seedRecoveryAction(companyId, issueId, agentId, runId);
       currentActor = agentActor(companyId, agentId, runId);
       mockEvaluateDoneTransitionGuard.mockResolvedValue(recoveryDeliveryAllowed(branchName));
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
 
       const res = await request(app)
         .post(`/api/issues/${issueId}/recovery-actions/resolve`)
@@ -1743,7 +1754,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
           doneTier: {
             tier: "tier2",
             probeEvidence:
-              "acceptance probe — GET /api/health returned 200 after the manual landing",
+              "probe `acceptance probe GET /api/health` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: GET /api/health returned 200 after the manual landing",
           },
         });
 
@@ -1760,7 +1771,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         (c) => c.authorType !== "system" && c.body.includes("Closed at Tier 2 (live):"),
       );
       expect(declaration).toHaveLength(1);
-      expect(declaration[0]?.body).toContain("acceptance probe — GET /api/health returned 200");
+      expect(declaration[0]?.body).toContain("GET /api/health returned 200 after the manual landing");
       expect(declaration[0]?.body).toContain("Owner landed the recovery; closing the card.");
 
       const action = await recoveryActionRow(issueId);

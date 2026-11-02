@@ -7,10 +7,13 @@ import {
   agents,
   companies,
   createDb,
+  executionWorkspaces,
   goals,
   issueComments,
   issueRelations,
+  issueWorkProducts,
   issues,
+  projects,
 } from "@paperclipai/db";
 import { buildIssueBlockersResolvedWakeStateKey, ISSUE_BLOCKERS_RESOLVED_WAKE_REASON, type IssueBlockersResolvedWakeup } from "../services/issue-dependency-wakeups.js";
 import {
@@ -38,12 +41,33 @@ vi.mock("../services/github-credential.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/github-credential.js")>();
   return {
     ...actual,
+    // SUP-21902: the done-transition guard resolves a company GitHub token to
+    // verify the Tier 2 probe head; the fixture always has one.
+    resolveGitHubToken: async () => ({
+      token: "test-token",
+      scope: "company",
+      secretName: "GITHUB_TOKEN",
+    }),
     resolveGitHubTokenForRepo: async () =>
       credentialMock.tokenForTest
         ? { token: credentialMock.tokenForTest, scope: "company", secretName: "GITHUB_TOKEN" }
         : { token: null, reason: "no GitHub token bound in fixture" },
   };
 });
+
+// SUP-21902: the guard resolves the declared probe head through the commits
+// API; the mocked remote serves the recorded merge commit for any commit ref,
+// so the sweep's named head matches this delivery's recorded merge commit.
+vi.mock("../services/github-fetch.js", () => ({
+  ghFetch: (url: string) =>
+    typeof url === "string" && /\/commits\//.test(url)
+      ? Promise.resolve({ ok: true, status: 200, json: async () => ({ sha: "c0cd56e43f9a81f360532f7b92fbf176798016ad" }) } as unknown as Response)
+      : Promise.resolve(new Response(JSON.stringify({}), { status: 404 })),
+  gitHubApiBase: (hostname: string) =>
+    hostname === "github.com" || hostname === "www.github.com"
+      ? "https://api.github.com"
+      : `https://${hostname}/api/v3`,
+}));
 
 // Durability seam: when set, logActivityInTransaction rejects for exactly one
 // action (the withhold audit row) so a test can prove that an audit failure
@@ -152,6 +176,65 @@ async function seedOperatorCard(
       type: "blocks",
     });
   }
+  // SUP-21902: bind the card to a synthetic repo-backed execution workspace and
+  // record this delivery's merge commit on a merged pull_request work product,
+  // so the Tier 2 origin guard can resolve the sweep's probe head and compare
+  // it with the recorded merge commit (no live branch-tip fallback).
+  const tier2ProjectId = randomUUID();
+  const tier2WorkspaceId = randomUUID();
+  const tier2Now = new Date();
+  await db.insert(projects).values({
+    id: tier2ProjectId,
+    companyId: fixture.companyId,
+    name: "Tier 2 Fixture Project",
+    status: "active",
+    createdAt: tier2Now,
+    updatedAt: tier2Now,
+  });
+  await db.insert(executionWorkspaces).values({
+    id: tier2WorkspaceId,
+    companyId: fixture.companyId,
+    projectId: tier2ProjectId,
+    projectWorkspaceId: null,
+    sourceIssueId: cardId,
+    mode: "isolated_workspace",
+    strategyType: "git_worktree",
+    name: "tier2-fixture-ws",
+    status: "active",
+    cwd: "/tmp/test",
+    repoUrl: "https://github.com/TEA-Core/paperclip",
+    baseRef: "fold/tea-patches-v2026.722.0",
+    branchName: "tier2-fixture-ws",
+    providerType: "git_worktree",
+    providerRef: "/tmp/test",
+    lastUsedAt: tier2Now,
+    openedAt: tier2Now,
+    createdAt: tier2Now,
+    updatedAt: tier2Now,
+  });
+  await db.insert(issueWorkProducts).values({
+    companyId: fixture.companyId,
+    issueId: cardId,
+    type: "pull_request",
+    provider: "github",
+    externalId: "TEA-Core/paperclip#404",
+    title: "PR #404 TEA-Core/paperclip",
+    url: "https://github.com/TEA-Core/paperclip/pull/404",
+    status: "merged",
+    reviewState: "none",
+    isPrimary: true,
+    healthStatus: "unknown",
+    metadata: {
+      prNumber: 404,
+      repository: "TEA-Core/paperclip",
+      mergedAt: "2026-08-29T00:11:06Z",
+      mergeCommitSha: "c0cd56e43f9a81f360532f7b92fbf176798016ad",
+    },
+  });
+  await db
+    .update(issues)
+    .set({ projectId: tier2ProjectId, executionWorkspaceId: tier2WorkspaceId })
+    .where(eq(issues.id, cardId));
   return { ...fixture, cardId, dependentId };
 }
 
@@ -192,9 +275,16 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(issueComments);
     await db.delete(issueRelations);
+    await db.delete(issueWorkProducts);
     await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projects);
     await db.delete(goals);
     await db.delete(agents);
+    // Guard audit rows can land after the first activity_log delete (async
+    // post-commit writes from the close under test); clear again before the
+    // company delete they reference.
+    await db.delete(activityLog);
     await db.delete(companies);
   });
 
@@ -814,10 +904,20 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
       .where(eq(issueComments.issueId, fixture.cardId));
     expect(comments).toHaveLength(0);
 
-    const refusalAudits = await db
+    // The guard writes its refusal audit fire-and-forget (`void writeAuditLog`);
+    // with the commits API mocked the sweep now returns before that insert
+    // necessarily lands, so poll for the row instead of racing it.
+    let refusalAudits = await db
       .select()
       .from(activityLog)
       .where(eq(activityLog.entityId, fixture.cardId));
+    for (let attempt = 0; attempt < 50 && refusalAudits.length === 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      refusalAudits = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.entityId, fixture.cardId));
+    }
     expect(refusalAudits).toEqual(
       expect.arrayContaining([
         expect.objectContaining({

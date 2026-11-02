@@ -6,6 +6,7 @@ import {
   issueLabels as issueLabelsTable,
   issueRelations as issueRelationsTable,
   issues as issuesTable,
+  issueWorkProducts as issueWorkProductsTable,
   labels as labelsTable,
 } from "@paperclipai/db";
 import {
@@ -149,7 +150,7 @@ function filterLabelRowsByName(
  * `select().from().where()` resolves to the `executionWorkspaces` rows exactly
  * as the legacy positional chain did, so pre-existing tests are untouched.
  */
-function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[] }) {
+function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[]; issueWorkProducts?: Record<string, unknown>[] }) {
   // SUP-15233: the guard reads the issues table twice inside
   // countLadderedChildren: read 1 is the parent_id edge (decomposition
   // children), read 2 is the inArray re-read (blockedBy edge, only present in
@@ -205,6 +206,11 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     where: vi.fn().mockResolvedValue(rows.issueLabels ?? []),
     then: vi.fn().mockResolvedValue(rows.issueLabels ?? []),
   };
+  const workProductsChain = {
+    from: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
+    then: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
+  };
   const selectChain = {
     from: vi.fn().mockReturnThis(),
     where: vi.fn().mockResolvedValue(rows.executionWorkspaces ?? []),
@@ -240,6 +246,7 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
         if (table === issueExecutionDecisionsTable) return decisionsChain;
         if (table === labelsTable) return labelsChain;
         if (table === issueLabelsTable) return issueLabelsChain;
+        if (table === issueWorkProductsTable) return workProductsChain;
         const chain = chains[callCount] ?? selectChain;
         callCount++;
         return chain;
@@ -5512,7 +5519,7 @@ describe("evaluateDoneTierDeclaration", () => {
     });
   }
 
-  function setupTier2OriginMocks() {
+  function setupTier2OriginMocks(recordedMergeCommits: string[] = [T2_MERGE_SHA]) {
     ghFetchMock.mockReset();
     mockResolveGitHubToken.mockReset();
     mockResolveGitHubToken.mockResolvedValue({
@@ -5520,7 +5527,12 @@ describe("evaluateDoneTierDeclaration", () => {
       scope: "company",
       secretName: "GITHUB_TOKEN",
     });
-    setupDbMock({ executionWorkspaces: [mockExecutionWorkspaceRow()] });
+    setupDbMock({
+      executionWorkspaces: [mockExecutionWorkspaceRow()],
+      issueWorkProducts: recordedMergeCommits.map((sha) => ({
+        metadata: { mergeCommitSha: sha, mergedAt: "2026-10-30T00:00:00.000Z" },
+      })),
+    });
   }
 
   describe("Tier 2 via accompanying comment", () => {
@@ -5567,9 +5579,48 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.reason).toContain(T2_STRANGER_SHA);
       expect(result.reason).toContain(T2_MERGE_SHA);
       expect(result.reason).toContain("delivery merge head");
+      expect(result.reason).toContain("recorded for this delivery");
       const commitsUrls = ghFetchMock.mock.calls.map(([url]) => String(url)).filter((url) => url.includes("/commits/"));
       expect(commitsUrls.some((url) => url.endsWith(`/commits/${encodeURIComponent(T2_PROBE_HEAD)}`))).toBe(true);
-      expect(commitsUrls.some((url) => url.endsWith(`/commits/${encodeURIComponent(T2_DEFAULT_REF)}`))).toBe(true);
+      // The comparison target is the recorded merge commit, never the live branch tip:
+      // the guard must not resolve the default branch at all.
+      expect(commitsUrls.some((url) => url.endsWith(`/commits/${encodeURIComponent(T2_DEFAULT_REF)}`))).toBe(false);
+    });
+
+    it("SUP-21902: refuses a Tier 2 declaration when no recorded delivery merge commit is available (merge_commit_unrecorded, no branch-tip fallback)", async () => {
+      setupTier2OriginMocks([]);
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("merge_commit_unrecorded");
+      expect(result.reason).toContain("no fallback to the live branch tip");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("SUP-21902: accepts a probe at the recorded merge commit even when the live branch tip has moved past it", async () => {
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_STRANGER_SHA },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
     });
 
     it("SUP-21902: refuses a valid-shape Tier 2 declaration whose named head does not resolve (head_unresolvable)", async () => {

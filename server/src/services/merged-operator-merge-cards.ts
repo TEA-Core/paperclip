@@ -394,15 +394,25 @@ export function createMergedOperatorMergeCardSweepService(
         .where(eq(issues.id, row.id))
         .limit(1);
       if (!guardIssue) continue;
-      const guardProbeEvidence = [
-        "all gate pull requests verified merged by the merged-operator merge-card sweep:",
-        ...references.map((reference) => {
+      // SUP-21902: Tier-2 evidence must be machine-checkable — name the probe
+      // command, the probe head (a gate PR's merge commit, which the guard
+      // compares with this delivery's recorded merge commit), and the
+      // post-merge predicate. Without a merge commit there is no head to
+      // name, so the card defers instead of closing on prose.
+      const probeReference = references.find((reference) =>
+        evidence.get(pullRequestEvidenceKey(row.companyId, reference))?.mergeCommitSha,
+      );
+      if (!probeReference) continue;
+      const probeItem = evidence.get(pullRequestEvidenceKey(row.companyId, probeReference))!;
+      const guardProbeEvidence =
+        `probe \`merged-operator merge-card sweep gate PRs ${references.map((r) => `${r.owner}/${r.repo}#${r.number}`).join(", ")}\` ` +
+        `head ${probeItem.mergeCommitSha} post-merge: all gate pull requests verified merged by the merged-operator merge-card sweep: ` +
+        references.map((reference) => {
           const item = evidence.get(pullRequestEvidenceKey(row.companyId, reference))!;
           const mergedAt = item.mergedAt ? ` merged at ${item.mergedAt}` : "";
           const sha = item.mergeCommitSha ? `, merge commit ${item.mergeCommitSha}` : "";
           return `${reference.owner}/${reference.repo}#${reference.number}${mergedAt}${sha}`;
-        }),
-      ].join(" ");
+        }).join(" ");
       const guardVerdict = await evaluateDoneTransitionGuardForBackstopClose({
         db,
         issue: guardIssue,

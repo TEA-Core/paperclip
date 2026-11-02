@@ -13,6 +13,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueExecutionDecisions,
+  issueWorkProducts,
   issues,
   projects,
   executionWorkspaces,
@@ -1262,6 +1263,14 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         returnAssignee: { type: "agent", agentId: authorId, userId: null },
       },
     }).where(eq(issues.id, fixture.issue.id));
+    // SUP-21902: recorded delivery merge commit for the Tier 2 origin guard.
+    await db.insert(issueWorkProducts).values({
+      companyId: fixture.company.id, issueId: fixture.issue.id, type: "pull_request", provider: "github",
+      externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+      reviewState: "none", isPrimary: true, healthStatus: "unknown",
+      metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    });
     return {
       app: createApp(db, agentActor(fixture.company, author!, actorRun!.id)),
       actorRun: actorRun!,

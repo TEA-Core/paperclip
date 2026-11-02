@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { createDb, executionWorkspaces, issues, projects } from "@paperclipai/db";
+import { createDb, executionWorkspaces, issueWorkProducts, issues, projects } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import {
   CAPABILITY_HIGH_RISK_SEMANTIC_VECTORS,
@@ -121,6 +121,14 @@ describeEmbedded("Paperclip semantic mock/production conformance", () => {
     });
     for (const world of Object.values(ids.worlds)) {
       await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, world.taskId));
+      // SUP-21902: recorded delivery merge commit for the Tier 2 origin guard.
+      await db.insert(issueWorkProducts).values({
+        companyId: ids.companyId, issueId: world.taskId, type: "pull_request", provider: "github",
+        externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+        url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+        reviewState: "none", isPrimary: true, healthStatus: "unknown",
+        metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+      });
     }
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockResolvedValue("test-token");

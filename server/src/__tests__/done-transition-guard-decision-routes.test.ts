@@ -18,6 +18,7 @@ import {
   issueDeliveryReceipts,
   issueLabels,
   issueExecutionDecisions,
+  issueWorkProducts,
   issues,
   labels,
   projectWorkspaces,
@@ -382,6 +383,14 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .update(executionWorkspaces)
       .set({ sourceIssueId: issueId })
       .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    // SUP-21902: recorded delivery merge commit for the Tier 2 origin guard.
+    await db.insert(issueWorkProducts).values({
+      companyId, issueId, type: "pull_request", provider: "github",
+      externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+      reviewState: "none", isPrimary: true, healthStatus: "unknown",
+      metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    });
 
     return { companyId, reviewerAgentId, implementerAgentId, issueId, identifier };
   }
@@ -557,6 +566,14 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .update(executionWorkspaces)
       .set({ sourceIssueId: parentIssueId })
       .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    // SUP-21902: recorded delivery merge commit for the Tier 2 origin guard.
+    await db.insert(issueWorkProducts).values({
+      companyId, issueId: parentIssueId, type: "pull_request", provider: "github",
+      externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+      reviewState: "none", isPrimary: true, healthStatus: "unknown",
+      metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    });
 
     const childIdentifiers: { id: string; identifier: string; excluded: boolean }[] = [];
     const totalChildren = opts.ladderedChildren + opts.excludedChildren;
@@ -973,14 +990,14 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .post(`/api/issues/${identifier}/comments`)
       .send({
         body: "## Review: APPROVED\n\nShip it.",
-        doneTier: { tier: "tier2", probeEvidence: "reviewer probe verified the patched path on the PR head." },
+        doneTier: { tier: "tier2", probeEvidence: "probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the patched path on the PR head." },
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(await statusOf(issueId)).toBe("done");
 
     const expectedBody =
-      "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): reviewer probe verified the patched path on the PR head.";
+      "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the patched path on the PR head.";
     const comments = await db
       .select({ body: issueComments.body })
       .from(issueComments)
@@ -1666,7 +1683,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         const ref = decodeURIComponent(url.split("/commits/")[1]?.split("?")[0] ?? "");
         if (ref === "fold/tea-patches-v2026.722.0") {
           defaultRefProbeCount += 1;
-          if (controlStatus !== 200 && defaultRefProbeCount > 1) {
+          if (controlStatus !== 200) {
             return new Response(JSON.stringify({ message: "default branch unavailable" }), { status: controlStatus });
           }
           return new Response(
@@ -1826,7 +1843,10 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(await statusOf(issueId)).toBe("done");
-      expect(commitProbeCalls()).toHaveLength(2);
+      // One commits probe only: the Tier 2 probe-head resolution. The guard
+      // compares against the recorded merge commit, so it no longer resolves
+      // the live default-branch tip, and the cited-SHA resolver probes nothing.
+      expect(commitProbeCalls()).toHaveLength(1);
       expect(await auditRows(companyId, issueId, "issue.done_transition_cited_sha_resolved")).toHaveLength(0);
     });
   });

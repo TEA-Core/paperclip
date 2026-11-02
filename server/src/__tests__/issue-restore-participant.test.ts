@@ -6,7 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { eq, sql } from "drizzle-orm";
 import {
   activityLog, agentSessionGoalActions, agentTaskSessions, agentWakeupRequests, agents, chatConversations, chatEndpoints, companies, companyMemberships, createDb, executionWorkspaces, heartbeatRunEvents, heartbeatRuns,
-  issueExecutionDecisions, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, pluginManagedResources, plugins, projects, toolApplications, toolConnections, type Db,
+  issueExecutionDecisions, issueRecoveryActions, issueThreadInteractions, issueWorkProducts, issues, nativeRunFinalizations, pluginManagedResources, plugins, projects, toolApplications, toolConnections, type Db,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase, type EmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
@@ -137,6 +137,14 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
       lastUsedAt: tier2Now, openedAt: tier2Now, createdAt: tier2Now, updatedAt: tier2Now,
     });
     await db.update(issues).set({ executionWorkspaceId: tier2WorkspaceId, deliveryRequirement: "record_only" }).where(eq(issues.id, ISSUE));
+    // SUP-21902: recorded delivery merge commit for the Tier 2 origin guard.
+    await db.insert(issueWorkProducts).values({
+      companyId: COMPANY, issueId: ISSUE, type: "pull_request", provider: "github",
+      externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+      reviewState: "none", isPrimary: true, healthStatus: "unknown",
+      metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    });
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockResolvedValue("test-token");
     await db.insert(issueExecutionDecisions).values({

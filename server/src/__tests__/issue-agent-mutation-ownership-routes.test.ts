@@ -228,6 +228,53 @@ function registerRouteMocks() {
     STALE_REOPEN_PENDING_CONSUMPTION_GRACE_MS: 5 * 60 * 1000,
   }));
 
+  // SUP-21902: this suite exercises mutation ownership against a fully mocked
+  // db, so the real Tier 2 origin predicate (which resolves heads through the
+  // commits API over a live database) cannot run here. The boundary mock keeps
+  // the contract enforceable for these fixtures: a close declaration must
+  // still carry the machine-checkable probe/head/post-merge shape, or the
+  // close fails. The real predicate (including the recorded-merge-commit
+  // comparison) is covered by done-transition-guard.test.ts and the
+  // done-transition-guard-*-routes suites.
+  vi.doMock("../services/done-transition-guard.js", async () => {
+    const actual = await vi.importActual<typeof import("../services/done-transition-guard.js")>(
+      "../services/done-transition-guard.js",
+    );
+    const TIER2_PREFIX = "Closed at Tier 2 (live):";
+    const TIER2_PROBE_SHAPE = /^probe `[^`]+` head [0-9a-f]{7,40} post-merge: .+$/i;
+    return {
+      ...actual,
+      evaluateDoneTierDeclaration: async (
+        _db: unknown,
+        _issue: unknown,
+        accompanyingComment: string | null,
+      ) => {
+        const line = (accompanyingComment ?? "")
+          .split(/\r?\n/)
+          .map((l: string) => l.trim())
+          .find((l: string) => l.startsWith(TIER2_PREFIX));
+        const malformed = {
+          allowed: false,
+          reason:
+            "(ownership-suite tier boundary) Tier 2 declaration probe evidence is not in the machine-checkable shape.",
+          tier: null,
+          skipped: false,
+          skipReason: null,
+        };
+        if (!line) return malformed;
+        const evidence = line.slice(TIER2_PREFIX.length).trim();
+        if (!TIER2_PROBE_SHAPE.test(evidence)) return malformed;
+        return {
+          allowed: true,
+          reason: `Tier 2 declaration found: ${evidence}`,
+          tier: "tier2",
+          skipped: false,
+          skipReason: null,
+        };
+      },
+    };
+  });
+
   vi.doMock("../services/runner-goals.js", () => ({
     runnerGoalService: () => mockRunnerGoalService,
     RunnerGoalActionError: class RunnerGoalActionError extends Error {},
@@ -519,6 +566,7 @@ describe("agent issue mutation checkout ownership", () => {
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../services/issues.js");
     vi.doUnmock("../services/work-products.js");
+    vi.doUnmock("../services/done-transition-guard.js");
     vi.doUnmock("../routes/issues.js");
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
@@ -1608,7 +1656,7 @@ describe("agent issue mutation checkout ownership", () => {
           doneTier: {
             tier: "tier2",
             probeEvidence:
-              "pkill -f 'paperclip serve' && paperclip serve >&2 & sleep 2; curl -sf http://127.0.0.1:8787/healthz => {\"ok\":true} on the locally built carrier head",
+              "probe `curl -sf http://127.0.0.1:8787/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: locally built carrier head returned ok",
           },
         });
 
@@ -3506,7 +3554,7 @@ describe("agent issue mutation checkout ownership", () => {
         // SUP-21910: agent done-resolves through this door now carry a
         // done-tier declaration, exactly like the PATCH close door.
         resolutionNote:
-          "Owner completed.\nClosed at Tier 2 (live): probed the delivered branch head after merge.",
+          "Owner completed.\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probed the delivered branch head after merge.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -3530,7 +3578,7 @@ describe("agent issue mutation checkout ownership", () => {
         sourceIssueStatus: "done",
         // SUP-21910: done-tier declaration for the gated recovery done door.
         resolutionNote:
-          "Owner completed.\nClosed at Tier 2 (live): probed the delivered branch head after merge.",
+          "Owner completed.\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probed the delivered branch head after merge.",
       });
 
     // Fork divergence: upstream's `board_escalation_no_takeover_v1` owns stranded
@@ -3561,7 +3609,7 @@ describe("agent issue mutation checkout ownership", () => {
         sourceIssueStatus: "done",
         // SUP-21910: done-tier declaration for the gated recovery done door.
         resolutionNote:
-          "Owner completed.\nClosed at Tier 2 (live): probed the delivered branch head after merge.",
+          "Owner completed.\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probed the delivered branch head after merge.",
       });
 
     // Fork divergence: upstream's `board_escalation_no_takeover_v1` owns stranded
@@ -3658,7 +3706,7 @@ describe("agent issue mutation checkout ownership", () => {
         // SUP-21910: carry a done-tier declaration so the shared guard lets the
         // request through to the participant-authority refusal under test.
         resolutionNote:
-          "Owner completed.\nClosed at Tier 2 (live): probed the delivered branch head after merge.",
+          "Owner completed.\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probed the delivered branch head after merge.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
@@ -3691,7 +3739,7 @@ describe("agent issue mutation checkout ownership", () => {
         // SUP-21910: carry a done-tier declaration so the shared guard lets the
         // request through to the review-policy refusal under test.
         resolutionNote:
-          "Owner completed.\nClosed at Tier 2 (live): probed the delivered branch head after merge.",
+          "Owner completed.\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probed the delivered branch head after merge.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);

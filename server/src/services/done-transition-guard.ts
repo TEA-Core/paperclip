@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { and, eq, inArray } from "drizzle-orm";
-import { agents, issueExecutionDecisions, issueLabels, issues, labels, type Db } from "@paperclipai/db";
+import { agents, issueExecutionDecisions, issueLabels, issues, issueWorkProducts, labels, type Db } from "@paperclipai/db";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   resolveGitHubToken,
@@ -1051,11 +1051,15 @@ async function proveLandedAtTip(
 // and a close-time resolver proves the origin claim:
 //  - the named head resolves in the delivery repository (a 404 is the
 //    `head_unresolvable` refusal, not an allow);
-//  - the resolved probe head equals the delivery merge head — the sha the delivery
-//    default branch points at right now — so pre-merge probe output (any head that is
-//    not the merge head) is refused;
-//  - an unresolvable default branch, a missing credential, or a provider failure is
-//    "could not be verified" and fails closed, mirroring the Tier 1 landing proof.
+//  - the resolved probe head equals THIS DELIVERY'S RECORDED MERGE COMMIT — the
+//    `mergeCommitSha` stamped on the issue's merged `pull_request` work product by
+//    pr-delivery (`metadata.mergeCommitSha`, sourced from GitHub at merge time) —
+//    NOT the live default-branch tip, which moves with every later merge and would
+//    let a probe at an earlier merge pass as proof of the current live surface;
+//  - when no recorded merge commit is available at close time the close fails
+//    closed (`merge_commit_unrecorded`): there is no fallback to the branch tip;
+//  - a missing credential or a provider failure is "could not be verified" and
+//    fails closed, mirroring the Tier 1 landing proof.
 // Arbitrary non-empty prose is malformed evidence under this contract, never live proof.
 const TIER2_PROBE_SHAPE_RE = /^probe `([^`]+)` head ([0-9a-f]{7,40}) post-merge: (.+)$/i;
 
@@ -1085,6 +1089,45 @@ function acceptTier2(evidence: string, sameRun: boolean): DoneTierDeclarationRes
 function unverifiedTier2(err: unknown): string {
   const detail = err instanceof Error ? err.message : "unknown";
   return `Tier 2 declaration could not be verified against the delivery merge head (${detail}). Accepted form: ${TIER2_FORM}`;
+}
+
+/**
+ * SUP-21902 (re-slice): this delivery's RECORDED merge commit(s), read from the
+ * merged `pull_request` work products pr-delivery stamps with
+ * `metadata.mergeCommitSha` at merge time. Distinct recorded shas are returned
+ * lowercased; a probe head matching any recorded merge commit for this issue
+ * satisfies the equality leg (a carrier issue can record more than one merged
+ * PR), while an empty result means the merge commit is not recorded and the
+ * caller must fail closed rather than fall back to the live branch tip.
+ */
+async function loadRecordedDeliveryMergeCommits(
+  db: Db,
+  issue: { id: string; companyId: string },
+): Promise<string[]> {
+  const rows = await db
+    .select({ metadata: issueWorkProducts.metadata })
+    .from(issueWorkProducts)
+    .where(
+      and(
+        eq(issueWorkProducts.companyId, issue.companyId),
+        eq(issueWorkProducts.issueId, issue.id),
+        eq(issueWorkProducts.type, "pull_request"),
+        eq(issueWorkProducts.status, "merged"),
+      ),
+    );
+  const shas = new Set<string>();
+  for (const row of rows) {
+    const sha = (row.metadata as Record<string, unknown> | null)?.mergeCommitSha;
+    if (typeof sha === "string" && /^[0-9a-f]{7,40}$/i.test(sha.trim())) {
+      shas.add(sha.trim().toLowerCase());
+    }
+  }
+  return [...shas];
+}
+
+function recordedMergeCommitMatches(recorded: string, resolvedProbeHead: string): boolean {
+  if (recorded.length === 40) return recorded === resolvedProbeHead;
+  return resolvedProbeHead.startsWith(recorded);
 }
 
 async function proveTier2Live(
@@ -1134,6 +1177,21 @@ async function proveTier2Live(
         `Accepted form: ${TIER2_FORM}`,
     );
   }
+  let recordedMergeCommits: string[];
+  try {
+    recordedMergeCommits = await loadRecordedDeliveryMergeCommits(db, issue);
+  } catch (err) {
+    return refuseTier2(unverifiedTier2(err));
+  }
+  if (recordedMergeCommits.length === 0) {
+    return refuseTier2(
+      "Tier 2 declaration could not be verified: no recorded delivery merge commit is available " +
+        "for this issue (merge_commit_unrecorded); the recorded merge commit is the " +
+        "`mergeCommitSha` on a merged pull_request work product, and there is no fallback to " +
+        "the live branch tip. " +
+        `Accepted form: ${TIER2_FORM}`,
+    );
+  }
   let token: string | null;
   try {
     const tokenResult = await resolveGitHubToken(db, issue.companyId);
@@ -1167,33 +1225,11 @@ async function proveTier2Live(
         `Accepted form: ${TIER2_FORM}`,
     );
   }
-  const defaultBranch = ctx.defaultRef.startsWith("origin/") && ctx.defaultRef.length > "origin/".length
-    ? ctx.defaultRef.slice("origin/".length)
-    : ctx.defaultRef;
-  let mergeHead: string | null;
-  try {
-    mergeHead = await resolveGitHubRefHeadSha(
-      parsed.hostname,
-      parsed.owner,
-      parsed.repo,
-      defaultBranch,
-      token,
-    );
-  } catch (err) {
-    return refuseTier2(unverifiedTier2(err));
-  }
-  if (mergeHead === null) {
-    return refuseTier2(
-      `Tier 2 declaration could not be verified: delivery default branch ${ctx.defaultRef} is ` +
-        `unresolvable in ${parsed.owner}/${parsed.repo}, so no delivery merge head exists to ` +
-        "match the probe head against.",
-    );
-  }
-  if (probeHeadResolved !== mergeHead) {
+  if (!recordedMergeCommits.some((recorded) => recordedMergeCommitMatches(recorded, probeHeadResolved))) {
     return refuseTier2(
       `Tier 2 declaration head ${probeHead} (resolved ${probeHeadResolved}) does not match the ` +
-        `delivery merge head ${mergeHead} that ${ctx.defaultRef} points at; the probe did not run ` +
-        "against the delivery merge head, so pre-merge probe output is not live proof. " +
+        `delivery merge head ${recordedMergeCommits.join(", ")} recorded for this delivery; the probe did not run ` +
+        "against this delivery's recorded merge commit, so pre-merge probe output is not live proof. " +
         `Accepted form: ${TIER2_FORM}`,
     );
   }

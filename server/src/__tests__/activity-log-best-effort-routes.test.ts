@@ -12,6 +12,7 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issueComments,
+  issueWorkProducts,
   issues,
   projects,
 } from "@paperclipai/db";
@@ -193,6 +194,14 @@ describeEmbeddedPostgres("best-effort activity log on issue routes", () => {
       updatedAt: tier2Now,
     });
     await db.update(issues).set({ executionWorkspaceId: tier2WorkspaceId }).where(eq(issues.id, issueId));
+    // SUP-21902: recorded delivery merge commit for the Tier 2 origin guard.
+    await db.insert(issueWorkProducts).values({
+      companyId: companyId, issueId: issueId, type: "pull_request", provider: "github",
+      externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+      reviewState: "none", isPrimary: true, healthStatus: "unknown",
+      metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    });
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockResolvedValue("test-token");
 
