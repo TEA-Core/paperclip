@@ -1037,6 +1037,19 @@ async function ensureRepairTargetWorktree(input: {
   };
 }
 
+function removeSeededSecretsMasterKeyEnvEntries(envPath: string): void {
+  if (!existsSync(envPath)) return;
+
+  const previousContents = readFileSync(envPath, "utf8");
+  const nextContents = previousContents.replace(
+    /^[\t ]*(?:export[\t ]+)?PAPERCLIP_SECRETS_MASTER_KEY(?:_FILE)?[\t ]*=.*(?:\r\n|\r|\n|$)/gm,
+    "",
+  );
+  if (nextContents !== previousContents) {
+    writeFileSync(envPath, nextContents, { encoding: "utf8", mode: 0o600 });
+  }
+}
+
 function resolveSourceConnectionString(config: PaperclipConfig, envEntries: Record<string, string>, portOverride?: number): string {
   if (config.database.mode === "postgres") {
     const connectionString = nonEmpty(envEntries.DATABASE_URL) ?? nonEmpty(config.database.connectionString);
@@ -1651,56 +1664,78 @@ async function scrubSeededSecretReferences(
     await db.execute(sql`
       update agents
       set adapter_config = jsonb_set(
-        adapter_config - 'provider' - 'managedProfileId' - 'agentCoreProfileId' - 'env',
+        adapter_config - 'provider' - 'managedProfileId' - 'agentCoreProfileId',
         '{env}',
-        '{}'::jsonb,
+        (select coalesce(jsonb_object_agg(key, value), '{}'::jsonb)
+          from jsonb_each(coalesce(adapter_config -> 'env', '{}'::jsonb))
+          where key !~* '(api[-_]?key|access[-_]?token|auth(?:[-_]?token)|authorization|bearer|(^|[-_])token($|[-_])|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)'
+            and coalesce(value ->> 'type', '') not in ('secret_ref', 'user_secret_ref')),
         true
       )
     `);
-    // SUP-22348: agent revisions store the same adapter_config snapshots, so
-    // they carry the same secret references and must get the same scrub.
     await db.execute(sql`
       update agent_config_revisions
       set
         before_config = jsonb_set(
+          before_config,
+          '{adapterConfig}',
           jsonb_set(
-            before_config - 'provider' - 'managedProfileId' - 'agentCoreProfileId' - 'env',
-            '{adapterConfig}',
-            coalesce(before_config -> 'adapterConfig', '{}'::jsonb) - 'provider' - 'managedProfileId' - 'agentCoreProfileId' - 'env',
+            coalesce(before_config -> 'adapterConfig', '{}'::jsonb) - 'provider' - 'managedProfileId' - 'agentCoreProfileId',
+            '{env}',
+            (select coalesce(jsonb_object_agg(key, value), '{}'::jsonb)
+              from jsonb_each(coalesce(before_config -> 'adapterConfig' -> 'env', '{}'::jsonb))
+              where key !~* '(api[-_]?key|access[-_]?token|auth(?:[-_]?token)|authorization|bearer|(^|[-_])token($|[-_])|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)'
+                and coalesce(value ->> 'type', '') not in ('secret_ref', 'user_secret_ref')),
             true
           ),
-          '{adapterConfig,env}',
-          '{}'::jsonb,
           true
         ),
         after_config = jsonb_set(
+          after_config,
+          '{adapterConfig}',
           jsonb_set(
-            after_config - 'provider' - 'managedProfileId' - 'agentCoreProfileId' - 'env',
-            '{adapterConfig}',
-            coalesce(after_config -> 'adapterConfig', '{}'::jsonb) - 'provider' - 'managedProfileId' - 'agentCoreProfileId' - 'env',
+            coalesce(after_config -> 'adapterConfig', '{}'::jsonb) - 'provider' - 'managedProfileId' - 'agentCoreProfileId',
+            '{env}',
+            (select coalesce(jsonb_object_agg(key, value), '{}'::jsonb)
+              from jsonb_each(coalesce(after_config -> 'adapterConfig' -> 'env', '{}'::jsonb))
+              where key !~* '(api[-_]?key|access[-_]?token|auth(?:[-_]?token)|authorization|bearer|(^|[-_])token($|[-_])|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)'
+                and coalesce(value ->> 'type', '') not in ('secret_ref', 'user_secret_ref')),
             true
           ),
-          '{adapterConfig,env}',
-          '{}'::jsonb,
           true
         )
     `);
-    // SUP-22348: retained env columns can hold plaintext values and
-    // secret_ref/user_secret_ref bindings; every binding form is secret
-    // material, so the env map is emptied while non-secret fields survive.
     await db.execute(sql`
       update projects
-      set env = '{}'::jsonb
+      set env = (
+        select coalesce(jsonb_object_agg(key, value), '{}'::jsonb)
+        from jsonb_each(coalesce(env, '{}'::jsonb))
+        where key !~* '(api[-_]?key|access[-_]?token|auth(?:[-_]?token)|authorization|bearer|(^|[-_])token($|[-_])|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)'
+          and coalesce(value ->> 'type', '') not in ('secret_ref', 'user_secret_ref')
+      )
       where env is not null and env <> '{}'::jsonb
     `);
     await db.execute(sql`
       update routines
-      set env = '{}'::jsonb
+      set env = (
+        select coalesce(jsonb_object_agg(key, value), '{}'::jsonb)
+        from jsonb_each(coalesce(env, '{}'::jsonb))
+        where key !~* '(api[-_]?key|access[-_]?token|auth(?:[-_]?token)|authorization|bearer|(^|[-_])token($|[-_])|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)'
+          and coalesce(value ->> 'type', '') not in ('secret_ref', 'user_secret_ref')
+      )
       where env is not null and env <> '{}'::jsonb
     `);
     await db.execute(sql`
       update routine_revisions
-      set snapshot = jsonb_set(snapshot, '{routine,env}', '{}'::jsonb, true)
+      set snapshot = jsonb_set(
+        snapshot,
+        '{routine,env}',
+        (select coalesce(jsonb_object_agg(key, value), '{}'::jsonb)
+          from jsonb_each(coalesce(snapshot -> 'routine' -> 'env', '{}'::jsonb))
+          where key !~* '(api[-_]?key|access[-_]?token|auth(?:[-_]?token)|authorization|bearer|(^|[-_])token($|[-_])|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)'
+            and coalesce(value ->> 'type', '') not in ('secret_ref', 'user_secret_ref')),
+        true
+      )
       where snapshot ? 'routine'
         and snapshot -> 'routine' -> 'env' is distinct from '{}'::jsonb
     `);
@@ -1827,6 +1862,9 @@ async function seedWorktreeDatabase(input: {
       `Validated migration ${targetValidation.summary.migrationRevision}.`,
     );
     if (seededMasterKey) {
+      if (input.seedMode === "minimal-no-secrets") {
+        removeSeededSecretsMasterKeyEnvEntries(input.targetPaths.envPath);
+      }
       mergePaperclipEnvEntries({ PAPERCLIP_SECRETS_MASTER_KEY: seededMasterKey }, input.targetPaths.envPath);
     }
 

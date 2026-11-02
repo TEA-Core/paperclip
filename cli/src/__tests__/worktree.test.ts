@@ -2449,6 +2449,9 @@ describe("worktree helpers", () => {
           JSON.stringify({
             PROD_TOKEN: { type: "secret_ref", secretId },
             LEGACY_TOKEN: "legacy-plaintext-token",
+            SAFE_FLAG: "enabled",
+            AUTH0_DOMAIN: "tenant.example.test",
+            PUBLIC_ENDPOINT: { type: "plain", value: "https://example.test" },
           }),
         ],
       );
@@ -2462,7 +2465,12 @@ describe("worktree helpers", () => {
             provider: "claude_managed",
             managedProfileId: "production-managed-profile",
             model: "claude-sonnet-5",
-            env: { API_KEY: { type: "secret_ref", secretId } },
+                env: {
+                  API_KEY: { type: "secret_ref", secretId },
+                SAFE_FLAG: "enabled",
+                AUTH0_DOMAIN: "tenant.example.test",
+                PUBLIC_ENDPOINT: { type: "plain", value: "https://example.test" },
+                },
           }),
         ],
       );
@@ -2478,7 +2486,12 @@ describe("worktree helpers", () => {
             adapterConfig: {
               managedProfileId: "production-managed-profile",
               model: "old-model",
-              env: { API_KEY: { type: "secret_ref", secretId } },
+              env: {
+                API_KEY: { type: "secret_ref", secretId },
+                SAFE_FLAG: "enabled",
+                AUTH0_DOMAIN: "tenant.example.test",
+                PUBLIC_ENDPOINT: { type: "plain", value: "https://example.test" },
+              },
             },
           }),
           JSON.stringify({
@@ -2487,7 +2500,12 @@ describe("worktree helpers", () => {
             adapterConfig: {
               agentCoreProfileId: "production-core-profile",
               model: "claude-sonnet-5",
-              env: { TOKEN: "plaintext-token" },
+                env: {
+                  TOKEN: "plaintext-token",
+                SAFE_FLAG: "enabled",
+                AUTH0_DOMAIN: "tenant.example.test",
+                PUBLIC_ENDPOINT: { type: "plain", value: "https://example.test" },
+                },
             },
           }),
         ],
@@ -2502,6 +2520,9 @@ describe("worktree helpers", () => {
             ANTHROPIC_API_KEY: "plaintext-production-token",
             WEBHOOK_SECRET: { type: "secret_ref", secretId },
             USER_TOKEN: { type: "user_secret_ref", key: "user-declared-key" },
+            SAFE_FLAG: "enabled",
+            AUTH0_DOMAIN: "tenant.example.test",
+            PUBLIC_ENDPOINT: { type: "plain", value: "https://example.test" },
           }),
         ],
       );
@@ -2520,6 +2541,9 @@ describe("worktree helpers", () => {
               env: {
                 PROD_TOKEN: { type: "secret_ref", secretId },
                 LEGACY_TOKEN: "legacy-plaintext-token",
+                SAFE_FLAG: "enabled",
+                AUTH0_DOMAIN: "tenant.example.test",
+                PUBLIC_ENDPOINT: { type: "plain", value: "https://example.test" },
               },
             },
             triggers: [],
@@ -2572,6 +2596,8 @@ describe("worktree helpers", () => {
         [
           `PAPERCLIP_HOME=${homeDir}`,
           `PAPERCLIP_INSTANCE_ID=${currentInstanceId}`,
+          "PAPERCLIP_SECRETS_MASTER_KEY=stale-inline-master-key",
+          "export PAPERCLIP_SECRETS_MASTER_KEY_FILE=stale-master-key-file",
         ].join("\n"),
         "utf8",
       );
@@ -2593,7 +2619,9 @@ describe("worktree helpers", () => {
       const seededKey = masterKeyMatch![1]!.trim();
       expect(seededKey).not.toBe("source-secret-material");
       expect(seededKey).not.toBe("inline-source-master-material");
+      expect(seededKey).not.toBe("stale-inline-master-key");
       expect(Buffer.from(seededKey, "base64").length).toBe(32);
+      expect(rewrittenEnv).not.toMatch(/^export PAPERCLIP_SECRETS_MASTER_KEY_FILE=/m);
       expect(fs.existsSync(path.join(currentPaths.instanceRoot, "secrets", "master.key"))).toBe(false);
       expect(fs.existsSync(path.join(currentPaths.instanceRoot, ".secrets", "master.key"))).toBe(false);
 
@@ -2633,7 +2661,14 @@ describe("worktree helpers", () => {
           [agentId],
         );
         expect(agentRows).toEqual([{
-          adapterConfig: { model: "claude-sonnet-5", env: {} },
+          adapterConfig: {
+            model: "claude-sonnet-5",
+            env: {
+              SAFE_FLAG: "enabled",
+              AUTH0_DOMAIN: "tenant.example.test",
+              PUBLIC_ENDPOINT: { type: "plain", value: "https://example.test" },
+            },
+          },
         }]);
         const agentRevisionRows = await targetDb.$client.unsafe<{
           beforeConfig: Record<string, unknown>;
@@ -2648,7 +2683,11 @@ describe("worktree helpers", () => {
             adapterType: "claude_managed",
             adapterConfig: {
               model: "old-model",
-              env: {},
+              env: {
+                SAFE_FLAG: "enabled",
+                AUTH0_DOMAIN: "tenant.example.test",
+                PUBLIC_ENDPOINT: { type: "plain", value: "https://example.test" },
+              },
             },
           },
           afterConfig: {
@@ -2656,7 +2695,11 @@ describe("worktree helpers", () => {
             adapterType: "claude_managed",
             adapterConfig: {
               model: "claude-sonnet-5",
-              env: {},
+              env: {
+                SAFE_FLAG: "enabled",
+                AUTH0_DOMAIN: "tenant.example.test",
+                PUBLIC_ENDPOINT: { type: "plain", value: "https://example.test" },
+              },
             },
           },
         }]);
@@ -2667,12 +2710,25 @@ describe("worktree helpers", () => {
           `select "env", "name" from "projects" where "id" = $1`,
           [projectId],
         );
-        expect(projectRows).toEqual([{ env: {}, name: "Secret-bearing project" }]);
+        expect(projectRows).toEqual([{
+          env: {
+            SAFE_FLAG: "enabled",
+            AUTH0_DOMAIN: "tenant.example.test",
+            PUBLIC_ENDPOINT: { type: "plain", value: "https://example.test" },
+          },
+          name: "Secret-bearing project",
+        }]);
         const routineRows = await targetDb.$client.unsafe<{ env: Record<string, unknown> | null }[]>(
           `select "env" from "routines" where "id" = $1`,
           [routineId],
         );
-        expect(routineRows).toEqual([{ env: {} }]);
+        expect(routineRows).toEqual([{
+          env: {
+            SAFE_FLAG: "enabled",
+            AUTH0_DOMAIN: "tenant.example.test",
+            PUBLIC_ENDPOINT: { type: "plain", value: "https://example.test" },
+          },
+        }]);
         const routineRevisionRows = await targetDb.$client.unsafe<{ snapshot: Record<string, unknown> }[]>(
           `select "snapshot" from "routine_revisions" where "id" = $1`,
           [routineRevisionId],
@@ -2680,7 +2736,14 @@ describe("worktree helpers", () => {
         expect(routineRevisionRows).toEqual([{
           snapshot: {
             version: 1,
-            routine: { title: "Secret-bearing routine", env: {} },
+            routine: {
+              title: "Secret-bearing routine",
+              env: {
+                SAFE_FLAG: "enabled",
+                AUTH0_DOMAIN: "tenant.example.test",
+                PUBLIC_ENDPOINT: { type: "plain", value: "https://example.test" },
+              },
+            },
             triggers: [],
           },
         }]);
