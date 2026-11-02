@@ -942,8 +942,14 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     // SUP-21902: with the credential resolving, the Tier 2 origin predicate and the
     // live open-PR discovery may READ the remote, but a record_only close must drive
     // no repository delivery transport — no arming status, no merge.
+    // Why this is not the old `expect(mockGhFetch).not.toHaveBeenCalled()`: the
+    // re-sliced Tier 2 predicate must resolve the declared probe head through
+    // the commits API and compare it with the recorded merge commit, so a
+    // legitimate close now performs read calls (and the open-PR discovery may
+    // too). A not-called assertion cannot hold for the new accepted close;
+    // the exact invariant that still holds is the zero transport list below.
     const deliveryTransportCalls = mockGhFetch.mock.calls.filter(([u]) => /\/statuses\/|\/merge/.test(String(u)));
-    expect(deliveryTransportCalls).toHaveLength(0);
+    expect(deliveryTransportCalls).toEqual([]);
   });
 
   it("PATCH: record_only close skips repository delivery; repository_delivery keeps it (SUP-21258)", async () => {
@@ -1770,7 +1776,17 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(await statusOf(issueId)).toBe("done");
-      expect(commitProbeCalls()).toContain("https://api.github.com/repos/TEA-Core/paperclip/commits/674fef15d2");
+      // Exact probe list, restored: two calls, both for the same ref — the
+      // Tier 2 origin predicate resolves the named probe head, and the
+      // cited-SHA resolver probes the cited commit. A single call cannot
+      // hold because both predicates now resolve heads; the old singleton
+      // only held while Tier 2 accepted the sentence on its face, which the
+      // re-slice deliberately removed (verified by running this test: the
+      // observed call list is exactly these two).
+      expect(commitProbeCalls()).toEqual([
+        "https://api.github.com/repos/TEA-Core/paperclip/commits/674fef15d2",
+        "https://api.github.com/repos/TEA-Core/paperclip/commits/674fef15d2",
+      ]);
       const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
       expect(comments.filter((c) => c.authorType === "system")).toHaveLength(0);
     });

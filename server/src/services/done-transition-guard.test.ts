@@ -5505,13 +5505,16 @@ describe("evaluateDoneTierDeclaration", () => {
   // on the remote), and any other URL 404s so unrelated probes never satisfy
   // the predicate by accident.
   function mockRefHeadResolutions(
-    resolutions: Array<{ ref: string; sha: string | null; unprocessable?: string }>,
+    resolutions: Array<{ ref: string; sha: string | null; unprocessable?: string; status?: number }>,
   ) {
     ghFetchMock.mockImplementation(async (url: string) => {
       const u = String(url);
       if (!u.includes("/commits/")) return new Response(JSON.stringify({}), { status: 404 });
-      for (const { ref, sha, unprocessable } of resolutions) {
+      for (const { ref, sha, unprocessable, status } of resolutions) {
         if (u.endsWith(`/commits/${encodeURIComponent(ref)}`)) {
+          if (status !== undefined) {
+            return new Response(JSON.stringify({ message: "provider error" }), { status });
+          }
           if (unprocessable !== undefined) {
             return new Response(JSON.stringify({ message: unprocessable }), { status: 422 });
           }
@@ -5687,6 +5690,23 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.reason).not.toContain("head_unresolvable");
     });
 
+    it("SUP-21902: a 401 or 403 from the head resolver refuses the close (never admits on a provider auth failure)", async () => {
+      for (const status of [401, 403]) {
+        mockRefHeadResolutions([{ ref: T2_PROBE_HEAD, sha: null, status }]);
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          repoBackedTierIssue(),
+          tier2Line(validTier2Evidence()),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("could not be verified");
+        expect(result.reason).not.toContain("head_unresolvable");
+      }
+    });
+
     it("SUP-21902: accepts a valid post-merge Tier 2 declaration whose named head is the delivery merge head", async () => {
       mockRefHeadResolutions([
         { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
@@ -5812,6 +5832,35 @@ describe("evaluateDoneTierDeclaration", () => {
         "curl https://app.example.com/health head aaaaaaaaaa post-merge: fix is live",
         "probe `curl https://app.example.com/health` post-merge: fix is live",
         "probe `curl https://app.example.com/health` head aaaaaaaaaa",
+      ]) {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          repoBackedTierIssue(),
+          tier2Line(evidence),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("machine-checkable");
+      }
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("SUP-21902: refuses Tier 2 shapes missing exactly one part (empty probe command, empty post-merge predicate) and a case-and-whitespace probe head", async () => {
+      for (const evidence of [
+        // Only the probe command text is missing (empty backticks); every
+        // other part of the shape is present, so dropping the command
+        // capture from the shape check would admit this.
+        "probe `` head aaaaaaaaaa post-merge: fix is live",
+        // Only the post-merge predicate is missing (empty after the colon);
+        // every other part is present, so allowing an empty predicate
+        // would admit this.
+        "probe `curl -sf https://tea-core.example/healthz` head aaaaaaaaaa post-merge:",
+        // Probe head carries whitespace inside it (and upper case), so it
+        // is not a resolvable hex ref; trimming or case-folding a captured
+        // head into a match would admit this.
+        "probe `curl -sf https://tea-core.example/healthz` head AAAA AAAA post-merge: fix is live",
       ]) {
         const result = await evaluateDoneTierDeclaration(
           mockDb,
