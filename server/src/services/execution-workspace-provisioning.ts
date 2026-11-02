@@ -309,8 +309,7 @@ export async function provisionIssueExecutionWorkspace(
   // project_primary row whose realized branch is null, which orphaned the
   // recorded delivery identity and looped final review on
   // delivery_identity_unresolved. Carry the recorded branch onto the new row,
-  // but only when it is anchored to THIS card (its identifier prefix, or the
-  // branch the card's bound workspace already carries): a board-attested
+  // but only when it carries THIS card's identifier prefix: a board-attested
   // record is not ownership-validated, and copying it onto the row would turn
   // another card's branch into this card's validated own branch (ADR-091 D1).
   const [recordedDeliveryRow] = issueId
@@ -331,17 +330,15 @@ export async function provisionIssueExecutionWorkspace(
       ? readNonEmptyString((recordedDelivery as { branch: string }).branch.trim())
       : null;
   const recordedDeliveryIdentifier = readNonEmptyString(issueRef?.identifier);
-  const existingWorkspaceSourceIssueId = existingExecutionWorkspace?.sourceIssueId?.trim() ?? "";
-  const existingWorkspaceOwnedByCard =
-    existingWorkspaceSourceIssueId === "" || existingWorkspaceSourceIssueId === issueId;
+  // The carry requires the identifier-prefix anchor in every arm, case
+  // sensitively (git refs are case-sensitive). Equality with the bound
+  // workspace row's branch is not enough: a sourceless row can carry a
+  // foreign branch name, and copying it would launder that name into this
+  // card's validated own branch (ADR-091 D1).
   const recordedDeliveryBranch =
     recordedDeliveryBranchCandidate !== null &&
-    ((recordedDeliveryIdentifier !== null &&
-      recordedDeliveryBranchCandidate
-        .toLowerCase()
-        .startsWith(`${recordedDeliveryIdentifier.toLowerCase()}-`)) ||
-      (existingWorkspaceOwnedByCard &&
-        recordedDeliveryBranchCandidate === existingExecutionWorkspace?.branchName))
+    recordedDeliveryIdentifier !== null &&
+    recordedDeliveryBranchCandidate.startsWith(`${recordedDeliveryIdentifier}-`)
       ? recordedDeliveryBranchCandidate
       : null;
   const nativeRecoveryExecutionWorkspaceId = resolveNativeRecoveryExecutionWorkspaceBinding({

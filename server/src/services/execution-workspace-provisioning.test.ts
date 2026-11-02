@@ -431,7 +431,7 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
 
   async function provisionWithRecordedDeliveryBranch(
     recordedBranchFor: (issueIdentifier: string, ancestorIdentifier: string) => string,
-    opts: { boundToDeadAncestorCarrier?: boolean } = {},
+    opts: { boundToDeadAncestorCarrier?: boolean; boundToSourcelessForeignRow?: boolean } = {},
   ) {
     const companyId = randomUUID();
     const projectId = randomUUID();
@@ -561,6 +561,26 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       });
     }
 
+    if (opts.boundToSourcelessForeignRow) {
+      await db.insert(executionWorkspaces).values({
+        id: carrierWorkspaceId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        sourceIssueId: null as never,
+        mode: "isolated_workspace",
+        strategyType: "project_primary",
+        name: RECORDED_BRANCH,
+        status: "active",
+        cwd: tempRoot,
+        branchName: RECORDED_BRANCH,
+        providerType: "local_fs",
+        providerRef: tempRoot,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -579,7 +599,7 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       responsibleUserId: "responsible-user",
       issueNumber: 1,
       identifier: issueIdentifier,
-      executionWorkspaceId: opts.boundToDeadAncestorCarrier ? carrierWorkspaceId : null,
+      executionWorkspaceId: opts.boundToDeadAncestorCarrier || opts.boundToSourcelessForeignRow ? carrierWorkspaceId : null,
       executionWorkspacePreference: null,
       executionWorkspaceSettings: {
         mode: "isolated_workspace",
@@ -619,7 +639,7 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       description: null,
       projectId,
       projectWorkspaceId,
-      executionWorkspaceId: opts.boundToDeadAncestorCarrier ? carrierWorkspaceId : null,
+      executionWorkspaceId: opts.boundToDeadAncestorCarrier || opts.boundToSourcelessForeignRow ? carrierWorkspaceId : null,
       executionWorkspacePreference: null,
     };
 
@@ -717,6 +737,18 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       .where(eq(executionWorkspaces.id, result.persistedExecutionWorkspace!.id));
     expect(persistedRows).toHaveLength(1);
     expect(persistedRows[0]!.branchName).toBe(recordedBranch);
+  });
+
+  it("does not carry a foreign branch name even when the bound sourceless row carries it", async () => {
+    const { result } = await provisionWithRecordedDeliveryBranch(() => "SUP-9999-foreign", {
+      boundToSourcelessForeignRow: true,
+    });
+
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+    expect(result.persistedExecutionWorkspace).not.toBeNull();
+    expect(result.persistedExecutionWorkspace!.branchName).not.toBe("SUP-9999-foreign");
+    expect(result.persistedExecutionWorkspace!.branchName).toBeNull();
   });
 
   it("does not carry a recorded delivery branch that belongs to an unrelated card", async () => {

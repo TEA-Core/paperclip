@@ -215,7 +215,6 @@ import {
   type DecisionHeadResolution,
   resolveIssueRepoContext,
   resolveCardDeliveryBranchOwnership,
-  isDeliveredByCardIdentifierPrefix,
   resolveLinkedPullRequestsWithState,
   publishHeadBoundRelease,
   DEFAULT_RELEASE_DEADLINES,
@@ -19506,11 +19505,7 @@ export function issueRoutes(
       // alone never turns an unanchored branch into the card's own branch.
       const recordedBranchAnchoredToCard =
         existing.identifier != null
-        && isDeliveredByCardIdentifierPrefix(
-          { ...projectRepo, headRefName: requestedDeliveryIdentity.branch },
-          projectRepo,
-          existing.identifier,
-        );
+        && requestedDeliveryIdentity.branch.startsWith(`${existing.identifier}-`);
       const canRecordProjectPrimaryBranch =
         branchOwnership.legitimate
         && branchOwnership.branch === null
@@ -19527,14 +19522,27 @@ export function issueRoutes(
         && requestedDeliveryIdentity.prNumber !== undefined
         && requestedDeliveryIdentity.prUrl !== undefined
         && recordedBranchAnchoredToCard;
+      // ADR-083 terminal carrier: the owner is done/cancelled and can never
+      // stamp again. A board refresh may bind the carrier branch's PR under
+      // the same shape approval time accepts (exact carrier branch plus a
+      // complete PR binding); the merged-on-base proof stays enforced at
+      // approval by requireMerged.
+      const boardTerminalCarrierRecord =
+        boardDeliveryRefresh
+        && branchOwnership.carrierOwnerTerminal === true
+        && requestedDeliveryIdentity.prNumber !== undefined
+        && requestedDeliveryIdentity.prUrl !== undefined
+        && branchOwnership.branch !== null
+        && requestedDeliveryIdentity.branch === branchOwnership.branch;
       const recordedBranchMismatch =
-        (!canRecordProjectPrimaryBranch && !boardOrphanDeliveryRecord && branchOwnership.branch === null)
+        (!canRecordProjectPrimaryBranch && !boardOrphanDeliveryRecord && !boardTerminalCarrierRecord && branchOwnership.branch === null)
         || (branchOwnership.branch !== null
           // Git refs are case-sensitive: the recorded branch must equal the control-plane branch exactly.
           && requestedDeliveryIdentity.branch !== branchOwnership.branch);
       if (
         !canRecordProjectPrimaryBranch
         && !boardOrphanDeliveryRecord
+        && !boardTerminalCarrierRecord
         && (!branchOwnership.legitimate || recordedBranchMismatch)
       ) {
         const branchReason =

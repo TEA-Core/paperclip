@@ -5443,6 +5443,40 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect(await recordedDeliveryOf(issueId)).toBeUndefined();
   });
 
+  it("allows the board to bind a terminal carrier PR on an in_review carrier child", async () => {
+    const { companyId, issueId } = await seedIssue({
+      status: "in_review",
+      sharedWorkspaceOwnerBranch: "SUP-14823-carrier-branch",
+    });
+    await db
+      .update(issues)
+      .set({ status: "done" })
+      .where(eq(issues.identifier, "SUP-14823-1"));
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14823-carrier-branch",
+          headSha: HEAD_SHA,
+          prNumber: PR_NUMBER,
+          prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [row] = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const delivery = (row!.executionState ?? {})?.delivery as Record<string, unknown> | undefined;
+    expect(delivery).toBeDefined();
+    expect(delivery!.branch).toBe("SUP-14823-carrier-branch");
+    expect(delivery!.prNumber).toBe(PR_NUMBER);
+  });
+
   it("still rejects the board refreshing deliveryIdentity with a foreign branch", async () => {
     const { companyId, issueId } = await seedIssue({ status: "in_review" });
     currentActor = boardActor(companyId);

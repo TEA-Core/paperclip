@@ -2385,7 +2385,9 @@ export async function resolveDeliveryIdentity(
       branchOwnership.noExecutionWorkspace === true &&
       hasBoundPr &&
       identifier !== null &&
-      isDeliveredByCardIdentifierPrefix({ ...projectRepo, headRefName: branch }, projectRepo, identifier);
+      // Case-sensitive anchor: git refs are case-sensitive, so a lowercase
+      // look-alike prefix does not bind this card's delivery.
+      branch.startsWith(`${identifier}-`);
     // ADR-083 terminal carrier: the owner is done/cancelled, so it can never
     // stamp again, but a recorded bound PR on the carrier branch that is proven
     // merged on its base branch IS the completed delivery. An open PR on a dead
@@ -2491,6 +2493,34 @@ type MergedDeliveryVerification =
  * rewritten after the merge), which fails closed per ADR-091 D4. 401/403
  * rotates to the next token candidate, mirroring the neighboring reads.
  */
+/**
+ * The base branch a merged delivery must be proven on: the card's own
+ * control-plane base (its workspace `baseRef`, remote-tracking prefix
+ * stripped), never the live PR's self-reported `base.ref`. A PR merged onto
+ * a side branch (release/other) must not satisfy a delivery whose base is
+ * the repo's main line. Null when the card records no base; callers then
+ * fall back to the live PR base (legacy rows without a recorded base).
+ */
+async function resolveCardDeliveryBaseRef(
+  db: Db,
+  companyId: string,
+  issueId: string,
+): Promise<string | null> {
+  const [issueRow] = await db
+    .select({
+      projectId: issues.projectId,
+      projectWorkspaceId: issues.projectWorkspaceId,
+      executionWorkspaceId: issues.executionWorkspaceId,
+    })
+    .from(issues)
+    .where(eq(issues.id, issueId));
+  if (!issueRow) return null;
+  const ctx = await resolveIssueRepoContext(db, { companyId, ...issueRow });
+  const raw = ctx?.defaultRef ?? null;
+  if (!raw) return null;
+  return raw.startsWith("origin/") && raw.length > "origin/".length ? raw.slice("origin/".length) : raw;
+}
+
 async function verifyMergedPullRequestOnBaseBranch(
   token: string,
   owner: string,
@@ -2561,7 +2591,7 @@ async function resolveExactBoundPullRequest(
           candidate.token,
           repo.owner,
           repo.repo,
-          result.baseRef,
+          (await resolveCardDeliveryBaseRef(db, companyId, issueId)) ?? result.baseRef,
           result.mergeCommitSha,
         );
         if (verified.outcome === "auth-failed" && candidate !== candidates[candidates.length - 1]) continue;
@@ -3592,7 +3622,7 @@ async function verifyLiveFinalDeliveryHead(
         candidate.token,
         pr.owner,
         pr.repo,
-        live.base?.ref ?? null,
+        (await resolveCardDeliveryBaseRef(db, companyId, issueId)) ?? live.base?.ref ?? null,
         live.merge_commit_sha ?? null,
       );
       if (verified.outcome === "auth-failed") {

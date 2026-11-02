@@ -2490,6 +2490,159 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         expect(result.reason).toContain("does not match the bound PR's current head");
       }
     });
+
+    it("refuses a carrier PR merged onto a side branch when the card base is main (base pinning)", async () => {
+      const issueId = await insertTerminalCarrierChild();
+      const [childRow] = await db
+        .select({ executionWorkspaceId: issues.executionWorkspaceId })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      await db
+        .update(executionWorkspaces)
+        .set({ baseRef: "main" })
+        .where(eq(executionWorkspaces.id, childRow!.executionWorkspaceId!));
+      installRoutes([
+        {
+          url: PR_URL,
+          body: { ...carrierMergedPrBody(), base: { ref: "release/other" } },
+        },
+        { url: COMPARE_URL, body: { status: "ahead", ahead_by: 2 } },
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("not proven on its base branch");
+      }
+    });
+
+    it("refuses an orphan PR merged onto a side branch when the card base is main (base pinning)", async () => {
+      const issueId = await insertOrphanBoundCard();
+      await db
+        .update(projectWorkspaces)
+        .set({ defaultRef: "main" })
+        .where(eq(projectWorkspaces.companyId, companyId));
+      installRoutes([
+        {
+          url: PR_URL,
+          body: {
+            state: "closed",
+            draft: false,
+            merged: true,
+            title: "Fix thing (SUP-42)",
+            merge_commit_sha: MERGE_SHA,
+            base: { ref: "release/other" },
+            head: { ref: "SUP-42-branch", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+          },
+        },
+        { url: COMPARE_URL, body: { status: "ahead", ahead_by: 2 } },
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("not proven on its base branch");
+      }
+    });
+
+    it("resolves a LIVE carrier child whose bound PR is open and head-matching (not terminal)", async () => {
+      const ownerIssueId = await insertIssue({ identifier: "SUP-1" });
+      const issueId = await insertIssue({
+        identifier: "SUP-42",
+        parentId: ownerIssueId,
+        sharedWorkspaceOwnerIssueId: ownerIssueId,
+        branchName: CARRIER_BRANCH,
+        delivery: {
+          repo: { owner: OWNER, repo: REPO },
+          prNumber: 42,
+          prUrl: `https://github.com/${OWNER}/${REPO}/pull/42`,
+          branch: CARRIER_BRANCH,
+          headSha: APPROVED_HEAD,
+        },
+      });
+      await insertMention(issueId, { number: 42, headRefName: CARRIER_BRANCH });
+      installRoutes([{ url: PR_URL, body: prHeadBody(APPROVED_HEAD, CARRIER_BRANCH) }]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("resolved");
+    });
+
+    it("refuses an orphan record with no PR binding even when an open PR sits on its branch", async () => {
+      const issueId = await insertIssue({
+        deliveryIdentity: false,
+        delivery: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-42-branch",
+          headSha: APPROVED_HEAD,
+        },
+      });
+      const orphanProjectId = randomUUID();
+      await db.insert(projects).values({
+        id: orphanProjectId,
+        companyId,
+        name: `${OWNER}/${REPO}`,
+        status: "in_progress",
+      });
+      await db.insert(projectWorkspaces).values({
+        id: randomUUID(),
+        companyId,
+        projectId: orphanProjectId,
+        name: "Primary",
+        cwd: "/tmp/test",
+        isPrimary: true,
+        repoUrl: `https://github.com/${OWNER}/${REPO}`,
+      });
+      await db.update(issues).set({ projectId: orphanProjectId }).where(eq(issues.id, issueId));
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch" });
+      installRoutes([{ url: PR_URL, body: prHeadBody(APPROVED_HEAD) }]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+    });
+
+    it("refuses an orphan record whose branch only matches the identifier prefix in lowercase", async () => {
+      const issueId = await insertOrphanBoundCard("sup-42-work");
+      installRoutes([
+        {
+          url: PR_URL,
+          body: {
+            state: "closed",
+            draft: false,
+            merged: true,
+            title: "Fix thing (SUP-42)",
+            merge_commit_sha: MERGE_SHA,
+            base: { ref: "main" },
+            head: { ref: "sup-42-work", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+          },
+        },
+        { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+    });
+
+    it("refuses an orphan record whose branch lacks the hyphen boundary after the identifier", async () => {
+      const issueId = await insertOrphanBoundCard("SUP-421-work");
+      installRoutes([
+        {
+          url: PR_URL,
+          body: {
+            state: "closed",
+            draft: false,
+            merged: true,
+            title: "Fix thing (SUP-42)",
+            merge_commit_sha: MERGE_SHA,
+            base: { ref: "main" },
+            head: { ref: "SUP-421-work", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+          },
+        },
+        { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+    });
   });
 
   describe("resolveCardPullRequest (SUP-14917 shared resolution)", () => {
