@@ -251,9 +251,18 @@ done/cancelled (a terminal carrier), provided the record binds a PR (`prNumber`
 and `prUrl`); approval later accepts it only as a merged delivery (see below).
 Board attestation alone never turns an unanchored branch into the card's own
 branch. Workspace provisioning applies the same anchor when it carries the
-recorded branch onto a freshly minted workspace row: the recorded branch must
-carry the card's identifier prefix in every case, and equality with the branch
-of the bound workspace row is not enough.
+recorded branch onto a freshly minted or restored workspace row: the recorded
+branch must carry the card's identifier prefix in every case, and equality with
+the branch of the bound workspace row is not enough.
+
+The provisioning carry also applies only while the card's status is `in_review`
+at provisioning time. Once a card leaves `in_review` (a bounced redo wake, a
+reopened follow-up), the fresh or restored row keeps a null branch, exactly as
+before the carry existed, so a later write into `in_review` with a new anchored
+branch is stamped normally. A card that stays `in_review` and re-delivers on a
+different branch than the one carried onto its row still gets `422
+delivery_identity_branch_write_rejected`; that case is unchanged and not covered
+by this carry.
 
 **Merged-only bindings:** when the control plane cannot back the record with a
 live delivery branch, `resolveDeliveryIdentity` still returns the binding but

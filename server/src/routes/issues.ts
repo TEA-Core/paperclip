@@ -19438,7 +19438,7 @@ export function issueRoutes(
       const boardDeliveryRefresh = req.actor.type === "board" && existing.status === "in_review";
       if ((!holdsLease || !enteringReview) && !boardDeliveryRefresh) {
         res.status(422).json({
-          error: "deliveryIdentity may only be written by the lease-holding run on a transition into in_review",
+          error: "deliveryIdentity may only be written by the lease-holding run on a transition into in_review, or by a board actor on a card already in in_review",
           code: "delivery_identity_write_rejected",
           details: {
             issueId: existing.id,
