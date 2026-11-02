@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS "issue_delivery_receipts" (
 	CONSTRAINT "issue_delivery_receipts_provider_check" CHECK ("issue_delivery_receipts"."provider" in ('github')),
 	CONSTRAINT "issue_delivery_receipts_actor_type_check" CHECK ("issue_delivery_receipts"."authorized_by_actor_type" in ('user', 'board', 'agent')),
 	CONSTRAINT "issue_delivery_receipts_pull_request_number_check" CHECK ("issue_delivery_receipts"."pull_request_number" > 0),
-	CONSTRAINT "issue_delivery_receipts_head_sha_check" CHECK ("issue_delivery_receipts"."head_sha" ~ '^[0-9a-f]{40,64}$')
+	CONSTRAINT "issue_delivery_receipts_head_sha_check" CHECK ("issue_delivery_receipts"."head_sha" ~ '^[0-9a-f]{40}$')
 );
 --> statement-breakpoint
 CREATE TABLE IF NOT EXISTS "issue_delivery_receipt_links" (
@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS "issue_delivery_receipt_links" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "issue_delivery_receipt_links_provider_check" CHECK ("issue_delivery_receipt_links"."provider" in ('github')),
 	CONSTRAINT "issue_delivery_receipt_links_pull_request_number_check" CHECK ("issue_delivery_receipt_links"."pull_request_number" > 0),
-	CONSTRAINT "issue_delivery_receipt_links_head_sha_check" CHECK ("issue_delivery_receipt_links"."head_sha" ~ '^[0-9a-f]{40,64}$')
+	CONSTRAINT "issue_delivery_receipt_links_head_sha_check" CHECK ("issue_delivery_receipt_links"."head_sha" ~ '^[0-9a-f]{40}$')
 );
 --> statement-breakpoint
 DO $$ BEGIN ALTER TABLE "issue_delivery_receipts" ADD CONSTRAINT "issue_delivery_receipts_company_id_companies_id_fk" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id") ON DELETE cascade ON UPDATE no action; EXCEPTION WHEN duplicate_object THEN NULL; END $$;

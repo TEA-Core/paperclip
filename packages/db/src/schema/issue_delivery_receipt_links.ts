@@ -74,7 +74,7 @@ export const issueDeliveryReceiptLinks = pgTable(
     pullRequestNumberCheck: check("issue_delivery_receipt_links_pull_request_number_check", sql`${table.pullRequestNumber} > 0`),
     headShaCheck: check(
       "issue_delivery_receipt_links_head_sha_check",
-      sql`${table.headSha} ~ '^[0-9a-f]{40,64}$'`,
+      sql`${table.headSha} ~ '^[0-9a-f]{40}$'`,
     ),
   }),
 );
