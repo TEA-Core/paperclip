@@ -3523,6 +3523,124 @@ Duplicate headings receive stable suffixes.
     expect(harness.dbExecutes.some((execute) => execute.sql.includes("wiki_page_revisions"))).toBe(true);
   });
 
+  it("rejects wiki_write_page carrying new redaction placeholders before the hash CAS and any write", async () => {
+    const harness = createTestHarness({ manifest });
+    const original = "# Report\n\nThe gateway was called as live-root bearer of the cluster.\n";
+    const path = "wiki/reports/live-root.md";
+    const files = new Map<string, string>([[path, original]]);
+    const writes: Array<{ path: string; contents: string }> = [];
+    harness.ctx.localFolders.readText = async (_companyId, _folderKey, relativePath) => {
+      const value = files.get(relativePath);
+      if (value == null) throw new Error("missing");
+      return value;
+    };
+    harness.ctx.localFolders.writeTextAtomic = async (_companyId, _folderKey, relativePath, contents) => {
+      writes.push({ path: relativePath, contents });
+      files.set(relativePath, contents);
+      return harness.ctx.localFolders.status(COMPANY_ID, "wiki-root");
+    };
+
+    await plugin.definition.setup(harness.ctx);
+
+    // A correct CAS hash proves the placeholder guard fires first, not the CAS.
+    const currentHash = createHash("sha256").update(original, "utf8").digest("hex");
+    const projected = original.replace("of the", "***REDACTED***");
+    await expect(
+      harness.executeTool("wiki_write_page", {
+        companyId: COMPANY_ID,
+        wikiId: "default",
+        path,
+        contents: projected,
+        expectedHash: currentHash,
+      }),
+    ).rejects.toThrow("contents carries redaction placeholder(s) absent from the current page");
+
+    expect(writes).toHaveLength(0);
+    expect(files.get(path)).toBe(original);
+  });
+
+  it("accepts a page write whose placeholder count is equal or fewer than the on-disk page", async () => {
+    const harness = createTestHarness({ manifest });
+    const original = "# Audit\n\nTwo spans were scrubbed: ***REDACTED*** and ***REDACTED***.\n";
+    const path = "wiki/reports/scrubbed.md";
+    const files = new Map<string, string>([[path, original]]);
+    harness.ctx.localFolders.readText = async (_companyId, _folderKey, relativePath) => {
+      const value = files.get(relativePath);
+      if (value == null) throw new Error("missing");
+      return value;
+    };
+    harness.ctx.localFolders.writeTextAtomic = async (_companyId, _folderKey, relativePath, contents) => {
+      files.set(relativePath, contents);
+      return harness.ctx.localFolders.status(COMPANY_ID, "wiki-root");
+    };
+
+    await plugin.definition.setup(harness.ctx);
+
+    // Keeping one of two documented literals is a legitimate edit.
+    const reduced = "# Audit\n\nOne span remains: ***REDACTED***.\n";
+    await expect(
+      harness.executeTool("wiki_write_page", {
+        companyId: COMPANY_ID,
+        wikiId: "default",
+        path,
+        contents: reduced,
+        expectedHash: createHash("sha256").update(original, "utf8").digest("hex"),
+      }),
+    ).resolves.toBeTruthy();
+    // requireString() trims tool params, so the write lands trimmed.
+    expect(files.get(path)).toBe(reduced.trimEnd());
+
+    // Growing past the on-disk count is refused.
+    const grown = "# Audit\n\nThree now: ***REDACTED*** ***REDACTED*** ***REDACTED***.\n";
+    await expect(
+      harness.executeTool("wiki_write_page", {
+        companyId: COMPANY_ID,
+        wikiId: "default",
+        path,
+        contents: grown,
+        expectedHash: createHash("sha256").update(reduced, "utf8").digest("hex"),
+      }),
+    ).rejects.toThrow("contents carries redaction placeholder(s) absent from the current page");
+    expect(files.get(path)).toBe(reduced.trimEnd());
+  });
+
+  it("accepts a read-then-write CAS round trip on a page whose raw bytes include a redactable span", async () => {
+    const harness = createTestHarness({ manifest });
+    const raw = "# Secrets note\n\nHeader used: Bearer live-root-session\n";
+    const path = "wiki/reports/bearer-note.md";
+    const files = new Map<string, string>([[path, raw]]);
+    harness.ctx.localFolders.readText = async (_companyId, _folderKey, relativePath) => {
+      const value = files.get(relativePath);
+      if (value == null) throw new Error("missing");
+      return value;
+    };
+    harness.ctx.localFolders.writeTextAtomic = async (_companyId, _folderKey, relativePath, contents) => {
+      files.set(relativePath, contents);
+      return harness.ctx.localFolders.status(COMPANY_ID, "wiki-root");
+    };
+
+    await plugin.definition.setup(harness.ctx);
+
+    const read = await harness.executeTool<{ content: string; data: { hash: string } }>("wiki_read_page", {
+      companyId: COMPANY_ID,
+      wikiId: "default",
+      path,
+    });
+    expect(read.data.hash).toBe(createHash("sha256").update(raw, "utf8").digest("hex"));
+
+    const appended = `${read.content}## Follow-up\n\nRound trip closed.\n`;
+    await expect(
+      harness.executeTool("wiki_write_page", {
+        companyId: COMPANY_ID,
+        wikiId: "default",
+        path,
+        contents: appended,
+        expectedHash: read.data.hash,
+      }),
+    ).resolves.toBeTruthy();
+    expect(files.get(path)).toBe(appended.trimEnd());
+  });
+
   it("rejects write-page with missing/misnamed/empty contents and leaves the page byte-identical", async () => {
     const harness = createTestHarness({ manifest });
     const original = "# Shared\n\nExisting body.\n";

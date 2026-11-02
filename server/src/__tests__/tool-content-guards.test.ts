@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   canonicalToolArguments,
@@ -78,5 +79,40 @@ describe("tool content guards", () => {
         direction: "result",
       }),
     ).toThrow(ToolContentValidationError);
+  });
+
+  it("keeps the plugin-supplied data.hash on redaction and reports the projected hash separately", () => {
+    const onDiskContent = "# Ops runbook\n\nCall with: Bearer live-root-session\n";
+    const projectedContent = "# Ops runbook\n\nCall with: Bearer ***REDACTED***\n";
+    const onDiskHash = createHash("sha256").update(onDiskContent, "utf8").digest("hex");
+
+    const result = validateToolContent({
+      value: { content: onDiskContent, data: { hash: onDiskHash } },
+      direction: "result",
+      sensitiveMode: "redact",
+    });
+
+    const value = result.value as { content: string; data: Record<string, unknown> };
+    expect(value.content).toBe(projectedContent);
+    expect(value.data.hash).toBe(onDiskHash);
+    expect(value.data.redacted).toBe(true);
+    expect(value.data.projectedHash).toBe(createHash("sha256").update(projectedContent, "utf8").digest("hex"));
+    expect(value.data.projectedHash).not.toBe(onDiskHash);
+    expect(value.data.projectedSizeBytes).toBe(Buffer.byteLength(projectedContent, "utf8"));
+    expect(result.findings).toContain("sensitive_value");
+  });
+
+  it("leaves a redaction-free tool result untouched", () => {
+    const content = "# Plain page\n\nNothing exciting here\n";
+    const hash = createHash("sha256").update(content, "utf8").digest("hex");
+
+    const result = validateToolContent({
+      value: { content, data: { hash } },
+      direction: "result",
+      sensitiveMode: "redact",
+    });
+
+    expect(result.value).toEqual({ content, data: { hash } });
+    expect(result.findings).toEqual([]);
   });
 });

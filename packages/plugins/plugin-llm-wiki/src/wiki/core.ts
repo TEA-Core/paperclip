@@ -1762,6 +1762,30 @@ function assertExpectedHash(expectedHash: string | null | undefined, currentHash
   }
 }
 
+const WIKI_REDACTION_PLACEHOLDER = "***REDACTED***";
+
+function countRedactionPlaceholders(contents: string): number {
+  let count = 0;
+  let index = contents.indexOf(WIKI_REDACTION_PLACEHOLDER);
+  while (index !== -1) {
+    count += 1;
+    index = contents.indexOf(WIKI_REDACTION_PLACEHOLDER, index + WIKI_REDACTION_PLACEHOLDER.length);
+  }
+  return count;
+}
+
+function assertNoNewRedactionPlaceholders(incomingContents: string, currentContents: string | null, path: string): void {
+  const incomingCount = countRedactionPlaceholders(incomingContents);
+  if (incomingCount === 0) return;
+  const currentCount = currentContents == null ? 0 : countRedactionPlaceholders(currentContents);
+  if (incomingCount > currentCount) {
+    throw new Error(
+      `Refusing to overwrite ${path}: contents carries redaction placeholder(s) absent from the current page ` +
+        `(${incomingCount} vs ${currentCount} on disk); re-read from disk bytes, do not write back projected content`,
+    );
+  }
+}
+
 async function upsertWikiInstance(ctx: PluginContext, input: { companyId: string; wikiId: string; rootPath?: string | null }) {
   await ctx.db.execute(
     `INSERT INTO ${tableName(ctx.db.namespace, "wiki_instances")} AS wiki_instances
@@ -1845,6 +1869,7 @@ export async function writeWikiPage(ctx: PluginContext, input: WritePageInput) {
   const path = assertPagePath(input.path);
   assertPageWriteAllowed(path, input.writer);
   const current = await readCurrentWithHash(ctx, input.companyId, path, space);
+  assertNoNewRedactionPlaceholders(input.contents, current.contents, path);
   assertExpectedHash(input.expectedHash, current.hash, path);
   await ctx.localFolders.writeTextAtomic(input.companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, path), input.contents);
   const metadata = await upsertPageMetadata(ctx, {
