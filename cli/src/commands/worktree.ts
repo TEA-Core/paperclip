@@ -1663,13 +1663,23 @@ async function scrubSeededSecretReferences(
       update agent_config_revisions
       set
         before_config = jsonb_set(
-          before_config - 'provider' - 'managedProfileId' - 'agentCoreProfileId' - 'env',
+          jsonb_set(
+            before_config - 'provider' - 'managedProfileId' - 'agentCoreProfileId' - 'env',
+            '{adapterConfig}',
+            coalesce(before_config -> 'adapterConfig', '{}'::jsonb) - 'provider' - 'managedProfileId' - 'agentCoreProfileId' - 'env',
+            true
+          ),
           '{adapterConfig,env}',
           '{}'::jsonb,
           true
         ),
         after_config = jsonb_set(
-          after_config - 'provider' - 'managedProfileId' - 'agentCoreProfileId' - 'env',
+          jsonb_set(
+            after_config - 'provider' - 'managedProfileId' - 'agentCoreProfileId' - 'env',
+            '{adapterConfig}',
+            coalesce(after_config -> 'adapterConfig', '{}'::jsonb) - 'provider' - 'managedProfileId' - 'agentCoreProfileId' - 'env',
+            true
+          ),
           '{adapterConfig,env}',
           '{}'::jsonb,
           true
