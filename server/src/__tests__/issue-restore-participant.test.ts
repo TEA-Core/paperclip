@@ -6,7 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import {
   activityLog, agentSessionGoalActions, agentTaskSessions, agentWakeupRequests, agents, chatConversations, chatEndpoints, companies, companyMemberships, createDb, heartbeatRunEvents, heartbeatRuns,
-  issueExecutionDecisions, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, toolApplications, toolConnections, type Db,
+  issueExecutionDecisions, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, pluginManagedResources, plugins, toolApplications, toolConnections, type Db,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase, type EmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
@@ -72,6 +72,8 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(pluginManagedResources);
+    await db.delete(plugins);
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(companies);
@@ -114,6 +116,29 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
   }
   async function audit() {
     return db.select().from(activityLog).where(eq(activityLog.entityId, ISSUE));
+  }
+  async function seedWikiMaintainerBinding(agentId: string) {
+    const pluginId = randomUUID();
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      packageName: "@paperclipai/plugin-llm-wiki",
+      version: "0.1.0",
+      apiVersion: 1,
+      categories: [],
+      manifestJson: {} as never,
+      status: "ready",
+      installOrder: 1,
+    });
+    await db.insert(pluginManagedResources).values({
+      companyId: COMPANY,
+      pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      resourceKind: "agent",
+      resourceKey: "wiki-maintainer",
+      resourceId: agentId,
+      defaultsJson: {},
+    });
   }
   // The BEFORE UPDATE trigger pauses *after* restore's final live-run read while
   // its transaction still holds the issue row. Only the disposable test DB has it.
@@ -240,6 +265,25 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     expect((await post()).status).toBe(409);
     expect(await snapshot()).toEqual(before);
     expect(await audit()).toHaveLength(0);
+  });
+
+  it("refuses to restore a Wiki handoff to a non-canonical participant", async () => {
+    await seedWikiMaintainerBinding(INDEPENDENT);
+    await db.update(issues).set({ title: "Handoff to Wiki Maintainer" }).where(eq(issues.id, ISSUE));
+    const before = await snapshot();
+    const result = await post();
+    expect(result.status, JSON.stringify(result.body)).toBe(422);
+    expect(await snapshot()).toEqual(before);
+    expect(await audit()).toHaveLength(0);
+  });
+
+  it("restores a Wiki handoff to the canonical maintainer", async () => {
+    await seedWikiMaintainerBinding(PARTICIPANT);
+    await db.update(issues).set({ title: "Handoff to Wiki Maintainer" }).where(eq(issues.id, ISSUE));
+    const result = await post();
+    expect(result.status, JSON.stringify(result.body)).toBe(200);
+    expect((await snapshot()).assigneeAgentId).toBe(PARTICIPANT);
+    expect(await audit()).toHaveLength(1);
   });
 
   it("409s without changes for a fixed conversation identity", async () => {

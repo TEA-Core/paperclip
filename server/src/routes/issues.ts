@@ -13202,6 +13202,18 @@ export function issueRoutes(
             issue.createdByAgentId ?? null,
           ).agentIds.has(participantId as string)
         ) throw conflict("Pending participant cannot approve their own work");
+        await assertWikiHandoffWriteIntegrity({
+          db: tx as unknown as Db,
+          companyId: issue.companyId,
+          issue: {
+            title: issue.title,
+            description: issue.description,
+            executionPolicy: issue.executionPolicy,
+            executionState: state,
+          },
+          incomingAssigneeAgentId: participantId,
+          checkReviewStage: false,
+        });
 
         const [agent] = await tx.select().from(agents)
           .where(and(eq(agents.id, participantId as string), eq(agents.companyId, issue.companyId)))
@@ -19186,10 +19198,10 @@ export function issueRoutes(
     }
     Object.assign(updateFields, transition.patch);
     // SUP-13526 / SUP-21752: check the assignee and execution state the write
-    // will persist. A workflow-owned assignment is the active review
-    // participant; it is not an explicit assignee write, and the pre-transition
-    // request assignee plus stored state can describe a stage this transition
-    // has already completed.
+    // will persist. The gate is keyed on the request explicitly supplying an
+    // assignee; a workflow-owned assignment is exempt only when the request did
+    // not supply one. Otherwise a request could pair an explicit assignee with
+    // a workflow re-assertion and land a self-satisfying review seat.
     const resultingAssigneeAgentId =
       updateFields.assigneeAgentId !== undefined
         ? (updateFields.assigneeAgentId as string | null)
@@ -19198,10 +19210,7 @@ export function issueRoutes(
       updateFields.executionState !== undefined
         ? updateFields.executionState
         : existing.executionState;
-    if (
-      normalizedAssigneeAgentId !== undefined &&
-      !transition.workflowControlledAssignment
-    ) {
+    if (normalizedAssigneeAgentId !== undefined) {
       assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
         executionPolicy: nextExecutionPolicy,
         executionState: resultingExecutionState,
