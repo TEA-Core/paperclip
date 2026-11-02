@@ -2647,7 +2647,6 @@ describe("worktree helpers", () => {
             name: "Secret-bearing agent",
             adapterType: "claude_managed",
             adapterConfig: {
-              managedProfileId: "production-managed-profile",
               model: "old-model",
               env: {},
             },
@@ -2656,7 +2655,6 @@ describe("worktree helpers", () => {
             name: "Secret-bearing agent",
             adapterType: "claude_managed",
             adapterConfig: {
-              agentCoreProfileId: "production-core-profile",
               model: "claude-sonnet-5",
               env: {},
             },
