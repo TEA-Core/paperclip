@@ -2493,34 +2493,6 @@ type MergedDeliveryVerification =
  * rewritten after the merge), which fails closed per ADR-091 D4. 401/403
  * rotates to the next token candidate, mirroring the neighboring reads.
  */
-/**
- * The base branch a merged delivery must be proven on: the card's own
- * control-plane base (its workspace `baseRef`, remote-tracking prefix
- * stripped), never the live PR's self-reported `base.ref`. A PR merged onto
- * a side branch (release/other) must not satisfy a delivery whose base is
- * the repo's main line. Null when the card records no base; callers then
- * fall back to the live PR base (legacy rows without a recorded base).
- */
-async function resolveCardDeliveryBaseRef(
-  db: Db,
-  companyId: string,
-  issueId: string,
-): Promise<string | null> {
-  const [issueRow] = await db
-    .select({
-      projectId: issues.projectId,
-      projectWorkspaceId: issues.projectWorkspaceId,
-      executionWorkspaceId: issues.executionWorkspaceId,
-    })
-    .from(issues)
-    .where(eq(issues.id, issueId));
-  if (!issueRow) return null;
-  const ctx = await resolveIssueRepoContext(db, { companyId, ...issueRow });
-  const raw = ctx?.defaultRef ?? null;
-  if (!raw) return null;
-  return raw.startsWith("origin/") && raw.length > "origin/".length ? raw.slice("origin/".length) : raw;
-}
-
 async function verifyMergedPullRequestOnBaseBranch(
   token: string,
   owner: string,
@@ -2560,6 +2532,35 @@ async function verifyMergedPullRequestOnBaseBranch(
   };
 }
 
+/**
+ * The base branch a merged-only delivery (`requireMerged`: terminal ADR-083
+ * carrier or no execution workspace) must be proven on: the card's own
+ * control-plane base (its workspace `baseRef`, remote-tracking prefix
+ * stripped), never the live PR's self-reported `base.ref`. A PR merged onto a
+ * side branch must not satisfy such a delivery, because nothing live backs it.
+ * Null when the card records no base: the caller then refuses, it never falls
+ * back to the live PR base. Ordinary bindings are not pinned.
+ */
+async function resolveCardDeliveryBaseRef(
+  db: Db,
+  companyId: string,
+  issueId: string,
+): Promise<string | null> {
+  const [issueRow] = await db
+    .select({
+      projectId: issues.projectId,
+      projectWorkspaceId: issues.projectWorkspaceId,
+      executionWorkspaceId: issues.executionWorkspaceId,
+    })
+    .from(issues)
+    .where(eq(issues.id, issueId));
+  if (!issueRow) return null;
+  const ctx = await resolveIssueRepoContext(db, { companyId, ...issueRow });
+  const raw = ctx?.defaultRef ?? null;
+  if (!raw) return null;
+  return raw.startsWith("origin/") && raw.length > "origin/".length ? raw.slice("origin/".length) : raw;
+}
+
 async function resolveExactBoundPullRequest(
   db: Db,
   companyId: string,
@@ -2591,7 +2592,7 @@ async function resolveExactBoundPullRequest(
           candidate.token,
           repo.owner,
           repo.repo,
-          (await resolveCardDeliveryBaseRef(db, companyId, issueId)) ?? result.baseRef,
+          binding.requireMerged ? await resolveCardDeliveryBaseRef(db, companyId, issueId) : result.baseRef,
           result.mergeCommitSha,
         );
         if (verified.outcome === "auth-failed" && candidate !== candidates[candidates.length - 1]) continue;
@@ -2665,7 +2666,7 @@ async function resolveExactBoundPullRequest(
  * honest cost, and it is why this path is entered only when ownership of the
  * recorded branch is positively disproven, never by default.
  */
-export function isDeliveredByCardIdentifierPrefix(
+function isDeliveredByCardIdentifierPrefix(
   pr: { owner: string; repo: string; headRefName: string | null },
   deliveryRepo: { owner: string; repo: string },
   identifier: string,
@@ -3618,11 +3619,12 @@ async function verifyLiveFinalDeliveryHead(
       // SUP-21513: a merged delivery whose merge commit is proven on the
       // recorded base branch is a completed delivery — accept it. No status is
       // written later; publishApprovalStatus truthfully skips merged PRs.
+      const mergedOnly = (await resolveDeliveryIdentity(db, companyId, issueId)).binding?.requireMerged === true;
       const verified = await verifyMergedPullRequestOnBaseBranch(
         candidate.token,
         pr.owner,
         pr.repo,
-        (await resolveCardDeliveryBaseRef(db, companyId, issueId)) ?? live.base?.ref ?? null,
+        mergedOnly ? await resolveCardDeliveryBaseRef(db, companyId, issueId) : live.base?.ref ?? null,
         live.merge_commit_sha ?? null,
       );
       if (verified.outcome === "auth-failed") {

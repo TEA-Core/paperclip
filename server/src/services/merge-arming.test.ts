@@ -2013,6 +2013,33 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       }
     });
 
+    it("keeps proving an ordinary binding against the PR's own base when the workspace base differs (stacked carrier child)", async () => {
+      const issueId = await insertBoundCard();
+      const [cardRow] = await db
+        .select({ executionWorkspaceId: issues.executionWorkspaceId })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      await db
+        .update(executionWorkspaces)
+        .set({ baseRef: "main" })
+        .where(eq(executionWorkspaces.id, cardRow!.executionWorkspaceId!));
+      const stackedPr = { ...mergedPrHeadBody(), base: { ref: "SUP-1-carrier" } };
+      installRoutes([
+        { url: PR_URL, body: stackedPr },
+        {
+          url: `https://api.github.com/repos/${OWNER}/${REPO}/compare/SUP-1-carrier...${MERGE_SHA}`,
+          body: { status: "identical", ahead_by: 0 },
+        },
+        { url: COMPARE_URL, body: { status: "ahead", ahead_by: 3 } },
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("resolved");
+
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight.kind).toBe("resolved");
+    });
+
     it("preflightFinalDelivery (the approve 409 gate) accepts the merged proven delivery", async () => {
       const issueId = await insertBoundCard();
       installRoutes([
@@ -2262,6 +2289,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     const CARRIER_BRANCH = "SUP-1-carrier-branch";
     const MERGE_SHA = "mergec000000000000000000000000000000000001";
     const COMPARE_URL = `https://api.github.com/repos/${OWNER}/${REPO}/compare/main...${MERGE_SHA}`;
+    const SIDE_COMPARE_URL = `https://api.github.com/repos/${OWNER}/${REPO}/compare/release%2Fother...${MERGE_SHA}`;
 
     function carrierMergedPrBody() {
       return {
@@ -2279,7 +2307,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       };
     }
 
-    async function insertTerminalCarrierChild() {
+    async function insertTerminalCarrierChild(options: { pinned?: boolean } = {}) {
       const ownerIssueId = await insertIssue({ identifier: "SUP-1" });
       await db.update(issues).set({ status: "done" }).where(eq(issues.id, ownerIssueId));
       const issueId = await insertIssue({
@@ -2296,6 +2324,16 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         },
       });
       await insertMention(issueId, { number: 42, headRefName: CARRIER_BRANCH });
+      if (options.pinned !== false) {
+        const [childRow] = await db
+          .select({ executionWorkspaceId: issues.executionWorkspaceId })
+          .from(issues)
+          .where(eq(issues.id, issueId));
+        await db
+          .update(executionWorkspaces)
+          .set({ baseRef: "main" })
+          .where(eq(executionWorkspaces.id, childRow!.executionWorkspaceId!));
+      }
       return issueId;
     }
 
@@ -2376,7 +2414,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       }
     });
 
-    async function insertOrphanBoundCard(recordedBranch = "SUP-42-branch") {
+    async function insertOrphanBoundCard(recordedBranch = "SUP-42-branch", options: { pinned?: boolean } = {}) {
       const issueId = await insertIssue({
         deliveryIdentity: false,
         delivery: {
@@ -2402,6 +2440,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         cwd: "/tmp/test",
         isPrimary: true,
         repoUrl: `https://github.com/${OWNER}/${REPO}`,
+        ...(options.pinned === false ? {} : { defaultRef: "main" }),
       });
       await db.update(issues).set({ projectId: orphanProjectId }).where(eq(issues.id, issueId));
       await insertMention(issueId, { number: 42, headRefName: recordedBranch });
@@ -2493,19 +2532,12 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
 
     it("refuses a carrier PR merged onto a side branch when the card base is main (base pinning)", async () => {
       const issueId = await insertTerminalCarrierChild();
-      const [childRow] = await db
-        .select({ executionWorkspaceId: issues.executionWorkspaceId })
-        .from(issues)
-        .where(eq(issues.id, issueId));
-      await db
-        .update(executionWorkspaces)
-        .set({ baseRef: "main" })
-        .where(eq(executionWorkspaces.id, childRow!.executionWorkspaceId!));
       installRoutes([
         {
           url: PR_URL,
           body: { ...carrierMergedPrBody(), base: { ref: "release/other" } },
         },
+        { url: SIDE_COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
         { url: COMPARE_URL, body: { status: "ahead", ahead_by: 2 } },
       ]);
 
@@ -2518,10 +2550,6 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
 
     it("refuses an orphan PR merged onto a side branch when the card base is main (base pinning)", async () => {
       const issueId = await insertOrphanBoundCard();
-      await db
-        .update(projectWorkspaces)
-        .set({ defaultRef: "main" })
-        .where(eq(projectWorkspaces.companyId, companyId));
       installRoutes([
         {
           url: PR_URL,
@@ -2535,6 +2563,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
             head: { ref: "SUP-42-branch", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
           },
         },
+        { url: SIDE_COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
         { url: COMPARE_URL, body: { status: "ahead", ahead_by: 2 } },
       ]);
 
@@ -2543,6 +2572,51 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       if (result.kind === "unresolvable") {
         expect(result.reason).toContain("not proven on its base branch");
       }
+    });
+
+    it("refuses a merged-only terminal carrier binding whose card records no base, never falling back to the PR's own base", async () => {
+      const issueId = await insertTerminalCarrierChild({ pinned: false });
+      installRoutes([
+        { url: PR_URL, body: carrierMergedPrBody() },
+        { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("not proven on its base branch");
+      }
+
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight.kind).toBe("unresolvable");
+    });
+
+    it("refuses a merged-only no-workspace binding whose card records no base, never falling back to the PR's own base", async () => {
+      const issueId = await insertOrphanBoundCard("SUP-42-branch", { pinned: false });
+      installRoutes([
+        {
+          url: PR_URL,
+          body: {
+            state: "closed",
+            draft: false,
+            merged: true,
+            title: "Fix thing (SUP-42)",
+            merge_commit_sha: MERGE_SHA,
+            base: { ref: "main" },
+            head: { ref: "SUP-42-branch", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+          },
+        },
+        { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("not proven on its base branch");
+      }
+
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight.kind).toBe("unresolvable");
     });
 
     it("resolves a LIVE carrier child whose bound PR is open and head-matching (not terminal)", async () => {

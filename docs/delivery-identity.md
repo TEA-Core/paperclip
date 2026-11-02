@@ -15,7 +15,7 @@ Before approval status is published or merge arming proceeds, the server validat
 
 1. The source issue, when recorded, must be the current authorizing issue.
 2. `prUrl` must be the canonical URL for `repo` and `prNumber`.
-3. The exact pull request must exist, be open, and not be a draft. Exception: a merged-only binding (a card with no execution workspace, or an ADR-083 carrier whose owner is already done/cancelled) must instead be merged and proven on its base branch; an open PR is refused. See [Branch protection](branch-protection.md) for the write path and merged-only rule.
+3. The exact pull request must exist, be open, and not be a draft. Exception: a merged-only binding (a card with no execution workspace, or an ADR-083 carrier whose owner is already done/cancelled) must instead be merged and proven on the card's own control-plane base branch; an open PR is refused. See [Branch protection](branch-protection.md) for the write path and merged-only rule.
 4. Its live head branch must equal `branch`.
 5. Its live head SHA must equal `headSha`.
 6. The pull request repository must equal the project's delivery repository.

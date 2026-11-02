@@ -245,19 +245,26 @@ only when anchored to it. It must equal the card's control-plane delivery branch
 delivery_identity_branch_write_rejected`. A board refresh also needs the card's
 identifier prefix on `branch` to stamp it onto this card's own `project_primary`
 row that has no branch, or to record a card with **no** execution workspace
-(that record must also bind a PR, `prNumber` and `prUrl`). Board attestation
-alone never turns an unanchored branch into the card's own branch. Workspace
-provisioning applies the same anchor when it carries the recorded branch onto a
-freshly minted workspace row (the recorded branch needs the card's identifier
-prefix, or must already be the branch of a row this card owns).
+(that record must also bind a PR, `prNumber` and `prUrl`). A board refresh may
+also record the exact branch of an ADR-083 carrier whose owner is already
+done/cancelled (a terminal carrier), provided the record binds a PR (`prNumber`
+and `prUrl`); approval later accepts it only as a merged delivery (see below).
+Board attestation alone never turns an unanchored branch into the card's own
+branch. Workspace provisioning applies the same anchor when it carries the
+recorded branch onto a freshly minted workspace row: the recorded branch must
+carry the card's identifier prefix in every case, and equality with the branch
+of the bound workspace row is not enough.
 
 **Merged-only bindings:** when the control plane cannot back the record with a
 live delivery branch, `resolveDeliveryIdentity` still returns the binding but
 marks it `requireMerged`. This covers a card with no execution workspace (anchored
 by identifier prefix) and an ADR-083 carrier whose owner is already done/cancelled.
 `resolveExactBoundPullRequest` then accepts it only as a completed delivery: the
-bound PR must be merged and proven on its base branch. An open PR on a dead
-carrier stays refused (SUP-16896). A merged-only binding is never a release
+bound PR must be merged and its merge commit proven on the card's own
+control-plane base (the workspace `baseRef`, or the project workspace default
+ref), never the PR's self-reported base. A card that records no such base is
+refused. Ordinary bindings keep proving a merged PR against the PR's own base
+branch. An open PR on a dead carrier stays refused (SUP-16896). A merged-only binding is never a release
 target (`resolveReleaseDeliveryTarget`) and never feeds release-assurance.
 
 ### Guard B actor-resolution order (ADR-092 D3, SUP-14826)
