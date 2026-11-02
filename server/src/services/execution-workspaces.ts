@@ -4737,6 +4737,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             {
               ...(requestedStatus ? { status: requestedStatus } : {}),
               ...transition.patch,
+              ...(transition.workflowControlledAssignment
+                ? { workflowControlledAssignment: true }
+                : {}),
               actorAgentId: input.actor.agentId ?? null,
               actorUserId: input.actor.actorType === "user" ? input.actor.actorId : null,
             },

@@ -11613,6 +11613,13 @@ export function issueService(db: Db) {
          * from a request body.
          */
         systemWorkspaceBinding?: boolean;
+        /**
+         * Internal only. Set when the execution-policy transition owns the
+         * assignee written in this update. The persisted assignee is the active
+         * review participant, not an explicit request write, so the
+         * self-satisfying review-stage gate does not apply to it.
+         */
+        workflowControlledAssignment?: boolean;
         companyGuard?: string;
         /**
          * Internal only. Optimistic concurrency token for PATCH /api/issues/:id.
@@ -11669,6 +11676,7 @@ export function issueService(db: Db) {
         systemWorkspaceBinding,
         companyGuard,
         expectedUpdatedAt,
+        workflowControlledAssignment,
         ...issueData
       } = data;
       if (
@@ -12102,7 +12110,10 @@ export function issueService(db: Db) {
               : receiptExisting.assigneeAgentId,
           checkReviewStage: false,
         });
-        if (issueData.assigneeAgentId !== undefined) {
+        if (
+          issueData.assigneeAgentId !== undefined &&
+          !workflowControlledAssignment
+        ) {
           assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
             executionPolicy:
               issueData.executionPolicy !== undefined
