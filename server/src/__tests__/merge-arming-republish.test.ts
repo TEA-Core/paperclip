@@ -4943,6 +4943,52 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect(workspace!.branchName).toBe("SUP-14824-project-primary");
   });
 
+  it("stamps a re-delivery on a new branch after a bounce left a stale recorded delivery and a branchless workspace row", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({
+      executionRunId: runId,
+      strategyType: "project_primary",
+      deliveryBranch: null,
+    });
+    await db
+      .update(issues)
+      .set({
+        executionState: {
+          delivery: {
+            repo: { owner: OWNER, repo: REPO },
+            branch: "SUP-14824-first-delivery",
+            headSha: HEAD_SHA,
+          },
+        },
+      })
+      .where(eq(issues.id, issueId));
+    currentActor = agentActor(companyId, agentId, runId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14824-redo",
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [row] = await db
+      .select({ executionState: issues.executionState, workspaceId: issues.executionWorkspaceId })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const delivery = (row!.executionState ?? {})?.delivery as Record<string, unknown> | undefined;
+    expect(delivery!.branch).toBe("SUP-14824-redo");
+    const [workspace] = await db
+      .select({ branchName: executionWorkspaces.branchName })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, row!.workspaceId!));
+    expect(workspace!.branchName).toBe("SUP-14824-redo");
+  });
+
   it("records a carrier child delivery identity on its owner's carrier branch (SUP-15909)", async () => {
     const runId = randomUUID();
     const { companyId, issueId, agentId } = await seedIssue({

@@ -309,12 +309,13 @@ export async function provisionIssueExecutionWorkspace(
   // project_primary row whose realized branch is null, which orphaned the
   // recorded delivery identity and looped final review on
   // delivery_identity_unresolved. Carry the recorded branch onto the new row,
-  // but only when it carries THIS card's identifier prefix: a board-attested
-  // record is not ownership-validated, and copying it onto the row would turn
-  // another card's branch into this card's validated own branch (ADR-091 D1).
+  // but only while the card is in_review and only when it carries THIS card's
+  // identifier prefix: a board-attested record is not ownership-validated, and
+  // copying it onto the row would turn another card's branch into this card's
+  // validated own branch (ADR-091 D1).
   const [recordedDeliveryRow] = issueId
     ? await db
-        .select({ executionState: issues.executionState })
+        .select({ executionState: issues.executionState, status: issues.status })
         .from(issues)
         .where(eq(issues.id, issueId))
     : [];
@@ -322,6 +323,7 @@ export async function provisionIssueExecutionWorkspace(
     recordedDeliveryRow?.executionState as { delivery?: unknown } | null | undefined
   )?.delivery;
   const recordedDeliveryBranchCandidate =
+    recordedDeliveryRow?.status === "in_review" &&
     recordedDelivery !== null &&
     recordedDelivery !== undefined &&
     typeof recordedDelivery === "object" &&
