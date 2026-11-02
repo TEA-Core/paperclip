@@ -2316,7 +2316,14 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     it("still refuses a terminal carrier child whose bound PR head moved", async () => {
       const issueId = await insertTerminalCarrierChild();
       installRoutes([
-        { url: PR_URL, body: { state: "open", draft: false, merged: false, title: "Carrier", head: { ref: CARRIER_BRANCH, sha: LIVE_HEAD, repo: { full_name: `${OWNER}/${REPO}` } } } },
+        {
+          url: PR_URL,
+          body: {
+            ...carrierMergedPrBody(),
+            head: { ref: CARRIER_BRANCH, sha: LIVE_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+          },
+        },
+        { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
       ]);
 
       const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
@@ -2324,6 +2331,20 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       if (result.kind === "unresolvable") {
         expect(result.reason).toContain("does not match the bound PR's current head");
       }
+    });
+
+    it("refuses an OPEN bound PR on a terminal carrier even when its live head matches the record (SUP-16896)", async () => {
+      const issueId = await insertTerminalCarrierChild();
+      installRoutes([{ url: PR_URL, body: prHeadBody(APPROVED_HEAD, CARRIER_BRANCH) }]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("is not merged");
+      }
+
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight.kind).not.toBe("resolved");
     });
 
     it("still refuses a bound PR owned by an unrelated issue (ADR-091 D1)", async () => {
@@ -2355,14 +2376,14 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       }
     });
 
-    async function insertOrphanBoundCard() {
+    async function insertOrphanBoundCard(recordedBranch = "SUP-42-branch") {
       const issueId = await insertIssue({
         deliveryIdentity: false,
         delivery: {
           repo: { owner: OWNER, repo: REPO },
           prNumber: 42,
           prUrl: `https://github.com/${OWNER}/${REPO}/pull/42`,
-          branch: "SUP-42-branch",
+          branch: recordedBranch,
           headSha: APPROVED_HEAD,
         },
       });
@@ -2383,7 +2404,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         repoUrl: `https://github.com/${OWNER}/${REPO}`,
       });
       await db.update(issues).set({ projectId: orphanProjectId }).where(eq(issues.id, issueId));
-      await insertMention(issueId, { number: 42, headRefName: "SUP-42-branch" });
+      await insertMention(issueId, { number: 42, headRefName: recordedBranch });
       return issueId;
     }
 
@@ -2409,9 +2430,59 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(result.kind).toBe("resolved");
     });
 
+    it("refuses an OPEN bound PR on a card with no execution workspace even when identifier-anchored and head-matching", async () => {
+      const issueId = await insertOrphanBoundCard();
+      installRoutes([{ url: PR_URL, body: prHeadBody(APPROVED_HEAD) }]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("is not merged");
+      }
+    });
+
+    it("refuses a merged-and-proven PR on a no-workspace card when the branch is not anchored to this card (ADR-091 D1)", async () => {
+      const issueId = await insertOrphanBoundCard("SUP-7-other-branch");
+      installRoutes([
+        {
+          url: PR_URL,
+          body: {
+            state: "closed",
+            draft: false,
+            merged: true,
+            title: "Other card's fix (SUP-7)",
+            merge_commit_sha: MERGE_SHA,
+            base: { ref: "main" },
+            head: { ref: "SUP-7-other-branch", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+          },
+        },
+        { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("does not match this card's control-plane delivery branch");
+      }
+    });
+
     it("still refuses a no-workspace card whose bound PR head moved", async () => {
       const issueId = await insertOrphanBoundCard();
-      installRoutes([{ url: PR_URL, body: prHeadBody(LIVE_HEAD) }]);
+      installRoutes([
+        {
+          url: PR_URL,
+          body: {
+            state: "closed",
+            draft: false,
+            merged: true,
+            title: "Fix thing (SUP-42)",
+            merge_commit_sha: MERGE_SHA,
+            base: { ref: "main" },
+            head: { ref: "SUP-42-branch", sha: LIVE_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+          },
+        },
+        { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+      ]);
 
       const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
       expect(result.kind).toBe("unresolvable");

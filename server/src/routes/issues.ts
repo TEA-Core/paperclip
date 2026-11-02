@@ -215,6 +215,7 @@ import {
   type DecisionHeadResolution,
   resolveIssueRepoContext,
   resolveCardDeliveryBranchOwnership,
+  isDeliveredByCardIdentifierPrefix,
   resolveLinkedPullRequestsWithState,
   publishHeadBoundRelease,
   DEFAULT_RELEASE_DEADLINES,
@@ -19435,8 +19436,7 @@ export function issueRoutes(
       // push that moved the PR head, or a workspace that drifted). Agents
       // still need the lease-holding run entering review. Every ownership
       // check below (project repo, control-plane branch) still applies.
-      const boardDeliveryRefresh =
-        req.actor.type === "board" && (enteringReview || existing.status === "in_review");
+      const boardDeliveryRefresh = req.actor.type === "board" && existing.status === "in_review";
       if ((!holdsLease || !enteringReview) && !boardDeliveryRefresh) {
         res.status(422).json({
           error: "deliveryIdentity may only be written by the lease-holding run on a transition into in_review",
@@ -19514,10 +19514,21 @@ export function issueRoutes(
           && branchOwnership.branch === null
           && deliveryWorkspace !== undefined
           && !deliveryWorkspace.branchName);
-      // Board refresh on a card with no execution workspace at all: the board
-      // attests the record and approval-time exact-PR verification proves the
-      // bound PR. Agents still cannot create such a record.
-      const boardOrphanDeliveryRecord = boardDeliveryRefresh && !existing.executionWorkspaceId;
+      // Board refresh on a card with no execution workspace at all: the record
+      // must bind a PR and carry this card's identifier prefix, the same anchor
+      // resolveDeliveryIdentity requires, so the write never returns 200 for a
+      // record the approval gate then refuses. Agents still cannot create it.
+      const boardOrphanDeliveryRecord =
+        boardDeliveryRefresh
+        && !existing.executionWorkspaceId
+        && requestedDeliveryIdentity.prNumber !== undefined
+        && requestedDeliveryIdentity.prUrl !== undefined
+        && existing.identifier != null
+        && isDeliveredByCardIdentifierPrefix(
+          { ...projectRepo, headRefName: requestedDeliveryIdentity.branch },
+          projectRepo,
+          existing.identifier,
+        );
       const recordedBranchMismatch =
         (!canStampRecordedBranch && !boardOrphanDeliveryRecord && branchOwnership.branch === null)
         || (branchOwnership.branch !== null
@@ -20371,7 +20382,6 @@ export function issueRoutes(
               .where(and(
                 eq(executionWorkspaces.id, existing.executionWorkspaceId),
                 eq(executionWorkspaces.companyId, existing.companyId),
-                eq(executionWorkspaces.strategyType, "project_primary"),
                 isNull(executionWorkspaces.branchName),
               ));
           }

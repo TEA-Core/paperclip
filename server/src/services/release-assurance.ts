@@ -75,7 +75,7 @@ export function releaseAssuranceDeps(db: Db): ReleaseAssuranceDeps {
     recordedDelivery: async (executor, companyId, issueId) => {
       const identity = await resolveDeliveryIdentity(executor, companyId, issueId);
       const { binding, repo } = identity;
-      if (identity.recordedUnusable || !binding || !repo || repo.hostname?.toLowerCase() !== "github.com") return null;
+      if (identity.recordedUnusable || !binding || binding.requireMerged || !repo || repo.hostname?.toLowerCase() !== "github.com") return null;
       // Only github.com repositories resolve. The recorded PR url must also be a github.com url naming the
       // same repository and number; any mismatch is an unusable record.
       const url = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/i.exec(binding.prUrl);

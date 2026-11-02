@@ -429,7 +429,7 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
     expect(issueRows[0]!.executionWorkspaceId).toBe(result.persistedExecutionWorkspace!.id);
   });
 
-  it("carries the recorded delivery branch onto a fresh project_primary workspace", async () => {
+  async function provisionWithRecordedDeliveryBranch(recordedBranchFor: (issueIdentifier: string) => string) {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const projectWorkspaceId = randomUUID();
@@ -439,7 +439,7 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const issueIdentifier = `${issuePrefix}-1`;
     const now = new Date("2026-07-07T00:00:00.000Z");
-    const RECORDED_BRANCH = `${issueIdentifier}-delivered`;
+    const RECORDED_BRANCH = recordedBranchFor(issueIdentifier);
 
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-provisioning-carry-"));
     tempRoots.push(tempRoot);
@@ -658,17 +658,41 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
       },
     });
 
+    return { result, recordedBranch: RECORDED_BRANCH };
+  }
+
+  it("carries the recorded delivery branch onto a fresh project_primary workspace", async () => {
+    const { result, recordedBranch } = await provisionWithRecordedDeliveryBranch(
+      (issueIdentifier) => `${issueIdentifier}-delivered`,
+    );
+
     expect(result.kind).toBe("provisioned");
     if (result.kind !== "provisioned") return;
     expect(result.persistedExecutionWorkspace).not.toBeNull();
-    expect(result.persistedExecutionWorkspace!.branchName).toBe(RECORDED_BRANCH);
+    expect(result.persistedExecutionWorkspace!.branchName).toBe(recordedBranch);
 
     const persistedRows = await db
       .select()
       .from(executionWorkspaces)
       .where(eq(executionWorkspaces.id, result.persistedExecutionWorkspace!.id));
     expect(persistedRows).toHaveLength(1);
-    expect(persistedRows[0]!.branchName).toBe(RECORDED_BRANCH);
+    expect(persistedRows[0]!.branchName).toBe(recordedBranch);
+  });
+
+  it("does not carry a recorded delivery branch that belongs to an unrelated card", async () => {
+    const { result } = await provisionWithRecordedDeliveryBranch(() => "OTHERCARD-9-delivered");
+
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+    expect(result.persistedExecutionWorkspace).not.toBeNull();
+    expect(result.persistedExecutionWorkspace!.branchName).not.toBe("OTHERCARD-9-delivered");
+
+    const persistedRows = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, result.persistedExecutionWorkspace!.id));
+    expect(persistedRows).toHaveLength(1);
+    expect(persistedRows[0]!.branchName).not.toBe("OTHERCARD-9-delivered");
   });
 
   it("returns a deferred result when the workspace is occupied by another run", async () => {

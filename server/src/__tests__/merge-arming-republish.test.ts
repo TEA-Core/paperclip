@@ -4855,7 +4855,7 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
         status: "active",
         branchName: opts.strategyType === "project_primary"
           ? opts.deliveryBranch ?? null
-          : opts.sharedWorkspaceOwnerBranch ?? "SUP-14824-branch",
+          : opts.sharedWorkspaceOwnerBranch ?? (opts.deliveryBranch === null ? null : "SUP-14824-branch"),
         repoUrl: REPO_URL,
         createdAt: now,
         updatedAt: now,
@@ -5237,7 +5237,7 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
       .send({
         deliveryIdentity: {
           repo: { owner: OWNER, repo: REPO },
-          branch: "SUP-14824-branch",
+          branch: "SUP-14824-1-delivered",
           headSha: HEAD_SHA,
           prNumber: PR_NUMBER,
           prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
@@ -5251,7 +5251,110 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
       .where(eq(issues.id, issueId));
     const delivery = (row!.executionState ?? {})?.delivery as Record<string, unknown> | undefined;
     expect(delivery).toBeDefined();
-    expect(delivery!.branch).toBe("SUP-14824-branch");
+    expect(delivery!.branch).toBe("SUP-14824-1-delivered");
+  });
+
+  it("rejects a board record on a no-workspace card that binds no PR", async () => {
+    const { companyId, issueId } = await seedIssue({ status: "in_review", noWorkspace: true });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14824-1-delivered",
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_branch_write_rejected");
+    const [row] = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect((row!.executionState ?? {})?.delivery).toBeUndefined();
+  });
+
+  it("rejects a board record on a no-workspace card whose branch is not anchored to the card (ADR-091 D1)", async () => {
+    const { companyId, issueId } = await seedIssue({ status: "in_review", noWorkspace: true });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-999-foreign-branch",
+          headSha: HEAD_SHA,
+          prNumber: PR_NUMBER,
+          prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_branch_write_rejected");
+    const [row] = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect((row!.executionState ?? {})?.delivery).toBeUndefined();
+  });
+
+  it("rejects a board delivery record while moving a card into in_review without the lease", async () => {
+    const { companyId, issueId } = await seedIssue({ status: "in_progress" });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14824-branch",
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_write_rejected");
+    const [row] = await db
+      .select({ executionState: issues.executionState, status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(row!.status).toBe("in_progress");
+    expect((row!.executionState ?? {})?.delivery).toBeUndefined();
+  });
+
+  it("persists the board-stamped branch onto a git_worktree workspace row that lost its branch", async () => {
+    const { companyId, issueId } = await seedIssue({
+      status: "in_review",
+      strategyType: "git_worktree",
+      deliveryBranch: null,
+    });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14824-1-restored",
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [issueRow] = await db
+      .select({ executionWorkspaceId: issues.executionWorkspaceId })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const [workspace] = await db
+      .select({ branchName: executionWorkspaces.branchName })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, issueRow!.executionWorkspaceId!));
+    expect(workspace!.branchName).toBe("SUP-14824-1-restored");
   });
 
   it("still rejects the board refreshing deliveryIdentity with a foreign branch", async () => {

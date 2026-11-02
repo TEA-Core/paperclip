@@ -2024,7 +2024,8 @@ export interface CardDeliveryBranchOwnership {
   * True iff the card has no execution-workspace row at all
   * (`execution_workspace_id` IS NULL). Distinct from a row that exists with a
   * NULL branch_name: with no row there is no control-plane branch to
-  * contradict a recorded bound PR, which exact-PR verification then proves.
+  * contradict a recorded bound PR, so the record is anchored by the card's
+  * identifier prefix and accepted only as a merged-and-proven delivery.
   */
  noExecutionWorkspace?: boolean;
 }
@@ -2202,6 +2203,13 @@ interface DeliveryBinding {
   prUrl: string;
   headSha: string;
   sourceIssueId?: string;
+  /**
+   * Set when the control plane cannot back the record with a live delivery
+   * branch (ADR-083 terminal carrier owner, or no execution workspace). Such a
+   * binding is accepted only as a COMPLETED delivery: the bound PR must be
+   * merged and proven on its base branch, never an open PR.
+   */
+  requireMerged?: boolean;
 }
 
 export async function resolveDeliveryIdentity(
@@ -2369,17 +2377,22 @@ export async function resolveDeliveryIdentity(
     const branchOwnership = await resolveCardDeliveryBranchOwnership(db, companyId, issueId);
     const hasBoundPr = prNumber !== null && prUrl !== null;
     // A card with NO execution-workspace row has no control-plane branch that
-    // could contradict the record. Its recorded bound PR is still proven by
-    // exact-PR verification (live head ref, head SHA, or merged-on-base proof),
-    // so the binding may proceed; an agent cannot create this record through
-    // the write gate, which still requires a workspace-validated branch.
-    const orphanBoundDelivery = branchOwnership.noExecutionWorkspace === true && hasBoundPr;
+    // could contradict the record, so the record is anchored to the card by its
+    // identifier prefix instead (the same weaker predicate a shared-workspace
+    // card uses). The binding is then accepted only as a merged-and-proven
+    // delivery (`requireMerged`); an unrelated card's PR is never bound.
+    const orphanBoundDelivery =
+      branchOwnership.noExecutionWorkspace === true &&
+      hasBoundPr &&
+      identifier !== null &&
+      isDeliveredByCardIdentifierPrefix({ ...projectRepo, headRefName: branch }, projectRepo, identifier);
     // ADR-083 terminal carrier: the owner is done/cancelled, so it can never
-    // stamp again, but a recorded bound PR proven merged on its base branch
-    // IS the completed delivery. Returning the binding lets exact-PR
-    // verification decide; an unmerged or unproven PR still refuses there.
+    // stamp again, but a recorded bound PR on the carrier branch that is proven
+    // merged on its base branch IS the completed delivery. An open PR on a dead
+    // carrier stays refused (SUP-16896) by `requireMerged`.
     const terminalCarrierBoundDelivery =
       branchOwnership.carrierOwnerTerminal === true && hasBoundPr;
+    const mergedOnlyBinding = orphanBoundDelivery || terminalCarrierBoundDelivery;
     if (
       !orphanBoundDelivery &&
       (branchOwnership.branch === null ||
@@ -2416,7 +2429,10 @@ export async function resolveDeliveryIdentity(
     return {
       branch,
       repo: projectRepo,
-      binding: prNumber !== null && prUrl !== null ? { branch, prNumber, prUrl, headSha, sourceIssueId } : undefined,
+      binding:
+        prNumber !== null && prUrl !== null
+          ? { branch, prNumber, prUrl, headSha, sourceIssueId, ...(mergedOnlyBinding ? { requireMerged: true } : {}) }
+          : undefined,
       branchIsOwn: branchOwnership.branchIsOwn,
       identifier,
     };
@@ -2561,6 +2577,12 @@ async function resolveExactBoundPullRequest(
         return { pr: null, reason: result.draft === true ? "recorded delivery identity PR is a draft" : "recorded delivery identity PR is not open" };
       }
     }
+    if (binding.requireMerged && result.merged !== true) {
+      return {
+        pr: null,
+        reason: "recorded delivery identity PR is not merged; a delivery without a live control-plane branch (terminal ADR-083 carrier or no execution workspace) is accepted only once its PR is merged and proven on its base branch",
+      };
+    }
     if (result.headRef !== binding.branch) {
       return {
         pr: null,
@@ -2613,7 +2635,7 @@ async function resolveExactBoundPullRequest(
  * honest cost, and it is why this path is entered only when ownership of the
  * recorded branch is positively disproven, never by default.
  */
-function isDeliveredByCardIdentifierPrefix(
+export function isDeliveredByCardIdentifierPrefix(
   pr: { owner: string; repo: string; headRefName: string | null },
   deliveryRepo: { owner: string; repo: string },
   identifier: string,
@@ -4762,6 +4784,9 @@ export async function resolveReleaseDeliveryTarget(
   }
   const bindingError = deliveryBindingValidationError(identity.binding, identity.repo, issueId);
   if (bindingError) return { ok: false, reason: bindingError };
+  if (identity.binding.requireMerged) {
+    return { ok: false, reason: "the card's recorded delivery PR is accepted only as a merged delivery (terminal carrier or no execution workspace); it is not a release target" };
+  }
   const { owner, repo } = identity.repo;
   const number = identity.binding.prNumber;
   const [issueRow] = await db
