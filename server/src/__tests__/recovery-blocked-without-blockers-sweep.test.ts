@@ -1995,6 +1995,42 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     await expect(heartbeat.reconcileExhaustedRecoveryDrain()).resolves.toBeDefined();
   });
 
+  it("fresh board monitor armed by the drain resets the persisted monitor attempt counters", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Escalated-exhausted card re-armed with a fresh board monitor",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+      monitorAttemptCount: 12,
+      monitorScheduledBy: "assignee",
+      executionState: exhaustedMonitorExecutionState(12),
+      updatedAt: oldDate(),
+    });
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileExhaustedRecoveryDrain();
+    expect(result.monitorArmed).toBe(1);
+
+    const [issue] = await db
+      .select({
+        monitorAttemptCount: issues.monitorAttemptCount,
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        executionState: issues.executionState,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(issue.monitorNextCheckAt).not.toBeNull();
+    expect(issue.monitorAttemptCount).toBe(0);
+    expect(issue.executionState).toMatchObject({
+      monitor: { status: "scheduled", attemptCount: 0, scheduledBy: "board" },
+    });
+  });
+
   it("bounds-exhausted board monitor re-arm falls through instead of throwing from the drain", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
     const issueId = randomUUID();
