@@ -395,21 +395,28 @@ export function createMergedOperatorMergeCardSweepService(
         .limit(1);
       if (!guardIssue) continue;
       // SUP-21902: Tier-2 evidence must be machine-checkable — name the probe
-      // command, the probe head (a gate PR's merge commit, which the guard
-      // compares with this delivery's recorded merge commit), and the
-      // post-merge predicate. Without a merge commit there is no head to
-      // name, so the card defers instead of closing on prose.
-      const probeReference = references.find((reference) =>
-        evidence.get(pullRequestEvidenceKey(row.companyId, reference))?.mergeCommitSha,
+      // command, the probe head (the merge commit of the most recently merged
+      // gate PR, mirroring the guard's most-recent recorded merge commit
+      // comparison), and the post-merge predicate. Without a merge commit
+      // there is no head to name, so the card defers instead of closing on
+      // prose.
+      const mergedAtMs = (reference: GitHubPullRequestReference) => {
+        const parsed = Date.parse(
+          evidence.get(pullRequestEvidenceKey(row.companyId, reference))?.mergedAt ?? "",
+        );
+        return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
+      };
+      const probeReference = references.reduce((latest, reference) =>
+        mergedAtMs(reference) > mergedAtMs(latest) ? reference : latest,
       );
-      if (!probeReference) {
+      const probeItem = evidence.get(pullRequestEvidenceKey(row.companyId, probeReference))!;
+      if (!probeItem.mergeCommitSha) {
         logger.warn(
           { issueId: row.id },
-          "merged operator merge-card sweep: no gate pull request has a merge commit to name as the Tier-2 probe head; deferring",
+          "merged operator merge-card sweep: the most recently merged gate pull request has no merge commit to name as the Tier-2 probe head; deferring",
         );
         continue;
       }
-      const probeItem = evidence.get(pullRequestEvidenceKey(row.companyId, probeReference))!;
       const guardProbeEvidence =
         `probe \`merged-operator merge-card sweep gate PRs ${references.map((r) => `${r.owner}/${r.repo}#${r.number}`).join(", ")}\` ` +
         `head ${probeItem.mergeCommitSha} post-merge: all gate pull requests verified merged by the merged-operator merge-card sweep: ` +

@@ -881,6 +881,47 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
     );
   });
 
+  it("SUP-21902: a multi-PR gate names the most recently merged gate PR's merge commit as the probe head, not the first listed", async () => {
+    const { companyId, goalId, agentId } = await seedCompany(db);
+    const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
+      cardTitle: "Merge approved PRs TEA-Core/paperclip#404 and #405",
+      cardDescription: mergeGateMarker([404, 405]),
+    });
+
+    const earlierMerge = {
+      state: "merged" as const,
+      mergeCommitSha: "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      mergedAt: "2026-08-28T00:00:00Z",
+    };
+    const latestMerge = { ...MERGED_EVIDENCE, mergedAt: "2026-08-30T00:00:00Z" };
+    const service = createMergedOperatorMergeCardSweepService(db, {
+      resolvePullRequest: vi.fn(async (_companyId: string, reference: { number: number }) =>
+        reference.number === 404 ? { ...earlierMerge } : { ...latestMerge },
+      ),
+      enqueueWakeup: vi.fn(async () => ({ id: "wake-1" })),
+    });
+
+    await expect(service.sweepMergedOperatorMergeCards()).resolves.toEqual({
+      checked: 1,
+      candidates: 1,
+      closed: 1,
+      woken: 1,
+    });
+    expect(
+      await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, fixture.cardId))
+        .then((rows) => rows[0]?.status),
+    ).toBe("done");
+    const [comment] = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, fixture.cardId));
+    expect(comment!.body).toContain(`head ${latestMerge.mergeCommitSha} post-merge:`);
+    expect(comment!.body).not.toContain(`head ${earlierMerge.mergeCommitSha} post-merge:`);
+  });
+
   it("SUP-21902: defers a card whose gate PR is in another repository (its merge commit is unresolvable in the card's repo)", async () => {
     const { companyId, goalId, agentId } = await seedCompany(db);
     const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
@@ -922,7 +963,7 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
     );
   });
 
-  it("SUP-21902: defers and logs when no gate PR carries a merge commit to name as the probe head", async () => {
+  it("SUP-21902: defers and logs when the most recently merged gate PR carries no merge commit to name as the probe head", async () => {
     const { companyId, goalId, agentId } = await seedCompany(db);
     const fixture = await seedOperatorCard(db, { companyId, goalId, agentId }, {
       cardTitle: "Merge approved PR TEA-Core/paperclip#404 into fold/tea-patches-v2026.722.0",
@@ -954,7 +995,7 @@ describeEmbeddedPostgres.sequential("merged operator merge-card sweep", () => {
     ).toBe("todo");
     expect(warn).toHaveBeenCalledWith(
       expect.objectContaining({ issueId: fixture.cardId }),
-      expect.stringContaining("no gate pull request has a merge commit"),
+      expect.stringContaining("most recently merged gate pull request has no merge commit"),
     );
   });
 
