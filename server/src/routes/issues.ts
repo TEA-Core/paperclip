@@ -13547,7 +13547,28 @@ export function issueRoutes(
           existing,
           "issue:mutate",
         );
-        if (!boundaryDecision.allowed) {
+        let hasRecoveryResolutionGrantExemption = false;
+        if (
+          !boundaryDecision.allowed &&
+          boundaryDecision.reason === "deny_missing_grant" &&
+          !boundaryDecision.code &&
+          typeof req.body.actionId === "string"
+        ) {
+          const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
+            existing.companyId,
+            existing.id,
+          );
+          const unblockDescriptor = existing.unblockDescriptor;
+          hasRecoveryResolutionGrantExemption =
+            activeRecoveryAction != null &&
+            activeRecoveryAction.id === req.body.actionId &&
+            (activeRecoveryAction.ownerAgentId === req.actor.agentId ||
+              (unblockDescriptor != null &&
+                unblockDescriptor.owner !== "board" &&
+                "agentId" in unblockDescriptor.owner &&
+                unblockDescriptor.owner.agentId === req.actor.agentId));
+        }
+        if (!boundaryDecision.allowed && !hasRecoveryResolutionGrantExemption) {
           await denyIssueWrite(
             req,
             res,
