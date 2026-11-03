@@ -270,13 +270,22 @@ A `deliveryIdentity` write is validated against the workspace the card holds at
 the time of the request, so a `PATCH` that carries `deliveryIdentity` and also
 changes `executionWorkspaceId` is refused in every case (agent or board, own
 branch, `project_primary` stamp, no-workspace record, or terminal-carrier
-record) with `422 delivery_identity_branch_write_rejected`. In the
-`project_primary` and orphan arms the two separate writes work in either order:
-rebind the workspace in one `PATCH`, then record the delivery in a second (or
-record first, then rebind). The terminal-carrier arm is narrower: an identity
-`PATCH` after a rebind onto the carrier branch is refused with `422`, the
-reverse order returns `200` and the approval-time resolver then refuses the
-record, and a change to a null workspace is refused.
+record) with `422 delivery_identity_branch_write_rejected`. Do the two as
+separate `PATCH`es, rebind first: the record is then validated against (and, for
+a `project_primary` stamp, written onto) the workspace the card will hold at
+approval. Recording first and rebinding second is not refused at write time, but
+a rebind does not revalidate a stored record, so it can leave a record the
+approval resolver refuses with `delivery_identity_unresolved` ("recorded delivery
+identity's branch does not match this card's control-plane delivery branch").
+In the `project_primary` arm the stamp lands on the old row, so a rebind to a row
+with a null or different branch leaves the record unresolvable. In the orphan
+arm (no execution workspace) the record is accepted as a merged-only delivery
+only while the card has no workspace; after a rebind the record must equal the
+new row's branch, so it resolves only if that branch happens to match. The
+terminal-carrier arm is narrower still: an identity `PATCH` after a rebind onto
+the carrier branch is refused with `422`, the reverse order returns `200` and the
+approval-time resolver then refuses the record, and a change to a null workspace
+is refused.
 
 The provisioning carry also applies only while the card's status is `in_review`
 at provisioning time. Once a card leaves `in_review` (a bounced redo wake, a
@@ -297,11 +306,14 @@ marks it `requireMerged`. This covers a card with no execution workspace (anchor
 by identifier prefix) and an ADR-083 carrier whose owner is already done/cancelled.
 `resolveExactBoundPullRequest` then accepts it only as a completed delivery: the
 bound PR must be merged and its merge commit proven on the card's own
-control-plane base, meaning the execution workspace `baseRef`, never the PR's
-self-reported base. A null workspace `baseRef` does not fall back to the project
+control-plane base, never the PR's self-reported base. The base depends on the
+shape. When the card has an execution workspace row (the terminal-carrier shape)
+it is that row's `baseRef`, and a null `baseRef` does not fall back to the project
 default: the proof is refused (a terminal carrier whose `baseRef` is
-`release/other` arms a PR merged on `release/other`). A card that records no
-such base is refused. Ordinary bindings keep proving a merged PR against the PR's own base
+`release/other` arms a PR merged on `release/other`). A card with no execution
+workspace has no such row, so the base falls through to the project workspace:
+its `defaultRef`, else its `repoRef` (the card's own project workspace, else the
+project's primary one). A card that resolves no base is refused. Ordinary bindings keep proving a merged PR against the PR's own base
 branch. An open PR on a dead carrier stays refused (SUP-16896). A merged-only
 binding is never a release target (`resolveReleaseDeliveryTarget`) and never
 feeds release-assurance.

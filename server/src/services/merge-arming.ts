@@ -2535,11 +2535,14 @@ async function verifyMergedPullRequestOnBaseBranch(
 /**
  * The base branch a merged-only delivery (`requireMerged`: terminal ADR-083
  * carrier or no execution workspace) must be proven on: the card's own
- * control-plane base (its workspace `baseRef`, remote-tracking prefix
- * stripped), never the live PR's self-reported `base.ref`. A PR merged onto a
- * side branch must not satisfy such a delivery, because nothing live backs it.
- * Null when the card records no base: the caller then refuses, it never falls
- * back to the live PR base. Ordinary bindings are not pinned.
+ * control-plane base (remote-tracking prefix stripped), never the live PR's
+ * self-reported `base.ref`. With an execution workspace row that is the row's
+ * `baseRef` (a null `baseRef` does not fall back to the project default); with
+ * no such row `resolveIssueRepoContext` falls through to the project workspace
+ * `defaultRef ?? repoRef`. A PR merged onto a side branch must not satisfy such
+ * a delivery, because nothing live backs it. Null when the card records no
+ * base: the caller then refuses, it never falls back to the live PR base.
+ * Ordinary bindings are not pinned.
  */
 async function resolveCardDeliveryBaseRef(
   db: Db,
