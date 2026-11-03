@@ -278,15 +278,6 @@ const UNDISPATCHABLE_ASSIGNEE_RECOVERY_CAUSE = "undispatchable_assignee";
 // actions live in the DB, not here).
 const UNDISPATCHABLE_ASSIGNED_SIGHT_COUNTS_LIMIT = 10_000;
 let lastUndispatchableAssignedSweepLogAt: Date | null = null;
-
-// A declared `external_pull` agent is never invoked by design: it pulls its
-// queue out of band, so a pull-only adapter type is its normal shape, not a
-// missing wake path. Same declaration the strand sweeps honour (strand-skip.ts).
-// Only while its status lets it work: a paused, terminated or pending-approval
-// agent pulls nothing, so its cards stay undispatchable.
-function isWorkingExternalPullAgent(agent: Pick<typeof agents.$inferSelect, "status" | "runtimeConfig">) {
-  return isExternalPullAgent(agent) && isAgentStatusInvokable(agent.status);
-}
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -11966,9 +11957,7 @@ export function recoveryService(
 
     // Backstop: resolve open undispatchable-assignee actions whose condition
     // has since cleared (assignee re-assigned to a dispatchable agent or a
-    // user, card left todo/in_progress, or source issue gone), and retire as
-    // `false_positive` those whose assignee is a working declared external-pull
-    // agent (the candidate loop below never raises on those). Driven by the
+    // user, card left todo/in_progress, or source issue gone). Driven by the
     // persisted action rows — not the in-memory sight counter — so it
     // survives control-plane restarts and also covers cards that fell outside
     // the candidate window below. Exhausted (terminal) rows are left alone:
@@ -11988,7 +11977,6 @@ export function recoveryService(
         .from(issues)
         .where(eq(issues.id, action.sourceIssueId));
       let resolutionNote: string | null = null;
-      let outcome: "restored" | "false_positive" = "restored";
       if (!source) {
         resolutionNote = "Recovery action became stale because the source issue no longer exists.";
       } else if (source.status !== "todo" && source.status !== "in_progress") {
@@ -11997,14 +11985,11 @@ export function recoveryService(
         resolutionNote = "Recovery action became stale because the source issue no longer has an agent assignee.";
       } else {
         const [assignee] = await db
-          .select({ adapterType: agents.adapterType, status: agents.status, runtimeConfig: agents.runtimeConfig })
+          .select({ adapterType: agents.adapterType })
           .from(agents)
           .where(eq(agents.id, source.assigneeAgentId));
         if (!assignee || !isPullOnlyAdapterType(assignee.adapterType)) {
           resolutionNote = "Recovery action became stale because the source issue assignee is no longer a pull-only adapter agent.";
-        } else if (isWorkingExternalPullAgent(assignee)) {
-          outcome = "false_positive";
-          resolutionNote = "Recovery action was a false positive: the source issue assignee declares external-pull work delivery and pulls its queue out of band, so it was never undispatchable.";
         }
       }
       if (!resolutionNote) continue;
@@ -12013,7 +11998,7 @@ export function recoveryService(
         sourceIssueId: action.sourceIssueId,
         actionId: action.id,
         status: "resolved",
-        outcome,
+        outcome: "restored",
         resolutionNote,
       });
       if (resolvedAction) {
@@ -12076,9 +12061,17 @@ export function recoveryService(
         continue;
       }
 
-      // A working declared external-pull assignee pulls its own queue; the
-      // backstop above retires any action already open on its cards.
-      if (isWorkingExternalPullAgent({ status: candidate.assigneeStatus, runtimeConfig: candidate.assigneeRuntimeConfig })) {
+      // A declared `external_pull` agent is never invoked by design: it pulls
+      // its queue out of band, so a pull-only adapter type is its normal
+      // shape, not a missing wake path. Same declaration the strand sweeps
+      // honour (strand-skip.ts). Only while its status lets it work: a paused,
+      // terminated or pending-approval agent pulls nothing, so its cards stay
+      // reportable. Existing actions are left to the backstop above, which
+      // still keys on the adapter type alone.
+      if (
+        isExternalPullAgent({ runtimeConfig: candidate.assigneeRuntimeConfig }) &&
+        isAgentStatusInvokable(candidate.assigneeStatus)
+      ) {
         undispatchableAssignedSightCounts.delete(candidate.id);
         result.skipped += 1;
         continue;
