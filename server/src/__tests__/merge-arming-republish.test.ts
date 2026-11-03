@@ -4363,12 +4363,18 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
           for (const poolMax of [1, 2, 3, 10]) {
             for (const mode of ["direct", "prepare:false"] as const) {
               const parent = createDb(tempDb!.connectionString, mode === "direct" ? { maxConnections: poolMax } : { prepare: false, maxConnections: poolMax });
-              const app = express();
-              app.use(releaseRequestClock({ totalMs: 150 }));
-              app.use(express.json());
-              app.use(releaseScopedActor(parent, { deploymentMode: "authenticated" }, 150));
-              app.use("/api", issueRoutes(parent, {} as any, { mergeReleaseDeadlines: { totalMs: 150, compensationMs: 150, fetchMs: 100 } }));
-              app.use(errorHandler);
+              // Only the held cells race the clock, so only they get the 150 ms one. An auth-free cell opens a fresh authentication
+              // connection and must be answered by the handler, whatever the host speed: it gets a clock too long to fire.
+              const makeApp = (totalMs: number) => {
+                const app = express();
+                app.use(releaseRequestClock({ totalMs }));
+                app.use(express.json());
+                app.use(releaseScopedActor(parent, { deploymentMode: "authenticated" }, totalMs));
+                app.use("/api", issueRoutes(parent, {} as any, { mergeReleaseDeadlines: { totalMs, compensationMs: 150, fetchMs: 100 } }));
+                app.use(errorHandler);
+                return app;
+              };
+              const apps = { held: makeApp(150), free: makeApp(30_000) };
               try {
                 for (const held of [false, true]) {
                   for (const shape of shapes) {
@@ -4376,7 +4382,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
                     const unlock = held ? setTimeout(() => { void release!(); }, 700) : undefined;
                     const started = performance.now();
                     let status: number;
-                    try { status = (await send(app, shape.name, issueId, key.token)).status; } finally { if (unlock) { clearTimeout(unlock); await release!(); } }
+                    try { status = (await send(held ? apps.held : apps.free, shape.name, issueId, key.token)).status; } finally { if (unlock) { clearTimeout(unlock); await release!(); } }
                     const ms = Math.round((performance.now() - started) * 10) / 10;
                     cells += 1;
                     evidence.push({ pool: poolMax, mode, variant: shape.name, authHeld: held, status, ms });
