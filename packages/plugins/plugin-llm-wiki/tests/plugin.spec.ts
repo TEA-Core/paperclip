@@ -1533,6 +1533,92 @@ Duplicate headings receive stable suffixes.
     expect(pages.content).toBe("No pages indexed yet.");
   });
 
+  it("lists the complete disk-backed page tree and reports truncation", async () => {
+    const harness = createTestHarness({ manifest });
+    const now = new Date().toISOString();
+    const paths = Array.from({ length: 250 }, (_, index) => `wiki/concepts/page-${String(index).padStart(4, "0")}.md`);
+    harness.ctx.db.query = async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      harness.dbQueries.push({ sql, params });
+      if (sql.includes("wiki_pages")) {
+        return [
+          ...paths.slice(0, 99).map((path, index) => ({
+            path,
+            title: `Indexed Page ${index}`,
+            page_type: "concepts",
+            backlinks: [],
+            source_refs: [],
+            content_hash: `hash-${index}`,
+            updated_at: now,
+          })),
+          {
+            path: "wiki/concepts/phantom.md",
+            title: "Phantom Page",
+            page_type: "concepts",
+            backlinks: [],
+            source_refs: [],
+            content_hash: "phantom",
+            updated_at: now,
+          },
+        ] as T[];
+      }
+      return [];
+    };
+    await plugin.definition.setup(harness.ctx);
+    for (const path of paths) {
+      await harness.ctx.localFolders.writeTextAtomic(COMPANY_ID, "wiki-root", path, `# ${path}\n`);
+    }
+
+    const result = await harness.executeTool<{
+      content: string;
+      data: {
+        pages: Array<{ path: string; title: string | null; pageType: string | null }>;
+        truncated: boolean;
+      };
+    }>("wiki_list_pages", { companyId: COMPANY_ID, wikiId: "default" });
+
+    expect(result.data.pages).toHaveLength(250);
+    expect(result.data.pages.map((page) => page.path)).toEqual(paths);
+    expect(result.data.pages[0]).toMatchObject({ path: paths[0], title: "Indexed Page 0", pageType: "concepts" });
+    expect(result.data.pages[99]).toMatchObject({ path: paths[99], title: null, pageType: "concepts" });
+    expect(result.data.pages.some((page) => page.path === "wiki/concepts/phantom.md")).toBe(false);
+    expect(result.data.truncated).toBe(false);
+    expect(result.content.split("\n")).toHaveLength(250);
+
+    for (let index = paths.length; index <= 2000; index += 1) {
+      const path = `wiki/concepts/page-${String(index).padStart(4, "0")}.md`;
+      await harness.ctx.localFolders.writeTextAtomic(COMPANY_ID, "wiki-root", path, `# ${path}\n`);
+    }
+    const truncated = await harness.executeTool<{
+      data: { pages: Array<{ path: string }>; truncated: boolean };
+    }>("wiki_list_pages", { companyId: COMPANY_ID, wikiId: "default" });
+    expect(truncated.data.pages).toHaveLength(2000);
+    expect(truncated.data.truncated).toBe(true);
+  });
+
+  it("filters phantom rows out of wiki search results", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.ctx.db.query = async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      harness.dbQueries.push({ sql, params });
+      if (sql.includes("wiki_pages")) {
+        return [
+          { kind: "page", path: "wiki/concepts/present.md", title: "Present Page", match_text: "concepts" },
+          { kind: "page", path: "wiki/concepts/phantom.md", title: "Phantom Page", match_text: "concepts" },
+        ] as T[];
+      }
+      return [];
+    };
+    await plugin.definition.setup(harness.ctx);
+    await harness.ctx.localFolders.writeTextAtomic(COMPANY_ID, "wiki-root", "wiki/concepts/present.md", "# Present Page\n");
+
+    const result = await harness.executeTool<{
+      content: string;
+      data: { results: Array<{ path: string }> };
+    }>("wiki_search", { companyId: COMPANY_ID, wikiId: "default", query: "page" });
+
+    expect(result.data.results.map((row) => row.path)).toEqual(["wiki/concepts/present.md"]);
+    expect(result.content).toBe("page: wiki/concepts/present.md - Present Page");
+  });
+
   it("preserves caller-supplied log headings at column zero", async () => {
     const harness = createTestHarness({ manifest });
     const files = new Map<string, string>([["wiki/log.md", "# Log\n\nAppend-only chronological record of wiki operations.\n"]]);
