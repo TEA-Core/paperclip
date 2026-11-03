@@ -282,10 +282,12 @@ with a null or different branch leaves the record unresolvable. In the orphan
 arm (no execution workspace) the record is accepted as a merged-only delivery
 only while the card has no workspace; after a rebind the record must equal the
 new row's branch, so it resolves only if that branch happens to match. The
-terminal-carrier arm is narrower still: an identity `PATCH` after a rebind onto
-the carrier branch is refused with `422`, the reverse order returns `200` and the
-approval-time resolver then refuses the record, and a change to a null workspace
-is refused.
+terminal-carrier arm is narrower still: the record is accepted only while the
+card is bound to the terminal carrier row, so rebind onto that row first and then
+record (that identity `PATCH` returns `200`). A record sent while the card still
+holds another row is refused with `422`, and rebinding away from the carrier row
+after recording returns `200` but leaves a record the approval-time resolver
+refuses.
 
 The provisioning carry also applies only while the card's status is `in_review`
 at provisioning time. Once a card leaves `in_review` (a bounced redo wake, a
