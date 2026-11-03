@@ -939,17 +939,19 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(await statusOf(issueId)).toBe("done");
-    // SUP-21902: with the credential resolving, the Tier 2 origin predicate and the
-    // live open-PR discovery may READ the remote, but a record_only close must drive
-    // no repository delivery transport — no arming status, no merge.
-    // Why this is not the old `expect(mockGhFetch).not.toHaveBeenCalled()`: the
-    // re-sliced Tier 2 predicate must resolve the declared probe head through
-    // the commits API and compare it with the recorded merge commit, so a
-    // legitimate close now performs read calls (and the open-PR discovery may
-    // too). A not-called assertion cannot hold for the new accepted close;
-    // the exact invariant that still holds is the zero transport list below.
-    const deliveryTransportCalls = mockGhFetch.mock.calls.filter(([u]) => /\/statuses\/|\/merge/.test(String(u)));
-    expect(deliveryTransportCalls).toEqual([]);
+    // SUP-22541: a record_only close makes exactly two read-only GETs — the
+    // Tier-2 probe-head commits resolution and the live open-PR discovery —
+    // so the strict form is the exact (method, URL) call list in order, not
+    // not-called: any extra call, any non-GET method, any delivery endpoint,
+    // or a missing read fails this assertion.
+    const fetchCalls = mockGhFetch.mock.calls.map(([url, init]) => [
+      String((init as RequestInit | undefined)?.method ?? "GET"),
+      String(url),
+    ]);
+    expect(fetchCalls).toEqual([
+      ["GET", "https://api.github.com/repos/TEA-Core/paperclip/commits/7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19"],
+      ["GET", "https://api.github.com/repos/TEA-Core/paperclip/pulls?state=open&per_page=100"],
+    ]);
   });
 
   it("PATCH: record_only close skips repository delivery; repository_delivery keeps it (SUP-21258)", async () => {
