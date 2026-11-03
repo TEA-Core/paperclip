@@ -7,6 +7,9 @@ import {
   issueRelations as issueRelationsTable,
   issues as issuesTable,
   issueWorkProducts as issueWorkProductsTable,
+  documents as documentsTable,
+  executionWorkspaces as executionWorkspacesTable,
+  issueDocuments as issueDocumentsTable,
   labels as labelsTable,
 } from "@paperclipai/db";
 import {
@@ -150,7 +153,7 @@ function filterLabelRowsByName(
  * `select().from().where()` resolves to the `executionWorkspaces` rows exactly
  * as the legacy positional chain did, so pre-existing tests are untouched.
  */
-function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[]; issueWorkProducts?: Record<string, unknown>[] }) {
+function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[]; issueWorkProducts?: Record<string, unknown>[]; issueDocuments?: Record<string, unknown>[]; documents?: Record<string, unknown>[] }) {
   // SUP-15233: the guard reads the issues table twice inside
   // countLadderedChildren: read 1 is the parent_id edge (decomposition
   // children), read 2 is the inArray re-read (blockedBy edge, only present in
@@ -211,6 +214,18 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     where: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
     then: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
   };
+  const issueDocumentsChain = {
+    from: vi.fn().mockReturnThis(),
+    innerJoin: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue(rows.documents ?? []),
+    then: vi.fn().mockResolvedValue(rows.documents ?? []),
+  };
+  const documentsChain = {
+    from: vi.fn().mockReturnThis(),
+    innerJoin: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue(rows.documents ?? []),
+    then: vi.fn().mockResolvedValue(rows.documents ?? []),
+  };
   const selectChain = {
     from: vi.fn().mockReturnThis(),
     where: vi.fn().mockResolvedValue(rows.executionWorkspaces ?? []),
@@ -246,8 +261,11 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
         if (table === issueExecutionDecisionsTable) return decisionsChain;
         if (table === labelsTable) return labelsChain;
         if (table === issueLabelsTable) return issueLabelsChain;
-        if (table === issueWorkProductsTable) return workProductsChain;
-        const chain = chains[callCount] ?? selectChain;
+         if (table === issueWorkProductsTable) return workProductsChain;
+         if (table === issueDocumentsTable) return issueDocumentsChain;
+         if (table === documentsTable) return documentsChain;
+         if (table === executionWorkspacesTable && rows.executionWorkspaces !== undefined) return selectChain;
+         const chain = chains[callCount] ?? selectChain;
         callCount++;
         return chain;
       },
@@ -5344,6 +5362,8 @@ describe("evaluateDoneTierDeclaration", () => {
     id: "issue-1",
     companyId: "company-1",
     identifier: "SUP-12345",
+    deliveryRequirement: "record_only" as const,
+    executionWorkspaceId: "ew-1",
   };
 
   function mockComment(body: string, runId: string | null = null) {
@@ -5426,6 +5446,34 @@ describe("evaluateDoneTierDeclaration", () => {
         reason: "Landing delegated",
         landing: { mode: "landingDelegated", prNumber: 123, carrier: "done-close-landing-backstop" },
       })).toBe("Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #123 via done-close-landing-backstop — Landing delegated. Liveness unverified.");
+    });
+
+    it("renders the no-repository Tier 1 landing state", () => {
+      expect(renderDoneTierDeclaration(null, {
+        tier: "tier1",
+        reason: "The entry ruling is recorded",
+        landing: { mode: "noRepositoryLanding" },
+      })).toBe("Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — The entry ruling is recorded. Liveness unverified.");
+    });
+
+    it("accepts no-repository landing only with an own non-Git workspace and entry ruling", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ strategyType: "adapter_managed", providerType: "cloud_sandbox" })],
+        documents: [{ latestBody: "Recorded ruling" }],
+      });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        renderDoneTierDeclaration(null, {
+          tier: "tier1",
+          reason: "The entry ruling is recorded",
+          landing: { mode: "noRepositoryLanding" },
+        }),
+        null,
+        async () => [],
+      );
+      expect(result.allowed, result.reason).toBe(true);
+      expect(result.tier).toBe("tier1");
     });
 
     it("preserves the body when the existing Tier 2 declaration matches", () => {
