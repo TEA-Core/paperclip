@@ -876,10 +876,10 @@ describeEmbeddedPostgres("recovery sweep undispatchable-assignee escalation (SUP
         );
     }
 
-    it("raises nothing for a live external-pull agent's todo and in_progress cards, fresh or old", async () => {
+    it.each(["idle", "error"])("raises nothing for a live (%s) external-pull agent's todo and in_progress cards, fresh or old", async (agentStatus) => {
       const companyId = await seedCompany();
       const externalPullAgentId = await seedAgent(companyId, "process", {
-        status: "idle",
+        status: agentStatus,
         runtimeConfig: externalPull,
       });
       const plainProcessAgentId = await seedAgent(companyId, "process");
@@ -903,6 +903,8 @@ describeEmbeddedPostgres("recovery sweep undispatchable-assignee escalation (SUP
       }
 
       for (const result of results) expect(result.issueIds).toEqual([strandedId]);
+      // Each pass skips exactly the three declared external-pull cards.
+      expect(results.map((result) => result.skipped)).toEqual([3, 3, 3]);
       expect(results.map((result) => result.escalated)).toEqual([0, 1, 0]);
       for (const issueId of [todoId, inProgressId, oldTodoId]) {
         expect(await detectionRows(issueId)).toHaveLength(0);
@@ -910,6 +912,46 @@ describeEmbeddedPostgres("recovery sweep undispatchable-assignee escalation (SUP
       }
       const [stranded] = await recoveryActionRows(strandedId);
       expect(stranded).toMatchObject({ kind: "undispatchable_assignee", status: "active" });
+    });
+
+    it.each([
+      { label: "paused", leave: { status: "paused" } },
+      { label: "undeclared", leave: { runtimeConfig: {} } },
+    ])("counts first sight again when a declared agent becomes $label after an exempt pass", async ({ leave }) => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, "process");
+      const issueId = await seedCard(companyId, agentId);
+      const sweep = makeSweep();
+
+      // Prior sight while the agent is an undeclared process agent.
+      expect(await sweep.reconcileUndispatchableAssignedIssues()).toMatchObject({
+        reported: 1,
+        skipped: 0,
+        escalated: 0,
+      });
+
+      await db.update(agents).set({ runtimeConfig: externalPull }).where(eq(agents.id, agentId));
+      expect(await sweep.reconcileUndispatchableAssignedIssues()).toMatchObject({
+        reported: 0,
+        skipped: 1,
+        escalated: 0,
+        issueIds: [],
+      });
+
+      // The exempt pass reset the sight count, so the first sweep after the
+      // agent leaves the exemption is report-only and the second escalates.
+      await db.update(agents).set(leave).where(eq(agents.id, agentId));
+      expect(await sweep.reconcileUndispatchableAssignedIssues()).toMatchObject({
+        reported: 1,
+        skipped: 0,
+        escalated: 0,
+        issueIds: [issueId],
+      });
+      expect(await recoveryActionRows(issueId)).toHaveLength(0);
+      expect(await sweep.reconcileUndispatchableAssignedIssues()).toMatchObject({
+        reported: 1,
+        escalated: 1,
+      });
     });
 
     it.each(["paused", "terminated", "pending_approval"])(
