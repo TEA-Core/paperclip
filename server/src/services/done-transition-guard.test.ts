@@ -5476,6 +5476,26 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.tier).toBe("tier1");
     });
 
+    it("accepts no-repository landing for the persisted project-primary local-fs workspace shape", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ strategyType: "project_primary", providerType: "local_fs" })],
+        documents: [{ latestBody: "Recorded ruling" }],
+      });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        renderDoneTierDeclaration(null, {
+          tier: "tier1",
+          reason: "The entry ruling is recorded",
+          landing: { mode: "noRepositoryLanding" },
+        }),
+        null,
+        async () => [],
+      );
+      expect(result.allowed, result.reason).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
     it("preserves the body when the existing Tier 2 declaration matches", () => {
       const body = "Context\n\nClosed at Tier 2 (live): existing evidence\n\nFollow-up";
       expect(renderDoneTierDeclaration(body, {

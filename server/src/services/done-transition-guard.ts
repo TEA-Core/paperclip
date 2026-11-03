@@ -907,11 +907,9 @@ async function proveNoRepositoryLanding(
       );
     }
     if (
-    workspace.strategyType === "git_worktree" ||
-    workspace.providerType === "git_worktree" ||
-    workspace.strategyType === "project_primary" ||
-    workspace.providerType === "local_fs" && workspace.strategyType !== "adapter_managed"
-  ) {
+      workspace.strategyType === "git_worktree" ||
+      workspace.providerType === "git_worktree"
+    ) {
       return refuseTier1(
         'Tier 1 "no-repository-landing" is not accepted for a Git worktree.',
       );
