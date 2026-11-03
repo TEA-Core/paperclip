@@ -11018,6 +11018,24 @@ export function recoveryService(
         continue;
       }
 
+      const sourceIssue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, candidate.sourceIssueId))
+        .then((rows) => rows[0] ?? null);
+      const terminalSource =
+        !sourceIssue || sourceIssue.status === "done" || sourceIssue.status === "cancelled";
+
+      if (terminalSource) {
+        if (candidate.attemptCount >= effectiveMaxAttempts) {
+          result.maxAttemptsReached += 1;
+          await escalateExhaustedRecoveryAction(candidate, effectiveMaxAttempts, now);
+        } else {
+          result.skippedTerminalSource += 1;
+        }
+        continue;
+      }
+
       // SUP-22273: for the two stranded-participant kinds a live owner is not
       // a wedge. If the owner agent — or, on a board-owned row, the pending
       // participant it was minted for — has run anywhere after this action's
@@ -11051,18 +11069,6 @@ export function recoveryService(
       if (candidate.attemptCount >= effectiveMaxAttempts) {
         result.maxAttemptsReached += 1;
         await escalateExhaustedRecoveryAction(candidate, effectiveMaxAttempts, now);
-        continue;
-      }
-
-      const sourceIssue = await db
-        .select()
-        .from(issues)
-        .where(eq(issues.id, candidate.sourceIssueId))
-        .then((rows) => rows[0] ?? null);
-
-      // Nothing left to recover: the source issue is gone or already terminal.
-      if (!sourceIssue || sourceIssue.status === "done" || sourceIssue.status === "cancelled") {
-        result.skippedTerminalSource += 1;
         continue;
       }
 

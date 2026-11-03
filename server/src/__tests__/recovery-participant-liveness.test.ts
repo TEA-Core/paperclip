@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -17,6 +17,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import {
   REVIEW_PARTICIPANT_LIVE_WINDOW_MS,
   participantRanSince,
@@ -101,16 +102,17 @@ describeEmbeddedPostgres("recovery review-participant liveness (SUP-22272)", () 
   async function createIssue(
     companyId: string,
     prefix: string,
-    status: "in_progress" | "in_review",
+    status: "in_progress" | "in_review" | "done" | "cancelled",
     assigneeAgentId: string | null,
     opts: {
+      issueNumber?: number;
       updatedAt?: Date;
       executionPolicy?: Record<string, unknown>;
       executionState?: Record<string, unknown> | null;
     } = {},
   ) {
     const issueId = randomUUID();
-    const issueNumber = 1;
+    const issueNumber = opts.issueNumber ?? 1;
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -651,6 +653,146 @@ describeEmbeddedPostgres("recovery review-participant liveness (SUP-22272)", () 
       .where(eq(issueRecoveryActions.id, action.id));
     expect(updated.status).toBe("active");
     expect(updated.outcome).toBeNull();
+  });
+
+  it("keeps a live-owner re-mint's reserved attempt across repeated stale sweeps", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const remintedAt = new Date();
+      vi.setSystemTime(new Date(remintedAt.getTime() - 2 * 60 * 60_000));
+      const { companyId, coderId, prefix } = await seedCompany();
+      const issueId = await createIssue(companyId, prefix, "in_progress", coderId);
+      const svc = issueRecoveryActionService(db);
+      const fingerprint = `stranded_assigned_issue:${companyId}:${issueId}`;
+      const input = {
+        companyId,
+        sourceIssueId: issueId,
+        kind: "stranded_assigned_issue" as const,
+        ownerType: "agent" as const,
+        ownerAgentId: coderId,
+        cause: "stranded_assigned_issue",
+        fingerprint,
+        nextAction: "Restore a live execution path.",
+        wakePolicy: { type: "wake_owner" as const },
+      };
+      const predecessor = await svc.upsertSourceScoped(input);
+      await db
+        .update(issueRecoveryActions)
+        .set({ attemptCount: 5 })
+        .where(eq(issueRecoveryActions.id, predecessor.id));
+      await svc.resolveActiveForIssue({
+        companyId,
+        sourceIssueId: issueId,
+        kind: "stranded_assigned_issue",
+        fingerprint,
+        status: "resolved",
+        outcome: "false_positive",
+        resolutionNote: "Cycle resolved.",
+      });
+
+      vi.setSystemTime(remintedAt);
+      await seedParticipantRun(companyId, coderId, minutesAgo(5), issueId);
+      const successor = await svc.upsertSourceScoped(input);
+      expect(successor.attemptCount).toBe(4);
+      expect(successor.status).toBe("active");
+
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const results = [];
+      for (let sweep = 0; sweep < 2; sweep += 1) {
+        vi.setSystemTime(new Date(remintedAt.getTime() + (sweep + 1) * 81 * 60_000));
+        results.push(await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60_000 }));
+      }
+      expect(results.map((result) => ({
+        checked: result.checked,
+        skippedOwnerLive: result.skippedOwnerLive,
+        reFired: result.reFired,
+        maxAttemptsReached: result.maxAttemptsReached,
+      }))).toEqual([
+        { checked: 1, skippedOwnerLive: 1, reFired: 0, maxAttemptsReached: 0 },
+        { checked: 1, skippedOwnerLive: 1, reFired: 0, maxAttemptsReached: 0 },
+      ]);
+
+      const [updated] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, successor.id));
+      expect(updated.status).toBe("active");
+      expect(updated.outcome).toBeNull();
+      expect(updated.attemptCount).toBe(4);
+      expect(
+        updated.lastAttemptAt ? new Date(updated.lastAttemptAt).toISOString() : null,
+      ).toBe(successor.lastAttemptAt ? new Date(successor.lastAttemptAt).toISOString() : null);
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("handles a terminal source before holding its live owner", async () => {
+    const { companyId, coderId, prefix } = await seedCompany();
+    const doneIssueId = await createIssue(companyId, prefix, "done", coderId);
+    const belowCeilingAction = await insertSweepAction({
+      companyId,
+      sourceIssueId: doneIssueId,
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: coderId,
+      previousOwnerAgentId: null,
+      attemptCount: 2,
+      lastAttemptAt: minutesAgo(30),
+      wakePolicy: { type: "wake_owner" },
+    });
+    const cancelledIssueId = await createIssue(companyId, prefix, "cancelled", coderId, {
+      issueNumber: 2,
+    });
+    const ceilingAction = await insertSweepAction({
+      companyId,
+      sourceIssueId: cancelledIssueId,
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: coderId,
+      previousOwnerAgentId: null,
+      attemptCount: 5,
+      lastAttemptAt: minutesAgo(20),
+      wakePolicy: { type: "wake_owner" },
+    });
+    await seedParticipantRun(companyId, coderId, minutesAgo(5), doneIssueId);
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60_000 });
+
+    expect(result.checked).toBe(2);
+    expect(result.skippedTerminalSource).toBe(1);
+    expect(result.skippedOwnerLive).toBe(0);
+    expect(result.reFired).toBe(0);
+    expect(result.maxAttemptsReached).toBe(1);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const rows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        inArray(issueRecoveryActions.id, [belowCeilingAction.id, ceilingAction.id]),
+      );
+    expect(rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: belowCeilingAction.id,
+          status: "active",
+          attemptCount: 2,
+        }),
+        expect.objectContaining({
+          id: ceilingAction.id,
+          status: "escalated",
+          outcome: "exhausted",
+          attemptCount: 5,
+        }),
+      ]),
+    );
   });
 
   it("expiry: once the owner's run is outside the window the sweep re-fires and burns the attempt as before", async () => {

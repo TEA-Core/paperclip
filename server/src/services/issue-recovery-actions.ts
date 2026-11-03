@@ -1022,7 +1022,10 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
       }
       const [created] = await db
         .insert(issueRecoveryActions)
-        .values(buildInsertValues(input, ownerType, now, nextAttemptCount, insertEvidenceExtra))
+        .values({
+          ...buildInsertValues(input, ownerType, now, nextAttemptCount, insertEvidenceExtra),
+          ...(ownerLiveDepthCap ? { lastAttemptAt: asDatabaseDate(prev!.updatedAt) } : {}),
+        })
         .returning();
       return toReadModel(created!);
     } catch (error) {
