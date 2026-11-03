@@ -2499,9 +2499,27 @@ async function verifyMergedPullRequestOnBaseBranch(
   repo: string,
   baseRef: string | null,
   mergeCommitSha: string | null,
+  options: { requireVerifiedBranch?: boolean } = {},
 ): Promise<MergedDeliveryVerification> {
   if (!baseRef || !mergeCommitSha) {
     return { outcome: "unproven", reason: "merged PR has no readable merge commit or base branch" };
+  }
+  if (options.requireVerifiedBranch) {
+    // The pinned base comes from a persisted workspace/project ref, which can
+    // name a tag or a commit SHA. GitHub compare accepts those as a base, so
+    // containment against them would prove nothing about a control-plane
+    // branch. Resolve the ref under refs/heads/* first: only a live branch
+    // may serve as the compare base (fail closed otherwise).
+    const branchHead = await fetchBranchHeadSha(token, owner, repo, baseRef);
+    if (!branchHead.ok) {
+      if (branchHead.status === 401 || branchHead.status === 403) {
+        return { outcome: "auth-failed", status: branchHead.status };
+      }
+      return {
+        outcome: "unproven",
+        reason: `the card's recorded base ref ${baseRef} is not a verified branch`,
+      };
+    }
   }
   let response: Response;
   try {
@@ -2561,7 +2579,30 @@ async function resolveCardDeliveryBaseRef(
   const ctx = await resolveIssueRepoContext(db, { companyId, ...issueRow });
   const raw = ctx?.defaultRef ?? null;
   if (!raw) return null;
-  return raw.startsWith("origin/") && raw.length > "origin/".length ? raw.slice("origin/".length) : raw;
+  return normalizeCardDeliveryBaseRef(raw);
+}
+
+/**
+ * Normalizes a persisted control-plane ref to the branch name it denotes, or
+ * null when it cannot denote a branch at all. `origin/<b>`,
+ * `refs/remotes/origin/<b>` and `refs/heads/<b>` all denote `<b>`. Tags
+ * (`refs/tags/*`), any other `refs/*` form, and commit SHAs (full 40-hex or
+ * abbreviated hex) are refused: a merged-only proof must be made against a
+ * branch, and the caller verifies the surviving name under `refs/heads/*`
+ * before comparing.
+ */
+function normalizeCardDeliveryBaseRef(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  let branch: string;
+  if (trimmed.startsWith("refs/heads/")) branch = trimmed.slice("refs/heads/".length);
+  else if (trimmed.startsWith("refs/remotes/origin/")) branch = trimmed.slice("refs/remotes/origin/".length);
+  else if (trimmed.startsWith("refs/")) return null;
+  else if (trimmed.startsWith("origin/")) branch = trimmed.slice("origin/".length);
+  else branch = trimmed;
+  if (!branch) return null;
+  if (/^[0-9a-fA-F]{7,40}$/.test(branch)) return null;
+  return branch;
 }
 
 async function resolveExactBoundPullRequest(
@@ -2597,6 +2638,7 @@ async function resolveExactBoundPullRequest(
           repo.repo,
           binding.requireMerged ? await resolveCardDeliveryBaseRef(db, companyId, issueId) : result.baseRef,
           result.mergeCommitSha,
+          { requireVerifiedBranch: binding.requireMerged },
         );
         if (verified.outcome === "auth-failed" && candidate !== candidates[candidates.length - 1]) continue;
         if (verified.outcome !== "proven") {
@@ -3629,6 +3671,7 @@ async function verifyLiveFinalDeliveryHead(
         pr.repo,
         mergedOnly ? await resolveCardDeliveryBaseRef(db, companyId, issueId) : live.base?.ref ?? null,
         live.merge_commit_sha ?? null,
+        { requireVerifiedBranch: mergedOnly },
       );
       if (verified.outcome === "auth-failed") {
         if (candidate !== candidates[candidates.length - 1]) continue;

@@ -283,11 +283,15 @@ arm (no execution workspace) the record is accepted as a merged-only delivery
 only while the card has no workspace; after a rebind the record must equal the
 new row's branch, so it resolves only if that branch happens to match. The
 terminal-carrier arm is narrower still: the record is accepted only while the
-card is bound to the terminal carrier row, so rebind onto that row first and then
-record (that identity `PATCH` returns `200`). A record sent while the card still
-holds another row is refused with `422`, and rebinding away from the carrier row
-after recording returns `200` but leaves a record the approval-time resolver
-refuses.
+card is bound to the terminal carrier row. A `PATCH` that rebinds the card onto
+that row returns `200` but does not bind it (the workspace pointer becomes
+null), and an identity `PATCH` sent after such a rebind is refused with `422`
+`delivery_identity_branch_write_rejected`, because the card then has no
+execution-workspace delivery branch. Recording first (while bound to the
+carrier row) returns `200`, and rebinding away afterwards also returns `200`
+and leaves the record in place, but the approval-time resolver then refuses it.
+The supported route is to record while the card is bound to the carrier row
+and not rebind afterwards.
 
 The provisioning carry also applies only while the card's status is `in_review`
 at provisioning time. Once a card leaves `in_review` (a bounced redo wake, a

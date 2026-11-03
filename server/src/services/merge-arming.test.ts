@@ -2290,6 +2290,10 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     const MERGE_SHA = "mergec000000000000000000000000000000000001";
     const COMPARE_URL = `https://api.github.com/repos/${OWNER}/${REPO}/compare/main...${MERGE_SHA}`;
     const SIDE_COMPARE_URL = `https://api.github.com/repos/${OWNER}/${REPO}/compare/release%2Fother...${MERGE_SHA}`;
+    const REFS_MAIN_ROUTE = {
+      url: `https://api.github.com/repos/${OWNER}/${REPO}/git/refs/heads/main`,
+      body: { object: { sha: MERGE_SHA } },
+    };
 
     function carrierMergedPrBody() {
       return {
@@ -2307,7 +2311,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       };
     }
 
-    async function insertTerminalCarrierChild(options: { pinned?: boolean } = {}) {
+    async function insertTerminalCarrierChild(options: { pinned?: boolean; baseRef?: string } = {}) {
       const ownerIssueId = await insertIssue({ identifier: "SUP-1" });
       await db.update(issues).set({ status: "done" }).where(eq(issues.id, ownerIssueId));
       const issueId = await insertIssue({
@@ -2331,7 +2335,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           .where(eq(issues.id, issueId));
         await db
           .update(executionWorkspaces)
-          .set({ baseRef: "main" })
+          .set({ baseRef: options.baseRef ?? "main" })
           .where(eq(executionWorkspaces.id, childRow!.executionWorkspaceId!));
       }
       return issueId;
@@ -2342,6 +2346,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       installRoutes([
         { url: PR_URL, body: carrierMergedPrBody() },
         { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+        REFS_MAIN_ROUTE,
       ]);
 
       const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
@@ -2362,6 +2367,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           },
         },
         { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+              REFS_MAIN_ROUTE,
       ]);
 
       const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
@@ -2463,6 +2469,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           },
         },
         { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+              REFS_MAIN_ROUTE,
       ]);
 
       const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
@@ -2521,6 +2528,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           },
         },
         { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+              REFS_MAIN_ROUTE,
       ]);
 
       const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
@@ -2539,6 +2547,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         },
         { url: SIDE_COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
         { url: COMPARE_URL, body: { status: "ahead", ahead_by: 2 } },
+              REFS_MAIN_ROUTE,
       ]);
 
       const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
@@ -2565,6 +2574,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         },
         { url: SIDE_COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
         { url: COMPARE_URL, body: { status: "ahead", ahead_by: 2 } },
+              REFS_MAIN_ROUTE,
       ]);
 
       const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
@@ -2579,6 +2589,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       installRoutes([
         { url: PR_URL, body: carrierMergedPrBody() },
         { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+              REFS_MAIN_ROUTE,
       ]);
 
       const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
@@ -2589,6 +2600,43 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
 
       const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
       expect(preflight.kind).toBe("unresolvable");
+    });
+
+    it.each([
+      ["a tag", "v1.2.3"],
+      ["a full commit SHA", "0123456789abcdef0123456789abcdef01234567"],
+      ["an abbreviated commit SHA", "abc1234"],
+      ["a refs/tags ref", "refs/tags/v1.2.3"],
+    ])("refuses a merged-only binding whose recorded base is %s, never proving against it", async (_label, baseRef) => {
+      const issueId = await insertTerminalCarrierChild({ baseRef });
+      installRoutes([
+        { url: PR_URL, body: carrierMergedPrBody() },
+        { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+        { url: `https://api.github.com/repos/${OWNER}/${REPO}/compare/${encodeURIComponent(baseRef)}...${MERGE_SHA}`, body: { status: "identical", ahead_by: 0 } },
+        { url: `https://api.github.com/repos/${OWNER}/${REPO}/git/refs/heads/${baseRef}`, ok: false, status: 404 },
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("not proven on its base branch");
+      }
+    });
+
+    it.each([
+      ["origin/main", "origin/main"],
+      ["refs/remotes/origin/main", "refs/remotes/origin/main"],
+      ["refs/heads/main", "refs/heads/main"],
+    ])("proves a merged-only binding whose recorded base is persisted as %s", async (_label, baseRef) => {
+      const issueId = await insertTerminalCarrierChild({ baseRef });
+      installRoutes([
+        { url: PR_URL, body: carrierMergedPrBody() },
+        { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+        REFS_MAIN_ROUTE,
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("resolved");
     });
 
     it("refuses a merged-only no-workspace binding whose card records no base, never falling back to the PR's own base", async () => {
@@ -2607,6 +2655,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           },
         },
         { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+              REFS_MAIN_ROUTE,
       ]);
 
       const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
@@ -2712,6 +2761,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           },
         },
         { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+              REFS_MAIN_ROUTE,
       ]);
 
       const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
