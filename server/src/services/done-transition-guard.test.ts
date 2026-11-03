@@ -6096,7 +6096,8 @@ describe("evaluateDoneTierDeclaration", () => {
       // shape of that promise: a future edit that names the structured field on
       // only one door drops a count and fails here, not in production.
       expect((route.match(/\$\{DONE_TIER_STRUCTURED_FORMS\}/g) ?? []).length).toBeGreaterThanOrEqual(2);
-      expect((route.match(/\$\{TIER1_FORM\}/g) ?? []).length).toBeGreaterThanOrEqual(2);
+      expect((route.match(/\$\{tierDeclarationAlternatives\}/g) ?? []).length).toBeGreaterThanOrEqual(2);
+      expect(route).toContain("` or ${TIER1_FORM}`");
     });
 
     it("SUP-21474: routes remedy interpolates TIER1_FORM un-cut so both Tier 1 forms keep balanced quotes", () => {
