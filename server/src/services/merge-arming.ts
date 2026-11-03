@@ -3476,12 +3476,49 @@ const finalDeliveryLiveSchema = z.object({
   base: z.object({ ref: z.string() }).optional(),
 });
 
-/** Read-only final-stage certification; no approval or status writes. */
+/**
+ * Read-only final-stage certification; no approval or status writes.
+ *
+ * SUP-22346: final-delivery close preflight alone may fall back to the issue's
+ * explicitly mentioned PRs when the ordinary resolver dead-ends on no-pr — a
+ * delivery merged out-of-band after final review is cached closed, so every
+ * open-PR resolver (cached mentions, live workspace discovery) legitimately
+ * returns nothing. Exactly one LIVE-merged mentioned carrier is accepted, and
+ * only after the same live merged-state, base-branch merge-commit containment,
+ * and branch/repo ownership checks as the ordinary path. Every other
+ * resolution path (approval publication, merge arming, reconciliation) stays
+ * open-PR-only.
+ */
 export async function preflightFinalDelivery(
   db: Db, companyId: string, issueId: string, identifier: string,
 ): Promise<DecisionHeadResolution> {
   const resolved = await resolveApprovalDecisionHead(db, companyId, issueId, identifier, true);
-  if (resolved.kind !== "resolved") return resolved;
+  if (resolved.kind === "resolved") {
+    return verifyLiveFinalDeliveryHead(db, companyId, issueId, resolved);
+  }
+  if (resolved.reason.startsWith("no-pr:")) {
+    const carrier = await resolveSingleMergedMentionCarrier(db, companyId, issueId);
+    if (carrier.kind === "resolved") {
+      return verifyLiveFinalDeliveryHead(db, companyId, issueId, carrier);
+    }
+    if (carrier.kind === "unresolvable") return carrier;
+  }
+  return resolved;
+}
+
+/**
+ * Live final-delivery head verification shared by the ordinary resolved path
+ * and the SUP-22346 merged-mention carrier fallback: merged deliveries must
+ * prove their merge commit on the base branch, open deliveries must be
+ * unmerged, and either way the live head, head repo, and delivery-identity
+ * ownership must still match what the decision resolved.
+ */
+async function verifyLiveFinalDeliveryHead(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  resolved: { kind: "resolved"; headSha: string; displayName: string; pr: { owner: string; repo: string; number: number } },
+): Promise<DecisionHeadResolution> {
   const { pr } = resolved;
   const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
   for (const candidate of candidates) {
@@ -3531,6 +3568,79 @@ export async function preflightFinalDelivery(
     return resolved;
   }
   return { kind: "unresolvable", reason: "head_unverifiable: no credential can verify the live delivery" };
+}
+
+/**
+ * SUP-22346: among the issue's explicitly mentioned PRs (cached state is
+ * irrelevant — a PR merged out-of-band is cached closed), resolve the single
+ * one that is live-merged. Zero live-merged mentions is `none` (the caller
+ * keeps its original no-pr outcome); more than one is unresolvable
+ * ambiguity — both fail closed. The one live head SHA is returned so the
+ * caller re-runs the full live verification (containment, ownership, head
+ * match) before accepting the carrier.
+ *
+ * SUP-22355: an explicitly mentioned PR that stays unreadable after the
+ * 401/403 credential rotation (any other failure — HTTP 429/404, network
+ * error — or no credential resolving its repository at all) makes the whole
+ * resolution `unresolvable` instead of silently dropping the candidate:
+ * uniqueness of the merged carrier is unprovable while any mention is
+ * unreadable, so a verified merged mention must not be accepted beside it.
+ */
+async function resolveSingleMergedMentionCarrier(
+  db: Db,
+  companyId: string,
+  issueId: string,
+): Promise<
+  | { kind: "none" }
+  | { kind: "resolved"; headSha: string; displayName: string; pr: { owner: string; repo: string; number: number } }
+  | { kind: "unresolvable"; reason: string }
+> {
+  const mentioned = await resolveLinkedPullRequestsWithState(db, companyId, issueId);
+  const mergedCarriers: Array<{
+    kind: "resolved";
+    headSha: string;
+    displayName: string;
+    pr: { owner: string; repo: string; number: number };
+  }> = [];
+  for (const pr of mentioned) {
+    const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
+    // SUP-22355: a mention no credential can even attempt is unreadable —
+    // fail closed rather than skipping the candidate.
+    let unreadable: string | null = candidates.length === 0 ? "no credential resolves this repository" : null;
+    for (let i = 0; i < candidates.length; i++) {
+      const live = await fetchPullRequestHeadSha(candidates[i]!.token, pr.owner, pr.repo, pr.number);
+      if (live.ok) {
+        unreadable = null;
+        if (live.merged === true && live.headSha) {
+          mergedCarriers.push({
+            kind: "resolved",
+            headSha: live.headSha,
+            displayName: pr.displayName,
+            pr: { owner: pr.owner, repo: pr.repo, number: pr.number },
+          });
+        }
+        break;
+      }
+      unreadable = live.status === 0 ? "network error" : `HTTP ${live.status}`;
+      if ((live.status === 401 || live.status === 403) && i < candidates.length - 1) continue;
+      break;
+    }
+    if (unreadable !== null) {
+      return {
+        kind: "unresolvable",
+        reason: `unreadable_mention: mentioned PR ${pr.displayName} could not be read after credential rotation (${unreadable}); merged-carrier uniqueness is unprovable`,
+      };
+    }
+  }
+  if (mergedCarriers.length === 0) return { kind: "none" };
+  if (mergedCarriers.length > 1) {
+    const names = mergedCarriers.map((carrier) => carrier.displayName).join(", ");
+    return {
+      kind: "unresolvable",
+      reason: `ambiguous: multiple merged mentioned PRs (${mergedCarriers.length}): ${names}`,
+    };
+  }
+  return mergedCarriers[0]!;
 }
 
 /**

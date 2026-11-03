@@ -2062,6 +2062,199 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     });
   });
 
+  // SUP-22346: the carrier PR can merge out-of-band between final review and
+  // the close. The merged PR is cached closed, so every open-PR resolver
+  // (cached mentions, live workspace discovery) legitimately returns nothing
+  // and the final-delivery preflight dead-ends on no-pr — the SUP-19568
+  // blocker. FINAL close preflight alone falls back to the explicitly
+  // mentioned PRs: exactly one LIVE-merged mentioned carrier is accepted,
+  // after the same live merged-state, base-branch containment, and
+  // branch/repo ownership checks as the ordinary path. Every other resolver
+  // (resolveApprovalDecisionHead included) stays open-PR-only.
+  describe("SUP-22346 merged mentioned carrier (final-delivery preflight only)", () => {
+    const MERGE_SHA = "mergec000000000000000000000000000000000001";
+    const COMPARE_URL = `https://api.github.com/repos/${OWNER}/${REPO}/compare/main...${MERGE_SHA}`;
+    const PR_43_URL = `https://api.github.com/repos/${OWNER}/${REPO}/pulls/43`;
+    const PR_44_URL = `https://api.github.com/repos/${OWNER}/${REPO}/pulls/44`;
+
+    function mergedMentionBody(overrides: Record<string, unknown> = {}) {
+      return {
+        state: "closed",
+        draft: false,
+        merged: true,
+        title: "Fix thing (SUP-42)",
+        merge_commit_sha: MERGE_SHA,
+        base: { ref: "main" },
+        head: {
+          ref: "SUP-42-branch",
+          sha: APPROVED_HEAD,
+          repo: { full_name: `${OWNER}/${REPO}` },
+        },
+        ...overrides,
+      };
+    }
+
+    function mergedCarrierRoutes(prBody: unknown = mergedMentionBody(), compareBody: unknown = { status: "behind", ahead_by: 0 }) {
+      return [
+        // Live workspace discovery finds no OPEN PR — the merged carrier is
+        // closed — which is exactly what makes the ordinary resolver no-pr.
+        { url: OPEN_PRS_LIST_URL, body: [] },
+        { url: PR_URL, body: prBody },
+        { url: COMPARE_URL, body: compareBody },
+        { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+      ];
+    }
+
+    async function insertMentionOnlyCard() {
+      // No recorded delivery binding — the SUP-19568 gap: the only carrier
+      // evidence is the explicit mention, cached closed after the merge.
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "closed" });
+      return issueId;
+    }
+
+    it("preflightFinalDelivery accepts the single verified merged mentioned carrier", async () => {
+      const issueId = await insertMentionOnlyCard();
+      installRoutes(mergedCarrierRoutes());
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") {
+        expect(result.headSha).toBe(APPROVED_HEAD);
+        expect(result.displayName).toBe(`${OWNER}/${REPO}#42`);
+        expect(result.pr).toEqual({ owner: OWNER, repo: REPO, number: 42 });
+      }
+      expect(postStatusShas()).toEqual([]);
+    });
+
+    it("resolveApprovalDecisionHead stays open-PR-only for the same card (no carrier fallback)", async () => {
+      const issueId = await insertMentionOnlyCard();
+      installRoutes(mergedCarrierRoutes());
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe("no-pr: no open linked PR resolvable at decision time");
+      }
+    });
+
+    it("keeps refusing when the mentioned PR is closed but NOT merged", async () => {
+      const issueId = await insertMentionOnlyCard();
+      installRoutes(mergedCarrierRoutes({
+        state: "closed",
+        draft: false,
+        merged: false,
+        title: "Fix thing (SUP-42)",
+        head: { ref: "SUP-42-branch", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+      }));
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe("no-pr: no open linked PR resolvable at decision time");
+      }
+    });
+
+    it("refuses ambiguously when TWO mentioned PRs are live-merged", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, state: "closed" });
+      await insertMention(issueId, { number: 43, state: "closed", headRefName: "SUP-43-other-branch" });
+      installRoutes([
+        ...mergedCarrierRoutes(),
+        { url: PR_43_URL, body: mergedMentionBody() },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("ambiguous: multiple merged mentioned PRs (2)");
+        expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
+        expect(result.reason).toContain(`${OWNER}/${REPO}#43`);
+      }
+    });
+
+    // SUP-22355: an explicitly mentioned PR whose live read fails for a
+    // non-401/403 reason (here HTTP 429) must make the merged-carrier
+    // resolution unresolvable — uniqueness is unprovable while one mention
+    // is unreadable, so the other (fully verified) merged mention must NOT
+    // be accepted.
+    it("refuses when one mentioned PR is unreadable (HTTP 429) even as the other is a verified merged carrier", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, state: "closed" });
+      await insertMention(issueId, { number: 44, state: "closed", headRefName: "SUP-44-branch" });
+      installRoutes([
+        ...mergedCarrierRoutes(),
+        { url: PR_44_URL, body: { message: "rate limited" }, ok: false, status: 429 },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("unreadable_mention");
+        expect(result.reason).toContain(`${OWNER}/${REPO}#44`);
+        expect(result.reason).toContain("HTTP 429");
+      }
+    });
+
+    it("refuses the merged carrier whose merge commit is NOT proven on the base branch", async () => {
+      const issueId = await insertMentionOnlyCard();
+      installRoutes(mergedCarrierRoutes(mergedMentionBody(), { status: "ahead", ahead_by: 2 }));
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("head_merged_unproven");
+        expect(result.reason).toContain("is not on base branch main");
+      }
+    });
+
+    it("refuses the merged carrier whose live head branch is not the card's own delivery branch", async () => {
+      const issueId = await insertMentionOnlyCard();
+      installRoutes(mergedCarrierRoutes(mergedMentionBody({
+        head: { ref: "SUP-99-other-branch", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+      })));
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("not_delivered");
+      }
+    });
+
+    it("refuses the merged carrier whose live head repo is not the card's delivery repo", async () => {
+      const issueId = await insertMentionOnlyCard();
+      installRoutes(mergedCarrierRoutes(mergedMentionBody({
+        head: { ref: "SUP-42-branch", sha: APPROVED_HEAD, repo: { full_name: "other-org/other-repo" } },
+      })));
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("not_delivered");
+      }
+    });
+
+    it("never considers a merged PR that is not mentioned on the card (unrelated)", async () => {
+      const issueId = await insertIssue();
+      installRoutes(mergedCarrierRoutes());
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe("no-pr: no open linked PR resolvable at decision time");
+      }
+    });
+  });
+
   describe("resolveCardPullRequest (SUP-14917 shared resolution)", () => {
     it("resolves a single cached OPEN mention with no live GitHub call (source=mention)", async () => {
       const issueId = await insertIssue();

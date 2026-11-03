@@ -268,6 +268,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     mergeArmingEnabled = false,
     deliveryRequirement,
     assigneeAgentId = null,
+    mentionState,
   }: {
     draft?: boolean;
     missing?: boolean;
@@ -278,6 +279,8 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     mergeArmingEnabled?: boolean;
     deliveryRequirement?: IssueDeliveryRequirement;
     assigneeAgentId?: string | null;
+    /** SUP-22346: cache the mentioned PR as merged/closed out-of-band ("merged" | "ambiguous") or closed-unmerged. */
+    mentionState?: "merged" | "ambiguous" | "closed-unmerged";
   } = {}) {
     const company = await seedCompany(db);
     if (mergeArmingEnabled) {
@@ -322,9 +325,20 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         skippedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
       },
     }).where(eq(issues.id, issue.id));
+    // SUP-22346: mentionState models the out-of-band-merged carrier — the
+    // cached mention is closed, so every open-PR resolver sees nothing and the
+    // live open-PR list is empty.
+    const mergedMention = mentionState === "merged" || mentionState === "ambiguous";
     const pr = {
       number: 42, state: "open", draft, merged: false, node_id: "sandbox-pr",
       title: identifier, head: { ref: branch, sha: "a".repeat(40), repo: { full_name: "TEA-Core/paperclip" } },
+      ...(mentionState
+        ? {
+            state: "closed" as const,
+            merged: mergedMention,
+            ...(mergedMention ? { merge_commit_sha: "c".repeat(40), base: { ref: "main" } } : {}),
+          }
+        : {}),
     };
     if (repo && !missing) {
       const [object] = await db.insert(externalObjects).values({
@@ -338,6 +352,20 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
           companyId: company.id, sourceIssueId: issue.id, sourceKind: "description",
           objectId: object!.id, providerKey: "github", detectorKey: "github_pr", objectType: "pull_request",
           matchedTextRedacted: "delivery", sanitizedDisplayUrl: object!.sanitizedCanonicalUrl,
+          canonicalIdentityHash: randomUUID(), canonicalIdentity: {},
+        });
+      }
+      if (mentionState === "ambiguous") {
+        const [object43] = await db.insert(externalObjects).values({
+          companyId: company.id, providerKey: "github", objectType: "pull_request",
+          externalId: "TEA-Core/paperclip#pull/43", displayKey: "43", displayTitle: identifier,
+          sanitizedCanonicalUrl: "https://github.com/TEA-Core/paperclip/pull/43",
+          canonicalIdentityHash: randomUUID(), data: { ...pr, number: 43 },
+        }).returning();
+        await db.insert(externalObjectMentions).values({
+          companyId: company.id, sourceIssueId: issue.id, sourceKind: "description",
+          objectId: object43!.id, providerKey: "github", detectorKey: "github_pr", objectType: "pull_request",
+          matchedTextRedacted: "delivery", sanitizedDisplayUrl: object43!.sanitizedCanonicalUrl,
           canonicalIdentityHash: randomUUID(), canonicalIdentity: {},
         });
       }
@@ -382,14 +410,19 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         writes.push({ url, body: JSON.parse(String(init.body)) });
         return Response.json({ id: 1 });
       }
+      if (url.includes("/pulls/43")) {
+        return Response.json({ ...pr, number: 43 });
+      }
       if (url.includes("/pulls/42")) {
         const [stored] = await db.select().from(issues).where(eq(issues.id, issue.id));
         const head = moveAfterPreflight && stored!.executionState?.lastDecisionOutcome === "approved"
           ? { ...pr.head, sha: "b".repeat(40) } : pr.head;
         return Response.json({ ...pr, head });
       }
-      if (url.includes("/pulls?")) return Response.json(missing ? [] : [pr]);
-      if (url.includes("/compare/")) return Response.json({ ahead_by: 1 });
+      if (url.includes("/pulls?")) return Response.json(mentionState ? [] : missing ? [] : [pr]);
+      if (url.includes("/compare/")) {
+        return Response.json(mergedMention ? { status: "behind", ahead_by: 0 } : { ahead_by: 1 });
+      }
       if (url.includes("/git/ref/")) return Response.json({ object: { sha: pr.head.sha } });
       throw new Error(`Unexpected sandbox request: ${url}`);
     });
@@ -588,6 +621,46 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
 
     expect(response.status).toBe(409);
     expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight" });
+  });
+
+  it("accepts the final approval whose only resolvable carrier is one verified merged mentioned PR (SUP-22346)", async () => {
+    const fixture = await pendingDelivery({ mentionState: "merged" });
+    const response = await fixture.approve();
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.status).toBe("done");
+    expect(stored.executionState).toMatchObject({
+      completedStageIds: [fixture.stageId], lastDecisionOutcome: "approved",
+      approvalStatus: { approvedHeadSha: fixture.pr.head.sha },
+    });
+    // Publication stays open-PR-only: a merged carrier gets no status write.
+    expect(fixture.writes).toEqual([]);
+    expect(fixture.armCalls).toEqual([]);
+  });
+
+  it("keeps the merged-carrier gate fail-closed when the mentioned PR is closed but NOT merged (SUP-22346)", async () => {
+    const fixture = await pendingDelivery({ mentionState: "closed-unmerged" });
+    const response = await fixture.approve();
+
+    expect(response.status).toBe(409);
+    expect(response.body).toMatchObject({
+      details: { code: "approval_final_delivery_preflight", reason: expect.stringContaining("no-pr") },
+    });
+    expect((await fixture.read()).status).toBe("in_review");
+    expect(fixture.writes).toEqual([]);
+  });
+
+  it("keeps the merged-carrier gate fail-closed when two mentioned PRs are live-merged (SUP-22346)", async () => {
+    const fixture = await pendingDelivery({ mentionState: "ambiguous" });
+    const response = await fixture.approve();
+
+    expect(response.status).toBe(409);
+    expect(response.body).toMatchObject({
+      details: { code: "approval_final_delivery_preflight", reason: expect.stringContaining("ambiguous: multiple merged mentioned PRs (2)") },
+    });
+    expect((await fixture.read()).status).toBe("in_review");
+    expect(fixture.writes).toEqual([]);
   });
 
   it("allows a final approval with an accepted merged-elsewhere override when no linked PR resolves (SUP-21498)", async () => {
