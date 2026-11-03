@@ -879,10 +879,20 @@ export async function provisionIssueExecutionWorkspace(
       : {}),
   };
   const pendingForwardBranchReconcile = executionWorkspace.pendingForwardBranchReconcile ?? null;
+  // Never stamp this card's recorded branch onto a restored row another
+  // issue owns (an ancestor-owned shared_workspace row): the ownership
+  // resolver would then read this card's branch as a legitimate carrier
+  // branch (ADR-091 D1). Fresh rows and rows this card owns are unaffected.
+  const restoringOntoForeignRow =
+    resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace &&
+    reusableExistingExecutionWorkspace != null &&
+    reusableExistingExecutionWorkspace.sourceIssueId != null &&
+    reusableExistingExecutionWorkspace.sourceIssueId !== "" &&
+    reusableExistingExecutionWorkspace.sourceIssueId !== issueId;
   const branchNameForInitialPersistence =
     pendingForwardBranchReconcile?.recordedBranchName ??
     executionWorkspace.branchName ??
-    recordedDeliveryBranch;
+    (restoringOntoForeignRow ? null : recordedDeliveryBranch);
   try {
     persistedExecutionWorkspace =
       resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace && reusableExistingExecutionWorkspace

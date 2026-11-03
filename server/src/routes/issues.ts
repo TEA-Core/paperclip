@@ -19518,8 +19518,32 @@ export function issueRoutes(
       // must bind a PR and carry this card's identifier prefix, the same anchor
       // resolveDeliveryIdentity requires, so the write never returns 200 for a
       // record the approval gate then refuses. Agents still cannot create it.
+      // Combined PATCH: when this same request rebinds the card to a new
+      // execution workspace, validate the record against the EFFECTIVE
+      // workspace it will land on, not the old empty binding — otherwise the
+      // refresh returns 200 and approval later refuses the stored record.
+      const combinedRebindId =
+        typeof updateFields.executionWorkspaceId === "string"
+          ? updateFields.executionWorkspaceId
+          : null;
+      let combinedRebindBranch: string | null | undefined;
+      if (combinedRebindId !== null && combinedRebindId !== existing.executionWorkspaceId) {
+        const [reboundWorkspace] = await db
+          .select({ branchName: executionWorkspaces.branchName })
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, combinedRebindId));
+        combinedRebindBranch = reboundWorkspace?.branchName ?? null;
+      }
+      const boardCombinedRebindRecord =
+        boardDeliveryRefresh
+        && combinedRebindBranch !== undefined
+        && combinedRebindBranch !== null
+        && requestedDeliveryIdentity.branch === combinedRebindBranch;
+      const combinedRebindMismatch =
+        combinedRebindBranch !== undefined && !boardCombinedRebindRecord;
       const boardOrphanDeliveryRecord =
         boardDeliveryRefresh
+        && combinedRebindBranch === undefined
         && !existing.executionWorkspaceId
         && requestedDeliveryIdentity.prNumber !== undefined
         && requestedDeliveryIdentity.prUrl !== undefined
@@ -19537,7 +19561,8 @@ export function issueRoutes(
         && branchOwnership.branch !== null
         && requestedDeliveryIdentity.branch === branchOwnership.branch;
       const recordedBranchMismatch =
-        (!canRecordProjectPrimaryBranch && !boardOrphanDeliveryRecord && !boardTerminalCarrierRecord && branchOwnership.branch === null)
+        combinedRebindMismatch
+        || (!canRecordProjectPrimaryBranch && !boardOrphanDeliveryRecord && !boardTerminalCarrierRecord && branchOwnership.branch === null)
         || (branchOwnership.branch !== null
           // Git refs are case-sensitive: the recorded branch must equal the control-plane branch exactly.
           && requestedDeliveryIdentity.branch !== branchOwnership.branch);
@@ -19545,6 +19570,7 @@ export function issueRoutes(
         !canRecordProjectPrimaryBranch
         && !boardOrphanDeliveryRecord
         && !boardTerminalCarrierRecord
+        && !boardCombinedRebindRecord
         && (!branchOwnership.legitimate || recordedBranchMismatch)
       ) {
         const branchReason =

@@ -5489,6 +5489,56 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect(await recordedDeliveryOf(issueId)).toBeUndefined();
   });
 
+  it("validates a combined deliveryIdentity + executionWorkspaceId PATCH against the new workspace", async () => {
+    const { companyId, issueId } = await seedIssue({ status: "in_review", noWorkspace: true });
+    const [seeded] = await db
+      .select({ projectId: issues.projectId })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const reboundWorkspaceId = randomUUID();
+    await db.insert(executionWorkspaces).values({
+      id: reboundWorkspaceId,
+      companyId,
+      projectId: seeded!.projectId,
+      mode: "isolated",
+      strategyType: "git_worktree",
+      name: "rebound-ws",
+      status: "active",
+      branchName: "SUP-14824-branch",
+      repoUrl: REPO_URL,
+    });
+    currentActor = boardActor(companyId);
+
+    const matching = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionWorkspaceId: reboundWorkspaceId,
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14824-branch",
+          headSha: HEAD_SHA,
+          prNumber: PR_NUMBER,
+          prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+        },
+      });
+    expect(matching.status, JSON.stringify(matching.body)).toBe(200);
+
+    const mismatching = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionWorkspaceId: reboundWorkspaceId,
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14824-other-branch",
+          headSha: HEAD_SHA,
+          prNumber: PR_NUMBER,
+          prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+        },
+      });
+    expect(mismatching.status).toBe(422);
+    expect(mismatching.body.code).toBe("delivery_identity_branch_write_rejected");
+  });
+
   it("allows the board to bind a terminal carrier PR on an in_review carrier child", async () => {
     const { companyId, issueId } = await seedIssue({
       status: "in_review",
