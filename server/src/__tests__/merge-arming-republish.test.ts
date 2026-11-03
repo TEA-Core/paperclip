@@ -5690,7 +5690,15 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect(delivery!.prNumber).toBe(PR_NUMBER);
   });
 
-  it("pins the terminal-carrier order: a rebind onto the carrier row does not bind, and the record after it is refused", async () => {
+  const terminalCarrierDelivery = {
+    repo: { owner: OWNER, repo: REPO },
+    branch: "SUP-14823-carrier-branch",
+    headSha: HEAD_SHA,
+    prNumber: PR_NUMBER,
+    prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+  };
+
+  async function seedTerminalCarrierChild() {
     const { companyId, issueId } = await seedIssue({
       status: "in_review",
       sharedWorkspaceOwnerBranch: "SUP-14823-carrier-branch",
@@ -5699,13 +5707,66 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     const carrierWorkspaceId = await boundWorkspaceOf(issueId);
     const awayWorkspaceId = await insertReboundWorkspace(issueId, "SUP-14824-own-branch");
     currentActor = boardActor(companyId);
-    const deliveryIdentity = {
-      repo: { owner: OWNER, repo: REPO },
-      branch: "SUP-14823-carrier-branch",
-      headSha: HEAD_SHA,
-      prNumber: PR_NUMBER,
-      prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
-    };
+    return { issueId, carrierWorkspaceId, awayWorkspaceId };
+  }
+
+  it("pins the terminal-carrier order (enableIsolatedWorkspaces on): a record sent off the carrier row is refused, a record after rebinding onto it is accepted", async () => {
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    try {
+      const { issueId, carrierWorkspaceId, awayWorkspaceId } = await seedTerminalCarrierChild();
+
+      const away = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionWorkspaceId: awayWorkspaceId });
+      expect(away.status, JSON.stringify(away.body)).toBe(200);
+      expect(await boundWorkspaceOf(issueId)).toBe(awayWorkspaceId);
+
+      const early = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ deliveryIdentity: terminalCarrierDelivery });
+      expect(early.status, JSON.stringify(early.body)).toBe(422);
+      expect(early.body.code).toBe("delivery_identity_branch_write_rejected");
+      expect(await recordedDeliveryOf(issueId)).toBeUndefined();
+
+      const back = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionWorkspaceId: carrierWorkspaceId });
+      expect(back.status, JSON.stringify(back.body)).toBe(200);
+      expect(await boundWorkspaceOf(issueId)).toBe(carrierWorkspaceId);
+
+      const record = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ deliveryIdentity: terminalCarrierDelivery });
+      expect(record.status, JSON.stringify(record.body)).toBe(200);
+      expect((await recordedDeliveryOf(issueId) as Record<string, unknown>).branch).toBe("SUP-14823-carrier-branch");
+    } finally {
+      await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    }
+  });
+
+  it("pins the terminal-carrier reverse order (enableIsolatedWorkspaces on): recording first, then rebinding away, leaves the record in place", async () => {
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    try {
+      const { issueId, awayWorkspaceId } = await seedTerminalCarrierChild();
+
+      const record = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ deliveryIdentity: terminalCarrierDelivery });
+      expect(record.status, JSON.stringify(record.body)).toBe(200);
+
+      const away = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionWorkspaceId: awayWorkspaceId });
+      expect(away.status, JSON.stringify(away.body)).toBe(200);
+      expect(await boundWorkspaceOf(issueId)).toBe(awayWorkspaceId);
+      expect((await recordedDeliveryOf(issueId) as Record<string, unknown>).branch).toBe("SUP-14823-carrier-branch");
+    } finally {
+      await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    }
+  });
+
+  it("pins the terminal-carrier rebind with enableIsolatedWorkspaces off: the rebind is dropped (200, pointer cleared) and the record after it is refused", async () => {
+    const { issueId, carrierWorkspaceId, awayWorkspaceId } = await seedTerminalCarrierChild();
 
     const away = await request(app)
       .patch(`/api/issues/${issueId}`)
@@ -5719,37 +5780,12 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect(back.status, JSON.stringify(back.body)).toBe(200);
     expect(await boundWorkspaceOf(issueId)).toBeNull();
 
-    const record = await request(app).patch(`/api/issues/${issueId}`).send({ deliveryIdentity });
+    const record = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ deliveryIdentity: terminalCarrierDelivery });
     expect(record.status, JSON.stringify(record.body)).toBe(422);
     expect(record.body.code).toBe("delivery_identity_branch_write_rejected");
     expect(await recordedDeliveryOf(issueId)).toBeUndefined();
-  });
-
-  it("pins the terminal-carrier reverse order: recording first, then rebinding away, leaves the record in place", async () => {
-    const { companyId, issueId } = await seedIssue({
-      status: "in_review",
-      sharedWorkspaceOwnerBranch: "SUP-14823-carrier-branch",
-    });
-    await db.update(issues).set({ status: "done" }).where(eq(issues.identifier, "SUP-14823-1"));
-    const awayWorkspaceId = await insertReboundWorkspace(issueId, "SUP-14824-own-branch");
-    currentActor = boardActor(companyId);
-    const deliveryIdentity = {
-      repo: { owner: OWNER, repo: REPO },
-      branch: "SUP-14823-carrier-branch",
-      headSha: HEAD_SHA,
-      prNumber: PR_NUMBER,
-      prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
-    };
-
-    const record = await request(app).patch(`/api/issues/${issueId}`).send({ deliveryIdentity });
-    expect(record.status, JSON.stringify(record.body)).toBe(200);
-
-    const away = await request(app)
-      .patch(`/api/issues/${issueId}`)
-      .send({ executionWorkspaceId: awayWorkspaceId });
-    expect(away.status, JSON.stringify(away.body)).toBe(200);
-    expect(await boundWorkspaceOf(issueId)).toBeNull();
-    expect((await recordedDeliveryOf(issueId) as Record<string, unknown>).branch).toBe("SUP-14823-carrier-branch");
   });
 
   it("still rejects the board refreshing deliveryIdentity with a foreign branch", async () => {

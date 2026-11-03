@@ -283,15 +283,18 @@ arm (no execution workspace) the record is accepted as a merged-only delivery
 only while the card has no workspace; after a rebind the record must equal the
 new row's branch, so it resolves only if that branch happens to match. The
 terminal-carrier arm is narrower still: the record is accepted only while the
-card is bound to the terminal carrier row. A `PATCH` that rebinds the card onto
-that row returns `200` but does not bind it (the workspace pointer becomes
-null), and an identity `PATCH` sent after such a rebind is refused with `422`
-`delivery_identity_branch_write_rejected`, because the card then has no
-execution-workspace delivery branch. Recording first (while bound to the
-carrier row) returns `200`, and rebinding away afterwards also returns `200`
-and leaves the record in place, but the approval-time resolver then refuses it.
-The supported route is to record while the card is bound to the carrier row
-and not rebind afterwards.
+card is bound to the terminal carrier row. A record sent before the card is
+bound to that row is refused with `422` `delivery_identity_branch_write_rejected`.
+Whether a rebind onto the carrier row binds depends on the
+`enableIsolatedWorkspaces` experimental flag. With the flag on, the rebind binds
+(the pointer keeps the carrier row id) and an identity `PATCH` sent after it
+returns `200`. With the flag off, the rebind is silently dropped (`200`, the old
+pointer is cleared, so the workspace pointer is null) and an identity `PATCH`
+sent after it is refused with `422` `delivery_identity_branch_write_rejected`,
+because the card then has no execution-workspace delivery branch. Rebinding away
+from the carrier row after the record is written returns `200` and leaves the
+record in place, but the approval-time resolver then refuses it. So write the
+record while the card is bound to the carrier row and do not rebind afterwards.
 
 The provisioning carry also applies only while the card's status is `in_review`
 at provisioning time. Once a card leaves `in_review` (a bounced redo wake, a
