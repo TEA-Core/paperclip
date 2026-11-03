@@ -332,8 +332,14 @@ default: the proof is refused (a terminal carrier whose `baseRef` is
 `release/other` arms a PR merged on `release/other`). A card with no execution
 workspace has no such row, so the base falls through to the project workspace:
 its `defaultRef`, else its `repoRef` (the card's own project workspace, else the
-project's primary one). A card that resolves no base is refused. Ordinary bindings keep proving a merged PR against the PR's own base
-branch. An open PR on a dead carrier stays refused (SUP-16896). A merged-only
+project's primary one). The base must be a live branch: `origin/<b>`,
+`refs/remotes/origin/<b>` and `refs/heads/<b>` all denote `<b>`, which is then
+resolved under `refs/heads/*` on GitHub. A tag, any other `refs/*` form, a commit
+SHA, or a name that is not a live branch is refused, because containment against
+a non-branch base proves nothing about the control-plane branch. A card that
+resolves no base is refused. Ordinary bindings keep proving a merged PR against
+the PR's own base branch. An open PR on a dead carrier stays refused
+(SUP-16896). A merged-only
 binding is never a release target (`resolveReleaseDeliveryTarget`) and never
 feeds release-assurance.
 
