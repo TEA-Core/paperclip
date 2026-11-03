@@ -1721,7 +1721,9 @@ async function listLocalFiles(ctx: PluginContext, input: { companyId: string; sp
         .map((entry) => ({ ...entry, path: logicalPathFromSpacePath(input.space, entry.path) })),
       truncated: listing.truncated,
     };
-  } catch {
+  } catch (error) {
+    const code = typeof error === "object" && error && "code" in error ? String((error as { code?: unknown }).code) : "";
+    if (code !== "ENOENT") throw error;
     return { entries: [], truncated: false };
   }
 }

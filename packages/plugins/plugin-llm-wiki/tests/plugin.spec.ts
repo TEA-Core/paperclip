@@ -1518,6 +1518,7 @@ Duplicate headings receive stable suffixes.
   it("registers worker data, actions, and tools", async () => {
     const harness = createTestHarness({ manifest });
     await plugin.definition.setup(harness.ctx);
+    await harness.ctx.localFolders.configure({ companyId: COMPANY_ID, folderKey: "wiki-root", path: "/memory/wiki-root" });
 
     const overview = await harness.getData<{ status: string; operationCount: number; eventIngestion: { enabled: boolean } }>("overview", {
       companyId: COMPANY_ID,
@@ -1593,6 +1594,52 @@ Duplicate headings receive stable suffixes.
     }>("wiki_list_pages", { companyId: COMPANY_ID, wikiId: "default" });
     expect(truncated.data.pages).toHaveLength(2000);
     expect(truncated.data.truncated).toBe(true);
+  });
+
+  it("fails wiki_list_pages instead of claiming a complete listing when the disk listing fails", async () => {
+    const harness = createTestHarness({ manifest });
+    const now = new Date().toISOString();
+    harness.ctx.db.query = async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      harness.dbQueries.push({ sql, params });
+      if (sql.includes("wiki_pages")) {
+        return [
+          {
+            path: "wiki/concepts/live.md",
+            title: "Live Page",
+            page_type: "concepts",
+            backlinks: [],
+            source_refs: [],
+            content_hash: "live",
+            updated_at: now,
+          },
+        ] as T[];
+      }
+      return [];
+    };
+    await plugin.definition.setup(harness.ctx);
+    await harness.ctx.localFolders.writeTextAtomic(COMPANY_ID, "wiki-root", "wiki/concepts/live.md", "# Live Page\n");
+    harness.ctx.localFolders.list = async () => {
+      throw new Error("transient disk listing failure");
+    };
+
+    await expect(
+      harness.executeTool("wiki_list_pages", { companyId: COMPANY_ID, wikiId: "default" }),
+    ).rejects.toThrow("transient disk listing failure");
+  });
+
+  it("treats a missing wiki directory as an empty complete listing", async () => {
+    const harness = createTestHarness({ manifest });
+    await plugin.definition.setup(harness.ctx);
+    harness.ctx.localFolders.list = async () => {
+      throw Object.assign(new Error("missing wiki directory"), { code: "ENOENT" });
+    };
+
+    const result = await harness.executeTool<{
+      data: { pages: Array<{ path: string }>; truncated: boolean };
+    }>("wiki_list_pages", { companyId: COMPANY_ID, wikiId: "default" });
+
+    expect(result.data.pages).toEqual([]);
+    expect(result.data.truncated).toBe(false);
   });
 
   it("filters phantom rows out of wiki search results", async () => {
@@ -1745,6 +1792,7 @@ Duplicate headings receive stable suffixes.
     };
 
     await plugin.definition.setup(harness.ctx);
+    await harness.ctx.localFolders.configure({ companyId: COMPANY_ID, folderKey: "wiki-root", path: "/memory/wiki-root" });
     const result = await harness.getData<{
       pages: Array<{ path: string }>;
       sources: Array<{ rawPath: string }>;
