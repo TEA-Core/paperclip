@@ -5895,10 +5895,13 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(commitsUrls.some((url) => url.endsWith(`/commits/${encodeURIComponent(T2_PROBE_HEAD)}`))).toBe(true);
     });
 
-    it("SUP-22541: refuses Tier 2 probe heads with padding or interior whitespace before any GitHub call (H18: whitespace never reaches the comparison)", async () => {
-      // The shape's head group accepts hex only, so no captured head can
-      // carry whitespace: trimming the captured head is a no-op, and padded
-      // or spaced heads fail the shape check before any resolution.
+    it("SUP-22541: refuses Tier 2 probe heads with padding or interior whitespace at the shape check with zero GitHub calls (H18 is an equivalent mutant; regression coverage only)", async () => {
+      // Mutant H18 (adding trim() to the captured probe head) is equivalent:
+      // the shape's head group accepts hex only and can never capture
+      // whitespace, so trim() is a no-op for every reachable input and no
+      // test can kill it. This test is kept as behavioural regression
+      // coverage proving whitespace-bearing heads are refused at the shape
+      // check with zero GitHub calls.
       for (const evidence of [
         "probe `curl -sf https://tea-core.example/healthz` head  aaaaaaaaaa post-merge: fix is live",
         "probe `curl -sf https://tea-core.example/healthz` head aaaaaaaaaa  post-merge: fix is live",
