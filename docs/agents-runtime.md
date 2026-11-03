@@ -98,6 +98,8 @@ Two supported shapes, in order of preference:
 
 `workDelivery` is what tells Paperclip that a run is a doorbell rather than the work. Without it, a wake-only command (the `/bin/echo` no-op operators reach for) produces a run that succeeded having done nothing, and Paperclip reads that as "made progress but chose no next step": it queues a corrective missing-disposition wake, that wake is another no-op, and the stranded-issue sweep eventually escalates the issue with a `missing_disposition` recovery action. With `workDelivery: "external_pull"` set, the missing-disposition handoff is skipped for that agent and any handoff already pending against it is resolved on its next successful run.
 
+The same declaration keeps the undispatchable-assignee sweep quiet. A `process` agent cannot be woken, so that sweep normally reports its `todo`/`in_progress` cards and opens a board-owned `undispatchable_assignee` recovery action. A declared pull agent is exempt while its status lets it work; a paused, terminated or pending-approval pull agent pulls nothing, so its cards are still reported. Declaring the mode does not close an `undispatchable_assignee` action that is already open: the board resolves it.
+
 Notes:
 
 - The declaration is read from the agent record only. Paperclip never infers it from the adapter command, because a no-op command and a genuinely misconfigured `process` agent look identical — and the misconfigured one still needs its recovery path.
