@@ -42,6 +42,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
 }));
+const mockAdr072EscalationScheduler = vi.hoisted(() => vi.fn());
 
 const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(async () => false),
@@ -264,7 +265,9 @@ async function createApp(actor?: TestActor) {
     };
     next();
   });
-  app.use("/api", issueRoutes(mockDb as any, {} as any));
+  app.use("/api", issueRoutes(mockDb as any, {} as any, {
+    adr072CloseLadderEscalationScheduler: mockAdr072EscalationScheduler,
+  }));
   app.use(reportUnexpectedRouteError("issue-execution-policy-missing-approval-stage"));
   app.use(errorHandler);
   return app;
@@ -1392,6 +1395,29 @@ describe("issue execution policy missing approval stage", () => {
       );
     }
 
+    function escalationInputs() {
+      return mockLogActivityInTransaction.mock.calls
+        .map((call) => (call as unknown[])[1] as Record<string, unknown> | undefined)
+        .filter((input): input is Record<string, unknown> =>
+          input?.action === "issue.adr072_close_ladder_escalated");
+    }
+
+    function escalationComments() {
+      return mockIssueService.addComment.mock.calls.filter((call) =>
+        String(call[1] ?? "").includes("[ADR-072 close ladder escalation]"),
+      );
+    }
+
+    function scheduledEscalation() {
+      expect(mockAdr072EscalationScheduler).toHaveBeenCalledTimes(1);
+      const [callback, delayMs] = mockAdr072EscalationScheduler.mock.calls[0] as unknown as [
+        () => Promise<void>,
+        number,
+      ];
+      expect(delayMs).toBe(120 * 60 * 1000);
+      return callback;
+    }
+
     function createChildFixture() {
       mockIssueService.createChild.mockResolvedValue({
         issue: {
@@ -1526,6 +1552,92 @@ describe("issue execution policy missing approval stage", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
+    it("wakes the parent assignee with the advisory comment", async () => {
+      createChildFixture();
+      mockIssueService.getById.mockResolvedValue(parentIssue(reviewOnlyPolicy()));
+      twoOpenLadderedChildren();
+
+      const res = await request(await createApp(agentActor()))
+        .post(`/api/issues/${PARENT_ID}/children`)
+        .send({ title: "New child", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        AGENT_ID,
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            issueId: PARENT_ID,
+            wakeCommentId: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+          }),
+          contextSnapshot: expect.objectContaining({
+            issueId: PARENT_ID,
+            source: "issue.adr072_close_ladder_advisory",
+          }),
+        }),
+      );
+    });
+
+    it("posts exactly one CTO/board escalation after 120 minutes when the ladder and pointer are unchanged", async () => {
+      createChildFixture();
+      mockIssueService.getById.mockResolvedValue(parentIssue(reviewOnlyPolicy()));
+      twoOpenLadderedChildren();
+
+      const res = await request(await createApp(agentActor()))
+        .post(`/api/issues/${PARENT_ID}/children`)
+        .send({ title: "New child", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      const escalate = scheduledEscalation();
+      await escalate();
+      expect(escalationInputs()).toHaveLength(1);
+      expect(escalationInputs()[0]!.issueId).toBe(PARENT_ID);
+      expect(escalationComments()).toHaveLength(1);
+      expect(String(escalationComments()[0]![1])).toContain("CTO / board");
+      expect(String(escalationComments()[0]![1])).toContain("120 minutes");
+      activityFlagState.rows = [{ id: "99999999-9999-4999-8999-999999999999" }];
+      await escalate();
+      expect(escalationInputs()).toHaveLength(1);
+      expect(escalationComments()).toHaveLength(1);
+    });
+
+    it("does not escalate when the ladder completes before the deadline", async () => {
+      createChildFixture();
+      mockIssueService.getById.mockResolvedValue(parentIssue(reviewOnlyPolicy()));
+      twoOpenLadderedChildren();
+
+      const res = await request(await createApp(agentActor()))
+        .post(`/api/issues/${PARENT_ID}/children`)
+        .send({ title: "New child", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      const escalate = scheduledEscalation();
+      mockIssueService.getById.mockResolvedValue(parentIssue(satisfiedAdr072Policy()));
+      armSatisfiedAgents();
+      await escalate();
+      expect(escalationInputs()).toEqual([]);
+      expect(escalationComments()).toEqual([]);
+    });
+
+    it("does not escalate when the pointer advances before the deadline", async () => {
+      createChildFixture();
+      mockIssueService.getById.mockResolvedValue(parentIssue(reviewOnlyPolicy()));
+      twoOpenLadderedChildren();
+
+      const res = await request(await createApp(agentActor()))
+        .post(`/api/issues/${PARENT_ID}/children`)
+        .send({ title: "New child", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      const escalate = scheduledEscalation();
+      mockIssueService.getById.mockResolvedValue({
+        ...parentIssue(reviewOnlyPolicy()),
+        executionState: advancedParentState(),
+      });
+      await escalate();
+      expect(escalationInputs()).toEqual([]);
+      expect(escalationComments()).toEqual([]);
+    });
+
     it("names the seat-restricted rearm remedy when the pointer has already advanced", async () => {
       createChildFixture();
       mockIssueService.getById.mockResolvedValue({
@@ -1553,6 +1665,7 @@ describe("issue execution policy missing approval stage", () => {
       expect(body).toContain("assignee agent");
       expect(body).toContain("board user");
       expect(body).not.toContain("free window");
+      expect(mockAdr072EscalationScheduler).not.toHaveBeenCalled();
     });
 
     it("is idempotent: a prior durable advisory row on the parent is a no-op", async () => {
