@@ -9178,12 +9178,14 @@ export function recoveryService(
   // board-owned action is only a read-time attention projection — it has no
   // wake/ageing path of its own. Mint (or reuse) a durable recovery issue
   // owned by an invokable agent, link it from the action's `recoveryIssueId`,
-  // and enqueue a wake for the owner. The recovery issue is a first-class
+  // and wake the owner once, at mint only. The recovery issue is a first-class
   // non-terminal card: it ages through assignment/wake machinery, can be
   // escalated or resolved by its owner, and satisfies AC1's
-  // "non-terminal recoveryIssueId" evidence. Idempotent: the origin-scoped
-  // lookup reuses an open recovery issue for the source, and an explicit
-  // `recoveryIssueId` short-circuits re-creation.
+  // "non-terminal recoveryIssueId" evidence. Idempotent: at most one card per
+  // (source, recovery action), ever. The lookup finds it by its
+  // `exhausted_recovery:<actionId>` fingerprint in any status (a card its
+  // owner closed is not re-minted), else reuses an open recovery issue for
+  // the source. A reused card is linked but never re-woken.
   // Returns the recovery issue's id, or null when no invokable owner exists
   // (in which case the escalation itself remains the board's item — there is
   // no agent to wake, and no wake can be honestly claimed).
@@ -9196,8 +9198,9 @@ export function recoveryService(
   // non-terminal source the same live path the exhaustion/drain paths give:
   // a future board monitor when the source is monitor-dispatchable, else a
   // durable non-terminal `recoveryIssueId` owned by an invokable agent.
-  // Idempotent: a source with a future monitor or an open linked recovery
-  // issue is left untouched, so repeat passes mint nothing and post nothing.
+  // Idempotent: a source with a future monitor or a linked recovery issue
+  // (open, or closed by its owner) is left untouched, so repeat passes mint
+  // nothing, wake nothing and post nothing.
   const EXHAUSTED_RECOVERY_DRAIN_CANDIDATE_LIMIT = 500;
 
   async function reconcileExhaustedRecoveryDrain(opts?: {
