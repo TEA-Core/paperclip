@@ -106,8 +106,11 @@ export const TIER1_FORM =
   '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."' +
   ' or "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
   'landing obligation transferred to done-close-landing-backstop, not yet discharged; ' +
-  '<why Tier 2 was not probed>. Liveness unverified."' +
-  ' or "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — <why Tier 2 was not probed>. Liveness unverified." (record_only issues with a complete entry-ruling document in an own non-Git workspace only)';
+  '<why Tier 2 was not probed>. Liveness unverified."';
+export const TIER1_NO_REPOSITORY_FORM =
+  '"Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — <why Tier 2 was not probed>. Liveness unverified." ' +
+  '(record_only issues with a complete entry-ruling document in an own non-Git workspace only)';
+export const TIER1_ACCEPTED_FORMS = `${TIER1_FORM} or ${TIER1_NO_REPOSITORY_FORM}`;
 // Structured `doneTier` forms (SUP-21328): the second accepted close form on both
 // agent-writable close doors. The missing-tier remedy names these verbatim so the
 // 422 remedy and the structured parser always agree (SUP-15787 invariant).
@@ -1400,14 +1403,14 @@ function describeTierRejection(tier2: Tier2Parse, tier1: Tier1Parse): string | n
       "A Tier 1 declaration was found but it does not begin its own line — the guard " +
       "requires the literal to start the line (no bullet, bold, quote, or leading text). " +
       `Offending line: "${tier1.offendingLine.slice(0, 200)}". ` +
-      `Accepted form: ${TIER1_FORM} — per SUP-12693.`
+      `Accepted form: ${TIER1_ACCEPTED_FORMS} — per SUP-12693.`
     );
   }
   if (tier1.kind === "missing_suffix") {
     return (
       "A Tier 1 declaration was found but it is missing the required " +
       `"${TIER_1_SUFFIX}" suffix on the prefix line. ` +
-      `Accepted form: ${TIER1_FORM} — per SUP-12693.`
+      `Accepted form: ${TIER1_ACCEPTED_FORMS} — per SUP-12693.`
     );
   }
   return null;
@@ -1448,7 +1451,7 @@ export async function evaluateDoneTierDeclaration(
       if (tier1.reason.length === 0) {
         return {
           allowed: false,
-          reason: `Tier 1 declaration found but <reason> is empty. Use: ${TIER1_FORM}`,
+          reason: `Tier 1 declaration found but <reason> is empty. Use: ${TIER1_ACCEPTED_FORMS}`,
           tier: null,
           skipped: false,
           skipReason: null,
@@ -1463,7 +1466,7 @@ export async function evaluateDoneTierDeclaration(
         ("Close comment is missing a done-tier declaration. Accepted forms: " +
           `${TIER2_FORM}` +
           ` or ` +
-          `${TIER1_FORM}` +
+          `${TIER1_ACCEPTED_FORMS}` +
           ` — per SUP-12693.`),
       tier: null,
       skipped: false,
@@ -1483,7 +1486,7 @@ export async function evaluateDoneTierDeclaration(
       reason:
         "No accompanying comment and no run id to look up a same-run comment; no done-tier declaration found. " +
         `Accepted forms: ${TIER2_FORM}` +
-        ` or ${TIER1_FORM}` +
+        ` or ${TIER1_ACCEPTED_FORMS}` +
         ` — per SUP-12693.`,
       tier: null,
       skipped: false,
@@ -1513,7 +1516,7 @@ export async function evaluateDoneTierDeclaration(
       reason:
         "No done-tier declaration found in the accompanying comment or the most recent same-run comment. " +
         `Accepted forms: ${TIER2_FORM}` +
-        ` or ${TIER1_FORM}` +
+        ` or ${TIER1_ACCEPTED_FORMS}` +
         ` — per SUP-12693.`,
       tier: null,
       skipped: false,
@@ -1536,7 +1539,7 @@ export async function evaluateDoneTierDeclaration(
         allowed: false,
         reason:
           "Tier 1 declaration found in same-run comment but <reason> is empty. " +
-          `Use: ${TIER1_FORM}`,
+          `Use: ${TIER1_ACCEPTED_FORMS}`,
         tier: null,
         skipped: false,
         skipReason: null,

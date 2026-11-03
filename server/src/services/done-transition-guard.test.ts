@@ -6101,7 +6101,7 @@ describe("evaluateDoneTierDeclaration", () => {
     it("SUP-21474: routes remedy interpolates TIER1_FORM un-cut so both Tier 1 forms keep balanced quotes", () => {
       const route = readFileSync(new URL("../routes/issues.ts", import.meta.url), "utf8");
       expect(route).not.toContain("TIER1_FORM.slice(1, -1)");
-      expect(route).toContain("` or ${TIER1_FORM}`");
+      expect(route).toContain("` or ${TIER1_FORM} or ${TIER1_NO_REPOSITORY_FORM}`");
 
       const tier2Form = '"Closed at Tier 2 (live): probe `<probe command>` head <probe head sha> post-merge: <post-merge predicate>"';
       const remedy = `${tier2Form} or ${TIER1_FORM} — per SUP-12693.`;
