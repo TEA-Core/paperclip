@@ -42,6 +42,7 @@ import { releaseRequestClock } from "../middleware/release-request-clock.js";
 import { RELEASE_AUTH_SCOPE_LIMIT, releaseScopedActor } from "../middleware/release-scoped-actor.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { boardAuthService } from "../services/board-auth.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -5489,54 +5490,170 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect(await recordedDeliveryOf(issueId)).toBeUndefined();
   });
 
-  it("validates a combined deliveryIdentity + executionWorkspaceId PATCH against the new workspace", async () => {
-    const { companyId, issueId } = await seedIssue({ status: "in_review", noWorkspace: true });
+  async function insertReboundWorkspace(issueId: string, branchName: string) {
     const [seeded] = await db
-      .select({ projectId: issues.projectId })
+      .select({ companyId: issues.companyId, projectId: issues.projectId })
       .from(issues)
       .where(eq(issues.id, issueId));
     const reboundWorkspaceId = randomUUID();
     await db.insert(executionWorkspaces).values({
       id: reboundWorkspaceId,
-      companyId,
+      companyId: seeded!.companyId,
       projectId: seeded!.projectId,
       mode: "isolated",
       strategyType: "git_worktree",
       name: "rebound-ws",
       status: "active",
-      branchName: "SUP-14824-branch",
+      branchName,
       repoUrl: REPO_URL,
     });
+    return reboundWorkspaceId;
+  }
+
+  async function boundWorkspaceOf(issueId: string) {
+    const [row] = await db
+      .select({ executionWorkspaceId: issues.executionWorkspaceId })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    return row!.executionWorkspaceId;
+  }
+
+  it("refuses a board delivery record that also rebinds the card's workspace, then accepts the two separate PATCHes (orphan card)", async () => {
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    try {
+      const { companyId, issueId } = await seedIssue({ status: "in_review", noWorkspace: true });
+      const reboundWorkspaceId = await insertReboundWorkspace(issueId, "SUP-14824-branch");
+      currentActor = boardActor(companyId);
+      const deliveryIdentity = {
+        repo: { owner: OWNER, repo: REPO },
+        branch: "SUP-14824-branch",
+        headSha: HEAD_SHA,
+        prNumber: PR_NUMBER,
+        prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+      };
+
+      const combined = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionWorkspaceId: reboundWorkspaceId, deliveryIdentity });
+      expect(combined.status).toBe(422);
+      expect(combined.body.code).toBe("delivery_identity_branch_write_rejected");
+      expect(await boundWorkspaceOf(issueId)).toBeNull();
+      expect(await recordedDeliveryOf(issueId)).toBeUndefined();
+
+      const rebind = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionWorkspaceId: reboundWorkspaceId });
+      expect(rebind.status, JSON.stringify(rebind.body)).toBe(200);
+      expect(await boundWorkspaceOf(issueId)).toBe(reboundWorkspaceId);
+
+      const record = await request(app).patch(`/api/issues/${issueId}`).send({ deliveryIdentity });
+      expect(record.status, JSON.stringify(record.body)).toBe(200);
+      expect((await recordedDeliveryOf(issueId) as Record<string, unknown>).branch).toBe("SUP-14824-branch");
+    } finally {
+      await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    }
+  });
+
+  it("refuses a board record that also rebinds a null-branch project_primary row, and leaves the old row unstamped", async () => {
+    const { companyId, issueId } = await seedIssue({
+      status: "in_review",
+      strategyType: "project_primary",
+      deliveryBranch: null,
+    });
+    const oldWorkspaceId = await boundWorkspaceOf(issueId);
+    const reboundWorkspaceId = await insertReboundWorkspace(issueId, "SUP-14824-other-branch");
     currentActor = boardActor(companyId);
 
-    const matching = await request(app)
+    const combined = await request(app)
       .patch(`/api/issues/${issueId}`)
       .send({
+        executionWorkspaceId: reboundWorkspaceId,
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14824-1-restored",
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(combined.status).toBe(422);
+    expect(combined.body.code).toBe("delivery_identity_branch_write_rejected");
+    expect(await boundWorkspaceOf(issueId)).toBe(oldWorkspaceId);
+    expect(await workspaceBranchOf(issueId)).toBeNull();
+    expect(await recordedDeliveryOf(issueId)).toBeUndefined();
+
+    const record = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14824-1-restored",
+          headSha: HEAD_SHA,
+        },
+      });
+    expect(record.status, JSON.stringify(record.body)).toBe(200);
+    expect(await workspaceBranchOf(issueId)).toBe("SUP-14824-1-restored");
+  });
+
+  it("refuses a board terminal-carrier record that also rebinds the card, then accepts the record alone", async () => {
+    const { companyId, issueId } = await seedIssue({
+      status: "in_review",
+      sharedWorkspaceOwnerBranch: "SUP-14823-carrier-branch",
+    });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.identifier, "SUP-14823-1"));
+    const carrierWorkspaceId = await boundWorkspaceOf(issueId);
+    const reboundWorkspaceId = await insertReboundWorkspace(issueId, "SUP-14824-other-branch");
+    currentActor = boardActor(companyId);
+    const deliveryIdentity = {
+      repo: { owner: OWNER, repo: REPO },
+      branch: "SUP-14823-carrier-branch",
+      headSha: HEAD_SHA,
+      prNumber: PR_NUMBER,
+      prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+    };
+
+    const combined = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionWorkspaceId: reboundWorkspaceId, deliveryIdentity });
+
+    expect(combined.status).toBe(422);
+    expect(combined.body.code).toBe("delivery_identity_branch_write_rejected");
+    expect(await boundWorkspaceOf(issueId)).toBe(carrierWorkspaceId);
+    expect(await recordedDeliveryOf(issueId)).toBeUndefined();
+
+    const record = await request(app).patch(`/api/issues/${issueId}`).send({ deliveryIdentity });
+    expect(record.status, JSON.stringify(record.body)).toBe(200);
+    expect((await recordedDeliveryOf(issueId) as Record<string, unknown>).branch).toBe("SUP-14823-carrier-branch");
+  });
+
+  it("refuses a lease-holding agent's delivery record that also rebinds the card, on its own branch", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId });
+    await db.update(heartbeatRuns).set({ status: "queued" }).where(eq(heartbeatRuns.id, runId));
+    const reboundWorkspaceId = await insertReboundWorkspace(issueId, "SUP-14824-branch");
+    const oldWorkspaceId = await boundWorkspaceOf(issueId);
+    currentActor = agentActor(companyId, agentId, runId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
         executionWorkspaceId: reboundWorkspaceId,
         deliveryIdentity: {
           repo: { owner: OWNER, repo: REPO },
           branch: "SUP-14824-branch",
           headSha: HEAD_SHA,
-          prNumber: PR_NUMBER,
-          prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
         },
       });
-    expect(matching.status, JSON.stringify(matching.body)).toBe(200);
 
-    const mismatching = await request(app)
-      .patch(`/api/issues/${issueId}`)
-      .send({
-        executionWorkspaceId: reboundWorkspaceId,
-        deliveryIdentity: {
-          repo: { owner: OWNER, repo: REPO },
-          branch: "SUP-14824-other-branch",
-          headSha: HEAD_SHA,
-          prNumber: PR_NUMBER,
-          prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
-        },
-      });
-    expect(mismatching.status).toBe(422);
-    expect(mismatching.body.code).toBe("delivery_identity_branch_write_rejected");
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_branch_write_rejected");
+    const [row] = await db
+      .select({ status: issues.status, executionWorkspaceId: issues.executionWorkspaceId })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(row!.status).toBe("in_progress");
+    expect(row!.executionWorkspaceId).toBe(oldWorkspaceId);
+    expect(await recordedDeliveryOf(issueId)).toBeUndefined();
   });
 
   it("allows the board to bind a terminal carrier PR on an in_review carrier child", async () => {

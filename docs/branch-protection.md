@@ -255,7 +255,18 @@ Board attestation alone never turns an unanchored branch into the card's own
 branch. Workspace provisioning applies the same anchor when it carries the
 recorded branch onto a freshly minted or restored workspace row: the recorded
 branch must carry the card's identifier prefix in every case, and equality with
-the branch of the bound workspace row is not enough.
+the branch of the bound workspace row is not enough. The carry also never lands
+on a restored row another issue owns (for example an ancestor-owned
+`shared_workspace` row): that row keeps its own branch, so the card's recorded
+branch is never read back as a legitimate carrier branch. Fresh rows and rows
+the card owns are carried normally.
+
+A `deliveryIdentity` write is validated against the workspace the card holds at
+the time of the request, so a `PATCH` that carries `deliveryIdentity` and also
+changes `executionWorkspaceId` is refused in every case (agent or board, own
+branch, `project_primary` stamp, no-workspace record, or terminal-carrier
+record) with `422 delivery_identity_branch_write_rejected`. Rebind the workspace
+in one `PATCH`, then record the delivery in a second.
 
 The provisioning carry also applies only while the card's status is `in_review`
 at provisioning time. Once a card leaves `in_review` (a bounced redo wake, a

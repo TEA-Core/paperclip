@@ -19482,6 +19482,29 @@ export function issueRoutes(
         });
         return;
       }
+      // A delivery record is validated against the workspace the card holds NOW.
+      // A PATCH that also rebinds the card would store a record the new binding
+      // can refuse at approval, so rebind first and record in a second PATCH.
+      if (
+        updateFields.executionWorkspaceId !== undefined
+        && updateFields.executionWorkspaceId !== (existing.executionWorkspaceId ?? null)
+      ) {
+        res.status(422).json({
+          error: "deliveryIdentity cannot be written in the same request that changes executionWorkspaceId; rebind the workspace first, then record the delivery in a separate PATCH",
+          code: "delivery_identity_branch_write_rejected",
+          details: {
+            issueId: existing.id,
+            identifier: existing.identifier ?? null,
+            holdsLease,
+            enteringReview,
+            recordedBranch: requestedDeliveryIdentity.branch,
+            executionWorkspaceId: existing.executionWorkspaceId ?? null,
+            requestedExecutionWorkspaceId: updateFields.executionWorkspaceId,
+            reason: "deliveryIdentity and executionWorkspaceId must be written in separate PATCHes",
+          },
+        });
+        return;
+      }
       // ADR-091 D1 (SUP-15909): the recorded BRANCH half is a security boundary too.
       // It must be a branch this card may lawfully arm on — its own execution-workspace
       // branch, or an ADR-083 carrier owner's branch. resolveCardDeliveryBranchOwnership
@@ -19518,32 +19541,8 @@ export function issueRoutes(
       // must bind a PR and carry this card's identifier prefix, the same anchor
       // resolveDeliveryIdentity requires, so the write never returns 200 for a
       // record the approval gate then refuses. Agents still cannot create it.
-      // Combined PATCH: when this same request rebinds the card to a new
-      // execution workspace, validate the record against the EFFECTIVE
-      // workspace it will land on, not the old empty binding — otherwise the
-      // refresh returns 200 and approval later refuses the stored record.
-      const combinedRebindId =
-        typeof updateFields.executionWorkspaceId === "string"
-          ? updateFields.executionWorkspaceId
-          : null;
-      let combinedRebindBranch: string | null | undefined;
-      if (combinedRebindId !== null && combinedRebindId !== existing.executionWorkspaceId) {
-        const [reboundWorkspace] = await db
-          .select({ branchName: executionWorkspaces.branchName })
-          .from(executionWorkspaces)
-          .where(eq(executionWorkspaces.id, combinedRebindId));
-        combinedRebindBranch = reboundWorkspace?.branchName ?? null;
-      }
-      const boardCombinedRebindRecord =
-        boardDeliveryRefresh
-        && combinedRebindBranch !== undefined
-        && combinedRebindBranch !== null
-        && requestedDeliveryIdentity.branch === combinedRebindBranch;
-      const combinedRebindMismatch =
-        combinedRebindBranch !== undefined && !boardCombinedRebindRecord;
       const boardOrphanDeliveryRecord =
         boardDeliveryRefresh
-        && combinedRebindBranch === undefined
         && !existing.executionWorkspaceId
         && requestedDeliveryIdentity.prNumber !== undefined
         && requestedDeliveryIdentity.prUrl !== undefined
@@ -19561,8 +19560,7 @@ export function issueRoutes(
         && branchOwnership.branch !== null
         && requestedDeliveryIdentity.branch === branchOwnership.branch;
       const recordedBranchMismatch =
-        combinedRebindMismatch
-        || (!canRecordProjectPrimaryBranch && !boardOrphanDeliveryRecord && !boardTerminalCarrierRecord && branchOwnership.branch === null)
+        (!canRecordProjectPrimaryBranch && !boardOrphanDeliveryRecord && !boardTerminalCarrierRecord && branchOwnership.branch === null)
         || (branchOwnership.branch !== null
           // Git refs are case-sensitive: the recorded branch must equal the control-plane branch exactly.
           && requestedDeliveryIdentity.branch !== branchOwnership.branch);
@@ -19570,7 +19568,6 @@ export function issueRoutes(
         !canRecordProjectPrimaryBranch
         && !boardOrphanDeliveryRecord
         && !boardTerminalCarrierRecord
-        && !boardCombinedRebindRecord
         && (!branchOwnership.legitimate || recordedBranchMismatch)
       ) {
         const branchReason =
