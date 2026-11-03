@@ -732,6 +732,7 @@ export function summarySlotService(db: Db) {
       description,
       status: "todo",
       priority: "medium",
+      deliveryRequirement: "record_only",
       assigneeAgentId: summarizerAgentId,
       createdByAgentId: actor.agentId ?? null,
       createdByUserId: actor.userId ?? null,

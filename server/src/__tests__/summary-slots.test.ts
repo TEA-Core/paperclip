@@ -1650,4 +1650,59 @@ describeEmbeddedPostgres("summary slot service", () => {
       });
     });
   });
+
+  describe("generate record-only delivery", () => {
+    it("creates record-only generation issues for every supported scope", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const projectWorkspaceId = await seedProjectWorkspace(companyId, projectId);
+      const executionWorkspaceId = await seedExecutionWorkspace(companyId, projectId, projectWorkspaceId);
+      await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+      const selectors = [
+        {
+          ...projectSelector(companyId, projectId),
+          projectId,
+          projectWorkspaceId,
+        },
+        {
+          companyId,
+          scopeKind: "workspaces_overview",
+          slotKey: "header",
+          scopeId: null,
+          projectId: null,
+          projectWorkspaceId: null,
+        },
+        {
+          companyId,
+          scopeKind: "project_workspace",
+          slotKey: "header",
+          scopeId: projectWorkspaceId,
+          projectId,
+          projectWorkspaceId,
+        },
+        {
+          ...executionWorkspaceSelector(companyId, executionWorkspaceId),
+          projectId,
+          projectWorkspaceId,
+        },
+      ] as const;
+
+      for (const selector of selectors) {
+        const result = await svc.generate(selector, { userId: "board-user" });
+        const issueRow = await db
+          .select()
+          .from(issues)
+          .where(eq(issues.id, result.generatingIssue.id))
+          .then((rows) => rows[0]!);
+
+        expect(issueRow.deliveryRequirement, selector.scopeKind).toBe("record_only");
+        expect(issueRow.projectId, selector.scopeKind).toBe(selector.projectId);
+        expect(issueRow.projectWorkspaceId, selector.scopeKind).toBe(selector.projectWorkspaceId);
+      }
+
+      const issueRows = await db.select().from(issues).where(eq(issues.companyId, companyId));
+      expect(issueRows).toHaveLength(4);
+    });
+  });
 });
