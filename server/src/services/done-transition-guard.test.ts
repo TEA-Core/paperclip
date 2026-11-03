@@ -7233,6 +7233,8 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(route).toContain('issue.deliveryRequirement === "record_only"');
       expect(route).toContain("DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS");
       expect(route).toContain("TIER2_RECORD_ONLY_FORM");
+      expect((route.match(/tier0Alternative/g) ?? []).length).toBeGreaterThanOrEqual(3);
+      expect(route).toContain('` or "Closed at Tier 0 (decision-only): <reason>"`');
     });
 
     it("SUP-21474: routes remedy interpolates TIER1_FORM un-cut so both Tier 1 forms keep balanced quotes", () => {
