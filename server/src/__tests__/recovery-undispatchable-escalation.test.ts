@@ -913,31 +913,62 @@ describeEmbeddedPostgres("recovery sweep undispatchable-assignee escalation (SUP
     });
 
     it.each(["paused", "terminated", "pending_approval"])(
-      "still raises when the external-pull agent is %s",
+      "still raises, and keeps the action open, when the external-pull agent is %s",
       async (status) => {
         const companyId = await seedCompany();
         const agentId = await seedAgent(companyId, "process", { status, runtimeConfig: externalPull });
         const issueId = await seedCard(companyId, agentId);
 
-        const { action } = await openEscalation(companyId, agentId, issueId);
-
+        const { sweep, action } = await openEscalation(companyId, agentId, issueId);
         expect(action).toMatchObject({
           kind: "undispatchable_assignee",
           status: "active",
           previousOwnerAgentId: agentId,
         });
+
+        const next = await sweep.reconcileUndispatchableAssignedIssues();
+        expect(next).toMatchObject({ reported: 1, resolved: 0 });
+        const rows = await recoveryActionRows(issueId);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({ id: action.id, status: "active", outcome: null });
       },
     );
 
-    it.each([
-      { label: "open", patch: null },
-      { label: "exhausted", patch: { status: "escalated", outcome: "exhausted", attemptCount: 5 } },
-    ])("leaves an $label action minted before the declaration untouched", async ({ patch }) => {
+    it("retires an action opened before the declaration as false_positive and does not re-mint it", async () => {
       const companyId = await seedCompany();
       const agentId = await seedAgent(companyId, "process");
       const issueId = await seedCard(companyId, agentId);
       const { sweep, action } = await openEscalation(companyId, agentId, issueId);
-      if (patch) await db.update(issueRecoveryActions).set(patch).where(eq(issueRecoveryActions.id, action.id));
+
+      await db.update(agents).set({ runtimeConfig: externalPull }).where(eq(agents.id, agentId));
+
+      const retire = await sweep.reconcileUndispatchableAssignedIssues();
+      expect(retire).toMatchObject({ reported: 0, escalated: 0, resolved: 1 });
+      for (let cycle = 0; cycle < 2; cycle += 1) {
+        expect(await sweep.reconcileUndispatchableAssignedIssues()).toMatchObject({
+          reported: 0,
+          escalated: 0,
+          resolved: 0,
+        });
+      }
+
+      const rows = await recoveryActionRows(issueId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ id: action.id, status: "resolved", outcome: "false_positive" });
+      expect(rows[0].resolutionNote).toContain("external-pull");
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue).toMatchObject({ status: "todo", assigneeAgentId: agentId });
+    });
+
+    it("leaves an exhausted action for the board after the declaration", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, "process");
+      const issueId = await seedCard(companyId, agentId);
+      const { sweep, action } = await openEscalation(companyId, agentId, issueId);
+      await db
+        .update(issueRecoveryActions)
+        .set({ status: "escalated", outcome: "exhausted", attemptCount: 5 })
+        .where(eq(issueRecoveryActions.id, action.id));
       const [before] = await recoveryActionRows(issueId);
 
       await db.update(agents).set({ runtimeConfig: externalPull }).where(eq(agents.id, agentId));
