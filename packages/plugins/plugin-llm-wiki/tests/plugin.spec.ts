@@ -1518,6 +1518,7 @@ Duplicate headings receive stable suffixes.
   it("registers worker data, actions, and tools", async () => {
     const harness = createTestHarness({ manifest });
     await plugin.definition.setup(harness.ctx);
+    await harness.ctx.localFolders.configure({ companyId: COMPANY_ID, folderKey: "wiki-root", path: "/memory/wiki-root" });
 
     const overview = await harness.getData<{ status: string; operationCount: number; eventIngestion: { enabled: boolean } }>("overview", {
       companyId: COMPANY_ID,
@@ -1531,6 +1532,175 @@ Duplicate headings receive stable suffixes.
       wikiId: "default",
     });
     expect(pages.content).toBe("No pages indexed yet.");
+  });
+
+  it("lists the complete disk-backed page tree and reports truncation", async () => {
+    const harness = createTestHarness({ manifest });
+    const now = new Date().toISOString();
+    const paths = Array.from({ length: 250 }, (_, index) => `wiki/concepts/page-${String(index).padStart(4, "0")}.md`);
+    harness.ctx.db.query = async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      harness.dbQueries.push({ sql, params });
+      if (sql.includes("wiki_pages")) {
+        return [
+          ...paths.slice(0, 99).map((path, index) => ({
+            path,
+            title: `Indexed Page ${index}`,
+            page_type: "concepts",
+            backlinks: [],
+            source_refs: [],
+            content_hash: `hash-${index}`,
+            updated_at: now,
+          })),
+          {
+            path: "wiki/concepts/phantom.md",
+            title: "Phantom Page",
+            page_type: "concepts",
+            backlinks: [],
+            source_refs: [],
+            content_hash: "phantom",
+            updated_at: now,
+          },
+        ] as T[];
+      }
+      return [];
+    };
+    await plugin.definition.setup(harness.ctx);
+    for (const path of paths) {
+      await harness.ctx.localFolders.writeTextAtomic(COMPANY_ID, "wiki-root", path, `# ${path}\n`);
+    }
+
+    const result = await harness.executeTool<{
+      content: string;
+      data: {
+        pages: Array<{ path: string; title: string | null; pageType: string | null }>;
+        truncated: boolean;
+      };
+    }>("wiki_list_pages", { companyId: COMPANY_ID, wikiId: "default" });
+
+    expect(result.data.pages).toHaveLength(250);
+    expect(result.data.pages.map((page) => page.path)).toEqual(paths);
+    expect(result.data.pages[0]).toMatchObject({ path: paths[0], title: "Indexed Page 0", pageType: "concepts" });
+    expect(result.data.pages[99]).toMatchObject({ path: paths[99], title: null, pageType: "concepts" });
+    expect(result.data.pages.some((page) => page.path === "wiki/concepts/phantom.md")).toBe(false);
+    expect(result.data.truncated).toBe(false);
+    expect(result.content.split("\n")).toHaveLength(250);
+
+    for (let index = paths.length; index <= 2000; index += 1) {
+      const path = `wiki/concepts/page-${String(index).padStart(4, "0")}.md`;
+      await harness.ctx.localFolders.writeTextAtomic(COMPANY_ID, "wiki-root", path, `# ${path}\n`);
+    }
+    const truncated = await harness.executeTool<{
+      data: { pages: Array<{ path: string }>; truncated: boolean };
+    }>("wiki_list_pages", { companyId: COMPANY_ID, wikiId: "default" });
+    expect(truncated.data.pages).toHaveLength(2000);
+    expect(truncated.data.truncated).toBe(true);
+  });
+
+  it("fails wiki_list_pages instead of claiming a complete listing when the disk listing fails", async () => {
+    const harness = createTestHarness({ manifest });
+    const now = new Date().toISOString();
+    harness.ctx.db.query = async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      harness.dbQueries.push({ sql, params });
+      if (sql.includes("wiki_pages")) {
+        return [
+          {
+            path: "wiki/concepts/live.md",
+            title: "Live Page",
+            page_type: "concepts",
+            backlinks: [],
+            source_refs: [],
+            content_hash: "live",
+            updated_at: now,
+          },
+        ] as T[];
+      }
+      return [];
+    };
+    await plugin.definition.setup(harness.ctx);
+    await harness.ctx.localFolders.writeTextAtomic(COMPANY_ID, "wiki-root", "wiki/concepts/live.md", "# Live Page\n");
+    harness.ctx.localFolders.list = async () => {
+      throw new Error("transient disk listing failure");
+    };
+
+    await expect(
+      harness.executeTool("wiki_list_pages", { companyId: COMPANY_ID, wikiId: "default" }),
+    ).rejects.toThrow("transient disk listing failure");
+  });
+
+  it("treats a missing wiki directory as an empty complete listing", async () => {
+    const harness = createTestHarness({ manifest });
+    await plugin.definition.setup(harness.ctx);
+    harness.ctx.localFolders.list = async () => {
+      throw Object.assign(new Error("missing wiki directory"), { code: "ENOENT" });
+    };
+
+    const result = await harness.executeTool<{
+      data: { pages: Array<{ path: string }>; truncated: boolean };
+    }>("wiki_list_pages", { companyId: COMPANY_ID, wikiId: "default" });
+
+    expect(result.data.pages).toEqual([]);
+    expect(result.data.truncated).toBe(false);
+  });
+
+  it("filters phantom rows out of wiki search results", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.ctx.db.query = async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      harness.dbQueries.push({ sql, params });
+      if (sql.includes("wiki_pages")) {
+        return [
+          { kind: "page", path: "wiki/concepts/present.md", title: "Present Page", match_text: "concepts" },
+          { kind: "page", path: "wiki/concepts/phantom.md", title: "Phantom Page", match_text: "concepts" },
+        ] as T[];
+      }
+      return [];
+    };
+    await plugin.definition.setup(harness.ctx);
+    await harness.ctx.localFolders.writeTextAtomic(COMPANY_ID, "wiki-root", "wiki/concepts/present.md", "# Present Page\n");
+
+    const result = await harness.executeTool<{
+      content: string;
+      data: { results: Array<{ path: string }> };
+    }>("wiki_search", { companyId: COMPANY_ID, wikiId: "default", query: "page" });
+
+    expect(result.data.results.map((row) => row.path)).toEqual(["wiki/concepts/present.md"]);
+    expect(result.content).toBe("page: wiki/concepts/present.md - Present Page");
+  });
+
+  it("keeps fetching search candidates past phantom rows until the readable limit is met", async () => {
+    const harness = createTestHarness({ manifest });
+    const offsets: number[] = [];
+    harness.ctx.db.query = async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      harness.dbQueries.push({ sql, params });
+      if (sql.includes("wiki_pages")) {
+        const offset = Number(params?.[5] ?? 0);
+        offsets.push(offset);
+        if (offset === 0) {
+          return Array.from({ length: 5 }, (_unused, index) => ({
+            kind: "page",
+            path: `wiki/concepts/phantom-${index}.md`,
+            title: `Phantom Page ${index}`,
+            match_text: "concepts",
+          })) as T[];
+        }
+        if (offset === 5) {
+          return [
+            { kind: "page", path: "wiki/concepts/present.md", title: "Present Page", match_text: "concepts" },
+          ] as T[];
+        }
+      }
+      return [];
+    };
+    await plugin.definition.setup(harness.ctx);
+    await harness.ctx.localFolders.writeTextAtomic(COMPANY_ID, "wiki-root", "wiki/concepts/present.md", "# Present Page\n");
+
+    const result = await harness.executeTool<{
+      content: string;
+      data: { results: Array<{ path: string }> };
+    }>("wiki_search", { companyId: COMPANY_ID, wikiId: "default", query: "page", limit: 5 });
+
+    expect(offsets).toEqual([0, 5]);
+    expect(result.data.results.map((row) => row.path)).toEqual(["wiki/concepts/present.md"]);
+    expect(result.content).toBe("page: wiki/concepts/present.md - Present Page");
   });
 
   it("preserves caller-supplied log headings at column zero", async () => {
@@ -1622,6 +1792,7 @@ Duplicate headings receive stable suffixes.
     };
 
     await plugin.definition.setup(harness.ctx);
+    await harness.ctx.localFolders.configure({ companyId: COMPANY_ID, folderKey: "wiki-root", path: "/memory/wiki-root" });
     const result = await harness.getData<{
       pages: Array<{ path: string }>;
       sources: Array<{ rawPath: string }>;

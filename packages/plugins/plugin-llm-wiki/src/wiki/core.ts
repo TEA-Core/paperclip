@@ -1707,7 +1707,7 @@ async function filterReadableRows<T>(
   return checks.filter((row): row is T => row != null);
 }
 
-async function listLocalFiles(ctx: PluginContext, input: { companyId: string; space: Pick<WikiSpace, "pathPrefix">; relativePath: "wiki" | "raw" }): Promise<PluginLocalFolderEntry[]> {
+async function listLocalFiles(ctx: PluginContext, input: { companyId: string; space: Pick<WikiSpace, "pathPrefix">; relativePath: "wiki" | "raw" }): Promise<{ entries: PluginLocalFolderEntry[]; truncated: boolean }> {
   try {
     const relativePath = spaceRelativePath(input.space, input.relativePath);
     const listing = await ctx.localFolders.list(input.companyId, WIKI_ROOT_FOLDER_KEY, {
@@ -1715,11 +1715,16 @@ async function listLocalFiles(ctx: PluginContext, input: { companyId: string; sp
       recursive: true,
       maxEntries: LOCAL_BROWSE_FILE_LIMIT,
     });
-    return listing.entries
-      .filter((entry) => entry.kind === "file")
-      .map((entry) => ({ ...entry, path: logicalPathFromSpacePath(input.space, entry.path) }));
-  } catch {
-    return [];
+    return {
+      entries: listing.entries
+        .filter((entry) => entry.kind === "file")
+        .map((entry) => ({ ...entry, path: logicalPathFromSpacePath(input.space, entry.path) })),
+      truncated: listing.truncated,
+    };
+  } catch (error) {
+    const code = typeof error === "object" && error && "code" in error ? String((error as { code?: unknown }).code) : "";
+    if (code !== "ENOENT") throw error;
+    return { entries: [], truncated: false };
   }
 }
 
@@ -4188,21 +4193,27 @@ export async function registerWikiTools(ctx: PluginContext) {
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
     const query = requireString(input.query, "query");
     const limit = normalizeLimit(input.limit, 20, 50);
-    const rows = await ctx.db.query<{ kind: string; path: string; title: string | null; match_text: string | null }>(
-      `SELECT 'page' AS kind, path, title, page_type AS match_text
-         FROM ${tableName(ctx.db.namespace, "wiki_pages")}
-        WHERE company_id = $1 AND wiki_id = $2 AND space_id = $5 AND (lower(path) LIKE lower($3) OR lower(coalesce(title, '')) LIKE lower($3))
-       UNION ALL
-       SELECT 'source' AS kind, raw_path AS path, title, source_type AS match_text
-         FROM ${tableName(ctx.db.namespace, "wiki_sources")}
-        WHERE company_id = $1 AND wiki_id = $2 AND space_id = $5 AND (lower(raw_path) LIKE lower($3) OR lower(coalesce(title, '')) LIKE lower($3) OR lower(coalesce(url, '')) LIKE lower($3))
-       ORDER BY kind, path
-       LIMIT $4`,
-      [companyId, wikiId, `%${query}%`, limit, space.id],
-    );
+    const rows: Array<{ kind: string; path: string; title: string | null; match_text: string | null }> = [];
+    for (let offset = 0; rows.length < limit; offset += limit) {
+      const batch = await ctx.db.query<{ kind: string; path: string; title: string | null; match_text: string | null }>(
+        `SELECT 'page' AS kind, path, title, page_type AS match_text
+           FROM ${tableName(ctx.db.namespace, "wiki_pages")}
+          WHERE company_id = $1 AND wiki_id = $2 AND space_id = $5 AND (lower(path) LIKE lower($3) OR lower(coalesce(title, '')) LIKE lower($3))
+         UNION ALL
+         SELECT 'source' AS kind, raw_path AS path, title, source_type AS match_text
+           FROM ${tableName(ctx.db.namespace, "wiki_sources")}
+          WHERE company_id = $1 AND wiki_id = $2 AND space_id = $5 AND (lower(raw_path) LIKE lower($3) OR lower(coalesce(title, '')) LIKE lower($3) OR lower(coalesce(url, '')) LIKE lower($3))
+         ORDER BY kind, path
+         LIMIT $4 OFFSET $6`,
+        [companyId, wikiId, `%${query}%`, limit, space.id, offset],
+      );
+      if (!batch.length) break;
+      rows.push(...(await filterReadableRows(ctx, companyId, space, batch, (row) => row.path)));
+      if (batch.length < limit) break;
+    }
     return {
-      content: rows.length ? rows.map((row) => `${row.kind}: ${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No wiki matches found.",
-      data: { companyId, wikiId, spaceSlug: space.slug, query, results: rows },
+      content: rows.slice(0, limit).map((row) => `${row.kind}: ${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") || "No wiki matches found.",
+      data: { companyId, wikiId, spaceSlug: space.slug, query, results: rows.slice(0, limit) },
     };
   });
 
@@ -4384,13 +4395,16 @@ export async function registerWikiTools(ctx: PluginContext) {
     const companyId = requireString(input.companyId, "companyId");
     const wikiId = normalizeWikiId(input.wikiId);
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
-    const rows = await ctx.db.query<{ path: string; title: string | null; page_type: string | null }>(
-      `SELECT path, title, page_type FROM ${tableName(ctx.db.namespace, "wiki_pages")} WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3 ORDER BY path LIMIT 200`,
-      [companyId, wikiId, space.id],
-    );
+    const result = await listPages(ctx, {
+      companyId,
+      wikiId,
+      spaceSlug: space.slug,
+      limit: typeof input.limit === "number" ? input.limit : null,
+    });
+    const rows = result.pages.map((page) => ({ path: page.path, title: page.title, pageType: page.pageType }));
     return {
       content: rows.length ? rows.map((row) => `${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No pages indexed yet.",
-      data: { companyId, wikiId, spaceSlug: space.slug, pages: rows },
+      data: { companyId, wikiId, spaceSlug: space.slug, pages: rows, truncated: result.truncated },
     };
   });
 }
@@ -4452,7 +4466,7 @@ export async function listPages(ctx: PluginContext, input: {
   pageType?: string | null;
   includeRaw?: boolean;
   limit?: number | null;
-}): Promise<{ pages: WikiPageRow[]; sources: WikiSourceRow[] }> {
+}): Promise<{ pages: WikiPageRow[]; sources: WikiSourceRow[]; truncated: boolean }> {
   const wikiId = normalizeWikiId(input.wikiId);
   const space = await resolveSpace(ctx, { companyId: input.companyId, wikiId, spaceSlug: input.spaceSlug });
   const limit = normalizeLimit(input.limit, 500, LOCAL_BROWSE_FILE_LIMIT);
@@ -4491,17 +4505,21 @@ export async function listPages(ctx: PluginContext, input: {
     updatedAt: row.updated_at,
   }));
   let pagesWithLocalFiles = pages;
+  let truncated = false;
   if (!input.pageType) {
     const wikiFiles = await listLocalFiles(ctx, { companyId: input.companyId, space, relativePath: "wiki" });
-    pagesWithLocalFiles = mergeLocalPageRows(pages, wikiFiles);
+    truncated = wikiFiles.truncated;
+    pagesWithLocalFiles = mergeLocalPageRows(pages, wikiFiles.entries);
   }
 
   let sources: WikiSourceRow[] = [];
   if (input.includeRaw) {
     sources = (await listSources(ctx, { companyId: input.companyId, wikiId, spaceSlug: space.slug, limit, onlyReadable: true })).sources;
-    sources = mergeLocalSourceRows(sources, await listLocalFiles(ctx, { companyId: input.companyId, space, relativePath: "raw" }));
+    const rawFiles = await listLocalFiles(ctx, { companyId: input.companyId, space, relativePath: "raw" });
+    truncated = truncated || rawFiles.truncated;
+    sources = mergeLocalSourceRows(sources, rawFiles.entries);
   }
-  return { pages: pagesWithLocalFiles, sources };
+  return { pages: pagesWithLocalFiles, sources, truncated };
 }
 
 export async function listSources(ctx: PluginContext, input: {
