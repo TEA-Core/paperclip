@@ -5876,6 +5876,48 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(ghFetchMock).not.toHaveBeenCalled();
     });
 
+    it("SUP-22541: accepts an uppercase Tier 2 probe head at the recorded merge commit (H2: the captured head is case-folded before resolution)", async () => {
+      // The shape regex accepts uppercase hex, and the guard folds the
+      // captured head to lowercase before resolving it: dropping the
+      // casefold would resolve the uppercase ref (404 on a case-sensitive
+      // remote) and refuse this close.
+      mockRefHeadResolutions([{ ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA }]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence(T2_PROBE_HEAD.toUpperCase())),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+      const commitsUrls = ghFetchMock.mock.calls.map(([url]) => String(url)).filter((url) => url.includes("/commits/"));
+      expect(commitsUrls.some((url) => url.endsWith(`/commits/${encodeURIComponent(T2_PROBE_HEAD)}`))).toBe(true);
+    });
+
+    it("SUP-22541: refuses Tier 2 probe heads with padding or interior whitespace before any GitHub call (H18: whitespace never reaches the comparison)", async () => {
+      // The shape's head group accepts hex only, so no captured head can
+      // carry whitespace: trimming the captured head is a no-op, and padded
+      // or spaced heads fail the shape check before any resolution.
+      for (const evidence of [
+        "probe `curl -sf https://tea-core.example/healthz` head  aaaaaaaaaa post-merge: fix is live",
+        "probe `curl -sf https://tea-core.example/healthz` head aaaaaaaaaa  post-merge: fix is live",
+        "probe `curl -sf https://tea-core.example/healthz` head \taaaaaaaaaa post-merge: fix is live",
+      ]) {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          repoBackedTierIssue(),
+          tier2Line(evidence),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("machine-checkable");
+      }
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
     it("allows transition with Tier 2 declaration and evidence on the following line", async () => {
       mockRefHeadResolutions([
         { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
