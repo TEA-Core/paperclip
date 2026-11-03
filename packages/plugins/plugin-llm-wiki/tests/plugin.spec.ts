@@ -1619,6 +1619,43 @@ Duplicate headings receive stable suffixes.
     expect(result.content).toBe("page: wiki/concepts/present.md - Present Page");
   });
 
+  it("keeps fetching search candidates past phantom rows until the readable limit is met", async () => {
+    const harness = createTestHarness({ manifest });
+    const offsets: number[] = [];
+    harness.ctx.db.query = async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+      harness.dbQueries.push({ sql, params });
+      if (sql.includes("wiki_pages")) {
+        const offset = Number(params?.[5] ?? 0);
+        offsets.push(offset);
+        if (offset === 0) {
+          return Array.from({ length: 5 }, (_unused, index) => ({
+            kind: "page",
+            path: `wiki/concepts/phantom-${index}.md`,
+            title: `Phantom Page ${index}`,
+            match_text: "concepts",
+          })) as T[];
+        }
+        if (offset === 5) {
+          return [
+            { kind: "page", path: "wiki/concepts/present.md", title: "Present Page", match_text: "concepts" },
+          ] as T[];
+        }
+      }
+      return [];
+    };
+    await plugin.definition.setup(harness.ctx);
+    await harness.ctx.localFolders.writeTextAtomic(COMPANY_ID, "wiki-root", "wiki/concepts/present.md", "# Present Page\n");
+
+    const result = await harness.executeTool<{
+      content: string;
+      data: { results: Array<{ path: string }> };
+    }>("wiki_search", { companyId: COMPANY_ID, wikiId: "default", query: "page", limit: 5 });
+
+    expect(offsets).toEqual([0, 5]);
+    expect(result.data.results.map((row) => row.path)).toEqual(["wiki/concepts/present.md"]);
+    expect(result.content).toBe("page: wiki/concepts/present.md - Present Page");
+  });
+
   it("preserves caller-supplied log headings at column zero", async () => {
     const harness = createTestHarness({ manifest });
     const files = new Map<string, string>([["wiki/log.md", "# Log\n\nAppend-only chronological record of wiki operations.\n"]]);

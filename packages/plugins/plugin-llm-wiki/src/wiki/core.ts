@@ -4191,22 +4191,27 @@ export async function registerWikiTools(ctx: PluginContext) {
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
     const query = requireString(input.query, "query");
     const limit = normalizeLimit(input.limit, 20, 50);
-    const indexedRows = await ctx.db.query<{ kind: string; path: string; title: string | null; match_text: string | null }>(
-      `SELECT 'page' AS kind, path, title, page_type AS match_text
-         FROM ${tableName(ctx.db.namespace, "wiki_pages")}
-        WHERE company_id = $1 AND wiki_id = $2 AND space_id = $5 AND (lower(path) LIKE lower($3) OR lower(coalesce(title, '')) LIKE lower($3))
-       UNION ALL
-       SELECT 'source' AS kind, raw_path AS path, title, source_type AS match_text
-         FROM ${tableName(ctx.db.namespace, "wiki_sources")}
-        WHERE company_id = $1 AND wiki_id = $2 AND space_id = $5 AND (lower(raw_path) LIKE lower($3) OR lower(coalesce(title, '')) LIKE lower($3) OR lower(coalesce(url, '')) LIKE lower($3))
-       ORDER BY kind, path
-       LIMIT $4`,
-      [companyId, wikiId, `%${query}%`, limit, space.id],
-    );
-    const rows = await filterReadableRows(ctx, companyId, space, indexedRows, (row) => row.path);
+    const rows: Array<{ kind: string; path: string; title: string | null; match_text: string | null }> = [];
+    for (let offset = 0; rows.length < limit; offset += limit) {
+      const batch = await ctx.db.query<{ kind: string; path: string; title: string | null; match_text: string | null }>(
+        `SELECT 'page' AS kind, path, title, page_type AS match_text
+           FROM ${tableName(ctx.db.namespace, "wiki_pages")}
+          WHERE company_id = $1 AND wiki_id = $2 AND space_id = $5 AND (lower(path) LIKE lower($3) OR lower(coalesce(title, '')) LIKE lower($3))
+         UNION ALL
+         SELECT 'source' AS kind, raw_path AS path, title, source_type AS match_text
+           FROM ${tableName(ctx.db.namespace, "wiki_sources")}
+          WHERE company_id = $1 AND wiki_id = $2 AND space_id = $5 AND (lower(raw_path) LIKE lower($3) OR lower(coalesce(title, '')) LIKE lower($3) OR lower(coalesce(url, '')) LIKE lower($3))
+         ORDER BY kind, path
+         LIMIT $4 OFFSET $6`,
+        [companyId, wikiId, `%${query}%`, limit, space.id, offset],
+      );
+      if (!batch.length) break;
+      rows.push(...(await filterReadableRows(ctx, companyId, space, batch, (row) => row.path)));
+      if (batch.length < limit) break;
+    }
     return {
-      content: rows.length ? rows.map((row) => `${row.kind}: ${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No wiki matches found.",
-      data: { companyId, wikiId, spaceSlug: space.slug, query, results: rows },
+      content: rows.slice(0, limit).map((row) => `${row.kind}: ${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") || "No wiki matches found.",
+      data: { companyId, wikiId, spaceSlug: space.slug, query, results: rows.slice(0, limit) },
     };
   });
 
