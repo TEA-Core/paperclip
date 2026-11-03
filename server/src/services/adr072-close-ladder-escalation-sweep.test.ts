@@ -1,11 +1,20 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const mockLogActivityInTransaction = vi.hoisted(() => vi.fn(async () => undefined));
+const mockLogActivityInTransaction = vi.hoisted(() =>
+  vi.fn(async (_db: unknown, _input: Record<string, unknown>) => undefined),
+);
+const mockAddIssueComment = vi.hoisted(() =>
+  vi.fn(async (..._args: unknown[]) => undefined),
+);
 
 vi.mock("./activity-log.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./activity-log.js")>();
   return { ...actual, logActivityInTransaction: mockLogActivityInTransaction };
 });
+
+vi.mock("./issues.js", () => ({
+  issueService: () => ({ addComment: mockAddIssueComment }),
+}));
 
 import {
   ADR072_CLOSE_LADDER_ADVISORY_ACTION,
@@ -33,6 +42,8 @@ const NOW = Date.parse("2026-11-03T12:00:00.000Z");
 type DbState = {
   advisoryRows: Array<{ id: string; companyId: string; entityId: string; createdAt: Date }>;
   escalatedMarkerRows: Array<{ id: string }>;
+  wakeDeliveredMarkerRows: Array<{ id: string }>;
+  deferredMarkerRows: Array<{ id: string }>;
   issueRow: Record<string, unknown> | null;
   childRows: Array<Record<string, unknown>>;
   agentRows: Array<{ id: string; name: string }>;
@@ -40,7 +51,7 @@ type DbState = {
   inserts: Array<{ table: string; values: Record<string, unknown> }>;
 };
 
-function deadlineCutoff(condition: unknown): Date | null {
+function deadlineBounds(condition: unknown): Date[] {
   const dates: Date[] = [];
   const seen = new Set<unknown>();
   const visit = (node: unknown): void => {
@@ -57,7 +68,7 @@ function deadlineCutoff(condition: unknown): Date | null {
     for (const value of Object.values(node as Record<string, unknown>)) visit(value);
   };
   visit(condition);
-  return dates[0] ?? null;
+  return dates;
 }
 
 function makeDb(state: DbState) {
@@ -91,13 +102,32 @@ function makeDb(state: DbState) {
         ) {
           rows = state.advisoryRows;
           applyWindow = true;
+        } else if (
+          name === "activity_log"
+          && keys.length === 2
+          && keys.includes("id")
+          && keys.includes("action")
+        ) {
+          rows = [
+            ...state.escalatedMarkerRows.map((row) => ({
+              ...row,
+              action: ADR072_CLOSE_LADDER_ESCALATION_ACTION,
+            })),
+            ...state.wakeDeliveredMarkerRows.map((row) => ({
+              ...row,
+              action: "issue.adr072_close_ladder_escalation_wake_delivered",
+            })),
+            ...state.deferredMarkerRows.map((row) => ({
+              ...row,
+              action: "issue.adr072_close_ladder_escalation_deferred",
+            })),
+          ];
         } else if (name === "activity_log" && keys.length === 1 && keys[0] === "id") {
           rows = state.escalatedMarkerRows;
         } else if (name === "issues" && childSignature) {
           rows = state.childRows;
         } else if (
           name === "issues"
-          && keys.length === 6
           && keys.includes("identifier")
           && keys.includes("createdByAgentId")
         ) {
@@ -122,10 +152,13 @@ function makeDb(state: DbState) {
                 onRejected?: (reason: unknown) => unknown,
               ) =>
                 Promise.resolve(
-                  applyWindow && deadlineCutoff(condition)
+                  applyWindow && deadlineBounds(condition).length > 0
                     ? rows.filter((row) => {
-                        const createdAt = (row as { createdAt: Date }).createdAt;
-                        return createdAt.getTime() <= deadlineCutoff(condition)!.getTime();
+                        const createdAt = (row as { createdAt: Date }).createdAt.getTime();
+                        const bounds = deadlineBounds(condition).map((date) => date.getTime());
+                        return bounds.length === 1
+                          ? createdAt <= bounds[0]!
+                          : createdAt >= Math.min(...bounds) && createdAt <= Math.max(...bounds);
                       })
                     : rows,
                 ).then(onFulfilled, onRejected),
@@ -246,6 +279,8 @@ function parentIssueRow(overrides: Record<string, unknown> = {}) {
     id: PARENT_ID,
     companyId: COMPANY,
     identifier: "PAP-1587",
+    status: "in_progress",
+    hiddenAt: null,
     executionPolicy: reviewOnlyPolicy(),
     executionState: null,
     createdByAgentId: null,
@@ -262,17 +297,30 @@ function dueAdvisoryRow(entityId: string = PARENT_ID) {
   };
 }
 
-function escalationMarkerInputs() {
+function activityMarkerInputs(action: string) {
   return mockLogActivityInTransaction.mock.calls
     .map((call) => (call as unknown[])[1] as Record<string, unknown> | undefined)
     .filter(
-      (input): input is Record<string, unknown> =>
-        input?.action === ADR072_CLOSE_LADDER_ESCALATION_ACTION,
+      (input): input is Record<string, unknown> => input?.action === action,
     );
 }
 
+function escalationMarkerInputs() {
+  return activityMarkerInputs(ADR072_CLOSE_LADDER_ESCALATION_ACTION);
+}
+
 function escalationCommentInserts(state: DbState) {
-  return state.inserts.filter((insert) => insert.table === "issue_comments");
+  return [
+    ...state.inserts.filter((insert) => insert.table === "issue_comments"),
+    ...mockAddIssueComment.mock.calls.map((call) => ({
+      table: "issue_comments",
+      values: {
+        issueId: call[0],
+        body: call[1],
+        authorType: (call[3] as Record<string, unknown> | undefined)?.authorType,
+      },
+    })),
+  ];
 }
 
 describe("adr072 close-ladder escalation sweep", () => {
@@ -284,6 +332,8 @@ describe("adr072 close-ladder escalation sweep", () => {
     state = {
       advisoryRows: [],
       escalatedMarkerRows: [],
+      wakeDeliveredMarkerRows: [],
+      deferredMarkerRows: [],
       issueRow: null,
       childRows: [],
       agentRows: [
@@ -294,6 +344,15 @@ describe("adr072 close-ladder escalation sweep", () => {
       decisionRows: [],
       inserts: [],
     };
+    mockLogActivityInTransaction.mockImplementation(async (_db, input) => {
+      if (input.action === ADR072_CLOSE_LADDER_ESCALATION_ACTION) {
+        state.escalatedMarkerRows.push({ id: "escalation-marker" });
+      } else if (input.action === "issue.adr072_close_ladder_escalation_wake_delivered") {
+        state.wakeDeliveredMarkerRows.push({ id: "wake-delivered-marker" });
+      } else if (input.action === "issue.adr072_close_ladder_escalation_deferred") {
+        state.deferredMarkerRows.push({ id: "deferred-marker" });
+      }
+    });
     wakeup = vi.fn(async () => undefined);
   });
 
@@ -356,6 +415,23 @@ describe("adr072 close-ladder escalation sweep", () => {
     );
   });
 
+  it("writes escalation comments through issueService instead of bypassing redaction", async () => {
+    armDueIncompleteParent();
+    const service = makeService();
+
+    await service.sweep(NOW);
+
+    expect(mockAddIssueComment).toHaveBeenCalledTimes(1);
+    expect(mockAddIssueComment).toHaveBeenCalledWith(
+      PARENT_ID,
+      expect.stringContaining(ADR072_CLOSE_LADDER_ESCALATION_MARKER),
+      {},
+      { authorType: "system" },
+      expect.anything(),
+    );
+    expect(state.inserts.filter((insert) => insert.table === "issue_comments")).toEqual([]);
+  });
+
   it("is exactly-once: a second sweep over the durable marker neither re-posts nor re-wakes after the ladder is repaired", async () => {
     armDueIncompleteParent();
     const service = makeService();
@@ -375,11 +451,10 @@ describe("adr072 close-ladder escalation sweep", () => {
     expect(wakeup).toHaveBeenCalledTimes(1);
   });
 
-  it("survives a restart: a fresh service instance derives the deadline from the durable advisory row", async () => {
+  it("survives a restart without repeating a delivered wake", async () => {
     armDueIncompleteParent();
     const first = makeService();
     expect((await first.sweep(NOW)).escalated).toBe(1);
-    state.escalatedMarkerRows = [{ id: "marker-1" }];
 
     const restarted = makeService();
     const result = await restarted.sweep(NOW);
@@ -387,7 +462,23 @@ describe("adr072 close-ladder escalation sweep", () => {
     expect(result.alreadyEscalated).toBe(1);
     expect(result.escalated).toBe(0);
     expect(escalationCommentInserts(state)).toHaveLength(1);
-    expect(wakeup).toHaveBeenCalledTimes(2);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("wakes exactly once across consecutive sweeps of a still-overdue parent", async () => {
+    armDueIncompleteParent();
+    const service = makeService();
+
+    await service.sweep(NOW);
+    await service.sweep(NOW);
+    await service.sweep(NOW);
+
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect(escalationCommentInserts(state)).toHaveLength(1);
+    expect(escalationMarkerInputs()).toHaveLength(1);
+    expect(
+      activityMarkerInputs("issue.adr072_close_ladder_escalation_wake_delivered"),
+    ).toHaveLength(1);
   });
 
   it("does not escalate when the ladder completes before the deadline", async () => {
@@ -425,6 +516,23 @@ describe("adr072 close-ladder escalation sweep", () => {
     expect(wakeup).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["done", { status: "done" }],
+    ["cancelled", { status: "cancelled" }],
+    ["hidden", { hiddenAt: new Date(NOW - 60 * 1000) }],
+  ])("does not escalate a %s parent", async (_label, overrides) => {
+    armDueIncompleteParent();
+    state.issueRow = parentIssueRow(overrides);
+    const service = makeService();
+
+    const result = await service.sweep(NOW);
+
+    expect(result.notDue).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(escalationMarkerInputs()).toEqual([]);
+    expect(wakeup).not.toHaveBeenCalled();
+  });
+
   it("ignores advisories whose deadline has not yet elapsed", async () => {
     armDueIncompleteParent();
     state.advisoryRows = [
@@ -444,7 +552,26 @@ describe("adr072 close-ladder escalation sweep", () => {
     expect(escalationCommentInserts(state)).toEqual([]);
   });
 
-  it("defers without posting when the company has no exec-CTO agent to route to", async () => {
+  it("does not scan advisories older than the retention horizon", async () => {
+    armDueIncompleteParent();
+    state.advisoryRows = [
+      {
+        id: "advisory-expired",
+        companyId: COMPANY,
+        entityId: PARENT_ID,
+        createdAt: new Date(NOW - 27 * 60 * 60 * 1000),
+      },
+    ];
+    const service = makeService();
+
+    const result = await service.sweep(NOW);
+
+    expect(result.candidates).toBe(0);
+    expect(escalationMarkerInputs()).toEqual([]);
+    expect(wakeup).not.toHaveBeenCalled();
+  });
+
+  it("records one durable deferral when the company has no exec-CTO agent", async () => {
     armDueIncompleteParent();
     state.agentRows = [
       { id: QAE_AGENT_ID, name: "support-QAE" },
@@ -453,11 +580,15 @@ describe("adr072 close-ladder escalation sweep", () => {
     const service = makeService();
 
     const result = await service.sweep(NOW);
+    await service.sweep(NOW);
 
     expect(result.deferredNoRecipient).toBe(1);
     expect(result.escalated).toBe(0);
     expect(escalationMarkerInputs()).toEqual([]);
     expect(escalationCommentInserts(state)).toEqual([]);
+    expect(
+      activityMarkerInputs("issue.adr072_close_ladder_escalation_deferred"),
+    ).toHaveLength(1);
     expect(wakeup).not.toHaveBeenCalled();
   });
 
@@ -491,6 +622,12 @@ describe("adr072 close-ladder escalation sweep", () => {
     expect(second.alreadyEscalated).toBe(1);
     expect(second.failed).toBe(0);
     expect(escalationCommentInserts(state)).toHaveLength(1);
+    expect(wakeup).toHaveBeenCalledTimes(2);
+
+    const third = await service.sweep(NOW);
+
+    expect(third.alreadyEscalated).toBe(1);
+    expect(third.failed).toBe(0);
     expect(wakeup).toHaveBeenCalledTimes(2);
   });
 

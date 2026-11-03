@@ -1,9 +1,10 @@
-import { and, eq, lte } from "drizzle-orm";
+import { and, eq, gte, inArray, lte } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agents, issueComments, issues } from "@paperclipai/db";
+import { activityLog, agents, issues } from "@paperclipai/db";
 import { normalizeAgentUrlKey } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 import { logActivityInTransaction } from "./activity-log.js";
+import { issueService } from "./issues.js";
 import {
   countLadderedChildren,
   findMissingAdr072CloseLadderStages,
@@ -14,6 +15,10 @@ export const ADR072_CLOSE_LADDER_ADVISORY_ACTION =
   "issue.adr072_close_ladder_incomplete";
 export const ADR072_CLOSE_LADDER_ESCALATION_ACTION =
   "issue.adr072_close_ladder_escalated";
+export const ADR072_CLOSE_LADDER_ESCALATION_WAKE_DELIVERED_ACTION =
+  "issue.adr072_close_ladder_escalation_wake_delivered";
+export const ADR072_CLOSE_LADDER_ESCALATION_DEFERRED_ACTION =
+  "issue.adr072_close_ladder_escalation_deferred";
 export const ADR072_CLOSE_LADDER_ESCALATION_MARKER =
   "[ADR-072 close ladder escalation]";
 export const ADR072_CLOSE_LADDER_ESCALATION_DELAY_MS = 120 * 60 * 1000;
@@ -21,6 +26,7 @@ export const ADR072_CLOSE_LADDER_ESCALATION_ACTOR_ID =
   "adr072-close-ladder-escalation";
 
 const EXEC_CTO_URL_KEY = "exec-cto";
+const ADR072_CLOSE_LADDER_ESCALATION_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 export type Adr072CloseLadderEscalationWakeup = (
   agentId: string,
@@ -90,8 +96,7 @@ async function escalateDueParent(
     delayMinutes: number;
   },
 ): Promise<Adr072CloseLadderEscalationOutcome> {
-  const recipientAgentId = await resolveExecCtoAgentId(db, opts.companyId);
-  if (!recipientAgentId) return "deferred_no_recipient";
+  let recipientAgentId: string | null = null;
   const outcome = await db.transaction(async (tx) => {
     const txDb = tx as unknown as Db;
     await txDb
@@ -104,13 +109,22 @@ async function escalateDueParent(
         id: issues.id,
         companyId: issues.companyId,
         identifier: issues.identifier,
+        status: issues.status,
+        hiddenAt: issues.hiddenAt,
         executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
         createdByAgentId: issues.createdByAgentId,
       })
       .from(issues)
       .where(eq(issues.id, opts.issueId));
-    if (!current) return "not_due" as const;
+    if (
+      !current
+      || current.status === "done"
+      || current.status === "cancelled"
+      || current.hiddenAt
+    ) {
+      return "not_due" as const;
+    }
     const laddered = await countLadderedChildren(txDb, current.companyId, current.id, {
       requireCompletedLadder: false,
     });
@@ -131,18 +145,58 @@ async function escalateDueParent(
       (state?.completedStageIds?.length ?? 0) > 0 ||
       (state?.skippedStageIds?.length ?? 0) > 0;
     if (pointerAdvanced) return "not_due" as const;
-    const alreadyEscalated = await txDb
-      .select({ id: activityLog.id })
+    const markerRows = await txDb
+      .select({ id: activityLog.id, action: activityLog.action })
       .from(activityLog)
       .where(
         and(
           eq(activityLog.companyId, current.companyId),
-          eq(activityLog.action, ADR072_CLOSE_LADDER_ESCALATION_ACTION),
+          inArray(activityLog.action, [
+            ADR072_CLOSE_LADDER_ESCALATION_ACTION,
+            ADR072_CLOSE_LADDER_ESCALATION_WAKE_DELIVERED_ACTION,
+            ADR072_CLOSE_LADDER_ESCALATION_DEFERRED_ACTION,
+          ]),
           eq(activityLog.entityType, "issue"),
           eq(activityLog.entityId, current.id),
         ),
       );
-    if (alreadyEscalated.length > 0) return "already_escalated" as const;
+    if (
+      markerRows.some(
+        (row) => row.action === ADR072_CLOSE_LADDER_ESCALATION_WAKE_DELIVERED_ACTION,
+      )
+    ) {
+      return "already_escalated" as const;
+    }
+    const resolvedRecipientAgentId = await resolveExecCtoAgentId(txDb, current.companyId);
+    if (!resolvedRecipientAgentId) {
+      if (
+        !markerRows.some(
+          (row) => row.action === ADR072_CLOSE_LADDER_ESCALATION_DEFERRED_ACTION,
+        )
+      ) {
+        await logActivityInTransaction(txDb, {
+          companyId: current.companyId,
+          actorType: "system",
+          actorId: ADR072_CLOSE_LADDER_ESCALATION_ACTOR_ID,
+          action: ADR072_CLOSE_LADDER_ESCALATION_DEFERRED_ACTION,
+          entityType: "issue",
+          entityId: current.id,
+          issueId: current.id,
+          details: {
+            identifier: current.identifier ?? null,
+            deadlineMinutes: opts.delayMinutes,
+            reason: "exec_cto_not_found",
+          },
+        });
+      }
+      return "deferred_no_recipient" as const;
+    }
+    recipientAgentId = resolvedRecipientAgentId;
+    if (
+      markerRows.some((row) => row.action === ADR072_CLOSE_LADDER_ESCALATION_ACTION)
+    ) {
+      return "already_escalated" as const;
+    }
     await logActivityInTransaction(txDb, {
       companyId: current.companyId,
       actorType: "system",
@@ -164,10 +218,9 @@ async function escalateDueParent(
         routedToAgentId: recipientAgentId,
       },
     });
-    await txDb.insert(issueComments).values({
-      companyId: current.companyId,
-      issueId: current.id,
-      body: buildAdr072CloseLadderEscalation({
+    await issueService(txDb).addComment(
+      current.id,
+      buildAdr072CloseLadderEscalation({
         identifier: current.identifier ?? null,
         missingStageLabels: shape.missingStageLabels,
         outOfOrderStageLabels: shape.outOfOrderStageLabels,
@@ -175,11 +228,18 @@ async function escalateDueParent(
         ladderedChildIdentifiers: laddered.identifiers,
         delayMinutes: opts.delayMinutes,
       }),
-      authorType: "system",
-    });
+      {},
+      { authorType: "system" },
+      txDb,
+    );
     return "escalated" as const;
   });
-  if (outcome !== "escalated" && outcome !== "already_escalated") return outcome;
+  if (
+    (outcome !== "escalated" && outcome !== "already_escalated")
+    || !recipientAgentId
+  ) {
+    return outcome;
+  }
   try {
     await opts.wakeup(recipientAgentId, {
       source: "automation",
@@ -196,6 +256,18 @@ async function escalateDueParent(
         issueId: opts.issueId,
         source: "issue.adr072_close_ladder_escalated",
       },
+    });
+    await db.transaction(async (tx) => {
+      await logActivityInTransaction(tx as unknown as Db, {
+        companyId: opts.companyId,
+        actorType: "system",
+        actorId: ADR072_CLOSE_LADDER_ESCALATION_ACTOR_ID,
+        action: ADR072_CLOSE_LADDER_ESCALATION_WAKE_DELIVERED_ACTION,
+        entityType: "issue",
+        entityId: opts.issueId,
+        issueId: opts.issueId,
+        details: { routedToAgentId: recipientAgentId },
+      });
     });
   } catch (err) {
     logger.warn(
@@ -239,6 +311,9 @@ export function createAdr072CloseLadderEscalationSweepService(
         failed: 0,
       };
       const cutoff = new Date(atNow - escalationDelayMs);
+      const retentionCutoff = new Date(
+        atNow - escalationDelayMs - ADR072_CLOSE_LADDER_ESCALATION_RETENTION_MS,
+      );
       const due = await db
         .select({
           id: activityLog.id,
@@ -251,6 +326,7 @@ export function createAdr072CloseLadderEscalationSweepService(
           and(
             eq(activityLog.action, ADR072_CLOSE_LADDER_ADVISORY_ACTION),
             eq(activityLog.entityType, "issue"),
+            gte(activityLog.createdAt, retentionCutoff),
             lte(activityLog.createdAt, cutoff),
           ),
         );
