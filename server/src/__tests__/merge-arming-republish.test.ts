@@ -5499,7 +5499,7 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     await db.insert(executionWorkspaces).values({
       id: reboundWorkspaceId,
       companyId: seeded!.companyId,
-      projectId: seeded!.projectId,
+      projectId: seeded!.projectId!,
       mode: "isolated",
       strategyType: "git_worktree",
       name: "rebound-ws",
