@@ -5710,7 +5710,7 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     return { issueId, carrierWorkspaceId, awayWorkspaceId };
   }
 
-  it("pins the terminal-carrier order (enableIsolatedWorkspaces on): a record sent off the carrier row is refused, a record after rebinding onto it is accepted", async () => {
+  it("pins the shared_workspace terminal-carrier order (enableIsolatedWorkspaces on): a record sent off the carrier row is refused, a record after rebinding onto it is accepted", async () => {
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
     try {
       const { issueId, carrierWorkspaceId, awayWorkspaceId } = await seedTerminalCarrierChild();
@@ -5744,7 +5744,7 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     }
   });
 
-  it("pins the terminal-carrier reverse order (enableIsolatedWorkspaces on): recording first, then rebinding away, leaves the record in place", async () => {
+  it("pins the shared_workspace terminal-carrier reverse order (enableIsolatedWorkspaces on): recording first, then rebinding away, leaves the record in place", async () => {
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
     try {
       const { issueId, awayWorkspaceId } = await seedTerminalCarrierChild();
@@ -5765,7 +5765,7 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     }
   });
 
-  it("pins the terminal-carrier rebind with enableIsolatedWorkspaces off: the rebind is dropped (200, pointer cleared) and the record after it is refused", async () => {
+  it("pins the shared_workspace terminal-carrier rebind with enableIsolatedWorkspaces off: the rebind is dropped (200, pointer cleared) and the record after it is refused", async () => {
     const { issueId, carrierWorkspaceId, awayWorkspaceId } = await seedTerminalCarrierChild();
 
     const away = await request(app)

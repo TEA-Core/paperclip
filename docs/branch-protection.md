@@ -271,7 +271,8 @@ the time of the request, so a `PATCH` that carries `deliveryIdentity` and also
 changes `executionWorkspaceId` is refused in every case (agent or board, own
 branch, `project_primary` stamp, no-workspace record, or terminal-carrier
 record) with `422 delivery_identity_branch_write_rejected`. Do the two as
-separate `PATCH`es, rebind first: the record is then validated against (and, for
+separate `PATCH`es, rebind first (the rebind is subject to the gates listed under
+the terminal-carrier arm below): the record is then validated against (and, for
 a `project_primary` stamp, written onto) the workspace the card will hold at
 approval. Recording first and rebinding second is not refused at write time, but
 a rebind does not revalidate a stored record, so it can leave a record the
@@ -285,16 +286,25 @@ new row's branch, so it resolves only if that branch happens to match. The
 terminal-carrier arm is narrower still: the record is accepted only while the
 card is bound to the terminal carrier row. A record sent before the card is
 bound to that row is refused with `422` `delivery_identity_branch_write_rejected`.
-Whether a rebind onto the carrier row binds depends on the
-`enableIsolatedWorkspaces` experimental flag. With the flag on, the rebind binds
-(the pointer keeps the carrier row id) and an identity `PATCH` sent after it
-returns `200`. With the flag off, the rebind is silently dropped (`200`, the old
-pointer is cleared, so the workspace pointer is null) and an identity `PATCH`
-sent after it is refused with `422` `delivery_identity_branch_write_rejected`,
-because the card then has no execution-workspace delivery branch. Rebinding away
-from the carrier row after the record is written returns `200` and leaves the
-record in place, but the approval-time resolver then refuses it. So write the
-record while the card is bound to the carrier row and do not rebind afterwards.
+Whether a rebind onto the carrier row binds depends on
+three gates. (1) The `enableIsolatedWorkspaces` experimental flag: with it off,
+the rebind is silently dropped (`200`, the old pointer is cleared, so the
+workspace pointer is null) and an identity `PATCH` sent after it is refused with
+`422` `delivery_identity_branch_write_rejected`, because the card then has no
+execution-workspace delivery branch; with it on, the pointer keeps the row id.
+(2) The binding coherence check on an explicit rebind: a row that is neither a
+`shared_workspace` row nor sourced by the card itself is refused with `422`
+`workspace_cross_source_binding`. An `isolated_workspace` ADR-083 carrier is
+sourced by an ancestor card, so a rebind onto it is refused and the only route
+is to record while the card still holds the carrier row; a `shared_workspace`
+carrier passes this check. (3) The project policy: with
+`executionWorkspacePolicy.allowIssueOverride` set to `false` (and the flag on),
+any explicit `executionWorkspaceId` is refused with `422`
+`workspace_issue_override_disallowed`. When all three pass, the rebind binds
+and an identity `PATCH` sent after it returns `200`. Rebinding away from the
+carrier row after the record is written returns `200` and leaves the record in
+place, but the approval-time resolver then refuses it. So write the record while
+the card is bound to the carrier row and do not rebind afterwards.
 
 The provisioning carry also applies only while the card's status is `in_review`
 at provisioning time. Once a card leaves `in_review` (a bounced redo wake, a
