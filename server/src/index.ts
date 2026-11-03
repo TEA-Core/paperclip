@@ -94,6 +94,7 @@ import { formatTerminalWorkspaceReaperSkipLogLine } from "./services/execution-w
 import { deliverNativeQuestionResponse } from "./services/native-runtime/native-question-bridge.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
 import { createMergedOperatorMergeCardSweepService } from "./services/merged-operator-merge-cards.js";
+import { createAdr072CloseLadderEscalationSweepService } from "./services/adr072-close-ladder-escalation-sweep.js";
 import { createBranchPrReconcilerSweepService } from "./services/branch-pr-reconciler.js";
 import { prDeliveryService } from "./services/pr-delivery.js";
 import { rotateOpenCodeLog } from "./services/opencode-log-rotation.js";
@@ -1427,6 +1428,9 @@ async function startServerWithDatabaseTeardown(
     const doneCloseLandingBackstop = createDoneCloseLandingBackstopService(db as any, {
       wakeup: heartbeat.wakeup,
     });
+    const adr072CloseLadderEscalation = createAdr072CloseLadderEscalationSweepService(db as any, {
+      wakeup: heartbeat.wakeup,
+    });
     const carrierPromotionSweep = createCarrierPromotionSweepService(db as any);
     const summarySlotRefreshSweep = createSummarySlotRefreshSweepService(db as any, {
       wakeup: heartbeat.wakeup,
@@ -1523,6 +1527,22 @@ async function startServerWithDatabaseTeardown(
         .catch((err) => {
           logger.error({ err }, "done-close landing backstop sweep failed");
         }), { name: "doneCloseLandingBackstop" });
+    };
+    const scheduleAdr072CloseLadderEscalationSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(adr072CloseLadderEscalation
+        .sweep()
+        .then((result) => {
+          if (result.failed > 0 || result.deferredNoRecipient > 0) {
+            logger.warn(result, "adr072 close-ladder escalation sweep found unroutable or failed candidates");
+          } else if (result.escalated > 0) {
+            logger.info(result, "adr072 close-ladder escalation sweep escalated parents to exec-CTO");
+          }
+          return result;
+        })
+        .catch((err) => {
+          logger.error({ err }, "adr072 close-ladder escalation sweep failed");
+        }), { name: "adr072CloseLadderEscalation" });
     };
     const scheduleMergedPullRequestConfirmationSweep = () => {
       if (heartbeatSchedulerStopped) return;
@@ -2043,6 +2063,7 @@ async function startServerWithDatabaseTeardown(
         scheduleGitHubConnectionContinuitySweep();
         scheduleTerminalWorkspaceSweep();
         scheduleDoneCloseLandingBackstopSweep();
+        scheduleAdr072CloseLadderEscalationSweep();
         scheduleCarrierPromotionSweep();
         scheduleSummarySlotRefreshSweep();
         scheduleAdapterLoginReaperSweep();

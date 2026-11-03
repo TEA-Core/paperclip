@@ -4333,10 +4333,6 @@ export function issueRoutes(
       proposalId: string;
       actor: { agentId?: string | null; userId?: string | null };
     }) => Promise<unknown>;
-    adr072CloseLadderEscalationScheduler?: (
-      callback: () => Promise<void>,
-      delayMs: number,
-    ) => void;
   } = {},
 ) {
   const router = Router();
@@ -4347,13 +4343,6 @@ export function issueRoutes(
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
-  const scheduleAdr072CloseLadderEscalation =
-    opts.adr072CloseLadderEscalationScheduler ?? ((callback, delayMs) => {
-      const timer = setTimeout(() => {
-        void callback();
-      }, delayMs);
-      timer.unref();
-    });
   const commentWasCreatedByAssigneeRun = async (
     comment: { companyId: string; createdByRunId?: string | null },
     assigneeAgentId: string | null | undefined,
@@ -17287,41 +17276,6 @@ export function issueRoutes(
     "issue.adr072_close_ladder_incomplete";
   const ADR072_CLOSE_LADDER_ADVISORY_MARKER =
     "[ADR-072 close ladder incomplete]";
-  const ADR072_CLOSE_LADDER_ESCALATION_ACTION =
-    "issue.adr072_close_ladder_escalated";
-  const ADR072_CLOSE_LADDER_ESCALATION_MARKER =
-    "[ADR-072 close ladder escalation]";
-  const ADR072_CLOSE_LADDER_ESCALATION_DELAY_MS = 120 * 60 * 1000;
-
-  function buildAdr072CloseLadderEscalation(input: {
-    identifier: string | null;
-    missingStageLabels: string[];
-    outOfOrderStageLabels: string[];
-    ladderedChildCount: number;
-    ladderedChildIdentifiers: string[];
-  }): string {
-    const lines = [
-      ADR072_CLOSE_LADDER_ESCALATION_MARKER,
-      "",
-      `CTO / board: this card${input.identifier ? ` (${input.identifier})` : ""} ` +
-        `remains an incomplete ADR-072 close-ladder parent over ` +
-        `${input.ladderedChildCount} laddered child issue(s) ` +
-        `(${input.ladderedChildIdentifiers.join(", ")}) after ` +
-        `${ADR072_CLOSE_LADDER_ESCALATION_DELAY_MS / 60000} minutes, and its ` +
-        "close-ladder pointer has not advanced.",
-    ];
-    if (input.missingStageLabels.length > 0) {
-      lines.push("", `Missing close-ladder stage(s): ${input.missingStageLabels.join(", ")}`);
-    }
-    if (input.outOfOrderStageLabels.length > 0) {
-      lines.push("", `Out-of-order close-ladder stage(s): ${input.outOfOrderStageLabels.join(", ")}`);
-    }
-    lines.push(
-      "",
-      "Advisory only: no execution policy, status, assignee, or stage pointer was changed.",
-    );
-    return lines.join("\n");
-  }
 
   function buildAdr072CloseLadderAdvisory(input: {
     identifier: string | null;
@@ -17394,100 +17348,6 @@ export function issueRoutes(
         "sole authority and recomputes the shape from live rows.",
     );
     return lines.join("\n");
-  }
-
-  async function escalateAdr072CloseLadderAfterDeadline(
-    parent: {
-      id: string;
-      companyId: string;
-      identifier?: string | null;
-    },
-    source: "child_create" | "accepted_plan_decomposition" | "issue_create",
-  ): Promise<void> {
-    try {
-      await db.transaction(async (tx) => {
-        const current = await svc.getByIdForUpdate(parent.id, tx);
-        if (!current) return;
-        const alreadyEscalated = await tx
-          .select({ id: activityLog.id })
-          .from(activityLog)
-          .where(
-            and(
-              eq(activityLog.companyId, current.companyId),
-              eq(activityLog.action, ADR072_CLOSE_LADDER_ESCALATION_ACTION),
-              eq(activityLog.entityType, "issue"),
-              eq(activityLog.entityId, current.id),
-            ),
-          );
-        if (alreadyEscalated.length > 0) return;
-        const txDb = tx as unknown as Db;
-        const laddered = await countLadderedChildren(
-          txDb,
-          current.companyId,
-          current.id,
-          { requireCompletedLadder: false },
-        );
-        if (laddered.count < 2) return;
-        const shape = await findMissingAdr072CloseLadderStages(
-          txDb,
-          current.companyId,
-          current.id,
-          current.executionPolicy,
-          current.executionState,
-          current.createdByAgentId,
-        );
-        if (
-          shape.missingStageLabels.length === 0 &&
-          shape.outOfOrderStageLabels.length === 0
-        ) {
-          return;
-        }
-        const state = parseIssueExecutionState(current.executionState);
-        const pointerAdvanced =
-          (state?.completedStageIds?.length ?? 0) > 0 ||
-          (state?.skippedStageIds?.length ?? 0) > 0;
-        if (pointerAdvanced) return;
-        await logActivityInTransaction(tx as unknown as Db, {
-          companyId: current.companyId,
-          actorType: "system",
-          actorId: "adr072-close-ladder-escalation",
-          action: ADR072_CLOSE_LADDER_ESCALATION_ACTION,
-          entityType: "issue",
-          entityId: current.id,
-          issueId: current.id,
-          details: {
-            identifier: current.identifier ?? null,
-            ladderedChildCount: laddered.count,
-            ladderedChildIdentifiers: laddered.identifiers,
-            excludedChildIdentifiers: laddered.excludedChildIdentifiers,
-            missingStageLabels: shape.missingStageLabels,
-            outOfOrderStageLabels: shape.outOfOrderStageLabels,
-            pointerAdvanced,
-            currentStageIndex: state?.currentStageIndex ?? null,
-            deadlineMinutes: ADR072_CLOSE_LADDER_ESCALATION_DELAY_MS / 60000,
-            source,
-          },
-        });
-        await svc.addComment(
-          current.id,
-          buildAdr072CloseLadderEscalation({
-            identifier: current.identifier ?? null,
-            missingStageLabels: shape.missingStageLabels,
-            outOfOrderStageLabels: shape.outOfOrderStageLabels,
-            ladderedChildCount: laddered.count,
-            ladderedChildIdentifiers: laddered.identifiers,
-          }),
-          {},
-          { authorType: "system" },
-          tx,
-        );
-      });
-    } catch (err) {
-      logger.warn(
-        { err, issueId: parent.id, companyId: parent.companyId, source },
-        "failed to escalate ADR-072 close-ladder deadline",
-      );
-    }
   }
 
   async function flagAdr072CloseLadderOnChildAcquisition(
@@ -17626,12 +17486,6 @@ export function issueRoutes(
         requestedByActorId: "adr072-close-ladder-advisory",
         wakeCommentId: advisoryComment.id,
       });
-      if (!pointerAdvanced) {
-        scheduleAdr072CloseLadderEscalation(
-          () => escalateAdr072CloseLadderAfterDeadline(parent, source),
-          ADR072_CLOSE_LADDER_ESCALATION_DELAY_MS,
-        );
-      }
     } catch (err) {
       logger.warn(
         { err, issueId: parent.id, companyId: parent.companyId, source },
