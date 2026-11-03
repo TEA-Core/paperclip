@@ -19423,7 +19423,9 @@ export function issueRoutes(
     let deliveryIdentityWorkspaceBranchWrite = false;
     // ADR-091 D1 (SUP-14824): record the delivery identity on in_review transition.
     // Only a run that holds the issue's lease may write it, and only on a transition
-    // INTO in_review. Any other actor or transition is rejected without partial write.
+    // INTO in_review; a board actor may also refresh it on a card already in_review
+    // (see boardDeliveryRefresh). Any other actor or transition is rejected without
+    // partial write.
     if (requestedDeliveryIdentity) {
       const holdsLease =
         actor.actorType === "agent"
