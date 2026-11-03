@@ -241,10 +241,15 @@ Any other actor or transition is rejected with `422 delivery_identity_write_reje
 and no partial write occurs. `recordedByRunId` and `recordedAt` are
 server-owned (set from the actor context), never client-supplied.
 
-Both write paths hold the same single rule: the recorded branch binds this card
-only when anchored to it. It must equal the card's control-plane delivery branch
+The board refresh path applies the anchoring rule, including the
+identifier-prefix check: the recorded branch binds this card only when anchored
+to it. It must equal the card's control-plane delivery branch
 (or a legitimate ADR-083 carrier owner's branch), else `422
-delivery_identity_branch_write_rejected`. A board refresh also needs the card's
+delivery_identity_branch_write_rejected`. The lease-holding agent path that
+enters review does not apply that rule: it keeps its existing behaviour and can
+still stamp an unanchored branch (including a lowercase-prefixed one such as
+`sup-22-work`), because that path does not use the identifier-prefix helper.
+That is pre-existing and unchanged by this change. A board refresh also needs the card's
 identifier prefix on `branch` to stamp it onto this card's own `project_primary`
 row that has no branch, or to record a card with **no** execution workspace
 (that record must also bind a PR, `prNumber` and `prUrl`). A board refresh may
@@ -265,14 +270,23 @@ A `deliveryIdentity` write is validated against the workspace the card holds at
 the time of the request, so a `PATCH` that carries `deliveryIdentity` and also
 changes `executionWorkspaceId` is refused in every case (agent or board, own
 branch, `project_primary` stamp, no-workspace record, or terminal-carrier
-record) with `422 delivery_identity_branch_write_rejected`. Rebind the workspace
-in one `PATCH`, then record the delivery in a second.
+record) with `422 delivery_identity_branch_write_rejected`. In the
+`project_primary` and orphan arms the two separate writes work in either order:
+rebind the workspace in one `PATCH`, then record the delivery in a second (or
+record first, then rebind). The terminal-carrier arm is narrower: an identity
+`PATCH` after a rebind onto the carrier branch is refused with `422`, the
+reverse order returns `200` and the approval-time resolver then refuses the
+record, and a change to a null workspace is refused.
 
 The provisioning carry also applies only while the card's status is `in_review`
 at provisioning time. Once a card leaves `in_review` (a bounced redo wake, a
-reopened follow-up), the fresh or restored row keeps a null branch, exactly as
-before the carry existed, so a later write into `in_review` with a new anchored
-branch is stamped normally. A card that stays `in_review` and re-delivers on a
+reopened follow-up), the fresh or restored row keeps a null branch in the
+shapes where the realized branch is null (a `project_primary` or
+local-filesystem row), exactly as before the carry existed, so a later write
+into `in_review` with a new anchored branch is stamped normally. A
+`git_worktree` realization is different: its row keeps the realized worktree
+branch, which takes precedence over the recorded branch, so the null-branch
+statement does not hold for that shape. A card that stays `in_review` and re-delivers on a
 different branch than the one carried onto its row still gets `422
 delivery_identity_branch_write_rejected`; that case is unchanged and not covered
 by this carry.
@@ -283,9 +297,11 @@ marks it `requireMerged`. This covers a card with no execution workspace (anchor
 by identifier prefix) and an ADR-083 carrier whose owner is already done/cancelled.
 `resolveExactBoundPullRequest` then accepts it only as a completed delivery: the
 bound PR must be merged and its merge commit proven on the card's own
-control-plane base (the workspace `baseRef`, or the project workspace default
-ref), never the PR's self-reported base. A card that records no such base is
-refused. Ordinary bindings keep proving a merged PR against the PR's own base
+control-plane base, meaning the execution workspace `baseRef`, never the PR's
+self-reported base. A null workspace `baseRef` does not fall back to the project
+default: the proof is refused (a terminal carrier whose `baseRef` is
+`release/other` arms a PR merged on `release/other`). A card that records no
+such base is refused. Ordinary bindings keep proving a merged PR against the PR's own base
 branch. An open PR on a dead carrier stays refused (SUP-16896). A merged-only
 binding is never a release target (`resolveReleaseDeliveryTarget`) and never
 feeds release-assurance.
