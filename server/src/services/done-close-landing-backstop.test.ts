@@ -289,6 +289,7 @@ function candidateRow(overrides: {
   id?: string;
   identifier?: string | null;
   assigneeAgentId?: string | null;
+  deliveryRequirement?: "repository_delivery" | "record_only";
   createdAt?: string;
   reason?: string;
   skipReason?: string;
@@ -309,6 +310,7 @@ function candidateRow(overrides: {
       status: overrides.status ?? "done",
       identifier: overrides.identifier ?? "SUP-13326",
       assigneeAgentId: overrides.assigneeAgentId === undefined ? AGENT : overrides.assigneeAgentId,
+      deliveryRequirement: overrides.deliveryRequirement ?? "repository_delivery",
     },
   };
 }
@@ -545,6 +547,7 @@ describe("done-close-landing discovery predicate (AC1 — #514-class card)", () 
     );
     // The arming-refusal arm keys on the explicit refusal action (SUP-14900).
     expect(compiled.params).toContain("issue.merge_arming_refused_on_close");
+    expect(compiled.params).toContain("record_only");
     // Only issue-scoped rows, joined to the card, and only cards still `done`.
     expect(compiled.sql).toContain(`inner join "issues"`);
     expect(compiled.sql).toContain(`"activity_log"."entity_id" = "issues"."id"`);
@@ -696,6 +699,41 @@ describe("done-close-landing discovery predicate (AC1 — #514-class card)", () 
 });
 
 describe("createDoneCloseLandingBackstopService", () => {
+  it("skips a record-only candidate before PR resolution or side effects", async () => {
+    const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+    const { service } = makeService(
+      {
+        candidates: [candidateRow({ deliveryRequirement: "record_only" })],
+        existingLandingRows: [],
+      },
+      { wakeup },
+    );
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr()]);
+    const resolve = mockResolver(async () => closedSnapshot);
+
+    const result = await service.sweep();
+
+    expect(result).toEqual({
+      due: true,
+      candidates: 1,
+      confirmed: 0,
+      failed: 0,
+      deferred: 0,
+      reenqueued: 0,
+      escalated: 0,
+      draftStranded: 0,
+      unarmable: [],
+    });
+    expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+    expect(mockResolveCardPullRequest).not.toHaveBeenCalled();
+    expect(resolve).not.toHaveBeenCalled();
+    expect(mockEnableAutoMerge).not.toHaveBeenCalled();
+    expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    expect(wakeup).not.toHaveBeenCalled();
+  });
+
   it("emits issue.done_close_landing_confirmed for a merged decision-carried PR and raises nothing else", async () => {
     const { service } = makeService({
       candidates: [candidateRow()],
