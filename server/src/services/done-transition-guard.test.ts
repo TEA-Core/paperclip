@@ -12,6 +12,7 @@ import {
 import {
   countLadderedChildren,
   evaluateDoneTransitionGuard,
+  evaluateDoneTransitionGuardForBackstopClose,
   evaluateDoneTierDeclaration,
   extractCitedCommitShas,
   resolveCitedCommits,
@@ -21,6 +22,7 @@ import {
   DONE_TIER_TIER2_JSON,
   renderDoneTierDeclaration,
   TIER1_FORM,
+  TIER2_RECORD_ONLY_FORM,
   GitHubAuthError,
   type DoneTransitionOverride,
 } from "./done-transition-guard.js";
@@ -5960,6 +5962,172 @@ describe("evaluateDoneTierDeclaration", () => {
       );
       expect(result.allowed).toBe(false);
       expect(result.tier).toBe(null);
+    });
+  });
+
+  // SUP-22801: a record_only card owes no repository landing, so the shared
+  // done-tier evaluator accepts a machine-checkable record-only live-evidence
+  // grammar (probe command, observed target, UTC observation instant, pass
+  // predicate/result) with no merge head, and refuses prose, malformed
+  // components, impossible instants, and failing predicates. The merge-head
+  // contract for repository_delivery cards is byte-for-byte unchanged.
+  describe("record-only Tier 2 live evidence (SUP-22801)", () => {
+    function recordOnlyTierIssue() {
+      return { ...tierIssue, deliveryRequirement: "record_only" as const };
+    }
+
+    const RECORD_ONLY_EVIDENCE =
+      "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records";
+
+    beforeEach(() => {
+      // A record-only close must resolve nothing on GitHub: no token, no repo,
+      // no probe head. Reset every provider mock so any call is a failure.
+      setupDbMock({});
+      mockResolveGitHubToken.mockReset();
+      ghFetchMock.mockReset();
+    });
+
+    it("accepts a valid record-only declaration on a record_only card with no repo and no merged work product", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        recordOnlyTierIssue(),
+        tier2Line(RECORD_ONLY_EVIDENCE),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("record-only probe");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveGitHubToken).not.toHaveBeenCalled();
+    });
+
+    it("accepts the same record-only declaration from the same-run comment path", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        recordOnlyTierIssue(),
+        null,
+        "run-1",
+        () => Promise.resolve([mockComment(tier2Line(RECORD_ONLY_EVIDENCE), "run-1")]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+      expect(result.reason).toContain("same-run comment");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses arbitrary prose on a record_only card, naming the record-only accepted form verbatim", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        recordOnlyTierIssue(),
+        tier2Line("the sweep consumed everything on schedule."),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("machine-checkable");
+      expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses an impossible instant, a failing verdict, and a blank component, each naming the record-only form", async () => {
+      for (const [evidence, expected] of [
+        ["record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2026-13-04T09:15:00Z result: pass endpoint healthy", "not a real UTC calendar instant"],
+        ["record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: fail endpoint returned 500", "failing predicate"],
+        ["record-only probe ` ` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass endpoint healthy", "blank probe command"],
+      ] as const) {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidence),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed, evidence).toBe(false);
+        expect(result.tier, evidence).toBe(null);
+        expect(result.reason, evidence).toContain(expected);
+        expect(result.reason, evidence).toContain(TIER2_RECORD_ONLY_FORM);
+      }
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("keeps the merge-head grammar working on a record_only card that has a recorded merged work product (SUP-21258)", async () => {
+      setupTier2OriginMocks();
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        { ...repoBackedTierIssue(), deliveryRequirement: "record_only" as const },
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+    });
+
+    it("refuses the merge-head grammar on a repo-less record_only card while naming the form it can actually write", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        recordOnlyTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      // The refusal stays actionable for a card with no repository: both the
+      // record-only form and the merge-head form are named.
+      expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+      expect(result.reason).toContain("probe `<probe command>` head <probe head sha> post-merge:");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses record-only evidence on a repository_delivery card and keeps the merge-head refusal", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(RECORD_ONLY_EVIDENCE),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("deliveryRequirement=record_only");
+      expect(result.reason).toContain("probe `<probe command>` head <probe head sha> post-merge:");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("names the record-only form in the missing-declaration refusal on a record_only card", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        recordOnlyTierIssue(),
+        "All done here.",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("missing a done-tier declaration");
+      expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+    });
+
+    it("backstop close: a record_only card closes through the shared evaluator with a structured record-only doneTier", async () => {
+      const verdict = await evaluateDoneTransitionGuardForBackstopClose({
+        db: mockDb,
+        issue: { ...recordOnlyTierIssue(), projectId: null, projectWorkspaceId: null, executionWorkspaceId: null },
+        actorId: "execution-control-reconciliation",
+        closeComment: null,
+        structuredDoneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+      });
+      expect(verdict.allowed).toBe(true);
+      if (!verdict.allowed) return;
+      expect(verdict.closeComment).toContain("Closed at Tier 2 (live): record-only probe");
+      expect(ghFetchMock).not.toHaveBeenCalled();
     });
   });
 
