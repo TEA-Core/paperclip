@@ -77,17 +77,21 @@ describeEmbeddedPostgres("recovery sweep undispatchable-assignee escalation (SUP
     return companyId;
   }
 
-  async function seedAgent(companyId: string, adapterType: string) {
+  async function seedAgent(
+    companyId: string,
+    adapterType: string,
+    opts?: { status?: string; runtimeConfig?: Record<string, unknown> },
+  ) {
     const agentId = randomUUID();
     await db.insert(agents).values({
       id: agentId,
       companyId,
       name: "Agent",
       role: "engineer",
-      status: "active",
+      status: opts?.status ?? "active",
       adapterType,
       adapterConfig: {},
-      runtimeConfig: {},
+      runtimeConfig: opts?.runtimeConfig ?? {},
       permissions: {},
     });
     return agentId;
@@ -855,5 +859,139 @@ describeEmbeddedPostgres("recovery sweep undispatchable-assignee escalation (SUP
     expect(rows[0].id).toBe(action.id);
     expect(rows[0].status).toBe("active");
     expect(rows[0].attemptCount).toBe(1);
+  });
+
+  describe("declared external-pull assignees", () => {
+    const externalPull = { workDelivery: "external_pull" };
+
+    async function detectionRows(issueId: string) {
+      return db
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, issueId),
+            eq(activityLog.action, "issue.undispatchable_assignee_detected"),
+          ),
+        );
+    }
+
+    it.each(["idle", "error"])("raises nothing for a live (%s) external-pull agent's todo and in_progress cards, fresh or old", async (agentStatus) => {
+      const companyId = await seedCompany();
+      const externalPullAgentId = await seedAgent(companyId, "process", {
+        status: agentStatus,
+        runtimeConfig: externalPull,
+      });
+      const plainProcessAgentId = await seedAgent(companyId, "process");
+      const todoId = await seedCard(companyId, externalPullAgentId, { issueNumber: 1 });
+      const inProgressId = await seedCard(companyId, externalPullAgentId, {
+        status: "in_progress",
+        issueNumber: 2,
+      });
+      const oldTodoId = await seedCard(companyId, externalPullAgentId, { issueNumber: 3 });
+      await db
+        .update(issues)
+        .set({ createdAt: new Date(Date.now() - 30 * 24 * 60 * 60_000) })
+        .where(eq(issues.id, oldTodoId));
+      // Control: an undeclared process agent in the same sweep still raises.
+      const strandedId = await seedCard(companyId, plainProcessAgentId, { issueNumber: 4 });
+
+      const sweep = makeSweep();
+      const results = [];
+      for (let cycle = 0; cycle < 3; cycle += 1) {
+        results.push(await sweep.reconcileUndispatchableAssignedIssues());
+      }
+
+      for (const result of results) expect(result.issueIds).toEqual([strandedId]);
+      // Each pass skips exactly the three declared external-pull cards.
+      expect(results.map((result) => result.skipped)).toEqual([3, 3, 3]);
+      expect(results.map((result) => result.escalated)).toEqual([0, 1, 0]);
+      for (const issueId of [todoId, inProgressId, oldTodoId]) {
+        expect(await detectionRows(issueId)).toHaveLength(0);
+        expect(await recoveryActionRows(issueId)).toHaveLength(0);
+      }
+      const [stranded] = await recoveryActionRows(strandedId);
+      expect(stranded).toMatchObject({ kind: "undispatchable_assignee", status: "active" });
+    });
+
+    it.each([
+      { label: "paused", leave: { status: "paused" } },
+      { label: "undeclared", leave: { runtimeConfig: {} } },
+    ])("counts first sight again when a declared agent becomes $label after an exempt pass", async ({ leave }) => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, "process");
+      const issueId = await seedCard(companyId, agentId);
+      const sweep = makeSweep();
+
+      // Prior sight while the agent is an undeclared process agent.
+      expect(await sweep.reconcileUndispatchableAssignedIssues()).toMatchObject({
+        reported: 1,
+        skipped: 0,
+        escalated: 0,
+      });
+
+      await db.update(agents).set({ runtimeConfig: externalPull }).where(eq(agents.id, agentId));
+      expect(await sweep.reconcileUndispatchableAssignedIssues()).toMatchObject({
+        reported: 0,
+        skipped: 1,
+        escalated: 0,
+        issueIds: [],
+      });
+
+      // The exempt pass reset the sight count, so the first sweep after the
+      // agent leaves the exemption is report-only and the second escalates.
+      await db.update(agents).set(leave).where(eq(agents.id, agentId));
+      expect(await sweep.reconcileUndispatchableAssignedIssues()).toMatchObject({
+        reported: 1,
+        skipped: 0,
+        escalated: 0,
+        issueIds: [issueId],
+      });
+      expect(await recoveryActionRows(issueId)).toHaveLength(0);
+      expect(await sweep.reconcileUndispatchableAssignedIssues()).toMatchObject({
+        reported: 1,
+        escalated: 1,
+      });
+    });
+
+    it.each(["paused", "terminated", "pending_approval"])(
+      "still raises when the external-pull agent is %s",
+      async (status) => {
+        const companyId = await seedCompany();
+        const agentId = await seedAgent(companyId, "process", { status, runtimeConfig: externalPull });
+        const issueId = await seedCard(companyId, agentId);
+
+        const { action } = await openEscalation(companyId, agentId, issueId);
+
+        expect(action).toMatchObject({
+          kind: "undispatchable_assignee",
+          status: "active",
+          previousOwnerAgentId: agentId,
+        });
+      },
+    );
+
+    it.each([
+      { label: "open", patch: null },
+      { label: "exhausted", patch: { status: "escalated", outcome: "exhausted", attemptCount: 5 } },
+    ])("leaves an $label action minted before the declaration untouched", async ({ patch }) => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, "process");
+      const issueId = await seedCard(companyId, agentId);
+      const { sweep, action } = await openEscalation(companyId, agentId, issueId);
+      if (patch) await db.update(issueRecoveryActions).set(patch).where(eq(issueRecoveryActions.id, action.id));
+      const [before] = await recoveryActionRows(issueId);
+
+      await db.update(agents).set({ runtimeConfig: externalPull }).where(eq(agents.id, agentId));
+      // The agent's own wake on the card must not read as the condition clearing.
+      await seedQueuedWakeup(companyId, agentId, issueId);
+      for (let cycle = 0; cycle < 2; cycle += 1) {
+        const result = await sweep.reconcileUndispatchableAssignedIssues();
+        expect(result).toMatchObject({ reported: 0, escalated: 0, resolved: 0 });
+        await sweep.reconcileActiveRecoveryActions();
+      }
+
+      expect(await recoveryActionRows(issueId)).toEqual([before]);
+    });
   });
 });

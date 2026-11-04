@@ -12025,6 +12025,8 @@ export function recoveryService(
           assigneeAgentId: issues.assigneeAgentId,
           monitorNextCheckAt: issues.monitorNextCheckAt,
           assigneeAdapterType: agents.adapterType,
+          assigneeStatus: agents.status,
+          assigneeRuntimeConfig: agents.runtimeConfig,
           totalCount: sql<number>`count(*) over()::int`,
         })
         .from(issues)
@@ -12054,6 +12056,22 @@ export function recoveryService(
       // counter, so a card that recovers between cycles counts first-sight
       // again from the next confirmed cycle.
       if (!isPullOnlyAdapterType(candidate.assigneeAdapterType)) {
+        undispatchableAssignedSightCounts.delete(candidate.id);
+        result.skipped += 1;
+        continue;
+      }
+
+      // A declared `external_pull` agent is never invoked by design: it pulls
+      // its queue out of band, so a pull-only adapter type is its normal
+      // shape, not a missing wake path. Same declaration the strand sweeps
+      // honour (strand-skip.ts). Only while its status lets it work: a paused,
+      // terminated or pending-approval agent pulls nothing, so its cards stay
+      // reportable. Existing actions are left to the backstop above, which
+      // still keys on the adapter type alone.
+      if (
+        isExternalPullAgent({ runtimeConfig: candidate.assigneeRuntimeConfig }) &&
+        isAgentStatusInvokable(candidate.assigneeStatus)
+      ) {
         undispatchableAssignedSightCounts.delete(candidate.id);
         result.skipped += 1;
         continue;
