@@ -5556,8 +5556,8 @@ describe("evaluateDoneTierDeclaration", () => {
         documents: [{ id: "doc-entry-ruling", latestBody: "Recorded ruling" }],
       });
       mockExecFile.mockImplementation(
-        (_file: string, _args: string[], _opts: unknown, cb: (err: Error) => void) => {
-          cb(new Error("damaged git metadata"));
+        (_file: string, _args: string[], _opts: unknown, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
+          cb(new Error("damaged git metadata"), "", "fatal: damaged git metadata");
         },
       );
       const result = await evaluateDoneTierDeclaration(
