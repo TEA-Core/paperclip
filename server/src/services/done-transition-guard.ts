@@ -380,9 +380,17 @@ async function resolveGitHubRefHeadSha(
   return sha.toLowerCase();
 }
 
+const GIT_PROBE_OPTIONS = (() => {
+  const env = { ...process.env, LC_ALL: "C" };
+  for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"]) {
+    delete env[key];
+  }
+  return { maxBuffer: 16 * 1024 * 1024, env };
+})();
+
 function runGit(args: string[], cwd: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile("git", ["-C", cwd, ...args], { maxBuffer: 16 * 1024 * 1024 }, (error, stdout) => {
+    execFile("git", ["-C", cwd, ...args], GIT_PROBE_OPTIONS, (error, stdout) => {
       if (error) reject(error);
       else resolve(stdout);
     });
@@ -454,7 +462,7 @@ async function isGitCheckout(workspacePath: string): Promise<boolean | null> {
     execFile(
       "git",
       ["-C", workspacePath, "rev-parse", "--is-inside-work-tree"],
-      { maxBuffer: 16 * 1024 * 1024 },
+      GIT_PROBE_OPTIONS,
       (error, stdout, stderr) => {
         if (!error) {
           resolve(stdout.trim() === "true");
@@ -931,7 +939,12 @@ async function proveNoRepositoryLanding(
         baseRef: executionWorkspaces.baseRef,
       })
       .from(executionWorkspaces)
-      .where(eq(executionWorkspaces.id, issue.executionWorkspaceId));
+      .where(
+        and(
+          eq(executionWorkspaces.id, issue.executionWorkspaceId),
+          eq(executionWorkspaces.companyId, issue.companyId),
+        ),
+      );
     const workspace = workspaceRows[0];
     if (!workspace || workspace.sourceIssueId !== issue.id) {
       return refuseTier1(
@@ -972,7 +985,13 @@ async function proveNoRepositoryLanding(
     const documentRows = await db
       .select({ latestBody: documents.latestBody })
       .from(issueDocuments)
-      .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
+      .innerJoin(
+        documents,
+        and(
+          eq(issueDocuments.documentId, documents.id),
+          eq(documents.companyId, issue.companyId),
+        ),
+      )
       .where(
         and(
           eq(issueDocuments.companyId, issue.companyId),
@@ -1415,7 +1434,7 @@ async function proveTier1Landing(
   const landingStates = [hasLanded, hasDelegated, hasNoRepositoryLanding].filter(Boolean).length;
   if (landingStates > 1) {
     return refuseTier1(
-      'Tier 1 declaration names both "landed-at-tip" and "landing-delegated"; name exactly one.',
+      'Tier 1 declaration must name exactly one landing-state token: "landed-at-tip", "landing-delegated", or "no-repository-landing".',
     );
   }
   if (landingStates === 0) {
@@ -1610,7 +1629,7 @@ export async function evaluateDoneTierDeclaration(
       ("Same-run comment does not contain a done-tier declaration. " +
         `Accepted forms: ${TIER2_FORM}` +
         ` or ` +
-        `${TIER1_FORM}` +
+        `${TIER1_ACCEPTED_FORMS}` +
         ` — per SUP-12693.`),
     tier: null,
     skipped: false,

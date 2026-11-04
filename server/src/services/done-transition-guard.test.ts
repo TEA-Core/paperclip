@@ -153,6 +153,19 @@ function filterLabelRowsByName(
  * `select().from().where()` resolves to the `executionWorkspaces` rows exactly
  * as the legacy positional chain did, so pre-existing tests are untouched.
  */
+function conditionHasColumn(condition: unknown, table: unknown, columnName: string): boolean {
+  const seen = new Set<object>();
+  const visit = (node: unknown): boolean => {
+    if (!node || typeof node !== "object") return false;
+    if (seen.has(node)) return false;
+    seen.add(node);
+    const candidate = node as { table?: unknown; name?: unknown };
+    if (candidate.table === table && candidate.name === columnName) return true;
+    return Reflect.ownKeys(node).some((key) => visit(Reflect.get(node, key)));
+  };
+  return visit(condition);
+}
+
 function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[]; issueWorkProducts?: Record<string, unknown>[]; issueDocuments?: Record<string, unknown>[]; documents?: Record<string, unknown>[] }) {
   // SUP-15233: the guard reads the issues table twice inside
   // countLadderedChildren: read 1 is the parent_id edge (decomposition
@@ -216,19 +229,29 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
   };
   const linkedDocumentRows = (rows.issueDocuments ?? []).flatMap((link) =>
     (rows.documents ?? [])
+      .filter((document) => document.id === link.documentId)
+      .map((document) => ({ latestBody: document.latestBody })),
+  );
+  const companyScopedDocumentRows = (rows.issueDocuments ?? []).flatMap((link) =>
+    (rows.documents ?? [])
       .filter(
         (document) =>
           document.id === link.documentId &&
           link.companyId === "company-1" &&
           link.issueId === "issue-1" &&
-          link.key === "entry-ruling",
+          link.key === "entry-ruling" &&
+          (document.companyId === undefined || document.companyId === "company-1"),
       )
       .map((document) => ({ latestBody: document.latestBody })),
   );
+  let documentJoinCompanyScoped = false;
   const issueDocumentsChain = {
     from: vi.fn().mockReturnThis(),
-    innerJoin: vi.fn().mockReturnThis(),
-    where: vi.fn().mockResolvedValue(linkedDocumentRows),
+    innerJoin: vi.fn((_table: unknown, condition?: unknown) => {
+      documentJoinCompanyScoped = condition !== undefined && conditionHasColumn(condition, documentsTable, "company_id");
+      return issueDocumentsChain;
+    }),
+    where: vi.fn(() => Promise.resolve(documentJoinCompanyScoped ? companyScopedDocumentRows : linkedDocumentRows)),
     then: vi.fn().mockResolvedValue(linkedDocumentRows),
   };
   const documentsChain = {
@@ -239,7 +262,13 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
   };
   const selectChain = {
     from: vi.fn().mockReturnThis(),
-    where: vi.fn().mockResolvedValue(rows.executionWorkspaces ?? []),
+    where: vi.fn((condition: unknown) =>
+      Promise.resolve(
+        conditionHasColumn(condition, executionWorkspacesTable, "company_id")
+          ? (rows.executionWorkspaces ?? []).filter((workspace) => workspace.companyId === "company-1")
+          : rows.executionWorkspaces ?? [],
+      ),
+    ),
     then: vi.fn().mockResolvedValue(rows.executionWorkspaces ?? []),
   };
   const selectChain2 = {
@@ -5516,6 +5545,50 @@ describe("evaluateDoneTierDeclaration", () => {
       );
       expect(result.allowed, result.reason).toBe(true);
       expect(result.tier).toBe("tier1");
+    });
+
+    it("rejects no-repository landing when the execution workspace belongs to another company", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ companyId: "company-2" })],
+        issueDocuments: [{ companyId: "company-1", issueId: "issue-1", key: "entry-ruling", documentId: "doc-entry-ruling" }],
+        documents: [{ id: "doc-entry-ruling", latestBody: "Recorded ruling" }],
+      });
+      mockGitProbe("0", "0", "");
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        renderDoneTierDeclaration(null, {
+          tier: "tier1",
+          reason: "The entry ruling is recorded",
+          landing: { mode: "noRepositoryLanding" },
+        }),
+        null,
+        async () => [],
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("owned by this issue");
+    });
+
+    it("rejects no-repository landing when the entry ruling document belongs to another company", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueDocuments: [{ companyId: "company-1", issueId: "issue-1", key: "entry-ruling", documentId: "doc-entry-ruling" }],
+        documents: [{ id: "doc-entry-ruling", companyId: "company-2", latestBody: "Recorded ruling" }],
+      });
+      mockGitProbe("0", "0", "");
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        renderDoneTierDeclaration(null, {
+          tier: "tier1",
+          reason: "The entry ruling is recorded",
+          landing: { mode: "noRepositoryLanding" },
+        }),
+        null,
+        async () => [],
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("non-empty entry-ruling record deliverable");
     });
 
     it("rejects no-repository landing on a repository-delivery issue", async () => {
