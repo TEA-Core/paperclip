@@ -348,10 +348,56 @@ describe("assertPatchableExecutionPolicyWrite (SUP-13634)", () => {
     );
   });
 
-  it("allows a body that normalizes to null over an issue with no close ladder", () => {
+  // SUP-22890: the null-clear allowance is scoped to stored policies with
+  // nothing to destroy. A monitor-only watcher previously fell through the
+  // stages-only gate: `{mode, commentRequired, stages: []}` — the SUP-13925
+  // round-trip with `monitor` dropped — normalized to null and silently wiped
+  // the card's only wake path. The backstop now protects a stored monitor.
+  it("rejects a body that normalizes to null over a stored monitor-only policy, naming the monitor", () => {
     const monitorOnly = normalizeIssueExecutionPolicy({ monitor, stages: [] });
     expect(monitorOnly).not.toBeNull();
-    expect(() => assertWrite({ raw: { mode: "normal" }, currentPolicy: monitorOnly })).not.toThrow();
+    expect(() => assertWrite({ raw: { mode: "normal" }, currentPolicy: monitorOnly })).toThrowError(
+      "executionPolicy must not clear the issue's monitor",
+    );
+    // The field repro: explicit `stages: []` with the `monitor` key omitted.
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw: { mode: "normal", commentRequired: true, stages: [] },
+        currentPolicy: monitorOnly,
+        stagesExplicitlyEmpty: true,
+      }),
+    ).toThrowError("executionPolicy must not clear the issue's monitor");
+  });
+
+  it("still allows a body that normalizes to null over a stored policy with nothing to destroy", () => {
+    const noLadder = normalizeIssueExecutionPolicy({ stages: [] }, { preserveEmptyPolicy: true });
+    expect(noLadder).not.toBeNull();
+    expect(noLadder!.stages).toEqual([]);
+    expect(noLadder!.monitor).toBeUndefined();
+    expect(() => assertWrite({ raw: { mode: "normal" }, currentPolicy: noLadder })).not.toThrow();
+  });
+
+  // SUP-22890 AC2: a stage-less body that carries a monitor must never
+  // normalize to null — neither with `stages` omitted (SUP-15377 preserve
+  // shape) nor with an explicit `stages: []` (SUP-13925 round-trip shape).
+  it("never collapses a stage-less monitor-bearing body to null, with or without explicit stages", () => {
+    const stored = normalizeIssueExecutionPolicy({ stages: [], monitor })!;
+    expect(normalizeIssueExecutionPolicy({ mode: "normal", commentRequired: true, monitor })).not.toBeNull();
+    expect(normalizeIssueExecutionPolicy({ mode: "normal", commentRequired: true, stages: [], monitor })).not.toBeNull();
+    const partial = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, monitor },
+      currentPolicy: stored,
+      stagesKeyAbsent: true,
+    });
+    expect(partial).not.toBeNull();
+    expect(partial!.monitor?.nextCheckAt).toBe(monitor.nextCheckAt);
+    const roundTrip = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [], monitor },
+      currentPolicy: stored,
+      stagesKeyAbsent: false,
+    });
+    expect(roundTrip).not.toBeNull();
+    expect(roundTrip!.monitor?.nextCheckAt).toBe(monitor.nextCheckAt);
   });
 
   it("allows a full replacement policy over a non-null stored policy", () => {
