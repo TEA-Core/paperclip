@@ -728,7 +728,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     });
   });
 
-  it.each(["done", "cancelled"] as const)("cancels pending deferred wakes when an issue becomes %s", async (status) => {
+  it.each(["done", "cancelled"] as const)("cancels only ineligible deferred wakes when an issue becomes %s", async (status) => {
     const companyId = await seedAssignableAgentCompany();
     const agentId = randomUUID();
     await db.insert(agents).values(agentRow(companyId, {
@@ -741,8 +741,22 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       status: "todo",
       priority: "medium",
     });
+    const [userComment, closingRunComment] = await db.insert(issueComments).values([
+      {
+        companyId,
+        issueId: issue.id,
+        authorUserId: "local-board",
+        body: "Please handle this follow-up",
+      },
+      {
+        companyId,
+        issueId: issue.id,
+        authorAgentId: agentId,
+        body: "Closing this issue",
+      },
+    ]).returning();
     const otherIssueId = randomUUID();
-    const [targetWake, unrelatedWake, queuedWake] = await db.insert(agentWakeupRequests).values([
+    const [targetWake, unrelatedWake, queuedWake, userCommentWake, coalescedCommentWake, agentOnlyCommentWake] = await db.insert(agentWakeupRequests).values([
       {
         companyId,
         agentId,
@@ -766,6 +780,54 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
         reason: "issue_commented",
         status: "queued",
         payload: { issueId: issue.id },
+      },
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_commented",
+        status: "deferred_issue_execution",
+        requestedByActorType: "user",
+        requestedByActorId: "local-board",
+        payload: {
+          issueId: issue.id,
+          _paperclipWakeContext: {
+            issueId: issue.id,
+            wakeCommentIds: [userComment!.id],
+          },
+        },
+      },
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_commented",
+        status: "deferred_issue_execution",
+        requestedByActorType: "user",
+        requestedByActorId: "local-board",
+        payload: {
+          issueId: issue.id,
+          _paperclipWakeContext: {
+            issueId: issue.id,
+            wakeCommentIds: [closingRunComment!.id, userComment!.id],
+          },
+        },
+      },
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_commented",
+        status: "deferred_issue_execution",
+        requestedByActorType: "agent",
+        requestedByActorId: agentId,
+        payload: {
+          issueId: issue.id,
+          _paperclipWakeContext: {
+            issueId: issue.id,
+            wakeCommentIds: [closingRunComment!.id],
+          },
+        },
       },
     ]).returning();
 
@@ -792,6 +854,79 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(wakesById.get(queuedWake!.id)).toMatchObject({
       status: "queued",
       finishedAt: null,
+    });
+    expect(wakesById.get(userCommentWake!.id)).toMatchObject({
+      status: "deferred_issue_execution",
+      finishedAt: null,
+    });
+    expect(wakesById.get(coalescedCommentWake!.id)).toMatchObject({
+      status: "deferred_issue_execution",
+      finishedAt: null,
+    });
+    expect(wakesById.get(agentOnlyCommentWake!.id)).toMatchObject({
+      status: "cancelled",
+      finishedAt: expect.any(Date),
+    });
+  });
+
+  it("uses the locked status when a concurrent reopen races terminal wake cleanup", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const agentId = randomUUID();
+    await db.insert(agents).values(agentRow(companyId, {
+      id: agentId,
+      name: "DeferredWakeAgent",
+    }));
+    const issue = await svc.create(companyId, {
+      title: "Close after a concurrent reopen",
+      description: null,
+      status: "done",
+      priority: "medium",
+    });
+    const [wake] = await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      reason: "issue_execution_deferred",
+      status: "deferred_issue_execution",
+      payload: { issueId: issue.id },
+    }).returning();
+    const holderPidReady = deferred<number>();
+    const reopenCanCommit = deferred<void>();
+    const concurrentReopen = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select ${issues.id} from ${issues} where ${issues.id} = ${issue.id} for update`,
+      );
+      const [backend] = (await tx.execute(sql`select pg_backend_pid() as pid`)) as unknown as Array<{ pid: number }>;
+      holderPidReady.resolve(backend!.pid);
+      await reopenCanCommit.promise;
+      await tx
+        .update(issues)
+        .set({ status: "todo", completedAt: null, updatedAt: new Date() })
+        .where(eq(issues.id, issue.id));
+    });
+    const holderPid = await holderPidReady.promise;
+    const closePromise = svc.update(issue.id, { status: "done", actorUserId: "local-board" });
+    await expect.poll(async () => {
+      const rows = (await db.execute(
+        sql`select 1 from pg_stat_activity where ${holderPid} = any(pg_blocking_pids(pid))`,
+      )) as unknown as Array<unknown>;
+      return rows.length > 0;
+    }, { timeout: 5_000, interval: 10 }).toBe(true);
+    reopenCanCommit.resolve();
+    await concurrentReopen;
+
+    const closed = await closePromise;
+    expect(closed?.status).toBe("done");
+    const [cancelledWake] = await db
+      .select({
+        status: agentWakeupRequests.status,
+        finishedAt: agentWakeupRequests.finishedAt,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wake!.id));
+    expect(cancelledWake).toMatchObject({
+      status: "cancelled",
+      finishedAt: expect.any(Date),
     });
   });
 
