@@ -109,7 +109,7 @@ export const TIER1_FORM =
   '<why Tier 2 was not probed>. Liveness unverified."';
 export const TIER1_NO_REPOSITORY_FORM =
   '"Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — <why Tier 2 was not probed>. Liveness unverified." ' +
-  '(record_only issues with a complete entry-ruling document in an own non-Git workspace only)';
+  '(record_only issues with a complete entry-ruling document in an own non-Git workspace or own clean, zero-ahead Git worktree only)';
 export const TIER1_ACCEPTED_FORMS = `${TIER1_FORM} or ${TIER1_NO_REPOSITORY_FORM}`;
 // Structured `doneTier` forms (SUP-21328): the second accepted close form on both
 // agent-writable close doors. The missing-tier remedy names these verbatim so the
@@ -121,7 +121,7 @@ export const DONE_TIER_TIER1_LANDED_JSON =
 export const DONE_TIER_TIER1_DELEGATED_JSON =
   '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landingDelegated", "prNumber": <N>, "carrier": "done-close-landing-backstop" } }';
 export const DONE_TIER_TIER1_NO_REPOSITORY_LANDING_JSON =
-  '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "noRepositoryLanding" } } (record_only issues with a complete entry-ruling document in an own non-Git workspace only)';
+  '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "noRepositoryLanding" } } (record_only issues with a complete entry-ruling document in an own non-Git workspace or own clean, zero-ahead Git worktree only)';
 export const DONE_TIER_STRUCTURED_FORMS =
   `${DONE_TIER_TIER2_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}; ` +
   `${DONE_TIER_TIER1_NO_REPOSITORY_LANDING_JSON}`;
@@ -412,6 +412,19 @@ async function countIssueAttributableCommits(
     const attributableCount = Number.parseInt(attributableRaw.trim(), 10);
     if (Number.isNaN(aheadCount) || Number.isNaN(attributableCount)) return null;
     return { aheadCount, attributableCount };
+  } catch {
+    return null;
+  }
+}
+
+async function countCommitsAhead(
+  worktreePath: string,
+  baseRef: string,
+): Promise<number | null> {
+  try {
+    const raw = await runGit(["rev-list", "--count", `${baseRef}..HEAD`], worktreePath);
+    const count = Number.parseInt(raw.trim(), 10);
+    return Number.isNaN(count) ? null : count;
   } catch {
     return null;
   }
@@ -888,7 +901,7 @@ async function proveNoRepositoryLanding(
   }
   if (!issue.executionWorkspaceId) {
     return refuseTier1(
-      'Tier 1 "no-repository-landing" requires an own non-Git execution workspace.',
+      'Tier 1 "no-repository-landing" requires an own execution workspace.',
     );
   }
   try {
@@ -897,6 +910,8 @@ async function proveNoRepositoryLanding(
         sourceIssueId: executionWorkspaces.sourceIssueId,
         strategyType: executionWorkspaces.strategyType,
         providerType: executionWorkspaces.providerType,
+        cwd: executionWorkspaces.cwd,
+        baseRef: executionWorkspaces.baseRef,
       })
       .from(executionWorkspaces)
       .where(eq(executionWorkspaces.id, issue.executionWorkspaceId));
@@ -910,9 +925,28 @@ async function proveNoRepositoryLanding(
       workspace.strategyType === "git_worktree" ||
       workspace.providerType === "git_worktree"
     ) {
-      return refuseTier1(
-        'Tier 1 "no-repository-landing" is not accepted for a Git worktree.',
-      );
+      if (
+        typeof workspace.cwd !== "string" ||
+        workspace.cwd.length === 0 ||
+        typeof workspace.baseRef !== "string" ||
+        workspace.baseRef.length === 0
+      ) {
+        return refuseTier1(
+          'Tier 1 "no-repository-landing" requires a Git worktree with a recorded path and base ref.',
+        );
+      }
+      const dirty = await worktreeHasUncommittedContent(workspace.cwd);
+      if (dirty !== false) {
+        return refuseTier1(
+          'Tier 1 "no-repository-landing" requires a clean Git worktree.',
+        );
+      }
+      const aheadCount = await countCommitsAhead(workspace.cwd, workspace.baseRef);
+      if (aheadCount !== 0) {
+        return refuseTier1(
+          'Tier 1 "no-repository-landing" requires a Git worktree with zero commits ahead of its base ref.',
+        );
+      }
     }
     const documentRows = await db
       .select({ latestBody: documents.latestBody })
@@ -1349,6 +1383,7 @@ async function proveTier1Landing(
     projectId?: string | null;
     projectWorkspaceId?: string | null;
     executionWorkspaceId?: string | null;
+    deliveryRequirement?: IssueDeliveryRequirement | null;
   },
   reason: string,
   sameRun: boolean,
