@@ -266,6 +266,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     unmentioned = false,
     holdPull = false,
     mergeArmingEnabled = false,
+    recordedBinding = false,
     deliveryRequirement,
     assigneeAgentId = null,
     mentionState,
@@ -277,6 +278,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     unmentioned?: boolean;
     holdPull?: boolean;
     mergeArmingEnabled?: boolean;
+    recordedBinding?: boolean;
     deliveryRequirement?: IssueDeliveryRequirement;
     assigneeAgentId?: string | null;
     /** SUP-22346: cache the mentioned PR as merged/closed out-of-band ("merged" | "ambiguous") or closed-unmerged. */
@@ -323,6 +325,15 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         currentStageType: "review", currentParticipant: { type: "user", userId: "board-user" },
         returnAssignee: { type: "agent", agentId: author.id }, completedStageIds: [],
         skippedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+        ...(recordedBinding ? {
+          delivery: {
+            repo: { owner: "TEA-Core", repo: "paperclip" },
+            prNumber: 42,
+            prUrl: "https://github.com/TEA-Core/paperclip/pull/42",
+            branch,
+            headSha: "a".repeat(40),
+          },
+        } : {}),
       },
     }).where(eq(issues.id, issue.id));
     // SUP-22346: mentionState models the out-of-band-merged carrier — the
@@ -489,6 +500,37 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(fixture.writes).toEqual([]);
   });
 
+  it("accepts a proven merged delivery with no recorded binding", async () => {
+    const fixture = await pendingDelivery({ mentionState: "merged" });
+    const response = await fixture.approve();
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.status).toBe("done");
+    expect(stored.executionState).toMatchObject({
+      completedStageIds: [fixture.stageId],
+      approvalStatus: { approvedHeadSha: "c".repeat(40) },
+    });
+    expect(fixture.writes).toEqual([]);
+  });
+
+  it("returns the merged-delivery remedy for an unproven recorded binding", async () => {
+    const fixture = await pendingDelivery({ mentionState: "merged", recordedBinding: true });
+    github.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("/pulls/42")) return Response.json(fixture.pr);
+      if (url.includes("/compare/")) return Response.json({ message: "Not Found" }, { status: 404 });
+      throw new Error(`Unexpected sandbox request: ${url}`);
+    });
+
+    const response = await fixture.approve();
+
+    expect(response.status).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight" });
+    expect(response.body.details.remedy).toContain("restore or prove the merged PR's merge commit");
+    expect(response.body.details.remedy).not.toContain("provide one OPEN, non-draft owned PR");
+  });
+
   it("refuses final draft delivery without completing or recording an approval", async () => {
     const fixture = await pendingDelivery({ draft: true });
     const response = await fixture.approve();
@@ -632,7 +674,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(stored.status).toBe("done");
     expect(stored.executionState).toMatchObject({
       completedStageIds: [fixture.stageId], lastDecisionOutcome: "approved",
-      approvalStatus: { approvedHeadSha: fixture.pr.head.sha },
+      approvalStatus: { approvedHeadSha: "c".repeat(40) },
     });
     // Publication stays open-PR-only: a merged carrier gets no status write.
     expect(fixture.writes).toEqual([]);
@@ -657,7 +699,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
 
     expect(response.status).toBe(409);
     expect(response.body).toMatchObject({
-      details: { code: "approval_final_delivery_preflight", reason: expect.stringContaining("ambiguous: multiple merged mentioned PRs (2)") },
+      details: { code: "approval_final_delivery_preflight", reason: expect.stringContaining("ambiguous: multiple linked merged PRs (2)") },
     });
     expect((await fixture.read()).status).toBe("in_review");
     expect(fixture.writes).toEqual([]);

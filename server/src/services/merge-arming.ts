@@ -417,7 +417,7 @@ export async function resolveLinkedPullRequests(
         headRefName: headRefName ?? null,
         title: (row.data?.title as string | undefined) ?? null,
         displayName: `${owner}/${repo}#${number}`,
-        cachedState: state ?? null,
+        cachedState: row.data?.merged === true ? "merged" : state ?? null,
         lastErrorCode: row.lastErrorCode ?? null,
         reviewDecision: null,
         draft: draft === true,
@@ -483,7 +483,7 @@ export async function resolveLinkedPullRequestsWithState(
         headRefName: headRefName ?? null,
         title: (row.data?.title as string | undefined) ?? null,
         displayName: `${owner}/${repo}#${number}`,
-        cachedState: state ?? null,
+        cachedState: row.data?.merged === true ? "merged" : state ?? null,
         lastErrorCode: row.lastErrorCode ?? null,
         reviewDecision: null,
         draft: draft === true,
@@ -2489,7 +2489,7 @@ async function resolveExactBoundPullRequest(
   issueId: string,
   binding: DeliveryBinding,
   repo: { owner: string; repo: string },
-): Promise<{ pr: LinkedPullRequest | null; reason?: string }> {
+): Promise<{ pr: LinkedPullRequest | null; headSha?: string | null; reason?: string }> {
   const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, repo.owner, repo.repo);
   if (candidates.length === 0) {
     return { pr: null, reason: "recorded delivery identity PR cannot be verified without a GitHub token" };
@@ -2526,9 +2526,25 @@ async function resolveExactBoundPullRequest(
               : `recorded delivery identity PR is merged but not proven on its base branch: ${verified.reason}`,
           };
         }
-      } else {
-        return { pr: null, reason: result.draft === true ? "recorded delivery identity PR is a draft" : "recorded delivery identity PR is not open" };
+        return {
+          pr: {
+            id: "",
+            owner: repo.owner,
+            repo: repo.repo,
+            number: binding.prNumber,
+            headRefName: result.headRef,
+            title: null,
+            displayName: `${repo.owner}/${repo.repo}#${binding.prNumber}`,
+            cachedState: "merged",
+            lastErrorCode: null,
+            reviewDecision: null,
+            draft: false,
+            nodeId: cached?.nodeId ?? null,
+          },
+          headSha: result.mergeCommitSha,
+        };
       }
+      return { pr: null, reason: result.draft === true ? "recorded delivery identity PR is a draft" : "recorded delivery identity PR is not open" };
     }
     if (result.headRef !== binding.branch) {
       return {
@@ -3303,7 +3319,7 @@ export async function resolveApprovalDecisionHead(
     }
     return {
       kind: "resolved",
-      headSha: deliveryIdentity.binding.headSha,
+      headSha: exact.headSha ?? deliveryIdentity.binding.headSha,
       displayName: exact.pr.displayName,
       pr: { owner: exact.pr.owner, repo: exact.pr.repo, number: exact.pr.number },
     };
@@ -3327,6 +3343,8 @@ export async function resolveApprovalDecisionHead(
   const linkedPRsWithDrafts = await resolveLinkedPullRequests(db, companyId, issueId, { includeDrafts: true });
   const draftLinkedPRs = linkedPRsWithDrafts.filter((pr) => pr.draft === true);
   const linkedPRs = linkedPRsWithDrafts.filter((pr) => pr.draft !== true);
+  const linkedPRsWithState = await resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts: true });
+  const mergedLinkedPRs = linkedPRsWithState.filter((pr) => pr.cachedState === "merged" && pr.draft !== true);
 
   // ADR-091 D1 (SUP-14676): this resolver pins the FIRST publish, and that path
   // always runs publishApprovalStatus with enforceDeliveryIdentity: true — so it
@@ -3361,6 +3379,54 @@ export async function resolveApprovalDecisionHead(
     return head.ok
       ? { kind: "resolved", headSha: head.headSha, displayName: pr.displayName, pr: { owner: pr.owner, repo: pr.repo, number: pr.number } }
       : { kind: "unresolvable", reason: head.reason };
+  }
+
+  if (mergedLinkedPRs.length > 0) {
+    const narrowed = await narrowToDelivered(db, companyId, issueId, mergedLinkedPRs);
+    if (narrowed.outcome !== "narrowed") return unresolvableFromNarrowing(narrowed);
+    if (narrowed.delivered.length > 1) {
+      return {
+        kind: "unresolvable",
+        reason: `ambiguous: multiple linked merged PRs (${narrowed.delivered.length}): ${narrowed.delivered.map((pr) => pr.displayName).join(", ")}`,
+      };
+    }
+    const pr = narrowed.delivered[0]!;
+    const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
+    if (candidates.length === 0) {
+      return { kind: "unresolvable", reason: `auth_required: no GitHub token resolvable for ${pr.owner}/${pr.repo}` };
+    }
+    for (const candidate of candidates) {
+      const live = await fetchPullRequestHeadSha(candidate.token, pr.owner, pr.repo, pr.number);
+      if (!live.ok) {
+        if ((live.status === 401 || live.status === 403) && candidate !== candidates[candidates.length - 1]) continue;
+        return { kind: "unresolvable", reason: `head_unverifiable: merged delivery lookup returned HTTP ${live.status}` };
+      }
+      if (live.merged !== true || live.draft === true) {
+        return { kind: "unresolvable", reason: "head_not_merged: cached merged delivery is no longer proven merged" };
+      }
+      const verified = await verifyMergedPullRequestOnBaseBranch(
+        candidate.token,
+        pr.owner,
+        pr.repo,
+        live.baseRef,
+        live.mergeCommitSha,
+      );
+      if (verified.outcome === "auth-failed" && candidate !== candidates[candidates.length - 1]) continue;
+      if (verified.outcome !== "proven") {
+        return {
+          kind: "unresolvable",
+          reason: verified.outcome === "auth-failed"
+            ? `head_unverifiable: merged delivery verification returned HTTP ${verified.status}`
+            : `head_merged_unproven: ${verified.reason}`,
+        };
+      }
+      return {
+        kind: "resolved",
+        headSha: live.mergeCommitSha!,
+        displayName: pr.displayName,
+        pr: { owner: pr.owner, repo: pr.repo, number: pr.number },
+      };
+    }
   }
 
   // Zero cached linked PRs: mirror publishApprovalStatus's live re-resolve so
@@ -3531,6 +3597,20 @@ async function verifyLiveFinalDeliveryHead(
     const parsed = finalDeliveryLiveSchema.safeParse(await response.json());
     if (!parsed.success) return { kind: "unresolvable", reason: "head_unverifiable: incomplete live PR response" };
     const live = parsed.data;
+    const deliveryIdentity = await resolveDeliveryIdentity(db, companyId, issueId);
+    const boundMergedDelivery = live.merged === true &&
+      deliveryIdentity.binding?.prNumber === pr.number &&
+      deliveryIdentity.repo?.owner.toLowerCase() === pr.owner.toLowerCase() &&
+      deliveryIdentity.repo?.repo.toLowerCase() === pr.repo.toLowerCase();
+    if (!boundMergedDelivery) {
+      const narrowed = await narrowToDelivered(db, companyId, issueId, [{
+        ...pr, headRefName: live.head.ref, displayName: resolved.displayName,
+      }]);
+      if (live.head.repo?.full_name?.toLowerCase() !== `${pr.owner}/${pr.repo}`.toLowerCase() ||
+          narrowed.outcome !== "narrowed") {
+        return { kind: "unresolvable", reason: "not_delivered: live PR is not the owner's recorded repo delivery" };
+      }
+    }
     if (live.merged === true) {
       // SUP-21513: a merged delivery whose merge commit is proven on the
       // recorded base branch is a completed delivery — accept it. No status is
@@ -3549,6 +3629,7 @@ async function verifyLiveFinalDeliveryHead(
       if (verified.outcome !== "proven") {
         return { kind: "unresolvable", reason: `head_merged_unproven: ${verified.reason}` };
       }
+      return resolved;
     } else if (live.state !== "open") {
       return { kind: "unresolvable", reason: "head_not_open: delivery must be OPEN and unmerged" };
     }
@@ -3557,13 +3638,6 @@ async function verifyLiveFinalDeliveryHead(
     }
     if (live.head?.sha !== resolved.headSha) {
       return { kind: "unresolvable", reason: "head_moved: delivery changed during final preflight; review the new head" };
-    }
-    const narrowed = await narrowToDelivered(db, companyId, issueId, [{
-      ...pr, headRefName: live.head.ref, displayName: resolved.displayName,
-    }]);
-    if (live.head.repo?.full_name?.toLowerCase() !== `${pr.owner}/${pr.repo}`.toLowerCase() ||
-        narrowed.outcome !== "narrowed") {
-      return { kind: "unresolvable", reason: "not_delivered: live PR is not the owner's recorded repo delivery" };
     }
     return resolved;
   }

@@ -4669,7 +4669,10 @@ export function issueRoutes(
     const { verdict, deliveryOwnerIssueId } = resolution;
     if (verdict.kind !== "resolved") {
       if (options.overrideAccepted) return;
-      const remedy = `Delivery owner ${deliveryOwnerIssueId}: provide one OPEN, non-draft owned PR and a readable reviewed head, then submit the final verdict again. ${verdict.reason}`;
+      const remedy = verdict.reason.startsWith("head_merged_unproven:") ||
+        verdict.reason.includes("recorded delivery identity PR is merged but not proven on its base branch")
+        ? `Delivery owner ${deliveryOwnerIssueId}: restore or prove the merged PR's merge commit on its recorded base branch, then submit the final verdict again. ${verdict.reason}`
+        : `Delivery owner ${deliveryOwnerIssueId}: provide one OPEN, non-draft owned PR and a readable reviewed head, then submit the final verdict again. ${verdict.reason}`;
       throw conflict("Final repository delivery preflight refused; stage remains pending", {
         code: "approval_final_delivery_preflight", reason: verdict.reason, deliveryOwnerIssueId, remedy,
       });
