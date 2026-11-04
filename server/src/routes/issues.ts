@@ -18970,7 +18970,17 @@ export function issueRoutes(
       }
       await assertCanReArmExecutionPolicy(access, req, existing.companyId, existing.assigneeAgentId, true);
     }
-    const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
+    // SUP-22851: the alias translation below re-normalizes THIS stored policy.
+    // An enrolled release-assurance card carries approvalAuthority
+    // "release_assurance", which normalizeIssueExecutionPolicy refuses unless a
+    // trusted caller opts in — so the stored read passes the scoped trust only
+    // when the alias translation will run. A caller-supplied executionPolicy
+    // body never gets it (the nested spelling keeps refusing the authority).
+    const monitorAliasTranslation = monitorAliasRaw !== undefined && req.body.executionPolicy === undefined;
+    const previousExecutionPolicy = normalizeIssueExecutionPolicy(
+      existing.executionPolicy ?? null,
+      monitorAliasTranslation ? { allowReleaseAssuranceAuthority: true } : undefined,
+    );
     // SUP-22840: translate the top-level `monitor` alias into the canonical
     // partial `executionPolicy` write. The route schema already refused the
     // both-shapes body, so the only alias shape reaching here pairs with an
@@ -18982,7 +18992,7 @@ export function issueRoutes(
     // Both stage flags were captured from the RAW body, which carried no
     // executionPolicy key at all, so `stagesKeyAbsent` must be re-stamped for
     // the synthesized write.
-    if (monitorAliasRaw !== undefined && req.body.executionPolicy === undefined) {
+    if (monitorAliasTranslation) {
       const { stages: _storedStages, ...policyBase } = previousExecutionPolicy ?? {
         stages: [] as NormalizedExecutionPolicy["stages"],
       };
@@ -19025,6 +19035,11 @@ export function issueRoutes(
         stagesKeyAbsent,
         executionState: parsedExecutionState,
         rearmPointer: rearmExecutionPolicyRequested,
+        // SUP-22851: the alias-synthesized body is wholly stored-derived (the
+        // schema-validated monitor is the only swap), so its normalization is
+        // of the already-stored policy and carries the same scoped trust. A
+        // caller-supplied executionPolicy body never sets this.
+        allowReleaseAssuranceAuthority: monitorAliasTranslation,
       });
       // Mirror of the assert's gating above: only the paths that actually
       // enforce INV-LADDER-1 pre-transaction are re-checked under the lock.
@@ -20009,6 +20024,12 @@ export function issueRoutes(
       ...updateFields,
       ...(transition.workflowControlledAssignment
         ? { workflowControlledAssignment: true }
+        : {}),
+      // SUP-22851: the alias translation preserved an already-stored
+      // release-assurance authority; the service's defensive re-normalization
+      // of this route-normalized write must trust it (never a request field).
+      ...(monitorAliasTranslation && previousExecutionPolicy?.approvalAuthority === "release_assurance"
+        ? { preservedStoredApprovalAuthority: true }
         : {}),
       ...(deliveryIdentityWorkspaceBranchWrite && existing.executionWorkspaceId
         ? { executionWorkspaceId: existing.executionWorkspaceId }
@@ -21052,7 +21073,14 @@ export function issueRoutes(
       });
     }
 
-    const nextStoredExecutionPolicy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+    // SUP-22851: this re-read of the stored policy feeds the monitor summary
+    // for the write that just landed. The alias translation may have just
+    // preserved a stored release-assurance authority, so it reads back with the
+    // same scoped trust; every other PATCH path normalizes as before.
+    const nextStoredExecutionPolicy = normalizeIssueExecutionPolicy(
+      issue.executionPolicy ?? null,
+      monitorAliasTranslation ? { allowReleaseAssuranceAuthority: true } : undefined,
+    );
     const previousMonitor = summarizeIssueMonitor(existing, previousExecutionPolicy);
     const nextMonitor = summarizeIssueMonitor(issue, nextStoredExecutionPolicy);
     const monitorScheduledChanged = previousMonitor.nextCheckAt !== nextMonitor.nextCheckAt;

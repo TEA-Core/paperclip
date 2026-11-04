@@ -1031,6 +1031,97 @@ describe("issue execution policy routes", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(mockIssueService.addComment).not.toHaveBeenCalled();
     });
+
+    // SUP-22851: the stored shape delivery.md §Release-assurance handoff pins —
+    // authority release_assurance over exactly one approval stage whose only
+    // participant is the RA seat. Explicit stage/participant ids keep the
+    // normalized expectation id-stable.
+    const RA_SEAT_AGENT_ID = "99999999-9999-4999-8999-999999999999";
+    const storedReleaseAssuranceRaw = {
+      mode: "normal",
+      commentRequired: true,
+      approvalAuthority: "release_assurance",
+      stages: [
+        {
+          id: "12121212-1212-4121-8121-121212121212",
+          type: "approval",
+          approvalsNeeded: 1,
+          participants: [
+            { id: "23232323-2323-4232-8232-232323232323", type: "agent", agentId: RA_SEAT_AGENT_ID },
+          ],
+        },
+      ],
+    };
+
+    it("preserves a stored release-assurance authority on the authorized board path", async () => {
+      const issue = seededIssue(storedReleaseAssuranceRaw, "Alias arm over enrolled release-assurance card");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitor: aliasMonitor });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      // The stored authority rides the preserved policy; only the monitor swaps in.
+      expect(patch.executionPolicy).toEqual(
+        normalizeIssueExecutionPolicy(
+          { ...storedReleaseAssuranceRaw, monitor: { ...aliasMonitor, scheduledBy: "board" } },
+          { allowReleaseAssuranceAuthority: true },
+        ),
+      );
+      // The route vouches for the stored authority so the service-side
+      // re-normalization of this already-normalized write trusts it too.
+      expect(patch.preservedStoredApprovalAuthority).toBe(true);
+      expect(patch).toMatchObject({
+        monitorNextCheckAt: new Date("2026-12-01T12:00:00.000Z"),
+      });
+    });
+
+    it("preserves a stored release-assurance authority for the assignee agent", async () => {
+      const issue = seededIssue(storedReleaseAssuranceRaw, "Alias arm as assignee agent");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitor: aliasMonitor });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(patch.executionPolicy).toEqual(
+        normalizeIssueExecutionPolicy(
+          { ...storedReleaseAssuranceRaw, monitor: { ...aliasMonitor, scheduledBy: "assignee" } },
+          { allowReleaseAssuranceAuthority: true },
+        ),
+      );
+      expect(patch.preservedStoredApprovalAuthority).toBe(true);
+    });
+
+    it("still refuses a caller-supplied executionPolicy that selects the release-assurance authority", async () => {
+      const issue = seededIssue(storedReleaseAssuranceRaw, "Nested selection refused");
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await createApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ executionPolicy: { ...storedReleaseAssuranceRaw, monitor: aliasMonitor } });
+
+      // The scoped trust exists only for the alias translation of the STORED
+      // policy; the nested spelling normalizes caller-supplied data and the
+      // authority selection is refused exactly as before.
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain("release_assurance");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
   });
 
   it("rejects board-authored in_review transitions without a review path", async () => {
