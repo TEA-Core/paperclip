@@ -12198,9 +12198,9 @@ export function issueService(db: Db) {
           const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
           await issueThreadInteractionService(tx).expireConnectionIntentsForOwnershipChange(updated);
         }
-        if (existing.status !== updated.status) {
+        if (receiptExisting.status !== updated.status) {
           if (
-            (existing.status === "done" || existing.status === "cancelled") &&
+            (receiptExisting.status === "done" || receiptExisting.status === "cancelled") &&
             updated.status !== "done" &&
             updated.status !== "cancelled"
           ) {
@@ -12231,7 +12231,7 @@ export function issueService(db: Db) {
                 entityId: workspace.id,
                 details: {
                   sourceIssueId: updated.id,
-                  previousIssueStatus: existing.status,
+                  previousIssueStatus: receiptExisting.status,
                   nextIssueStatus: updated.status,
                   workspaceAction: "left_archived",
                 },
@@ -12239,6 +12239,31 @@ export function issueService(db: Db) {
             }
           }
           if (updated.status === "done" || updated.status === "cancelled") {
+            const cancelledAt = new Date();
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "cancelled",
+                finishedAt: cancelledAt,
+                error: "Issue closed before deferred execution",
+                updatedAt: cancelledAt,
+              })
+              .where(
+                and(
+                  eq(agentWakeupRequests.companyId, updated.companyId),
+                  eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                  wakeRequestTargetsIssue(updated.id),
+                  sql`not exists (
+                    select 1
+                    from jsonb_array_elements_text(
+                      coalesce(${agentWakeupRequests.payload}->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb)
+                    ) as wake_comment(id)
+                    join ${issueComments} on wake_comment.id = ${issueComments.id}::text
+                    where ${issueComments.issueId} = ${updated.id}
+                      and ${issueComments.authorUserId} is not null
+                  )`,
+                ),
+              );
             await finalizeSummarySlotsForTerminalIssue(tx, updated);
             // Every terminal transition funnels through here, including direct
             // service callers (tree control, recovery, pipelines, status cards)
