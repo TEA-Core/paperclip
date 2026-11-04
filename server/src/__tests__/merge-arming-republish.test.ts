@@ -5399,6 +5399,41 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     return (row!.executionState ?? {})?.delivery;
   }
 
+  it("refuses a board deliveryIdentity write on a card that is not in review, and accepts it on a card in review (mutant D3)", async () => {
+    // Pins the board-refresh guard in the deliveryIdentity write gate: a
+    // board actor may refresh the record only while the card is already
+    // in_review. Dropping or inverting that status condition lets a board
+    // write persist a delivery record on a card in any other state.
+    const write = () => ({
+      deliveryIdentity: {
+        repo: { owner: OWNER, repo: REPO },
+        branch: "SUP-14824-branch",
+        headSha: HEAD_SHA,
+      },
+    });
+    // One card throughout: the company issue prefix is globally unique, so
+    // the card's status is flipped directly between attempts. A refused
+    // write persists nothing, so each attempt starts from the same record.
+    const { companyId, issueId } = await seedIssue({ status: "todo" });
+    currentActor = boardActor(companyId);
+    for (const status of ["todo", "blocked", "done", "in_progress"]) {
+      await db.update(issues).set({ status }).where(eq(issues.id, issueId));
+
+      const res = await request(app).patch(`/api/issues/${issueId}`).send(write());
+
+      expect(res.status, `${status}: ${JSON.stringify(res.body)}`).toBe(422);
+      expect(res.body.code).toBe("delivery_identity_write_rejected");
+      expect(await recordedDeliveryOf(issueId)).toBeUndefined();
+    }
+
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, issueId));
+
+    const res = await request(app).patch(`/api/issues/${issueId}`).send(write());
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect((await recordedDeliveryOf(issueId) as Record<string, unknown>).branch).toBe("SUP-14824-branch");
+  });
+
   it("persists a card-anchored board-stamped branch onto the card's own project_primary row that lost its branch", async () => {
     const { companyId, issueId } = await seedIssue({
       status: "in_review",
