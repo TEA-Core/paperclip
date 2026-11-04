@@ -275,11 +275,14 @@ separate `PATCH`es, rebind first, but only where the rebind actually binds (the
 gates listed under the terminal-carrier arm below). Under the default
 configuration (`enableIsolatedWorkspaces` off) a rebind is silently dropped, so
 rebind-first does not work in the `project_primary` arm: the stamp is written
-onto the `project_primary` row the card already holds, with no rebind. A
-`project_primary` board stamp that carries an explicit `executionWorkspaceId`
-is refused with `422` `workspace_issue_override_disallowed` only with
-`enableIsolatedWorkspaces` on and when the project policy sets
-`executionWorkspacePolicy.allowIssueOverride` to `false`; with the flag off the
+onto the `project_primary` row the card already holds, with no rebind. With
+`enableIsolatedWorkspaces` on and a project policy that sets
+`executionWorkspacePolicy.allowIssueOverride` to `false`, a `project_primary`
+stamp that writes the branch onto the card's branchless row is refused with
+`422` `workspace_issue_override_disallowed` whether or not the request names an
+`executionWorkspaceId`: the route re-supplies the stored workspace id on that
+write, and the policy check counts it as an override. This applies to the board
+refresh and to the agent's entry-into-review write alike. With the flag off the
 id is dropped from the patch before that policy check and the stamp proceeds on
 the row the card already holds. When the
 rebind does bind, the record is validated against (and, for a `project_primary`
