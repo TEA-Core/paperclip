@@ -4,6 +4,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   companyMemberships,
@@ -393,6 +394,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(agentWakeupRequests);
     await db.delete(issueComments);
     await db.delete(issueThreadInteractions);
     await db.delete(issueRelations);
@@ -723,6 +725,73 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       interactionId,
       interactionKind: "ask_user_questions",
       interactionStatus: "expired",
+    });
+  });
+
+  it.each(["done", "cancelled"] as const)("cancels pending deferred wakes when an issue becomes %s", async (status) => {
+    const companyId = await seedAssignableAgentCompany();
+    const agentId = randomUUID();
+    await db.insert(agents).values(agentRow(companyId, {
+      id: agentId,
+      name: "DeferredWakeAgent",
+    }));
+    const issue = await svc.create(companyId, {
+      title: "Close me with a deferred wake",
+      description: null,
+      status: "todo",
+      priority: "medium",
+    });
+    const otherIssueId = randomUUID();
+    const [targetWake, unrelatedWake, queuedWake] = await db.insert(agentWakeupRequests).values([
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_execution_deferred",
+        status: "deferred_issue_execution",
+        payload: { issueId: issue.id },
+      },
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_execution_deferred",
+        status: "deferred_issue_execution",
+        payload: { issueId: otherIssueId },
+      },
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_commented",
+        status: "queued",
+        payload: { issueId: issue.id },
+      },
+    ]).returning();
+
+    const updated = await svc.update(issue.id, { status, actorUserId: "local-board" });
+    expect(updated?.status).toBe(status);
+
+    const wakes = await db
+      .select({
+        id: agentWakeupRequests.id,
+        status: agentWakeupRequests.status,
+        finishedAt: agentWakeupRequests.finishedAt,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, companyId));
+    const wakesById = new Map(wakes.map((wake) => [wake.id, wake]));
+    expect(wakesById.get(targetWake!.id)).toMatchObject({
+      status: "cancelled",
+      finishedAt: expect.any(Date),
+    });
+    expect(wakesById.get(unrelatedWake!.id)).toMatchObject({
+      status: "deferred_issue_execution",
+      finishedAt: null,
+    });
+    expect(wakesById.get(queuedWake!.id)).toMatchObject({
+      status: "queued",
+      finishedAt: null,
     });
   });
 

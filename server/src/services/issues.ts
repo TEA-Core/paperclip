@@ -12239,6 +12239,22 @@ export function issueService(db: Db) {
             }
           }
           if (updated.status === "done" || updated.status === "cancelled") {
+            const cancelledAt = new Date();
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "cancelled",
+                finishedAt: cancelledAt,
+                error: "Issue closed before deferred execution",
+                updatedAt: cancelledAt,
+              })
+              .where(
+                and(
+                  eq(agentWakeupRequests.companyId, updated.companyId),
+                  eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                  wakeRequestTargetsIssue(updated.id),
+                ),
+              );
             await finalizeSummarySlotsForTerminalIssue(tx, updated);
             // Every terminal transition funnels through here, including direct
             // service callers (tree control, recovery, pipelines, status cards)
