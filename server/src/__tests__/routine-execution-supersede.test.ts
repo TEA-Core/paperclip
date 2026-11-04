@@ -116,6 +116,7 @@ describeEmbeddedPostgres("routine execution supersede on terminal done", () => {
         status: "active",
         concurrencyPolicy: "coalesce_if_active",
         catchUpPolicy: "skip_missed",
+        variables: [],
       },
       {},
     );
@@ -132,6 +133,7 @@ describeEmbeddedPostgres("routine execution supersede on terminal done", () => {
         status: "active",
         concurrencyPolicy: "coalesce_if_active",
         catchUpPolicy: "skip_missed",
+        variables: [],
       },
       {},
     );
