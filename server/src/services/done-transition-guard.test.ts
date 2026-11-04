@@ -5627,7 +5627,7 @@ describe("evaluateDoneTierDeclaration", () => {
             cb(null, "true");
             return;
           }
-          cb(null, "");
+          cb(null, args.includes("status") ? "" : "1");
         },
       );
       const result = await evaluateDoneTierDeclaration(
