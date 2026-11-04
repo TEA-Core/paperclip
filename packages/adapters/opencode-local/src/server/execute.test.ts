@@ -1086,7 +1086,7 @@ describe("execute — OpenCode V2 serve transport", () => {
     expect(requests.some((entry) => entry.path === "/api/session/ses_fake/prompt")).toBe(true);
     expect(metadata[0]?.commandArgs?.slice(0, 5)).toEqual(["serve", "--hostname", "127.0.0.1", "--port", "0"]);
     expect(metadata[0]?.commandNotes?.join("\n")).toContain("opencode serve");
-    expect(metadata[0]?.commandNotes?.join("\n")).toContain("waits for mcp.resources.changed from 1 injected MCP server(s)");
+    expect(metadata[0]?.commandNotes?.join("\n")).toContain("waits for 1 injected MCP server(s) to report connected and remain quiet");
     expect(logs).not.toContain("one-shot");
     expect(JSON.stringify({ logs, result })).not.toContain(token);
   });
@@ -1106,14 +1106,16 @@ describe("execute — OpenCode V2 serve transport", () => {
     expect(metadata[0]?.commandNotes?.join("\n")).not.toContain("PAPERCLIP_OPENCODE_PRINT_LOGS");
   });
 
-  it("does not describe a readiness gate when no MCP server was injected", async () => {
-    const { result, metadata } = await runServe({}, { mcp: false });
+  it("does not touch or wait on the readiness gate when no MCP server was injected", async () => {
+    const { result, metadata, requests } = await runServe({}, { mcp: false });
 
     expect(result.exitCode).toBe(0);
     const notes = metadata[0]?.commandNotes?.join("\n") ?? "";
     expect(notes).toContain("opencode serve");
     expect(notes).toContain("no MCP server was injected");
-    expect(notes).not.toContain("mcp.resources.changed");
+    expect(notes).not.toContain("remain quiet");
+    expect(requests.some((entry) => entry.path === "/api/mcp")).toBe(false);
+    expect(requests.some((entry) => entry.method === "POST" && entry.path === "/api/session")).toBe(true);
   });
 
   it("reports a failed turn's provider message as the errorMessage", async () => {

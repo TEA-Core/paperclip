@@ -15,6 +15,11 @@ import {
   parseOpenCodeJsonl,
   type OpenCodeServeTurnOutcome,
 } from "./parse.js";
+import {
+  OPENCODE_MCP_QUIESCENCE_MS,
+  OPENCODE_MCP_READY_DEADLINE_MS,
+  waitForOpenCodeMcpReady,
+} from "./mcp-readiness-gate.js";
 
 /**
  * OpenCode V2 server transport.
@@ -25,23 +30,13 @@ import {
  * `opencode serve` lets the adapter start the server, wait for the MCP servers
  * it injected, and only then create the session and send the prompt.
  *
- * The readiness gate is TIMER-BASED BY NECESSITY: OpenCode 2.2.4 exposes no
- * endpoint or event that says a new session will see an MCP server's tools.
- * `mcp.resources.changed` precedes tool availability by a short unmarked
- * interval (prompting immediately carried the tools in 0 of 5 lab runs;
- * +100, +250 and +500 ms after the event carried them in 5 of 5 each). The gate
- * waits for that event from every injected server, settles, and fails the run
- * closed when the event never arrives. On a loaded host the settle can be too
- * short, which starts a run WITHOUT its Paperclip tools.
+ * The readiness gate requires every injected server to report `connected`,
+ * then holds until the MCP event stream has stayed quiescent for the validated
+ * quiet window. It fails closed before session creation on a deadline, stream
+ * failure, or stream closure.
  */
 
-/** Longest wait for `mcp.resources.changed` from every injected MCP server. */
-export const OPENCODE_SERVE_MCP_READY_TIMEOUT_MS = 15_000;
-/** Settle after the event; 0 ms failed 5/5 in the lab, 100+ ms passed 5/5. */
-export const OPENCODE_SERVE_MCP_SETTLE_MS = 1_000;
 const SERVE_START_TIMEOUT_MS = 30_000;
-/** Longest wait for the MCP status read that explains a failed readiness gate. */
-const MCP_STATUS_READ_TIMEOUT_MS = 1_000;
 const SERVER_USERNAME = "opencode";
 // The text `opencode run` gives the model when it auto-rejects a permission request.
 const PERMISSION_REJECT_MESSAGE =
@@ -95,10 +90,6 @@ export function redactOpenCodeServeSecrets(text: string, secrets: string[]): str
     if (secret.length >= 4) result = result.split(secret).join("[redacted]");
   }
   return result;
-}
-
-function sleep(ms: number) {
-  return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
 interface Deferred<T> {
@@ -171,7 +162,7 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
   const secrets = [password, credential, ...input.mcpServers.map((server) => server.token)];
   const redact = (text: string) => redactOpenCodeServeSecrets(text, secrets);
   const authorization = `Basic ${credential}`;
-  const readyTimeoutMs = input.mcpReadyTimeoutMs ?? OPENCODE_SERVE_MCP_READY_TIMEOUT_MS;
+  const readyTimeoutMs = input.mcpReadyTimeoutMs ?? OPENCODE_MCP_READY_DEADLINE_MS;
 
   let stdout = "";
   let stderr = "";
@@ -229,8 +220,6 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
   let failure: string | null = null;
   let boundSessionId: string | null = null;
   let cancelledQuestion: string | null = null;
-  const seenResourceServers = new Set<string>();
-  const readyWaiters: Array<() => void> = [];
   const eventState = createOpenCodeServeEventState();
 
   let base = "";
@@ -241,31 +230,6 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
       signal: abort.signal,
     });
     return { status: response.status, text: await response.text() };
-  };
-
-  // `GET /api/mcp` only starts MCP on the first call; the servers' own states
-  // appear in it a moment later. Read it once a gate has failed, to say why.
-  const describeMcpStatus = async () => {
-    const readTimer = timeout(MCP_STATUS_READ_TIMEOUT_MS);
-    let entries: unknown[] = [];
-    try {
-      const reply = await Promise.race([request("/api/mcp"), readTimer.promise]);
-      const data = reply === "timeout" ? null : parseObject(safeJson(reply.text)).data;
-      if (Array.isArray(data)) entries = data;
-    } catch {
-      // A diagnostic only: the gate has already failed without it.
-    } finally {
-      readTimer.cancel();
-    }
-    const statusByName = new Map(entries.map((entry) => [asString(parseObject(entry).name, ""), parseObject(parseObject(entry).status)]));
-    return input.mcpServers
-      .map((server) => {
-        const status = statusByName.get(server.name);
-        if (!status) return `${server.name}: not reported`;
-        const error = asString(status.error, "").slice(0, 200);
-        return `${server.name}: ${asString(status.status, "unknown")}${error ? ` (${error})` : ""}`;
-      })
-      .join("; ");
   };
 
   // A headless `opencode run` answers an interactive request itself because
@@ -315,12 +279,7 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     const event = parseObject(envelope);
     const data = parseObject(event.data);
     const type = asString(event.type, "");
-    if (type === "mcp.resources.changed") {
-      const name = asString(data.server, "");
-      if (name) seenResourceServers.add(name);
-      for (const wake of readyWaiters.splice(0)) wake();
-      return;
-    }
+    if (type === "mcp.resources.changed" || type === "mcp.status.changed") return;
     // The server is private to this run, so a child or subagent session's
     // request is the run's too and would hold the turn open just the same.
     if (type === "permission.asked") {
@@ -414,39 +373,15 @@ export async function runOpenCodeServeProcess(input: OpenCodeServeInput): Promis
     connectTimer.cancel();
     if (connectResult !== "connected") throw new ServeTransportError(`OpenCode event stream did not connect (${connectResult})`);
 
-    // First location-scoped request: this is what makes OpenCode start MCP.
-    // The readiness deadline covers it, so a request that blocks while the MCP
-    // servers come up cannot outlast the bound.
-    const deadline = Date.now() + readyTimeoutMs;
-    const touchTimer = timeout(readyTimeoutMs);
-    const touched = await Promise.race([request("/api/mcp").then(() => "touched" as const), serverExited, touchTimer.promise]);
-    touchTimer.cancel();
-    if (touched === "server-exited") throw new ServeTransportError("OpenCode server stopped while starting its MCP servers");
-    if (touched === "timeout") {
-      throw new ServeTransportError(`OpenCode did not answer its MCP status request within ${readyTimeoutMs / 1000}s; the run was not started.`);
-    }
-
     if (input.mcpServers.length > 0) {
-      const missing = () => input.mcpServers.filter((entry) => !seenResourceServers.has(entry.name)).map((entry) => entry.name);
-      while (missing().length > 0) {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) {
-          throw new ServeTransportError(
-            `OpenCode did not report mcp.resources.changed for MCP server(s) ${missing().join(", ")} within ` +
-              `${readyTimeoutMs / 1000}s (reported status: ${await describeMcpStatus()}); ` +
-              `the run was not started because it would have begun without its Paperclip tools.`,
-          );
-        }
-        const wake = deferred<void>();
-        readyWaiters.push(wake.resolve);
-        const tick = timeout(remaining);
-        const reason = await Promise.race([wake.promise.then(() => "event" as const), serverExited, pumpEnded, tick.promise]);
-        tick.cancel();
-        if (reason === "server-exited" || reason === "stream-closed") {
-          throw new ServeTransportError("OpenCode server stopped while waiting for its MCP servers");
-        }
-      }
-      await sleep(input.mcpSettleMs ?? OPENCODE_SERVE_MCP_SETTLE_MS);
+      await waitForOpenCodeMcpReady({
+        baseUrl: base,
+        authorization,
+        servers: input.mcpServers.map((entry) => entry.name),
+        deadlineMs: readyTimeoutMs,
+        quiescenceMs: input.mcpSettleMs ?? OPENCODE_MCP_QUIESCENCE_MS,
+        signal: abort.signal,
+      });
     }
 
     const model = parseOpenCodeServeModel(input.model, input.variant);

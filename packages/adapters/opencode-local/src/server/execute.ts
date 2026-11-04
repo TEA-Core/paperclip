@@ -69,8 +69,10 @@ import {
   parseOpenCodeJsonl,
 } from "./parse.js";
 import {
-  OPENCODE_SERVE_MCP_READY_TIMEOUT_MS,
-  OPENCODE_SERVE_MCP_SETTLE_MS,
+  OPENCODE_MCP_QUIESCENCE_MS,
+  OPENCODE_MCP_READY_DEADLINE_MS,
+} from "./mcp-readiness-gate.js";
+import {
   buildOpenCodeServeArgs,
   runOpenCodeServeProcess,
 } from "./serve-transport.js";
@@ -1456,8 +1458,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       commandNotes.push(
         `Running OpenCode V2 through a private \`opencode serve\` (loopback, per-run port and password); ` +
           (runtimeMcpServers.length > 0
-            ? `the first prompt waits for mcp.resources.changed from ${runtimeMcpServers.length} injected MCP server(s) plus ` +
-              `${OPENCODE_SERVE_MCP_SETTLE_MS} ms (timer-based gate, fails the run after ${OPENCODE_SERVE_MCP_READY_TIMEOUT_MS / 1000}s).`
+            ? `the first prompt waits for ${runtimeMcpServers.length} injected MCP server(s) to report connected and remain quiet for ` +
+              `${OPENCODE_MCP_QUIESCENCE_MS}ms (fails after ${OPENCODE_MCP_READY_DEADLINE_MS / 1000}s).`
             : `no MCP server was injected, so the first prompt does not wait.`),
       );
       if (printLogs) {

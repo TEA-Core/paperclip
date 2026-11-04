@@ -10,6 +10,7 @@ const mcpName = process.env.FAKE_MCP_NAME ?? "";
 // Authorization header it receives, and this token.
 const leakToken = process.env.FAKE_SECRET ?? "";
 const clients = new Set();
+let mcpStarted = false;
 const push = (type, data) => {
   for (const res of clients) res.write(`data: ${JSON.stringify({ id: `evt_${Math.random()}`, type, data })}\n\n`);
 };
@@ -33,14 +34,21 @@ const server = http.createServer(async (req, res) => {
     clients.add(res);
     res.on("close", () => clients.delete(res));
     res.write(`data: ${JSON.stringify({ id: "evt_0", type: "server.connected", data: {} })}\n\n`);
+    if (process.env.FAKE_CLOSE_EVENT === "1") setTimeout(() => res.end(), 20);
     return;
   }
   if (req.url === "/api/mcp") {
     if (process.env.FAKE_HANG_MCP === "1") return;
-    if (mcpName && process.env.FAKE_NO_MCP_EVENT !== "1") {
+    if (mcpName && !mcpStarted && process.env.FAKE_NO_MCP_EVENT !== "1") {
+      mcpStarted = true;
       setTimeout(() => push("mcp.resources.changed", { server: mcpName }), 100);
     }
-    return json(200, { location: { directory: process.cwd() }, data: JSON.parse(process.env.FAKE_MCP_STATUS ?? "[]") });
+    const data = process.env.FAKE_MCP_STATUS
+      ? JSON.parse(process.env.FAKE_MCP_STATUS)
+      : mcpName && process.env.FAKE_NO_MCP_EVENT !== "1"
+        ? [{ name: mcpName, status: { status: "connected" } }]
+        : [];
+    return json(200, { location: { directory: process.cwd() }, data });
   }
   if (req.url === "/api/session" && req.method === "POST") return json(200, { data: { id: "ses_fake" } });
   const sessionMatch = /^\/api\/session\/([^/]+)(\/.*)?$/.exec(req.url);
