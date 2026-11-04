@@ -1,4 +1,6 @@
 import { execFile } from "node:child_process";
+import { lstat } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { and, eq, inArray } from "drizzle-orm";
 import {
   agents,
@@ -457,18 +459,35 @@ async function worktreeHasUncommittedContent(worktreePath: string): Promise<bool
   }
 }
 
+async function findGitMarker(workspacePath: string): Promise<boolean | null> {
+  let currentPath = resolve(workspacePath);
+  while (true) {
+    try {
+      await lstat(join(currentPath, ".git"));
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
+    }
+    const parentPath = dirname(currentPath);
+    if (parentPath === currentPath) return false;
+    currentPath = parentPath;
+  }
+}
+
 async function isGitCheckout(workspacePath: string): Promise<boolean | null> {
-  return new Promise((resolve) => {
+  const hasGitMarker = await findGitMarker(workspacePath);
+  if (hasGitMarker === null) return null;
+  return new Promise((resolveResult) => {
     execFile(
       "git",
       ["-C", workspacePath, "rev-parse", "--is-inside-work-tree"],
       GIT_PROBE_OPTIONS,
       (error, stdout, stderr) => {
         if (!error) {
-          resolve(stdout.trim() === "true");
+          resolveResult(stdout.trim() === "true");
           return;
         }
-        resolve(stderr.includes("not a git repository") ? false : null);
+        resolveResult(stderr.includes("not a git repository") && !hasGitMarker ? false : null);
       },
     );
   });

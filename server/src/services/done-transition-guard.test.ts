@@ -5549,6 +5549,32 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.tier).toBe("tier1");
     });
 
+    it("refuses no-repository landing when Git metadata exists but checkout verification fails", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ strategyType: "adapter_managed", providerType: "local_fs", cwd: process.cwd() })],
+        issueDocuments: [{ companyId: "company-1", issueId: "issue-1", key: "entry-ruling", documentId: "doc-entry-ruling" }],
+        documents: [{ id: "doc-entry-ruling", latestBody: "Recorded ruling" }],
+      });
+      mockExecFile.mockImplementation(
+        (_file: string, _args: string[], _opts: unknown, cb: (err: Error) => void) => {
+          cb(new Error("damaged git metadata"));
+        },
+      );
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        renderDoneTierDeclaration(null, {
+          tier: "tier1",
+          reason: "The entry ruling is recorded",
+          landing: { mode: "noRepositoryLanding" },
+        }),
+        null,
+        async () => [],
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("could not verify the Git worktree status");
+    });
+
     it("rejects no-repository landing when the execution workspace belongs to another company", async () => {
       setupDbMock({
         executionWorkspaces: [mockExecutionWorkspaceRow({ companyId: "company-2" })],
