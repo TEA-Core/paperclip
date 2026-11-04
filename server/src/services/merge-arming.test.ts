@@ -2185,6 +2185,36 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       }
     });
 
+    // D3 (restored): the mention-carrier acceptance turns on the live
+    // `merged` answer alone (the e82cb201 semantics restored by the round-7
+    // RESTORE decision). An open-but-merged answer still carries, and an
+    // open-and-unmerged answer never does, so deleting the merged check or
+    // re-adding a closed-state requirement both go red here.
+    it("accepts the single mentioned carrier on a live merged answer even while state reads open (D3)", async () => {
+      const issueId = await insertMentionOnlyCard();
+      installRoutes(mergedCarrierRoutes(mergedMentionBody({ state: "open" })));
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") {
+        expect(result.headSha).toBe(APPROVED_HEAD);
+        expect(result.pr).toEqual({ owner: OWNER, repo: REPO, number: 42 });
+      }
+    });
+
+    it("keeps refusing when the mentioned PR is open and NOT merged (D3)", async () => {
+      const issueId = await insertMentionOnlyCard();
+      installRoutes(mergedCarrierRoutes(mergedMentionBody({ state: "open", merged: false })));
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toBe("no-pr: no open linked PR resolvable at decision time");
+      }
+    });
+
     it("refuses ambiguously when TWO mentioned PRs are live-merged", async () => {
       const issueId = await insertIssue();
       await insertMention(issueId, { number: 42, state: "closed" });
@@ -2701,6 +2731,26 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       if (result.kind === "unresolvable") {
         expect(result.reason).toContain("belongs to fork-owner/");
       }
+    });
+
+    it("resolves a merged-only bound PR whose head repository differs only by case", async () => {
+      // GitHub owner/repo names are case-insensitive identifiers for the
+      // same repository, so the head.repo rule refuses a different
+      // repository, not a different casing of this one.
+      const issueId = await insertTerminalCarrierChild();
+      const body = carrierMergedPrBody();
+      body.head.repo = { full_name: `${OWNER.toUpperCase()}/${REPO.toUpperCase()}` };
+      installRoutes([
+        { url: PR_URL, body },
+        { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+        REFS_MAIN_ROUTE,
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("resolved");
+
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight.kind).toBe("resolved");
     });
 
     it.each([

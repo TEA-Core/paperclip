@@ -1640,6 +1640,84 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       expect(await statusOf(issueId)).toBe("in_review");
     });
 
+    it("refuses the recovery close for a legacy record whose branch is git-invalid, even with a proven merged PR (read-side validation)", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("R21598D");
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      // A legacy record seeded before the write boundary existed: its branch
+      // is a percent-encoded traversal git itself refuses, and the carrier
+      // row carries the same string, so every other gate (branch equality,
+      // carrier ownership, merged-and-proven PR) would pass. Only the
+      // read-side branch validation in the resolver refuses it; dropping
+      // that check closes the card with 200.
+      const invalidBranch = "R21598Q-1-%2F..";
+      const [seededIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const carrierOwnerId = randomUUID();
+      await db.insert(issues).values({
+        id: carrierOwnerId,
+        companyId,
+        identifier: "R21598Q-1",
+        issueNumber: 98,
+        title: "Terminal carrier owner (legacy invalid branch)",
+        status: "done",
+        priority: "medium",
+        createdByUserId: "cloud-user-1",
+      });
+      await db
+        .update(executionWorkspaces)
+        .set({ sourceIssueId: carrierOwnerId, mode: "shared_workspace", branchName: invalidBranch })
+        .where(eq(executionWorkspaces.id, seededIssue!.executionWorkspaceId!));
+      await db
+        .update(issues)
+        .set({
+          parentId: carrierOwnerId,
+          executionState: {
+            ...(seededIssue!.executionState as Record<string, unknown>),
+            delivery: {
+              repo: { owner: "TEA-Core", repo: "paperclip" },
+              branch: invalidBranch,
+              headSha: certifiedDelivery.headSha,
+              prNumber: 404,
+              prUrl: "https://github.com/TEA-Core/paperclip/pull/404",
+            },
+          },
+        })
+        .where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 0, status: "identical" }), { status: 200 });
+        if (url.includes("/git/refs/heads/")) return new Response(JSON.stringify({ object: { sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" } }), { status: 200 });
+        if (url.includes("/pulls?")) {
+          return new Response(JSON.stringify([{
+            number: 404, draft: false, merged: true, merged_at: "2026-08-29T00:11:06Z",
+            head: { ref: invalidBranch, sha: certifiedDelivery.headSha },
+            title: "Legacy invalid-branch PR", body: null,
+          }]), { status: 200 });
+        }
+        if (url.includes("/pulls/")) {
+          return new Response(JSON.stringify({
+            state: "closed", merged: true, draft: false, title: "Legacy invalid-branch PR",
+            merge_commit_sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19",
+            head: { sha: certifiedDelivery.headSha, ref: invalidBranch, repo: { full_name: "TEA-Core/paperclip" } },
+            base: { ref: "main" },
+          }), { status: 200 });
+        }
+        if (url.includes("/commits/")) return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      certifiedDelivery.useRealPreflight = true;
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send(closeBody);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("approval_final_delivery_preflight");
+      expect(await statusOf(issueId)).toBe("in_review");
+    });
+
     it("lets an accepted merged-elsewhere doneTransitionOverride clear the preflight and close the card", async () => {
       const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("R21598B");
       const runId = await seedRun(companyId, reviewerAgentId, issueId);

@@ -5530,6 +5530,7 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     ["a lower-case percent-encoded dot pair", "SUP-14824-1-%2e%2e/x"],
     ["a newline", "SUP-14824-1-line\nbreak"],
     ["a NUL character", "SUP-14824-1-nul\u0000byte"],
+    ["a lone surrogate", "SUP-14824-1-\uD800x"],
   ])("refuses a board delivery record whose branch is git-invalid (%s) with 422, persisting nothing", async (_label, branch) => {
     const { companyId, issueId } = await seedIssue({ status: "in_review" });
     currentActor = boardActor(companyId);
