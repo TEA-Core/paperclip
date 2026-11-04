@@ -381,7 +381,7 @@ async function resolveGitHubRefHeadSha(
 }
 
 const GIT_PROBE_OPTIONS = (() => {
-  const env = { ...process.env, LC_ALL: "C" };
+  const env: NodeJS.ProcessEnv = { ...process.env, LC_ALL: "C" };
   for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"]) {
     delete env[key];
   }
