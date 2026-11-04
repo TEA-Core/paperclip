@@ -764,6 +764,63 @@ describeEmbeddedPostgres("attention service", () => {
     });
   });
 
+  it("deduplicates repeated recovery incidents before raising a rate alert", async () => {
+    const { companyId, workerId } = await seedCompany("ARR");
+    const sourceIssueId = await insertIssue({
+      companyId,
+      identifier: "ARR-1",
+      title: "Flapping recovery source",
+      status: "done",
+    });
+    const now = new Date("2026-07-15T12:00:00.000Z");
+    const createdAt = new Date("2026-07-08T12:00:00.000Z");
+    await db.insert(heartbeatRuns).values(
+      Array.from({ length: 100 }, () => ({
+        id: randomUUID(),
+        companyId,
+        agentId: workerId,
+        invocationSource: "assignment",
+        status: "succeeded",
+        createdAt,
+      })),
+    );
+    const recoveryAction = (fingerprint: string) => ({
+      id: randomUUID(),
+      companyId,
+      sourceIssueId,
+      kind: "legacy_execution_requires_reconciliation",
+      status: "resolved",
+      outcome: "restored",
+      ownerType: "agent",
+      ownerAgentId: workerId,
+      cause: "legacy_execution_requires_reconciliation",
+      fingerprint,
+      evidence: {},
+      nextAction: "recover",
+      createdAt,
+      updatedAt: createdAt,
+    });
+    await db.insert(issueRecoveryActions).values(
+      Array.from({ length: 5 }, () => recoveryAction("legacy-execution:flap")),
+    );
+
+    const service = attentionService(db, { now: () => now });
+    const deduplicatedFeed = await service.list(companyId, { userId: "board-user" });
+    expect(deduplicatedFeed.items.some((item) => item.sourceKind === "recovery_rate_alert")).toBe(false);
+
+    await db.insert(issueRecoveryActions).values([
+      recoveryAction("legacy-execution:second"),
+      recoveryAction("legacy-execution:third"),
+    ]);
+    const breachedFeed = await service.list(companyId, { userId: "board-user" });
+    expect(breachedFeed.items.find((item) => item.sourceKind === "recovery_rate_alert")).toMatchObject({
+      subject: {
+        title: "Recovery rate 3% in week 2026-07-06 exceeds 2%",
+        metadata: { breachedWeeks: ["2026-07-06"] },
+      },
+    });
+  });
+
   it("returns addressed interactions to board attention after addressee pause or termination", async () => {
     const { companyId, reviewerId } = await seedCompany("ATF");
     const pausedReviewerId = randomUUID();
