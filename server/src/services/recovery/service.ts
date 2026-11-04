@@ -6345,7 +6345,7 @@ export function recoveryService(
           result.skipped += 1;
           continue;
         }
-        await recoveryActionsSvc.upsertSourceScoped({
+        const upserted = await recoveryActionsSvc.upsertSourceScoped({
           companyId: issue.companyId,
           sourceIssueId: issue.id,
           kind: "no_live_path_unowned",
@@ -6364,6 +6364,13 @@ export function recoveryService(
           maxAttempts: null,
           lastAttemptAt: now,
         });
+        // A terminal action of another kind owns the card, so the upsert
+        // returned it untouched. Logging an escalation anyway wrote one row per
+        // scheduler tick for the same card (SUP-22165: 1,568 rows in 14h).
+        if (upserted.kind !== "no_live_path_unowned") {
+          result.skipped += 1;
+          continue;
+        }
         result.noLivePathUnowned += 1;
         result.issueIds.push(issue.id);
         await logActivity(db, {
@@ -6510,7 +6517,7 @@ export function recoveryService(
           result.skipped += 1;
           continue;
         }
-        await recoveryActionsSvc.upsertSourceScoped({
+        const upserted = await recoveryActionsSvc.upsertSourceScoped({
           companyId: issue.companyId,
           sourceIssueId: issue.id,
           kind: "no_live_path_owner_unavailable",
@@ -6533,6 +6540,11 @@ export function recoveryService(
           maxAttempts: null,
           lastAttemptAt: now,
         });
+        // Same guard as no_live_path_unowned above: another kind still owns it.
+        if (upserted.kind !== "no_live_path_owner_unavailable") {
+          result.skipped += 1;
+          continue;
+        }
         result.noLivePathOwnerUnavailable += 1;
         result.issueIds.push(issue.id);
         await logActivity(db, {
@@ -9166,12 +9178,14 @@ export function recoveryService(
   // board-owned action is only a read-time attention projection — it has no
   // wake/ageing path of its own. Mint (or reuse) a durable recovery issue
   // owned by an invokable agent, link it from the action's `recoveryIssueId`,
-  // and enqueue a wake for the owner. The recovery issue is a first-class
+  // and wake the owner once, at mint only. The recovery issue is a first-class
   // non-terminal card: it ages through assignment/wake machinery, can be
   // escalated or resolved by its owner, and satisfies AC1's
-  // "non-terminal recoveryIssueId" evidence. Idempotent: the origin-scoped
-  // lookup reuses an open recovery issue for the source, and an explicit
-  // `recoveryIssueId` short-circuits re-creation.
+  // "non-terminal recoveryIssueId" evidence. Idempotent: at most one card per
+  // (source, recovery action), ever. The lookup finds it by its
+  // `exhausted_recovery:<actionId>` fingerprint in any status (a card its
+  // owner closed is not re-minted), else reuses an open recovery issue for
+  // the source. A reused card is linked but never re-woken.
   // Returns the recovery issue's id, or null when no invokable owner exists
   // (in which case the escalation itself remains the board's item — there is
   // no agent to wake, and no wake can be honestly claimed).
@@ -9184,8 +9198,9 @@ export function recoveryService(
   // non-terminal source the same live path the exhaustion/drain paths give:
   // a future board monitor when the source is monitor-dispatchable, else a
   // durable non-terminal `recoveryIssueId` owned by an invokable agent.
-  // Idempotent: a source with a future monitor or an open linked recovery
-  // issue is left untouched, so repeat passes mint nothing and post nothing.
+  // Idempotent: a source with a future monitor or a linked recovery issue
+  // (open, or closed by its owner) is left untouched, so repeat passes mint
+  // nothing, wake nothing and post nothing.
   const EXHAUSTED_RECOVERY_DRAIN_CANDIDATE_LIMIT = 500;
 
   async function reconcileExhaustedRecoveryDrain(opts?: {
@@ -9387,17 +9402,33 @@ export function recoveryService(
       return true;
     };
 
-    const openRecoveryIssue = await findOpenRecoveryIssue();
-    if (openRecoveryIssue) {
-      if (openRecoveryIssue.id !== input.existingRecoveryIssueId) {
-        await linkRecoveryIssue(openRecoveryIssue.id);
+    // At most one exhausted-recovery card per (source, recovery action), ever.
+    // A card its owner closed, cancelled, or hid is that owner's disposition:
+    // re-minting it handed the same board decision straight back to the same
+    // owner (SUP-21999: four serial cards). Otherwise reuse any open recovery
+    // card for the source. The owner is woken once, when the card is minted;
+    // re-waking it on every drain pass only bought runs that re-parked the
+    // card (SUP-22447: 114 runs), so a reused card gets no wake.
+    const reusableRecoveryIssue =
+      (await db
+        .select()
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, input.issue.companyId),
+            eq(issues.originKind, RECOVERY_ORIGIN_KINDS.strandedIssueRecovery),
+            eq(issues.originId, input.issue.id),
+            eq(issues.originFingerprint, `exhausted_recovery:${input.recoveryActionId}`),
+          ),
+        )
+        .orderBy(desc(issues.createdAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null)) ?? (await findOpenRecoveryIssue());
+    if (reusableRecoveryIssue) {
+      if (reusableRecoveryIssue.id !== input.existingRecoveryIssueId) {
+        await linkRecoveryIssue(reusableRecoveryIssue.id);
       }
-      // A reused issue is not necessarily a live issue: its original wake may
-      // have failed, completed without disposition, or been skipped before the
-      // link was persisted. Re-drive only when no live wake remains so normal
-      // idempotent drain passes do not spam the owner.
-      await enqueueRecoveryIssueWake(openRecoveryIssue);
-      return openRecoveryIssue.id;
+      return reusableRecoveryIssue.id;
     }
 
     const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
@@ -9424,6 +9455,9 @@ export function recoveryService(
         originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
         originId: input.issue.id,
         originFingerprint: `exhausted_recovery:${input.recoveryActionId}`,
+        // The card records a board decision and never ships code, so its owner
+        // must be able to close it without a repository delivery.
+        deliveryRequirement: "record_only",
         billingCode: input.issue.billingCode,
       });
     } catch (error) {
@@ -9431,7 +9465,6 @@ export function recoveryService(
       const winningIssue = await findOpenRecoveryIssue();
       if (!winningIssue) throw error;
       if (winningIssue.id !== input.existingRecoveryIssueId) await linkRecoveryIssue(winningIssue.id);
-      await enqueueRecoveryIssueWake(winningIssue);
       return winningIssue.id;
     }
 
@@ -9869,7 +9902,7 @@ export function recoveryService(
         const healAttemptCount =
           (resolvedAction?.evidence?.healAttemptCount as number | undefined) ?? 0;
 
-        await recoveryActionsSvc.upsertSourceScoped({
+        const upserted = await recoveryActionsSvc.upsertSourceScoped({
           companyId,
           sourceIssueId: candidate.id,
           kind: "blocked_without_blockers",
@@ -9891,6 +9924,13 @@ export function recoveryService(
           maxAttempts: null,
           lastAttemptAt: now,
         });
+        // An exhausted action of another kind that the terminal-action guard
+        // above does not match still owns the card; the upsert returned it
+        // untouched, so there is no escalation to count or log on this tick.
+        if (upserted.kind !== "blocked_without_blockers") {
+          result.alreadyActionedSkipped++;
+          continue;
+        }
 
         result.escalated++;
         result.issueIds.push(candidate.id);
