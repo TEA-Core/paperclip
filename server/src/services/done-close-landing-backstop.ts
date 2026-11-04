@@ -1,4 +1,4 @@
-import { and, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, companies, issues } from "@paperclipai/db";
 import type { IssueUnblockDescriptor } from "@paperclipai/shared";
@@ -176,6 +176,7 @@ interface CandidateIssue {
   id: string;
   companyId: string;
   status: string;
+  deliveryRequirement?: "repository_delivery" | "record_only";
   identifier: string | null;
   assigneeAgentId: string | null;
   unblockDescriptor?: IssueUnblockDescriptor | null;
@@ -263,6 +264,7 @@ export function buildDiscoveryQuery(db: Db, windowStart: Date, discoveryCutoff: 
         id: issues.id,
         companyId: issues.companyId,
         status: issues.status,
+        deliveryRequirement: issues.deliveryRequirement,
         identifier: issues.identifier,
         assigneeAgentId: issues.assigneeAgentId,
         unblockDescriptor: issues.unblockDescriptor,
@@ -279,6 +281,7 @@ export function buildDiscoveryQuery(db: Db, windowStart: Date, discoveryCutoff: 
     .where(
       and(
         eq(activityLog.entityType, "issue"),
+        ne(issues.deliveryRequirement, "record_only"),
         or(
           and(
             eq(activityLog.action, SKIPPED_ACTION),
@@ -436,6 +439,7 @@ export function createDoneCloseLandingBackstopService(
     deps: { resolver: ExternalObjectResolver | null; svc: ReturnType<typeof issueService>; graceCutoff: Date },
   ) {
     const issue = row.issue;
+    if (issue.deliveryRequirement === "record_only") return;
     const details = readRecord(row.details);
     // SUP-15953: verdicts (confirmed/failed/escalated) require the full landing
     // grace. A candidate inside the wider re-enqueue window but outside this
