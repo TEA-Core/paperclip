@@ -271,10 +271,16 @@ the time of the request, so a `PATCH` that carries `deliveryIdentity` and also
 changes `executionWorkspaceId` is refused in every case (agent or board, own
 branch, `project_primary` stamp, no-workspace record, or terminal-carrier
 record) with `422 delivery_identity_branch_write_rejected`. Do the two as
-separate `PATCH`es, rebind first (the rebind is subject to the gates listed under
-the terminal-carrier arm below): the record is then validated against (and, for
-a `project_primary` stamp, written onto) the workspace the card will hold at
-approval. Recording first and rebinding second is not refused at write time, but
+separate `PATCH`es, rebind first, but only where the rebind actually binds (the
+gates listed under the terminal-carrier arm below). Under the default
+configuration (`enableIsolatedWorkspaces` off) a rebind is silently dropped, so
+rebind-first does not work in the `project_primary` arm: the stamp is written
+onto the `project_primary` row the card already holds, with no rebind. A
+`project_primary` board stamp that carries an explicit `executionWorkspaceId`
+is refused with `422` `workspace_issue_override_disallowed` when the project
+policy sets `executionWorkspacePolicy.allowIssueOverride` to `false`. When the
+rebind does bind, the record is validated against (and, for a `project_primary`
+stamp, written onto) the workspace the card will hold at approval. Recording first and rebinding second is not refused at write time, but
 a rebind does not revalidate a stored record, so it can leave a record the
 approval resolver refuses with `delivery_identity_unresolved` ("recorded delivery
 identity's branch does not match this card's control-plane delivery branch").

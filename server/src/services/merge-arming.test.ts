@@ -2623,6 +2623,18 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       }
     });
 
+    it.each([[401], [403]])("refuses a tag-only merged-only base when the branch read answers HTTP %i (mutant E4)", async (status) => {
+      const issueId = await insertTerminalCarrierChild({ baseRef: "v1.2.3" });
+      installRoutes([
+        { url: PR_URL, body: carrierMergedPrBody() },
+        { url: `https://api.github.com/repos/${OWNER}/${REPO}/git/refs/heads/v1.2.3`, ok: false, status },
+        { url: `https://api.github.com/repos/${OWNER}/${REPO}/compare/v1.2.3...${MERGE_SHA}`, body: { status: "identical", ahead_by: 0 } },
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+    });
+
     it.each([
       ["origin/main", "origin/main"],
       ["refs/remotes/origin/main", "refs/remotes/origin/main"],
