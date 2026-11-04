@@ -277,8 +277,11 @@ configuration (`enableIsolatedWorkspaces` off) a rebind is silently dropped, so
 rebind-first does not work in the `project_primary` arm: the stamp is written
 onto the `project_primary` row the card already holds, with no rebind. A
 `project_primary` board stamp that carries an explicit `executionWorkspaceId`
-is refused with `422` `workspace_issue_override_disallowed` when the project
-policy sets `executionWorkspacePolicy.allowIssueOverride` to `false`. When the
+is refused with `422` `workspace_issue_override_disallowed` only with
+`enableIsolatedWorkspaces` on and when the project policy sets
+`executionWorkspacePolicy.allowIssueOverride` to `false`; with the flag off the
+id is dropped from the patch before that policy check and the stamp proceeds on
+the row the card already holds. When the
 rebind does bind, the record is validated against (and, for a `project_primary`
 stamp, written onto) the workspace the card will hold at approval. Recording first and rebinding second is not refused at write time, but
 a rebind does not revalidate a stored record, so it can leave a record the
