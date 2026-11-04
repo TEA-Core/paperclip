@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { isValidGitBranchName } from "./execution-workspace-branch-ownership.js";
 
 describe("isValidGitBranchName", () => {
-  it.each(["SUP-1-100%", "SUP-1-fix-50%-cpu", "SUP-1-%zz", "SUP-1-50%2", "SUP-1-café-修正", "SUP-1-%41"])(
+  it.each(["SUP-1-100%", "SUP-1-fix-50%-cpu", "SUP-1-%zz", "SUP-1-50%2", "SUP-1-café-修正", "SUP-1-%41", "SUP-1-100%25", "SUP-1-%2541"])(
     "accepts %s, which git accepts",
     (name) => {
       expect(isValidGitBranchName(name)).toBe(true);
@@ -21,7 +21,13 @@ describe("isValidGitBranchName", () => {
     "SUP-1-../x",
     "",
     "@",
+    "SUP-1-%25252541",
   ])("refuses %j", (name) => {
     expect(isValidGitBranchName(name)).toBe(false);
+  });
+
+  it("refuses a deeply nested escape string without throwing", () => {
+    const nested = `SUP-1-%${"25".repeat(20_000)}`;
+    expect(isValidGitBranchName(nested)).toBe(false);
   });
 });
