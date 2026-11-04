@@ -1458,6 +1458,7 @@ export async function evaluateDoneTierDeclaration(
     projectId?: string | null;
     projectWorkspaceId?: string | null;
     executionWorkspaceId?: string | null;
+    deliveryRequirement?: IssueDeliveryRequirement | null;
   },
   accompanyingComment: string | null,
   runId: string | null,
