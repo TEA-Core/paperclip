@@ -445,8 +445,8 @@ async function countCommitsAhead(
  * attributable commits and no merged PR owes no observable repo content — the
  * no-repo-deliverable shape (design/spec cards whose acceptance is a recorded
  * decision, SUP-13873). Returns null when the probe is unreachable (path
- * missing, git failure) so callers fail open instead of blocking on an
- * unmeasured signal.
+ * missing, git failure) so callers can report that the state could not be
+ * verified.
  */
 async function worktreeHasUncommittedContent(worktreePath: string): Promise<boolean | null> {
   try {
@@ -970,12 +970,22 @@ async function proveNoRepositoryLanding(
         );
       }
       const dirty = await worktreeHasUncommittedContent(workspacePath);
-      if (dirty !== false) {
+      if (dirty === null) {
+        return refuseTier1(
+          'Tier 1 "no-repository-landing" could not verify the Git worktree status.',
+        );
+      }
+      if (dirty) {
         return refuseTier1(
           'Tier 1 "no-repository-landing" requires a clean Git worktree.',
         );
       }
       const aheadCount = await countCommitsAhead(workspacePath, workspace.baseRef);
+      if (aheadCount === null) {
+        return refuseTier1(
+          'Tier 1 "no-repository-landing" could not count commits ahead of the recorded base ref.',
+        );
+      }
       if (aheadCount !== 0) {
         return refuseTier1(
           'Tier 1 "no-repository-landing" requires a Git worktree with zero commits ahead of its base ref.',

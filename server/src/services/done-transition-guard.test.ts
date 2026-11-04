@@ -160,7 +160,9 @@ function conditionHasColumn(condition: unknown, table: unknown, columnName: stri
     if (seen.has(node)) return false;
     seen.add(node);
     const candidate = node as { table?: unknown; name?: unknown };
-    if (candidate.table === table && candidate.name === columnName) return true;
+    if ("table" in candidate && "name" in candidate) {
+      return candidate.table === table && candidate.name === columnName;
+    }
     return Reflect.ownKeys(node).some((key) => visit(Reflect.get(node, key)));
   };
   return visit(condition);
@@ -5748,6 +5750,58 @@ describe("evaluateDoneTierDeclaration", () => {
       );
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("clean");
+    });
+
+    it("rejects no-repository landing when Git status cannot be verified", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueDocuments: [{ companyId: "company-1", issueId: "issue-1", key: "entry-ruling", documentId: "doc-entry-ruling" }],
+        documents: [{ id: "doc-entry-ruling", latestBody: "Recorded ruling" }],
+      });
+      mockGitProbeUnavailable();
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        renderDoneTierDeclaration(null, {
+          tier: "tier1",
+          reason: "The entry ruling is recorded",
+          landing: { mode: "noRepositoryLanding" },
+        }),
+        null,
+        async () => [],
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("could not verify the Git worktree status");
+    });
+
+    it("rejects no-repository landing when Git ahead count cannot be verified", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueDocuments: [{ companyId: "company-1", issueId: "issue-1", key: "entry-ruling", documentId: "doc-entry-ruling" }],
+        documents: [{ id: "doc-entry-ruling", latestBody: "Recorded ruling" }],
+      });
+      mockExecFile.mockImplementation(
+        (_file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string) => void) => {
+          if (args.includes("status")) {
+            cb(null, "");
+            return;
+          }
+          cb(new Error("git not available"), "");
+        },
+      );
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        renderDoneTierDeclaration(null, {
+          tier: "tier1",
+          reason: "The entry ruling is recorded",
+          landing: { mode: "noRepositoryLanding" },
+        }),
+        null,
+        async () => [],
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("could not count commits ahead");
     });
 
     it("rejects no-repository landing when the own Git worktree is ahead of its base ref", async () => {
