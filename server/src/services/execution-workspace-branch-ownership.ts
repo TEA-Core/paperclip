@@ -20,12 +20,11 @@ export function isValidGitBranchName(name: string): boolean {
   if (name.includes("..") || name.includes("@{")) return false;
   // A percent-encoded form that decodes to an invalid name (for example
   // `%2F` for a slash, building `../` after decoding) is equally invalid.
-  try {
-    const decoded = decodeURIComponent(name);
-    if (decoded !== name && !isValidGitBranchName(decoded)) return false;
-  } catch {
-    return false;
-  }
+  // Only well-formed ASCII `%HH` escapes are decoded; a lone `%` stays literal.
+  const decoded = name.replace(/%([0-7][0-9a-fA-F])/g, (_match, hex: string) =>
+    String.fromCharCode(parseInt(hex, 16)),
+  );
+  if (decoded !== name && !isValidGitBranchName(decoded)) return false;
   if (name.startsWith("/") || name.endsWith("/") || name.includes("//")) return false;
   if (name.endsWith(".")) return false;
   for (const component of name.split("/")) {

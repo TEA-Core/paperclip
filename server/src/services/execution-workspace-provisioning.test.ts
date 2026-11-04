@@ -784,6 +784,29 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
     expect(persistedRows[0]!.branchName).toBe(recordedBranch);
   });
 
+  it.each(["100%", "fix-50%-cpu"])(
+    "carries a recorded delivery branch with a lone percent sign (%s) onto a fresh workspace",
+    async (suffix) => {
+      const { result, recordedBranch } = await provisionWithRecordedDeliveryBranch(
+        (issueIdentifier) => `${issueIdentifier}-${suffix}`,
+      );
+
+      expect(result.kind).toBe("provisioned");
+      if (result.kind !== "provisioned") return;
+      expect(result.persistedExecutionWorkspace!.branchName).toBe(recordedBranch);
+    },
+  );
+
+  it("does not carry a percent-encoded traversal recorded delivery branch onto a fresh workspace", async () => {
+    const { result } = await provisionWithRecordedDeliveryBranch(
+      (issueIdentifier) => `${issueIdentifier}-%2F..`,
+    );
+
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+    expect(result.persistedExecutionWorkspace!.branchName).toBeNull();
+  });
+
   it("does not carry a git-invalid recorded delivery branch onto a fresh workspace", async () => {
     const { result } = await provisionWithRecordedDeliveryBranch(
       (issueIdentifier) => `${issueIdentifier}-../x`,
