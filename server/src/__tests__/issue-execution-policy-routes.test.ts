@@ -2371,6 +2371,63 @@ describe("issue execution policy routes", () => {
       expect(written.executionPolicy?.monitor?.maxAttempts).toBe(100);
     });
 
+    // SUP-22890: the destructive shape. The SUP-13925 round-trip with the
+    // `monitor` key dropped used to return 200 while nulling executionPolicy
+    // and clearing the monitor — a silent wake loss on a monitor-only watcher.
+    // It must now 422 naming the field it would destroy, before any write.
+    it("rejects the stage-less round-trip that drops the monitor key, naming the monitor", async () => {
+      const issueId = randomUUID();
+      const issue = monitorOnlyIssue(issueId);
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockResolvedValue({ ...issue, executionPolicy: null } as any);
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            stages: [],
+          },
+        });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain("executionPolicy must not clear the issue's monitor");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    // SUP-22890 AC2: both monitor-bearing re-arm shapes must persist a
+    // non-null policy. The whole-object shape is covered above; this is the
+    // partial shape (`stages` omitted) from the field repro.
+    it("persists a non-null policy for the partial monitor re-arm with stages omitted", async () => {
+      const issueId = randomUUID();
+      const issue = monitorOnlyIssue(issueId);
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockResolvedValue(issue as any);
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            monitor: {
+              nextCheckAt: "2026-08-27T08:00:00.000Z",
+              notes: "ci-health digest",
+            },
+          },
+        });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+      const written = mockIssueService.update.mock.calls.at(-1)?.[1] as {
+        executionPolicy?: { stages?: unknown[]; monitor?: { nextCheckAt?: string } } | null;
+      };
+      expect(written.executionPolicy).not.toBeNull();
+      expect(written.executionPolicy?.stages).toEqual([]);
+      expect(written.executionPolicy?.monitor?.nextCheckAt).toBe("2026-08-27T08:00:00.000Z");
+    });
+
     it("rejects a PATCH that sets executionPolicy to null over a non-null stored policy and leaves it untouched", async () => {
       const issueId = randomUUID();
       const issue = ladderIssue(issueId);

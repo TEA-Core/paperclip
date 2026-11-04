@@ -582,11 +582,16 @@ export function normalizeIssueExecutionPolicy(
  * read that policy, edit `monitor.nextCheckAt`, and write the whole object
  * back. That round-trip carries an explicit `stages: []` and used to 422, which
  * left the only working re-arm path a partial `{monitor: {...}}` body that
- * relies on merge semantics. Permitting the round-trip grants no new
- * capability: over an already stage-less policy the identical stored result is
- * reachable today by omitting the `stages` key entirely, so the rejection was
- * blocking an idiom rather than defending the ladder. Over a policy that *has*
- * stages the rejection is unchanged — that is the case ADR-029/ADR-072 guard.
+ * relies on merge semantics. The round-trip is faithful ONLY while the body
+ * keeps carrying the `monitor` key. SUP-22890 falsified the original safety
+ * argument ("the identical stored result is reachable by omitting the `stages`
+ * key entirely"): omitting `stages` PRESERVES the stored stages (SUP-15377),
+ * while the same explicit `stages: []` body with `monitor` dropped normalizes
+ * to `null` (SUP-17459 no-ladder collapse) and silently destroys the watcher's
+ * only wake path. The null-collapse backstop below now protects a stored
+ * monitor, refusing that destructive round-trip with a 422 naming the monitor.
+ * Over a policy that *has* stages the rejection is unchanged — that is the
+ * case ADR-029/ADR-072 guard.
  *
  * SUP-15377: an omitted `stages` key is a preserve signal, not a clear. The
  * schema's `.default([])` silently turned every stage-less partial write —
@@ -624,10 +629,13 @@ export function assertPatchableExecutionPolicyWrite(input: {
   const { raw, currentPolicy, stagesExplicitlyEmpty, stagesKeyAbsent, executionState, rearmPointer } = input;
 
   // SUP-13925: only reject when there is a close ladder to strip. `stages: []`
-  // over a stored policy that is already stage-less is a faithful round-trip,
-  // not a removal. `currentPolicy === null` still rejects: there is no stored
-  // shape being round-tripped, so an explicit empty array there is the
-  // ladder-free policy the guard was written to keep off the board.
+  // over a stored policy that is already stage-less removes no stage, but it is
+  // a faithful round-trip only while the body keeps the policy's other content
+  // (most importantly `monitor`) intact — the null-collapse backstop below
+  // (SUP-22890) refuses the shape that would destroy it. `currentPolicy ===
+  // null` still rejects: there is no stored shape being round-tripped, so an
+  // explicit empty array there is the ladder-free policy the guard was written
+  // to keep off the board.
   if (stagesExplicitlyEmpty && (currentPolicy === null || currentPolicy.stages.length > 0)) {
     throw unprocessable("executionPolicy.stages must not be empty");
   }
@@ -638,18 +646,24 @@ export function assertPatchableExecutionPolicyWrite(input: {
     );
   }
 
-  // SUP-13634 fail-closed backstop: a body that normalizes back to null over a
-  // stored ladder would silently clear it. SUP-15377: a body that OMITS the
-  // `stages` key is no longer a clear — the stored stages are carried forward
-  // by `resolvePatchExecutionPolicy` — so this backstop is scoped to bodies
-  // where the key was not omitted. It is a backstop, not the primary guard:
-  // the explicit-`[]` branch above already refuses every reachable clear.
+  // SUP-13634 fail-closed backstop: a body that normalizes back to null over
+  // stored removable content would silently clear it. SUP-15377: a body that
+  // OMITS the `stages` key is no longer a clear — the stored stages are
+  // carried forward by `resolvePatchExecutionPolicy` — so this backstop is
+  // scoped to bodies where the key was not omitted. SUP-22890: the protected
+  // surface is a close ladder OR a stored monitor. A monitor-only watcher
+  // (`stages: []`) fell through the stages-only gate, so the SUP-13925
+  // round-trip with `monitor` dropped normalized to null and wiped the card's
+  // only wake path while reporting 200. The refusal names the field at risk.
   if (raw !== null && typeof raw === "object" && !Array.isArray(raw) &&
-      currentPolicy !== null && currentPolicy.stages.length > 0 && !stagesKeyAbsent) {
+      currentPolicy !== null && !stagesKeyAbsent &&
+      (currentPolicy.monitor || currentPolicy.stages.length > 0)) {
     const normalized = normalizeIssueExecutionPolicy(raw);
     if (normalized === null) {
       throw unprocessable(
-        "executionPolicy must not clear the issue's existing close stages; send the full replacement policy instead",
+        currentPolicy.stages.length > 0
+          ? "executionPolicy must not clear the issue's existing close stages; send the full replacement policy instead"
+          : "executionPolicy must not clear the issue's monitor; send the full replacement policy including the monitor, or omit the stages key to clear it explicitly",
       );
     }
   }
