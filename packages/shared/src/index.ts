@@ -1982,6 +1982,8 @@ export {
   type OverrideReleaseIssueHead,
   stripCreateOnlyIssueAttribution,
   ISSUE_CREATE_ONLY_ATTRIBUTION_KEYS,
+  ISSUE_UPDATE_MONITOR_ALIAS_CONFLICT_MESSAGE,
+  refineIssueUpdateMonitorAliasConflict,
   stalledReviewDecisionSchema,
   issueExecutionPolicySchema,
   issueExecutionStateSchema,

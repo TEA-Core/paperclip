@@ -118,6 +118,7 @@ import {
   updateIssueObjectSchema,
   updateIssueSchema,
   stripCreateOnlyIssueAttribution,
+  refineIssueUpdateMonitorAliasConflict,
   isClosedIsolatedExecutionWorkspace,
   isMarkdownArtifactWorkProduct,
   isMarkdownAttachmentContent,
@@ -514,7 +515,10 @@ const updateIssueRouteSchema = stripCreateOnlyIssueAttribution(updateIssueObject
   // Request-level compare-and-set token, not an issue column. Stripped before
   // the column update. Absent leaves the write unconditional.
   expectedUpdatedAt: z.string().datetime({ offset: true }).optional(),
-}));
+  // SUP-22840: `monitor` (inherited from updateIssueObjectSchema) is the
+  // top-level alias for `executionPolicy.monitor`; a body carrying both
+  // spellings is refused here so the handler below never has to pick a winner.
+}).superRefine(refineIssueUpdateMonitorAliasConflict));
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
   revision: z.string().min(1),
@@ -18655,6 +18659,10 @@ export function issueRoutes(
       // `updateFields` so it never reaches svc.update as a spurious write.
       rearmExecutionPolicy: rearmExecutionPolicyRaw,
       expectedUpdatedAt: expectedUpdatedAtRaw,
+      // SUP-22840: top-level alias for `executionPolicy.monitor`, not an issue
+      // column — keep it out of `updateFields`; it is translated into the
+      // canonical partial policy write after `previousExecutionPolicy` loads.
+      monitor: monitorAliasRaw,
       ...updateFields
     } = req.body;
     if (
@@ -18835,7 +18843,10 @@ export function issueRoutes(
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(existing);
     const isAgentWorkUpdate =
       req.actor.type === "agent" &&
-      (Object.keys(updateFields).length > 0 || reviewRequest !== undefined || hiddenAtRaw !== undefined);
+      (Object.keys(updateFields).length > 0 ||
+        reviewRequest !== undefined ||
+        hiddenAtRaw !== undefined ||
+        monitorAliasRaw !== undefined);
     if (
       expectedUpdatedAtRaw !== undefined &&
       closedExecutionWorkspace &&
@@ -18960,6 +18971,24 @@ export function issueRoutes(
       await assertCanReArmExecutionPolicy(access, req, existing.companyId, existing.assigneeAgentId, true);
     }
     const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
+    // SUP-22840: translate the top-level `monitor` alias into the canonical
+    // partial `executionPolicy` write. The route schema already refused the
+    // both-shapes body, so the only alias shape reaching here pairs with an
+    // `executionPolicy` key that is entirely absent. The synthesized write
+    // keeps every stored non-stage policy field (returnAssigneeAgentId,
+    // reviewPreset, authorizationPolicy, maxReviewRounds, baseRef, approval
+    // authority) and swaps the monitor in; `stages` is omitted so the
+    // SUP-15377 preserve path carries the stored ladder forward unchanged.
+    // Both stage flags were captured from the RAW body, which carried no
+    // executionPolicy key at all, so `stagesKeyAbsent` must be re-stamped for
+    // the synthesized write.
+    if (monitorAliasRaw !== undefined && req.body.executionPolicy === undefined) {
+      const { stages: _storedStages, ...policyBase } = previousExecutionPolicy ?? {
+        stages: [] as NormalizedExecutionPolicy["stages"],
+      };
+      req.body.executionPolicy = { ...policyBase, monitor: monitorAliasRaw };
+      (req as unknown as Record<string, unknown>).executionPolicyStagesKeyAbsent = true;
+    }
     // SUP-16525: set when this PATCH writes an executionPolicy that must satisfy
     // INV-LADDER-1 against the *live* pointer. The assert in the block below
     // reads `existing.executionState`; the pointer can move between that

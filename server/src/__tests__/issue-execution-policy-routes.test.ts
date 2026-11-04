@@ -870,6 +870,169 @@ describe("issue execution policy routes", () => {
     );
   });
 
+  describe("SUP-22840 top-level monitor alias", () => {
+    const REVIEWER_AGENT_ID = "44444444-4444-4444-8444-444444444444";
+    const RETURN_ASSIGNEE_AGENT_ID = "66666666-6666-4666-8666-666666666666";
+    const aliasMonitor = { nextCheckAt: "2026-12-01T12:00:00.000Z" };
+
+    function agentApp() {
+      return createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "55555555-5555-4555-8555-555555555555",
+      });
+    }
+
+    function seededIssue(executionPolicy: unknown, title: string) {
+      return {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-2284",
+        title,
+        executionPolicy,
+        executionState: null,
+        monitorAttemptCount: 0,
+        monitorNextCheckAt: null,
+        monitorLastTriggeredAt: null,
+        monitorNotes: null,
+        monitorScheduledBy: null,
+      };
+    }
+
+    const storedLadderRaw = {
+      mode: "normal",
+      commentRequired: true,
+      returnAssigneeAgentId: RETURN_ASSIGNEE_AGENT_ID,
+      maxReviewRounds: 3,
+      baseRef: "main",
+      stages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          type: "review",
+          participants: [
+            { id: "22222222-2222-4222-8222-222222222222", type: "agent", agentId: REVIEWER_AGENT_ID },
+          ],
+        },
+      ],
+    };
+
+    it("translates the alias into a canonical partial write that preserves the stored ladder", async () => {
+      const issue = seededIssue(storedLadderRaw, "Alias arm over live ladder");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitor: aliasMonitor });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      // The alias itself must never reach the column update.
+      expect(patch).not.toHaveProperty("monitor");
+      // The canonical write is the stored policy with the monitor swapped in:
+      // same expectations the nested spelling would produce.
+      expect(patch.executionPolicy).toEqual(
+        normalizeIssueExecutionPolicy({ ...storedLadderRaw, monitor: aliasMonitor }),
+      );
+      expect(patch).toMatchObject({
+        monitorNextCheckAt: new Date("2026-12-01T12:00:00.000Z"),
+      });
+    });
+
+    it("arms a fresh policy when the stored executionPolicy is null", async () => {
+      const issue = seededIssue(null, "Alias arm on null policy");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitor: aliasMonitor });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(patch).not.toHaveProperty("monitor");
+      expect(patch.executionPolicy).toEqual(normalizeIssueExecutionPolicy({ monitor: aliasMonitor }));
+      expect(patch).toMatchObject({
+        monitorNextCheckAt: new Date("2026-12-01T12:00:00.000Z"),
+      });
+    });
+
+    it("treats alias null as disarm while keeping the stored ladder", async () => {
+      const issue = seededIssue(
+        { ...storedLadderRaw, monitor: { nextCheckAt: "2026-11-01T00:00:00.000Z" } },
+        "Alias disarm",
+      );
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitor: null });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(patch.executionPolicy).toEqual(
+        normalizeIssueExecutionPolicy({ ...storedLadderRaw, monitor: null }),
+      );
+      expect(patch).toMatchObject({ monitorNextCheckAt: null });
+    });
+
+    it("refuses a body carrying both the alias and an executionPolicy key before any write", async () => {
+      const issue = seededIssue(storedLadderRaw, "Alias conflict");
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({
+          monitor: aliasMonitor,
+          executionPolicy: { monitor: { nextCheckAt: "2027-01-01T00:00:00.000Z" } },
+        });
+
+      expect(res.status).toBe(400);
+      // The refusal rides the zod issue in `details`, pinned at ["monitor"].
+      expect(res.body.details).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: ["monitor"],
+            message: expect.stringContaining("monitor cannot be combined with executionPolicy"),
+          }),
+        ]),
+      );
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("keeps unknown top-level keys a strict 400 that commits nothing", async () => {
+      const issue = seededIssue(storedLadderRaw, "Strict around the alias");
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitorr: aliasMonitor, comment: "co-sent side effect", status: "todo" });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("monitorr");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+  });
+
   it("rejects board-authored in_review transitions without a review path", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",

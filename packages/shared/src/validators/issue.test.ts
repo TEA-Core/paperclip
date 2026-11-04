@@ -7,6 +7,7 @@ import {
   createAcceptedPlanDecompositionSchema,
   createChildIssueSchema,
   createIssueSchema,
+  ISSUE_UPDATE_MONITOR_ALIAS_CONFLICT_MESSAGE,
   issueBlockedInboxAttentionSchema,
   issueExecutionMonitorPolicySchema,
   issueExecutionPolicySchema,
@@ -1217,6 +1218,62 @@ describe("issue validators", () => {
     expect(parsed.executionPolicy?.monitor?.scheduledBy).toBe("assignee");
     expect(parsed.executionPolicy?.stages).toHaveLength(1);
     expect(parsed.executionPolicy?.stages[0].type).toBe("review");
+  });
+
+  describe("top-level monitor alias on update (SUP-22840)", () => {
+    const aliasMonitor = { nextCheckAt: "2026-12-01T00:00:00.000Z" };
+
+    it("accepts the alias alone, validating it with the nested monitor contract", () => {
+      const parsed = updateIssueSchema.parse({ monitor: aliasMonitor });
+      expect(parsed.monitor).toMatchObject({
+        nextCheckAt: aliasMonitor.nextCheckAt,
+        scheduledBy: "assignee",
+      });
+
+      const misspelled = updateIssueSchema.safeParse({
+        monitor: { nextCheckAtt: "2026-12-01T00:00:00.000Z" },
+      });
+      expect(misspelled.success).toBe(false);
+      if (!misspelled.success) {
+        expect(unrecognizedKeysOf(misspelled.error)).toContain("nextCheckAtt");
+      }
+    });
+
+    it("accepts alias null (disarm intent) and omits it when the key is absent", () => {
+      expect(updateIssueSchema.parse({ monitor: null }).monitor).toBeNull();
+      expect("monitor" in updateIssueSchema.parse({ status: "todo" })).toBe(false);
+    });
+
+    it("refuses a body carrying both the alias and an executionPolicy key, even null", () => {
+      for (const executionPolicy of [
+        { monitor: aliasMonitor },
+        { mode: "normal" },
+        null,
+      ]) {
+        const parsed = updateIssueSchema.safeParse({ monitor: aliasMonitor, executionPolicy });
+        expect(parsed.success).toBe(false);
+        if (!parsed.success) {
+          expect(parsed.error.issues).toContainEqual(
+            expect.objectContaining({
+              code: z.ZodIssueCode.custom,
+              path: ["monitor"],
+              message: ISSUE_UPDATE_MONITOR_ALIAS_CONFLICT_MESSAGE,
+            }),
+          );
+        }
+      }
+    });
+
+    it("keeps unknown top-level keys strict around the alias", () => {
+      const parsed = updateIssueSchema.safeParse({
+        monitor: aliasMonitor,
+        monitorr: aliasMonitor,
+      });
+      expect(parsed.success).toBe(false);
+      if (!parsed.success) {
+        expect(unrecognizedKeysOf(parsed.error)).toContain("monitorr");
+      }
+    });
   });
 
   describe("ADR-103 M2: parentLinkKind edge field (SUP-17182)", () => {
