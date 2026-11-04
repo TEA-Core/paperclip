@@ -5488,12 +5488,21 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.tier).toBe("tier1");
     });
 
-    it("accepts no-repository landing for the persisted project-primary local-fs workspace shape", async () => {
+    it("accepts no-repository landing for a persisted non-Git workspace path", async () => {
       setupDbMock({
-        executionWorkspaces: [mockExecutionWorkspaceRow({ strategyType: "project_primary", providerType: "local_fs" })],
+        executionWorkspaces: [mockExecutionWorkspaceRow({ strategyType: "adapter_managed", providerType: "local_fs", cwd: "/tmp/non-git-workspace" })],
         issueDocuments: [{ companyId: "company-1", issueId: "issue-1", key: "entry-ruling", documentId: "doc-entry-ruling" }],
         documents: [{ id: "doc-entry-ruling", latestBody: "Recorded ruling" }],
       });
+      mockExecFile.mockImplementation(
+        (_file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
+          if (args.includes("--is-inside-work-tree")) {
+            cb(new Error("not a git repository"), "", "fatal: not a git repository");
+            return;
+          }
+          cb(null, "", "");
+        },
+      );
       const result = await evaluateDoneTierDeclaration(
         mockDb,
         tierIssue,
@@ -5529,6 +5538,36 @@ describe("evaluateDoneTierDeclaration", () => {
       );
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("record_only");
+    });
+
+    it("rejects no-repository landing when a project-primary workspace points at a Git checkout", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ strategyType: "project_primary", providerType: "local_fs" })],
+        issueDocuments: [{ companyId: "company-1", issueId: "issue-1", key: "entry-ruling", documentId: "doc-entry-ruling" }],
+        documents: [{ id: "doc-entry-ruling", latestBody: "Recorded ruling" }],
+      });
+      mockExecFile.mockImplementation(
+        (_file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string) => void) => {
+          if (args.includes("--is-inside-work-tree")) {
+            cb(null, "true");
+            return;
+          }
+          cb(null, "");
+        },
+      );
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        renderDoneTierDeclaration(null, {
+          tier: "tier1",
+          reason: "The entry ruling is recorded",
+          landing: { mode: "noRepositoryLanding" },
+        }),
+        null,
+        async () => [],
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("zero commits ahead");
     });
 
     it("rejects no-repository landing when the entry ruling is missing", async () => {

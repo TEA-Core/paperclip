@@ -449,6 +449,23 @@ async function worktreeHasUncommittedContent(worktreePath: string): Promise<bool
   }
 }
 
+async function isGitCheckout(workspacePath: string): Promise<boolean | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "git",
+      ["-C", workspacePath, "rev-parse", "--is-inside-work-tree"],
+      { maxBuffer: 16 * 1024 * 1024 },
+      (error, stdout, stderr) => {
+        if (!error) {
+          resolve(stdout.trim() === "true");
+          return;
+        }
+        resolve(stderr.includes("not a git repository") ? false : null);
+      },
+    );
+  });
+}
+
 /**
  * Count merged PRs in the repo whose title or body references the issue identifier.
  *
@@ -921,13 +938,17 @@ async function proveNoRepositoryLanding(
         'Tier 1 "no-repository-landing" requires an execution workspace owned by this issue.',
       );
     }
-    if (
-      workspace.strategyType === "git_worktree" ||
-      workspace.providerType === "git_worktree"
-    ) {
+    const workspacePath = typeof workspace.cwd === "string" && workspace.cwd.length > 0
+      ? workspace.cwd
+      : null;
+    const isGitWorkspace = workspace.strategyType === "git_worktree" || workspace.providerType === "git_worktree"
+      ? true
+      : workspacePath
+        ? await isGitCheckout(workspacePath)
+        : null;
+    if (isGitWorkspace !== false) {
       if (
-        typeof workspace.cwd !== "string" ||
-        workspace.cwd.length === 0 ||
+        workspacePath === null ||
         typeof workspace.baseRef !== "string" ||
         workspace.baseRef.length === 0
       ) {
@@ -935,13 +956,13 @@ async function proveNoRepositoryLanding(
           'Tier 1 "no-repository-landing" requires a Git worktree with a recorded path and base ref.',
         );
       }
-      const dirty = await worktreeHasUncommittedContent(workspace.cwd);
+      const dirty = await worktreeHasUncommittedContent(workspacePath);
       if (dirty !== false) {
         return refuseTier1(
           'Tier 1 "no-repository-landing" requires a clean Git worktree.',
         );
       }
-      const aheadCount = await countCommitsAhead(workspace.cwd, workspace.baseRef);
+      const aheadCount = await countCommitsAhead(workspacePath, workspace.baseRef);
       if (aheadCount !== 0) {
         return refuseTier1(
           'Tier 1 "no-repository-landing" requires a Git worktree with zero commits ahead of its base ref.',
