@@ -2140,6 +2140,16 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       return issueId;
     }
 
+    it("preflightFinalDelivery refuses a mention carrier on a contradictory PR answer (state open, merged true)", async () => {
+      const issueId = await insertMentionOnlyCard();
+      installRoutes(mergedCarrierRoutes(mergedMentionBody({ state: "open" })));
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind, JSON.stringify(result)).toBe("unresolvable");
+      if (result.kind === "unresolvable") expect(result.reason).toContain("no-pr");
+    });
+
     it("preflightFinalDelivery accepts the single verified merged mentioned carrier", async () => {
       const issueId = await insertMentionOnlyCard();
       installRoutes(mergedCarrierRoutes());
@@ -2311,7 +2321,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       };
     }
 
-    async function insertTerminalCarrierChild(options: { pinned?: boolean; baseRef?: string } = {}) {
+    async function insertTerminalCarrierChild(options: { pinned?: boolean; baseRef?: string; recordedBranch?: string } = {}) {
       const ownerIssueId = await insertIssue({ identifier: "SUP-1" });
       await db.update(issues).set({ status: "done" }).where(eq(issues.id, ownerIssueId));
       const issueId = await insertIssue({
@@ -2323,7 +2333,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           repo: { owner: OWNER, repo: REPO },
           prNumber: 42,
           prUrl: `https://github.com/${OWNER}/${REPO}/pull/42`,
-          branch: CARRIER_BRANCH,
+          branch: options.recordedBranch ?? CARRIER_BRANCH,
           headSha: APPROVED_HEAD,
         },
       });
@@ -2633,6 +2643,42 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
 
       const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
       expect(result.kind).toBe("unresolvable");
+    });
+
+    it.each([
+      ["percent-encoded traversal", "SUP-42-%2F.."],
+      ["nested dot pairs", "SUP-42-x..y"],
+      ["an encoded NUL", "SUP-42-%00x"],
+      ["an encoded newline", "SUP-42-%0ax"],
+      ["a four-pass encoded name", "SUP-42-%2525252F.."],
+    ])("refuses a legacy recorded delivery whose branch is git-invalid (%s) at resolve and preflight", async (_label, recordedBranch) => {
+      const issueId = await insertTerminalCarrierChild({ recordedBranch });
+      installRoutes([
+        { url: PR_URL, body: carrierMergedPrBody() },
+        { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+        REFS_MAIN_ROUTE,
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight.kind).toBe("unresolvable");
+    });
+
+    it("refuses a merged-only bound PR whose head repository is absent", async () => {
+      const issueId = await insertTerminalCarrierChild();
+      const body = carrierMergedPrBody();
+      delete (body.head as Record<string, unknown>).repo;
+      installRoutes([
+        { url: PR_URL, body },
+        { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+        REFS_MAIN_ROUTE,
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") expect(result.reason).toContain("head repository is absent");
     });
 
     it("refuses a contradictory PR answer (state open, merged true) for a terminal carrier", async () => {

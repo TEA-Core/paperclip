@@ -5577,6 +5577,31 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     },
   );
 
+  it("refuses a board delivery record whose branch equals the workspace branch but is git-invalid (write-validation mutant)", async () => {
+    const branch = "SUP-14824-1-../x";
+    const { companyId, issueId } = await seedIssue({ status: "in_review", deliveryBranch: branch });
+    const [seededIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    await db
+      .update(executionWorkspaces)
+      .set({ branchName: branch })
+      .where(eq(executionWorkspaces.id, seededIssue!.executionWorkspaceId!));
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch,
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_branch_write_rejected");
+    expect(await recordedDeliveryOf(issueId)).toBeUndefined();
+  });
+
   it("accepts a board delivery record with a valid Unicode branch name", async () => {
     const branch = "SUP-14824-1-café-修正";
     const { companyId, issueId } = await seedIssue({ status: "in_review", deliveryBranch: branch });

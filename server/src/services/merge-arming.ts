@@ -25,6 +25,7 @@ import {
   type GitHubTokenResolution,
 } from "./github-credential.js";
 import { inheritedExecutionWorkspaceBranchExempt } from "./execution-workspace-policy.js";
+import { isValidGitBranchName } from "./execution-workspace-branch-ownership.js";
 import { isStrictAncestorIssueIdOf } from "./issues.js";
 import {
   claimDeliveryReceiptForPublication,
@@ -2311,6 +2312,18 @@ export async function resolveDeliveryIdentity(
         identifier,
       };
     }
+    if (!isValidGitBranchName(branch)) {
+      // Legacy records seeded before the write boundary existed can carry a
+      // branch git itself would refuse; the read side applies the same
+      // validator so such a record is unusable here too.
+      return {
+        branch: null,
+        repo: null,
+        recordedUnusable: "recorded delivery identity branch is not a valid git branch name",
+        branchIsOwn: true,
+        identifier,
+      };
+    }
     if (!headSha) {
       return {
         branch: null,
@@ -2642,6 +2655,16 @@ async function resolveExactBoundPullRequest(
       // Closed-unmerged and open drafts keep the original fail-closed refusals
       // below, byte-identically (ADR-091 D4).
       if (closedAndMerged && result.draft !== true) {
+        if (binding.requireMerged && !result.headRepoFullName) {
+          // A merged-only (terminal-carrier or workspace-less) binding
+          // requires the head repository to be present and readable; an
+          // absent one cannot prove the PR is this card's delivery in the
+          // recorded repo.
+          return {
+            pr: null,
+            reason: "recorded delivery identity PR head repository is absent; a merged-only delivery requires a readable head repository",
+          };
+        }
         const verified = await verifyMergedPullRequestOnBaseBranch(
           candidate.token,
           repo.owner,
@@ -3670,7 +3693,7 @@ async function verifyLiveFinalDeliveryHead(
     const parsed = finalDeliveryLiveSchema.safeParse(await response.json());
     if (!parsed.success) return { kind: "unresolvable", reason: "head_unverifiable: incomplete live PR response" };
     const live = parsed.data;
-    if (live.merged === true) {
+    if (live.state === "closed" && live.merged === true) {
       // SUP-21513: a merged delivery whose merge commit is proven on the
       // recorded base branch is a completed delivery — accept it. No status is
       // written later; publishApprovalStatus truthfully skips merged PRs.
@@ -3752,7 +3775,7 @@ async function resolveSingleMergedMentionCarrier(
       const live = await fetchPullRequestHeadSha(candidates[i]!.token, pr.owner, pr.repo, pr.number);
       if (live.ok) {
         unreadable = null;
-        if (live.merged === true && live.headSha) {
+        if (live.state === "closed" && live.merged === true && live.headSha) {
           mergedCarriers.push({
             kind: "resolved",
             headSha: live.headSha,
