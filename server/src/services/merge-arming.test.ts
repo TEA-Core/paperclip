@@ -3229,6 +3229,26 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     });
   });
 
+  describe("publishApprovalStatus with a contradictory provider answer", () => {
+    it("skips a PR answered state open with merged true as not eligible, writing no status", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId);
+      installRoutes([
+        { url: PR_URL, body: { ...prHeadBody(APPROVED_HEAD), merged: true } },
+        { url: POST_STATUS_URL(APPROVED_HEAD), body: {} },
+      ]);
+
+      const outcome = await publishApprovalStatus(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+        expectedHeadSha: APPROVED_HEAD,
+      });
+
+      expect(outcome.kind).toBe("skipped");
+      expect(outcome.message).toContain("pr-not-eligible");
+      expect(postStatusCalls()).toHaveLength(0);
+    });
+  });
+
   describe("decision-time pin end to end", () => {
     it("refuses when the head moves between the decision read and the publish", async () => {
       const issueId = await insertIssue();

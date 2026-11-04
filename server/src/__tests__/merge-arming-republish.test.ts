@@ -5601,6 +5601,79 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect((await recordedDeliveryOf(issueId) as Record<string, unknown>).branch).toBe(branch);
   });
 
+  describe("a board delivery refresh in the same PATCH as a status change", () => {
+    const branch = "SUP-14824-1-refresh";
+
+    async function seedInReviewOnBranch() {
+      const seeded = await seedIssue({ status: "in_review" });
+      const [seededIssue] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+      await db
+        .update(executionWorkspaces)
+        .set({ branchName: branch })
+        .where(eq(executionWorkspaces.id, seededIssue!.executionWorkspaceId!));
+      currentActor = boardActor(seeded.companyId);
+      return seeded;
+    }
+
+    const deliveryIdentity = () => ({
+      repo: { owner: OWNER, repo: REPO },
+      branch,
+      headSha: HEAD_SHA,
+      prNumber: PR_NUMBER,
+      prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+    });
+
+    async function statusOf(issueId: string) {
+      const [row] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+      return row!.status;
+    }
+
+    it.each(["done", "in_progress"])(
+      "refuses a record that rides with status %s, persisting neither the record nor the status",
+      async (status) => {
+        const { issueId } = await seedInReviewOnBranch();
+
+        const res = await request(app)
+          .patch(`/api/issues/${issueId}`)
+          .send({ status, deliveryIdentity: deliveryIdentity() });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(422);
+        expect(res.body.code).toBe("delivery_identity_write_rejected");
+        expect(await statusOf(issueId)).toBe("in_review");
+        expect(await recordedDeliveryOf(issueId)).toBeUndefined();
+      },
+    );
+
+    it("accepts the refresh alone, then the status change alone, keeping the refreshed record", async () => {
+      const { issueId } = await seedInReviewOnBranch();
+
+      const refresh = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ deliveryIdentity: deliveryIdentity() });
+      expect(refresh.status, JSON.stringify(refresh.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("in_review");
+      expect((await recordedDeliveryOf(issueId) as Record<string, unknown>).branch).toBe(branch);
+
+      const verdict = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress" });
+      expect(verdict.status, JSON.stringify(verdict.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("in_progress");
+      expect((await recordedDeliveryOf(issueId) as Record<string, unknown>).branch).toBe(branch);
+    });
+
+    it("accepts a refresh that restates the unchanged in_review status", async () => {
+      const { issueId } = await seedInReviewOnBranch();
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review", deliveryIdentity: deliveryIdentity() });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect((await recordedDeliveryOf(issueId) as Record<string, unknown>).branch).toBe(branch);
+    });
+  });
+
   it("refuses a board delivery record that also rebinds the card's workspace, then accepts the two separate PATCHes (orphan card)", async () => {
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
     try {

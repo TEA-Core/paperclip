@@ -2635,12 +2635,13 @@ async function resolveExactBoundPullRequest(
         reason: `recorded delivery identity PR head belongs to ${result.headRepoFullName}, not the card's recorded repo ${repo.owner}/${repo.repo}`,
       };
     }
+    const closedAndMerged = result.state === "closed" && result.merged === true;
     if (result.open !== true || result.draft === true) {
       // SUP-21513: a MERGED delivery PR whose merge commit is proven on the
       // recorded base branch is a completed delivery, not an unresolved one.
       // Closed-unmerged and open drafts keep the original fail-closed refusals
       // below, byte-identically (ADR-091 D4).
-      if (result.merged === true && result.draft !== true) {
+      if (closedAndMerged && result.draft !== true) {
         const verified = await verifyMergedPullRequestOnBaseBranch(
           candidate.token,
           repo.owner,
@@ -2662,7 +2663,7 @@ async function resolveExactBoundPullRequest(
         return { pr: null, reason: result.draft === true ? "recorded delivery identity PR is a draft" : "recorded delivery identity PR is not open" };
       }
     }
-    if (binding.requireMerged && result.merged !== true) {
+    if (binding.requireMerged && !closedAndMerged) {
       return {
         pr: null,
         reason: "recorded delivery identity PR is not merged; a delivery without a live control-plane branch (terminal ADR-083 carrier or no execution workspace) is accepted only once its PR is merged and proven on its base branch",
@@ -3669,7 +3670,7 @@ async function verifyLiveFinalDeliveryHead(
     const parsed = finalDeliveryLiveSchema.safeParse(await response.json());
     if (!parsed.success) return { kind: "unresolvable", reason: "head_unverifiable: incomplete live PR response" };
     const live = parsed.data;
-    if (live.state === "closed" && live.merged === true) {
+    if (live.merged === true) {
       // SUP-21513: a merged delivery whose merge commit is proven on the
       // recorded base branch is a completed delivery — accept it. No status is
       // written later; publishApprovalStatus truthfully skips merged PRs.
@@ -4465,9 +4466,7 @@ async function fetchPullRequestHeadShaOnce(
       headRef: ref,
       open: body.state === "open" && body.merged !== true,
       draft: body.draft === true,
-      // A contradictory answer (state open with merged true) is not a merge:
-      // only a closed PR reported merged counts as merged.
-      merged: body.state === "closed" && body.merged === true,
+      merged: body.merged === true,
       mergeCommitSha,
       baseRef,
       headRepoFullName,

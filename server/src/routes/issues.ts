@@ -19506,6 +19506,26 @@ export function issueRoutes(
         });
         return;
       }
+      if (
+        boardDeliveryRefresh
+        && updateFields.status !== undefined
+        && updateFields.status !== existing.status
+      ) {
+        res.status(422).json({
+          error: "deliveryIdentity cannot be written in the same request that changes status; refresh the delivery record first, then issue the verdict in a separate PATCH",
+          code: "delivery_identity_write_rejected",
+          details: {
+            issueId: existing.id,
+            identifier: existing.identifier ?? null,
+            holdsLease,
+            enteringReview,
+            status: existing.status,
+            requestedStatus: updateFields.status,
+            reason: "deliveryIdentity and a status change must be written in separate PATCHes",
+          },
+        });
+        return;
+      }
       // A branch git itself would refuse (check-ref-format, including any
       // NUL or control character) can never be this card's delivery branch.
       if (!isValidGitBranchName(requestedDeliveryIdentity.branch)) {

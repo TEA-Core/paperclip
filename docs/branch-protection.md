@@ -238,8 +238,12 @@ route accepts a `deliveryIdentity` field. It is recorded only when either:
   moved the PR head or the workspace drifted, instead of a database write).
 
 Any other actor or transition is rejected with `422 delivery_identity_write_rejected`
-and no partial write occurs. `recordedByRunId` and `recordedAt` are
-server-owned (set from the actor context), never client-supplied.
+and no partial write occurs. A board refresh that also changes `status` in the
+same `PATCH` is refused the same way, because the final-delivery preflight and
+the done-transition guards read the stored record, not the one in the request:
+refresh the record first, then issue the verdict in a second `PATCH`.
+`recordedByRunId` and `recordedAt` are server-owned (set from the actor
+context), never client-supplied.
 
 The board refresh path applies the anchoring rule, including the
 identifier-prefix check: the recorded branch binds this card only when anchored
