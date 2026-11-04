@@ -89,7 +89,7 @@ const TIER_1_SUFFIX = "Liveness unverified.";
 // command, the probe head/commit it ran against, and a post-merge predicate, because
 // the guard resolves the named head and compares it with the delivery merge head at
 // close time. Arbitrary non-empty prose is no longer accepted Tier 2 evidence.
-const TIER2_FORM =
+export const TIER2_FORM =
   '"Closed at Tier 2 (live): probe `<probe command>` head <probe head sha> post-merge: <post-merge predicate>"';
 // SUP-22801: record-only Tier 2 form. A `record_only` card owes no repository
 // landing, so its live evidence names the real probe command, the observed
@@ -115,6 +115,18 @@ export const DONE_TIER_TIER1_DELEGATED_JSON =
   '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landingDelegated", "prNumber": <N>, "carrier": "done-close-landing-backstop" } }';
 export const DONE_TIER_STRUCTURED_FORMS =
   `${DONE_TIER_TIER2_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
+// SUP-22801: the record-only classification of the structured forms. A
+// record_only card's Tier 2 probeEvidence carries the record-only grammar —
+// no merge head — so the classification-aware 422 remedy names this set
+// instead, keeping the remedy and the structured parser in agreement
+// (SUP-15787 invariant). Tier 1 semantics are unchanged and stay listed: a
+// record_only card with a recorded merged work product may still land Tier 1
+// (SUP-21258). The no-repository landing form is deliberately NOT listed:
+// #1098 was reverted by #1101, so it is not a writable form at this fold tip.
+export const DONE_TIER_TIER2_RECORD_ONLY_JSON =
+  '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }';
+export const DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS =
+  `${DONE_TIER_TIER2_RECORD_ONLY_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
 
 export function renderDoneTierDeclaration(
   body: string | null | undefined,
@@ -1352,6 +1364,53 @@ async function loadRecordedDeliveryMergeCommit(
   return latestShas.size === 1 ? [...latestShas][0]! : null;
 }
 
+// SUP-22801 round-1 repair (record-only-invalid-calendar-date-accepted): a real
+// UTC calendar instant must survive BOTH strict component validation and a
+// round-trip re-serialization. `Date.parse` alone is not a validator — it
+// normalizes impossible dates instead of rejecting them (2026-02-31 becomes
+// 2026-03-03, a non-leap 2026-02-29 becomes 2026-03-01, 24:00 becomes the next
+// day), so a bare NaN check accepted fabricated observation timestamps that
+// name no real calendar instant. The round-trip comparison is the fail-closed
+// backstop for any component range this table misses.
+const UTC_INSTANT_COMPONENTS_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/;
+
+function isRealUtcCalendarInstant(observedAt: string): boolean {
+  const parts = UTC_INSTANT_COMPONENTS_RE.exec(observedAt);
+  if (!parts) {
+    return false;
+  }
+  const year = Number(parts[1]);
+  const month = Number(parts[2]);
+  const day = Number(parts[3]);
+  const hour = Number(parts[4]);
+  const minute = Number(parts[5]);
+  const second = Number(parts[6]);
+  if (month < 1 || month > 12) {
+    return false;
+  }
+  const leapYear = year % 400 === 0 || (year % 4 === 0 && year % 100 !== 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (day < 1 || day > (daysInMonth[month - 1] ?? 0)) {
+    return false;
+  }
+  if (hour > 23 || minute > 59 || second > 59) {
+    return false;
+  }
+  const epochMs = Date.parse(observedAt);
+  if (Number.isNaN(epochMs)) {
+    return false;
+  }
+  const roundTrip = new Date(epochMs);
+  return (
+    roundTrip.getUTCFullYear() === year &&
+    roundTrip.getUTCMonth() === month - 1 &&
+    roundTrip.getUTCDate() === day &&
+    roundTrip.getUTCHours() === hour &&
+    roundTrip.getUTCMinutes() === minute &&
+    roundTrip.getUTCSeconds() === second
+  );
+}
+
 // SUP-22801: record-only Tier 2 live proof. Pure and fail-closed — a
 // record_only card has no repository landing to resolve, so nothing here touches
 // GitHub or the database; every component of the accepted form is checked
@@ -1377,7 +1436,7 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
-  if (Number.isNaN(Date.parse(observedAt!))) {
+  if (!isRealUtcCalendarInstant(observedAt!)) {
     return refuseTier2(
       `record-only close Tier 2 probe evidence names observed instant ${observedAt}, which is not a ` +
         "real UTC calendar instant; the observation time must be a valid Z-suffixed ISO-8601 timestamp. " +

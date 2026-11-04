@@ -16,10 +16,12 @@ import {
   evaluateDoneTierDeclaration,
   extractCitedCommitShas,
   resolveCitedCommits,
+  DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS,
   DONE_TIER_STRUCTURED_FORMS,
   DONE_TIER_TIER1_DELEGATED_JSON,
   DONE_TIER_TIER1_LANDED_JSON,
   DONE_TIER_TIER2_JSON,
+  DONE_TIER_TIER2_RECORD_ONLY_JSON,
   renderDoneTierDeclaration,
   TIER1_FORM,
   TIER2_RECORD_ONLY_FORM,
@@ -6003,6 +6005,24 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(mockResolveGitHubToken).not.toHaveBeenCalled();
     });
 
+    it("accepts a real leap-day observation instant while refusing the same day on a non-leap year", async () => {
+      // SUP-22801 round-1 repair: the strict component + round-trip check must
+      // not over-reject real calendar instants — 2024-02-29 is a real UTC day
+      // and stays accepted even as 2026-02-29 is refused above.
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        recordOnlyTierIssue(),
+        tier2Line(
+          "record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2024-02-29T23:59:59Z result: pass endpoint healthy",
+        ),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
     it("accepts the same record-only declaration from the same-run comment path", async () => {
       const result = await evaluateDoneTierDeclaration(
         mockDb,
@@ -6035,6 +6055,13 @@ describe("evaluateDoneTierDeclaration", () => {
     it("refuses an impossible instant, a failing verdict, and a blank component, each naming the record-only form", async () => {
       for (const [evidence, expected] of [
         ["record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2026-13-04T09:15:00Z result: pass endpoint healthy", "not a real UTC calendar instant"],
+        // SUP-22801 round-1 repair: these components pass a bare Date.parse
+        // because the engine NORMALIZES them (2026-02-31 -> 2026-03-03,
+        // non-leap 2026-02-29 -> 2026-03-01, 24:00 -> next day); the strict
+        // component + round-trip check must still refuse them.
+        ["record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2026-02-31T09:15:00Z result: pass endpoint healthy", "not a real UTC calendar instant"],
+        ["record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2026-02-29T09:15:00Z result: pass endpoint healthy", "not a real UTC calendar instant"],
+        ["record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2026-11-04T24:00:00Z result: pass endpoint healthy", "not a real UTC calendar instant"],
         ["record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: fail endpoint returned 500", "failing predicate"],
         ["record-only probe ` ` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass endpoint healthy", "blank probe command"],
       ] as const) {
@@ -6195,6 +6222,21 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER2_JSON);
       expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_LANDED_JSON);
       expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_DELEGATED_JSON);
+      // SUP-22801: the record-only classification of the structured forms —
+      // its Tier 2 entry carries the record-only grammar, never a merge head,
+      // and Tier 1 entries are carried over unchanged.
+      expect(DONE_TIER_TIER2_RECORD_ONLY_JSON).toBe(
+        '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }',
+      );
+      expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER2_RECORD_ONLY_JSON);
+      expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_LANDED_JSON);
+      expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_DELEGATED_JSON);
+      // #1101 reverted #1098, so the no-repository Tier 1 landing is not a
+      // writable form at this fold tip — the record-only remedy must not
+      // name it, or it would steer a record_only card toward a form the
+      // structured parser no longer accepts.
+      expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).not.toContain("noRepositoryLanding");
+      expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).not.toContain("post-merge");
 
       const result = await evaluateDoneTierDeclaration(
         mockDb,
@@ -6213,9 +6255,18 @@ describe("evaluateDoneTierDeclaration", () => {
       // AC1 says "on both doors". The remedy is built once but branches on
       // input.createDoor, so one interpolation per branch is the machine-checkable
       // shape of that promise: a future edit that names the structured field on
-      // only one door drops a count and fails here, not in production.
-      expect((route.match(/\$\{DONE_TIER_STRUCTURED_FORMS\}/g) ?? []).length).toBeGreaterThanOrEqual(2);
+      // only one door drops a count and fails here, not in production. SUP-22801:
+      // the interpolated value is the classification-aware `structuredForms`
+      // ternary, selected by the issue's deliveryRequirement.
+      expect((route.match(/\$\{structuredForms\}/g) ?? []).length).toBeGreaterThanOrEqual(2);
+      expect((route.match(/\$\{tier2CommentForm\}/g) ?? []).length).toBeGreaterThanOrEqual(2);
       expect((route.match(/\$\{TIER1_FORM\}/g) ?? []).length).toBeGreaterThanOrEqual(2);
+      // The classification lever itself must stay wired in the route: the
+      // record-only forms are selected by deliveryRequirement, and both
+      // record-only constants are named there.
+      expect(route).toContain('issue.deliveryRequirement === "record_only"');
+      expect(route).toContain("DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS");
+      expect(route).toContain("TIER2_RECORD_ONLY_FORM");
     });
 
     it("SUP-21474: routes remedy interpolates TIER1_FORM un-cut so both Tier 1 forms keep balanced quotes", () => {
