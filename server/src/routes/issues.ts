@@ -202,6 +202,7 @@ import {
   workProductService,
 } from "../services/index.js";
 import { redactIssueCommentBody } from "../services/issues.js";
+import { isValidGitBranchName } from "../services/execution-workspace-branch-ownership.js";
 import { toIssueWorkProduct } from "../services/work-products.js";
 import {
   armMergeOnApproval,
@@ -13689,6 +13690,7 @@ export function issueRoutes(
       // read pre-tx; it stays board-gated by assertBoard.
       let doneTierResolutionNote = resolutionNote ?? null;
       let structuredDoneTierRendered = false;
+      let recoveryOverrideAccepted = false;
       if (sourceIssueStatus === "done" && existing.status !== "done") {
         const preTxsRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
           existing.companyId,
@@ -13747,6 +13749,7 @@ export function issueRoutes(
           res.status(recoveryDoneOutcome.status).json(recoveryDoneOutcome.body);
           return;
         }
+        recoveryOverrideAccepted = recoveryDoneOutcome.overrideAccepted === true;
       }
       const result = await db.transaction(async (tx) => {
         const lockedIssue = await tx
@@ -14037,6 +14040,7 @@ export function issueRoutes(
               };
             }
             await preflightTerminalApproval(lockedIssue, transition.patch, transition.decision, executionPolicy, {
+              overrideAccepted: recoveryOverrideAccepted,
               locked: { prefetch: finalDeliveryPrefetch, tx: tx as unknown as Db },
             });
             Object.assign(updateFields, transition.patch);
@@ -19421,16 +19425,24 @@ export function issueRoutes(
     let deliveryIdentityWorkspaceBranchWrite = false;
     // ADR-091 D1 (SUP-14824): record the delivery identity on in_review transition.
     // Only a run that holds the issue's lease may write it, and only on a transition
-    // INTO in_review. Any other actor or transition is rejected without partial write.
+    // INTO in_review; a board actor may also refresh it on a card already in_review
+    // (see boardDeliveryRefresh). Any other actor or transition is rejected without
+    // partial write.
     if (requestedDeliveryIdentity) {
       const holdsLease =
         actor.actorType === "agent"
         && actor.runId != null
         && (existing.executionRunId === actor.runId || existing.checkoutRunId === actor.runId);
       const enteringReview = existing.status !== "in_review" && updateFields.status === "in_review";
-      if (!holdsLease || !enteringReview) {
+      // Board refresh: the board is the full-control operator, so it may
+      // re-record or refresh delivery on a card already in review (a redo
+      // push that moved the PR head, or a workspace that drifted). Agents
+      // still need the lease-holding run entering review. Every ownership
+      // check below (project repo, control-plane branch) still applies.
+      const boardDeliveryRefresh = req.actor.type === "board" && existing.status === "in_review";
+      if ((!holdsLease || !enteringReview) && !boardDeliveryRefresh) {
         res.status(422).json({
-          error: "deliveryIdentity may only be written by the lease-holding run on a transition into in_review",
+          error: "deliveryIdentity may only be written by the lease-holding run on a transition into in_review, or by a board actor on a card already in in_review",
           code: "delivery_identity_write_rejected",
           details: {
             issueId: existing.id,
@@ -19472,6 +19484,66 @@ export function issueRoutes(
         });
         return;
       }
+      // A delivery record is validated against the workspace the card holds NOW.
+      // A PATCH that also rebinds the card would store a record the new binding
+      // can refuse at approval, so rebind first and record in a second PATCH.
+      if (
+        updateFields.executionWorkspaceId !== undefined
+        && updateFields.executionWorkspaceId !== (existing.executionWorkspaceId ?? null)
+      ) {
+        res.status(422).json({
+          error: "deliveryIdentity cannot be written in the same request that changes executionWorkspaceId; rebind the workspace first, then record the delivery in a separate PATCH",
+          code: "delivery_identity_branch_write_rejected",
+          details: {
+            issueId: existing.id,
+            identifier: existing.identifier ?? null,
+            holdsLease,
+            enteringReview,
+            recordedBranch: requestedDeliveryIdentity.branch,
+            executionWorkspaceId: existing.executionWorkspaceId ?? null,
+            requestedExecutionWorkspaceId: updateFields.executionWorkspaceId,
+            reason: "deliveryIdentity and executionWorkspaceId must be written in separate PATCHes",
+          },
+        });
+        return;
+      }
+      if (
+        boardDeliveryRefresh
+        && updateFields.status !== undefined
+        && updateFields.status !== existing.status
+      ) {
+        res.status(422).json({
+          error: "deliveryIdentity cannot be written in the same request that changes status; refresh the delivery record first, then issue the verdict in a separate PATCH",
+          code: "delivery_identity_write_rejected",
+          details: {
+            issueId: existing.id,
+            identifier: existing.identifier ?? null,
+            holdsLease,
+            enteringReview,
+            status: existing.status,
+            requestedStatus: updateFields.status,
+            reason: "deliveryIdentity and a status change must be written in separate PATCHes",
+          },
+        });
+        return;
+      }
+      // A branch git itself would refuse (check-ref-format, including any
+      // NUL or control character) can never be this card's delivery branch.
+      if (!isValidGitBranchName(requestedDeliveryIdentity.branch)) {
+        res.status(422).json({
+          error: "deliveryIdentity.branch is not a valid git branch name",
+          code: "delivery_identity_branch_write_rejected",
+          details: {
+            issueId: existing.id,
+            identifier: existing.identifier ?? null,
+            holdsLease,
+            enteringReview,
+            recordedBranch: requestedDeliveryIdentity.branch,
+            reason: "recorded branch is not a valid git branch name (git check-ref-format)",
+          },
+        });
+        return;
+      }
       // ADR-091 D1 (SUP-15909): the recorded BRANCH half is a security boundary too.
       // It must be a branch this card may lawfully arm on — its own execution-workspace
       // branch, or an ADR-083 carrier owner's branch. resolveCardDeliveryBranchOwnership
@@ -19491,17 +19563,52 @@ export function issueRoutes(
               eq(executionWorkspaces.companyId, existing.companyId),
             ))
         : [];
+      // The board stamp holds the same single rule as every other site: the
+      // recorded branch binds this card only when anchored to it (its
+      // identifier prefix) and the row is one this card owns. Board attestation
+      // alone never turns an unanchored branch into the card's own branch.
+      const recordedBranchAnchoredToCard =
+        existing.identifier != null
+        && requestedDeliveryIdentity.branch.startsWith(`${existing.identifier}-`);
       const canRecordProjectPrimaryBranch =
         branchOwnership.legitimate
         && branchOwnership.branch === null
         && deliveryWorkspace?.strategyType === "project_primary"
-        && !deliveryWorkspace.branchName;
+        && !deliveryWorkspace.branchName
+        && (!boardDeliveryRefresh || (branchOwnership.branchIsOwn && recordedBranchAnchoredToCard));
+      // Board refresh on a card with no execution workspace at all: the record
+      // must bind a PR and carry this card's identifier prefix, the same anchor
+      // resolveDeliveryIdentity requires, so the write never returns 200 for a
+      // record the approval gate then refuses. Agents still cannot create it.
+      const boardOrphanDeliveryRecord =
+        boardDeliveryRefresh
+        && !existing.executionWorkspaceId
+        && requestedDeliveryIdentity.prNumber !== undefined
+        && requestedDeliveryIdentity.prUrl !== undefined
+        && recordedBranchAnchoredToCard;
+      // ADR-083 terminal carrier: the owner is done/cancelled and can never
+      // stamp again. A board refresh may bind the carrier branch's PR under
+      // the same shape approval time accepts (exact carrier branch plus a
+      // complete PR binding); the merged-on-base proof stays enforced at
+      // approval by requireMerged.
+      const boardTerminalCarrierRecord =
+        boardDeliveryRefresh
+        && branchOwnership.carrierOwnerTerminal === true
+        && requestedDeliveryIdentity.prNumber !== undefined
+        && requestedDeliveryIdentity.prUrl !== undefined
+        && branchOwnership.branch !== null
+        && requestedDeliveryIdentity.branch === branchOwnership.branch;
       const recordedBranchMismatch =
-        (!canRecordProjectPrimaryBranch && branchOwnership.branch === null)
+        (!canRecordProjectPrimaryBranch && !boardOrphanDeliveryRecord && !boardTerminalCarrierRecord && branchOwnership.branch === null)
         || (branchOwnership.branch !== null
           // Git refs are case-sensitive: the recorded branch must equal the control-plane branch exactly.
           && requestedDeliveryIdentity.branch !== branchOwnership.branch);
-      if (!canRecordProjectPrimaryBranch && (!branchOwnership.legitimate || recordedBranchMismatch)) {
+      if (
+        !canRecordProjectPrimaryBranch
+        && !boardOrphanDeliveryRecord
+        && !boardTerminalCarrierRecord
+        && (!branchOwnership.legitimate || recordedBranchMismatch)
+      ) {
         const branchReason =
           branchOwnership.branch === null
             ? "card has no execution-workspace delivery branch to validate the recorded branch against"

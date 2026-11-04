@@ -62,7 +62,7 @@ import {
   type ExecutionWorkspaceInput,
   type RealizedExecutionWorkspace,
 } from "./workspace-runtime.js";
-import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
+import { isRuntimeOwnedGitBranch, isValidGitBranchName } from "./execution-workspace-branch-ownership.js";
 import {
   workspaceOperationService,
   type WorkspaceOperationRecorder,
@@ -304,6 +304,46 @@ export async function provisionIssueExecutionWorkspace(
   const existingExecutionWorkspace = requestedExecutionWorkspaceId
     ? await executionWorkspacesSvc.getById(requestedExecutionWorkspaceId)
     : null;
+  // A fresh workspace row must not drop the branch a recorded delivery was
+  // validated against. With no reuse preference every wake mints a new
+  // project_primary row whose realized branch is null, which orphaned the
+  // recorded delivery identity and looped final review on
+  // delivery_identity_unresolved. Carry the recorded branch onto the new row,
+  // but only while the card is in_review and only when it carries THIS card's
+  // identifier prefix: a board-attested record is not ownership-validated, and
+  // copying it onto the row would turn another card's branch into this card's
+  // validated own branch (ADR-091 D1).
+  const [recordedDeliveryRow] = issueId
+    ? await db
+        .select({ executionState: issues.executionState, status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+    : [];
+  const recordedDelivery = (
+    recordedDeliveryRow?.executionState as { delivery?: unknown } | null | undefined
+  )?.delivery;
+  const recordedDeliveryBranchCandidate =
+    recordedDeliveryRow?.status === "in_review" &&
+    recordedDelivery !== null &&
+    recordedDelivery !== undefined &&
+    typeof recordedDelivery === "object" &&
+    !Array.isArray(recordedDelivery) &&
+    typeof (recordedDelivery as { branch?: unknown }).branch === "string"
+      ? readNonEmptyString((recordedDelivery as { branch: string }).branch.trim())
+      : null;
+  const recordedDeliveryIdentifier = readNonEmptyString(issueRef?.identifier);
+  // The carry requires the identifier-prefix anchor in every arm, case
+  // sensitively (git refs are case-sensitive). Equality with the bound
+  // workspace row's branch is not enough: a sourceless row can carry a
+  // foreign branch name, and copying it would launder that name into this
+  // card's validated own branch (ADR-091 D1).
+  const recordedDeliveryBranch =
+    recordedDeliveryBranchCandidate !== null &&
+    recordedDeliveryIdentifier !== null &&
+    isValidGitBranchName(recordedDeliveryBranchCandidate) &&
+    recordedDeliveryBranchCandidate.startsWith(`${recordedDeliveryIdentifier}-`)
+      ? recordedDeliveryBranchCandidate
+      : null;
   const nativeRecoveryExecutionWorkspaceId = resolveNativeRecoveryExecutionWorkspaceBinding({
     bindingId: requestedExecutionWorkspaceIdOverride,
     persistedWorkspaceFound: existingExecutionWorkspace !== null,
@@ -840,8 +880,20 @@ export async function provisionIssueExecutionWorkspace(
       : {}),
   };
   const pendingForwardBranchReconcile = executionWorkspace.pendingForwardBranchReconcile ?? null;
+  // Never stamp this card's recorded branch onto a restored row another
+  // issue owns (an ancestor-owned shared_workspace row): the ownership
+  // resolver would then read this card's branch as a legitimate carrier
+  // branch (ADR-091 D1). Fresh rows and rows this card owns are unaffected.
+  const restoringOntoForeignRow =
+    resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace &&
+    reusableExistingExecutionWorkspace != null &&
+    reusableExistingExecutionWorkspace.sourceIssueId != null &&
+    reusableExistingExecutionWorkspace.sourceIssueId !== "" &&
+    reusableExistingExecutionWorkspace.sourceIssueId !== issueId;
   const branchNameForInitialPersistence =
-    pendingForwardBranchReconcile?.recordedBranchName ?? executionWorkspace.branchName;
+    pendingForwardBranchReconcile?.recordedBranchName ??
+    executionWorkspace.branchName ??
+    (restoringOntoForeignRow ? null : recordedDeliveryBranch);
   try {
     persistedExecutionWorkspace =
       resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace && reusableExistingExecutionWorkspace

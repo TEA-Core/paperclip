@@ -204,12 +204,14 @@ When resolving a card's delivery identity (`resolveDeliveryIdentity`), the
 control plane consults evidence in strict priority order:
 
 1. **Recorded delivery identity** (`issues.execution_state.delivery`) —
-   written at the `in_review` transition by the run that holds the issue's
-   lease. Contains `{ repo: { owner, repo }, branch, headSha, recordedByRunId,
-   recordedAt }`. When present and repo-resolvable (non-empty `repo.owner`,
-   `repo.repo`, `branch`, and `headSha`), the D1 gate compares the linked PR's
-   head against the **recorded** branch; the execution-workspace row is not
-   consulted for the branch half.
+   written only through the write path below (the lease-holding run entering
+   `in_review`, or a board refresh of a card already `in_review`). Contains
+   `{ repo: { owner, repo }, branch, headSha, recordedByRunId, recordedAt }`
+   plus an optional PR binding (`prNumber`, `prUrl`, `sourceIssueId`). When
+   present and repo-resolvable (non-empty `repo.owner`, `repo.repo`, `branch`,
+   and `headSha`), the D1 gate compares the linked PR's head against the
+   **recorded** branch; the execution-workspace row is not consulted for the
+   branch half.
 2. **Execution-workspace row** — when no recorded identity exists, the
    delivery identity falls back to the card's `execution_workspaces` row
    (`branchName` + `repoUrl`). This is the pre-D1 behavior, preserved
@@ -221,20 +223,154 @@ control plane consults evidence in strict priority order:
    branch name) is **never** entered when a recorded identity is present.
 
 **Fail-closed rule:** a recorded identity that is present but unusable
-(missing `repo.owner`/`repo.repo`/`branch`/`headSha`, or any of them empty)
+(missing `repo.owner`/`repo.repo`/`branch`/`headSha`, any of them empty, or a
+`branch` that is not a valid git branch name, as a legacy record written before
+the write-side check can be)
 produces a named `delivery_identity_unresolved` refusal and never falls back
 to the execution-workspace row. The named reason identifies which field is
 missing so an operator can diagnose the write path.
 
 **Write path (control-plane consume-contract):** the `PATCH /issues/:id`
-route accepts a `deliveryIdentity` field. It is recorded only when:
+route accepts a `deliveryIdentity` field. It is recorded only when either:
 - the actor is an agent run holding the issue's lease (`executionRunId` or
-  `checkoutRunId` matches), and
-- the transition is **into** `in_review` (prior status was not `in_review`).
+  `checkoutRunId` matches) and the transition is **into** `in_review` (prior
+  status was not `in_review`), or
+- the actor is a **board** member and the card is **already** `in_review`
+  (board refresh: re-record `branch`/`headSha`/`prNumber` after a redo push
+  moved the PR head or the workspace drifted, instead of a database write).
 
 Any other actor or transition is rejected with `422 delivery_identity_write_rejected`
-and no partial write occurs. `recordedByRunId` and `recordedAt` are
-server-owned (set from the actor context), never client-supplied.
+and no partial write occurs. A board refresh that also changes `status` in the
+same `PATCH` is refused the same way, because the final-delivery preflight and
+the done-transition guards read the stored record, not the one in the request:
+refresh the record first, then issue the verdict in a second `PATCH`.
+`recordedByRunId` and `recordedAt` are server-owned (set from the actor
+context), never client-supplied.
+
+The board refresh path applies the anchoring rule, including the
+identifier-prefix check: the recorded branch binds this card only when anchored
+to it. It must equal the card's control-plane delivery branch
+(or a legitimate ADR-083 carrier owner's branch), else `422
+delivery_identity_branch_write_rejected`. The lease-holding agent path that
+enters review does not apply that rule: it keeps its existing behaviour and can
+still stamp an unanchored branch (including a lowercase-prefixed one such as
+`sup-22-work`), because that path does not use the identifier-prefix helper.
+A board refresh also needs the card's
+identifier prefix on `branch` to stamp it onto this card's own `project_primary`
+row that has no branch, or to record a card with **no** execution workspace
+(that record must also bind a PR, `prNumber` and `prUrl`). A board refresh may
+also record the exact branch of an ADR-083 carrier whose owner is already
+done/cancelled (a terminal carrier), provided the record binds a PR (`prNumber`
+and `prUrl`); approval later accepts it only as a merged delivery (see below).
+Board attestation alone never turns an unanchored branch into the card's own
+branch. Workspace provisioning applies the same anchor when it carries the
+recorded branch onto a freshly minted or restored workspace row: the recorded
+branch must carry the card's identifier prefix in every case, and equality with
+the branch of the bound workspace row is not enough. The carry also never lands
+on a restored row another issue owns (for example an ancestor-owned
+`shared_workspace` row): that row keeps its own branch, so the card's recorded
+branch is never read back as a legitimate carrier branch. Fresh rows and rows
+the card owns are carried normally.
+
+On both paths `branch` must also be a name git itself would accept as a branch
+(`git check-ref-format --branch` rules: no empty name, lone `@`, leading dash or
+the exact name `HEAD`; no control character or NUL, space, `~^:?*[\`, `..`,
+`@{`, lone UTF-16 surrogate, doubled or edge slashes, trailing dot, or a
+component that starts with `.` or ends in `.lock`). A name that is invalid, or that becomes invalid
+after its well-formed `%HH` escapes are decoded (a bounded number of passes),
+is refused with `422 delivery_identity_branch_write_rejected`; a lone `%` is an
+ordinary character. Provisioning skips the branch carry for such a name.
+
+A `deliveryIdentity` write is validated against the workspace the card holds at
+the time of the request, so a `PATCH` that carries `deliveryIdentity` and also
+changes `executionWorkspaceId` is refused in every case (agent or board, own
+branch, `project_primary` stamp, no-workspace record, or terminal-carrier
+record) with `422 delivery_identity_branch_write_rejected`. Do the two as
+separate `PATCH`es, rebind first, but only where the rebind actually binds (the
+gates listed under the terminal-carrier arm below). Under the default
+configuration (`enableIsolatedWorkspaces` off) a rebind is silently dropped, so
+rebind-first does not work in the `project_primary` arm: the stamp is written
+onto the `project_primary` row the card already holds, with no rebind. With
+`enableIsolatedWorkspaces` on and a project policy that sets
+`executionWorkspacePolicy.allowIssueOverride` to `false`, a `project_primary`
+stamp that writes the branch onto the card's branchless row is refused with
+`422` `workspace_issue_override_disallowed` whether or not the request names an
+`executionWorkspaceId`: the route re-supplies the stored workspace id on that
+write, and the policy check counts it as an override. This applies to the board
+refresh and to the agent's entry-into-review write alike. With the flag off the
+id is dropped from the patch before that policy check and the stamp proceeds on
+the row the card already holds. When the
+rebind does bind, the record is validated against (and, for a `project_primary`
+stamp, written onto) the workspace the card will hold at approval. Recording first and rebinding second is not refused at write time, but
+a rebind does not revalidate a stored record, so it can leave a record the
+approval resolver refuses with `delivery_identity_unresolved` ("recorded delivery
+identity's branch does not match this card's control-plane delivery branch").
+In the `project_primary` arm the stamp lands on the old row, so a rebind to a row
+with a null or different branch leaves the record unresolvable. In the orphan
+arm (no execution workspace) the record is accepted as a merged-only delivery
+only while the card has no workspace; after a rebind the record must equal the
+new row's branch, so it resolves only if that branch happens to match. The
+terminal-carrier arm is narrower still: the record is accepted only while the
+card is bound to the terminal carrier row. A record sent before the card is
+bound to that row is refused with `422` `delivery_identity_branch_write_rejected`.
+Whether a rebind onto the carrier row binds depends on
+three gates. (1) The `enableIsolatedWorkspaces` experimental flag: with it off,
+the rebind is silently dropped (`200`, the old pointer is cleared, so the
+workspace pointer is null) and an identity `PATCH` sent after it is refused with
+`422` `delivery_identity_branch_write_rejected`, because the card then has no
+execution-workspace delivery branch; with it on, the pointer keeps the row id.
+(2) The binding coherence check on an explicit rebind: a row that is neither a
+`shared_workspace` row nor sourced by the card itself is refused with `422`
+`workspace_cross_source_binding`. An `isolated_workspace` ADR-083 carrier is
+sourced by an ancestor card, so a rebind onto it is refused and the only route
+is to record while the card still holds the carrier row; a `shared_workspace`
+carrier passes this check. (3) The project policy: with
+`executionWorkspacePolicy.allowIssueOverride` set to `false` (and the flag on),
+any explicit `executionWorkspaceId` is refused with `422`
+`workspace_issue_override_disallowed`. When all three pass, the rebind binds
+and an identity `PATCH` sent after it returns `200`. Rebinding away from the
+carrier row after the record is written returns `200` and leaves the record in
+place, but the approval-time resolver then refuses it. So write the record while
+the card is bound to the carrier row and do not rebind afterwards.
+
+The provisioning carry also applies only while the card's status is `in_review`
+at provisioning time. Once a card leaves `in_review` (a bounced redo wake, a
+reopened follow-up), the fresh or restored row keeps a null branch in the
+shapes where the realized branch is null (a `project_primary` or
+local-filesystem row), exactly as before the carry existed, so a later write
+into `in_review` with a new anchored branch is stamped normally. A
+`git_worktree` realization is different: its row keeps the realized worktree
+branch, which takes precedence over the recorded branch, so the null-branch
+statement does not hold for that shape. A card that stays `in_review` and re-delivers on a
+different branch than the one carried onto its row still gets `422
+delivery_identity_branch_write_rejected`; that case is unchanged and not covered
+by this carry.
+
+**Merged-only bindings:** when the control plane cannot back the record with a
+live delivery branch, `resolveDeliveryIdentity` still returns the binding but
+marks it `requireMerged`. This covers a card with no execution workspace (anchored
+by identifier prefix) and an ADR-083 carrier whose owner is already done/cancelled.
+`resolveExactBoundPullRequest` then accepts it only as a completed delivery: the
+bound PR must be merged, its head repository must be present and equal the
+recorded repository (a fork head, or an absent head repository, is refused), and
+its merge commit must be proven on the card's own control-plane base, never the
+PR's self-reported base. The base depends on the
+shape. When the card has an execution workspace row (the terminal-carrier shape)
+it is that row's `baseRef`, and a null `baseRef` does not fall back to the project
+default: the proof is refused (a terminal carrier whose `baseRef` is
+`release/other` arms a PR merged on `release/other`). A card with no execution
+workspace has no such row, so the base falls through to the project workspace:
+its `defaultRef`, else its `repoRef` (the card's own project workspace, else the
+project's primary one). The base must be a live branch: `origin/<b>`,
+`refs/remotes/origin/<b>` and `refs/heads/<b>` all denote `<b>`, which is then
+resolved under `refs/heads/*` on GitHub. A tag, any other `refs/*` form, a commit
+SHA, or a name that is not a live branch is refused, because containment against
+a non-branch base proves nothing about the control-plane branch. A card that
+resolves no base is refused. Ordinary bindings keep proving a merged PR against
+the PR's own base branch. An open PR on a dead carrier stays refused
+(SUP-16896). A merged-only
+binding is never a release target (`resolveReleaseDeliveryTarget`) and never
+feeds release-assurance.
 
 ### Guard B actor-resolution order (ADR-092 D3, SUP-14826)
 

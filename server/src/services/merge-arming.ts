@@ -25,6 +25,7 @@ import {
   type GitHubTokenResolution,
 } from "./github-credential.js";
 import { inheritedExecutionWorkspaceBranchExempt } from "./execution-workspace-policy.js";
+import { isValidGitBranchName } from "./execution-workspace-branch-ownership.js";
 import { isStrictAncestorIssueIdOf } from "./issues.js";
 import {
   claimDeliveryReceiptForPublication,
@@ -2012,6 +2013,22 @@ export interface CardDeliveryBranchOwnership {
  ownerIssueId: string | null;
  /** Named refusal reason when `legitimate` is false. */
  refusalReason: string | null;
+ /**
+  * True iff `legitimate` is false SOLELY because the ADR-083 carrier owner is
+  * already terminal (done/cancelled). A recorded bound PR that is proven
+  * merged on its base branch is a completed delivery in this shape, so
+  * `resolveDeliveryIdentity` may still return the binding for exact-PR
+  * verification instead of refusing outright.
+  */
+ carrierOwnerTerminal?: boolean;
+ /**
+  * True iff the card has no execution-workspace row at all
+  * (`execution_workspace_id` IS NULL). Distinct from a row that exists with a
+  * NULL branch_name: with no row there is no control-plane branch to
+  * contradict a recorded bound PR, so the record is anchored by the card's
+  * identifier prefix and accepted only as a merged-and-proven delivery.
+  */
+ noExecutionWorkspace?: boolean;
 }
 
 /**
@@ -2077,6 +2094,7 @@ export async function resolveCardDeliveryBranchOwnership(
      legitimate: false,
      ownerIssueId: null,
      refusalReason: "card has no execution-workspace delivery branch to validate the recorded branch against",
+     noExecutionWorkspace: true,
    };
  }
  const [wsRow] = await db
@@ -2136,6 +2154,7 @@ export async function resolveCardDeliveryBranchOwnership(
         branchIsOwn: false,
         carrier: true,
         legitimate: false,
+        carrierOwnerTerminal: true,
         ownerIssueId: source,
         refusalReason:
           `ADR-083 carrier owner ${ownerRow?.identifier ?? source} is already ${ownerStatus}; a terminal owner can never stamp or promote this carrier, so the delivery is refused (SUP-16896). The commits remain on branch '${branch}' — re-file the work on a live card's branch, or have the board/operator disposition the orphan carrier PR.`,
@@ -2185,6 +2204,13 @@ interface DeliveryBinding {
   prUrl: string;
   headSha: string;
   sourceIssueId?: string;
+  /**
+   * Set when the control plane cannot back the record with a live delivery
+   * branch (ADR-083 terminal carrier owner, or no execution workspace). Such a
+   * binding is accepted only as a COMPLETED delivery: the bound PR must be
+   * merged and proven on its base branch, never an open PR.
+   */
+  requireMerged?: boolean;
 }
 
 export async function resolveDeliveryIdentity(
@@ -2286,6 +2312,18 @@ export async function resolveDeliveryIdentity(
         identifier,
       };
     }
+    if (!isValidGitBranchName(branch)) {
+      // Legacy records seeded before the write boundary existed can carry a
+      // branch git itself would refuse; the read side applies the same
+      // validator so such a record is unusable here too.
+      return {
+        branch: null,
+        repo: null,
+        recordedUnusable: "recorded delivery identity branch is not a valid git branch name",
+        branchIsOwn: true,
+        identifier,
+      };
+    }
     if (!headSha) {
       return {
         branch: null,
@@ -2350,10 +2388,31 @@ export async function resolveDeliveryIdentity(
     // delivered (the SUP-15896 -> SUP-15908 laundering vector), so it fails closed —
     // never fall back to the workspace row.
     const branchOwnership = await resolveCardDeliveryBranchOwnership(db, companyId, issueId);
+    const hasBoundPr = prNumber !== null && prUrl !== null;
+    // A card with NO execution-workspace row has no control-plane branch that
+    // could contradict the record, so the record is anchored to the card by its
+    // identifier prefix instead (the same weaker predicate a shared-workspace
+    // card uses). The binding is then accepted only as a merged-and-proven
+    // delivery (`requireMerged`); an unrelated card's PR is never bound.
+    const orphanBoundDelivery =
+      branchOwnership.noExecutionWorkspace === true &&
+      hasBoundPr &&
+      identifier !== null &&
+      // Case-sensitive anchor: git refs are case-sensitive, so a lowercase
+      // look-alike prefix does not bind this card's delivery.
+      branch.startsWith(`${identifier}-`);
+    // ADR-083 terminal carrier: the owner is done/cancelled, so it can never
+    // stamp again, but a recorded bound PR on the carrier branch that is proven
+    // merged on its base branch IS the completed delivery. An open PR on a dead
+    // carrier stays refused (SUP-16896) by `requireMerged`.
+    const terminalCarrierBoundDelivery =
+      branchOwnership.carrierOwnerTerminal === true && hasBoundPr;
+    const mergedOnlyBinding = orphanBoundDelivery || terminalCarrierBoundDelivery;
     if (
-      branchOwnership.branch === null ||
-      // Git refs are case-sensitive: the recorded branch is an exact match, not case-folded.
-      branch !== branchOwnership.branch
+      !orphanBoundDelivery &&
+      (branchOwnership.branch === null ||
+        // Git refs are case-sensitive: the recorded branch is an exact match, not case-folded.
+        branch !== branchOwnership.branch)
     ) {
       return {
         branch: null,
@@ -2368,7 +2427,7 @@ export async function resolveDeliveryIdentity(
     // carrier-owner ancestor) is a foreign same-repo branch. Refuse to arm on it even
     // when the row is already in the DB — the gate asserts a named refusal, not just
     // the absence of a stamp.
-    if (!branchOwnership.legitimate) {
+    if (!branchOwnership.legitimate && !orphanBoundDelivery && !terminalCarrierBoundDelivery) {
       return {
         branch: null,
         repo: null,
@@ -2385,7 +2444,10 @@ export async function resolveDeliveryIdentity(
     return {
       branch,
       repo: projectRepo,
-      binding: prNumber !== null && prUrl !== null ? { branch, prNumber, prUrl, headSha, sourceIssueId } : undefined,
+      binding:
+        prNumber !== null && prUrl !== null
+          ? { branch, prNumber, prUrl, headSha, sourceIssueId, ...(mergedOnlyBinding ? { requireMerged: true } : {}) }
+          : undefined,
       branchIsOwn: branchOwnership.branchIsOwn,
       identifier,
     };
@@ -2450,9 +2512,27 @@ async function verifyMergedPullRequestOnBaseBranch(
   repo: string,
   baseRef: string | null,
   mergeCommitSha: string | null,
+  options: { requireVerifiedBranch?: boolean } = {},
 ): Promise<MergedDeliveryVerification> {
   if (!baseRef || !mergeCommitSha) {
     return { outcome: "unproven", reason: "merged PR has no readable merge commit or base branch" };
+  }
+  if (options.requireVerifiedBranch) {
+    // The pinned base comes from a persisted workspace/project ref, which can
+    // name a tag or a commit SHA. GitHub compare accepts those as a base, so
+    // containment against them would prove nothing about a control-plane
+    // branch. Resolve the ref under refs/heads/* first: only a live branch
+    // may serve as the compare base (fail closed otherwise).
+    const branchHead = await fetchBranchHeadSha(token, owner, repo, baseRef);
+    if (!branchHead.ok) {
+      if (branchHead.status === 401 || branchHead.status === 403) {
+        return { outcome: "auth-failed", status: branchHead.status };
+      }
+      return {
+        outcome: "unproven",
+        reason: `the card's recorded base ref ${baseRef} is not a verified branch`,
+      };
+    }
   }
   let response: Response;
   try {
@@ -2483,6 +2563,61 @@ async function verifyMergedPullRequestOnBaseBranch(
   };
 }
 
+/**
+ * The base branch a merged-only delivery (`requireMerged`: terminal ADR-083
+ * carrier or no execution workspace) must be proven on: the card's own
+ * control-plane base (remote-tracking prefix stripped), never the live PR's
+ * self-reported `base.ref`. With an execution workspace row that is the row's
+ * `baseRef` (a null `baseRef` does not fall back to the project default); with
+ * no such row `resolveIssueRepoContext` falls through to the project workspace
+ * `defaultRef ?? repoRef`. A PR merged onto a side branch must not satisfy such
+ * a delivery, because nothing live backs it. Null when the card records no
+ * base: the caller then refuses, it never falls back to the live PR base.
+ * Ordinary bindings are not pinned.
+ */
+async function resolveCardDeliveryBaseRef(
+  db: Db,
+  companyId: string,
+  issueId: string,
+): Promise<string | null> {
+  const [issueRow] = await db
+    .select({
+      projectId: issues.projectId,
+      projectWorkspaceId: issues.projectWorkspaceId,
+      executionWorkspaceId: issues.executionWorkspaceId,
+    })
+    .from(issues)
+    .where(eq(issues.id, issueId));
+  if (!issueRow) return null;
+  const ctx = await resolveIssueRepoContext(db, { companyId, ...issueRow });
+  const raw = ctx?.defaultRef ?? null;
+  if (!raw) return null;
+  return normalizeCardDeliveryBaseRef(raw);
+}
+
+/**
+ * Normalizes a persisted control-plane ref to the branch name it denotes, or
+ * null when it cannot denote a branch at all. `origin/<b>`,
+ * `refs/remotes/origin/<b>` and `refs/heads/<b>` all denote `<b>`. Tags
+ * (`refs/tags/*`), any other `refs/*` form, and commit SHAs (full 40-hex or
+ * abbreviated hex) are refused: a merged-only proof must be made against a
+ * branch, and the caller verifies the surviving name under `refs/heads/*`
+ * before comparing.
+ */
+function normalizeCardDeliveryBaseRef(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  let branch: string;
+  if (trimmed.startsWith("refs/heads/")) branch = trimmed.slice("refs/heads/".length);
+  else if (trimmed.startsWith("refs/remotes/origin/")) branch = trimmed.slice("refs/remotes/origin/".length);
+  else if (trimmed.startsWith("refs/")) return null;
+  else if (trimmed.startsWith("origin/")) branch = trimmed.slice("origin/".length);
+  else branch = trimmed;
+  if (!branch) return null;
+  if (/^[0-9a-fA-F]{7,40}$/.test(branch)) return null;
+  return branch;
+}
+
 async function resolveExactBoundPullRequest(
   db: Db,
   companyId: string,
@@ -2504,18 +2639,39 @@ async function resolveExactBoundPullRequest(
       if ((result.status === 401 || result.status === 403) && candidate !== candidates[candidates.length - 1]) continue;
       return { pr: null, reason: `recorded delivery identity PR open-state verification failed: HTTP ${result.status}` };
     }
+    if (result.headRepoFullName &&
+        result.headRepoFullName.toLowerCase() !== `${repo.owner}/${repo.repo}`.toLowerCase()) {
+      // A fork-head PR is not this card's delivery in the recorded repo, at
+      // the early arm decision just as at the final preflight.
+      return {
+        pr: null,
+        reason: `recorded delivery identity PR head belongs to ${result.headRepoFullName}, not the card's recorded repo ${repo.owner}/${repo.repo}`,
+      };
+    }
+    const closedAndMerged = result.state === "closed" && result.merged === true;
     if (result.open !== true || result.draft === true) {
       // SUP-21513: a MERGED delivery PR whose merge commit is proven on the
       // recorded base branch is a completed delivery, not an unresolved one.
       // Closed-unmerged and open drafts keep the original fail-closed refusals
       // below, byte-identically (ADR-091 D4).
-      if (result.merged === true && result.draft !== true) {
+      if (closedAndMerged && result.draft !== true) {
+        if (binding.requireMerged && !result.headRepoFullName) {
+          // A merged-only (terminal-carrier or workspace-less) binding
+          // requires the head repository to be present and readable; an
+          // absent one cannot prove the PR is this card's delivery in the
+          // recorded repo.
+          return {
+            pr: null,
+            reason: "recorded delivery identity PR head repository is absent; a merged-only delivery requires a readable head repository",
+          };
+        }
         const verified = await verifyMergedPullRequestOnBaseBranch(
           candidate.token,
           repo.owner,
           repo.repo,
-          result.baseRef,
+          binding.requireMerged ? await resolveCardDeliveryBaseRef(db, companyId, issueId) : result.baseRef,
           result.mergeCommitSha,
+          { requireVerifiedBranch: binding.requireMerged },
         );
         if (verified.outcome === "auth-failed" && candidate !== candidates[candidates.length - 1]) continue;
         if (verified.outcome !== "proven") {
@@ -2529,6 +2685,12 @@ async function resolveExactBoundPullRequest(
       } else {
         return { pr: null, reason: result.draft === true ? "recorded delivery identity PR is a draft" : "recorded delivery identity PR is not open" };
       }
+    }
+    if (binding.requireMerged && !closedAndMerged) {
+      return {
+        pr: null,
+        reason: "recorded delivery identity PR is not merged; a delivery without a live control-plane branch (terminal ADR-083 carrier or no execution workspace) is accepted only once its PR is merged and proven on its base branch",
+      };
     }
     if (result.headRef !== binding.branch) {
       return {
@@ -3535,12 +3697,14 @@ async function verifyLiveFinalDeliveryHead(
       // SUP-21513: a merged delivery whose merge commit is proven on the
       // recorded base branch is a completed delivery — accept it. No status is
       // written later; publishApprovalStatus truthfully skips merged PRs.
+      const mergedOnly = (await resolveDeliveryIdentity(db, companyId, issueId)).binding?.requireMerged === true;
       const verified = await verifyMergedPullRequestOnBaseBranch(
         candidate.token,
         pr.owner,
         pr.repo,
-        live.base?.ref ?? null,
+        mergedOnly ? await resolveCardDeliveryBaseRef(db, companyId, issueId) : live.base?.ref ?? null,
         live.merge_commit_sha ?? null,
+        { requireVerifiedBranch: mergedOnly },
       );
       if (verified.outcome === "auth-failed") {
         if (candidate !== candidates[candidates.length - 1]) continue;
@@ -4220,6 +4384,8 @@ export interface HeadShaSuccess extends GitHubFetchResult {
   mergeCommitSha: string | null;
   /** SUP-21513: the PR's recorded base branch (body.base.ref), else null. */
   baseRef: string | null;
+  /** The head repository (body.head.repo.full_name); a fork head differs from the base repo. */
+  headRepoFullName?: string | null;
 }
 
 export interface HeadShaFailure extends GitHubFetchResult {
@@ -4304,6 +4470,9 @@ async function fetchPullRequestHeadShaOnce(
   const head = body.head as Record<string, unknown> | undefined;
   const sha = head?.sha as string | undefined;
   const ref = typeof head?.ref === "string" && head.ref.length > 0 ? head.ref : null;
+  const headRepo = head?.repo as Record<string, unknown> | undefined;
+  const headRepoFullName =
+    typeof headRepo?.full_name === "string" && headRepo.full_name.length > 0 ? headRepo.full_name : null;
   const base = body.base as Record<string, unknown> | undefined;
   const baseRef = typeof base?.ref === "string" && base.ref.length > 0 ? base.ref : null;
   const mergeCommitSha =
@@ -4323,6 +4492,7 @@ async function fetchPullRequestHeadShaOnce(
       merged: body.merged === true,
       mergeCommitSha,
       baseRef,
+      headRepoFullName,
     };
   }
   return {
@@ -4731,6 +4901,9 @@ export async function resolveReleaseDeliveryTarget(
   }
   const bindingError = deliveryBindingValidationError(identity.binding, identity.repo, issueId);
   if (bindingError) return { ok: false, reason: bindingError };
+  if (identity.binding.requireMerged) {
+    return { ok: false, reason: "the card's recorded delivery PR is accepted only as a merged delivery (terminal carrier or no execution workspace); it is not a release target" };
+  }
   const { owner, repo } = identity.repo;
   const number = identity.binding.prNumber;
   const [issueRow] = await db
