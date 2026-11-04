@@ -275,7 +275,6 @@ import {
   findMissingAdr072CloseLadderStages,
   renderDoneTierDeclaration,
   TIER1_FORM,
-  TIER1_NO_REPOSITORY_FORM,
   writeAuditLog,
   type DoneTransitionOverride,
 } from "../services/done-transition-guard.js";
@@ -5443,13 +5442,13 @@ export function issueRoutes(
           `${DONE_TIER_STRUCTURED_FORMS}` +
           `. Alternatively, include a done-tier declaration in the close comment: ` +
           `"Closed at Tier 2 (live): probe \`<probe command>\` head <probe head sha> post-merge: <post-merge predicate>"` +
-          ` or ${TIER1_FORM} or ${TIER1_NO_REPOSITORY_FORM}` +
+          ` or ${TIER1_FORM}` +
           ` — per SUP-12693.`
         : "Provide a done-tier declaration, preferably as the structured doneTier field in this same request body: " +
           `${DONE_TIER_STRUCTURED_FORMS}` +
           `. Alternatively, include a done-tier declaration in the close comment: ` +
           `"Closed at Tier 2 (live): probe \`<probe command>\` head <probe head sha> post-merge: <post-merge predicate>"` +
-          ` or ${TIER1_FORM} or ${TIER1_NO_REPOSITORY_FORM}` +
+          ` or ${TIER1_FORM}` +
           ` — per SUP-12693.`;
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
       // a record-write failure propagates to the route's error handler (5xx) rather than

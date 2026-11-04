@@ -1055,12 +1055,6 @@ const doneTierLandingDelegatedSchema = z
   })
   .strict();
 
-const doneTierNoRepositoryLandingSchema = z
-  .object({
-    mode: z.literal("noRepositoryLanding"),
-  })
-  .strict();
-
 export const doneTierDeclarationSchema = z.discriminatedUnion("tier", [
   z
     .object({
@@ -1075,7 +1069,6 @@ export const doneTierDeclarationSchema = z.discriminatedUnion("tier", [
       landing: z.discriminatedUnion("mode", [
         doneTierLandedAtTipSchema,
         doneTierLandingDelegatedSchema,
-        doneTierNoRepositoryLandingSchema,
       ]),
     })
     .strict(),
