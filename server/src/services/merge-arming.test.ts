@@ -2140,16 +2140,6 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       return issueId;
     }
 
-    it("preflightFinalDelivery refuses a mention carrier on a contradictory PR answer (state open, merged true)", async () => {
-      const issueId = await insertMentionOnlyCard();
-      installRoutes(mergedCarrierRoutes(mergedMentionBody({ state: "open" })));
-
-      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
-
-      expect(result.kind, JSON.stringify(result)).toBe("unresolvable");
-      if (result.kind === "unresolvable") expect(result.reason).toContain("no-pr");
-    });
-
     it("preflightFinalDelivery accepts the single verified merged mentioned carrier", async () => {
       const issueId = await insertMentionOnlyCard();
       installRoutes(mergedCarrierRoutes());

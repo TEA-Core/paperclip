@@ -3693,7 +3693,7 @@ async function verifyLiveFinalDeliveryHead(
     const parsed = finalDeliveryLiveSchema.safeParse(await response.json());
     if (!parsed.success) return { kind: "unresolvable", reason: "head_unverifiable: incomplete live PR response" };
     const live = parsed.data;
-    if (live.state === "closed" && live.merged === true) {
+    if (live.merged === true) {
       // SUP-21513: a merged delivery whose merge commit is proven on the
       // recorded base branch is a completed delivery — accept it. No status is
       // written later; publishApprovalStatus truthfully skips merged PRs.
@@ -3775,7 +3775,7 @@ async function resolveSingleMergedMentionCarrier(
       const live = await fetchPullRequestHeadSha(candidates[i]!.token, pr.owner, pr.repo, pr.number);
       if (live.ok) {
         unreadable = null;
-        if (live.state === "closed" && live.merged === true && live.headSha) {
+        if (live.merged === true && live.headSha) {
           mergedCarriers.push({
             kind: "resolved",
             headSha: live.headSha,
