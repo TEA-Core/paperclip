@@ -223,7 +223,9 @@ control plane consults evidence in strict priority order:
    branch name) is **never** entered when a recorded identity is present.
 
 **Fail-closed rule:** a recorded identity that is present but unusable
-(missing `repo.owner`/`repo.repo`/`branch`/`headSha`, or any of them empty)
+(missing `repo.owner`/`repo.repo`/`branch`/`headSha`, any of them empty, or a
+`branch` that is not a valid git branch name, as a legacy record written before
+the write-side check can be)
 produces a named `delivery_identity_unresolved` refusal and never falls back
 to the execution-workspace row. The named reason identifies which field is
 missing so an operator can diagnose the write path.
@@ -348,8 +350,10 @@ live delivery branch, `resolveDeliveryIdentity` still returns the binding but
 marks it `requireMerged`. This covers a card with no execution workspace (anchored
 by identifier prefix) and an ADR-083 carrier whose owner is already done/cancelled.
 `resolveExactBoundPullRequest` then accepts it only as a completed delivery: the
-bound PR must be merged and its merge commit proven on the card's own
-control-plane base, never the PR's self-reported base. The base depends on the
+bound PR must be merged, its head repository must be present and equal the
+recorded repository (a fork head, or an absent head repository, is refused), and
+its merge commit must be proven on the card's own control-plane base, never the
+PR's self-reported base. The base depends on the
 shape. When the card has an execution workspace row (the terminal-carrier shape)
 it is that row's `baseRef`, and a null `baseRef` does not fall back to the project
 default: the proof is refused (a terminal carrier whose `baseRef` is

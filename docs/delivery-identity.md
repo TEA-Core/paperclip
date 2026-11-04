@@ -18,7 +18,7 @@ Before approval status is published or merge arming proceeds, the server validat
 3. The exact pull request must exist, be open, and not be a draft. Exception: a merged-only binding (a card with no execution workspace, or an ADR-083 carrier whose owner is already done/cancelled) must instead be merged and proven on the card's own control-plane base branch; an open PR is refused. See [Branch protection](branch-protection.md) for the write path and merged-only rule.
 4. Its live head branch must equal `branch`.
 5. Its live head SHA must equal `headSha`.
-6. The pull request repository must equal the project's delivery repository.
+6. The pull request repository must equal the project's delivery repository, and so must its head repository: a fork-head PR is refused, and a merged-only binding also refuses an absent head repository.
 7. Cached linked-PR metadata is used only to preserve the GraphQL node ID; it does not replace live verification.
 
 The exact pull request is selected by number and repository. Title text, issue-reference mentions, branch-only matches, PR URL prefixes, and the first or only same-branch candidate are not authoritative.
