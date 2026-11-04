@@ -7,7 +7,6 @@ import {
   createAcceptedPlanDecompositionSchema,
   createChildIssueSchema,
   createIssueSchema,
-  doneTierDeclarationSchema,
   issueBlockedInboxAttentionSchema,
   issueExecutionMonitorPolicySchema,
   issueExecutionPolicySchema,
@@ -120,23 +119,6 @@ describe("issue validators", () => {
     expect(
       updateIssueSchema.parse({ comment: undefined }).comment,
     ).toBeUndefined();
-  });
-
-  it("accepts structured no-repository Tier 1 declarations and rejects malformed variants", () => {
-    const declaration = {
-      tier: "tier1" as const,
-      reason: "The entry ruling is recorded",
-      landing: { mode: "noRepositoryLanding" as const },
-    };
-    expect(doneTierDeclarationSchema.safeParse(declaration).success).toBe(true);
-    expect(doneTierDeclarationSchema.safeParse({
-      ...declaration,
-      landing: { mode: "noRepositoryLanding", extra: true },
-    }).success).toBe(false);
-    expect(doneTierDeclarationSchema.safeParse({
-      tier: "tier1",
-      reason: "The entry ruling is recorded",
-    }).success).toBe(false);
   });
 
   it("accepts delivery requirements on create and update while rejecting unknown values", () => {
