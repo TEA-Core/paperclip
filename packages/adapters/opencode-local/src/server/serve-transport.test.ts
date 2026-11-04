@@ -158,14 +158,29 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
     expect((await requests()).some((entry) => entry.path.endsWith("/prompt"))).toBe(false);
   });
 
-  it("resumes a known session and switches its model", async () => {
-    const result = await runOpenCodeServeProcess(input({ resumeSessionId: "ses_known", variant: "high" }));
-    expect(result.exitCode).toBe(0);
+  it("preserves state and resumes a known session across two invocations", async () => {
+    const xdg = {
+      XDG_CONFIG_HOME: path.join(root, "xdg", "config"),
+      XDG_DATA_HOME: path.join(root, "xdg", "data"),
+      XDG_CACHE_HOME: path.join(root, "xdg", "cache"),
+      XDG_STATE_HOME: path.join(root, "xdg", "state"),
+    };
+    await Promise.all(Object.values(xdg).map((directory) => fs.mkdir(directory, { recursive: true })));
+    const env = serverEnv(xdg);
+    const first = await runOpenCodeServeProcess(input({ env, resumeSessionId: "ses_known", variant: "high" }));
+    expect(first.exitCode).toBe(0);
+    await Promise.all(Object.values(xdg).map((directory) => fs.access(directory)));
+
+    const second = await runOpenCodeServeProcess(input({ env, resumeSessionId: "ses_known", variant: "high" }));
+    expect(second.exitCode).toBe(0);
+    await Promise.all(Object.values(xdg).map((directory) => fs.access(directory)));
+
     const seen = await requests();
     const switched = seen.find((entry) => entry.path === "/api/session/ses_known/model")!;
     expect(JSON.parse(switched.body)).toEqual({ model: { providerID: "fx", id: "m1", variant: "high" } });
-    expect(seen.some((entry) => entry.path === "/api/session/ses_known/prompt")).toBe(true);
-    expect(seen.some((entry) => entry.path === "/api/session" && entry.method === "POST")).toBe(false);
+    expect(seen.filter((entry) => entry.method === "GET" && entry.path === "/api/session/ses_known")).toHaveLength(2);
+    expect(seen.filter((entry) => entry.method === "POST" && entry.path === "/api/session/ses_known/prompt")).toHaveLength(2);
+    expect(seen.some((entry) => entry.method === "POST" && entry.path === "/api/session")).toBe(false);
   });
 
   it("never leaks the server password, its Authorization header or the MCP bearer token", async () => {
