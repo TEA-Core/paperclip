@@ -784,6 +784,16 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
     expect(persistedRows[0]!.branchName).toBe(recordedBranch);
   });
 
+  it("does not carry a git-invalid recorded delivery branch onto a fresh workspace", async () => {
+    const { result } = await provisionWithRecordedDeliveryBranch(
+      (issueIdentifier) => `${issueIdentifier}-../x`,
+    );
+
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+    expect(result.persistedExecutionWorkspace!.branchName).toBeNull();
+  });
+
   it("does not carry the recorded delivery branch onto a fresh row once the card left in_review (bounced redo wake)", async () => {
     const { result, recordedBranch } = await provisionWithRecordedDeliveryBranch(
       (issueIdentifier) => `${issueIdentifier}-delivered`,

@@ -2626,6 +2626,15 @@ async function resolveExactBoundPullRequest(
       if ((result.status === 401 || result.status === 403) && candidate !== candidates[candidates.length - 1]) continue;
       return { pr: null, reason: `recorded delivery identity PR open-state verification failed: HTTP ${result.status}` };
     }
+    if (result.headRepoFullName &&
+        result.headRepoFullName.toLowerCase() !== `${repo.owner}/${repo.repo}`.toLowerCase()) {
+      // A fork-head PR is not this card's delivery in the recorded repo, at
+      // the early arm decision just as at the final preflight.
+      return {
+        pr: null,
+        reason: `recorded delivery identity PR head belongs to ${result.headRepoFullName}, not the card's recorded repo ${repo.owner}/${repo.repo}`,
+      };
+    }
     if (result.open !== true || result.draft === true) {
       // SUP-21513: a MERGED delivery PR whose merge commit is proven on the
       // recorded base branch is a completed delivery, not an unresolved one.
@@ -3660,7 +3669,7 @@ async function verifyLiveFinalDeliveryHead(
     const parsed = finalDeliveryLiveSchema.safeParse(await response.json());
     if (!parsed.success) return { kind: "unresolvable", reason: "head_unverifiable: incomplete live PR response" };
     const live = parsed.data;
-    if (live.merged === true) {
+    if (live.state === "closed" && live.merged === true) {
       // SUP-21513: a merged delivery whose merge commit is proven on the
       // recorded base branch is a completed delivery — accept it. No status is
       // written later; publishApprovalStatus truthfully skips merged PRs.
@@ -4351,6 +4360,8 @@ export interface HeadShaSuccess extends GitHubFetchResult {
   mergeCommitSha: string | null;
   /** SUP-21513: the PR's recorded base branch (body.base.ref), else null. */
   baseRef: string | null;
+  /** The head repository (body.head.repo.full_name); a fork head differs from the base repo. */
+  headRepoFullName?: string | null;
 }
 
 export interface HeadShaFailure extends GitHubFetchResult {
@@ -4435,6 +4446,9 @@ async function fetchPullRequestHeadShaOnce(
   const head = body.head as Record<string, unknown> | undefined;
   const sha = head?.sha as string | undefined;
   const ref = typeof head?.ref === "string" && head.ref.length > 0 ? head.ref : null;
+  const headRepo = head?.repo as Record<string, unknown> | undefined;
+  const headRepoFullName =
+    typeof headRepo?.full_name === "string" && headRepo.full_name.length > 0 ? headRepo.full_name : null;
   const base = body.base as Record<string, unknown> | undefined;
   const baseRef = typeof base?.ref === "string" && base.ref.length > 0 ? base.ref : null;
   const mergeCommitSha =
@@ -4451,9 +4465,12 @@ async function fetchPullRequestHeadShaOnce(
       headRef: ref,
       open: body.state === "open" && body.merged !== true,
       draft: body.draft === true,
-      merged: body.merged === true,
+      // A contradictory answer (state open with merged true) is not a merge:
+      // only a closed PR reported merged counts as merged.
+      merged: body.state === "closed" && body.merged === true,
       mergeCommitSha,
       baseRef,
+      headRepoFullName,
     };
   }
   return {

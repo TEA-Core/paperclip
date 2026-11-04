@@ -5524,6 +5524,56 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     return row!.executionWorkspaceId;
   }
 
+  it.each([
+    ["path traversal", "SUP-14824-1-../x"],
+    ["percent-encoded traversal", "SUP-14824-1-%2F.."],
+    ["a newline", "SUP-14824-1-line\nbreak"],
+    ["a NUL character", "SUP-14824-1-nul\u0000byte"],
+  ])("refuses a board delivery record whose branch is git-invalid (%s) with 422, persisting nothing", async (_label, branch) => {
+    const { companyId, issueId } = await seedIssue({ status: "in_review" });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch,
+          headSha: HEAD_SHA,
+          prNumber: PR_NUMBER,
+          prUrl: `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`,
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_branch_write_rejected");
+    expect(await recordedDeliveryOf(issueId)).toBeUndefined();
+  });
+
+  it("accepts a board delivery record with a valid Unicode branch name", async () => {
+    const branch = "SUP-14824-1-café-修正";
+    const { companyId, issueId } = await seedIssue({ status: "in_review", deliveryBranch: branch });
+    const [seededIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    await db
+      .update(executionWorkspaces)
+      .set({ branchName: branch })
+      .where(eq(executionWorkspaces.id, seededIssue!.executionWorkspaceId!));
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch,
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect((await recordedDeliveryOf(issueId) as Record<string, unknown>).branch).toBe(branch);
+  });
+
   it("refuses a board delivery record that also rebinds the card's workspace, then accepts the two separate PATCHes (orphan card)", async () => {
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
     try {

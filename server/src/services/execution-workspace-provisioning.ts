@@ -62,7 +62,7 @@ import {
   type ExecutionWorkspaceInput,
   type RealizedExecutionWorkspace,
 } from "./workspace-runtime.js";
-import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
+import { isRuntimeOwnedGitBranch, isValidGitBranchName } from "./execution-workspace-branch-ownership.js";
 import {
   workspaceOperationService,
   type WorkspaceOperationRecorder,
@@ -340,6 +340,7 @@ export async function provisionIssueExecutionWorkspace(
   const recordedDeliveryBranch =
     recordedDeliveryBranchCandidate !== null &&
     recordedDeliveryIdentifier !== null &&
+    isValidGitBranchName(recordedDeliveryBranchCandidate) &&
     recordedDeliveryBranchCandidate.startsWith(`${recordedDeliveryIdentifier}-`)
       ? recordedDeliveryBranchCandidate
       : null;

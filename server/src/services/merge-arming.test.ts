@@ -2635,6 +2635,38 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(result.kind).toBe("unresolvable");
     });
 
+    it("refuses a contradictory PR answer (state open, merged true) for a terminal carrier", async () => {
+      const issueId = await insertTerminalCarrierChild();
+      installRoutes([
+        { url: PR_URL, body: { ...carrierMergedPrBody(), state: "open" } },
+        { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+        REFS_MAIN_ROUTE,
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight.kind).toBe("unresolvable");
+    });
+
+    it("refuses a fork-head bound PR at the early arm decision for a terminal carrier", async () => {
+      const issueId = await insertTerminalCarrierChild();
+      const forkBody = carrierMergedPrBody();
+      forkBody.head.repo = { full_name: `fork-owner/${REPO}` };
+      installRoutes([
+        { url: PR_URL, body: forkBody },
+        { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
+        REFS_MAIN_ROUTE,
+      ]);
+
+      const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("belongs to fork-owner/");
+      }
+    });
+
     it.each([
       ["origin/main", "origin/main"],
       ["refs/remotes/origin/main", "refs/remotes/origin/main"],

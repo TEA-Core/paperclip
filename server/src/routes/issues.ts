@@ -202,6 +202,7 @@ import {
   workProductService,
 } from "../services/index.js";
 import { redactIssueCommentBody } from "../services/issues.js";
+import { isValidGitBranchName } from "../services/execution-workspace-branch-ownership.js";
 import { toIssueWorkProduct } from "../services/work-products.js";
 import {
   armMergeOnApproval,
@@ -19501,6 +19502,23 @@ export function issueRoutes(
             executionWorkspaceId: existing.executionWorkspaceId ?? null,
             requestedExecutionWorkspaceId: updateFields.executionWorkspaceId,
             reason: "deliveryIdentity and executionWorkspaceId must be written in separate PATCHes",
+          },
+        });
+        return;
+      }
+      // A branch git itself would refuse (check-ref-format, including any
+      // NUL or control character) can never be this card's delivery branch.
+      if (!isValidGitBranchName(requestedDeliveryIdentity.branch)) {
+        res.status(422).json({
+          error: "deliveryIdentity.branch is not a valid git branch name",
+          code: "delivery_identity_branch_write_rejected",
+          details: {
+            issueId: existing.id,
+            identifier: existing.identifier ?? null,
+            holdsLease,
+            enteringReview,
+            recordedBranch: requestedDeliveryIdentity.branch,
+            reason: "recorded branch is not a valid git branch name (git check-ref-format)",
           },
         });
         return;

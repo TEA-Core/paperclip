@@ -1565,6 +1565,81 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       expect(await statusOf(issueId)).toBe("in_review");
     });
 
+    it("refuses the recovery close when the provider answer is contradictory (state open, merged true)", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("R21598C");
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      // Make the card a merged-only terminal-carrier delivery: its workspace
+      // row is a shared row sourced by a done ancestor, carrying the
+      // ancestor's branch, so the recorded identity is accepted only as a
+      // merged delivery. A contradictory PR answer must not close it.
+      const [seededIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const carrierOwnerId = randomUUID();
+      await db.insert(issues).values({
+        id: carrierOwnerId,
+        companyId,
+        identifier: "R21598P-1",
+        issueNumber: 99,
+        title: "Terminal carrier owner",
+        status: "done",
+        priority: "medium",
+        createdByUserId: "cloud-user-1",
+      });
+      await db
+        .update(executionWorkspaces)
+        .set({ sourceIssueId: carrierOwnerId, mode: "shared_workspace", branchName: "R21598P-1-carrier-branch" })
+        .where(eq(executionWorkspaces.id, seededIssue!.executionWorkspaceId!));
+      await db
+        .update(issues)
+        .set({
+          parentId: carrierOwnerId,
+          executionState: {
+            ...(seededIssue!.executionState as Record<string, unknown>),
+            delivery: {
+              repo: { owner: "TEA-Core", repo: "paperclip" },
+              branch: "R21598P-1-carrier-branch",
+              headSha: certifiedDelivery.headSha,
+              prNumber: 404,
+              prUrl: "https://github.com/TEA-Core/paperclip/pull/404",
+            },
+          },
+        })
+        .where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 0, status: "identical" }), { status: 200 });
+        if (url.includes("/git/refs/heads/")) return new Response(JSON.stringify({ object: { sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" } }), { status: 200 });
+        if (url.includes("/pulls?")) {
+          return new Response(JSON.stringify([{
+            number: 404, draft: false, merged: true, merged_at: "2026-08-29T00:11:06Z",
+            head: { ref: "R21598P-1-carrier-branch", sha: certifiedDelivery.headSha },
+            title: "Contradictory PR", body: null,
+          }]), { status: 200 });
+        }
+        if (url.includes("/pulls/")) {
+          return new Response(JSON.stringify({
+            state: "open", merged: true, draft: false, title: "Contradictory PR",
+            merge_commit_sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19",
+            head: { sha: certifiedDelivery.headSha, ref: "R21598P-1-carrier-branch", repo: { full_name: "TEA-Core/paperclip" } },
+            base: { ref: "main" },
+          }), { status: 200 });
+        }
+        if (url.includes("/commits/")) return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      certifiedDelivery.useRealPreflight = true;
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+.send(closeBody);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("approval_final_delivery_preflight");
+      expect(await statusOf(issueId)).toBe("in_review");
+    });
+
     it("lets an accepted merged-elsewhere doneTransitionOverride clear the preflight and close the card", async () => {
       const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("R21598B");
       const runId = await seedRun(companyId, reviewerAgentId, issueId);
