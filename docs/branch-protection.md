@@ -249,7 +249,7 @@ delivery_identity_branch_write_rejected`. The lease-holding agent path that
 enters review does not apply that rule: it keeps its existing behaviour and can
 still stamp an unanchored branch (including a lowercase-prefixed one such as
 `sup-22-work`), because that path does not use the identifier-prefix helper.
-That is pre-existing and unchanged by this change. A board refresh also needs the card's
+A board refresh also needs the card's
 identifier prefix on `branch` to stamp it onto this card's own `project_primary`
 row that has no branch, or to record a card with **no** execution workspace
 (that record must also bind a PR, `prNumber` and `prUrl`). A board refresh may
