@@ -804,7 +804,7 @@ describeEmbeddedPostgres("attention service", () => {
       Array.from({ length: 5 }, () => recoveryAction("legacy-execution:flap")),
     );
 
-    const service = attentionService(db, { now: () => now });
+    const service = attentionService(db, { now: () => now.getTime() });
     const deduplicatedFeed = await service.list(companyId, { userId: "board-user" });
     expect(deduplicatedFeed.items.some((item) => item.sourceKind === "recovery_rate_alert")).toBe(false);
 
