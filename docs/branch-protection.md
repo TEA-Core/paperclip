@@ -273,9 +273,10 @@ branch is never read back as a legitimate carrier branch. Fresh rows and rows
 the card owns are carried normally.
 
 On both paths `branch` must also be a name git itself would accept as a branch
-(`git check-ref-format` rules: no control character or NUL, space, `~^:?*[\`,
-`..`, `@{`, doubled or edge slashes, trailing dot, or a component that starts
-with `.` or ends in `.lock`). A name that is invalid, or that becomes invalid
+(`git check-ref-format --branch` rules: no empty name, lone `@`, leading dash or
+the exact name `HEAD`; no control character or NUL, space, `~^:?*[\`, `..`,
+`@{`, lone UTF-16 surrogate, doubled or edge slashes, trailing dot, or a
+component that starts with `.` or ends in `.lock`). A name that is invalid, or that becomes invalid
 after its well-formed `%HH` escapes are decoded (a bounded number of passes),
 is refused with `422 delivery_identity_branch_write_rejected`; a lone `%` is an
 ordinary character. Provisioning skips the branch carry for such a name.

@@ -18,7 +18,7 @@ Agent mutation authorization can adopt a stale checkout into the request's live 
 
 An approval comment that interrupts an active run reloads the issue after cancellation releases the run links and may update `updatedAt`. It evaluates the review stage and certifies delivery from that post-interrupt row. A later change during the external preflight still fails the locked recheck.
 
-The check runs on the PATCH verdict, board stage-decision, auto-approval comment, recovery decision, and final escalation-accept routes. Repository-free doc/gate cards retain their existing close semantics. Sanctioned no-deliverable-head overrides remain subject to the existing done guard; they do not bypass ladder or tier requirements.
+The check runs on the PATCH verdict, board stage-decision, auto-approval comment, recovery decision, and final escalation-accept routes. Repository-free doc/gate cards retain their existing close semantics. Sanctioned no-deliverable-head overrides remain subject to the existing done guard; they do not bypass ladder or tier requirements. An accepted `doneTransitionOverride` lets an unresolved delivery verdict pass the preflight on the PATCH and recovery-decision routes alike, so an accepted override does not end in `approval_final_delivery_preflight`.
 
 ## Done-close draft safety
 
