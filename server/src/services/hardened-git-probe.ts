@@ -28,17 +28,16 @@ import { PROJECT_REPOSITORIES_DIR } from "@paperclipai/adapter-utils/git-workspa
 //     command-line configuration, which outranks repository configuration
 //     no matter when the repository writes it;
 //   - is killed after a timeout.
-// A worktree status is never computed against the repository's own git dir:
-// it runs against a private snapshot git dir (a copy of the index, the HEAD
-// commit, the shared object store as an alternate, and a server-written
-// config), so no repository-local configuration — and therefore no filter
-// driver, whatever its name or however late it is written — is read by the
-// process that reads worktree content.
+// The record_only no-repository probe additionally never computes a worktree
+// status against the repository's own git dir: it runs against a private
+// snapshot git dir (a copy of the index, the HEAD commit, the shared object
+// store as an alternate, and a server-written config), so no repository-local
+// configuration — and therefore no filter driver, whatever its name or however
+// late it is written — is read by the process that reads worktree content.
 
 const TRUSTED_GIT_BINARY_PATHS = ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"] as const;
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_BUFFER = 16 * 1024 * 1024;
-const MAX_SUBMODULE_DEPTH = 3;
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 // Command-line configuration applied to every invocation (GIT_CONFIG_COUNT
@@ -51,27 +50,6 @@ const FORCED_CONFIG: ReadonlyArray<readonly [string, string]> = [
   ["core.attributesFile", "/dev/null"],
   ["core.commitGraph", "false"],
 ];
-
-// Repository-local keys a no-repository probe refuses to run under: each one
-// either executes a program or redirects which tree or config Git reads.
-const FORBIDDEN_CONFIG_KEY_PATTERNS: ReadonlyArray<RegExp> = [
-  /^core\.fsmonitor$/,
-  /^core\.hookspath$/,
-  /^core\.worktree$/,
-  /^include\./,
-  /^includeif\./,
-  /^filter\./,
-];
-
-// Repository-local settings carried into a snapshot config, as validated data
-// only, so a status run keeps the checkout's own line-ending and file-mode
-// semantics without reading the repository's config file.
-const BENIGN_BOOLEAN_KEYS = ["core.filemode", "core.symlinks", "core.ignorecase", "core.precomposeunicode"] as const;
-// A Map, not an object literal: the lookup key is repository-written text.
-const BENIGN_ENUM_KEYS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
-  ["core.autocrlf", new Set(["true", "false", "input"])],
-  ["core.eol", new Set(["lf", "crlf", "native"])],
-]);
 
 // The only info/exclude rule the server writes into a task workspace
 // (heartbeat prepareProjectRepositoryWorkspaces).
@@ -142,15 +120,24 @@ export interface HardenedGitOptions {
   timeoutMs?: number;
   /** Stops repository discovery above this directory. */
   ceilingDirectory?: string | null;
+  /**
+   * When no trusted git binary exists, run `git` from PATH (still under the
+   * stripped environment) instead of failing. Only for probes that predate the
+   * trusted-binary requirement and fail open on an unmeasured result; a probe
+   * that gates a close must leave this unset and refuse.
+   */
+  pathFallback?: boolean;
 }
 
 /** Run one Git command under the hardened environment; resolves stdout. */
 export function runHardenedGit(args: readonly string[], options: HardenedGitOptions): Promise<string> {
-  const git = resolveTrustedGitBinary();
-  if (!git) {
+  const trustedGit = resolveTrustedGitBinary();
+  if (!trustedGit && !options.pathFallback) {
     return Promise.reject(new HardenedGitError("unavailable", "no root-owned git binary at a fixed system path"));
   }
+  const git = trustedGit ?? "git";
   const env = hardenedGitEnv(options.ceilingDirectory ?? null);
+  if (!trustedGit && process.env.PATH) env.PATH = process.env.PATH;
   return new Promise((resolve, reject) => {
     execFile(
       git,
@@ -176,62 +163,12 @@ export function runHardenedGit(args: readonly string[], options: HardenedGitOpti
   });
 }
 
-interface ConfigEntry {
-  scope: string;
-  key: string;
-  value: string | null;
-}
-
-async function listRepositoryConfig(worktreePath: string, options: HardenedGitOptions): Promise<ConfigEntry[]> {
-  const raw = await runHardenedGit(["-C", worktreePath, "config", "--list", "--show-scope", "-z"], options);
-  const fields = raw.split("\0");
-  if (fields[fields.length - 1] === "") fields.pop();
-  if (fields.length % 2 !== 0) throw new HardenedGitError("failed", "unparseable git config listing");
-  const entries: ConfigEntry[] = [];
-  for (let index = 0; index < fields.length; index += 2) {
-    const scope = fields[index]!;
-    const entry = fields[index + 1]!;
-    const newline = entry.indexOf("\n");
-    entries.push({
-      scope,
-      key: (newline === -1 ? entry : entry.slice(0, newline)).toLowerCase(),
-      value: newline === -1 ? null : entry.slice(newline + 1),
-    });
-  }
-  return entries;
-}
-
-function repositoryScoped(entries: readonly ConfigEntry[]): ConfigEntry[] {
-  return entries.filter((entry) => entry.scope !== "command");
-}
-
-function normalizeBoolean(value: string | null): "true" | "false" | null {
-  if (value === null) return "true";
-  const lowered = value.trim().toLowerCase();
-  if (["true", "yes", "on", "1"].includes(lowered)) return "true";
-  if (["false", "no", "off", "0", ""].includes(lowered)) return "false";
-  return null;
-}
-
-function snapshotConfig(objectFormat: "sha1" | "sha256", inherited: readonly ConfigEntry[]): string {
-  const values = new Map<string, string>();
-  for (const entry of repositoryScoped(inherited)) {
-    if ((BENIGN_BOOLEAN_KEYS as readonly string[]).includes(entry.key)) {
-      const normalized = normalizeBoolean(entry.value);
-      if (normalized !== null) values.set(entry.key, normalized);
-      continue;
-    }
-    const allowed = BENIGN_ENUM_KEYS.get(entry.key);
-    if (allowed && entry.value !== null && allowed.has(entry.value.trim().toLowerCase())) {
-      values.set(entry.key, entry.value.trim().toLowerCase());
-    }
-  }
+function snapshotConfig(objectFormat: "sha1" | "sha256"): string {
   const lines = [
     "[core]",
     `\trepositoryformatversion = ${objectFormat === "sha256" ? 1 : 0}`,
     "\tbare = false",
   ];
-  for (const [key, value] of values) lines.push(`\t${key.slice("core.".length)} = ${value}`);
   if (objectFormat === "sha256") lines.push("[extensions]", "\tobjectformat = sha256");
   return `${lines.join("\n")}\n`;
 }
@@ -243,20 +180,10 @@ interface WorktreeIdentity {
   objectFormat: "sha1" | "sha256";
 }
 
-/**
- * `pinnedWorkTree` overrides `core.worktree`: the identity (and the status
- * computed from it) is then for that directory, never for wherever the
- * repository's config points.
- */
-async function readWorktreeIdentity(
-  worktreePath: string,
-  options: HardenedGitOptions,
-  pinnedWorkTree: string | null = null,
-): Promise<WorktreeIdentity> {
+async function readWorktreeIdentity(worktreePath: string, options: HardenedGitOptions): Promise<WorktreeIdentity> {
   const out = await runHardenedGit(
     [
       "-C", worktreePath,
-      ...(pinnedWorkTree ? [`--work-tree=${pinnedWorkTree}`] : []),
       "rev-parse", "--path-format=absolute",
       "--git-dir", "--git-common-dir", "--show-toplevel", "--show-object-format",
     ],
@@ -374,50 +301,6 @@ async function snapshotStatusIsDirty(
   return raw.split("\0").some((record) => record.length > 0);
 }
 
-/**
- * The hardened replacement for the done-transition guard's pre-existing
- * `git status --porcelain` probe (repository_delivery path). Same answer —
- * modified, staged, or untracked non-ignored content, including dirt inside
- * populated submodules — but computed without executing anything the
- * repository configures and without following an inherited GIT_DIR /
- * GIT_WORK_TREE / GIT_INDEX_FILE. When the repository sets `core.worktree`
- * (a submodule does so legitimately; a planted one redirects to a decoy), the
- * probed path itself is pinned as the work tree. Returns null when the state
- * could not be measured, preserving the caller's unmeasured-signal contract.
- */
-export async function hardenedWorktreeHasUncommittedContent(
-  worktreePath: string,
-  depth = 0,
-): Promise<boolean | null> {
-  if (depth > MAX_SUBMODULE_DEPTH) return null;
-  const options: HardenedGitOptions = { cwd: "/" };
-  try {
-    const config = await listRepositoryConfig(worktreePath, options);
-    const redirected = repositoryScoped(config).some((entry) => entry.key === "core.worktree");
-    const identity = await readWorktreeIdentity(worktreePath, options, redirected ? await realpath(worktreePath) : null);
-    const headSha = await readHeadCommit(worktreePath, options);
-    const exclude = await readOptionalFile(path.join(identity.commonDir, "info", "exclude"));
-    return await withSnapshotGitDir(
-      { identity, headSha, config: snapshotConfig(identity.objectFormat, config), exclude },
-      async (snapshot) => {
-        if (await snapshotStatusIsDirty(snapshot, identity.topLevel, "dirty", options)) return true;
-        const submodules = (await listIndexEntries(snapshot, identity.topLevel, options))
-          .filter((entry) => entry.mode === "160000" && entry.stage === "0");
-        for (const submodule of submodules) {
-          const submodulePath = path.join(identity.topLevel, submodule.path);
-          const populated = await lstat(path.join(submodulePath, ".git")).then(() => true, () => false);
-          if (!populated) continue;
-          const dirty = await hardenedWorktreeHasUncommittedContent(submodulePath, depth + 1);
-          if (dirty !== false) return dirty;
-        }
-        return false;
-      },
-    );
-  } catch {
-    return null;
-  }
-}
-
 /** Whether a branch name carries this issue identifier as its own token. */
 export function branchNamesIssue(branch: string, identifier: string): boolean {
   const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -449,13 +332,17 @@ export interface NoRepositoryWorktreeProbeInput {
   /** `<instanceRoot>/projects/<companyId>/<projectId>`, derived from server env and immutable ids. */
   managedProjectRoot: string;
   issueIdentifier: string;
-  /** The project's default branch (project configuration, the provisioner's base). */
-  baseBranch: string;
+  /**
+   * Commits `sha` carries beyond the project's default branch, measured on the
+   * remote (a source the agent cannot write). Throws when it cannot be
+   * measured — for example when the commit is not on the remote at all.
+   */
+  countCommitsAheadOfBase: (sha: string) => Promise<number>;
   timeoutMs?: number;
 }
 
 export type NoRepositoryWorktreeProbeResult =
-  | { ok: true; branch: string; headSha: string; baseSha: string }
+  | { ok: true; branch: string; headSha: string }
   | { ok: false; reason: string };
 
 function refuse(reason: string): NoRepositoryWorktreeProbeResult {
@@ -498,19 +385,11 @@ async function verifyCleanLinkedWorktree(
   if (flags[2] !== "true") return { ok: false, reason: "is not a Git work tree" };
   if (flags[3] !== "false") return { ok: false, reason: "is a shallow clone" };
 
-  let config: ConfigEntry[];
   let identity: WorktreeIdentity;
   try {
-    config = await listRepositoryConfig(worktreePath, worktreeOptions);
     identity = await readWorktreeIdentity(worktreePath, worktreeOptions);
   } catch {
     return { ok: false, reason: "could not be identified as a Git work tree" };
-  }
-  if (repositoryScoped(config).some((entry) => FORBIDDEN_CONFIG_KEY_PATTERNS.some((pattern) => pattern.test(entry.key)))) {
-    return {
-      ok: false,
-      reason: "carries repository configuration the server will not run under (core.fsmonitor, core.hooksPath, core.worktree, include, includeIf or filter)",
-    };
   }
   if (identity.topLevel !== worktreePath) {
     return { ok: false, reason: "has a work-tree top level other than its own path" };
@@ -542,7 +421,7 @@ async function verifyCleanLinkedWorktree(
   }
   try {
     const dirtyReason = await withSnapshotGitDir(
-      { identity, headSha, config: snapshotConfig(identity.objectFormat, []), exclude },
+      { identity, headSha, config: snapshotConfig(identity.objectFormat), exclude },
       async (snapshot) => {
         for (const entry of await listIndexEntries(snapshot, worktreePath, worktreeOptions)) {
           if (entry.tag === "S") return "has skip-worktree index entries";
@@ -562,26 +441,36 @@ async function verifyCleanLinkedWorktree(
   return { ok: true, branch: branchRef.slice("refs/heads/".length), headSha };
 }
 
-async function countCommitsNotOnBase(baseSha: string, tipSha: string, options: HardenedGitOptions): Promise<number> {
-  const raw = (await runHardenedGit(["rev-list", "--count", `${baseSha}..${tipSha}`, "--"], options)).trim();
-  const count = Number.parseInt(raw, 10);
-  if (!/^\d+$/.test(raw) || Number.isNaN(count)) throw new HardenedGitError("failed", "unparseable rev-list count");
-  return count;
+/** Why `sha` may not stand as "level with the default branch"; null when it does. */
+async function aheadOfBaseRefusal(
+  subject: string,
+  sha: string,
+  countCommitsAheadOfBase: NoRepositoryWorktreeProbeInput["countCommitsAheadOfBase"],
+): Promise<string | null> {
+  let ahead: number;
+  try {
+    ahead = await countCommitsAheadOfBase(sha);
+    if (!Number.isInteger(ahead) || ahead < 0) throw new Error("not a commit count");
+  } catch {
+    return `${subject} tip ${sha.slice(0, 12)} could not be compared with the project's default branch on the remote`;
+  }
+  return ahead === 0 ? null : `${subject} has ${ahead} commit(s) not on the project's default branch`;
 }
 
 /**
  * SUP-22570: prove that the issue's own managed git worktree carries no
- * repository deliverable — clean, zero commits ahead of the project's base on
- * the remote-tracking ref — and that no other branch or worktree naming the
- * issue in the managed checkout carries one either.
+ * repository deliverable — clean, zero commits ahead of the project's default
+ * branch — and that no other branch or worktree naming the issue in the managed
+ * checkout carries one either.
  *
  * The recorded workspace path is only a candidate: it must resolve (symlinks
  * included) into `<managedProjectRoot>/<repo>/.paperclip/worktrees/…`, the
  * layout the server derives from the company and project ids, and be a linked
- * worktree of that managed checkout. The base is the remote-tracking ref of the
- * project's default branch in the managed checkout, never the workspace row's
- * recorded base ref. Every Git process runs from the managed checkout as its
- * working directory.
+ * worktree of that managed checkout. "Ahead of the default branch" is measured
+ * by the caller-supplied `countCommitsAheadOfBase` against the remote — never
+ * against a ref in the managed checkout, whose refs every agent worktree can
+ * write — and a tip it cannot measure refuses. Every Git process runs from the
+ * managed checkout as its working directory.
  */
 export async function probeNoRepositoryWorktree(
   input: NoRepositoryWorktreeProbeInput,
@@ -630,22 +519,9 @@ export async function probeNoRepositoryWorktree(
   }
 
   try {
-    const baseRef = `refs/remotes/origin/${input.baseBranch}`;
-    let baseSha: string;
-    try {
-      baseSha = (await runHardenedGit(
-        ["-C", repoRoot, "rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`],
-        options,
-      )).trim();
-    } catch {
-      return refuse(`the control-plane base ${baseRef} does not resolve in the managed checkout`);
-    }
-    if (!SHA_RE.test(baseSha)) return refuse(`the control-plane base ${baseRef} does not resolve in the managed checkout`);
-
-    const ownAhead = await countCommitsNotOnBase(baseSha, own.headSha!, options);
-    if (ownAhead !== 0) {
-      return refuse(`the recorded worktree has ${ownAhead} commit(s) not on ${baseRef}`);
-    }
+    const checkedTips = new Set<string>([own.headSha!]);
+    const ownRefusal = await aheadOfBaseRefusal("the recorded worktree", own.headSha!, input.countCommitsAheadOfBase);
+    if (ownRefusal) return refuse(ownRefusal);
 
     const branches = (await runHardenedGit(
       ["-C", repoRoot, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/"],
@@ -655,9 +531,10 @@ export async function probeNoRepositoryWorktree(
       const space = line.indexOf(" ");
       const sha = line.slice(0, space);
       const name = line.slice(space + 1).slice("refs/heads/".length);
-      if (!SHA_RE.test(sha) || !branchNamesIssue(name, input.issueIdentifier)) continue;
-      const ahead = await countCommitsNotOnBase(baseSha, sha, options);
-      if (ahead !== 0) return refuse(`branch ${name} has ${ahead} commit(s) not on ${baseRef}`);
+      if (!SHA_RE.test(sha) || !branchNamesIssue(name, input.issueIdentifier) || checkedTips.has(sha)) continue;
+      checkedTips.add(sha);
+      const refusal = await aheadOfBaseRefusal(`branch ${name}`, sha, input.countCommitsAheadOfBase);
+      if (refusal) return refuse(refusal);
     }
 
     const worktreeRecords = (await runHardenedGit(["-C", repoRoot, "worktree", "list", "--porcelain", "-z"], options))
@@ -680,7 +557,7 @@ export async function probeNoRepositoryWorktree(
       const other = await verifyCleanLinkedWorktree(worktreePath, commonDir, options);
       if (!other.ok) return refuse(`another worktree on branch ${branch} ${other.reason}`);
     }
-    return { ok: true, branch: own.branch!, headSha: own.headSha!, baseSha };
+    return { ok: true, branch: own.branch!, headSha: own.headSha! };
   } catch {
     return refuse("the managed checkout's branches could not be verified");
   }

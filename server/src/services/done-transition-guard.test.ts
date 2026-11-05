@@ -321,19 +321,6 @@ vi.mock("node:child_process", () => ({
   execFile: mockExecFile,
 }));
 
-// SUP-22880: the foreign-branch status probe reads the worktree through a
-// snapshot git dir (real files, several git calls); these unit tests model its
-// verdict directly. Its behaviour against real repositories is covered in
-// hardened-git-probe.test.ts.
-const mockWorktreeHasUncommittedContent = vi.hoisted(() => vi.fn());
-vi.mock("./hardened-git-probe.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./hardened-git-probe.js")>();
-  return {
-    ...actual,
-    hardenedWorktreeHasUncommittedContent: mockWorktreeHasUncommittedContent,
-  };
-});
-
 import { ghFetch } from "./github-fetch.js";
 import { resolveGitHubToken } from "./github-credential.js";
 import { resolveCardDeliveryBranchOwnership } from "./merge-arming.js";
@@ -347,10 +334,13 @@ const ghFetchMock = vi.mocked(ghFetch);
 function mockGitProbe(aheadCount: string, attributableCount: string, statusOutput = " M server/src/x.ts") {
   mockExecFile.mockImplementation(
     (_file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string) => void) => {
+      if (args.includes("status")) {
+        cb(null, statusOutput);
+        return;
+      }
       cb(null, args.includes("--grep") ? attributableCount : aheadCount);
     },
   );
-  mockWorktreeHasUncommittedContent.mockResolvedValue(statusOutput.trim().length > 0);
 }
 
 function mockGitProbeUnavailable() {
@@ -359,7 +349,6 @@ function mockGitProbeUnavailable() {
       cb(new Error("git not available"));
     },
   );
-  mockWorktreeHasUncommittedContent.mockResolvedValue(null);
 }
 
 describe("evaluateDoneTransitionGuard", () => {
@@ -4292,8 +4281,15 @@ describe("evaluateDoneTransitionGuard", () => {
       setupDbMock({
         executionWorkspaces: [mockExecutionWorkspaceRow({ branchName: foreignBranch })],
       });
-      mockGitProbe("5", "0");
-      mockWorktreeHasUncommittedContent.mockResolvedValue(null);
+      mockExecFile.mockImplementation(
+        (_file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string) => void) => {
+          if (args.includes("status")) {
+            cb(new Error("git status failed"), "");
+            return;
+          }
+          cb(null, args.includes("--grep") ? "0" : "5");
+        },
+      );
       ghFetchMock.mockImplementation(async (url: string) => {
         if (url.includes("/compare/")) {
           return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });

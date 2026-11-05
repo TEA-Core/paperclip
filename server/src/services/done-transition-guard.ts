@@ -16,7 +16,6 @@ import {
 } from "@paperclipai/db";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
-  hardenedWorktreeHasUncommittedContent,
   normalizeBaseBranch,
   probeNoRepositoryWorktree,
   runHardenedGit,
@@ -300,6 +299,7 @@ async function githubCompareAheadBy(
   defaultRef: string,
   branch: string,
   token: string,
+  signal?: AbortSignal,
 ): Promise<number | null> {
   const apiBase = gitHubApiBase(hostname);
   // baseRef is a local git ref (e.g. "origin/main", "origin/fold/tea-patches-...").
@@ -317,7 +317,7 @@ async function githubCompareAheadBy(
     "x-github-api-version": "2022-11-28",
     authorization: `Bearer ${token}`,
   };
-  const response = await ghFetch(url, { headers });
+  const response = await ghFetch(url, { headers, signal });
   if (!response.ok) {
     if (response.status === 404) {
       throw new GitHubBranchNotFoundError(
@@ -435,8 +435,11 @@ async function resolveGitHubRefHeadSha(
 // so they run through the hardened runner (absolute root-owned git, no
 // inherited GIT_* environment, no system/global config, fsmonitor and hooks
 // forced off, timeout). The process cwd is "/", never the probed workspace.
+// Both callers fail open on an unmeasured result, so a host without a
+// root-owned git keeps the prior PATH lookup (still under the stripped
+// environment) rather than turning every unmeasured probe into an allow.
 function runGit(args: string[], cwd: string): Promise<string> {
-  return runHardenedGit(["-C", cwd, ...args], { cwd: "/" });
+  return runHardenedGit(["-C", cwd, ...args], { cwd: "/", pathFallback: true });
 }
 
 /**
@@ -462,6 +465,25 @@ async function countIssueAttributableCommits(
     const attributableCount = Number.parseInt(attributableRaw.trim(), 10);
     if (Number.isNaN(aheadCount) || Number.isNaN(attributableCount)) return null;
     return { aheadCount, attributableCount };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether the worktree at `worktreePath` carries uncommitted content
+ * (modified, staged, or untracked non-ignored files). This is the owed-diff
+ * discriminator for the foreign-branch block: a clean worktree with zero
+ * attributable commits and no merged PR owes no observable repo content — the
+ * no-repo-deliverable shape (design/spec cards whose acceptance is a recorded
+ * decision, SUP-13873). Returns null when the probe is unreachable (path
+ * missing, git failure) so callers fail open instead of blocking on an
+ * unmeasured signal.
+ */
+async function worktreeHasUncommittedContent(worktreePath: string): Promise<boolean | null> {
+  try {
+    const out = await runGit(["status", "--porcelain"], worktreePath);
+    return out.split(/\r?\n/).some((line) => line.trim().length > 0);
   } catch {
     return null;
   }
@@ -1731,6 +1753,7 @@ async function proveTier2Live(
 // every check below holds, and the accepting door re-runs the same checks
 // inside its status write (verifyNoRepositoryLandingAtTransition).
 const NO_REPOSITORY_LANDING_TOKEN = "no-repository-landing";
+const GITHUB_BASE_COMPARE_TIMEOUT_MS = 15_000;
 const ENTRY_RULING_DOCUMENT_KEY = "entry-ruling";
 
 /** Who is closing: the ruling that authorizes the close must not be theirs. */
@@ -1828,7 +1851,11 @@ async function verifyNoRepositoryLanding(
     return noRepositoryRefusal("requires the workspace's project workspace to name the default branch.");
   }
   const projectWorkspace = await db
-    .select({ defaultRef: projectWorkspaces.defaultRef, repoRef: projectWorkspaces.repoRef })
+    .select({
+      defaultRef: projectWorkspaces.defaultRef,
+      repoRef: projectWorkspaces.repoRef,
+      repoUrl: projectWorkspaces.repoUrl,
+    })
     .from(projectWorkspaces)
     .where(
       and(
@@ -1926,13 +1953,38 @@ async function verifyNoRepositoryLanding(
   if (!recordedWorktreePath) {
     return noRepositoryRefusal("requires the workspace to record its worktree path.");
   }
+
+  // The base is the default branch on GitHub, reached through the project's
+  // repository URL and the company credential: neither is writable by an agent
+  // through its workspace, unlike every ref in the managed checkout. With no
+  // such base the form refuses.
+  const repository = parseRepoUrl(projectWorkspace?.repoUrl ?? null);
+  if (!repository) {
+    return noRepositoryRefusal("requires the project workspace to name a GitHub repository to measure the default branch against.");
+  }
+  const { token } = await resolveGitHubToken(db, issue.companyId);
+  if (!token) {
+    return noRepositoryRefusal("requires a configured GitHub credential to measure the default branch against.");
+  }
   const probe = await probeNoRepositoryWorktree({
     recordedWorktreePath,
     managedProjectRoot: path.dirname(
       resolveManagedProjectWorkspaceDir({ companyId: issue.companyId, projectId: workspace.projectId }),
     ),
     issueIdentifier: issue.identifier,
-    baseBranch,
+    countCommitsAheadOfBase: async (sha) => {
+      const ahead = await githubCompareAheadBy(
+        repository.hostname,
+        repository.owner,
+        repository.repo,
+        baseBranch,
+        sha,
+        token,
+        AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
+      );
+      if (ahead === null) throw new Error("GitHub compare returned no ahead_by");
+      return ahead;
+    },
   });
   if (!probe.ok) {
     return noRepositoryRefusal(`refused: ${probe.reason}.`);
@@ -1972,7 +2024,13 @@ export async function verifyNoRepositoryLandingAtTransition(
   ) {
     return noRepositoryRefusal("refused: the issue's execution workspace changed after the declaration was checked.");
   }
-  return verifyNoRepositoryLanding(tx, lockedIssue, closingActor);
+  try {
+    return await verifyNoRepositoryLanding(tx, lockedIssue, closingActor);
+  } catch (err) {
+    return noRepositoryRefusal(
+      `could not be verified at the close write (${err instanceof Error ? err.message : "unknown"}).`,
+    );
+  }
 }
 
 async function proveNoRepositoryLanding(
@@ -4317,17 +4375,13 @@ async function evaluateDoneTransitionGuardCore(
 
     // SUP-13873: with attribution and merged-PR probes both measured at zero,
     // the branch still owes no observable repo content only when the issue's
-    // worktree itself is clean (modified, staged, or untracked non-ignored
-    // files, including dirt inside populated submodules). A design/spec card
-    // whose acceptance is a recorded decision (a done-tier disposition,
-    // SUP-12693) leaves no attributable commit, no merged PR, and no
-    // uncommitted work — that is the sanctioned no-repo-deliverable close. A
-    // dirty worktree means content exists that was never delivered: keep the
-    // block and name the owed step. SUP-22880: the probe reads the workspace
-    // without executing anything its repository configures; null (unmeasured)
-    // keeps this path's fail-open contract.
+    // worktree itself is clean. A design/spec card whose acceptance is a
+    // recorded decision (a done-tier disposition, SUP-12693) leaves no
+    // attributable commit, no merged PR, and no uncommitted work — that is the
+    // sanctioned no-repo-deliverable close. A dirty worktree means content
+    // exists that was never delivered: keep the block and name the owed step.
     const uncommitted = ctx.worktreePath
-      ? await hardenedWorktreeHasUncommittedContent(ctx.worktreePath)
+      ? await worktreeHasUncommittedContent(ctx.worktreePath)
       : null;
     if (uncommitted === null) {
       return fallback(

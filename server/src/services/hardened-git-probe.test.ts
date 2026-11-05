@@ -4,7 +4,6 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
-  hardenedWorktreeHasUncommittedContent,
   HardenedGitError,
   probeNoRepositoryWorktree,
   resolveTrustedGitBinary,
@@ -61,13 +60,27 @@ interface ManagedLayout {
   repoRoot: string;
   worktree: string;
   addWorktree: (branch: string, base?: string) => string;
-  input: { recordedWorktreePath: string; managedProjectRoot: string; issueIdentifier: string; baseBranch: string };
+  input: {
+    recordedWorktreePath: string;
+    managedProjectRoot: string;
+    issueIdentifier: string;
+    countCommitsAheadOfBase: (sha: string) => Promise<number>;
+  };
+}
+
+/**
+ * Stands in for GitHub's compare API: commits ahead of the default branch,
+ * counted in the bare "origin" repository — a repository the agent's worktree
+ * cannot write. A commit origin has never seen throws, as GitHub's 404 does.
+ */
+function countOnOrigin(origin: string, baseBranch = "main") {
+  return async (sha: string) => Number.parseInt(git(origin, "rev-list", "--count", `${baseBranch}..${sha}`), 10);
 }
 
 /**
  * The managed layout the server provisions:
  * <instance>/projects/<company>/<project>/<repo>/.paperclip/worktrees/<branch>,
- * cloned from a bare "origin" so refs/remotes/origin/main is the base.
+ * cloned from a bare "origin", whose main branch is the base.
  */
 function managedLayout(): ManagedLayout {
   const origin = path.join(root, "origin.git");
@@ -94,7 +107,7 @@ function managedLayout(): ManagedLayout {
       recordedWorktreePath: worktree,
       managedProjectRoot,
       issueIdentifier: "SUP-7",
-      baseBranch: "main",
+      countCommitsAheadOfBase: countOnOrigin(origin),
     },
   };
 }
@@ -142,38 +155,29 @@ describe("hardened git runner (SUP-22880)", () => {
   });
 });
 
-describe("hardenedWorktreeHasUncommittedContent (pre-existing repository_delivery status probe)", () => {
-  it("does not execute a planted core.fsmonitor and still reports the dirty tree", async () => {
+// The pre-existing repository_delivery dirty probe is `git status --porcelain`
+// through this runner (done-transition-guard.ts runGit), with a PATH fallback.
+const WORKTREE_STATUS_OPTIONS = { cwd: "/", pathFallback: true } as const;
+async function worktreeStatus(repo: string): Promise<string> {
+  return runHardenedGit(["-C", repo, "status", "--porcelain"], WORKTREE_STATUS_OPTIONS);
+}
+
+describe("pre-existing repository_delivery status probe under the hardened runner (SUP-22880)", () => {
+  it("reports dirt without executing a planted core.fsmonitor", async () => {
     const repo = plainRepo("repo");
     git(repo, "config", "core.fsmonitor", planted);
     writeFileSync(path.join(repo, "a.txt"), "undelivered\n");
-    expect(await hardenedWorktreeHasUncommittedContent(repo)).toBe(true);
+    expect(await worktreeStatus(repo)).toContain("a.txt");
     expect(existsSync(marker)).toBe(false);
   });
 
-  it("does not execute a planted clean/process filter driver, and compares content without it", async () => {
-    const repo = plainRepo("repo");
-    writeFileSync(path.join(repo, ".gitattributes"), "* filter=evil\n");
-    git(repo, "add", ".gitattributes");
-    git(repo, "commit", "-qm", "attributes");
-    git(repo, "config", "filter.evil.clean", planted);
-    git(repo, "config", "filter.evil.process", planted);
-    git(repo, "config", "filter.evil.required", "true");
-    makeStatDirty(path.join(repo, "a.txt"));
-    expect(await hardenedWorktreeHasUncommittedContent(repo)).toBe(false);
-    writeFileSync(path.join(repo, "a.txt"), "undelivered\n");
-    expect(await hardenedWorktreeHasUncommittedContent(repo)).toBe(true);
-    expect(existsSync(marker)).toBe(false);
-  });
-
-  it("does not execute what an include.path target configures", async () => {
+  it("does not execute what an include.path target configures as fsmonitor", async () => {
     const repo = plainRepo("repo");
     const included = path.join(root, "included.cfg");
-    writeFileSync(included, `[core]\n\tfsmonitor = ${planted}\n[filter "evil"]\n\tclean = ${planted}\n`);
-    writeFileSync(path.join(repo, ".gitattributes"), "* filter=evil\n");
+    writeFileSync(included, `[core]\n\tfsmonitor = ${planted}\n`);
     git(repo, "config", "include.path", included);
-    makeStatDirty(path.join(repo, "a.txt"));
-    expect(await hardenedWorktreeHasUncommittedContent(repo)).toBe(true);
+    writeFileSync(path.join(repo, "b.txt"), "untracked\n");
+    expect(await worktreeStatus(repo)).toContain("b.txt");
     expect(existsSync(marker)).toBe(false);
   });
 
@@ -187,18 +191,12 @@ describe("hardenedWorktreeHasUncommittedContent (pre-existing repository_deliver
     }
     git(repo, "config", "core.hooksPath", hooks);
     writeFileSync(path.join(repo, "b.txt"), "untracked\n");
-    expect(await hardenedWorktreeHasUncommittedContent(repo)).toBe(true);
+    expect(await worktreeStatus(repo)).toContain("b.txt");
     expect(existsSync(marker)).toBe(false);
   });
 
-  it("measures the probed path, not the decoy a planted core.worktree points at", async () => {
-    const repo = plainRepo("repo");
-    const decoy = path.join(root, "decoy");
-    mkdirSync(decoy);
-    writeFileSync(path.join(decoy, "a.txt"), "hello\n");
-    writeFileSync(path.join(repo, "a.txt"), "undelivered\n");
-    git(repo, "config", "core.worktree", decoy);
-    expect(await hardenedWorktreeHasUncommittedContent(repo)).toBe(true);
+  it("reports a clean worktree as empty output", async () => {
+    expect(await worktreeStatus(plainRepo("repo"))).toBe("");
   });
 
   it("ignores GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE inherited by the server process", async () => {
@@ -210,7 +208,7 @@ describe("hardenedWorktreeHasUncommittedContent (pre-existing repository_deliver
     process.env.GIT_WORK_TREE = clean;
     process.env.GIT_INDEX_FILE = path.join(clean, ".git", "index");
     try {
-      expect(await hardenedWorktreeHasUncommittedContent(dirty)).toBe(true);
+      expect(await worktreeStatus(dirty)).toContain("a.txt");
     } finally {
       for (const [key, value] of [["GIT_DIR", saved.dir], ["GIT_WORK_TREE", saved.tree], ["GIT_INDEX_FILE", saved.index]] as const) {
         if (value === undefined) delete process.env[key];
@@ -219,50 +217,74 @@ describe("hardenedWorktreeHasUncommittedContent (pre-existing repository_deliver
     }
   });
 
-  it("keeps reporting dirt inside a populated submodule, without running the submodule's configured filter", async () => {
-    const library = plainRepo("library");
+  it("is unmeasured (rejects) rather than clean when git blocks past the timeout", async () => {
     const repo = plainRepo("repo");
-    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", library, "lib");
-    git(repo, "commit", "-qm", "submodule");
-    const submodule = path.join(repo, "lib");
-    git(submodule, "config", "filter.evil.clean", planted);
-    writeFileSync(path.join(submodule, ".gitattributes"), "* filter=evil\n");
-    expect(await hardenedWorktreeHasUncommittedContent(repo)).toBe(true);
-    rmSync(path.join(submodule, ".gitattributes"));
-    expect(await hardenedWorktreeHasUncommittedContent(repo)).toBe(false);
-    writeFileSync(path.join(submodule, "a.txt"), "undelivered\n");
-    expect(await hardenedWorktreeHasUncommittedContent(repo)).toBe(true);
-    expect(existsSync(marker)).toBe(false);
+    const fifo = path.join(root, "blocking-include");
+    execFileSync("mkfifo", [fifo]);
+    git(repo, "config", "include.path", fifo);
+    await expect(runHardenedGit(["-C", repo, "status", "--porcelain"], { ...WORKTREE_STATUS_OPTIONS, timeoutMs: 500 }))
+      .rejects.toMatchObject({ kind: "timeout" } satisfies Partial<HardenedGitError>);
   });
 });
 
 describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
-  it("accepts the issue's own clean worktree with zero commits ahead of the remote-tracking base", async () => {
+  it("accepts the issue's own clean worktree with zero commits ahead of the default branch on the remote", async () => {
     const layout = managedLayout();
     const result = await probeNoRepositoryWorktree(layout.input);
     expect(result).toMatchObject({ ok: true, branch: "SUP-7-record-ruling" });
   });
 
+  // Repository-local configuration the server must never run, and must not let
+  // make the form unavailable: a clean, level worktree still closes.
   it.each([
     ["core.fsmonitor", (worktree: string) => git(worktree, "config", "core.fsmonitor", planted)],
-    ["core.hooksPath", (worktree: string) => git(worktree, "config", "core.hooksPath", root)],
+    ["core.hooksPath", (worktree: string) => {
+      const hooks = path.join(root, "hooks");
+      mkdirSync(hooks);
+      for (const hook of ["post-index-change", "reference-transaction"]) {
+        writeFileSync(path.join(hooks, hook), `#!/bin/sh\necho fired >> '${marker}'\n`);
+        chmodSync(path.join(hooks, hook), 0o755);
+      }
+      git(worktree, "config", "core.hooksPath", hooks);
+    }],
     ["filter driver", (worktree: string) => {
-      git(worktree, "config", "filter.evil.clean", planted);
       writeFileSync(path.join(worktree, ".gitattributes"), "* filter=evil\n");
+      git(worktree, "add", ".gitattributes");
+      git(worktree, "commit", "-qm", "attributes");
+      git(worktree, "push", "-q", "origin", "HEAD:main");
+      git(worktree, "config", "filter.evil.clean", planted);
+      git(worktree, "config", "filter.evil.process", planted);
+      git(worktree, "config", "filter.evil.required", "true");
     }],
     ["include.path", (worktree: string) => {
       const included = path.join(root, "included.cfg");
-      writeFileSync(included, `[core]\n\tfsmonitor = ${planted}\n`);
+      writeFileSync(included, `[core]\n\tfsmonitor = ${planted}\n[filter "evil"]\n\tclean = ${planted}\n`);
       git(worktree, "config", "include.path", included);
     }],
-    ["core.worktree", (worktree: string) => git(worktree, "config", "core.worktree", root)],
-  ])("refuses a worktree whose repository config plants %s, without executing it", async (_label, plant) => {
+    ["includeIf", (worktree: string) => {
+      const included = path.join(root, "included-if.cfg");
+      writeFileSync(included, `[core]\n\tfsmonitor = ${planted}\n[filter "evil"]\n\tclean = ${planted}\n`);
+      git(worktree, "config", `includeIf.gitdir:${root}/.path`, included);
+      git(worktree, "config", "includeIf.onbranch:SUP-7**.path", included);
+    }],
+  ])("does not execute a planted %s, and does not make a clean worktree unclosable", async (_label, plant) => {
     const layout = managedLayout();
     plant(layout.worktree);
     makeStatDirty(path.join(layout.worktree, "a.txt"));
     const result = await probeNoRepositoryWorktree(layout.input);
-    expect(result.ok).toBe(false);
+    expect(result).toMatchObject({ ok: true });
     expect(existsSync(marker)).toBe(false);
+  });
+
+  it("measures the real work tree, not the decoy a planted core.worktree points at", async () => {
+    const layout = managedLayout();
+    const decoy = path.join(root, "decoy");
+    mkdirSync(decoy);
+    writeFileSync(path.join(decoy, "a.txt"), "hello\n");
+    writeFileSync(path.join(layout.worktree, "a.txt"), "undelivered\n");
+    git(layout.worktree, "config", "core.worktree", decoy);
+    const result = await probeNoRepositoryWorktree(layout.input);
+    expect(result.ok).toBe(false);
   });
 
   it("refuses a bare repository at the recorded path (rev-parse exits 0 and prints false)", async () => {
@@ -354,28 +376,52 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
     });
   });
 
-  it("refuses a committed change even when the local base branch was moved onto it", async () => {
-    const layout = managedLayout();
+  function commitOnIssueBranch(layout: ManagedLayout) {
     writeFileSync(path.join(layout.worktree, "b.txt"), "committed\n");
     git(layout.worktree, "add", "b.txt");
     git(layout.worktree, "commit", "-qm", "SUP-7 undelivered");
-    git(layout.repoRoot, "update-ref", "refs/heads/main", "refs/heads/SUP-7-record-ruling");
+  }
+
+  it("counts a pushed commit that the remote's default branch lacks", async () => {
+    const layout = managedLayout();
+    commitOnIssueBranch(layout);
+    git(layout.worktree, "push", "-q", "origin", "SUP-7-record-ruling");
     expect(await probeNoRepositoryWorktree(layout.input)).toEqual({
       ok: false,
-      reason: "the recorded worktree has 1 commit(s) not on refs/remotes/origin/main",
+      reason: "the recorded worktree has 1 commit(s) not on the project's default branch",
     });
   });
 
-  it("refuses when another branch naming the issue carries commits not on the base", async () => {
+  // The base is measured on the remote, so nothing the agent can write in the
+  // shared .git moves it: each of these makes a locally computed base level with
+  // the committed tip, and the remote still has never seen the commit.
+  it.each([
+    ["the local base branch is moved onto it", (layout: ManagedLayout) =>
+      git(layout.repoRoot, "update-ref", "refs/heads/main", "refs/heads/SUP-7-record-ruling")],
+    ["refs/remotes/origin/main is moved onto it with update-ref", (layout: ManagedLayout) =>
+      git(layout.repoRoot, "update-ref", "refs/remotes/origin/main", "refs/heads/SUP-7-record-ruling")],
+    ["refs/remotes/origin/main is rewritten by a local fetch refspec", (layout: ManagedLayout) =>
+      git(layout.repoRoot, "fetch", "-q", ".", "+refs/heads/SUP-7-record-ruling:refs/remotes/origin/main")],
+  ])("refuses an unpushed committed deliverable when %s", async (_label, moveBase) => {
     const layout = managedLayout();
-    writeFileSync(path.join(layout.worktree, "b.txt"), "committed\n");
-    git(layout.worktree, "add", "b.txt");
-    git(layout.worktree, "commit", "-qm", "real work");
+    commitOnIssueBranch(layout);
+    moveBase(layout);
+    const result = await probeNoRepositoryWorktree(layout.input);
+    expect(result).toMatchObject({ ok: false });
+    expect((result as { reason: string }).reason).toMatch(
+      /^the recorded worktree tip [0-9a-f]{12} could not be compared with the project's default branch on the remote$/,
+    );
+  });
+
+  it("refuses when another branch naming the issue carries commits the remote default branch lacks", async () => {
+    const layout = managedLayout();
+    commitOnIssueBranch(layout);
+    git(layout.worktree, "push", "-q", "origin", "SUP-7-record-ruling");
     const fabricated = layout.addWorktree("SUP-7-fresh");
     const result = await probeNoRepositoryWorktree({ ...layout.input, recordedWorktreePath: fabricated });
     expect(result).toEqual({
       ok: false,
-      reason: "branch SUP-7-record-ruling has 1 commit(s) not on refs/remotes/origin/main",
+      reason: "branch SUP-7-record-ruling has 1 commit(s) not on the project's default branch",
     });
   });
 
@@ -408,12 +454,45 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
     });
   });
 
-  it("refuses when the control-plane base does not resolve", async () => {
-    const layout = managedLayout();
-    const result = await probeNoRepositoryWorktree({ ...layout.input, baseBranch: "release" });
-    expect(result).toEqual({
-      ok: false,
-      reason: "the control-plane base refs/remotes/origin/release does not resolve in the managed checkout",
+  describe("fails closed when anything cannot be measured", () => {
+    const UNMEASURED =
+      /^the recorded worktree tip [0-9a-f]{12} could not be compared with the project's default branch on the remote$/;
+
+    it.each([
+      ["the remote comparison throws", async () => { throw new Error("GitHub compare API returned 500"); }],
+      ["the remote comparison returns no usable count", async () => Number.NaN],
+      ["the remote comparison returns a negative count", async () => -1],
+    ])("refuses when %s", async (_label, countCommitsAheadOfBase) => {
+      const layout = managedLayout();
+      const result = await probeNoRepositoryWorktree({ ...layout.input, countCommitsAheadOfBase });
+      expect(result).toMatchObject({ ok: false });
+      expect((result as { reason: string }).reason).toMatch(UNMEASURED);
+    });
+
+    it("refuses when the snapshot directory cannot be created", async () => {
+      const layout = managedLayout();
+      const previous = process.env.TMPDIR;
+      process.env.TMPDIR = path.join(root, "no-such-tmpdir");
+      try {
+        expect(await probeNoRepositoryWorktree(layout.input)).toEqual({
+          ok: false,
+          reason: "the recorded worktree status could not be verified",
+        });
+      } finally {
+        if (previous === undefined) delete process.env.TMPDIR;
+        else process.env.TMPDIR = previous;
+      }
+    });
+
+    it("refuses when git blocks past the timeout instead of hanging the close", async () => {
+      const layout = managedLayout();
+      const fifo = path.join(root, "blocking-include");
+      execFileSync("mkfifo", [fifo]);
+      git(layout.worktree, "config", "include.path", fifo);
+      const started = Date.now();
+      const result = await probeNoRepositoryWorktree({ ...layout.input, timeoutMs: 500 });
+      expect(result.ok).toBe(false);
+      expect(Date.now() - started).toBeLessThan(15_000);
     });
   });
 });

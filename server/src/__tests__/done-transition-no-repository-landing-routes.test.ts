@@ -109,6 +109,9 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
   let previousHome: string | undefined;
   let previousSchedulingSuppression: string | undefined;
   let seedSequence = 0;
+  // The bare repository the latest fixture was cloned from: what GitHub holds.
+  // The agent's worktree and the managed checkout's refs cannot write it.
+  let currentOrigin = "";
 
   beforeAll(async () => {
     previousSchedulingSuppression = process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
@@ -139,12 +142,27 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     else process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = previousSchedulingSuppression;
   });
 
+  // GitHub compare API stand-in: `compare/<base>...<sha>` answers with the
+  // commits `sha` has beyond `<base>` in the origin repository, and 404s for a
+  // commit origin has never received (a commit only the local checkout holds).
+  function compareAgainstOrigin(url: string): Response {
+    const match = /\/compare\/([^/]+)\.\.\.([0-9a-f]{40})$/.exec(url);
+    if (!match) return new Response(JSON.stringify({}), { status: 404 });
+    try {
+      const ahead = Number.parseInt(git(currentOrigin, "rev-list", "--count", `${decodeURIComponent(match[1]!)}..${match[2]}`), 10);
+      return new Response(JSON.stringify({ ahead_by: ahead }), { status: 200 });
+    } catch {
+      return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+    }
+  }
+
   beforeEach(() => {
     mockGhFetch.mockReset();
-    mockGhFetch.mockResolvedValue(new Response(JSON.stringify({}), { status: 404 }));
+    mockGhFetch.mockImplementation(async (url: string) => compareAgainstOrigin(url));
     mockGetByName.mockReset();
-    mockGetByName.mockResolvedValue(null);
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockReset();
+    mockResolveSecretValue.mockResolvedValue("test-token");
     mockEvaluateDoneTierDeclaration.mockReset();
     mockEvaluateDoneTierDeclaration.mockImplementation(realEvaluateDoneTierDeclarationRef.current!);
   });
@@ -234,7 +252,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
 
   /**
    * A record_only issue whose own isolated git worktree lives at the managed
-   * path, clean and level with refs/remotes/origin/main, with an entry ruling
+   * path, clean and level with the default branch on the remote, with an entry ruling
    * written by a different agent than the assignee that closes it.
    */
   async function seed(
@@ -268,6 +286,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     git(seedRepo, "push", "-q", origin, "main");
     mkdirSync(path.dirname(repoRoot), { recursive: true });
     git(home, "clone", "-q", origin, repoRoot);
+    currentOrigin = origin;
     const worktree = path.join(repoRoot, ".paperclip", "worktrees", branch);
     git(repoRoot, "worktree", "add", "-q", "-b", branch, worktree, "origin/main");
 
@@ -512,6 +531,98 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(res.body.error).toContain("records a pull request work product");
   });
 
+  function commitOnIssueBranch(fixture: SeededIssue) {
+    writeFileSync(path.join(fixture.worktree, "deliverable.md"), "work\n");
+    git(fixture.worktree, "add", "deliverable.md");
+    git(fixture.worktree, "commit", "-qm", `${fixture.identifier} undelivered`);
+  }
+
+  it.each([
+    ["update-ref moves refs/remotes/origin/main onto it", (fixture: SeededIssue) =>
+      git(fixture.repoRoot, "update-ref", "refs/remotes/origin/main", "HEAD")],
+    ["a local fetch refspec rewrites refs/remotes/origin/main", (fixture: SeededIssue) =>
+      git(fixture.repoRoot, "fetch", "-q", ".", `+refs/heads/${fixture.identifier}-entry-ruling:refs/remotes/origin/main`)],
+    ["the local main branch is moved onto it", (fixture: SeededIssue) =>
+      git(fixture.repoRoot, "update-ref", "refs/heads/main", "HEAD")],
+  ] as const)("refuses a committed, unpushed deliverable when %s", async (_label, moveBase) => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    commitOnIssueBranch(fixture);
+    moveBase(fixture);
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("could not be compared with the project's default branch on the remote");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  it("refuses a pushed deliverable that is ahead of the remote default branch", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    commitOnIssueBranch(fixture);
+    git(fixture.worktree, "push", "-q", "origin", `${fixture.identifier}-entry-ruling`);
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("has 1 commit(s) not on the project's default branch");
+  });
+
+  it("closes a worktree whose tip is already on the remote default branch, even when the checkout never fetched the new head", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    const other = path.join(home, "other-clone", fixture.identifier);
+    mkdirSync(path.dirname(other), { recursive: true });
+    git(home, "clone", "-q", currentOrigin, other);
+    writeFileSync(path.join(other, "later.md"), "merged by someone else\n");
+    git(other, "add", "later.md");
+    git(other, "commit", "-qm", "later merge");
+    git(other, "push", "-q", "origin", "main");
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(fixture.issueId)).toBe("done");
+  });
+
+  it.each([
+    ["no GitHub credential is configured", () => mockGetByName.mockResolvedValue(null), "requires a configured GitHub credential"],
+    ["GitHub answers the compare call with a server error", () =>
+      mockGhFetch.mockImplementation(async () => new Response("{}", { status: 500 })), "could not be compared with the project's default branch on the remote"],
+    ["the compare call answers without a commit count", () =>
+      mockGhFetch.mockImplementation(async () => new Response(JSON.stringify({}), { status: 200 })), "could not be compared with the project's default branch on the remote"],
+    ["the GitHub request cannot connect", () =>
+      mockGhFetch.mockImplementation(async () => { throw new Error("ECONNREFUSED"); }), "could not be compared with the project's default branch on the remote"],
+  ] as const)("fails closed when %s", async (_label, breakBase, expected) => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    breakBase();
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain(expected);
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  it("refuses at the status write, not with a 500, when the remote cannot be reached after the declaration was accepted", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    mockEvaluateDoneTierDeclaration.mockImplementation(async (...args: Parameters<typeof evaluateDoneTierDeclaration>) => {
+      const result = await realEvaluateDoneTierDeclarationRef.current!(...args);
+      expect(result.allowed, result.reason).toBe(true);
+      mockGhFetch.mockImplementation(async () => { throw new Error("ECONNREFUSED"); });
+      return result;
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("could not be compared with the project's default branch on the remote");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
   it.each([
     ["the worktree is dirtied", (fixture: SeededIssue) => {
       writeFileSync(path.join(fixture.worktree, "late.md"), "written after the probe\n");
@@ -520,7 +631,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       writeFileSync(path.join(fixture.worktree, "late.md"), "committed after the probe\n");
       git(fixture.worktree, "add", "late.md");
       git(fixture.worktree, "commit", "-qm", "late");
-    }, "commit(s) not on refs/remotes/origin/main"],
+    }, "could not be compared with the project's default branch on the remote"],
     ["the delivery requirement flips to repository_delivery", async (fixture: SeededIssue) => {
       await db.update(issues).set({ deliveryRequirement: "repository_delivery" }).where(eq(issues.id, fixture.issueId));
     }, "already stored as record_only at the close write"],
