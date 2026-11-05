@@ -376,6 +376,60 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
     });
   });
 
+  describe("untracked ignore files (ignored-file dirt)", () => {
+    const HIDDEN = "the recorded worktree has untracked ignore files that hide uncommitted content";
+
+    function hideDeliverable(worktree: string) {
+      mkdirSync(path.join(worktree, "hidden"));
+      writeFileSync(path.join(worktree, "hidden", ".gitignore"), "*\n");
+      writeFileSync(path.join(worktree, "hidden", "work.txt"), "undelivered\n");
+    }
+
+    function trackIgnoreRules(layout: ManagedLayout, rules: string) {
+      writeFileSync(path.join(layout.worktree, ".gitignore"), rules);
+      git(layout.worktree, "add", ".gitignore");
+      git(layout.worktree, "commit", "-qm", "ignore rules");
+      git(layout.worktree, "push", "-q", "origin", "HEAD:main");
+    }
+
+    it("refuses a directory whose own untracked .gitignore ignores everything, which status reads as clean", async () => {
+      const layout = managedLayout();
+      hideDeliverable(layout.worktree);
+      expect(git(layout.worktree, "status", "--porcelain", "--untracked-files=all")).toBe("");
+      expect(await probeNoRepositoryWorktree(layout.input)).toEqual({ ok: false, reason: HIDDEN });
+    });
+
+    it("refuses it in another worktree naming the issue", async () => {
+      const layout = managedLayout();
+      hideDeliverable(layout.worktree);
+      const fabricated = layout.addWorktree("SUP-7-fresh");
+      const result = await probeNoRepositoryWorktree({ ...layout.input, recordedWorktreePath: fabricated });
+      expect(result).toEqual({
+        ok: false,
+        reason: "another worktree on branch SUP-7-record-ruling has untracked ignore files that hide uncommitted content",
+      });
+    });
+
+    it("allows an ignored node_modules, including untracked ignore files shipped inside it", async () => {
+      const layout = managedLayout();
+      trackIgnoreRules(layout, "node_modules/\n");
+      const pkg = path.join(layout.worktree, "node_modules", "pkg");
+      mkdirSync(pkg, { recursive: true });
+      writeFileSync(path.join(pkg, "index.js"), "module.exports = 1;\n");
+      writeFileSync(path.join(pkg, ".gitignore"), "*\n");
+      expect(await probeNoRepositoryWorktree(layout.input)).toMatchObject({ ok: true });
+    });
+
+    it("allows a tracked .gitignore and the build output it ignores", async () => {
+      const layout = managedLayout();
+      trackIgnoreRules(layout, "*.log\ndist/\n");
+      writeFileSync(path.join(layout.worktree, "debug.log"), "noise\n");
+      mkdirSync(path.join(layout.worktree, "dist"));
+      writeFileSync(path.join(layout.worktree, "dist", "bundle.js"), "built\n");
+      expect(await probeNoRepositoryWorktree(layout.input)).toMatchObject({ ok: true });
+    });
+  });
+
   function commitOnIssueBranch(layout: ManagedLayout) {
     writeFileSync(path.join(layout.worktree, "b.txt"), "committed\n");
     git(layout.worktree, "add", "b.txt");

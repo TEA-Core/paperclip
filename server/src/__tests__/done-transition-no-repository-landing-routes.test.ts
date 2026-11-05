@@ -30,6 +30,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { projectRoutes } from "../routes/projects.js";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
   evaluateDoneTransitionGuardForBackstopClose,
@@ -130,6 +131,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     // The close path never touches attachment storage.
     const unusedStorage = {} as unknown as StorageService;
     app.use("/api", issueRoutes(db, unusedStorage));
+    app.use("/api", projectRoutes(db));
     app.use(errorHandler);
   }, 60_000);
 
@@ -243,6 +245,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     closerAgentId: string;
     rulerAgentId: string;
     projectId: string;
+    projectWorkspaceId: string;
     executionWorkspaceId: string;
     issueId: string;
     identifier: string;
@@ -344,7 +347,18 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       contextSnapshot: { issueId },
     });
     currentActor = { type: "agent", agentId: closerAgentId, companyId, source: "agent_key", runId };
-    return { companyId, closerAgentId, rulerAgentId, projectId, executionWorkspaceId, issueId, identifier, worktree, repoRoot };
+    return {
+      companyId,
+      closerAgentId,
+      rulerAgentId,
+      projectId,
+      projectWorkspaceId,
+      executionWorkspaceId,
+      issueId,
+      identifier,
+      worktree,
+      repoRoot,
+    };
   }
 
   async function close(identifier: string, doneTier: unknown = NO_REPOSITORY_DONE_TIER) {
@@ -620,6 +634,89 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.error).toContain("could not be compared with the project's default branch on the remote");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  async function storedProjectWorkspaceSource(projectWorkspaceId: string) {
+    return db
+      .select({
+        repoUrl: projectWorkspaces.repoUrl,
+        repoRef: projectWorkspaces.repoRef,
+        defaultRef: projectWorkspaces.defaultRef,
+      })
+      .from(projectWorkspaces)
+      .where(eq(projectWorkspaces.id, projectWorkspaceId))
+      .then((rows) => rows[0]!);
+  }
+
+  const SEEDED_SOURCE = { repoUrl: "https://github.com/TEA-Core/records", repoRef: "main", defaultRef: "main" };
+
+  it.each([
+    ["repoUrl", { repoUrl: "https://github.com/TEA-Core/elsewhere" }],
+    ["repoRef", { repoRef: "agent-branch" }],
+    ["defaultRef", { defaultRef: "agent-branch" }],
+  ] as const)("refuses an agent PATCH of the project workspace %s and leaves the stored row unchanged", async (_field, patch) => {
+    const fixture = await seed();
+
+    const res = await request(app)
+      .patch(`/api/projects/${fixture.projectId}/workspaces/${fixture.projectWorkspaceId}`)
+      .send(patch);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(await storedProjectWorkspaceSource(fixture.projectWorkspaceId)).toEqual(SEEDED_SOURCE);
+  });
+
+  it("refuses an agent adding a project workspace that names a repository or branch", async () => {
+    const fixture = await seed();
+
+    const res = await request(app)
+      .post(`/api/projects/${fixture.projectId}/workspaces`)
+      .send({ cwd: fixture.repoRoot, defaultRef: "agent-branch" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    const rows = await db.select({ id: projectWorkspaces.id }).from(projectWorkspaces).where(eq(projectWorkspaces.projectId, fixture.projectId));
+    expect(rows).toHaveLength(1);
+  });
+
+  it("still lets an agent change a project workspace field that is not a repository source", async () => {
+    const fixture = await seed();
+
+    const res = await request(app)
+      .patch(`/api/projects/${fixture.projectId}/workspaces/${fixture.projectWorkspaceId}`)
+      .send({ name: "Renamed by agent" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await storedProjectWorkspaceSource(fixture.projectWorkspaceId)).toEqual(SEEDED_SOURCE);
+  });
+
+  it("lets a board user change the project workspace default branch", async () => {
+    const fixture = await seed();
+    currentActor = { type: "board", userId: "local-board", source: "local_implicit" } as Express.Request["actor"];
+
+    const res = await request(app)
+      .patch(`/api/projects/${fixture.projectId}/workspaces/${fixture.projectWorkspaceId}`)
+      .send({ defaultRef: "release" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect((await storedProjectWorkspaceSource(fixture.projectWorkspaceId)).defaultRef).toBe("release");
+  });
+
+  it("does not let the closing agent move the compare base onto its own pushed branch", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    const branch = `${fixture.identifier}-entry-ruling`;
+    commitOnIssueBranch(fixture);
+    git(fixture.worktree, "push", "-q", "origin", branch);
+
+    const moveBase = await request(app)
+      .patch(`/api/projects/${fixture.projectId}/workspaces/${fixture.projectWorkspaceId}`)
+      .send({ defaultRef: branch });
+    expect(moveBase.status, JSON.stringify(moveBase.body)).toBe(403);
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("has 1 commit(s) not on the project's default branch");
     expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 

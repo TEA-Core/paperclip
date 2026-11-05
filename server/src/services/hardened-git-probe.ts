@@ -127,6 +127,8 @@ export interface HardenedGitOptions {
    * that gates a close must leave this unset and refuse.
    */
   pathFallback?: boolean;
+  /** Written to the process's standard input. */
+  input?: string;
 }
 
 /** Run one Git command under the hardened environment; resolves stdout. */
@@ -139,7 +141,7 @@ export function runHardenedGit(args: readonly string[], options: HardenedGitOpti
   const env = hardenedGitEnv(options.ceilingDirectory ?? null);
   if (!trustedGit && process.env.PATH) env.PATH = process.env.PATH;
   return new Promise((resolve, reject) => {
-    execFile(
+    const child = execFile(
       git,
       ["--no-optional-locks", ...args],
       {
@@ -160,6 +162,10 @@ export function runHardenedGit(args: readonly string[], options: HardenedGitOpti
         resolve(String(stdout));
       },
     );
+    if (options.input !== undefined) {
+      child.stdin?.on("error", () => {});
+      child.stdin?.end(options.input);
+    }
   });
 }
 
@@ -301,6 +307,37 @@ async function snapshotStatusIsDirty(
   return raw.split("\0").some((record) => record.length > 0);
 }
 
+/**
+ * Whether an untracked `.gitignore` hides itself, and so whatever sits beside it,
+ * from `status` (a hidden directory whose own `.gitignore` says `*`). An
+ * untracked ignore file that sits inside content a tracked rule or
+ * `info/exclude` already ignores (a provisioned `node_modules`) hides nothing
+ * new, and a tracked ignore file is part of the commit. Call only after
+ * `status` came back clean: every untracked ignore file is then ignored by
+ * something, and the source `check-ignore` names for each says by what.
+ */
+async function hasSelfHidingIgnoreFile(
+  snapshotGitDir: string,
+  workTree: string,
+  options: HardenedGitOptions,
+): Promise<boolean> {
+  const gitArgs = ["-C", workTree, `--git-dir=${snapshotGitDir}`, `--work-tree=${workTree}`];
+  const untrackedIgnoreFiles = (await runHardenedGit(
+    [...gitArgs, "ls-files", "-z", "--others", "--", ":(glob)**/.gitignore"],
+    options,
+  )).split("\0").filter((record) => record.length > 0);
+  if (untrackedIgnoreFiles.length === 0) return false;
+  const verdicts = (await runHardenedGit(
+    [...gitArgs, "check-ignore", "-v", "-z", "--stdin"],
+    { ...options, input: `${untrackedIgnoreFiles.join("\0")}\0` },
+  )).split("\0");
+  const untracked = new Set(untrackedIgnoreFiles);
+  for (let index = 0; index + 3 < verdicts.length; index += 4) {
+    if (untracked.has(verdicts[index]!)) return true;
+  }
+  return false;
+}
+
 /** Whether a branch name carries this issue identifier as its own token. */
 export function branchNamesIssue(branch: string, identifier: string): boolean {
   const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -429,8 +466,11 @@ async function verifyCleanLinkedWorktree(
           if (entry.mode === "160000") return "has submodules";
           if (entry.stage !== "0") return "has unmerged index entries";
         }
-        return (await snapshotStatusIsDirty(snapshot, worktreePath, "all", worktreeOptions))
-          ? "has uncommitted changes (modified, staged or untracked)"
+        if (await snapshotStatusIsDirty(snapshot, worktreePath, "all", worktreeOptions)) {
+          return "has uncommitted changes (modified, staged or untracked)";
+        }
+        return (await hasSelfHidingIgnoreFile(snapshot, worktreePath, worktreeOptions))
+          ? "has untracked ignore files that hide uncommitted content"
           : null;
       },
     );
@@ -469,8 +509,10 @@ async function aheadOfBaseRefusal(
  * worktree of that managed checkout. "Ahead of the default branch" is measured
  * by the caller-supplied `countCommitsAheadOfBase` against the remote — never
  * against a ref in the managed checkout, whose refs every agent worktree can
- * write — and a tip it cannot measure refuses. Every Git process runs from the
- * managed checkout as its working directory.
+ * write — and a tip it cannot measure refuses. The branch-name and worktree
+ * scans below read refs an agent can write, so they are advisory; the remote
+ * comparison of the recorded worktree's tip is the authority. Every Git process
+ * runs from the managed checkout as its working directory.
  */
 export async function probeNoRepositoryWorktree(
   input: NoRepositoryWorktreeProbeInput,

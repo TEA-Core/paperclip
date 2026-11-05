@@ -1076,21 +1076,19 @@ const doneTierNoRepositoryLandingSchema = z
   })
   .strict();
 
-const PROTOTYPE_POLLUTION_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-
 /**
- * True when `value` carries an own `__proto__`, `constructor` or `prototype`
- * key at any depth. `JSON.parse` creates `__proto__` as an ordinary own key,
- * and zod's `.strict()` strips it silently instead of rejecting it. Iterative,
- * so an absurdly nested body cannot exhaust the stack.
+ * True when `value` carries an own `__proto__` key at any depth. `JSON.parse`
+ * creates `__proto__` as an ordinary own key, and zod's `.strict()` strips it
+ * silently instead of rejecting it. Iterative, so an absurdly nested body
+ * cannot exhaust the stack.
  */
-export function hasPrototypePollutionKey(value: unknown): boolean {
+export function hasOwnProtoKey(value: unknown): boolean {
   const pending: unknown[] = [value];
   while (pending.length > 0) {
     const current = pending.pop();
     if (current === null || typeof current !== "object") continue;
     for (const key of Reflect.ownKeys(current)) {
-      if (typeof key === "string" && PROTOTYPE_POLLUTION_KEYS.has(key)) return true;
+      if (key === "__proto__") return true;
       const descriptor = Reflect.getOwnPropertyDescriptor(current, key);
       if (descriptor && "value" in descriptor) pending.push(descriptor.value);
     }
@@ -1100,8 +1098,8 @@ export function hasPrototypePollutionKey(value: unknown): boolean {
 
 export const doneTierDeclarationSchema = z
   .unknown()
-  .refine((value) => !hasPrototypePollutionKey(value), {
-    message: "doneTier must not carry __proto__, constructor or prototype keys",
+  .refine((value) => !hasOwnProtoKey(value), {
+    message: "doneTier must not carry a __proto__ key",
   })
   .pipe(
     z.discriminatedUnion("tier", [

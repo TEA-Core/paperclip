@@ -74,6 +74,20 @@ export function assertNoAgentHostWorkspaceCommandMutation(req: Request, paths: s
   );
 }
 
+const PROJECT_WORKSPACE_SOURCE_KEYS = ["repoUrl", "repoRef", "defaultRef"] as const;
+
+export function collectProjectWorkspaceSourcePaths(workspacePatch: unknown, prefix = ""): string[] {
+  if (!isRecord(workspacePatch)) return [];
+  return PROJECT_WORKSPACE_SOURCE_KEYS.filter((key) => hasOwn(workspacePatch, key)).map((key) => prefixPath(prefix, key));
+}
+
+export function assertNoAgentProjectWorkspaceSourceMutation(req: Request, paths: string[]) {
+  if (req.actor.type !== "agent" || paths.length === 0) return;
+  throw forbidden(
+    `Agent keys cannot set the repository or branch a project workspace is measured against (${paths.join(", ")}); a board user must.`,
+  );
+}
+
 export function collectAgentAdapterWorkspaceCommandPaths(
   adapterConfig: unknown,
   prefix = "adapterConfig",
