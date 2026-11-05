@@ -601,7 +601,9 @@ export function normalizeIssueExecutionPolicy(
  * carries the stored stages forward onto the normalized result so those
  * partial writes keep the ladder. This guard scopes its null-clear backstop to
  * bodies where `stagesKeyAbsent` is false, so an omission is no longer rejected
- * here; `resolvePatchExecutionPolicy` performs the preserve.
+ * here; `resolvePatchExecutionPolicy` performs the preserve. An explicit empty
+ * stages array must still retain a stored monitor in the request body, even when
+ * another field keeps normalization non-null.
  */
 export function assertPatchableExecutionPolicyWrite(input: {
   raw: unknown;
@@ -658,6 +660,12 @@ export function assertPatchableExecutionPolicyWrite(input: {
   if (raw !== null && typeof raw === "object" && !Array.isArray(raw) &&
       currentPolicy !== null && !stagesKeyAbsent &&
       (currentPolicy.monitor || currentPolicy.stages.length > 0)) {
+    const monitorKeyPresent = Object.prototype.hasOwnProperty.call(raw, "monitor");
+    if (stagesExplicitlyEmpty && currentPolicy.monitor && !monitorKeyPresent) {
+      throw unprocessable(
+        "executionPolicy must not clear the issue's monitor; send the full replacement policy including the monitor, or omit the stages key to clear it explicitly",
+      );
+    }
     const normalized = normalizeIssueExecutionPolicy(raw);
     if (normalized === null) {
       throw unprocessable(

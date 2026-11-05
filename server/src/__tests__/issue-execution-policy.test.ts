@@ -364,6 +364,7 @@ describe("assertPatchableExecutionPolicyWrite (SUP-13634)", () => {
       assertPatchableExecutionPolicyWrite({
         raw: { mode: "normal", commentRequired: true, stages: [] },
         currentPolicy: monitorOnly,
+        stagesKeyAbsent: false,
         stagesExplicitlyEmpty: true,
       }),
     ).toThrowError("executionPolicy must not clear the issue's monitor");
@@ -375,6 +376,19 @@ describe("assertPatchableExecutionPolicyWrite (SUP-13634)", () => {
     expect(noLadder!.stages).toEqual([]);
     expect(noLadder!.monitor).toBeUndefined();
     expect(() => assertWrite({ raw: { mode: "normal" }, currentPolicy: noLadder })).not.toThrow();
+  });
+
+  it("rejects an explicit empty stages write that drops a monitor even when another field preserves normalization", () => {
+    const monitorOnly = normalizeIssueExecutionPolicy({ monitor, stages: [] });
+    expect(monitorOnly).not.toBeNull();
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw: { stages: [], baseRef: "main" },
+        currentPolicy: monitorOnly,
+        stagesKeyAbsent: false,
+        stagesExplicitlyEmpty: true,
+      }),
+    ).toThrowError("executionPolicy must not clear the issue's monitor");
   });
 
   // SUP-22890 AC2: a stage-less body that carries a monitor must never
@@ -1153,7 +1167,7 @@ describe("issue execution policy transitions", () => {
           assigneeAgentId: qaAgentId,
           assigneeUserId: null,
           executionPolicy: policy,
-          executionState: rearm.patch.executionState,
+          executionState: rearm.patch.executionState as IssueExecutionState,
         },
         policy,
         requestedStatus: "done",
@@ -3425,6 +3439,7 @@ describe("issue execution policy transitions", () => {
         completedStageIds: [],
         lastDecisionId: null,
         lastDecisionOutcome: null,
+        reviewRequest: null,
       };
     }
 
@@ -3623,7 +3638,7 @@ describe("return-assignee exclusion is absolute (reverses SUP-10602 allowSelfAsF
             assigneeAgentId: qaAgentId,
             assigneeUserId: null,
             executionPolicy: policy,
-            executionState: result.patch.executionState,
+            executionState: result.patch.executionState as IssueExecutionState,
           },
           policy,
           requestedStatus: "done",
