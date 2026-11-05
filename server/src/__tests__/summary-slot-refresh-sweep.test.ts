@@ -334,6 +334,91 @@ describe("createSummarySlotRefreshSweepService", () => {
     );
   });
 
+  it("re-claims a `generating` slot pinned behind a plain `blocked` issue with no escalated recovery action (SUP-22977)", async () => {
+    const rows = [
+      { ...SCOPES[0], status: "generating", generatingIssueId: "issue-parked", updatedAt: new Date("2026-09-09T23:00:00Z") },
+    ];
+    // The parked issue holds the claim but nothing will progress it; the sweep
+    // must release the link so `generate` mints the next hour's generation
+    // instead of re-firing the parked one forever.
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: false, generatingIssueId: "issue-fresh" }));
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      issueRows: [{ status: "blocked" }],
+      recoveryRows: [],
+      wedgedMs: 6 * 60 * 60 * 1000,
+    });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 1,
+      inFlight: 0,
+      failed: 0,
+    });
+    expect(db.update).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      db,
+      expect.objectContaining({
+        action: "summary_slot.generate_requested",
+        details: expect.objectContaining({
+          alreadyGenerating: false,
+          source: "summary-slot-refresh-sweep",
+          wedgedRecovery: true,
+          wedgedReason: "blocked_generation_parked",
+          supersededGenerationIssueId: "issue-parked",
+        }),
+      }),
+    );
+    // The fresh generation (not the parked one) is woken.
+    expect(mockQueueWakeup).toHaveBeenCalledTimes(1);
+    expect(mockQueueWakeup).toHaveBeenCalledWith(
+      expect.objectContaining({ issue: expect.objectContaining({ id: "issue-fresh" }) }),
+    );
+  });
+
+  it("does not re-wake an in-flight generation that already wrote the slot's surviving revision (SUP-22977)", async () => {
+    const rows = [
+      {
+        ...SCOPES[0],
+        status: "generating",
+        generatingIssueId: "issue-live",
+        updatedAt: new Date("2026-09-09T23:00:00Z"),
+        // Discovery projected this identity check: the linked generation issue
+        // already wrote the slot's surviving revision.
+        wroteSurvivingRevision: true,
+      },
+    ];
+    // The issue is live and recent (not wedged), so the claim stays in place —
+    // but the re-wake is skipped: re-running a generation whose deliverable
+    // already landed just burns summarizer runs (observed live: three wakes
+    // for one written revision while the served header froze).
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: true }));
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      issueRows: [{ status: "in_progress", updatedAt: new Date("2026-09-09T23:30:00Z") }],
+      recoveryRows: [],
+      wedgedMs: 6 * 60 * 60 * 1000,
+    });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 0,
+      inFlight: 1,
+      failed: 0,
+    });
+    // Not wedged: no clear, no audit entry.
+    expect(db.update).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    // The re-fire wake is the defect: it must NOT be delivered once the
+    // generation already wrote the surviving revision.
+    expect(mockQueueWakeup).not.toHaveBeenCalled();
+  });
+
   it("leaves a `generating` slot in-flight when its linked `in_review` issue was recently updated, even though the slot row is old (AC-5, no thrash)", async () => {
     const rows = [
       // Old slot row — would trip a naive slot-age backstop (CR finding 1) ...

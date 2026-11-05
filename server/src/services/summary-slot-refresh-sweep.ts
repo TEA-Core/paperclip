@@ -9,6 +9,7 @@ import {
   type IssueAssignmentWakeupDeps,
 } from "./issue-assignment-wakeup.js";
 import { summarySlotService } from "./summary-slots.js";
+import { generationWroteSlotSql } from "./summary-slot-finalization.js";
 import type {
   SummarySlotKey,
   SummarySlotScopeKind,
@@ -39,25 +40,33 @@ import type {
  *     excluded at the query so a recently-written summary is never re-fired.
  *
  * For each candidate the sweep calls `summarySlotService(db).generate` at the
- * service layer — the exact consume-contract the HTTP route uses. For a fresh
+ * service layer — the exact consume-contract that the HTTP route uses. For a fresh
  * claim it records the route-equivalent `summary_slot.generate_requested`
  * activity entry and fires the same assignment wakeup the route fires so the
  * Summarizer claims it. For a slot that is already `generating` with an active,
  * progressing issue it does not re-fire `generate`, but re-delivers the
  * assignee wake so a wake that was rejected on the minting tick is retried
- * instead of leaving the slot stranded unwoken. The route's board gate is left
+ * instead of leaving the slot stranded unwoken — EXCEPT when the linked
+ * generation issue has already written the slot's surviving revision
+ * (SUP-22977): that wake would re-run a completed generation, so it is skipped
+ * and the tick is a no-op read for that slot. The route's board gate is left
  * untouched: this path is board-side, in-process, and does not introduce any
  * new credential or auth branch.
  *
  * Wedged-generation recovery (SUP-15764): `generate` treats a `generating`
  * slot as in-flight while its generation issue is *active* (`status` not in
  * `{done, cancelled}`), and `blocked` counts as active. A slot pinned behind a
- * permanently-`blocked` generation issue — e.g. one parked on a board
- * `missing_disposition` recovery action — would otherwise be re-woken on every
+ * permanently-`blocked` generation issue would otherwise be re-woken on every
  * due tick, forever, and logged nothing. Before claiming such a `generating`
- * candidate the sweep classifies it as *wedged* when EITHER:
+ * candidate the sweep classifies it as *wedged* when ANY of:
  *   - its generation issue is `blocked` and carries an active recovery action
  *     in status `escalated` (`reason: "blocked_escalated_recovery"`), or
+ *   - its generation issue is `blocked` at all (`reason:
+ *     "blocked_generation_parked"`, SUP-22977) — parked is parked with or
+ *     without an escalation trail; while a blocked generation holds the claim,
+ *     the sweep can neither mint the next hour's generation nor let the slot
+ *     serve a fresher revision, and the hourly re-wake burned summarizer runs
+ *     against an already-written deliverable; or
  *   - the linked generation issue has made no progress for longer than the
  *     bounded, env-tunable window `SUMMARY_SLOT_REFRESH_WEDGED_MS` (default
  *     6h) (`reason: "generating_age_exceeded"`). Progress is measured off the
@@ -145,10 +154,21 @@ type SummarySlotRefreshCandidate = {
   status: SummarySlotStatus;
   generatingIssueId: string | null;
   updatedAt: Date;
+  /**
+   * Whether the linked generation issue already wrote the slot's surviving
+   * revision (identity-based: slot document -> latest revision -> creating
+   * run's context snapshot issue id). Computed in the discovery SELECT
+   * (SUP-22977); `null`/`false`/missing means "not written (or unknown)", and
+   * the sweep fails open by re-delivering the wake.
+   */
+  wroteSurvivingRevision?: boolean | null;
 };
 
 /** Why a `generating` candidate was classified as wedged and re-claimed. */
-type WedgedReason = "blocked_escalated_recovery" | "generating_age_exceeded";
+type WedgedReason =
+  | "blocked_escalated_recovery"
+  | "blocked_generation_parked"
+  | "generating_age_exceeded";
 
 /** Reads a positive-integer millisecond env var, falling back to `fallbackMs` on missing or invalid values. */
 function readMsEnv(name: string, fallbackMs: number): number {
@@ -214,6 +234,10 @@ export function createSummarySlotRefreshSweepService(
         status: summarySlots.status,
         generatingIssueId: summarySlots.generatingIssueId,
         updatedAt: summarySlots.updatedAt,
+        wroteSurvivingRevision: sql<boolean>`${generationWroteSlotSql(
+          summarySlots.companyId,
+          summarySlots.generatingIssueId,
+        )}`,
       })
       .from(summarySlots)
       .where(
@@ -274,11 +298,14 @@ export function createSummarySlotRefreshSweepService(
 
     /**
      * Decides whether a `generating` candidate is wedged behind a
-     * non-progressing generation issue (SUP-15764). Two independent rules,
-     * either of which marks the slot for re-claim:
+     * non-progressing generation issue (SUP-15764). Independent rules, any of
+     * which marks the slot for re-claim:
      *   - the generation issue is `blocked` and has an active recovery action
      *     in status `escalated` — definitively parked on a human, so it will
      *     never progress on its own; or
+     *   - the generation issue is `blocked` at all (SUP-22977) — a parked
+     *     generation holds the claim hostage with the same effect, whether or
+     *     not an escalation trail exists; or
      *   - the generation has made no progress for the bounded `wedgedMs`
      *     window. Progress is measured off the linked issue's `updatedAt` (the
      *     issue is what is actually doing the work), NOT the slot row's
@@ -328,6 +355,15 @@ export function createSummarySlotRefreshSweepService(
         if (escalated) {
           return { wedged: true, reason: "blocked_escalated_recovery", supersededIssueId, observedUpdatedAt };
         }
+        // SUP-22977: a generation issue parked `blocked` WITHOUT an escalated
+        // recovery action is just as parked — nothing progresses it but a human
+        // (or the assignee unblocking it), and while it holds the claim the
+        // sweep can neither mint the next generation nor let the slot serve a
+        // fresher one. The escalated check above only distinguished the reason
+        // for telemetry; both branches reclaim the slot. A parked generation
+        // that later resumes and writes fails closed against the slot's write
+        // identity guard (the claim was superseded), so releasing here is safe.
+        return { wedged: true, reason: "blocked_generation_parked", supersededIssueId, observedUpdatedAt };
       }
 
       // Rule 2: no progress for the bounded window, clocked off the linked
@@ -497,9 +533,23 @@ export function createSummarySlotRefreshSweepService(
           // Summarizer is never told to claim it. A rejected re-wake throws into
           // the catch below and counts `failed`, so the slot is retried, not
           // stranded.
-          await fireWakeFor(res.generatingIssue, summarySlotRefreshTaskKey(candidate));
+          //
+          // SUP-22977: skip the re-wake when THIS generation issue already wrote
+          // the slot's surviving revision. The wake re-runs the assignee, and a
+          // completed write re-fired hourly just burns summarizer runs against a
+          // generation whose deliverable already landed (observed live: three
+          // wakes for one written revision while the served header froze). The
+          // written check is identity-based (slot document -> latest revision ->
+          // creating run's context snapshot issue id), computed in the discovery
+          // SELECT; a revision landing between discovery and here misses the
+          // guard once and is caught on the next tick, and a missing/unknown
+          // link fails open to the pre-existing re-wake behavior.
+          if (!candidate.wroteSurvivingRevision) {
+            await fireWakeFor(res.generatingIssue, summarySlotRefreshTaskKey(candidate));
+          }
           // In-flight only when the re-wake was delivered (or no dispatcher is
-          // configured); a rejected re-wake lands in the catch -> `failed`.
+          // configured, or the wake was skipped because the generation already
+          // wrote the slot); a rejected re-wake lands in the catch -> `failed`.
           result.inFlight += 1;
           continue;
         }
