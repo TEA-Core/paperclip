@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, gte, inArray, isNull } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, max } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   documentRevisions,
@@ -7,6 +7,7 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issues,
+  issueComments,
   projectWorkspaces,
   projects,
   summarySlots,
@@ -562,24 +563,61 @@ export function summarySlotService(db: Db) {
       status: issues.status,
       priority: issues.priority,
       updatedAt: issues.updatedAt,
+      lastCommentAt: max(issueComments.createdAt),
     };
 
     const [blocked, inReview, inProgress, recentlyDone] = await Promise.all([
       db.select(selectFields).from(issues)
+        .leftJoin(
+          issueComments,
+          and(
+            eq(issueComments.issueId, issues.id),
+            eq(issueComments.companyId, issues.companyId),
+            isNull(issueComments.deletedAt),
+          ),
+        )
         .where(and(...commonConditions, eq(issues.status, "blocked")))
+        .groupBy(issues.id)
         .orderBy(desc(issues.updatedAt)).limit(SUMMARY_SNAPSHOT_GROUP_LIMIT),
       db.select(selectFields).from(issues)
+        .leftJoin(
+          issueComments,
+          and(
+            eq(issueComments.issueId, issues.id),
+            eq(issueComments.companyId, issues.companyId),
+            isNull(issueComments.deletedAt),
+          ),
+        )
         .where(and(...commonConditions, eq(issues.status, "in_review")))
+        .groupBy(issues.id)
         .orderBy(desc(issues.updatedAt)).limit(SUMMARY_SNAPSHOT_GROUP_LIMIT),
       db.select(selectFields).from(issues)
+        .leftJoin(
+          issueComments,
+          and(
+            eq(issueComments.issueId, issues.id),
+            eq(issueComments.companyId, issues.companyId),
+            isNull(issueComments.deletedAt),
+          ),
+        )
         .where(and(...commonConditions, eq(issues.status, "in_progress")))
+        .groupBy(issues.id)
         .orderBy(desc(issues.updatedAt)).limit(SUMMARY_SNAPSHOT_GROUP_LIMIT),
       db.select(selectFields).from(issues)
+        .leftJoin(
+          issueComments,
+          and(
+            eq(issueComments.issueId, issues.id),
+            eq(issueComments.companyId, issues.companyId),
+            isNull(issueComments.deletedAt),
+          ),
+        )
         .where(and(
           ...commonConditions,
           inArray(issues.status, ["done"]),
           gte(issues.updatedAt, recentlyDoneSince),
         ))
+        .groupBy(issues.id)
         .orderBy(desc(issues.updatedAt)).limit(SUMMARY_SNAPSHOT_GROUP_LIMIT),
     ]);
 
@@ -595,7 +633,8 @@ export function summarySlotService(db: Db) {
             const issueLink = companyPrefix
               ? `[${identifier}](/${companyPrefix}/issues/${identifier})`
               : identifier;
-            return `- ${issueLink} — ${row.title} (${row.priority}; updated ${row.updatedAt.toISOString()})`;
+            const lastCommentAt = row.lastCommentAt?.toISOString() ?? "null";
+            return `- ${issueLink} — ${row.title} (${row.priority}; updated ${row.updatedAt.toISOString()}; lastCommentAt ${lastCommentAt})`;
           })
         : ["- None."]),
     ];
@@ -604,7 +643,9 @@ export function summarySlotService(db: Db) {
       "## Prebuilt scope snapshot",
       "",
       `Snapshot generated at ${new Date().toISOString()}. Recently done means updated since ${recentlyDoneSince.toISOString()}.`,
-      "Use this bounded, company-scoped snapshot as the issue source of truth for this run. Do not call issue-list endpoints.",
+       "This bounded, company-scoped snapshot is an index, not proof of what a card still owes. Do not call issue-list endpoints for listing.",
+       "Before writing an action claim about a specific issue — including that it still owes work, never ran, nothing has been sent, or an equivalent claim — check `GET /api/companies/{companyId}/issues/{ref}/comments`.",
+       "The issue description, the card body, and the previous slot body returned with `latestRevisionId` are unsafe sources for an action claim: descriptions can carry dated amendments, and a false revision becomes the next run's input. `lastCommentAt` makes staleness visible; it does not make a stale body safe.",
       "",
       ...formatGroup("Blocked", blocked),
       "",
@@ -658,7 +699,7 @@ export function summarySlotService(db: Db) {
       "```",
       "",
       "Write one short, colloquial Markdown summary that opens with the 1–3 specific, concrete, actionable items the reader should do right now to unblock this work — each saying what to do and why it's the thing holding up progress, with an inline link — followed by a brief plain-prose status of where things stand. Use your judgment: read whatever issues you need to understand the state, then focus on what's most important. Write for a reader who has not memorized issue ids or threads. If genuinely nothing needs the reader, say so plainly in one line and name the next thing worth watching. Never a trailing list of issue links or any link dump. Not a task list.",
-      "The current-slot response includes the latest document body and `latestRevisionId`; use those directly.",
+       "The current-slot response includes the latest document body and `latestRevisionId`; carry its body forward only after checking the issue thread for every action claim.",
       "Follow the skill's streaming protocol: emit the first plain-text `STATUS:` line immediately — named from the first task in the snapshot, before any analysis — keep emitting `STATUS:` lines as you think, and emit the sentinel-wrapped summary draft before the authoritative summary-slot write.",
       "Pass the `generationIssueId` from the token block above, the previous revision id when present, and the model actually used to the summary-slot write API.",
       "",
