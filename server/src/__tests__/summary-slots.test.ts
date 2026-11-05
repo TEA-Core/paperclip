@@ -12,8 +12,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueRecoveryActions,
-  issues,
-  issueComments,
+  issues, issueComments,
   projectWorkspaces,
   projects,
   summarySlots,
@@ -110,7 +109,6 @@ describeEmbeddedPostgres("summary slot service", () => {
   afterEach(async () => {
     await db.delete(summarySlots);
     await db.delete(documentRevisions);
-    await db.delete(issueComments);
     await db.delete(documents);
     await db.delete(issues);
     await db.delete(heartbeatRunEvents);
@@ -336,39 +334,6 @@ describeEmbeddedPostgres("summary slot service", () => {
         },
       ]);
 
-      const commentedIssueId = await db
-        .select({ id: issues.id })
-        .from(issues)
-        .where(eq(issues.identifier, `${issuePrefix(companyId)}-101`))
-        .then((rows) => rows[0]!.id);
-      await db.insert(issueComments).values([
-        {
-          companyId,
-          issueId: commentedIssueId,
-          authorType: "user",
-          authorUserId: "board-user",
-          body: "Approval is waiting.",
-          createdAt: new Date("2026-11-05T12:00:00.000Z"),
-        },
-        {
-          companyId,
-          issueId: commentedIssueId,
-          authorType: "user",
-          authorUserId: "board-user",
-          body: "Latest live update.",
-          createdAt: new Date("2026-11-05T12:30:00.000Z"),
-        },
-        {
-          companyId,
-          issueId: commentedIssueId,
-          authorType: "user",
-          authorUserId: "board-user",
-          body: "Deleted update.",
-          createdAt: new Date("2026-11-05T13:00:00.000Z"),
-          deletedAt: new Date("2026-11-05T14:00:00.000Z"),
-        },
-      ]);
-
       const result = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
 
       expect(result.alreadyGenerating).toBe(false);
@@ -417,16 +382,6 @@ describeEmbeddedPostgres("summary slot service", () => {
       );
       expect(issueRow.description).toContain("sentinel-wrapped summary draft");
       expect(issueRow.description).toContain("## Prebuilt scope snapshot");
-      expect(issueRow.description).toContain("lastCommentAt 2026-11-05T12:30:00.000Z");
-      expect(issueRow.description).toContain("lastCommentAt null");
-      expect(issueRow.description).toContain(
-        "GET /api/companies/{companyId}/issues/{ref}/comments",
-      );
-      expect(issueRow.description).toContain("snapshot is an index, not proof of what a card still owes");
-      expect(issueRow.description).toContain("issue description, the card body, and the previous slot body");
-      expect(issueRow.description).toContain("`lastCommentAt` makes staleness visible; it does not make a stale body safe");
-      expect(issueRow.description).toContain("Do not call issue-list endpoints for listing");
-      expect(issueRow.description).not.toContain("snapshot as the issue source of truth");
       expect(issueRow.description).toContain("### Blocked");
       expect(issueRow.description).toContain("Waiting on board approval");
       expect(issueRow.description).toContain("### In progress");
@@ -782,6 +737,88 @@ describeEmbeddedPostgres("summary slot service", () => {
         generatingIssueId: null,
         failureReason: expect.stringContaining("was cancelled before writing a summary"),
       });
+    });
+    it("renders per-issue lastCommentAt and the thread-check duty in the generation snapshot (SUP-23041)", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+
+      await db.insert(issues).values([
+        {
+          companyId,
+          projectId,
+          identifier: `${issuePrefix(companyId)}-201`,
+          issueNumber: 201,
+          title: "Waiting on board approval",
+          status: "blocked",
+          priority: "high",
+        },
+        {
+          companyId,
+          projectId,
+          identifier: `${issuePrefix(companyId)}-202`,
+          issueNumber: 202,
+          title: "Implement summary cards",
+          status: "in_progress",
+          priority: "medium",
+        },
+      ]);
+
+      const commentedIssueId = await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(eq(issues.identifier, `${issuePrefix(companyId)}-201`))
+        .then((rows) => rows[0]!.id);
+      await db.insert(issueComments).values([
+        {
+          companyId,
+          issueId: commentedIssueId,
+          authorType: "user",
+          authorUserId: "board-user",
+          body: "Approval is waiting.",
+          createdAt: new Date("2026-11-05T12:00:00.000Z"),
+        },
+        {
+          companyId,
+          issueId: commentedIssueId,
+          authorType: "user",
+          authorUserId: "board-user",
+          body: "Latest live update.",
+          createdAt: new Date("2026-11-05T12:30:00.000Z"),
+        },
+        {
+          companyId,
+          issueId: commentedIssueId,
+          authorType: "user",
+          authorUserId: "board-user",
+          body: "Deleted update.",
+          createdAt: new Date("2026-11-05T13:00:00.000Z"),
+          deletedAt: new Date("2026-11-05T14:00:00.000Z"),
+        },
+      ]);
+
+      const result = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      expect(result.alreadyGenerating).toBe(false);
+
+      const issueRow = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, result.generatingIssue.id))
+        .then((rows) => rows[0]!);
+      expect(issueRow.description).toContain("## Prebuilt scope snapshot");
+      expect(issueRow.description).toContain("lastCommentAt 2026-11-05T12:30:00.000Z");
+      expect(issueRow.description).toContain("lastCommentAt null");
+      expect(issueRow.description).toContain(
+        "GET /api/companies/{companyId}/issues/{ref}/comments",
+      );
+      expect(issueRow.description).toContain("snapshot is an index, not proof of what a card still owes");
+      expect(issueRow.description).toContain("issue description, the card body, and the previous slot body");
+      expect(issueRow.description).toContain("`lastCommentAt` makes staleness visible; it does not make a stale body safe");
+      expect(issueRow.description).toContain("Do not call issue-list endpoints for listing");
+      expect(issueRow.description).not.toContain("snapshot as the issue source of truth");
+      expect(issueRow.description).toContain("Waiting on board approval");
+      expect(issueRow.description).toContain("Implement summary cards");
     });
   });
 
