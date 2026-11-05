@@ -1,8 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { worktreeHasUncommittedContent } from "./done-transition-guard.js";
 import {
   HardenedGitError,
   probeNoRepositoryWorktree,
@@ -89,6 +90,23 @@ describe("a host with no root-owned git binary (SUP-22880 / SUP-22570)", () => {
       }
     }
   });
+
+  it("lets a legacy probe run past 15 seconds and still report the dirty worktree, instead of timing out into a fail-open", async () => {
+    const realGit = execFileSync("sh", ["-c", "command -v git"]).toString().trim();
+    const slowBin = path.join(root, "slow-bin");
+    mkdirSync(slowBin);
+    writeFileSync(path.join(slowBin, "git"), `#!/bin/sh\nsleep 16\nexec ${realGit} "$@"\n`);
+    chmodSync(path.join(slowBin, "git"), 0o755);
+    const dirty = plainRepo("dirty");
+    writeFileSync(path.join(dirty, "a.txt"), "undelivered\n");
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${slowBin}:${previousPath}`;
+    try {
+      expect(await worktreeHasUncommittedContent(dirty)).toBe(true);
+    } finally {
+      process.env.PATH = previousPath;
+    }
+  }, 60_000);
 
   it("refuses the record_only probe without measuring anything", async () => {
     const countCommitsAheadOfBase = vi.fn(async () => 0);

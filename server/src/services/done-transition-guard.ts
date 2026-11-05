@@ -16,6 +16,7 @@ import {
 } from "@paperclipai/db";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
+  LEGACY_WORKTREE_GIT_OPTIONS,
   normalizeBaseBranch,
   probeNoRepositoryWorktree,
   runHardenedGit,
@@ -436,11 +437,12 @@ async function resolveGitHubRefHeadSha(
 // safe.directory and global config still apply and an unmeasured probe is no
 // likelier than before, and lose only the GIT_DIR, GIT_WORK_TREE and
 // GIT_INDEX_FILE variables that would redirect which repository they read.
-// fsmonitor and hooks are forced off, a timeout applies, and the process cwd is
-// "/", never the probed workspace. Both callers fail open on an unmeasured
-// result.
+// fsmonitor and hooks are forced off, and the process cwd is "/", never the
+// probed workspace. As before, no timeout applies: a slow status must finish
+// and block, not time out into a fail-open. Both callers fail open on an
+// unmeasured result.
 function runGit(args: string[], cwd: string): Promise<string> {
-  return runHardenedGit(["-C", cwd, ...args], { cwd: "/", inheritEnvironment: true });
+  return runHardenedGit(["-C", cwd, ...args], LEGACY_WORKTREE_GIT_OPTIONS);
 }
 
 /**
@@ -449,7 +451,7 @@ function runGit(args: string[], cwd: string): Promise<string> {
  * unreachable (missing worktree, git failure, unresolvable base ref) so callers
  * can fail open instead of blocking on a signal they could not measure.
  */
-async function countIssueAttributableCommits(
+export async function countIssueAttributableCommits(
   worktreePath: string,
   defaultRef: string,
   identifier: string | null,
@@ -481,7 +483,7 @@ async function countIssueAttributableCommits(
  * missing, git failure) so callers fail open instead of blocking on an
  * unmeasured signal.
  */
-async function worktreeHasUncommittedContent(worktreePath: string): Promise<boolean | null> {
+export async function worktreeHasUncommittedContent(worktreePath: string): Promise<boolean | null> {
   try {
     const out = await runGit(["status", "--porcelain"], worktreePath);
     return out.split(/\r?\n/).some((line) => line.trim().length > 0);

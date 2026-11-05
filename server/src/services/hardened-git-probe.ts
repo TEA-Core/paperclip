@@ -30,7 +30,8 @@ import { PROJECT_REPOSITORIES_DIR } from "@paperclipai/adapter-utils/git-workspa
 //   - is killed after a timeout.
 // The pre-existing fail-open probes opt out of the from-scratch environment
 // (`inheritEnvironment`) so the server's safe.directory and global
-// configuration keep applying; they lose only the three redirecting variables.
+// configuration keep applying; they lose only the three redirecting variables,
+// and, as before, carry no timeout.
 // The record_only no-repository probe additionally never computes a worktree
 // status against the repository's own git dir: it runs against a private
 // snapshot git dir (a copy of the index, the HEAD commit, the shared object
@@ -143,13 +144,17 @@ export interface HardenedGitOptions {
    * environment and git configuration (global and system config, `GIT_CONFIG_*`
    * `safe.directory` entries, PATH), minus the `GIT_DIR`, `GIT_WORK_TREE` and
    * `GIT_INDEX_FILE` variables that redirect which repository is read; forces
-   * fsmonitor and hooks off on the command line; and runs `git` from PATH when
-   * no trusted binary exists. A probe that gates a close must leave this unset.
+   * fsmonitor and hooks off on the command line; runs `git` from PATH when no
+   * trusted binary exists; and applies no timeout unless `timeoutMs` is given. A
+   * probe that gates a close must leave this unset.
    */
   inheritEnvironment?: boolean;
   /** Written to the process's standard input. */
   input?: string;
 }
+
+/** How the pre-existing repository_delivery probes run git (done-transition-guard.ts `runGit`). */
+export const LEGACY_WORKTREE_GIT_OPTIONS: Readonly<HardenedGitOptions> = { cwd: "/", inheritEnvironment: true };
 
 /** Run one Git command under the hardened environment; resolves stdout. */
 export function runHardenedGit(args: readonly string[], options: HardenedGitOptions): Promise<string> {
@@ -168,7 +173,7 @@ export function runHardenedGit(args: readonly string[], options: HardenedGitOpti
       {
         cwd: options.cwd,
         env,
-        timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        timeout: options.timeoutMs ?? (inherit ? 0 : DEFAULT_TIMEOUT_MS),
         killSignal: "SIGKILL",
         maxBuffer: MAX_BUFFER,
         windowsHide: true,

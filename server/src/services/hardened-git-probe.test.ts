@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   HardenedGitError,
+  LEGACY_WORKTREE_GIT_OPTIONS,
   normalizeBaseBranch,
   probeNoRepositoryWorktree,
   resolveTrustedGitBinary,
@@ -157,8 +158,9 @@ describe("hardened git runner (SUP-22880)", () => {
 });
 
 // The pre-existing repository_delivery dirty probe is `git status --porcelain`
-// through this runner in its inherit-environment mode (done-transition-guard.ts runGit).
-const WORKTREE_STATUS_OPTIONS = { cwd: "/", inheritEnvironment: true } as const;
+// through this runner under the options done-transition-guard.ts runGit uses;
+// the guard-level wiring is driven in done-transition-guard-legacy-worktree-probes.test.ts.
+const WORKTREE_STATUS_OPTIONS = LEGACY_WORKTREE_GIT_OPTIONS;
 async function worktreeStatus(repo: string): Promise<string> {
   return runHardenedGit(["-C", repo, "status", "--porcelain"], WORKTREE_STATUS_OPTIONS);
 }
@@ -278,15 +280,6 @@ describe("pre-existing repository_delivery status probe under the hardened runne
         },
       );
     });
-  });
-
-  it("is unmeasured (rejects) rather than clean when git blocks past the timeout", async () => {
-    const repo = plainRepo("repo");
-    const fifo = path.join(root, "blocking-include");
-    execFileSync("mkfifo", [fifo]);
-    git(repo, "config", "include.path", fifo);
-    await expect(runHardenedGit(["-C", repo, "status", "--porcelain"], { ...WORKTREE_STATUS_OPTIONS, timeoutMs: 500 }))
-      .rejects.toMatchObject({ kind: "timeout" } satisfies Partial<HardenedGitError>);
   });
 });
 
