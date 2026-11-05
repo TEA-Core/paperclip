@@ -7,6 +7,9 @@ import {
   issueRelations as issueRelationsTable,
   issues as issuesTable,
   issueWorkProducts as issueWorkProductsTable,
+  documents as documentsTable,
+  executionWorkspaces as executionWorkspacesTable,
+  issueDocuments as issueDocumentsTable,
   labels as labelsTable,
 } from "@paperclipai/db";
 import {
@@ -150,7 +153,7 @@ function filterLabelRowsByName(
  * `select().from().where()` resolves to the `executionWorkspaces` rows exactly
  * as the legacy positional chain did, so pre-existing tests are untouched.
  */
-function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[]; issueWorkProducts?: Record<string, unknown>[] }) {
+function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[]; issueWorkProducts?: Record<string, unknown>[]; issueDocuments?: Record<string, unknown>[]; documents?: Record<string, unknown>[] }) {
   // SUP-15233: the guard reads the issues table twice inside
   // countLadderedChildren: read 1 is the parent_id edge (decomposition
   // children), read 2 is the inArray re-read (blockedBy edge, only present in
@@ -211,6 +214,29 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     where: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
     then: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
   };
+  const linkedDocumentRows = (rows.issueDocuments ?? []).flatMap((link) =>
+    (rows.documents ?? [])
+      .filter(
+        (document) =>
+          document.id === link.documentId &&
+          link.companyId === "company-1" &&
+          link.issueId === "issue-1" &&
+          link.key === "entry-ruling",
+      )
+      .map((document) => ({ latestBody: document.latestBody })),
+  );
+  const issueDocumentsChain = {
+    from: vi.fn().mockReturnThis(),
+    innerJoin: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue(linkedDocumentRows),
+    then: vi.fn().mockResolvedValue(linkedDocumentRows),
+  };
+  const documentsChain = {
+    from: vi.fn().mockReturnThis(),
+    innerJoin: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue(rows.documents ?? []),
+    then: vi.fn().mockResolvedValue(rows.documents ?? []),
+  };
   const selectChain = {
     from: vi.fn().mockReturnThis(),
     where: vi.fn().mockResolvedValue(rows.executionWorkspaces ?? []),
@@ -246,8 +272,11 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
         if (table === issueExecutionDecisionsTable) return decisionsChain;
         if (table === labelsTable) return labelsChain;
         if (table === issueLabelsTable) return issueLabelsChain;
-        if (table === issueWorkProductsTable) return workProductsChain;
-        const chain = chains[callCount] ?? selectChain;
+         if (table === issueWorkProductsTable) return workProductsChain;
+         if (table === issueDocumentsTable) return issueDocumentsChain;
+         if (table === documentsTable) return documentsChain;
+         if (table === executionWorkspacesTable && rows.executionWorkspaces !== undefined) return selectChain;
+         const chain = chains[callCount] ?? selectChain;
         callCount++;
         return chain;
       },
@@ -5344,6 +5373,8 @@ describe("evaluateDoneTierDeclaration", () => {
     id: "issue-1",
     companyId: "company-1",
     identifier: "SUP-12345",
+    deliveryRequirement: "record_only" as const,
+    executionWorkspaceId: "ew-1",
   };
 
   function mockComment(body: string, runId: string | null = null) {
@@ -5426,6 +5457,207 @@ describe("evaluateDoneTierDeclaration", () => {
         reason: "Landing delegated",
         landing: { mode: "landingDelegated", prNumber: 123, carrier: "done-close-landing-backstop" },
       })).toBe("Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #123 via done-close-landing-backstop — Landing delegated. Liveness unverified.");
+    });
+
+    it("renders the no-repository Tier 1 landing state", () => {
+      expect(renderDoneTierDeclaration(null, {
+        tier: "tier1",
+        reason: "The entry ruling is recorded",
+        landing: { mode: "noRepositoryLanding" },
+      })).toBe("Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — The entry ruling is recorded. Liveness unverified.");
+    });
+
+    it("accepts no-repository landing only with an own non-Git workspace and entry ruling", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ strategyType: "adapter_managed", providerType: "cloud_sandbox" })],
+        issueDocuments: [{ companyId: "company-1", issueId: "issue-1", key: "entry-ruling", documentId: "doc-entry-ruling" }],
+        documents: [{ id: "doc-entry-ruling", latestBody: "Recorded ruling" }],
+      });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        renderDoneTierDeclaration(null, {
+          tier: "tier1",
+          reason: "The entry ruling is recorded",
+          landing: { mode: "noRepositoryLanding" },
+        }),
+        null,
+        async () => [],
+      );
+      expect(result.allowed, result.reason).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("accepts no-repository landing for the persisted project-primary local-fs workspace shape", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({ strategyType: "project_primary", providerType: "local_fs" })],
+        issueDocuments: [{ companyId: "company-1", issueId: "issue-1", key: "entry-ruling", documentId: "doc-entry-ruling" }],
+        documents: [{ id: "doc-entry-ruling", latestBody: "Recorded ruling" }],
+      });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        renderDoneTierDeclaration(null, {
+          tier: "tier1",
+          reason: "The entry ruling is recorded",
+          landing: { mode: "noRepositoryLanding" },
+        }),
+        null,
+        async () => [],
+      );
+      expect(result.allowed, result.reason).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("rejects no-repository landing on a repository-delivery issue", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow({})],
+        issueDocuments: [{ companyId: "company-1", issueId: "issue-1", key: "entry-ruling", documentId: "doc-entry-ruling" }],
+        documents: [{ id: "doc-entry-ruling", latestBody: "Recorded ruling" }],
+      });
+      mockGitProbe("0", "0", "");
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        { ...tierIssue, deliveryRequirement: "repository_delivery" },
+        renderDoneTierDeclaration(null, {
+          tier: "tier1",
+          reason: "The entry ruling is recorded",
+          landing: { mode: "noRepositoryLanding" },
+        }),
+        null,
+        async () => [],
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("record_only");
+    });
+
+    it("rejects no-repository landing when the entry ruling is missing", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+      });
+      mockGitProbe("0", "0", "");
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        renderDoneTierDeclaration(null, {
+          tier: "tier1",
+          reason: "The entry ruling is recorded",
+          landing: { mode: "noRepositoryLanding" },
+        }),
+        null,
+        async () => [],
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("non-empty entry-ruling");
+    });
+
+    it("rejects no-repository landing when the entry ruling is empty", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueDocuments: [{ companyId: "company-1", issueId: "issue-1", key: "entry-ruling", documentId: "doc-entry-ruling" }],
+        documents: [{ id: "doc-entry-ruling", latestBody: "  \n" }],
+      });
+      mockGitProbe("0", "0", "");
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        renderDoneTierDeclaration(null, {
+          tier: "tier1",
+          reason: "The entry ruling is recorded",
+          landing: { mode: "noRepositoryLanding" },
+        }),
+        null,
+        async () => [],
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("non-empty entry-ruling");
+    });
+
+    it("rejects a document that is not linked as the issue entry ruling", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        documents: [{ id: "doc-unlinked", latestBody: "Recorded ruling" }],
+      });
+      mockGitProbe("0", "0", "");
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        renderDoneTierDeclaration(null, {
+          tier: "tier1",
+          reason: "The entry ruling is recorded",
+          landing: { mode: "noRepositoryLanding" },
+        }),
+        null,
+        async () => [],
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("non-empty entry-ruling");
+    });
+
+    it("accepts no-repository landing for an own clean Git worktree at its base ref", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueDocuments: [{ companyId: "company-1", issueId: "issue-1", key: "entry-ruling", documentId: "doc-entry-ruling" }],
+        documents: [{ id: "doc-entry-ruling", latestBody: "Recorded ruling" }],
+      });
+      mockGitProbe("0", "0", "");
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        renderDoneTierDeclaration(null, {
+          tier: "tier1",
+          reason: "The entry ruling is recorded",
+          landing: { mode: "noRepositoryLanding" },
+        }),
+        null,
+        async () => [],
+      );
+      expect(result.allowed, result.reason).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("rejects no-repository landing when the own Git worktree is dirty", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueDocuments: [{ companyId: "company-1", issueId: "issue-1", key: "entry-ruling", documentId: "doc-entry-ruling" }],
+        documents: [{ id: "doc-entry-ruling", latestBody: "Recorded ruling" }],
+      });
+      mockGitProbe("0", "0", " M server/src/x.ts");
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        renderDoneTierDeclaration(null, {
+          tier: "tier1",
+          reason: "The entry ruling is recorded",
+          landing: { mode: "noRepositoryLanding" },
+        }),
+        null,
+        async () => [],
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("clean");
+    });
+
+    it("rejects no-repository landing when the own Git worktree is ahead of its base ref", async () => {
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueDocuments: [{ companyId: "company-1", issueId: "issue-1", key: "entry-ruling", documentId: "doc-entry-ruling" }],
+        documents: [{ id: "doc-entry-ruling", latestBody: "Recorded ruling" }],
+      });
+      mockGitProbe("1", "0", "");
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        tierIssue,
+        renderDoneTierDeclaration(null, {
+          tier: "tier1",
+          reason: "The entry ruling is recorded",
+          landing: { mode: "noRepositoryLanding" },
+        }),
+        null,
+        async () => [],
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("zero commits ahead");
     });
 
     it("preserves the body when the existing Tier 2 declaration matches", () => {
@@ -6053,7 +6285,7 @@ describe("evaluateDoneTierDeclaration", () => {
     it("SUP-21474: routes remedy interpolates TIER1_FORM un-cut so both Tier 1 forms keep balanced quotes", () => {
       const route = readFileSync(new URL("../routes/issues.ts", import.meta.url), "utf8");
       expect(route).not.toContain("TIER1_FORM.slice(1, -1)");
-      expect(route).toContain("` or ${TIER1_FORM}`");
+      expect(route).toContain("` or ${TIER1_FORM} or ${TIER1_NO_REPOSITORY_FORM}`");
 
       const tier2Form = '"Closed at Tier 2 (live): probe `<probe command>` head <probe head sha> post-merge: <post-merge predicate>"';
       const remedy = `${tier2Form} or ${TIER1_FORM} — per SUP-12693.`;

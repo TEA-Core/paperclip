@@ -1,6 +1,17 @@
 import { execFile } from "node:child_process";
 import { and, eq, inArray } from "drizzle-orm";
-import { agents, issueExecutionDecisions, issueLabels, issues, issueWorkProducts, labels, type Db } from "@paperclipai/db";
+import {
+  agents,
+  documents,
+  executionWorkspaces,
+  issueDocuments,
+  issueExecutionDecisions,
+  issueLabels,
+  issues,
+  issueWorkProducts,
+  labels,
+  type Db,
+} from "@paperclipai/db";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   resolveGitHubToken,
@@ -96,6 +107,10 @@ export const TIER1_FORM =
   ' or "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
   'landing obligation transferred to done-close-landing-backstop, not yet discharged; ' +
   '<why Tier 2 was not probed>. Liveness unverified."';
+export const TIER1_NO_REPOSITORY_FORM =
+  '"Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — <why Tier 2 was not probed>. Liveness unverified." ' +
+  '(record_only issues with a complete entry-ruling document in an own non-Git workspace or own clean, zero-ahead Git worktree only)';
+export const TIER1_ACCEPTED_FORMS = `${TIER1_FORM} or ${TIER1_NO_REPOSITORY_FORM}`;
 // Structured `doneTier` forms (SUP-21328): the second accepted close form on both
 // agent-writable close doors. The missing-tier remedy names these verbatim so the
 // 422 remedy and the structured parser always agree (SUP-15787 invariant).
@@ -105,8 +120,11 @@ export const DONE_TIER_TIER1_LANDED_JSON =
   '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landedAtTip", "mergeCommit": "<sha>" } }';
 export const DONE_TIER_TIER1_DELEGATED_JSON =
   '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landingDelegated", "prNumber": <N>, "carrier": "done-close-landing-backstop" } }';
+export const DONE_TIER_TIER1_NO_REPOSITORY_LANDING_JSON =
+  '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "noRepositoryLanding" } } (record_only issues with a complete entry-ruling document in an own non-Git workspace or own clean, zero-ahead Git worktree only)';
 export const DONE_TIER_STRUCTURED_FORMS =
-  `${DONE_TIER_TIER2_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
+  `${DONE_TIER_TIER2_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}; ` +
+  `${DONE_TIER_TIER1_NO_REPOSITORY_LANDING_JSON}`;
 
 export function renderDoneTierDeclaration(
   body: string | null | undefined,
@@ -125,7 +143,9 @@ export function renderDoneTierDeclaration(
     ? `${TIER_2_PREFIX} ${declaration.probeEvidence}`
     : `${TIER_1_PREFIX} ${declaration.landing.mode === "landedAtTip"
       ? `landed-at-tip ${declaration.landing.mergeCommit}`
-      : `landing-delegated PR #${declaration.landing.prNumber} via ${declaration.landing.carrier}`} — ${declaration.reason}. ${TIER_1_SUFFIX}`;
+      : declaration.landing.mode === "landingDelegated"
+        ? `landing-delegated PR #${declaration.landing.prNumber} via ${declaration.landing.carrier}`
+        : "no-repository-landing"} — ${declaration.reason}. ${TIER_1_SUFFIX}`;
   if (lines.some((line) => line.trim() === rendered)) {
     return current;
   }
@@ -392,6 +412,19 @@ async function countIssueAttributableCommits(
     const attributableCount = Number.parseInt(attributableRaw.trim(), 10);
     if (Number.isNaN(aheadCount) || Number.isNaN(attributableCount)) return null;
     return { aheadCount, attributableCount };
+  } catch {
+    return null;
+  }
+}
+
+async function countCommitsAhead(
+  worktreePath: string,
+  baseRef: string,
+): Promise<number | null> {
+  try {
+    const raw = await runGit(["rev-list", "--count", `${baseRef}..HEAD`], worktreePath);
+    const count = Number.parseInt(raw.trim(), 10);
+    return Number.isNaN(count) ? null : count;
   } catch {
     return null;
   }
@@ -747,6 +780,8 @@ function parseTier1Declaration(body: string): Tier1Parse {
 // Tier 2 is a separate live-probe concern and is not checked here; see proveTier2Live.
 const LANDED_AT_TIP_TOKEN = "landed-at-tip";
 const LANDING_DELEGATED_TOKEN = "landing-delegated";
+const NO_REPOSITORY_LANDING_TOKEN = "no-repository-landing";
+const RECORD_DELIVERABLE_DOCUMENT_KEY = "entry-ruling";
 const LANDING_BACKSTOP_CARRIER = "done-close-landing-backstop";
 const NAMED_PR_RE = /\bPR #([1-9][0-9]*)\b/;
 const NAMED_MERGE_COMMIT_RE = /\b([0-9a-f]{7,40})\b/i;
@@ -851,6 +886,95 @@ export async function loadOwnDraftPredicate(
       deliveryBranch,
       branchIsOwn,
     );
+}
+
+async function proveNoRepositoryLanding(
+  db: Db,
+  issue: {
+    id: string;
+    companyId: string;
+    executionWorkspaceId?: string | null;
+    deliveryRequirement?: IssueDeliveryRequirement | null;
+  },
+  reason: string,
+  sameRun: boolean,
+): Promise<DoneTierDeclarationResult> {
+  if (issue.deliveryRequirement !== "record_only") {
+    return refuseTier1(
+      'Tier 1 "no-repository-landing" is accepted only on a record_only issue.',
+    );
+  }
+  if (!issue.executionWorkspaceId) {
+    return refuseTier1(
+      'Tier 1 "no-repository-landing" requires an own execution workspace.',
+    );
+  }
+  try {
+    const workspaceRows = await db
+      .select({
+        sourceIssueId: executionWorkspaces.sourceIssueId,
+        strategyType: executionWorkspaces.strategyType,
+        providerType: executionWorkspaces.providerType,
+        cwd: executionWorkspaces.cwd,
+        baseRef: executionWorkspaces.baseRef,
+      })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, issue.executionWorkspaceId));
+    const workspace = workspaceRows[0];
+    if (!workspace || workspace.sourceIssueId !== issue.id) {
+      return refuseTier1(
+        'Tier 1 "no-repository-landing" requires an execution workspace owned by this issue.',
+      );
+    }
+    if (
+      workspace.strategyType === "git_worktree" ||
+      workspace.providerType === "git_worktree"
+    ) {
+      if (
+        typeof workspace.cwd !== "string" ||
+        workspace.cwd.length === 0 ||
+        typeof workspace.baseRef !== "string" ||
+        workspace.baseRef.length === 0
+      ) {
+        return refuseTier1(
+          'Tier 1 "no-repository-landing" requires a Git worktree with a recorded path and base ref.',
+        );
+      }
+      const dirty = await worktreeHasUncommittedContent(workspace.cwd);
+      if (dirty !== false) {
+        return refuseTier1(
+          'Tier 1 "no-repository-landing" requires a clean Git worktree.',
+        );
+      }
+      const aheadCount = await countCommitsAhead(workspace.cwd, workspace.baseRef);
+      if (aheadCount !== 0) {
+        return refuseTier1(
+          'Tier 1 "no-repository-landing" requires a Git worktree with zero commits ahead of its base ref.',
+        );
+      }
+    }
+    const documentRows = await db
+      .select({ latestBody: documents.latestBody })
+      .from(issueDocuments)
+      .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
+      .where(
+        and(
+          eq(issueDocuments.companyId, issue.companyId),
+          eq(issueDocuments.issueId, issue.id),
+          eq(issueDocuments.key, RECORD_DELIVERABLE_DOCUMENT_KEY),
+        ),
+      );
+    if (typeof documentRows[0]?.latestBody !== "string" || documentRows[0].latestBody.trim().length === 0) {
+      return refuseTier1(
+        'Tier 1 "no-repository-landing" requires a non-empty entry-ruling record deliverable.',
+      );
+    }
+  } catch (err) {
+    return refuseTier1(
+      `Tier 1 declaration using "no-repository-landing" could not be verified at the close boundary (${err instanceof Error ? err.message : "unknown"}).`,
+    );
+  }
+  return acceptTier1(reason, sameRun);
 }
 
 async function proveLandingDelegated(
@@ -1446,23 +1570,27 @@ async function proveTier1Landing(
     projectId?: string | null;
     projectWorkspaceId?: string | null;
     executionWorkspaceId?: string | null;
+    deliveryRequirement?: IssueDeliveryRequirement | null;
   },
   reason: string,
   sameRun: boolean,
 ): Promise<DoneTierDeclarationResult> {
   const hasLanded = new RegExp(`\\b${LANDED_AT_TIP_TOKEN}\\b`).test(reason);
   const hasDelegated = new RegExp(`\\b${LANDING_DELEGATED_TOKEN}\\b`).test(reason);
-  if (hasLanded && hasDelegated) {
+  const hasNoRepositoryLanding = new RegExp(`\\b${NO_REPOSITORY_LANDING_TOKEN}\\b`).test(reason);
+  const landingStates = [hasLanded, hasDelegated, hasNoRepositoryLanding].filter(Boolean).length;
+  if (landingStates > 1) {
     return refuseTier1(
       'Tier 1 declaration names both "landed-at-tip" and "landing-delegated"; name exactly one.',
     );
   }
-  if (!hasLanded && !hasDelegated) {
+  if (landingStates === 0) {
     return refuseTier1(
-      'Tier 1 declaration is missing a landing-state token in <reason>; include "landed-at-tip" ' +
-        'or "landing-delegated".',
+      'Tier 1 declaration is missing a landing-state token in <reason>; include "landed-at-tip", "landing-delegated", ' +
+        'or "no-repository-landing".',
     );
   }
+  if (hasNoRepositoryLanding) return proveNoRepositoryLanding(db, issue, reason, sameRun);
   if (hasDelegated) return proveLandingDelegated(db, issue, reason, sameRun);
   return proveLandedAtTip(db, issue, reason, sameRun);
 }
@@ -1495,14 +1623,14 @@ function describeTierRejection(tier2: Tier2Parse, tier1: Tier1Parse): string | n
       "A Tier 1 declaration was found but it does not begin its own line — the guard " +
       "requires the literal to start the line (no bullet, bold, quote, or leading text). " +
       `Offending line: "${tier1.offendingLine.slice(0, 200)}". ` +
-      `Accepted form: ${TIER1_FORM} — per SUP-12693.`
+      `Accepted form: ${TIER1_ACCEPTED_FORMS} — per SUP-12693.`
     );
   }
   if (tier1.kind === "missing_suffix") {
     return (
       "A Tier 1 declaration was found but it is missing the required " +
       `"${TIER_1_SUFFIX}" suffix on the prefix line. ` +
-      `Accepted form: ${TIER1_FORM} — per SUP-12693.`
+      `Accepted form: ${TIER1_ACCEPTED_FORMS} — per SUP-12693.`
     );
   }
   return null;
@@ -1517,6 +1645,7 @@ export async function evaluateDoneTierDeclaration(
     projectId?: string | null;
     projectWorkspaceId?: string | null;
     executionWorkspaceId?: string | null;
+    deliveryRequirement?: IssueDeliveryRequirement | null;
   },
   accompanyingComment: string | null,
   runId: string | null,
@@ -1543,7 +1672,7 @@ export async function evaluateDoneTierDeclaration(
       if (tier1.reason.length === 0) {
         return {
           allowed: false,
-          reason: `Tier 1 declaration found but <reason> is empty. Use: ${TIER1_FORM}`,
+          reason: `Tier 1 declaration found but <reason> is empty. Use: ${TIER1_ACCEPTED_FORMS}`,
           tier: null,
           skipped: false,
           skipReason: null,
@@ -1558,7 +1687,7 @@ export async function evaluateDoneTierDeclaration(
         ("Close comment is missing a done-tier declaration. Accepted forms: " +
           `${TIER2_FORM}` +
           ` or ` +
-          `${TIER1_FORM}` +
+          `${TIER1_ACCEPTED_FORMS}` +
           ` — per SUP-12693.`),
       tier: null,
       skipped: false,
@@ -1578,7 +1707,7 @@ export async function evaluateDoneTierDeclaration(
       reason:
         "No accompanying comment and no run id to look up a same-run comment; no done-tier declaration found. " +
         `Accepted forms: ${TIER2_FORM}` +
-        ` or ${TIER1_FORM}` +
+        ` or ${TIER1_ACCEPTED_FORMS}` +
         ` — per SUP-12693.`,
       tier: null,
       skipped: false,
@@ -1608,7 +1737,7 @@ export async function evaluateDoneTierDeclaration(
       reason:
         "No done-tier declaration found in the accompanying comment or the most recent same-run comment. " +
         `Accepted forms: ${TIER2_FORM}` +
-        ` or ${TIER1_FORM}` +
+        ` or ${TIER1_ACCEPTED_FORMS}` +
         ` — per SUP-12693.`,
       tier: null,
       skipped: false,
@@ -1631,7 +1760,7 @@ export async function evaluateDoneTierDeclaration(
         allowed: false,
         reason:
           "Tier 1 declaration found in same-run comment but <reason> is empty. " +
-          `Use: ${TIER1_FORM}`,
+          `Use: ${TIER1_ACCEPTED_FORMS}`,
         tier: null,
         skipped: false,
         skipReason: null,
