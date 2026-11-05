@@ -829,6 +829,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             description: input.description,
             status: input.status,
             priority: input.priority,
+            deliveryRequirement: input.deliveryRequirement,
             assigneeAgentId: input.assigneeAgentId,
             assigneeUserId: input.assigneeUserId,
             requestDepth: input.requestDepth,
