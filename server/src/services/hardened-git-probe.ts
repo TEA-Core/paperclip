@@ -495,10 +495,10 @@ async function verifyCleanLinkedWorktree(
       { identity, headSha, config: snapshotConfig(identity.objectFormat), exclude },
       async (snapshot) => {
         for (const entry of await listIndexEntries(snapshot, worktreePath, worktreeOptions)) {
+          if (entry.stage !== "0") return "has unmerged index entries";
           if (entry.tag === "S") return "has skip-worktree index entries";
           if (entry.tag !== "H") return "has assume-unchanged index entries";
           if (entry.mode === "160000") return "has submodules";
-          if (entry.stage !== "0") return "has unmerged index entries";
         }
         if (await snapshotStatusIsDirty(snapshot, worktreePath, "all", worktreeOptions)) {
           return "has uncommitted changes (modified, staged or untracked)";

@@ -471,6 +471,48 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
     });
   });
 
+  it("refuses a worktree in the middle of a conflicted merge as unmerged, not as assume-unchanged", async () => {
+    const layout = managedLayout();
+    git(layout.worktree, "checkout", "-q", "-b", "other");
+    writeFileSync(path.join(layout.worktree, "a.txt"), "other\n");
+    git(layout.worktree, "add", "a.txt");
+    git(layout.worktree, "commit", "-qm", "other");
+    git(layout.worktree, "checkout", "-q", "SUP-7-record-ruling");
+    writeFileSync(path.join(layout.worktree, "a.txt"), "mine\n");
+    git(layout.worktree, "add", "a.txt");
+    git(layout.worktree, "commit", "-qm", "mine");
+    expect(() => git(layout.worktree, "merge", "other")).toThrow();
+    expect(git(layout.worktree, "ls-files", "--unmerged")).not.toBe("");
+    expect(await probeNoRepositoryWorktree(layout.input)).toEqual({
+      ok: false,
+      reason: "the recorded worktree has unmerged index entries",
+    });
+  });
+
+  it("refuses unmerged index entries in another worktree naming the issue", async () => {
+    const layout = managedLayout();
+    // Unmerged entries without a divergent commit, so the branch stays level with
+    // the base and the worktree scan, not the tip comparison, is what refuses.
+    const blob = (content: string) => {
+      const file = path.join(root, "blob.txt");
+      writeFileSync(file, content);
+      return git(layout.worktree, "hash-object", "-w", file);
+    };
+    git(layout.worktree, "update-index", "--force-remove", "a.txt");
+    execFileSync("git", ["-C", layout.worktree, "update-index", "--index-info"], {
+      env: fixtureEnv,
+      input: [["1", "base"], ["2", "mine"], ["3", "other"]]
+        .map(([stage, content]) => `100644 ${blob(`${content}\n`)} ${stage}\ta.txt\n`)
+        .join(""),
+    });
+    expect(git(layout.worktree, "ls-files", "--unmerged")).not.toBe("");
+    const fabricated = layout.addWorktree("SUP-7-fresh");
+    expect(await probeNoRepositoryWorktree({ ...layout.input, recordedWorktreePath: fabricated })).toEqual({
+      ok: false,
+      reason: "another worktree on branch SUP-7-record-ruling has unmerged index entries",
+    });
+  });
+
   it.each([
     ["a modified file", (worktree: string) => writeFileSync(path.join(worktree, "a.txt"), "undelivered\n")],
     ["a staged file", (worktree: string) => {
