@@ -975,6 +975,34 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     }
   });
 
+  it("PATCH: record_only accepts a structured no-repository Tier 1 close", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23001A", { deliveryRequirement: "record_only" });
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: "Recorded the decision; no repository deliverable exists.",
+        doneTier: {
+          tier: "tier1",
+          reason: "The recorded decision is the complete deliverable",
+          landing: { mode: "noRepositoryLanding" },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(issueId)).toBe("done");
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments.map((entry) => entry.body)).toContain(
+      "Recorded the decision; no repository deliverable exists.\n\nClosed at Tier 1 (landed, not liveness-probed): no-repository-landing — The recorded decision is the complete deliverable. Liveness unverified.",
+    );
+  });
+
   it("POST comment: auto-approval still closes the card when the branch has landed", async () => {
     const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D13185F");
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));

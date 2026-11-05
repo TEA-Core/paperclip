@@ -95,7 +95,9 @@ export const TIER1_FORM =
   '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."' +
   ' or "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
   'landing obligation transferred to done-close-landing-backstop, not yet discharged; ' +
-  '<why Tier 2 was not probed>. Liveness unverified."';
+  '<why Tier 2 was not probed>. Liveness unverified."' +
+  ' or "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — ' +
+  '<why Tier 2 was not probed>; accepted on record_only issues only. Liveness unverified."';
 // Structured `doneTier` forms (SUP-21328): the second accepted close form on both
 // agent-writable close doors. The missing-tier remedy names these verbatim so the
 // 422 remedy and the structured parser always agree (SUP-15787 invariant).
@@ -105,8 +107,10 @@ export const DONE_TIER_TIER1_LANDED_JSON =
   '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landedAtTip", "mergeCommit": "<sha>" } }';
 export const DONE_TIER_TIER1_DELEGATED_JSON =
   '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landingDelegated", "prNumber": <N>, "carrier": "done-close-landing-backstop" } }';
+export const DONE_TIER_TIER1_NO_REPOSITORY_LANDING_JSON =
+  '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "noRepositoryLanding" } } (record_only issues only)';
 export const DONE_TIER_STRUCTURED_FORMS =
-  `${DONE_TIER_TIER2_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
+  `${DONE_TIER_TIER2_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}; ${DONE_TIER_TIER1_NO_REPOSITORY_LANDING_JSON}`;
 
 export function renderDoneTierDeclaration(
   body: string | null | undefined,
@@ -125,7 +129,9 @@ export function renderDoneTierDeclaration(
     ? `${TIER_2_PREFIX} ${declaration.probeEvidence}`
     : `${TIER_1_PREFIX} ${declaration.landing.mode === "landedAtTip"
       ? `landed-at-tip ${declaration.landing.mergeCommit}`
-      : `landing-delegated PR #${declaration.landing.prNumber} via ${declaration.landing.carrier}`} — ${declaration.reason}. ${TIER_1_SUFFIX}`;
+      : declaration.landing.mode === "landingDelegated"
+        ? `landing-delegated PR #${declaration.landing.prNumber} via ${declaration.landing.carrier}`
+        : "no-repository-landing"} — ${declaration.reason}. ${TIER_1_SUFFIX}`;
   if (lines.some((line) => line.trim() === rendered)) {
     return current;
   }
@@ -747,6 +753,7 @@ function parseTier1Declaration(body: string): Tier1Parse {
 // Tier 2 is a separate live-probe concern and is not checked here; see proveTier2Live.
 const LANDED_AT_TIP_TOKEN = "landed-at-tip";
 const LANDING_DELEGATED_TOKEN = "landing-delegated";
+const NO_REPOSITORY_LANDING_TOKEN = "no-repository-landing";
 const LANDING_BACKSTOP_CARRIER = "done-close-landing-backstop";
 const NAMED_PR_RE = /\bPR #([1-9][0-9]*)\b/;
 const NAMED_MERGE_COMMIT_RE = /\b([0-9a-f]{7,40})\b/i;
@@ -1446,22 +1453,33 @@ async function proveTier1Landing(
     projectId?: string | null;
     projectWorkspaceId?: string | null;
     executionWorkspaceId?: string | null;
+    deliveryRequirement?: IssueDeliveryRequirement | null;
   },
   reason: string,
   sameRun: boolean,
 ): Promise<DoneTierDeclarationResult> {
   const hasLanded = new RegExp(`\\b${LANDED_AT_TIP_TOKEN}\\b`).test(reason);
   const hasDelegated = new RegExp(`\\b${LANDING_DELEGATED_TOKEN}\\b`).test(reason);
-  if (hasLanded && hasDelegated) {
+  const hasNoRepositoryLanding = new RegExp(`\\b${NO_REPOSITORY_LANDING_TOKEN}\\b`).test(reason);
+  const landingTokenCount = [hasLanded, hasDelegated, hasNoRepositoryLanding].filter(Boolean).length;
+  if (landingTokenCount > 1) {
     return refuseTier1(
-      'Tier 1 declaration names both "landed-at-tip" and "landing-delegated"; name exactly one.',
+      'Tier 1 declaration names more than one landing-state token; name exactly one of "landed-at-tip", "landing-delegated", or "no-repository-landing".',
     );
   }
-  if (!hasLanded && !hasDelegated) {
+  if (landingTokenCount === 0) {
     return refuseTier1(
-      'Tier 1 declaration is missing a landing-state token in <reason>; include "landed-at-tip" ' +
-        'or "landing-delegated".',
+      'Tier 1 declaration is missing a landing-state token in <reason>; include "landed-at-tip", ' +
+        '"landing-delegated", or "no-repository-landing" (record_only issues only).',
     );
+  }
+  if (hasNoRepositoryLanding) {
+    if (issue.deliveryRequirement !== "record_only") {
+      return refuseTier1(
+        'Tier 1 "no-repository-landing" is accepted only on a record_only issue; a repository_delivery issue must name "landed-at-tip" or "landing-delegated".',
+      );
+    }
+    return acceptTier1(reason, sameRun);
   }
   if (hasDelegated) return proveLandingDelegated(db, issue, reason, sameRun);
   return proveLandedAtTip(db, issue, reason, sameRun);
@@ -1517,6 +1535,7 @@ export async function evaluateDoneTierDeclaration(
     projectId?: string | null;
     projectWorkspaceId?: string | null;
     executionWorkspaceId?: string | null;
+    deliveryRequirement?: IssueDeliveryRequirement | null;
   },
   accompanyingComment: string | null,
   runId: string | null,
