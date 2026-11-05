@@ -98,10 +98,13 @@ function makeDb(
     })),
     update: vi.fn(() => ({
       set: (setArg: unknown) => ({
-        where: async (whereArg: unknown) => {
+        where: (whereArg: unknown) => {
           updateWhereArgs.push(whereArg);
           updateSetArgs.push(setArg);
-          return [];
+          // Awaitable directly (`update().set().where()`) and `.returning()`-able
+          // (`releaseSummarySlotBinding` chains `.returning()`); both resolve to
+          // zero affected rows.
+          return Object.assign(Promise.resolve([]), { returning: async () => [] });
         },
       }),
     })),
@@ -168,6 +171,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 2,
       claimed: 2,
       inFlight: 0,
+      released: 0,
       failed: 0,
     });
 
@@ -203,6 +207,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 0,
       claimed: 0,
       inFlight: 0,
+      released: 0,
       failed: 0,
     });
     // Discovery never runs when the feature flag is off.
@@ -222,6 +227,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 1,
       claimed: 0,
       inFlight: 1,
+      released: 0,
       failed: 0,
     });
     expect(mockGenerate).toHaveBeenCalledTimes(1);
@@ -259,6 +265,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 1,
       claimed: 0,
       inFlight: 0,
+      released: 0,
       failed: 1,
     });
     await expect(service.sweep()).resolves.toEqual({
@@ -267,6 +274,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 1,
       claimed: 0,
       inFlight: 1,
+      released: 0,
       failed: 0,
     });
     // `generate` ran on both due sweeps but never minted a second issue; the
@@ -288,6 +296,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 1,
       claimed: 0,
       inFlight: 0,
+      released: 0,
       failed: 1,
     });
   });
@@ -313,6 +322,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 1,
       claimed: 1,
       inFlight: 0,
+      released: 0,
       failed: 0,
     });
     // The stale `generating` link was cleared so `generate` re-mints the slot.
@@ -355,6 +365,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 1,
       claimed: 1,
       inFlight: 0,
+      released: 0,
       failed: 0,
     });
     expect(db.update).toHaveBeenCalledTimes(1);
@@ -391,14 +402,17 @@ describe("createSummarySlotRefreshSweepService", () => {
         wroteSurvivingRevision: true,
       },
     ];
-    // The issue is live and recent (not wedged), so the claim stays in place —
-    // but the re-wake is skipped: re-running a generation whose deliverable
+    // The issue is live (a run is bound) and recent (not wedged), so the claim
+    // stays in place and the SUP-23039 completion release does NOT fire — but
+    // the re-wake is skipped: re-running a generation whose deliverable
     // already landed just burns summarizer runs (observed live: three wakes
     // for one written revision while the served header froze).
     mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: true }));
     const { db, service } = makeService(rows, {
       wakeup: vi.fn(),
-      issueRows: [{ status: "in_progress", updatedAt: new Date("2026-09-09T23:30:00Z") }],
+      issueRows: [
+        { status: "in_progress", executionRunId: "run-live", updatedAt: new Date("2026-09-09T23:30:00Z") },
+      ],
       recoveryRows: [],
       wedgedMs: 6 * 60 * 60 * 1000,
     });
@@ -409,6 +423,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 1,
       claimed: 0,
       inFlight: 1,
+      released: 0,
       failed: 0,
     });
     // Not wedged: no clear, no audit entry.
@@ -417,6 +432,135 @@ describe("createSummarySlotRefreshSweepService", () => {
     // The re-fire wake is the defect: it must NOT be delivered once the
     // generation already wrote the surviving revision.
     expect(mockQueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("releases a completed generation's binding to idle without re-minting when its run is dead (SUP-23039)", async () => {
+    const rows = [
+      {
+        ...SCOPES[0],
+        status: "generating",
+        generatingIssueId: "issue-written",
+        updatedAt: new Date("2026-09-09T23:00:00Z"),
+        // Discovery projected the identity check: this generation wrote the
+        // slot's surviving revision.
+        wroteSurvivingRevision: true,
+      },
+    ];
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      // The run terminated (a record_only generation card parks un-closable):
+      // non-terminal issue, no live run, no recovery action. The generation is
+      // complete — release, don't classify as wedged and re-mint.
+      issueRows: [
+        { status: "in_review", executionRunId: null, checkoutRunId: null, updatedAt: new Date("2026-09-09T23:30:00Z") },
+      ],
+      recoveryRows: [],
+      wedgedMs: 6 * 60 * 60 * 1000,
+    });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 0,
+      inFlight: 0,
+      released: 1,
+      failed: 0,
+    });
+    // Exactly one write: the compare-and-set binding release. No wedged clear,
+    // no fresh mint, no wake, no audit entry.
+    expect(db.update).toHaveBeenCalledTimes(1);
+    expect(mockGenerate).not.toHaveBeenCalled();
+    expect(mockQueueWakeup).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    // The release is the shared identity-decided one: its WHERE pins the
+    // still-armed slot to this exact generation issue (and its SET decides
+    // idle/failed from the same identity predicate the finalizer uses).
+    const { sql, params } = new PgDialect().sqlToQuery(db.updateWhereArgs[0] as never);
+    expect(sql).toContain("generating_issue_id");
+    expect(params).toContain("issue-written");
+    expect(params).toContain("generating");
+    expect(db.updateSetArgs[0]).toMatchObject({ generatingIssueId: null });
+    // The status is the shared identity-decided CASE, not a blind `idle` write.
+    const setSql = new PgDialect().sqlToQuery(
+      (db.updateSetArgs[0] as { status: never }).status,
+    );
+    expect(setSql.sql.toUpperCase()).toContain("CASE WHEN");
+    expect(setSql.sql).toContain("'idle'");
+    expect(setSql.sql).toContain("'failed'");
+  });
+
+  it("does not release a written generation whose run is still live (it may still be finishing)", async () => {
+    const rows = [
+      {
+        ...SCOPES[0],
+        status: "generating",
+        generatingIssueId: "issue-written",
+        updatedAt: new Date("2026-09-09T23:00:00Z"),
+        wroteSurvivingRevision: true,
+      },
+    ];
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: true }));
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      issueRows: [
+        { status: "in_progress", executionRunId: "run-live", updatedAt: new Date("2026-09-09T23:30:00Z") },
+      ],
+      recoveryRows: [],
+      wedgedMs: 6 * 60 * 60 * 1000,
+    });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 0,
+      inFlight: 1,
+      released: 0,
+      failed: 0,
+    });
+    expect(db.update).not.toHaveBeenCalled();
+    expect(mockGenerate).toHaveBeenCalledTimes(1);
+    expect(mockQueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not release a written generation while a recovery action owns it; wedged classification proceeds", async () => {
+    const rows = [
+      {
+        ...SCOPES[0],
+        status: "generating",
+        generatingIssueId: "issue-written",
+        updatedAt: new Date("2026-09-09T23:00:00Z"),
+        wroteSurvivingRevision: true,
+      },
+    ];
+    mockGenerate.mockResolvedValue(generateResponse({ alreadyGenerating: false, generatingIssueId: "issue-fresh" }));
+    const { db, service } = makeService(rows, {
+      wakeup: vi.fn(),
+      issueRows: [
+        { status: "blocked", executionRunId: null, checkoutRunId: null, updatedAt: new Date("2026-09-09T23:00:00Z") },
+      ],
+      recoveryRows: [{ id: "ra-1", status: "active", sourceIssueId: "issue-written" }],
+      wedgedMs: 6 * 60 * 60 * 1000,
+    });
+
+    await expect(service.sweep()).resolves.toEqual({
+      due: true,
+      summariesEnabled: true,
+      candidates: 1,
+      claimed: 1,
+      inFlight: 0,
+      released: 0,
+      failed: 0,
+    });
+    // The recovery guard held the release, so the parked written generation is
+    // classified wedged and re-claimed (pre-SUP-23039 behavior for held
+    // claims): the wedged clear ran and a fresh generation was minted.
+    expect(db.update).toHaveBeenCalledTimes(1);
+    expect(mockGenerate).toHaveBeenCalledTimes(1);
+    expect(mockQueueWakeup).toHaveBeenCalledWith(
+      expect.objectContaining({ issue: expect.objectContaining({ id: "issue-fresh" }) }),
+    );
   });
 
   it("leaves a `generating` slot in-flight when its linked `in_review` issue was recently updated, even though the slot row is old (AC-5, no thrash)", async () => {
@@ -440,6 +584,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 1,
       claimed: 0,
       inFlight: 1,
+      released: 0,
       failed: 0,
     });
     // Not wedged: no stale-link clear and no re-claim audit entry.
@@ -469,6 +614,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 1,
       claimed: 1,
       inFlight: 0,
+      released: 0,
       failed: 0,
     });
     expect(db.update).toHaveBeenCalledTimes(1);
@@ -504,6 +650,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 1,
       claimed: 1,
       inFlight: 0,
+      released: 0,
       failed: 0,
     });
     expect(db.update).toHaveBeenCalledTimes(1);
@@ -577,6 +724,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 1,
       claimed: 0,
       inFlight: 1,
+      released: 0,
       failed: 0,
     });
     // No recovery write at all: the progress-guarded clear aborted before writing,
@@ -615,6 +763,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 1,
       claimed: 0,
       inFlight: 0,
+      released: 0,
       failed: 1,
     });
     // Two recovery writes: (1) the wedged clear to `idle`, (2) the candidacy restore.
@@ -663,6 +812,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 1,
       claimed: 1,
       inFlight: 0,
+      released: 0,
       failed: 0,
     });
     // Only the wedged clear write; no candidacy restore.
@@ -681,6 +831,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 1,
       claimed: 1,
       inFlight: 0,
+      released: 0,
       failed: 0,
     });
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
@@ -714,6 +865,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 1,
       claimed: 0,
       inFlight: 0,
+      released: 0,
       failed: 1,
     });
     expect(mockQueueWakeup).not.toHaveBeenCalled();
@@ -733,6 +885,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 1,
       claimed: 0,
       inFlight: 0,
+      released: 0,
       failed: 1,
     });
     // The wake must be asked to rethrow so a reject is surfaced, mirroring the
@@ -754,6 +907,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 1,
       claimed: 1,
       inFlight: 0,
+      released: 0,
       failed: 0,
     });
     expect(mockQueueWakeup).not.toHaveBeenCalled();
@@ -768,6 +922,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 0,
       claimed: 0,
       inFlight: 0,
+      released: 0,
       failed: 0,
     });
     expect(db.select).toHaveBeenCalledTimes(1);
@@ -795,6 +950,7 @@ describe("createSummarySlotRefreshSweepService", () => {
       candidates: 0,
       claimed: 0,
       inFlight: 0,
+      released: 0,
       failed: 0,
     });
     expect(db.select.mock.calls.length).toBe(selectsAfterFirst);
