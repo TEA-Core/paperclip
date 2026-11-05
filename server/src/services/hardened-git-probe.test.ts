@@ -601,6 +601,64 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
     });
   });
 
+  describe("bounds the comparisons made while the close holds the issue row", () => {
+    // `count` more commits land on the remote default branch; the managed
+    // checkout fetches them and gets one branch naming the issue at each, so
+    // every tip is a distinct historical commit level with the base.
+    function issueBranchesAtHistoricalCommits(layout: ManagedLayout, count: number) {
+      const shas: string[] = [];
+      for (let index = 1; index <= count; index += 1) {
+        writeFileSync(path.join(layout.seed, `history-${index}.txt`), `${index}\n`);
+        git(layout.seed, "add", `history-${index}.txt`);
+        git(layout.seed, "commit", "-qm", `history ${index}`);
+        shas.push(git(layout.seed, "rev-parse", "HEAD"));
+      }
+      git(layout.seed, "push", "-q", layout.origin, "main");
+      git(layout.repoRoot, "fetch", "-q", "origin");
+      shas.forEach((sha, index) => git(layout.repoRoot, "branch", `SUP-7-tip-${index + 1}`, sha));
+    }
+
+    function countingInput(layout: ManagedLayout) {
+      const compared: string[] = [];
+      const countOnRemote = countOnOrigin(layout.origin);
+      return {
+        compared,
+        input: {
+          ...layout.input,
+          countCommitsAheadOfBase: async (sha: string) => {
+            compared.push(sha);
+            return countOnRemote(sha);
+          },
+        },
+      };
+    }
+
+    it("refuses with too_many_branch_tips when a sixth distinct tip would need comparing, after at most five comparisons", async () => {
+      const layout = managedLayout();
+      issueBranchesAtHistoricalCommits(layout, 5);
+      const { compared, input } = countingInput(layout);
+
+      const result = await probeNoRepositoryWorktree(input);
+
+      expect(result).toMatchObject({ ok: false });
+      expect((result as { reason: string }).reason).toMatch(/^too_many_branch_tips: /);
+      expect(compared).toHaveLength(5);
+      expect(new Set(compared).size).toBe(5);
+    });
+
+    it("still accepts five distinct tips: the recorded worktree's and four branches'", async () => {
+      const layout = managedLayout();
+      issueBranchesAtHistoricalCommits(layout, 4);
+      const { compared, input } = countingInput(layout);
+
+      const result = await probeNoRepositoryWorktree(input);
+
+      expect(result).toMatchObject({ ok: true });
+      expect(compared).toHaveLength(5);
+      expect(new Set(compared).size).toBe(5);
+    });
+  });
+
   it("refuses when another worktree naming the issue holds uncommitted work", async () => {
     const layout = managedLayout();
     writeFileSync(path.join(layout.worktree, "a.txt"), "undelivered\n");
@@ -644,6 +702,26 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
       expect(result).toMatchObject({ ok: false });
       expect((result as { reason: string }).reason).toMatch(UNMEASURED);
     });
+
+    it("applies the 15 second default when no timeoutMs is passed, and refuses when it fires", async () => {
+      const layout = managedLayout();
+      const fifo = path.join(root, "blocking-include");
+      execFileSync("mkfifo", [fifo]);
+      git(layout.worktree, "config", "include.path", fifo);
+      const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+      await pause(100);
+      const started = performance.now();
+      let settled = false;
+      const pending = probeNoRepositoryWorktree(layout.input).finally(() => {
+        settled = true;
+      });
+      await pause(12_000);
+      expect(settled, "settled before the 15 second default").toBe(false);
+      const outcome = await Promise.race([pending, pause(40_000).then(() => "never settled" as const)]);
+      expect(outcome).not.toBe("never settled");
+      expect(performance.now() - started).toBeGreaterThanOrEqual(14_500);
+      expect(outcome).toMatchObject({ ok: false });
+    }, 70_000);
 
     it("refuses when the snapshot directory cannot be created", async () => {
       const layout = managedLayout();

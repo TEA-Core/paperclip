@@ -45,6 +45,7 @@ import { PROJECT_REPOSITORIES_DIR } from "@paperclipai/adapter-utils/git-workspa
 const TRUSTED_GIT_BINARY_PATHS = ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"] as const;
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_BUFFER = 16 * 1024 * 1024;
+const MAX_COMPARED_TIPS = 5;
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 // The two overrides that stop repository-local configuration from running a
@@ -607,6 +608,11 @@ export async function probeNoRepositoryWorktree(
       const sha = line.slice(0, space);
       const name = line.slice(space + 1).slice("refs/heads/".length);
       if (!SHA_RE.test(sha) || !branchNamesIssue(name, input.issueIdentifier) || checkedTips.has(sha)) continue;
+      if (checkedTips.size >= MAX_COMPARED_TIPS) {
+        return refuse(
+          `too_many_branch_tips: the recorded worktree and the branches naming this issue have more than ${MAX_COMPARED_TIPS} distinct tips to compare with the default branch`,
+        );
+      }
       checkedTips.add(sha);
       const refusal = await aheadOfBaseRefusal(`branch ${name}`, sha, input.countCommitsAheadOfBase);
       if (refusal) return refuse(refusal);

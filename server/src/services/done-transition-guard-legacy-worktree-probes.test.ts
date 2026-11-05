@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -182,4 +182,34 @@ describe("countIssueAttributableCommits (repository_delivery ahead-of-base signa
       },
     );
   });
+});
+
+describe("legacy probes carry no timeout (recorded owner decision)", () => {
+  // The repository's own configuration names an include that blocks until
+  // something writes the FIFO, so git cannot finish until the test releases it,
+  // 18 seconds in: past the 15 seconds every close-gating probe gets. A legacy
+  // probe with a timeout would have been killed and returned null into its
+  // fail-open branch.
+  it("a worktree status and an ahead-of-base count that outlast the close-gating default still complete and report", async () => {
+    const repo = plainRepo("repo");
+    git(repo, "branch", "base");
+    writeFileSync(path.join(repo, "b.txt"), "one\n");
+    git(repo, "add", "b.txt");
+    git(repo, "commit", "-qm", "fix(SUP-9): attributable");
+    writeFileSync(path.join(repo, "a.txt"), "undelivered\n");
+    const fifo = path.join(root, "blocking-include");
+    execFileSync("mkfifo", [fifo]);
+    git(repo, "config", "include.path", fifo);
+    const releaser = spawn("sh", ["-c", `sleep 18; while :; do : > '${fifo}'; done`], { stdio: "ignore" });
+    try {
+      const [dirty, counts] = await Promise.all([
+        worktreeHasUncommittedContent(repo),
+        countIssueAttributableCommits(repo, "base", "SUP-9"),
+      ]);
+      expect(dirty).toBe(true);
+      expect(counts).toEqual({ aheadCount: 1, attributableCount: 1 });
+    } finally {
+      releaser.kill();
+    }
+  }, 70_000);
 });
