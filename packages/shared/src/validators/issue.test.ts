@@ -158,16 +158,6 @@ describe("issue validators", () => {
     expect(doneTierDeclarationSchema.safeParse(JSON.parse(raw)).success).toBe(false);
   });
 
-  it.each([
-    ["__proto__ inside landing", '{"tier":"tier1","reason":"r","landing":{"mode":"noRepositoryLanding","__proto__":{"x":1}}}'],
-    ["__proto__ at the top level", '{"tier":"tier1","reason":"r","__proto__":{"x":1},"landing":{"mode":"landedAtTip","mergeCommit":"3f9c1e0a25b8"}}'],
-    ["__proto__ on a Tier 2 declaration", '{"tier":"tier2","probeEvidence":"probe `x` head 3f9c1e0a25b8 post-merge: y","__proto__":{}}'],
-  ])("rejects a doneTier JSON body with %s (zod's strict mode would strip it silently)", (_label, raw) => {
-    const parsed = JSON.parse(raw);
-    expect(doneTierDeclarationSchema.safeParse(parsed).success).toBe(false);
-    expect(updateIssueSchema.safeParse({ status: "done", doneTier: parsed }).success).toBe(false);
-  });
-
   it("accepts delivery requirements on create and update while rejecting unknown values", () => {
     expect(createIssueSchema.parse({ title: "Default delivery" }).deliveryRequirement).toBeUndefined();
     expect(

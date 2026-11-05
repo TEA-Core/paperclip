@@ -508,7 +508,37 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       );
 
     expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(JSON.stringify(res.body)).toContain("doneTier must not carry a __proto__ key");
     expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  const PROTO_TIER2_DONE_TIER =
+    '{"tier":"tier2","probeEvidence":"probe `x` head 3f9c1e0a25b8 post-merge: y","__proto__":{"polluted":true}}';
+
+  it("rejects a doneTier carrying an own __proto__ key on the comment door, persisting no comment", async () => {
+    const fixture = await seed();
+
+    const res = await request(app)
+      .post(`/api/issues/${fixture.identifier}/comments`)
+      .set("content-type", "application/json")
+      .send(`{"body":"closing note","doneTier":${PROTO_TIER2_DONE_TIER}}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(JSON.stringify(res.body)).toContain("doneTier must not carry a __proto__ key");
+    const comments = await db.select({ id: issueComments.id }).from(issueComments).where(eq(issueComments.issueId, fixture.issueId));
+    expect(comments).toHaveLength(0);
+  });
+
+  it("rejects a doneTier carrying an own __proto__ key on the recovery-action resolution door", async () => {
+    const fixture = await seed();
+
+    const res = await request(app)
+      .post(`/api/issues/${fixture.issueId}/recovery-actions/resolve`)
+      .set("content-type", "application/json")
+      .send(`{"outcome":"restored","sourceIssueStatus":"in_progress","doneTier":${PROTO_TIER2_DONE_TIER}}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(JSON.stringify(res.body)).toContain("doneTier must not carry a __proto__ key");
   });
 
   it.each([

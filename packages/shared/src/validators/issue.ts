@@ -1076,52 +1076,25 @@ const doneTierNoRepositoryLandingSchema = z
   })
   .strict();
 
-/**
- * True when `value` carries an own `__proto__` key at any depth. `JSON.parse`
- * creates `__proto__` as an ordinary own key, and zod's `.strict()` strips it
- * silently instead of rejecting it. Iterative, so an absurdly nested body
- * cannot exhaust the stack.
- */
-export function hasOwnProtoKey(value: unknown): boolean {
-  const pending: unknown[] = [value];
-  while (pending.length > 0) {
-    const current = pending.pop();
-    if (current === null || typeof current !== "object") continue;
-    for (const key of Reflect.ownKeys(current)) {
-      if (key === "__proto__") return true;
-      const descriptor = Reflect.getOwnPropertyDescriptor(current, key);
-      if (descriptor && "value" in descriptor) pending.push(descriptor.value);
-    }
-  }
-  return false;
-}
-
-export const doneTierDeclarationSchema = z
-  .unknown()
-  .refine((value) => !hasOwnProtoKey(value), {
-    message: "doneTier must not carry a __proto__ key",
-  })
-  .pipe(
-    z.discriminatedUnion("tier", [
-      z
-        .object({
-          tier: z.literal("tier2"),
-          probeEvidence: doneTierTextSchema,
-        })
-        .strict(),
-      z
-        .object({
-          tier: z.literal("tier1"),
-          reason: doneTierTextSchema,
-          landing: z.discriminatedUnion("mode", [
-            doneTierLandedAtTipSchema,
-            doneTierLandingDelegatedSchema,
-            doneTierNoRepositoryLandingSchema,
-          ]),
-        })
-        .strict(),
-    ]),
-  );
+export const doneTierDeclarationSchema = z.discriminatedUnion("tier", [
+  z
+    .object({
+      tier: z.literal("tier2"),
+      probeEvidence: doneTierTextSchema,
+    })
+    .strict(),
+  z
+    .object({
+      tier: z.literal("tier1"),
+      reason: doneTierTextSchema,
+      landing: z.discriminatedUnion("mode", [
+        doneTierLandedAtTipSchema,
+        doneTierLandingDelegatedSchema,
+        doneTierNoRepositoryLandingSchema,
+      ]),
+    })
+    .strict(),
+]);
 
 export type DoneTierDeclaration = z.infer<typeof doneTierDeclarationSchema>;
 
