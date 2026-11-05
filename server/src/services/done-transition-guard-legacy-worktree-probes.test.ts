@@ -39,7 +39,10 @@ function plainRepo(name: string): string {
   return dir;
 }
 
-async function withEnv<T>(vars: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+// The host's own system/global git config is shut out by default: CI images ship
+// `safe.directory = *`, which would mark every repository safe.
+async function withEnv<T>(overrides: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+  const vars = { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", ...overrides };
   const saved = Object.fromEntries(Object.keys(vars).map((key) => [key, process.env[key]]));
   Object.assign(process.env, vars);
   try {

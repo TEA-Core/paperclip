@@ -222,8 +222,11 @@ describe("pre-existing repository_delivery status probe under the hardened runne
 
   describe("keeps the server's own git configuration, so a dubiously owned workspace is still measured", () => {
     // GIT_TEST_ASSUME_DIFFERENT_OWNER makes git treat every repository as owned
-    // by another uid, the state a workspace shared across uids is in.
-    async function withEnv<T>(vars: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+    // by another uid, the state a workspace shared across uids is in. The host's
+    // own system/global git config is shut out by default: CI images ship
+    // `safe.directory = *`, which would mark every repository safe.
+    async function withEnv<T>(overrides: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+      const vars = { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", ...overrides };
       const saved = Object.fromEntries(Object.keys(vars).map((key) => [key, process.env[key]]));
       Object.assign(process.env, vars);
       try {
