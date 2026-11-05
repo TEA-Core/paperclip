@@ -272,7 +272,10 @@ import {
   evaluateDoneTransitionGuard,
   evaluateDoneTierDeclaration,
   resolveCitedCommits,
+  DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS,
   DONE_TIER_STRUCTURED_FORMS,
+  TIER2_FORM,
+  TIER2_RECORD_ONLY_FORM,
   findMissingAdr072CloseLadderStages,
   renderDoneTierDeclaration,
   TIER1_FORM,
@@ -5438,17 +5441,28 @@ export function issueRoutes(
       // closing actor writes in the comment they are already writing, and D6 makes
       // a Tier-1 substitution always writable, so a missing declaration is a 422,
       // never a deadlock.
+      // SUP-22801: the missing-tier remedy is classification-aware — a
+      // record_only card is steered to the record-only structured and comment
+      // forms it can actually write, never toward fabricating a merge head;
+      // repository deliveries keep the pre-existing merge-head remedy
+      // byte-for-byte.
+      const structuredForms = issue.deliveryRequirement === "record_only"
+        ? DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS
+        : DONE_TIER_STRUCTURED_FORMS;
+      const tier2CommentForm = issue.deliveryRequirement === "record_only"
+        ? TIER2_RECORD_ONLY_FORM
+        : TIER2_FORM;
       const remedy = input.createDoor
         ? "An issue cannot be created already done with a done-tier declaration: createIssueSchema accepts neither a close comment nor the structured doneTier field. Create the issue in a non-terminal status first, then close it via PATCH /api/issues/{id} with the structured doneTier field in the same request body: " +
-          `${DONE_TIER_STRUCTURED_FORMS}` +
+          `${structuredForms}` +
           `. Alternatively, include a done-tier declaration in the close comment: ` +
-          `"Closed at Tier 2 (live): probe \`<probe command>\` head <probe head sha> post-merge: <post-merge predicate>"` +
+          `${tier2CommentForm}` +
           ` or ${TIER1_FORM}` +
           ` — per SUP-12693.`
         : "Provide a done-tier declaration, preferably as the structured doneTier field in this same request body: " +
-          `${DONE_TIER_STRUCTURED_FORMS}` +
+          `${structuredForms}` +
           `. Alternatively, include a done-tier declaration in the close comment: ` +
-          `"Closed at Tier 2 (live): probe \`<probe command>\` head <probe head sha> post-merge: <post-merge predicate>"` +
+          `${tier2CommentForm}` +
           ` or ${TIER1_FORM}` +
           ` — per SUP-12693.`;
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
