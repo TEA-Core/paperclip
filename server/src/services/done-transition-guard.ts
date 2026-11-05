@@ -645,6 +645,11 @@ async function hydrateLinkedPrState(
           title: typeof body.title === "string" ? body.title : null,
           headRepoFullName,
           baseRefName: typeof base?.ref === "string" ? base.ref : null,
+          merged: typeof body.merged === "boolean" ? body.merged : pr.merged,
+          mergeCommitSha:
+            typeof body.merge_commit_sha === "string" && body.merge_commit_sha.length > 0
+              ? body.merge_commit_sha
+              : pr.mergeCommitSha ?? null,
         },
       };
     }
@@ -1043,11 +1048,193 @@ async function proveLandedAtTip(
       token,
     );
   } catch (err) {
+    if (err instanceof GitHubBranchNotFoundError) {
+      return proveLandedAtTipViaLinkedPrRepo(db, issue, reason, sameRun, sha, err);
+    }
     return refuseTier1(unverifiedTier1(err));
   }
   if (aheadBy !== 0) {
     return refuseTier1(
       `Tier 1 declaration merge commit ${sha} is not an ancestor of the default branch ${ctx.defaultRef}.`,
+    );
+  }
+  return acceptTier1(reason, sameRun);
+}
+
+/**
+ * SUP-22973: cross-repo landed-at-tip proof. `proveLandedAtTip` verifies the
+ * named merge commit against the card's project repository only, so a card
+ * whose deliverable landed via a linked MERGED pull request in a DIFFERENT
+ * repository (the routing/disposition card shape) can never verify — the
+ * project-repo compare 404s and every truthful Tier 1 declaration is refused.
+ *
+ * This fallback runs only after that project-repo compare 404'd
+ * (`GitHubBranchNotFoundError`): the declaration must name `PR #<N>` that
+ * resolves to exactly one linked PR recorded as MERGED whose recorded merge
+ * commit (`merge_commit_sha` on the cached external-object payload — or the
+ * live PR, when the cached row is stale — GitHub-authoritative either way,
+ * and immutable once merged) matches the named sha. Ancestry is then verified
+ * LIVE against THAT PR's own repository default branch, token via
+ * `resolveGitHubTokenCandidatesForRepo` (cross-repo capable, as
+ * `proveLandingDelegated` already uses). No new admit path opens:
+ *  - a sha that IS an ancestor of the project default branch never reaches
+ *    here (the first compare already accepted it);
+ *  - a compare that resolved (ahead_by measurable) never reaches here, so a
+ *    project-repo commit that is not at tip still refuses exactly as today;
+ *  - no named PR, an unlinked PR number, a merge-commit mismatch, an unmerged
+ *    PR, an ambiguous multi-repo match, or a cross-repo compare that does not
+ *    prove ancestry all refuse — with the original project-repo failure
+ *    carried in the message.
+ */
+async function proveLandedAtTipViaLinkedPrRepo(
+  db: Db,
+  issue: { id: string; companyId: string },
+  reason: string,
+  sameRun: boolean,
+  namedSha: string,
+  projectRepoErr: GitHubBranchNotFoundError,
+): Promise<DoneTierDeclarationResult> {
+  const refuse = (detail: string): DoneTierDeclarationResult =>
+    refuseTier1(`${unverifiedTier1(projectRepoErr)} ${detail}`);
+  const sha = namedSha.toLowerCase();
+  const named = NAMED_PR_RE.exec(reason);
+  if (!named) {
+    return refuse(
+      'For a landing in a repository other than the project repository, the declaration must name the linked PR (PR #<N>) whose merge commit is cited, so the landing can be verified against that PR\'s own repository.',
+    );
+  }
+  const number = Number(named[1]);
+  let linked: LinkedPullRequest[];
+  try {
+    linked = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, { includeDrafts: true });
+  } catch (err) {
+    return refuse(
+      `Cross-repo landing proof could not be evaluated (linked-PR resolution failed: ${err instanceof Error ? err.message : "unknown"}).`,
+    );
+  }
+  const namedPrs = linked.filter((candidate) => candidate.number === number);
+  if (namedPrs.length === 0) {
+    return refuse(
+      `Named PR #${number} is not a linked pull request on this card, so the landing cannot be verified against its repository.`,
+    );
+  }
+  const corroborates = (pr: LinkedPullRequest): string | null => {
+    const merged = pr.merged === true || pr.cachedState === "merged";
+    const recorded = (pr.mergeCommitSha ?? "").trim().toLowerCase();
+    return merged && recorded.startsWith(sha) ? recorded : null;
+  };
+  const matches: Array<{ pr: LinkedPullRequest; mergeCommit: string }> = [];
+  const states: string[] = [];
+  for (const candidate of namedPrs) {
+    // A cached MERGED row is terminal and GitHub-authoritative, so it may
+    // corroborate on its own; only a row that does NOT corroborate live (a
+    // stale open snapshot from before a merge that has since happened) is
+    // hydrated before the decision.
+    let mergeCommit = corroborates(candidate);
+    if (mergeCommit !== null) {
+      matches.push({ pr: candidate, mergeCommit });
+      continue;
+    }
+    try {
+      const tokenCandidates = await resolveGitHubTokenCandidatesForRepo(
+        db,
+        issue.companyId,
+        candidate.owner,
+        candidate.repo,
+      );
+      for (const tokenCandidate of tokenCandidates) {
+        const hydration = await hydrateLinkedPrState(candidate, tokenCandidate.token);
+        if (!hydration.hydrated) continue;
+        mergeCommit = corroborates(hydration.pr);
+        if (mergeCommit !== null) {
+          matches.push({ pr: hydration.pr, mergeCommit });
+        }
+        break;
+      }
+    } catch {
+      // Credential or provider failure on the live probe: the cached row (which
+      // did not corroborate) stands and this candidate yields no match.
+    }
+    if (mergeCommit === null) {
+      const merged = candidate.merged === true || candidate.cachedState === "merged";
+      const recorded = (candidate.mergeCommitSha ?? "").trim().toLowerCase();
+      states.push(
+        `${candidate.owner}/${candidate.repo}#${candidate.number} is ${
+          merged ? `merged at ${recorded || "an unrecorded merge commit"}` : "not recorded as merged"
+        }`,
+      );
+    }
+  }
+  if (matches.length === 0) {
+    return refuse(
+      `Named PR #${number} does not corroborate the merge commit ${namedSha} (${states.join("; ")}); the named merge commit must equal the linked PR's recorded merge_commit_sha.`,
+    );
+  }
+  if (matches.length > 1) {
+    return refuse(
+      `Named PR #${number} matches merged linked pull requests in multiple repositories (${matches
+        .map((match) => `${match.pr.owner}/${match.pr.repo}`)
+        .join(", ")}); name an unambiguous linked PR.`,
+    );
+  }
+  const { pr, mergeCommit } = matches[0]!;
+  // Resolve the PR repository's default branch live — the PR's base ref is not
+  // necessarily the repository default branch — under the same token
+  // candidates that can read that repository.
+  let defaultBranch: string | null = null;
+  let compareToken: string | null = null;
+  try {
+    const tokenCandidates = await resolveGitHubTokenCandidatesForRepo(db, issue.companyId, pr.owner, pr.repo);
+    for (const candidate of tokenCandidates) {
+      const repositoryResponse = await ghFetch(
+        `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}`,
+        {
+          headers: {
+            accept: "application/vnd.github+json",
+            "user-agent": "paperclip-done-transition-guard",
+            "x-github-api-version": "2022-11-28",
+            authorization: `Bearer ${candidate.token}`,
+          },
+        },
+      );
+      if (repositoryResponse.ok) {
+        const repository = (await repositoryResponse.json().catch(() => null)) as Record<string, unknown> | null;
+        if (typeof repository?.default_branch === "string" && repository.default_branch.length > 0) {
+          defaultBranch = repository.default_branch;
+          compareToken = candidate.token;
+          break;
+        }
+      }
+      if (![401, 403].includes(repositoryResponse.status)) break;
+    }
+  } catch (err) {
+    return refuse(
+      `Cross-repo landing proof could not be verified against ${pr.owner}/${pr.repo} (${err instanceof Error ? err.message : "unknown"}).`,
+    );
+  }
+  if (!defaultBranch || !compareToken) {
+    return refuse(
+      `Cross-repo landing proof could not be verified: the default branch of ${pr.owner}/${pr.repo} (linked PR #${number}) is not resolvable.`,
+    );
+  }
+  let aheadBy: number | null;
+  try {
+    aheadBy = await githubCompareAheadBy(
+      "github.com",
+      pr.owner,
+      pr.repo,
+      defaultBranch,
+      mergeCommit,
+      compareToken,
+    );
+  } catch (err) {
+    return refuseTier1(
+      `Tier 1 declaration could not be verified against the default branch of ${pr.owner}/${pr.repo} (linked PR #${number}): ${err instanceof Error ? err.message : "unknown"}.`,
+    );
+  }
+  if (aheadBy !== 0) {
+    return refuseTier1(
+      `Tier 1 declaration merge commit ${namedSha} (via ${pr.owner}/${pr.repo}#${number}) is not an ancestor of that repository's default branch ${defaultBranch}.`,
     );
   }
   return acceptTier1(reason, sameRun);

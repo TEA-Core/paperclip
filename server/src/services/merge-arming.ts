@@ -219,6 +219,23 @@ export interface LinkedPullRequest {
    * guard reads this to probe whether a merge queue covers the branch.
    */
   baseRefName?: string | null;
+  /**
+   * SUP-22973: the PR's recorded merge commit (`merge_commit_sha` on the
+   * cached external-object payload, written by the GitHub provider from the
+   * provider API at refresh time; a merged PR's merge commit is immutable), or
+   * null when the cached row has none (open or unhydrated PR). The
+   * done-transition guard's cross-repo landed-at-tip proof matches the close
+   * declaration's named sha against this value to resolve WHICH repository a
+   * cross-repo landing verified against.
+   */
+  mergeCommitSha?: string | null;
+  /**
+   * SUP-22973: true when the cached external-object payload records the PR as
+   * MERGED (the `merged` boolean the GitHub provider snapshots). Absent on
+   * rows whose payload predates the field or was never hydrated; treat absent
+   * as unknown, not false.
+   */
+  merged?: boolean;
 }
 
 export interface IssueRepoContext {
@@ -424,6 +441,8 @@ export async function resolveLinkedPullRequests(
         draft: draft === true,
         headRepoFullName: readString(row.data?.headRepoFullName),
         baseRefName: baseRefFromData(row.data),
+        mergeCommitSha: readString(row.data?.merge_commit_sha),
+        merged: row.data?.merged === true,
       });
   }
 
@@ -490,6 +509,8 @@ export async function resolveLinkedPullRequestsWithState(
         draft: draft === true,
         headRepoFullName: readString(row.data?.headRepoFullName),
         baseRefName: baseRefFromData(row.data),
+        mergeCommitSha: readString(row.data?.merge_commit_sha),
+        merged: row.data?.merged === true,
       });
   }
 
