@@ -1533,10 +1533,10 @@ async function startServerWithDatabaseTeardown(
       trackHeartbeatSchedulerWork(adr072CloseLadderEscalation
         .sweep()
         .then((result) => {
-          if (result.failed > 0 || result.deferredNoRecipient > 0) {
-            logger.warn(result, "adr072 close-ladder escalation sweep found unroutable or failed candidates");
-          } else if (result.escalated > 0) {
-            logger.info(result, "adr072 close-ladder escalation sweep escalated parents to exec-CTO");
+          if (result.failed > 0) {
+            logger.warn(result, "adr072 close-ladder escalation sweep found failed candidates");
+          } else if (result.escalated > 0 || result.escalatedToBoard > 0) {
+            logger.info(result, "adr072 close-ladder escalation sweep escalated parents to exec-CTO or the board");
           }
           return result;
         })

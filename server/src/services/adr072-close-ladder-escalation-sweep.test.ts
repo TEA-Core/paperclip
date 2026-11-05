@@ -6,6 +6,9 @@ const mockLogActivityInTransaction = vi.hoisted(() =>
 const mockAddIssueComment = vi.hoisted(() =>
   vi.fn(async (..._args: unknown[]) => undefined),
 );
+const mockUpdateIssue = vi.hoisted(() =>
+  vi.fn(async (..._args: unknown[]) => undefined),
+);
 
 vi.mock("./activity-log.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./activity-log.js")>();
@@ -13,11 +16,12 @@ vi.mock("./activity-log.js", async (importOriginal) => {
 });
 
 vi.mock("./issues.js", () => ({
-  issueService: () => ({ addComment: mockAddIssueComment }),
+  issueService: () => ({ addComment: mockAddIssueComment, update: mockUpdateIssue }),
 }));
 
 import {
   ADR072_CLOSE_LADDER_ADVISORY_ACTION,
+  ADR072_CLOSE_LADDER_BOARD_ESCALATION_ACTION,
   ADR072_CLOSE_LADDER_ESCALATION_ACTION,
   ADR072_CLOSE_LADDER_ESCALATION_MARKER,
   createAdr072CloseLadderEscalationSweepService,
@@ -43,7 +47,8 @@ type DbState = {
   advisoryRows: Array<{ id: string; companyId: string; entityId: string; createdAt: Date }>;
   escalatedMarkerRows: Array<{ id: string }>;
   wakeDeliveredMarkerRows: Array<{ id: string }>;
-  deferredMarkerRows: Array<{ id: string }>;
+  boardEscalatedMarkerRows: Array<{ id: string }>;
+  legacyDeferredMarkerRows: Array<{ id: string }>;
   issueRow: Record<string, unknown> | null;
   childRows: Array<Record<string, unknown>>;
   agentRows: Array<{ id: string; name: string }>;
@@ -117,7 +122,11 @@ function makeDb(state: DbState) {
               ...row,
               action: "issue.adr072_close_ladder_escalation_wake_delivered",
             })),
-            ...state.deferredMarkerRows.map((row) => ({
+            ...state.boardEscalatedMarkerRows.map((row) => ({
+              ...row,
+              action: ADR072_CLOSE_LADDER_BOARD_ESCALATION_ACTION,
+            })),
+            ...state.legacyDeferredMarkerRows.map((row) => ({
               ...row,
               action: "issue.adr072_close_ladder_escalation_deferred",
             })),
@@ -281,9 +290,14 @@ function parentIssueRow(overrides: Record<string, unknown> = {}) {
     identifier: "PAP-1587",
     status: "in_progress",
     hiddenAt: null,
+    assigneeAgentId: QAE_AGENT_ID,
+    assigneeUserId: null,
     executionPolicy: reviewOnlyPolicy(),
     executionState: null,
     createdByAgentId: null,
+    monitorNextCheckAt: null,
+    monitorWakeRequestedAt: null,
+    monitorScheduledBy: null,
     ...overrides,
   };
 }
@@ -307,6 +321,10 @@ function activityMarkerInputs(action: string) {
 
 function escalationMarkerInputs() {
   return activityMarkerInputs(ADR072_CLOSE_LADDER_ESCALATION_ACTION);
+}
+
+function boardEscalationMarkerInputs() {
+  return activityMarkerInputs(ADR072_CLOSE_LADDER_BOARD_ESCALATION_ACTION);
 }
 
 function escalationCommentInserts(state: DbState) {
@@ -333,7 +351,8 @@ describe("adr072 close-ladder escalation sweep", () => {
       advisoryRows: [],
       escalatedMarkerRows: [],
       wakeDeliveredMarkerRows: [],
-      deferredMarkerRows: [],
+      boardEscalatedMarkerRows: [],
+      legacyDeferredMarkerRows: [],
       issueRow: null,
       childRows: [],
       agentRows: [
@@ -349,8 +368,8 @@ describe("adr072 close-ladder escalation sweep", () => {
         state.escalatedMarkerRows.push({ id: "escalation-marker" });
       } else if (input.action === "issue.adr072_close_ladder_escalation_wake_delivered") {
         state.wakeDeliveredMarkerRows.push({ id: "wake-delivered-marker" });
-      } else if (input.action === "issue.adr072_close_ladder_escalation_deferred") {
-        state.deferredMarkerRows.push({ id: "deferred-marker" });
+      } else if (input.action === ADR072_CLOSE_LADDER_BOARD_ESCALATION_ACTION) {
+        state.boardEscalatedMarkerRows.push({ id: "board-escalation-marker" });
       }
     });
     wakeup = vi.fn(async () => undefined);
@@ -381,9 +400,9 @@ describe("adr072 close-ladder escalation sweep", () => {
     expect(result).toEqual({
       candidates: 1,
       escalated: 1,
+      escalatedToBoard: 0,
       alreadyEscalated: 0,
       notDue: 0,
-      deferredNoRecipient: 0,
       failed: 0,
     });
     const markers = escalationMarkerInputs();
@@ -571,7 +590,7 @@ describe("adr072 close-ladder escalation sweep", () => {
     expect(wakeup).not.toHaveBeenCalled();
   });
 
-  it("records one durable deferral when the company has no exec-CTO agent", async () => {
+  it("escalates to a board-owned decision item when the company has no exec-CTO agent", async () => {
     armDueIncompleteParent();
     state.agentRows = [
       { id: QAE_AGENT_ID, name: "support-QAE" },
@@ -580,16 +599,140 @@ describe("adr072 close-ladder escalation sweep", () => {
     const service = makeService();
 
     const result = await service.sweep(NOW);
+
+    expect(result.escalatedToBoard).toBe(1);
+    expect(result.escalated).toBe(0);
+    const markers = boardEscalationMarkerInputs();
+    expect(markers).toHaveLength(1);
+    expect((markers[0]!.details as Record<string, unknown>).routedTo).toBe("board");
+    expect((markers[0]!.details as Record<string, unknown>).boardMonitorDispatchable).toBe(true);
+    expect(escalationMarkerInputs()).toEqual([]);
+    const comments = escalationCommentInserts(state);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]!.values.issueId).toBe(PARENT_ID);
+    expect(comments[0]!.values.authorType).toBe("system");
+    const body = String(comments[0]!.values.body);
+    expect(body).toContain(ADR072_CLOSE_LADDER_ESCALATION_MARKER);
+    expect(body).toContain("Escalated to the board");
+    expect(body).toContain("no exec-CTO agent");
+    expect(body).toContain("Board decision item armed");
+    expect(wakeup).not.toHaveBeenCalled();
+  });
+
+  it("arms a board-scheduled monitor through the policy transition when escalating to the board", async () => {
+    armDueIncompleteParent();
+    state.agentRows = [
+      { id: QAE_AGENT_ID, name: "support-QAE" },
+      { id: LE_AGENT_ID, name: "coder-LE" },
+    ];
+    const service = makeService();
+
     await service.sweep(NOW);
 
-    expect(result.deferredNoRecipient).toBe(1);
-    expect(result.escalated).toBe(0);
-    expect(escalationMarkerInputs()).toEqual([]);
-    expect(escalationCommentInserts(state)).toEqual([]);
-    expect(
-      activityMarkerInputs("issue.adr072_close_ladder_escalation_deferred"),
-    ).toHaveLength(1);
+    expect(mockUpdateIssue).toHaveBeenCalledTimes(1);
+    const [issueId, patch] = mockUpdateIssue.mock.calls[0] as unknown as [
+      string,
+      Record<string, unknown>,
+    ];
+    expect(issueId).toBe(PARENT_ID);
+    expect(patch.monitorScheduledBy).toBe("board");
+    expect(patch.monitorNextCheckAt).toBeInstanceOf(Date);
+    expect((patch.monitorNextCheckAt as Date).getTime()).toBeGreaterThan(NOW);
+    expect(String(patch.monitorNotes)).toContain("Board decision required");
+    const policy = patch.executionPolicy as {
+      monitor?: { scheduledBy?: string; maxAttempts?: number };
+      stages?: Array<{ id?: string }>;
+    };
+    expect(policy.monitor?.scheduledBy).toBe("board");
+    expect(policy.monitor?.maxAttempts).toBe(3);
+    // The parent's own stages survive the arm untouched (normalizeIssueExecutionPolicy
+    // re-mints participant row ids per call, so compare the stable stage ids).
+    expect(policy.stages?.map((stage) => stage.id)).toEqual(
+      reviewOnlyPolicy().stages.map((stage) => stage.id),
+    );
+  });
+
+  it("is exactly-once: consecutive board sweeps neither re-comment, re-arm, nor re-mark", async () => {
+    armDueIncompleteParent();
+    state.agentRows = [
+      { id: QAE_AGENT_ID, name: "support-QAE" },
+      { id: LE_AGENT_ID, name: "coder-LE" },
+    ];
+    const service = makeService();
+
+    const first = await service.sweep(NOW);
+    const second = await service.sweep(NOW);
+    const third = await service.sweep(NOW);
+
+    expect(first.escalatedToBoard).toBe(1);
+    expect(second.alreadyEscalated).toBe(1);
+    expect(second.escalatedToBoard).toBe(0);
+    expect(third.alreadyEscalated).toBe(1);
+    expect(third.escalatedToBoard).toBe(0);
+    expect(escalationCommentInserts(state)).toHaveLength(1);
+    expect(boardEscalationMarkerInputs()).toHaveLength(1);
+    expect(mockUpdateIssue).toHaveBeenCalledTimes(1);
     expect(wakeup).not.toHaveBeenCalled();
+  });
+
+  it("heals a legacy deferral: old escalation_deferred markers do not pin the parent away from the board path", async () => {
+    armDueIncompleteParent();
+    state.agentRows = [
+      { id: QAE_AGENT_ID, name: "support-QAE" },
+      { id: LE_AGENT_ID, name: "coder-LE" },
+    ];
+    state.legacyDeferredMarkerRows = [{ id: "legacy-deferred-marker" }];
+    const service = makeService();
+
+    const result = await service.sweep(NOW);
+
+    expect(result.escalatedToBoard).toBe(1);
+    expect(boardEscalationMarkerInputs()).toHaveLength(1);
+    expect(escalationCommentInserts(state)).toHaveLength(1);
+    expect(mockUpdateIssue).toHaveBeenCalledTimes(1);
+  });
+
+  it("still escalates to the board without a monitor when the parent is not monitorable", async () => {
+    armDueIncompleteParent();
+    state.agentRows = [
+      { id: QAE_AGENT_ID, name: "support-QAE" },
+      { id: LE_AGENT_ID, name: "coder-LE" },
+    ];
+    state.issueRow = parentIssueRow({ assigneeAgentId: null, assigneeUserId: null });
+    const service = makeService();
+
+    const result = await service.sweep(NOW);
+
+    expect(result.escalatedToBoard).toBe(1);
+    expect(mockUpdateIssue).not.toHaveBeenCalled();
+    const markers = boardEscalationMarkerInputs();
+    expect((markers[0]!.details as Record<string, unknown>).boardMonitorDispatchable).toBe(false);
+    const body = String(escalationCommentInserts(state)[0]!.values.body);
+    expect(body).toContain("no board monitor was armed");
+    expect(wakeup).not.toHaveBeenCalled();
+  });
+
+  it("keeps an existing future monitor instead of re-arming over it", async () => {
+    armDueIncompleteParent();
+    state.agentRows = [
+      { id: QAE_AGENT_ID, name: "support-QAE" },
+      { id: LE_AGENT_ID, name: "coder-LE" },
+    ];
+    const existingCheckAt = new Date(NOW + 30 * 60 * 1000);
+    state.issueRow = parentIssueRow({
+      monitorNextCheckAt: existingCheckAt,
+      monitorScheduledBy: "assignee",
+    });
+    const service = makeService();
+
+    const result = await service.sweep(NOW);
+
+    expect(result.escalatedToBoard).toBe(1);
+    expect(mockUpdateIssue).not.toHaveBeenCalled();
+    const markers = boardEscalationMarkerInputs();
+    expect((markers[0]!.details as Record<string, unknown>).boardMonitorNextCheckAt).toBe(
+      existingCheckAt.toISOString(),
+    );
   });
 
   it("does not escalate a parent with fewer than two laddered children", async () => {
