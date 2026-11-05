@@ -1463,7 +1463,7 @@ async function startServerWithDatabaseTeardown(
       trackHeartbeatSchedulerWork(summarySlotRefreshSweep
         .sweep()
         .then((result) => {
-          if (result.candidates > 0 || result.claimed > 0 || result.inFlight > 0 || result.failed > 0) {
+          if (result.candidates > 0 || result.claimed > 0 || result.inFlight > 0 || result.released > 0 || result.failed > 0) {
             logger.info(result, "summary slot refresh sweep dispositioned stale summary slots");
           }
           return result;

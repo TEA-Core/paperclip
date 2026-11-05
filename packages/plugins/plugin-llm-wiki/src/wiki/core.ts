@@ -2477,6 +2477,7 @@ export async function createOperationIssue(ctx: PluginContext, input: OperationI
     description: operationPromptWithSpaceContext(operationContext),
     status: "todo",
     priority: input.operationType === "query" ? "medium" : "low",
+    deliveryRequirement: "record_only",
     assigneeAgentId: assignableAgentId,
     billingCode: operationBillingCode(wikiId, space),
     surfaceVisibility: "plugin_operation",

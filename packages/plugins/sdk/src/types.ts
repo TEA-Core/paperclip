@@ -1466,6 +1466,7 @@ export interface PluginIssuesClient {
     description?: string;
     status?: Issue["status"];
     priority?: Issue["priority"];
+    deliveryRequirement?: Issue["deliveryRequirement"];
     assigneeAgentId?: string;
     assigneeUserId?: string | null;
     requestDepth?: number;

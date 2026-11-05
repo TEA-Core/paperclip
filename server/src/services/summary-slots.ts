@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, gte, inArray, isNull, max } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, max, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   documentRevisions,
@@ -33,7 +33,11 @@ import { builtInAgentService } from "./built-in-agents.js";
 import { agentService } from "./agents.js";
 import { issueService } from "./issues.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
-import { readGenerationToken, releaseSummarySlotBinding } from "./summary-slot-finalization.js";
+import {
+  generationWroteSlotSql,
+  readGenerationToken,
+  releaseSummarySlotBinding,
+} from "./summary-slot-finalization.js";
 
 /** Built-in agent key for the Summarizer bundle (see PAP-13920). */
 export const SUMMARIZER_BUILT_IN_KEY = "summarizer";
@@ -345,7 +349,7 @@ export function summarySlotService(db: Db) {
   }
 
   /**
-   * True when a slot's `generating_issue_id` binding is DEAD (SUP-16945). Two cases:
+   * True when a slot's `generating_issue_id` binding is DEAD (SUP-16945). Three cases:
    *
    *   1. The bound generation issue is TERMINAL (done/cancelled). A terminal issue
    *      can never write a summary (the write guard refuses terminal writes), so its
@@ -361,9 +365,19 @@ export function summarySlotService(db: Db) {
    *      or `escalated`) — and has sat armed for at least `DEAD_GENERATION_GRACE_MS`.
    *      Such a slot would otherwise stay wedged in `generating` forever.
    *
-   * Conservative on purpose for case 2: a generation with a live run or any
-   * in-flight recovery action is in flight and is NEVER reclaimed, regardless of
-   * age.
+   *   3. Written-deliverable completion (SUP-23039): the bound issue is
+   *      non-terminal, has lost its live path, no recovery ladder owns it, and
+   *      THIS generation already wrote the slot's surviving revision (the same
+   *      identity chain the release itself uses to pick `idle`). The binding is
+   *      not merely dead — it is COMPLETE: the deliverable landed and no close
+   *      form is required to prove it (a `record_only` generation card can never
+   *      emit one), so it releases on the first read after the run terminates
+   *      instead of aging out `DEAD_GENERATION_GRACE_MS` presenting a finished
+   *      generation as in-flight on the board tile.
+   *
+   * Conservative on purpose for cases 2 and 3: a generation with a live run or
+   * any in-flight recovery action is in flight and is NEVER reclaimed,
+   * regardless of age or written state.
    *
    * Age is measured from the slot's arm time (`summary_slots.updated_at`) — the
    * moment `generate()` armed the slot to `generating` for this binding — the
@@ -387,7 +401,8 @@ export function summarySlotService(db: Db) {
     // interrupted transition).
     if (TERMINAL_ISSUE_STATUSES.has(issueRow.status as IssueStatus)) return true;
     // Case 2, guard 1: a live run means the generation is actually in flight —
-    // never reclaim, regardless of age.
+    // never reclaim, regardless of age or written state (the run may still be
+    // finishing).
     if (issueRow.executionRunId || issueRow.checkoutRunId) return false;
     // Case 2, guard 2: an in-flight recovery action means the issue is being
     // recovered — never reclaim, regardless of age.
@@ -396,8 +411,32 @@ export function summarySlotService(db: Db) {
       slotRow.generatingIssueId,
     );
     if (activeRecovery) return false;
+    // Case 3: the run is dead, no recovery ladder owns the issue, and this
+    // generation wrote the surviving revision — the binding is complete.
+    // Release immediately; the shared release below resolves it to `idle`
+    // (the same identity probe decides), never `failed`.
+    if (await generationWroteSurvivingRevision(slotRow)) return true;
     // Case 2, aged: armed for at least the grace window since the slot was armed.
     return now.getTime() - slotRow.updatedAt.getTime() >= DEAD_GENERATION_GRACE_MS;
+  }
+
+  /**
+   * Identity probe for the written-deliverable completion case (SUP-23039):
+   * true when THIS generation issue wrote the slot document's surviving (latest)
+   * revision. This is the exact `generationWroteSlotSql` chain the binding
+   * release itself uses to decide `idle`, evaluated before the release so a
+   * provably completed generation (run dead, no recovery) can bypass
+   * `DEAD_GENERATION_GRACE_MS`.
+   */
+  async function generationWroteSurvivingRevision(slotRow: SummarySlotRow): Promise<boolean> {
+    if (!slotRow.generatingIssueId) return false;
+    return db
+      .select({
+        wrote: sql<boolean>`${generationWroteSlotSql(slotRow.companyId, slotRow.generatingIssueId)}`,
+      })
+      .from(summarySlots)
+      .where(eq(summarySlots.id, slotRow.id))
+      .then((rows) => rows[0]?.wrote === true);
   }
 
   /**

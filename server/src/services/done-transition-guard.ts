@@ -89,13 +89,24 @@ const TIER_1_SUFFIX = "Liveness unverified.";
 // command, the probe head/commit it ran against, and a post-merge predicate, because
 // the guard resolves the named head and compares it with the delivery merge head at
 // close time. Arbitrary non-empty prose is no longer accepted Tier 2 evidence.
-const TIER2_FORM =
+export const TIER2_FORM =
   '"Closed at Tier 2 (live): probe `<probe command>` head <probe head sha> post-merge: <post-merge predicate>"';
+// SUP-22801: record-only Tier 2 form. A `record_only` card owes no repository
+// landing, so its live evidence names the real probe command, the observed
+// target, the UTC observation time, and a pass predicate/result — never a
+// fabricated merge head. Embedded verbatim in every record-only rejection
+// message (SUP-15787 invariant). Accepted ONLY on record_only cards; a
+// repository_delivery card keeps the merge-head form above unchanged.
+export const TIER2_RECORD_ONLY_FORM =
+  '"Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>"';
 export const TIER1_FORM =
   '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."' +
   ' or "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
   'landing obligation transferred to done-close-landing-backstop, not yet discharged; ' +
-  '<why Tier 2 was not probed>. Liveness unverified."';
+  '<why Tier 2 was not probed>. Liveness unverified."' +
+  ' or "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — ' +
+  '<why Tier 2 was not probed>; accepted on record_only issues or repository_delivery issues with ' +
+  'no pull-request work product or recorded merge commit. Liveness unverified."';
 // Structured `doneTier` forms (SUP-21328): the second accepted close form on both
 // agent-writable close doors. The missing-tier remedy names these verbatim so the
 // 422 remedy and the structured parser always agree (SUP-15787 invariant).
@@ -105,8 +116,21 @@ export const DONE_TIER_TIER1_LANDED_JSON =
   '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landedAtTip", "mergeCommit": "<sha>" } }';
 export const DONE_TIER_TIER1_DELEGATED_JSON =
   '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landingDelegated", "prNumber": <N>, "carrier": "done-close-landing-backstop" } }';
+export const DONE_TIER_TIER1_NO_REPOSITORY_LANDING_JSON =
+  '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "noRepositoryLanding" } } (record_only issues, or repository_delivery issues with no pull-request work product or recorded merge commit)';
 export const DONE_TIER_STRUCTURED_FORMS =
-  `${DONE_TIER_TIER2_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
+  `${DONE_TIER_TIER2_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}; ${DONE_TIER_TIER1_NO_REPOSITORY_LANDING_JSON}`;
+// SUP-22801: the record-only classification of the structured forms. A
+// record_only card's Tier 2 probeEvidence carries the record-only grammar —
+// no merge head — so the classification-aware 422 remedy names this set
+// instead, keeping the remedy and the structured parser in agreement
+// (SUP-15787 invariant). Tier 1 semantics are unchanged and stay listed: a
+// record_only card with a recorded merged work product may still land Tier 1
+// (SUP-21258).
+export const DONE_TIER_TIER2_RECORD_ONLY_JSON =
+  '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }';
+export const DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS =
+  `${DONE_TIER_TIER2_RECORD_ONLY_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}; ${DONE_TIER_TIER1_NO_REPOSITORY_LANDING_JSON}`;
 
 export function renderDoneTierDeclaration(
   body: string | null | undefined,
@@ -125,7 +149,9 @@ export function renderDoneTierDeclaration(
     ? `${TIER_2_PREFIX} ${declaration.probeEvidence}`
     : `${TIER_1_PREFIX} ${declaration.landing.mode === "landedAtTip"
       ? `landed-at-tip ${declaration.landing.mergeCommit}`
-      : `landing-delegated PR #${declaration.landing.prNumber} via ${declaration.landing.carrier}`} — ${declaration.reason}. ${TIER_1_SUFFIX}`;
+      : declaration.landing.mode === "landingDelegated"
+        ? `landing-delegated PR #${declaration.landing.prNumber} via ${declaration.landing.carrier}`
+        : "no-repository-landing"} — ${declaration.reason}. ${TIER_1_SUFFIX}`;
   if (lines.some((line) => line.trim() === rendered)) {
     return current;
   }
@@ -747,6 +773,7 @@ function parseTier1Declaration(body: string): Tier1Parse {
 // Tier 2 is a separate live-probe concern and is not checked here; see proveTier2Live.
 const LANDED_AT_TIP_TOKEN = "landed-at-tip";
 const LANDING_DELEGATED_TOKEN = "landing-delegated";
+const NO_REPOSITORY_LANDING_TOKEN = "no-repository-landing";
 const LANDING_BACKSTOP_CARRIER = "done-close-landing-backstop";
 const NAMED_PR_RE = /\bPR #([1-9][0-9]*)\b/;
 const NAMED_MERGE_COMMIT_RE = /\b([0-9a-f]{7,40})\b/i;
@@ -1259,6 +1286,19 @@ async function proveLandedAtTipViaLinkedPrRepo(
 // Arbitrary non-empty prose is malformed evidence under this contract, never live proof.
 const TIER2_PROBE_SHAPE_RE = /^probe `([^`]+)` head ([0-9a-f]{7,40}) post-merge: (.+)$/i;
 
+// SUP-22801: record-only Tier 2 live-evidence grammar, the classification-aware
+// sibling of TIER2_PROBE_SHAPE_RE for `deliveryRequirement=record_only` cards.
+// Machine-checkable components: a backticked probe command, the observed target,
+// a strict UTC ISO-8601 observation instant (Z-suffixed; validated as a real
+// calendar instant), and an explicit pass/fail verdict with the predicate and
+// observed result. The literal `record-only probe` marker makes the two Tier 2
+// grammars mutually recognisable, so a record-only declaration on a
+// repository_delivery card is refused by name, not by generic shape mismatch.
+// A `fail` verdict is accepted by the shape only so it can be refused with the
+// specific failing-predicate message — a failing probe is never live proof.
+const TIER2_RECORD_ONLY_PROBE_SHAPE_RE =
+  /^record-only probe `([^`]+)` target (.+?) observed (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z) result: (pass|fail) (.+)$/i;
+
 function refuseTier2(reason: string): DoneTierDeclarationResult {
   return {
     allowed: false,
@@ -1282,9 +1322,9 @@ function acceptTier2(evidence: string, sameRun: boolean): DoneTierDeclarationRes
   };
 }
 
-function unverifiedTier2(err: unknown): string {
+function unverifiedTier2(err: unknown, forms: string): string {
   const detail = err instanceof Error ? err.message : "unknown";
-  return `Tier 2 declaration could not be verified against the delivery merge head (${detail}). Accepted form: ${TIER2_FORM}`;
+  return `Tier 2 declaration could not be verified against the delivery merge head (${detail}). Accepted form: ${forms}`;
 }
 
 /**
@@ -1331,6 +1371,95 @@ async function loadRecordedDeliveryMergeCommit(
   return latestShas.size === 1 ? [...latestShas][0]! : null;
 }
 
+// SUP-22801 round-1 repair (record-only-invalid-calendar-date-accepted): a real
+// UTC calendar instant must survive BOTH strict component validation and a
+// round-trip re-serialization. `Date.parse` alone is not a validator — it
+// normalizes impossible dates instead of rejecting them (2026-02-31 becomes
+// 2026-03-03, a non-leap 2026-02-29 becomes 2026-03-01, 24:00 becomes the next
+// day), so a bare NaN check accepted fabricated observation timestamps that
+// name no real calendar instant. The round-trip comparison is the fail-closed
+// backstop for any component range this table misses.
+const UTC_INSTANT_COMPONENTS_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/;
+
+function isRealUtcCalendarInstant(observedAt: string): boolean {
+  const parts = UTC_INSTANT_COMPONENTS_RE.exec(observedAt);
+  if (!parts) {
+    return false;
+  }
+  const year = Number(parts[1]);
+  const month = Number(parts[2]);
+  const day = Number(parts[3]);
+  const hour = Number(parts[4]);
+  const minute = Number(parts[5]);
+  const second = Number(parts[6]);
+  if (month < 1 || month > 12) {
+    return false;
+  }
+  const leapYear = year % 400 === 0 || (year % 4 === 0 && year % 100 !== 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (day < 1 || day > (daysInMonth[month - 1] ?? 0)) {
+    return false;
+  }
+  if (hour > 23 || minute > 59 || second > 59) {
+    return false;
+  }
+  const epochMs = Date.parse(observedAt);
+  if (Number.isNaN(epochMs)) {
+    return false;
+  }
+  const roundTrip = new Date(epochMs);
+  return (
+    roundTrip.getUTCFullYear() === year &&
+    roundTrip.getUTCMonth() === month - 1 &&
+    roundTrip.getUTCDate() === day &&
+    roundTrip.getUTCHours() === hour &&
+    roundTrip.getUTCMinutes() === minute &&
+    roundTrip.getUTCSeconds() === second
+  );
+}
+
+// SUP-22801: record-only Tier 2 live proof. Pure and fail-closed — a
+// record_only card has no repository landing to resolve, so nothing here touches
+// GitHub or the database; every component of the accepted form is checked
+// locally: the shape, non-blank command/target/predicate, a real UTC instant,
+// and a `pass` verdict. Non-empty prose, missing components, an impossible
+// calendar instant, or a failing predicate are all refusals naming the accepted
+// form verbatim (SUP-15787 invariant).
+function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierDeclarationResult {
+  const shape = TIER2_RECORD_ONLY_PROBE_SHAPE_RE.exec(evidence.trim());
+  if (!shape) {
+    return refuseTier2(
+      "record-only close Tier 2 probe evidence is not in the machine-checkable shape that names the " +
+        "probe command, observed target, UTC observation time, and pass predicate/result; non-empty prose " +
+        "is not live proof, and no merge head is required on a record-only card. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
+  }
+  const [, probeCommand, observedTarget, observedAt, verdict, predicateResult] = shape;
+  if (!probeCommand!.trim() || !observedTarget!.trim() || !predicateResult!.trim()) {
+    return refuseTier2(
+      "record-only close Tier 2 probe evidence has a blank probe command, observed target, or " +
+        "pass predicate/result; each accepted-form component must be non-empty. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
+  }
+  if (!isRealUtcCalendarInstant(observedAt!)) {
+    return refuseTier2(
+      `record-only close Tier 2 probe evidence names observed instant ${observedAt}, which is not a ` +
+        "real UTC calendar instant; the observation time must be a valid Z-suffixed ISO-8601 timestamp. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
+  }
+  if (verdict !== "pass") {
+    return refuseTier2(
+      "record-only close Tier 2 probe evidence reports a failing predicate (result: fail); a failing " +
+        "probe is not live proof. Re-probe until the predicate passes, or do not close. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
+  }
+  return acceptTier2(evidence.trim(), sameRun);
+}
+
 async function proveTier2Live(
   db: Db,
   issue: {
@@ -1342,13 +1471,35 @@ async function proveTier2Live(
   },
   evidence: string,
   sameRun: boolean,
+  deliveryRequirement: IssueDeliveryRequirement | null | undefined,
 ): Promise<DoneTierDeclarationResult> {
+  // SUP-22801: classification-aware routing. The record-only grammar is
+  // accepted only on record_only cards; a repository_delivery card submitting
+  // it is refused by name rather than by generic shape mismatch. A record_only
+  // card may still close through the merge-head grammar below when it has a
+  // recorded merged work product (SUP-21258), so that contract is untouched;
+  // every refusal on that fall-through names BOTH forms so a repo-less
+  // record-only card always sees the form it can actually write.
+  const recordOnlyShape = TIER2_RECORD_ONLY_PROBE_SHAPE_RE.exec(evidence.trim());
+  if (recordOnlyShape) {
+    if (deliveryRequirement === "record_only") {
+      return proveTier2RecordOnlyLive(evidence, sameRun);
+    }
+    return refuseTier2(
+      "record-only probe evidence is accepted only on cards classified deliveryRequirement=record_only; " +
+        "this card is a repository delivery and must name its delivery merge head. " +
+        `Accepted form: ${TIER2_FORM}`,
+    );
+  }
+  const tier2Forms = deliveryRequirement === "record_only"
+    ? `${TIER2_RECORD_ONLY_FORM} or ${TIER2_FORM}`
+    : TIER2_FORM;
   const shape = TIER2_PROBE_SHAPE_RE.exec(evidence.trim());
   if (!shape) {
     return refuseTier2(
       "Tier 2 declaration probe evidence is not in the machine-checkable shape that names the " +
         "probe command, probe head, and post-merge predicate; non-empty prose is not live proof. " +
-        `Accepted form: ${TIER2_FORM}`,
+        `Accepted form: ${tier2Forms}`,
     );
   }
   const probeHead = shape[2]!.toLowerCase();
@@ -1362,27 +1513,27 @@ async function proveTier2Live(
       executionWorkspaceId: fields.executionWorkspaceId,
     });
   } catch (err) {
-    return refuseTier2(unverifiedTier2(err));
+    return refuseTier2(unverifiedTier2(err, tier2Forms));
   }
   if (!ctx?.repoUrl) {
     return refuseTier2(
       "Tier 2 declaration could not be verified: no delivery repository is resolvable, " +
         "so the probe head cannot be resolved against a delivery merge head. " +
-        `Accepted form: ${TIER2_FORM}`,
+        `Accepted form: ${tier2Forms}`,
     );
   }
   const parsed = parseRepoUrl(ctx.repoUrl);
   if (!parsed) {
     return refuseTier2(
       "Tier 2 declaration could not be verified: repository URL is not a GitHub repository. " +
-        `Accepted form: ${TIER2_FORM}`,
+        `Accepted form: ${tier2Forms}`,
     );
   }
   let recordedMergeCommit: string | null;
   try {
     recordedMergeCommit = await loadRecordedDeliveryMergeCommit(db, issue);
   } catch (err) {
-    return refuseTier2(unverifiedTier2(err));
+    return refuseTier2(unverifiedTier2(err, tier2Forms));
   }
   if (recordedMergeCommit === null) {
     return refuseTier2(
@@ -1390,7 +1541,7 @@ async function proveTier2Live(
         "for this issue (merge_commit_unrecorded); the recorded merge commit is the full 40-hex " +
         "`mergeCommitSha` on the most recent merged pull_request work product, and there is no " +
         "fallback to the live branch tip. " +
-        `Accepted form: ${TIER2_FORM}`,
+        `Accepted form: ${tier2Forms}`,
     );
   }
   let token: string | null;
@@ -1398,12 +1549,12 @@ async function proveTier2Live(
     const tokenResult = await resolveGitHubToken(db, issue.companyId);
     token = tokenResult.token;
   } catch (err) {
-    return refuseTier2(unverifiedTier2(err));
+    return refuseTier2(unverifiedTier2(err, tier2Forms));
   }
   if (!token) {
     return refuseTier2(
       "Tier 2 declaration could not be verified: GitHub credential is not configured. " +
-        `Accepted form: ${TIER2_FORM}`,
+        `Accepted form: ${tier2Forms}`,
     );
   }
   let probeHeadResolved: string | null;
@@ -1416,14 +1567,14 @@ async function proveTier2Live(
       token,
     );
   } catch (err) {
-    return refuseTier2(unverifiedTier2(err));
+    return refuseTier2(unverifiedTier2(err, tier2Forms));
   }
   if (probeHeadResolved === null) {
     return refuseTier2(
       `Tier 2 declaration head ${probeHead} is unresolvable in ${parsed.owner}/${parsed.repo} ` +
         `(head_unresolvable); the named probe head does not exist on the remote, so the probe ` +
         "evidence cannot be attributed to the delivery merge head. " +
-        `Accepted form: ${TIER2_FORM}`,
+        `Accepted form: ${tier2Forms}`,
     );
   }
   if (probeHeadResolved !== recordedMergeCommit) {
@@ -1431,10 +1582,61 @@ async function proveTier2Live(
       `Tier 2 declaration head ${probeHead} (resolved ${probeHeadResolved}) does not match the ` +
         `delivery merge head ${recordedMergeCommit} recorded for this delivery; the probe did not run ` +
         "against this delivery's recorded merge commit, so pre-merge probe output is not live proof. " +
-        `Accepted form: ${TIER2_FORM}`,
+        `Accepted form: ${tier2Forms}`,
     );
   }
   return acceptTier2(evidence.trim(), sameRun);
+}
+
+async function proveNoRepositoryLanding(
+  db: Db,
+  issue: {
+    id: string;
+    companyId: string;
+    deliveryRequirement?: IssueDeliveryRequirement | null;
+  },
+  reason: string,
+  sameRun: boolean,
+): Promise<DoneTierDeclarationResult> {
+  if (issue.deliveryRequirement === "record_only") return acceptTier1(reason, sameRun);
+  if (issue.deliveryRequirement !== "repository_delivery") {
+    return refuseTier1(
+      'Tier 1 "no-repository-landing" requires a record_only or repository_delivery issue.',
+    );
+  }
+
+  let rows: { type: string; metadata: unknown }[];
+  try {
+    rows = await db
+      .select({ type: issueWorkProducts.type, metadata: issueWorkProducts.metadata })
+      .from(issueWorkProducts)
+      .where(
+        and(
+          eq(issueWorkProducts.companyId, issue.companyId),
+          eq(issueWorkProducts.issueId, issue.id),
+        ),
+      );
+  } catch (err) {
+    return refuseTier1(
+      `Tier 1 "no-repository-landing" could not verify repository artifacts (${err instanceof Error ? err.message : "unknown"}).`,
+    );
+  }
+
+  if (rows.some((row) => row.type === "pull_request")) {
+    return refuseTier1(
+      'Tier 1 "no-repository-landing" cannot close a repository_delivery issue with a pull_request work product; name the actual landing state instead.',
+    );
+  }
+  const hasRecordedMergeCommit = rows.some((row) => {
+    const metadata = (row.metadata ?? {}) as Record<string, unknown>;
+    return typeof metadata.mergeCommitSha === "string" && metadata.mergeCommitSha.trim().length > 0;
+  });
+  if (hasRecordedMergeCommit) {
+    return refuseTier1(
+      'Tier 1 "no-repository-landing" cannot close a repository_delivery issue with a recorded merge commit; name the actual landing state instead.',
+    );
+  }
+  return acceptTier1(reason, sameRun);
 }
 
 async function proveTier1Landing(
@@ -1446,23 +1648,27 @@ async function proveTier1Landing(
     projectId?: string | null;
     projectWorkspaceId?: string | null;
     executionWorkspaceId?: string | null;
+    deliveryRequirement?: IssueDeliveryRequirement | null;
   },
   reason: string,
   sameRun: boolean,
 ): Promise<DoneTierDeclarationResult> {
   const hasLanded = new RegExp(`\\b${LANDED_AT_TIP_TOKEN}\\b`).test(reason);
   const hasDelegated = new RegExp(`\\b${LANDING_DELEGATED_TOKEN}\\b`).test(reason);
-  if (hasLanded && hasDelegated) {
+  const hasNoRepositoryLanding = new RegExp(`\\b${NO_REPOSITORY_LANDING_TOKEN}\\b`).test(reason);
+  const landingTokenCount = [hasLanded, hasDelegated, hasNoRepositoryLanding].filter(Boolean).length;
+  if (landingTokenCount > 1) {
     return refuseTier1(
-      'Tier 1 declaration names both "landed-at-tip" and "landing-delegated"; name exactly one.',
+      'Tier 1 declaration names more than one landing-state token; name exactly one of "landed-at-tip", "landing-delegated", or "no-repository-landing".',
     );
   }
-  if (!hasLanded && !hasDelegated) {
+  if (landingTokenCount === 0) {
     return refuseTier1(
-      'Tier 1 declaration is missing a landing-state token in <reason>; include "landed-at-tip" ' +
-        'or "landing-delegated".',
+      'Tier 1 declaration is missing a landing-state token in <reason>; include "landed-at-tip", ' +
+        '"landing-delegated", or "no-repository-landing".',
     );
   }
+  if (hasNoRepositoryLanding) return proveNoRepositoryLanding(db, issue, reason, sameRun);
   if (hasDelegated) return proveLandingDelegated(db, issue, reason, sameRun);
   return proveLandedAtTip(db, issue, reason, sameRun);
 }
@@ -1474,20 +1680,20 @@ async function proveTier1Landing(
  * (SUP-15787 case 4). Tier 2 is the primary tier, so its specific defect is
  * reported before Tier 1's.
  */
-function describeTierRejection(tier2: Tier2Parse, tier1: Tier1Parse): string | null {
+function describeTierRejection(tier2: Tier2Parse, tier1: Tier1Parse, tier2Forms: string): string | null {
   if (tier2.kind === "not_at_line_start") {
     return (
       "A Tier 2 declaration was found but it does not begin its own line — the guard " +
       "requires the literal to start the line (no bullet, bold, quote, or leading text). " +
       `Offending line: "${tier2.offendingLine.slice(0, 200)}". ` +
-      `Accepted form: ${TIER2_FORM} — per SUP-12693.`
+      `Accepted form: ${tier2Forms} — per SUP-12693.`
     );
   }
   if (tier2.kind === "missing_evidence") {
     return (
       "A Tier 2 declaration was found but no probe evidence follows it — the line after " +
       `"${TIER_2_PREFIX}" is blank and no non-empty line follows. ` +
-      `Accepted form: ${TIER2_FORM} — per SUP-12693.`
+      `Accepted form: ${tier2Forms} — per SUP-12693.`
     );
   }
   if (tier1.kind === "not_at_line_start") {
@@ -1517,11 +1723,24 @@ export async function evaluateDoneTierDeclaration(
     projectId?: string | null;
     projectWorkspaceId?: string | null;
     executionWorkspaceId?: string | null;
+    // SUP-22801: the card's delivery classification selects the accepted Tier 2
+    // evidence grammar. Every production door passes the full issue row, so the
+    // field is present on real closes; an absent field keeps the
+    // repository-delivery contract (fail closed on the pre-existing grammar).
+    deliveryRequirement?: IssueDeliveryRequirement | null;
   },
   accompanyingComment: string | null,
   runId: string | null,
   listComments: (issueId: string) => Promise<IssueComment[]>,
 ): Promise<DoneTierDeclarationResult> {
+  // SUP-22801: a record_only card's primary accepted Tier 2 form is the
+  // record-only live-evidence grammar (no merge head by design); the merge-head
+  // form stays accepted when the card has a recorded merged work product, so
+  // both are named in classification-aware refusals. Repository deliveries see
+  // exactly the pre-existing form, byte for byte.
+  const tier2Forms = issue.deliveryRequirement === "record_only"
+    ? `${TIER2_RECORD_ONLY_FORM} or ${TIER2_FORM}`
+    : `${TIER2_FORM}`;
   const fallback = (reason: string, skipped = false, skipReason: string | null = null): DoneTierDeclarationResult => ({
     allowed: true,
     reason,
@@ -1535,8 +1754,9 @@ export async function evaluateDoneTierDeclaration(
     if (tier2.kind === "matched") {
       // SUP-21902: a matched Tier 2 sentence is no longer accepted on its face —
       // the origin predicate resolves the named probe head and compares it with
-      // the delivery merge head before the close is allowed.
-      return proveTier2Live(db, issue, tier2.evidence, false);
+      // the delivery merge head before the close is allowed. SUP-22801: on a
+      // record_only card the record-only grammar is proven locally instead.
+      return proveTier2Live(db, issue, tier2.evidence, false, issue.deliveryRequirement);
     }
     const tier1 = parseTier1Declaration(accompanyingComment);
     if (tier1.kind === "matched") {
@@ -1554,9 +1774,9 @@ export async function evaluateDoneTierDeclaration(
     return {
       allowed: false,
       reason:
-        describeTierRejection(tier2, tier1) ??
+        describeTierRejection(tier2, tier1, tier2Forms) ??
         ("Close comment is missing a done-tier declaration. Accepted forms: " +
-          `${TIER2_FORM}` +
+          `${tier2Forms}` +
           ` or ` +
           `${TIER1_FORM}` +
           ` — per SUP-12693.`),
@@ -1577,7 +1797,7 @@ export async function evaluateDoneTierDeclaration(
       allowed: false,
       reason:
         "No accompanying comment and no run id to look up a same-run comment; no done-tier declaration found. " +
-        `Accepted forms: ${TIER2_FORM}` +
+        `Accepted forms: ${tier2Forms}` +
         ` or ${TIER1_FORM}` +
         ` — per SUP-12693.`,
       tier: null,
@@ -1607,7 +1827,7 @@ export async function evaluateDoneTierDeclaration(
       allowed: false,
       reason:
         "No done-tier declaration found in the accompanying comment or the most recent same-run comment. " +
-        `Accepted forms: ${TIER2_FORM}` +
+        `Accepted forms: ${tier2Forms}` +
         ` or ${TIER1_FORM}` +
         ` — per SUP-12693.`,
       tier: null,
@@ -1621,7 +1841,7 @@ export async function evaluateDoneTierDeclaration(
     // SUP-21902: same-run Tier 2 declarations face the same origin predicate as
     // accompanying-comment ones — a pre-merge or unresolvable head is refused
     // identically on both doors.
-    return proveTier2Live(db, issue, tier2.evidence, true);
+    return proveTier2Live(db, issue, tier2.evidence, true, issue.deliveryRequirement);
   }
 
   const tier1 = parseTier1Declaration(sameRunComment.body);
@@ -1643,9 +1863,9 @@ export async function evaluateDoneTierDeclaration(
   return {
     allowed: false,
     reason:
-      describeTierRejection(tier2, tier1) ??
+      describeTierRejection(tier2, tier1, tier2Forms) ??
       ("Same-run comment does not contain a done-tier declaration. " +
-        `Accepted forms: ${TIER2_FORM}` +
+        `Accepted forms: ${tier2Forms}` +
         ` or ` +
         `${TIER1_FORM}` +
         ` — per SUP-12693.`),
