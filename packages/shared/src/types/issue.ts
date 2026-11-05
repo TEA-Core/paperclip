@@ -720,7 +720,8 @@ export interface IssueExecutionPolicy {
   /**
    * Maximum consecutive agent-initiated changes-requested rounds before the
    * pending stage escalates to the responsible human. Null uses the server
-   * default. Human decisions reset the round counter.
+   * default: 10 with `stallEscalation`, 3 without. Human decisions reset the
+   * round counter.
    */
   maxReviewRounds?: number | null;
   /** Absent or null keeps the plain round ceiling with no stall arbiter. */

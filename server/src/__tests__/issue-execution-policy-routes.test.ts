@@ -1657,7 +1657,7 @@ describe("issue execution policy routes", () => {
   }
 
   it("mints exactly one review-escalation interaction at the round cap (SUP-14805)", async () => {
-    const issue = roundCapReviewIssue({}, { changesRequestedCount: DEFAULT_MAX_REVIEW_ROUNDS - 1 });
+    const issue = roundCapReviewIssue({}, { changesRequestedCount: 2 });
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...issue,
@@ -1674,7 +1674,7 @@ describe("issue execution policy routes", () => {
       }),
     )
       .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-      .send({ status: "in_progress", comment: "Final agent round — still not converging" });
+      .send({ status: "in_progress", comment: "Round three — still not converging" });
 
     expect(res.status).toBe(200);
     // The stage stays pending and the responsible human becomes the assignee.
@@ -1685,7 +1685,7 @@ describe("issue execution policy routes", () => {
     expect(updatePatch.executionState).toMatchObject({
       status: "pending",
       currentParticipant: { type: "user", userId: "board-user" },
-      changesRequestedCount: DEFAULT_MAX_REVIEW_ROUNDS,
+      changesRequestedCount: 3,
     });
 
     // Exactly one interaction is minted, as a user-actor request_confirmation.
@@ -1709,9 +1709,7 @@ describe("issue execution policy routes", () => {
       sourceRunId: "77777777-7777-4777-8777-777777777777",
     });
     expect(createOptions.idempotencyKey).toMatch(
-      new RegExp(
-        `^review-escalation:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:11111111-1111-4111-8111-111111111111:${DEFAULT_MAX_REVIEW_ROUNDS}:[a-f0-9]{16}$`,
-      ),
+      /^review-escalation:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:11111111-1111-4111-8111-111111111111:3:[a-f0-9]{16}$/,
     );
     expect(createOptions.payload).toMatchObject({
       version: 1,
@@ -1722,8 +1720,8 @@ describe("issue execution policy routes", () => {
       allowDeclineReason: true,
     });
     const details = (createOptions.payload as { detailsMarkdown: string }).detailsMarkdown;
-    expect(details).toContain(`reaching the round cap of ${DEFAULT_MAX_REVIEW_ROUNDS}`);
-    expect(details).toContain("> Final agent round — still not converging");
+    expect(details).toContain("reaching the round cap of 3");
+    expect(details).toContain("> Round three — still not converging");
     expect(details).toContain("Return assignee: agent 44444444-4444-4444-8444-444444444444");
     expect(details).toContain("on issue `PAP-2001`");
     expect(details).toContain("a human send-back does not burn a round");

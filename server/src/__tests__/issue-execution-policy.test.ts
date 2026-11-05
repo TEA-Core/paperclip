@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, isReviewChangesRequestedTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { BASE_MAX_REVIEW_ROUNDS, DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, isReviewChangesRequestedTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
 import { HttpError } from "../errors.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
@@ -3838,12 +3838,12 @@ describe("review round circuit breaker", () => {
 
   it("escalates the pending stage to the responsible human at the round cap", () => {
     const result = applyIssueExecutionPolicyTransition({
-      issue: reviewPendingIssue({}, { changesRequestedCount: DEFAULT_MAX_REVIEW_ROUNDS - 1 }),
+      issue: reviewPendingIssue({}, { changesRequestedCount: 2 }),
       policy,
       requestedStatus: "in_progress",
       requestedAssigneePatch: {},
       actor: { agentId: qaAgentId },
-      commentBody: "Final agent round feedback — still not converging",
+      commentBody: "Round three feedback — still not converging",
     });
 
     // The decision is still recorded, but the stage stays pending with the
@@ -3856,26 +3856,26 @@ describe("review round circuit breaker", () => {
       status: "pending",
       currentStageId: reviewStageId,
       currentParticipant: { type: "user", userId: boardUserId },
-      changesRequestedCount: DEFAULT_MAX_REVIEW_ROUNDS,
+      changesRequestedCount: 3,
     });
   });
 
   it("emits the reviewEscalation signal only on the round-cap escalation (SUP-14805)", () => {
     const result = applyIssueExecutionPolicyTransition({
-      issue: reviewPendingIssue({}, { changesRequestedCount: DEFAULT_MAX_REVIEW_ROUNDS - 1 }),
+      issue: reviewPendingIssue({}, { changesRequestedCount: 2 }),
       policy,
       requestedStatus: "in_progress",
       requestedAssigneePatch: {},
       actor: { agentId: qaAgentId },
-      commentBody: "Final agent round feedback — still not converging",
+      commentBody: "Round three feedback — still not converging",
     });
 
     expect(result.reviewEscalation).toMatchObject({
       escalatedToUserId: boardUserId,
       stageId: reviewStageId,
       stageType: "review",
-      maxRounds: DEFAULT_MAX_REVIEW_ROUNDS,
-      changesRequestedCount: DEFAULT_MAX_REVIEW_ROUNDS,
+      maxRounds: BASE_MAX_REVIEW_ROUNDS,
+      changesRequestedCount: 3,
       returnAssignee: { type: "agent", agentId: coderAgentId },
     });
   });
@@ -4092,55 +4092,84 @@ describe("review round circuit breaker", () => {
     });
   });
 
-  it("lets an agent loop run to the default ceiling of 10 rounds before escalating (R20)", () => {
-    const ninth = applyIssueExecutionPolicyTransition({
-      issue: reviewPendingIssue({}, { changesRequestedCount: 8 }),
-      policy,
-      requestedStatus: "in_progress",
-      requestedAssigneePatch: {},
-      actor: { agentId: qaAgentId },
-      commentBody: "Round nine feedback",
-    });
-    expect(ninth.patch.status).toBe("in_progress");
-    expect(ninth.patch.assigneeAgentId).toBe(coderAgentId);
-    expect(ninth.reviewEscalation).toBeUndefined();
+  describe("effective round ceiling (R20)", () => {
+    const arbiterId = "44444444-4444-4444-8444-444444444444";
+    const stallEscalation = { afterRounds: 2, toAgentId: arbiterId };
 
-    const tenth = applyIssueExecutionPolicyTransition({
-      issue: reviewPendingIssue({}, { changesRequestedCount: 9 }),
-      policy,
-      requestedStatus: "in_progress",
-      requestedAssigneePatch: {},
-      actor: { agentId: qaAgentId },
-      commentBody: "Round ten feedback",
-    });
-    expect(tenth.patch.status).toBe("in_review");
-    expect(tenth.patch.assigneeUserId).toBe(boardUserId);
-    expect(tenth.reviewEscalation).toMatchObject({ maxRounds: 10, changesRequestedCount: 10 });
-  });
+    function agentRound(withPolicy: typeof policy, changesRequestedCount: number) {
+      return applyIssueExecutionPolicyTransition({
+        issue: reviewPendingIssue({ executionPolicy: withPolicy }, { changesRequestedCount }),
+        policy: withPolicy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: `Round ${changesRequestedCount + 1} feedback`,
+      });
+    }
 
-  it("keeps a hold escalated at the pre-R20 ceiling of 3 sticky after the ceiling rose (R20)", () => {
-    const held = reviewPendingIssue(
-      { assigneeAgentId: null, assigneeUserId: boardUserId },
-      { currentParticipant: { type: "user", userId: boardUserId }, changesRequestedCount: 3 },
-    );
-    const unrelated = applyIssueExecutionPolicyTransition({
-      issue: held,
-      policy,
-      requestedAssigneePatch: {},
-      actor: { agentId: coderAgentId },
-    });
-    expect(unrelated.patch.executionState).toBeUndefined();
-    expect(unrelated.patch.assigneeAgentId).toBeUndefined();
+    it("keeps the ceiling of 3 without stallEscalation", () => {
+      const second = agentRound(policy, 1);
+      expect(second.patch.status).toBe("in_progress");
+      expect(second.reviewEscalation).toBeUndefined();
 
-    const humanApproves = applyIssueExecutionPolicyTransition({
-      issue: held,
-      policy,
-      requestedStatus: "done",
-      requestedAssigneePatch: {},
-      actor: { userId: boardUserId },
-      commentBody: "Approved from the escalation",
+      const third = agentRound(policy, 2);
+      expect(third.patch.status).toBe("in_review");
+      expect(third.patch.assigneeUserId).toBe(boardUserId);
+      expect(third.reviewEscalation).toMatchObject({ maxRounds: 3, changesRequestedCount: 3 });
     });
-    expect(humanApproves.decision).toMatchObject({ outcome: "approved" });
+
+    it("lets a policy with stallEscalation run to 10 rounds before escalating", () => {
+      const stalled = { ...policy, stallEscalation } as typeof policy;
+      const third = agentRound(stalled, 2);
+      expect(third.patch.status).toBe("in_progress");
+      expect(third.patch.assigneeAgentId).toBe(coderAgentId);
+      expect(third.reviewEscalation).toBeUndefined();
+
+      const ninth = agentRound(stalled, 8);
+      expect(ninth.patch.status).toBe("in_progress");
+      expect(ninth.reviewEscalation).toBeUndefined();
+
+      const tenth = agentRound(stalled, 9);
+      expect(tenth.patch.status).toBe("in_review");
+      expect(tenth.patch.assigneeUserId).toBe(boardUserId);
+      expect(tenth.reviewEscalation).toMatchObject({ maxRounds: DEFAULT_MAX_REVIEW_ROUNDS, changesRequestedCount: 10 });
+    });
+
+    it("honours an explicit maxReviewRounds with and without stallEscalation", () => {
+      const plain = { ...policy, maxReviewRounds: 5 } as typeof policy;
+      expect(agentRound(plain, 3).reviewEscalation).toBeUndefined();
+      expect(agentRound(plain, 4).reviewEscalation).toMatchObject({ maxRounds: 5, changesRequestedCount: 5 });
+
+      const stalled = { ...policy, maxReviewRounds: 4, stallEscalation } as typeof policy;
+      expect(agentRound(stalled, 2).reviewEscalation).toBeUndefined();
+      expect(agentRound(stalled, 3).reviewEscalation).toMatchObject({ maxRounds: 4, changesRequestedCount: 4 });
+    });
+
+    it("keeps a hold escalated at round 3 sticky under a stall-arbiter policy whose ceiling is 10", () => {
+      const stalled = { ...policy, stallEscalation } as typeof policy;
+      const held = reviewPendingIssue(
+        { executionPolicy: stalled, assigneeAgentId: null, assigneeUserId: boardUserId },
+        { currentParticipant: { type: "user", userId: boardUserId }, changesRequestedCount: 3 },
+      );
+      const unrelated = applyIssueExecutionPolicyTransition({
+        issue: held,
+        policy: stalled,
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+      expect(unrelated.patch.executionState).toBeUndefined();
+      expect(unrelated.patch.assigneeAgentId).toBeUndefined();
+
+      const humanApproves = applyIssueExecutionPolicyTransition({
+        issue: held,
+        policy: stalled,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { userId: boardUserId },
+        commentBody: "Approved from the escalation",
+      });
+      expect(humanApproves.decision).toMatchObject({ outcome: "approved" });
+    });
   });
 });
 

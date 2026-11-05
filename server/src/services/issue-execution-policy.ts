@@ -153,11 +153,16 @@ type TransitionResult = {
  * Consecutive agent-initiated changes-requested rounds tolerated on one stage
  * before the pending review escalates to the responsible human. Policies can
  * override via `maxReviewRounds`; human decisions always reset the counter.
- * Raised from 3 to 10 together with the stall arbiter (R20): a loop that still
- * makes progress may run to 10, a stalled one is caught earlier by
- * `stallEscalation`. Rollback: back to 3 with `stallEscalation` ignored.
+ * The raised ceiling of 10 (R20) applies only to a policy that carries
+ * `stallEscalation`: a loop that still makes progress may run to 10, a stalled
+ * one is caught earlier by the arbiter. A policy without `stallEscalation`
+ * keeps `BASE_MAX_REVIEW_ROUNDS`, so the raise never yields a bare 10.
+ * Rollback: set this back to 3 with `stallEscalation` ignored.
  */
 export const DEFAULT_MAX_REVIEW_ROUNDS = 10;
+
+/** Pre-R20 default ceiling, kept for policies with no stall arbiter. */
+export const BASE_MAX_REVIEW_ROUNDS = 3;
 
 /**
  * R20 stall signal written by a reviewer: a decision-comment line saying the
@@ -557,6 +562,8 @@ export function normalizeIssueExecutionPolicy(
   const baseRef = parsed.data.baseRef ?? null;
   const stallEscalation = parsed.data.stallEscalation ?? null;
   if (stallEscalation) {
+    // At afterRounds == ceiling the responsible human receives the stage first;
+    // the arbiter acts at that round only when the issue has no responsible human.
     const ceiling = parsed.data.maxReviewRounds ?? DEFAULT_MAX_REVIEW_ROUNDS;
     if (stallEscalation.afterRounds > ceiling) {
       throw unprocessable(
@@ -1051,19 +1058,20 @@ function principalsEqual(a: IssueExecutionStagePrincipal | null, b: IssueExecuti
 
 function resolveMaxReviewRounds(policy: IssueExecutionPolicy | null): number {
   const configured = policy?.maxReviewRounds;
-  return typeof configured === "number" && configured > 0 ? configured : DEFAULT_MAX_REVIEW_ROUNDS;
+  if (typeof configured === "number" && configured > 0) return configured;
+  return policy?.stallEscalation ? DEFAULT_MAX_REVIEW_ROUNDS : BASE_MAX_REVIEW_ROUNDS;
 }
 
 /**
  * Rounds from which a human non-participant on a pending stage counts as an
  * escalated hold. Without an explicit `maxReviewRounds` this stays at the
- * pre-R20 default ceiling (3), not the raised one: holds escalated at round 3
+ * pre-R20 default ceiling, not the raised one: holds escalated at round 3
  * before the ceiling rose must stay held, and a new escalation always lands at
  * or above the ceiling, so it is recognised too.
  */
 function resolveEscalatedHoldMinRounds(policy: IssueExecutionPolicy | null): number {
   const configured = policy?.maxReviewRounds;
-  return typeof configured === "number" && configured > 0 ? configured : 3;
+  return typeof configured === "number" && configured > 0 ? configured : BASE_MAX_REVIEW_ROUNDS;
 }
 
 function stallArbiterPrincipal(policy: IssueExecutionPolicy | null): IssueExecutionStagePrincipal | null {

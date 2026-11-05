@@ -130,7 +130,7 @@ interface IssueExecutionDecision {
 
 ### Round Ceiling and Stall Escalation
 
-Consecutive agent `changes_requested` decisions on one stage are counted in `executionState.changesRequestedCount`; a human decision resets the count. When the count reaches the round ceiling (`maxReviewRounds`, default **10**), the stage stays pending and is handed to the issue's responsible human instead of the implementer.
+Consecutive agent `changes_requested` decisions on one stage are counted in `executionState.changesRequestedCount`; a human decision resets the count. When the count reaches the round ceiling, the stage stays pending and is handed to the issue's responsible human instead of the implementer. The ceiling is `maxReviewRounds` when set; otherwise **10** for a policy that carries `stallEscalation` and **3** for a policy that does not, so the raised ceiling never applies without a stall arbiter.
 
 A loop that stops making progress is caught earlier by the optional `stallEscalation`:
 
@@ -149,7 +149,7 @@ A loop that stops making progress is caught earlier by the optional `stallEscala
 - With a stall signal, the stage stays pending on the same issue and is handed once to `toAgentId` (recorded in `executionState.stallHandoff` and as an `issue.review_stall_escalated` activity). The reviewer's decision is still recorded and the round count keeps running, so the ceiling still escalates to the human afterwards.
 - The arbiter **advises only**: it can request changes with a directive (the issue returns to the implementer and the next delivery goes back to the stage reviewer) or park the issue `blocked`; an approval from the arbiter is refused.
 - A stage-run is handed to the arbiter at most once. The arbiter is never the issue's return assignee or delivery author, and never a review-stage participant.
-- Validation: `afterRounds` is a positive integer no greater than the round ceiling; `toAgentId` must be an assignable agent in the issue's company. Without `stallEscalation` the loop runs to the ceiling as before.
+- Validation: `afterRounds` is a positive integer no greater than the round ceiling (10 unless `maxReviewRounds` is set); `toAgentId` must be an assignable agent in the issue's company. At `afterRounds` equal to the ceiling, a responsible human receives the stage first; the arbiter acts at that round only when the issue has no responsible human. Without `stallEscalation` the loop keeps the ceiling of 3.
 
 ### Policy Variants
 
