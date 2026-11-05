@@ -27,6 +27,9 @@ import { PROJECT_REPOSITORIES_DIR } from "@paperclipai/adapter-utils/git-workspa
 //     global excludes and attributes files and the commit graph off through
 //     command-line configuration, which outranks repository configuration
 //     no matter when the repository writes it;
+//   - allows no transport and no lazy fetch, so a promisor remote written into
+//     the repository's configuration cannot make a missing object run
+//     `core.sshCommand`, `remote.*.uploadpack` or any other transport helper;
 //   - is killed after a timeout.
 // The pre-existing fail-open probes opt out of the from-scratch environment
 // (`inheritEnvironment`) so the server's safe.directory and global
@@ -115,6 +118,8 @@ function hardenedGitEnv(ceilingDirectory: string | null): NodeJS.ProcessEnv {
     GIT_TERMINAL_PROMPT: "0",
     GIT_NO_REPLACE_OBJECTS: "1",
     GIT_GRAFT_FILE: "/dev/null",
+    GIT_ALLOW_PROTOCOL: "",
+    GIT_NO_LAZY_FETCH: "1",
     GIT_CONFIG_COUNT: String(FORCED_CONFIG.length),
   };
   FORCED_CONFIG.forEach(([key, value], index) => {

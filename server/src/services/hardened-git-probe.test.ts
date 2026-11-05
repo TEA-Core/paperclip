@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -363,6 +363,36 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
     const result = await probeNoRepositoryWorktree(layout.input);
     expect(result).toMatchObject({ ok: true });
     expect(existsSync(marker)).toBe(false);
+  });
+
+  // A promisor remote in the (agent-writable) repository configuration turns a
+  // missing object into a fetch, and a fetch runs the configured transport
+  // helper. The branch ref names an object that does not exist, so reading HEAD
+  // would trigger it.
+  describe("lazy fetch from a promisor remote written into the repository configuration", () => {
+    const MISSING_OBJECT = "1234567890abcdef1234567890abcdef12345678";
+
+    it.each([
+      ["remote.<name>.uploadpack on a local-path remote", (layout: ManagedLayout, program: string) =>
+        `[remote "evil"]\n\turl = ${layout.origin}\n\tpromisor = true\n\tuploadpack = ${program}\n`],
+      ["core.sshCommand on an ssh:// remote", (_layout: ManagedLayout, program: string) =>
+        `[core]\n\tsshCommand = ${program}\n[remote "evil"]\n\turl = ssh://evil.example.invalid/repo.git\n\tpromisor = true\n`],
+    ])("does not run %s when the issue branch names a missing object, and refuses the close", async (_label, remoteConfig) => {
+      const layout = managedLayout();
+      const program = path.join(root, "planted-transport.sh");
+      writeFileSync(program, `#!/bin/sh\necho fired >> '${marker}'\nexit 1\n`);
+      chmodSync(program, 0o755);
+      appendFileSync(
+        path.join(layout.repoRoot, ".git", "config"),
+        `[core]\n\trepositoryformatversion = 1\n[extensions]\n\tpartialClone = evil\n${remoteConfig(layout, program)}`,
+      );
+      writeFileSync(path.join(layout.repoRoot, ".git", "refs", "heads", "SUP-7-record-ruling"), `${MISSING_OBJECT}\n`);
+
+      const result = await probeNoRepositoryWorktree(layout.input);
+
+      expect(result).toEqual({ ok: false, reason: "the recorded worktree has no HEAD commit" });
+      expect(existsSync(marker)).toBe(false);
+    });
   });
 
   it("measures the real work tree, not the decoy a planted core.worktree points at", async () => {
