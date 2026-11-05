@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import { statSync } from "node:fs";
-import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { constants as fsConstants, statSync } from "node:fs";
+import { lstat, mkdir, mkdtemp, open, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PROJECT_REPOSITORIES_DIR } from "@paperclipai/adapter-utils/git-workspace-sync";
@@ -46,6 +46,8 @@ const TRUSTED_GIT_BINARY_PATHS = ["/usr/bin/git", "/usr/local/bin/git", "/bin/gi
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_BUFFER = 16 * 1024 * 1024;
 const MAX_COMPARED_TIPS = 5;
+const MAX_EXCLUDE_FILE_BYTES = 1024 * 1024;
+const MAX_INDEX_FILE_BYTES = 256 * 1024 * 1024;
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 // The two overrides that stop repository-local configuration from running a
@@ -250,9 +252,37 @@ async function readHeadCommit(worktreePath: string, options: HardenedGitOptions)
   }
 }
 
-async function readOptionalFile(target: string): Promise<string | null> {
+/**
+ * Reads a file inside the agent-writable repository. It is opened without
+ * following a symlink and without blocking on a FIFO, must be a regular file no
+ * larger than `maxBytes`, and is read through the handle, so a swapped-in FIFO,
+ * `/dev/zero` link or oversize file fails instead of hanging a thread or
+ * exhausting memory. Throws on anything else.
+ */
+async function readRegularFile(target: string, maxBytes: number): Promise<Buffer> {
+  const handle = await open(target, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | (fsConstants.O_NOFOLLOW ?? 0));
   try {
-    return await readFile(target, "utf8");
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > maxBytes) {
+      throw new HardenedGitError("failed", "not a regular file within the size limit");
+    }
+    const buffer = Buffer.allocUnsafe(stat.size + 1);
+    let filled = 0;
+    while (filled < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, filled, buffer.length - filled, null);
+      if (bytesRead === 0) break;
+      filled += bytesRead;
+    }
+    if (filled > stat.size) throw new HardenedGitError("failed", "file grew while it was read");
+    return buffer.subarray(0, filled);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readOptionalRegularFile(target: string, maxBytes: number): Promise<string | null> {
+  try {
+    return (await readRegularFile(target, maxBytes)).toString("utf8");
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
     throw error;
@@ -288,7 +318,10 @@ async function withSnapshotGitDir<T>(
     if (input.exclude !== null) await writeFile(path.join(snapshot, "info", "exclude"), input.exclude);
     for (const name of await readdir(input.identity.gitDir)) {
       if (name === "index" || name.startsWith("sharedindex.")) {
-        await copyFile(path.join(input.identity.gitDir, name), path.join(snapshot, name));
+        await writeFile(
+          path.join(snapshot, name),
+          await readRegularFile(path.join(input.identity.gitDir, name), MAX_INDEX_FILE_BYTES),
+        );
       }
     }
     return await fn(snapshot);
@@ -480,7 +513,12 @@ async function verifyCleanLinkedWorktree(
   if (await lstat(path.join(identity.gitDir, "index.lock")).then(() => true, () => false)) {
     return { ok: false, reason: "has a Git operation in progress (index.lock is present)" };
   }
-  const exclude = await readOptionalFile(path.join(identity.commonDir, "info", "exclude"));
+  let exclude: string | null;
+  try {
+    exclude = await readOptionalRegularFile(path.join(identity.commonDir, "info", "exclude"), MAX_EXCLUDE_FILE_BYTES);
+  } catch {
+    return { ok: false, reason: "status could not be verified" };
+  }
   if (
     exclude !== null &&
     exclude.split(/\r?\n/).some((line) => {

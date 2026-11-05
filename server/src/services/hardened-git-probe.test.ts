@@ -765,6 +765,80 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
       expect(outcome).toMatchObject({ ok: false });
     }, 70_000);
 
+    // The probe itself (not git) reads info/exclude and copies the index. Both
+    // live in the group-writable repository, so each is swapped for something
+    // that would hang a thread or exhaust memory if it were opened naively.
+    describe("repository files the probe reads itself", () => {
+      const PROMPT_MS = 5_000;
+      const UNVERIFIED = { ok: false, reason: "the recorded worktree status could not be verified" } as const;
+
+      function excludeFile(layout: ManagedLayout) {
+        return path.join(layout.repoRoot, ".git", "info", "exclude");
+      }
+
+      function indexFile(layout: ManagedLayout, worktree = layout.worktree) {
+        return path.join(git(worktree, "rev-parse", "--absolute-git-dir"), "index");
+      }
+
+      async function probePromptly(input: ManagedLayout["input"]) {
+        const started = performance.now();
+        const result = await probeNoRepositoryWorktree(input);
+        expect(performance.now() - started, "the probe hung on a swapped-in file").toBeLessThan(PROMPT_MS);
+        return result;
+      }
+
+      it("accepts a worktree whose info/exclude is absent", async () => {
+        const layout = managedLayout();
+        rmSync(excludeFile(layout));
+        expect(await probePromptly(layout.input)).toMatchObject({ ok: true });
+      });
+
+      it.each([
+        ["a FIFO at info/exclude", (layout: ManagedLayout) => {
+          rmSync(excludeFile(layout));
+          execFileSync("mkfifo", [excludeFile(layout)]);
+        }],
+        ["a symlink to /dev/zero at info/exclude", (layout: ManagedLayout) => {
+          rmSync(excludeFile(layout));
+          symlinkSync("/dev/zero", excludeFile(layout));
+        }],
+        ["a symlink to a regular file at info/exclude", (layout: ManagedLayout) => {
+          const target = path.join(root, "exclude-target");
+          writeFileSync(target, "# nothing\n");
+          rmSync(excludeFile(layout));
+          symlinkSync(target, excludeFile(layout));
+        }],
+        ["an info/exclude larger than the size limit", (layout: ManagedLayout) => {
+          writeFileSync(excludeFile(layout), `${"# padding\n".repeat(150_000)}`);
+        }],
+        ["a FIFO at the worktree's index", (layout: ManagedLayout) => {
+          rmSync(indexFile(layout));
+          execFileSync("mkfifo", [indexFile(layout)]);
+        }],
+        ["a symlink to /dev/zero at the worktree's index", (layout: ManagedLayout) => {
+          const target = indexFile(layout);
+          rmSync(target);
+          symlinkSync("/dev/zero", target);
+        }],
+      ])("refuses %s promptly", async (_label, swap) => {
+        const layout = managedLayout();
+        swap(layout);
+        expect(await probePromptly(layout.input)).toEqual(UNVERIFIED);
+      });
+
+      it("refuses promptly when another worktree naming the issue has a FIFO as its index", async () => {
+        const layout = managedLayout();
+        const fabricated = layout.addWorktree("SUP-7-fresh");
+        const index = indexFile(layout);
+        rmSync(index);
+        execFileSync("mkfifo", [index]);
+        expect(await probePromptly({ ...layout.input, recordedWorktreePath: fabricated })).toEqual({
+          ok: false,
+          reason: "another worktree on branch SUP-7-record-ruling status could not be verified",
+        });
+      });
+    });
+
     it("refuses when the snapshot directory cannot be created", async () => {
       const layout = managedLayout();
       const previous = process.env.TMPDIR;
