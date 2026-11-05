@@ -871,7 +871,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       ],
       [
         "T1",
-        "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip merge commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa. Liveness unverified.",
+        "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip merge commit 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19. Liveness unverified.",
       ],
     ] as const) {
       const { companyId, reviewerAgentId, issueId, identifier } =

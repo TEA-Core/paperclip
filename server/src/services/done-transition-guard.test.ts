@@ -6187,8 +6187,37 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(compareUrl).toContain("fold%2Ftea-patches-v2026.722.0");
     });
 
-    it("accepts landed-at-tip when the named merge commit is an ancestor of the default branch", async () => {
+    it("SUP-23031: refuses landed-at-tip when the ancestor sha does not belong to this issue", async () => {
+      // The SUP-22365 shape: the named sha IS the repo tip (ahead_by 0), but
+      // no linked PR, delivery head, or work product ties it to this card —
+      // ancestry alone must not accept a stranger's already-landed commit.
       compareAhead(0);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain(MERGE_SHA);
+      expect(result.reason).toContain("does not belong to this issue");
+      expect(result.reason).toContain("linked merged PR merge commit");
+      const compareUrl = ghFetchMock.mock.calls.map(([url]) => String(url)).find((url) => url.includes("/compare/"));
+      expect(compareUrl).toContain(encodeURIComponent(MERGE_SHA));
+    });
+
+    it("SUP-23031: accepts landed-at-tip when the named sha equals a linked merged PR's recorded merge_commit_sha", async () => {
+      compareAhead(0);
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        {
+          ...linkedPr(4103, "closed"),
+          merged: true,
+          mergeCommitSha: MERGE_SHA,
+        },
+      ]);
       const result = await evaluateDoneTierDeclaration(
         mockDb,
         landedIssue(),
@@ -6198,9 +6227,182 @@ describe("evaluateDoneTierDeclaration", () => {
       );
       expect(result.allowed).toBe(true);
       expect(result.tier).toBe("tier1");
-      const compareUrl = ghFetchMock.mock.calls.map(([url]) => String(url)).find((url) => url.includes("/compare/"));
-      expect(compareUrl).toContain(encodeURIComponent(MERGE_SHA));
-      expect(compareUrl).toContain("fold%2Ftea-patches-v2026.722.0");
+      // The cached MERGED row corroborates on its own: no live /pulls probe.
+      const urls = ghFetchMock.mock.calls.map(([url]) => String(url));
+      expect(urls.some((u) => u.includes("/pulls/4103"))).toBe(false);
+    });
+
+    it("SUP-23031: accepts landed-at-tip on a short named sha that prefixes the linked merged PR's merge_commit_sha", async () => {
+      compareAhead(0);
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        {
+          ...linkedPr(4104, "closed"),
+          merged: true,
+          mergeCommitSha: MERGE_SHA,
+        },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA.slice(0, 12)}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("SUP-23031: hydrates a stale-open linked row and accepts when the live merge corroborates the named sha", async () => {
+      compareAhead(0);
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        {
+          ...linkedPr(4105, "open"),
+          merged: undefined,
+          mergeCommitSha: null,
+        },
+      ]);
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (String(url).includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        }
+        if (String(url).includes("/pulls/4105")) {
+          return new Response(
+            JSON.stringify({ state: "closed", merged: true, merge_commit_sha: MERGE_SHA, draft: false }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+      const urls = ghFetchMock.mock.calls.map(([url]) => String(url));
+      expect(urls.some((u) => u.includes("/pulls/4105"))).toBe(true);
+    });
+
+    it("SUP-23031: tries the next repo credential when a stale linked row cannot hydrate with the first", async () => {
+      compareAhead(0);
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        {
+          ...linkedPr(4106, "open"),
+          merged: undefined,
+          mergeCommitSha: null,
+        },
+      ]);
+      mockResolveGitHubTokenCandidatesForRepo.mockResolvedValue([
+        { token: "wrong-repo-token", scope: "company", secretName: "GITHUB_TOKEN" },
+        { token: "right-repo-token", scope: "company", secretName: "GITHUB_TOKEN" },
+      ]);
+      const authByCall: string[] = [];
+      ghFetchMock.mockImplementation(async (url: string, init) => {
+        if (String(url).includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        }
+        if (String(url).includes("/pulls/4106")) {
+          const authorization = (init as { headers?: Record<string, string> } | undefined)?.headers?.authorization ?? "";
+          authByCall.push(authorization);
+          if (authorization === "Bearer wrong-repo-token") {
+            return new Response("{}", { status: 403 });
+          }
+          return new Response(
+            JSON.stringify({ state: "closed", merged: true, merge_commit_sha: MERGE_SHA, draft: false }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+      expect(authByCall).toEqual(["Bearer wrong-repo-token", "Bearer right-repo-token"]);
+    });
+
+    it("SUP-23031: refuses when the linked PR is recorded merged with a different merge commit and no work product corroborates", async () => {
+      compareAhead(0);
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        {
+          ...linkedPr(4106, "closed"),
+          merged: true,
+          mergeCommitSha: STRANGER_SHA,
+        },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("does not belong to this issue");
+      // A terminally recorded MERGED row with a different sha needs no live probe.
+      const urls = ghFetchMock.mock.calls.map(([url]) => String(url));
+      expect(urls.some((u) => u.includes("/pulls/4106"))).toBe(false);
+    });
+
+    it("SUP-23031: accepts landed-at-tip when the named sha equals the issue's recorded work-product merge commit", async () => {
+      compareAhead(0);
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueWorkProducts: [{ metadata: { mergeCommitSha: MERGE_SHA, mergedAt: "2026-11-04T00:00:00.000Z" } }],
+      });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("SUP-23031: accepts landed-at-tip when the named sha equals the issue's recorded delivery head", async () => {
+      compareAhead(0);
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueWorkProducts: [{ metadata: { headSha: MERGE_SHA, prNumber: 4107 } }],
+      });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("SUP-23031: refuses when a work product exists but records a different head and merge commit", async () => {
+      compareAhead(0);
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueWorkProducts: [{ metadata: { headSha: STRANGER_SHA, mergeCommitSha: STRANGER_SHA } }],
+      });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("does not belong to this issue");
     });
 
     describe("SUP-22973 cross-repo landed-at-tip via linked merged PR", () => {
