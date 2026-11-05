@@ -6181,9 +6181,9 @@ describe("evaluateDoneTierDeclaration", () => {
       // identified actor through PATCH /api/issues/{id}; the probe-backed proof
       // lives in done-transition-no-repository-landing-routes.test.ts.
       it.each([
-        { name: "a repository_delivery issue", deliveryRequirement: "repository_delivery", reason: "only on a record_only issue" },
-        { name: "a record_only issue without an identified closing actor", deliveryRequirement: "record_only", reason: "identified closing actor" },
-      ])("refuses $name", async ({ deliveryRequirement, reason }) => {
+        { name: "a repository_delivery issue", deliveryRequirement: "repository_delivery", reason: "only on a record_only issue", namesReclassification: true },
+        { name: "a record_only issue without an identified closing actor", deliveryRequirement: "record_only", reason: "identified closing actor", namesReclassification: false },
+      ])("refuses $name", async ({ deliveryRequirement, reason, namesReclassification }) => {
         const result = await evaluateDoneTierDeclaration(
           mockDb,
           { ...tierIssue, deliveryRequirement: deliveryRequirement as "record_only" | "repository_delivery" },
@@ -6194,6 +6194,12 @@ describe("evaluateDoneTierDeclaration", () => {
         expect(result.allowed).toBe(false);
         expect(result.tier).toBe(null);
         expect(result.reason).toContain(reason);
+        if (namesReclassification) {
+          expect(result.remedy).toContain('PATCH /api/issues/{id} { "deliveryRequirement": "record_only" }');
+          expect(result.remedy).toContain("authorized board user");
+        } else {
+          expect(result.remedy).toBeUndefined();
+        }
         expect(ghFetchMock).not.toHaveBeenCalled();
       });
     });

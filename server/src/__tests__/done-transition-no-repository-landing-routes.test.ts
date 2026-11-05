@@ -412,6 +412,26 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 
+  it("refuses a repository_delivery card with no pull request work product, naming the record_only path in the remedy", async () => {
+    const fixture = await seed({ deliveryRequirement: "repository_delivery" });
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    const products = await db
+      .select({ id: issueWorkProducts.id })
+      .from(issueWorkProducts)
+      .where(eq(issueWorkProducts.issueId, fixture.issueId));
+    expect(products).toHaveLength(0);
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(res.body.error).toContain("is accepted only on a record_only issue");
+    expect(res.body.details.remedy).toContain("authorized board user");
+    expect(res.body.details.remedy).toContain('{ "deliveryRequirement": "record_only" }');
+    expect(res.body.details.remedy).toContain("no-repository-landing form");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
   it("refuses a ruling the closing agent wrote", async () => {
     const fixture = await seed();
     await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.closerAgentId });

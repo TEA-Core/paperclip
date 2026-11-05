@@ -5499,7 +5499,7 @@ export function issueRoutes(
       const tier2CommentForm = issue.deliveryRequirement === "record_only"
         ? TIER2_RECORD_ONLY_FORM
         : TIER2_FORM;
-      const remedy = input.createDoor
+      const remedy = tierResult.remedy ?? (input.createDoor
         ? "An issue cannot be created already done with a done-tier declaration: createIssueSchema accepts neither a close comment nor the structured doneTier field. Create the issue in a non-terminal status first, then close it via PATCH /api/issues/{id} with the structured doneTier field in the same request body: " +
           `${structuredForms}` +
           noRepositoryStructuredFormSuffix(issue) +
@@ -5515,7 +5515,7 @@ export function issueRoutes(
           `${tier2CommentForm}` +
           ` or ${TIER1_FORM}` +
           noRepositoryTier1FormSuffix(issue) +
-          ` — per SUP-12693.`;
+          ` — per SUP-12693.`);
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
       // a record-write failure propagates to the route's error handler (5xx) rather than
       // returning a 422 with no thread-readable code/remedy (SUP-15878 precedent).

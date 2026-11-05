@@ -287,6 +287,9 @@ export interface DoneTierDeclarationResult {
   // no-repository form. The accepting door must re-run
   // verifyNoRepositoryLandingAtTransition inside its status write.
   landing?: "noRepositoryLanding";
+  // A remedy specific to this refusal. A door that builds its own generic remedy
+  // for a refused declaration uses this one instead when it is set.
+  remedy?: string;
 }
 
 function appendSkipReason(current: string | null, piece: string): string {
@@ -829,13 +832,14 @@ const LANDING_BACKSTOP_CARRIER = "done-close-landing-backstop";
 const NAMED_PR_RE = /\bPR #([1-9][0-9]*)\b/;
 const NAMED_MERGE_COMMIT_RE = /\b([0-9a-f]{7,40})\b/i;
 
-function refuseTier1(reason: string): DoneTierDeclarationResult {
+function refuseTier1(reason: string, remedy?: string): DoneTierDeclarationResult {
   return {
     allowed: false,
     reason,
     tier: null,
     skipped: false,
     skipReason: null,
+    ...(remedy === undefined ? {} : { remedy }),
   };
 }
 
@@ -1755,6 +1759,19 @@ async function proveTier2Live(
 // for one that has no repository deliverable at all. It is accepted only when
 // every check below holds, and the accepting door re-runs the same checks
 // inside its status write (verifyNoRepositoryLandingAtTransition).
+//
+// This replaces the no-repository form PR 1114 (SUP-23044) landed on the fold
+// branch, which a repository_delivery card could also use when it had no pull
+// request work product or merge commit. A close that records no repository
+// evidence is truthful only where the card is classified as having no repository
+// deliverable and the hardened probe below proves the worktree is empty, so a
+// repository_delivery card now refuses, and the refusal names the way forward:
+// a board user reclassifies the card to record_only, then it closes with the form.
+const REPOSITORY_DELIVERY_RECLASSIFY_REMEDY =
+  "This card is classified repository_delivery, and the no-repository close form is accepted only on a record_only card. " +
+  "If the card genuinely has no repository deliverable, ask an authorized board user to reclassify it with " +
+  'PATCH /api/issues/{id} { "deliveryRequirement": "record_only" } (an agent cannot reclassify a card it is assigned), ' +
+  "then close it with the no-repository-landing form; otherwise land the card's pull request and close it with a delivery declaration.";
 const NO_REPOSITORY_LANDING_TOKEN = "no-repository-landing";
 const GITHUB_BASE_COMPARE_TIMEOUT_MS = 15_000;
 const ENTRY_RULING_DOCUMENT_KEY = "entry-ruling";
@@ -1773,7 +1790,7 @@ export interface NoRepositoryLandingSubject {
   deliveryRequirement?: IssueDeliveryRequirement | null;
 }
 
-export type NoRepositoryLandingVerdict = { ok: true } | { ok: false; reason: string };
+export type NoRepositoryLandingVerdict = { ok: true } | { ok: false; reason: string; remedy?: string };
 
 // Repository evidence a no-repository declaration must not carry: a close that
 // claims no repository landing while citing a PR, a commit, a ref or a GitHub
@@ -1794,8 +1811,8 @@ function citedRepositoryEvidence(text: string): string | null {
   return extractCitedCommitShas(text).length > 0 ? "a commit SHA" : null;
 }
 
-function noRepositoryRefusal(reason: string): NoRepositoryLandingVerdict {
-  return { ok: false, reason: `Tier 1 "${NO_REPOSITORY_LANDING_TOKEN}" ${reason}` };
+function noRepositoryRefusal(reason: string, remedy?: string): NoRepositoryLandingVerdict {
+  return { ok: false, reason: `Tier 1 "${NO_REPOSITORY_LANDING_TOKEN}" ${reason}`, ...(remedy === undefined ? {} : { remedy }) };
 }
 
 async function verifyNoRepositoryLanding(
@@ -1804,7 +1821,7 @@ async function verifyNoRepositoryLanding(
   closingActor: DoneTierClosingActor | null,
 ): Promise<NoRepositoryLandingVerdict> {
   if (issue.deliveryRequirement !== "record_only") {
-    return noRepositoryRefusal("is accepted only on a record_only issue.");
+    return noRepositoryRefusal("is accepted only on a record_only issue.", REPOSITORY_DELIVERY_RECLASSIFY_REMEDY);
   }
   if (!closingActor || (!closingActor.agentId && !closingActor.userId)) {
     return noRepositoryRefusal("is accepted only through PATCH /api/issues/{id} by an identified closing actor.");
@@ -2058,7 +2075,7 @@ async function proveNoRepositoryLanding(
       `Tier 1 "${NO_REPOSITORY_LANDING_TOKEN}" could not be verified at the close boundary (${err instanceof Error ? err.message : "unknown"}).`,
     );
   }
-  if (!verdict.ok) return refuseTier1(verdict.reason);
+  if (!verdict.ok) return refuseTier1(verdict.reason, verdict.remedy);
   return { ...acceptTier1(reason, sameRun), landing: "noRepositoryLanding" };
 }
 
