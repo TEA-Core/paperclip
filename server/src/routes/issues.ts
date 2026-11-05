@@ -19395,6 +19395,8 @@ export function issueRoutes(
       },
       incomingAssigneeAgentId: resultingAssigneeAgentId,
       checkReviewStage: false,
+      workflowControlledAssignment:
+        transition.workflowControlledAssignment === true && normalizedAssigneeAgentId === undefined,
       refusalContext:
         req.actor.type === "board"
           ? undefined

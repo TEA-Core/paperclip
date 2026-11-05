@@ -3317,6 +3317,129 @@ describe("issue execution policy routes", () => {
     });
   });
 
+  describe("Wiki handoff review entry (SUP-23154)", () => {
+    const maintainerId = "33333333-3333-4333-8333-333333333333";
+    const selectedId = "44444444-4444-4444-8444-444444444444";
+    const otherId = "66666666-6666-4666-8666-666666666666";
+    const authorId = "77777777-7777-4777-8777-777777777777";
+    const stageId = "11111111-1111-4111-8111-111111111111";
+    const issueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    function issueWithParticipants(participantIds: string[], assigneeAgentId = maintainerId) {
+      return {
+        id: issueId,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-1550",
+        title: "Weekly report — handoff to Wiki Maintainer",
+        description: null,
+        projectId: null,
+        goalId: null,
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [{
+            id: stageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: participantIds.map((agentId) => ({ type: "agent", agentId })),
+          }],
+        }),
+        executionState: null,
+        executionWorkspaceId: null,
+        labels: [],
+        labelIds: [],
+      };
+    }
+
+    function armedIssue() {
+      return {
+        ...issueWithParticipants([maintainerId, selectedId]),
+        status: "in_review",
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: maintainerId, userId: null },
+          returnAssignee: { type: "agent", agentId: authorId, userId: null },
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      };
+    }
+
+    it("seats the selected non-Maintainer when done enters a new review stage", async () => {
+      const issue = issueWithParticipants([selectedId]);
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp()).patch(`/api/issues/${issueId}`).send({ status: "done" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(patch).toMatchObject({
+        status: "in_review",
+        assigneeAgentId: selectedId,
+        assigneeUserId: null,
+        workflowControlledAssignment: true,
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentParticipant: { type: "agent", agentId: selectedId },
+        },
+      });
+    });
+
+    it("refuses canonical-only review entry as wiki_handoff_self_satisfy", async () => {
+      mockIssueService.getById.mockResolvedValue(issueWithParticipants([maintainerId], authorId));
+
+      const res = await request(await createApp()).patch(`/api/issues/${issueId}`).send({ status: "done" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details).toMatchObject({
+        guard: "assignee_review_gate",
+        subGuard: "wiki_handoff",
+        reason: "wiki_handoff_self_satisfy",
+      });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("keeps refusing a manual reassignment to an unrelated agent", async () => {
+      mockIssueService.getById.mockResolvedValue(armedIssue());
+
+      const res = await request(await createApp()).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: otherId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details).toMatchObject({
+        subGuard: "wiki_handoff",
+        reason: "wiki_handoff_non_canonical_assignee",
+        assigneeAgentId: otherId,
+      });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("keeps refusing to clear the Wiki handoff assignee", async () => {
+      mockIssueService.getById.mockResolvedValue(armedIssue());
+
+      const res = await request(await createApp()).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: null });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details).toMatchObject({
+        subGuard: "wiki_handoff",
+        reason: "wiki_handoff_unassigned",
+      });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
+
   it.each([
     ["title", "Weekly report — updated handoff to Wiki Maintainer"],
     ["description", "Updated handoff to Wiki Maintainer instructions."],

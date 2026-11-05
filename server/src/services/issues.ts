@@ -12109,6 +12109,7 @@ export function issueService(db: Db) {
               ? issueData.assigneeAgentId
               : receiptExisting.assigneeAgentId,
           checkReviewStage: false,
+          workflowControlledAssignment,
         });
         if (
           issueData.assigneeAgentId !== undefined &&

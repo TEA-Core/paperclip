@@ -172,6 +172,41 @@ export async function resolveCanonicalWikiMaintainerAgentId(
   return rows[0]?.resourceId ?? null;
 }
 
+function isWorkflowControlledPendingReviewParticipant(input: {
+  executionPolicy: unknown;
+  executionState: unknown;
+  incomingAssigneeAgentId: string;
+  workflowControlledAssignment?: boolean;
+}): boolean {
+  if (input.workflowControlledAssignment !== true) return false;
+  const state = parseIssueExecutionState(input.executionState);
+  if (
+    state?.status !== "pending" ||
+    typeof state.currentStageIndex !== "number" ||
+    state.currentStageType !== "review" ||
+    state.currentParticipant?.type !== "agent" ||
+    state.currentParticipant.agentId !== input.incomingAssigneeAgentId
+  ) return false;
+  const policy = input.executionPolicy as { stages?: unknown } | null | undefined;
+  if (!policy || typeof policy !== "object" || !Array.isArray(policy.stages)) return false;
+  const rawStage = policy.stages[state.currentStageIndex];
+  if (!rawStage || typeof rawStage !== "object") return false;
+  const stage = rawStage as Pick<IssueExecutionStage, "id" | "type"> & { participants?: unknown };
+  if (
+    stage.type !== "review" ||
+    stage.id !== state.currentStageId ||
+    state.completedStageIds.includes(stage.id) ||
+    state.skippedStageIds?.includes(stage.id)
+  ) return false;
+  return Array.isArray(stage.participants) && stage.participants.some(
+    (participant) =>
+      participant &&
+      typeof participant === "object" &&
+      participant.type === "agent" &&
+      participant.agentId === input.incomingAssigneeAgentId,
+  );
+}
+
 export async function assertWikiHandoffWriteIntegrity(input: {
   db: Db | { select: unknown };
   companyId: string;
@@ -183,6 +218,7 @@ export async function assertWikiHandoffWriteIntegrity(input: {
   };
   incomingAssigneeAgentId: string | null | undefined;
   checkReviewStage?: boolean;
+  workflowControlledAssignment?: boolean;
   refusalContext?: { caller: RefusalCaller; issue: RefusalIssue | null };
 }): Promise<void> {
   const canonicalMaintainerAgentId = await resolveCanonicalWikiMaintainerAgentId(
@@ -194,28 +230,42 @@ export async function assertWikiHandoffWriteIntegrity(input: {
   const incoming = typeof input.incomingAssigneeAgentId === "string" && input.incomingAssigneeAgentId.length > 0
     ? input.incomingAssigneeAgentId
     : null;
-  if (incoming !== canonicalMaintainerAgentId) {
-    throw unprocessable(
-      "Refusing assigneeAgentId write on a Wiki handoff: the resulting assignee is not the canonical Wiki Maintainer managed by plugin paperclipai.plugin-llm-wiki (resourceKey wiki-maintainer)",
-      {
-        guard: "assignee_review_gate",
-        subGuard: "wiki_handoff",
-        reason: incoming === null ? "wiki_handoff_unassigned" : "wiki_handoff_non_canonical_assignee",
-        pluginKey: WIKI_LLM_WIKI_PLUGIN_KEY,
-        resourceKey: WIKI_MAINTAINER_AGENT_KEY,
-        canonicalMaintainerAgentId,
-        assigneeAgentId: incoming,
-      },
-    );
-  }
-  if (input.checkReviewStage !== false) {
+  const violation = wikiHandoffWriteWouldViolate({
+    canonicalMaintainerAgentId,
+    incomingAssigneeAgentId: incoming,
+    executionPolicy: input.issue.executionPolicy,
+    executionState: input.issue.executionState,
+    checkReviewStage: input.checkReviewStage,
+    workflowControlledAssignment: input.workflowControlledAssignment,
+  });
+  if (!violation) return;
+  if (
+    violation.reason === "wiki_handoff_self_satisfy" &&
+    input.workflowControlledAssignment !== true &&
+    input.checkReviewStage !== false
+  ) {
     assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
       executionPolicy: input.issue.executionPolicy,
       executionState: input.issue.executionState,
-      incomingAssigneeAgentId: input.incomingAssigneeAgentId,
+      incomingAssigneeAgentId: incoming,
       refusalContext: input.refusalContext,
     });
+    return;
   }
+  throw unprocessable(
+    violation.reason === "wiki_handoff_self_satisfy"
+      ? "Refusing assigneeAgentId write on a Wiki handoff: the canonical Wiki Maintainer cannot be the only participant able to clear the pending review stage"
+      : "Refusing assigneeAgentId write on a Wiki handoff: the resulting assignee is not the canonical Wiki Maintainer managed by plugin paperclipai.plugin-llm-wiki (resourceKey wiki-maintainer)",
+    {
+      guard: "assignee_review_gate",
+      subGuard: "wiki_handoff",
+      reason: incoming === null ? "wiki_handoff_unassigned" : violation.reason,
+      pluginKey: WIKI_LLM_WIKI_PLUGIN_KEY,
+      resourceKey: WIKI_MAINTAINER_AGENT_KEY,
+      canonicalMaintainerAgentId,
+      assigneeAgentId: incoming,
+    },
+  );
 }
 
 export function wikiHandoffWriteWouldViolate(input: {
@@ -223,6 +273,8 @@ export function wikiHandoffWriteWouldViolate(input: {
   incomingAssigneeAgentId: string | null | undefined;
   executionPolicy: unknown;
   executionState: unknown;
+  checkReviewStage?: boolean;
+  workflowControlledAssignment?: boolean;
 }): { reason: "wiki_handoff_non_canonical_assignee" | "wiki_handoff_self_satisfy" } | null {
   const canonical = typeof input.canonicalMaintainerAgentId === "string" && input.canonicalMaintainerAgentId.length > 0
     ? input.canonicalMaintainerAgentId
@@ -231,7 +283,19 @@ export function wikiHandoffWriteWouldViolate(input: {
   const incoming = typeof input.incomingAssigneeAgentId === "string" && input.incomingAssigneeAgentId.length > 0
     ? input.incomingAssigneeAgentId
     : null;
-  if (incoming !== canonical) return { reason: "wiki_handoff_non_canonical_assignee" };
+  if (incoming !== canonical) {
+    if (
+      incoming !== null &&
+      isWorkflowControlledPendingReviewParticipant({
+        executionPolicy: input.executionPolicy,
+        executionState: input.executionState,
+        incomingAssigneeAgentId: incoming,
+        workflowControlledAssignment: input.workflowControlledAssignment,
+      })
+    ) return null;
+    return { reason: "wiki_handoff_non_canonical_assignee" };
+  }
+  if (input.checkReviewStage === false && input.workflowControlledAssignment !== true) return null;
   if (
     findSelfSatisfyingReviewStage({
       executionPolicy: input.executionPolicy,
