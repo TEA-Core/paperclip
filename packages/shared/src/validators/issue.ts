@@ -1068,31 +1068,62 @@ const doneTierLandingDelegatedSchema = z
   })
   .strict();
 
+// SUP-22570: the record_only close with no repository deliverable. It carries
+// no repository evidence by construction; the server proves the claim.
 const doneTierNoRepositoryLandingSchema = z
   .object({
     mode: z.literal("noRepositoryLanding"),
   })
   .strict();
 
-export const doneTierDeclarationSchema = z.discriminatedUnion("tier", [
-  z
-    .object({
-      tier: z.literal("tier2"),
-      probeEvidence: doneTierTextSchema,
-    })
-    .strict(),
-  z
-    .object({
-      tier: z.literal("tier1"),
-      reason: doneTierTextSchema,
-      landing: z.discriminatedUnion("mode", [
-        doneTierLandedAtTipSchema,
-        doneTierLandingDelegatedSchema,
-        doneTierNoRepositoryLandingSchema,
-      ]),
-    })
-    .strict(),
-]);
+const PROTOTYPE_POLLUTION_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+/**
+ * True when `value` carries an own `__proto__`, `constructor` or `prototype`
+ * key at any depth. `JSON.parse` creates `__proto__` as an ordinary own key,
+ * and zod's `.strict()` strips it silently instead of rejecting it. Iterative,
+ * so an absurdly nested body cannot exhaust the stack.
+ */
+export function hasPrototypePollutionKey(value: unknown): boolean {
+  const pending: unknown[] = [value];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === null || typeof current !== "object") continue;
+    for (const key of Reflect.ownKeys(current)) {
+      if (typeof key === "string" && PROTOTYPE_POLLUTION_KEYS.has(key)) return true;
+      const descriptor = Reflect.getOwnPropertyDescriptor(current, key);
+      if (descriptor && "value" in descriptor) pending.push(descriptor.value);
+    }
+  }
+  return false;
+}
+
+export const doneTierDeclarationSchema = z
+  .unknown()
+  .refine((value) => !hasPrototypePollutionKey(value), {
+    message: "doneTier must not carry __proto__, constructor or prototype keys",
+  })
+  .pipe(
+    z.discriminatedUnion("tier", [
+      z
+        .object({
+          tier: z.literal("tier2"),
+          probeEvidence: doneTierTextSchema,
+        })
+        .strict(),
+      z
+        .object({
+          tier: z.literal("tier1"),
+          reason: doneTierTextSchema,
+          landing: z.discriminatedUnion("mode", [
+            doneTierLandedAtTipSchema,
+            doneTierLandingDelegatedSchema,
+            doneTierNoRepositoryLandingSchema,
+          ]),
+        })
+        .strict(),
+    ]),
+  );
 
 export type DoneTierDeclaration = z.infer<typeof doneTierDeclarationSchema>;
 
