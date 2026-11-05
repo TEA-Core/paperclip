@@ -6203,6 +6203,206 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(compareUrl).toContain("fold%2Ftea-patches-v2026.722.0");
     });
 
+    describe("SUP-22973 cross-repo landed-at-tip via linked merged PR", () => {
+      const CROSS_SHA = "cccccccccccccccccccccccccccccccccccccccc";
+      const OTHER_SHA = "dddddddddddddddddddddddddddddddddddddddd";
+      const AGENT_TOOLS = "TEA-Core/paperclip-agent-tools";
+
+      function crossLinkedPr(over: Record<string, unknown> = {}) {
+        return {
+          ...linkedPr(657, "closed"),
+          repo: "paperclip-agent-tools",
+          displayName: `${AGENT_TOOLS}#657`,
+          merged: true,
+          mergeCommitSha: CROSS_SHA,
+          ...over,
+        };
+      }
+
+      // The project-repo compare 404s (the landing lives in ANOTHER repository);
+      // the linked PR's own repository must answer the metadata + compare probes.
+      function crossRepoFetch(
+        opts: { aheadBy?: number; defaultBranch?: string | null; livePr?: Record<string, unknown> | null } = {},
+      ) {
+        ghFetchMock.mockImplementation(async (url: string) => {
+          const u = String(url);
+          if (u.includes("/repos/TEA-Core/paperclip/compare/")) {
+            return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+          }
+          if (u.includes(`/repos/${AGENT_TOOLS}/compare/`)) {
+            return new Response(JSON.stringify({ ahead_by: opts.aheadBy ?? 0 }), { status: 200 });
+          }
+          if (u === `https://api.github.com/repos/${AGENT_TOOLS}`) {
+            if (opts.defaultBranch === null) {
+              return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+            }
+            return new Response(
+              JSON.stringify({ default_branch: opts.defaultBranch ?? "main" }),
+              { status: 200 },
+            );
+          }
+          if (u === `https://api.github.com/repos/${AGENT_TOOLS}/pulls/657`) {
+            if (opts.livePr === null) {
+              return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+            }
+            return new Response(JSON.stringify(opts.livePr ?? {}), { status: 200 });
+          }
+          return new Response(JSON.stringify({}), { status: 404 });
+        });
+      }
+
+      it("accepts landed-at-tip for a cross-repo landing via the linked merged PR's own repository", async () => {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([crossLinkedPr()]);
+        crossRepoFetch();
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line(`landed-at-tip merge commit ${CROSS_SHA} via PR #657 (${AGENT_TOOLS}).`),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+        const urls = ghFetchMock.mock.calls.map(([url]) => String(url));
+        // The project repository was probed first and 404'd...
+        expect(urls.some((u) => u.includes("/repos/TEA-Core/paperclip/compare/"))).toBe(true);
+        // ...then ancestry was proven against the PR repository's default branch.
+        expect(urls).toContain(`https://api.github.com/repos/${AGENT_TOOLS}`);
+        expect(urls).toContain(`https://api.github.com/repos/${AGENT_TOOLS}/compare/main...${CROSS_SHA}`);
+        // The cached MERGED row corroborates on its own: no live /pulls probe.
+        expect(urls.some((u) => u === `https://api.github.com/repos/${AGENT_TOOLS}/pulls/657`)).toBe(false);
+      });
+
+      it("still refuses a project-repo 404 that names no linked PR", async () => {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([crossLinkedPr()]);
+        crossRepoFetch();
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line(`landed-at-tip merge commit ${CROSS_SHA}.`),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.skipped).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("could not be verified against the default branch");
+        expect(result.reason).toContain(CROSS_SHA);
+        expect(result.reason).toContain("must name the linked PR");
+      });
+
+      it("refuses when the named PR is not linked to the card", async () => {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([crossLinkedPr()]);
+        crossRepoFetch();
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line(`landed-at-tip merge commit ${CROSS_SHA} via PR #999 (${AGENT_TOOLS}).`),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("#999");
+        expect(result.reason).toContain("not a linked pull request");
+      });
+
+      it("refuses when the linked PR's recorded merge commit differs from the named sha", async () => {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+          crossLinkedPr({ mergeCommitSha: OTHER_SHA }),
+        ]);
+        crossRepoFetch({ livePr: null });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line(`landed-at-tip merge commit ${CROSS_SHA} via PR #657 (${AGENT_TOOLS}).`),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("does not corroborate");
+        expect(result.reason).toContain(OTHER_SHA);
+        expect(result.reason).toContain("merge_commit_sha");
+      });
+
+      it("refuses when the linked PR is not merged", async () => {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+          crossLinkedPr({ cachedState: "open", merged: false, mergeCommitSha: null }),
+        ]);
+        crossRepoFetch({ livePr: null });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line(`landed-at-tip merge commit ${CROSS_SHA} via PR #657 (${AGENT_TOOLS}).`),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("not recorded as merged");
+      });
+
+      it("refuses when the cross-repo compare shows the merge commit is not at tip", async () => {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([crossLinkedPr()]);
+        crossRepoFetch({ aheadBy: 1 });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line(`landed-at-tip merge commit ${CROSS_SHA} via PR #657 (${AGENT_TOOLS}).`),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("not an ancestor");
+        expect(result.reason).toContain(AGENT_TOOLS);
+        expect(result.reason).toContain("main");
+      });
+
+      it("refuses when the same PR number matches merged linked PRs in multiple repositories", async () => {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+          crossLinkedPr(),
+          crossLinkedPr({
+            repo: "paperclip-agent-tools-mirror",
+            displayName: "TEA-Core/paperclip-agent-tools-mirror#657",
+          }),
+        ]);
+        crossRepoFetch();
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line(`landed-at-tip merge commit ${CROSS_SHA} via PR #657 (${AGENT_TOOLS}).`),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("multiple repositories");
+      });
+
+      it("accepts when the cached row is stale-open but live hydration corroborates the merge", async () => {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+          crossLinkedPr({ cachedState: "open", merged: undefined, mergeCommitSha: null }),
+        ]);
+        crossRepoFetch({
+          livePr: { state: "closed", merged: true, merge_commit_sha: CROSS_SHA, draft: false },
+        });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line(`landed-at-tip merge commit ${CROSS_SHA} via PR #657 (${AGENT_TOOLS}).`),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+        const urls = ghFetchMock.mock.calls.map(([url]) => String(url));
+        expect(urls).toContain(`https://api.github.com/repos/${AGENT_TOOLS}/pulls/657`);
+        expect(urls).toContain(`https://api.github.com/repos/${AGENT_TOOLS}/compare/main...${CROSS_SHA}`);
+      });
+    });
+
     it("refuses landing-delegated without a linked PR", async () => {
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
       const result = await evaluateDoneTierDeclaration(
