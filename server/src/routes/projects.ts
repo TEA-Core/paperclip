@@ -257,6 +257,7 @@ export function projectRoutes(db: Db) {
         ...collectProjectWorkspaceCommandPaths(workspace, "workspace"),
       ],
     );
+    assertNoAgentProjectWorkspaceSourceMutation(req, collectProjectWorkspaceSourcePaths(workspace, "workspace"));
     await assertNoManagedSandboxWorkspacePath(workspace);
     if (projectData.env !== undefined) {
       projectData.env = await secretsSvc.normalizeEnvBindingsForPersistence(

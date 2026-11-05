@@ -701,6 +701,55 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect((await storedProjectWorkspaceSource(fixture.projectWorkspaceId)).defaultRef).toBe("release");
   });
 
+  it.each([
+    ["repoUrl", { repoUrl: "https://github.com/TEA-Core/records" }],
+    ["repoRef", { cwd: "/tmp/paperclip-agent-workspace", repoRef: "agent-branch" }],
+    ["defaultRef", { cwd: "/tmp/paperclip-agent-workspace", defaultRef: "agent-branch" }],
+  ] as const)("refuses an agent project create whose workspace sets %s and persists no project or workspace", async (field, workspace) => {
+    const fixture = await seed();
+    const name = `Agent-created ${field}`;
+
+    const res = await request(app)
+      .post(`/api/companies/${fixture.companyId}/projects`)
+      .send({ name, workspace });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    const created = await db.select({ id: projects.id }).from(projects).where(and(eq(projects.companyId, fixture.companyId), eq(projects.name, name)));
+    expect(created).toHaveLength(0);
+    const workspaces = await db.select({ id: projectWorkspaces.id }).from(projectWorkspaces).where(eq(projectWorkspaces.companyId, fixture.companyId));
+    expect(workspaces).toHaveLength(1);
+  });
+
+  it("still lets an agent create a project from registered repository URLs, which leave the compare base empty", async () => {
+    const fixture = await seed();
+
+    const res = await request(app)
+      .post(`/api/companies/${fixture.companyId}/projects`)
+      .send({ name: "Agent project from URLs", repositoryUrls: ["https://github.com/TEA-Core/records"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const [created] = await db.select({ id: projects.id }).from(projects).where(and(eq(projects.companyId, fixture.companyId), eq(projects.name, "Agent project from URLs")));
+    const [row] = await db.select({ defaultRef: projectWorkspaces.defaultRef, repoRef: projectWorkspaces.repoRef }).from(projectWorkspaces).where(eq(projectWorkspaces.projectId, created!.id));
+    expect(row).toEqual({ defaultRef: null, repoRef: null });
+  });
+
+  it("lets a board user create a project whose workspace sets repoUrl, repoRef and defaultRef", async () => {
+    const fixture = await seed();
+    currentActor = { type: "board", userId: "local-board", source: "local_implicit" } as Express.Request["actor"];
+
+    const res = await request(app)
+      .post(`/api/companies/${fixture.companyId}/projects`)
+      .send({
+        name: "Board project",
+        workspace: { repoUrl: "https://github.com/TEA-Core/records", repoRef: "main", defaultRef: "release" },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const [created] = await db.select({ id: projects.id }).from(projects).where(and(eq(projects.companyId, fixture.companyId), eq(projects.name, "Board project")));
+    const [row] = await db.select({ repoUrl: projectWorkspaces.repoUrl, repoRef: projectWorkspaces.repoRef, defaultRef: projectWorkspaces.defaultRef }).from(projectWorkspaces).where(eq(projectWorkspaces.projectId, created!.id));
+    expect(row).toEqual({ repoUrl: "https://github.com/TEA-Core/records", repoRef: "main", defaultRef: "release" });
+  });
+
   it("does not let the closing agent move the compare base onto its own pushed branch", async () => {
     const fixture = await seed();
     await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
