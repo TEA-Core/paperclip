@@ -468,6 +468,8 @@ import {
   type IssueThreadInteractionResolverRestriction,
 } from "../services/issue-thread-interaction-resolution.js";
 import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
+import { readBuiltInAgentMarker } from "../services/built-in-agent-metadata.js";
+import { isAgentInstructionsChangeTargetKey } from "../services/change-consent-gate.js";
 import {
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
@@ -1169,6 +1171,42 @@ async function auditAgentIssueCommentAttributionSpoof(input: {
       derivedFrom: "authenticated_actor",
     },
   });
+}
+
+/**
+ * SUP-23042 / SUP-22819: a Reflection Coach proposal card whose accepted
+ * confirmation target is `agent:<id>:instructions` owes no git deliverable —
+ * the mutation lands through the governed instructions API, never a
+ * repository merge — so a `repository_delivery` card of that class is
+ * uncloseable. Classification is derived server-side at creation and requires
+ * BOTH trusted signals: the creator carries the built-in `reflection-coach`
+ * agent marker AND the create body carries an explicit, exact
+ * `agent:<id>:instructions` consent target for this proposal. A coach card
+ * without that target (e.g. a draft skill committed under `skills/<slug>/`)
+ * fails closed to `repository_delivery`. An explicit `deliveryRequirement`
+ * always wins, and the assignee self-selection refusal at both create sites
+ * still applies.
+ */
+async function createIsReflectionCoachRecordOnly(
+  db: Db,
+  companyId: string,
+  req: Request,
+  body: { deliveryRequirement?: unknown; proposalTargetKey?: unknown },
+): Promise<boolean> {
+  if (req.actor.type !== "agent" || !req.actor.agentId) return false;
+  if (body.deliveryRequirement !== undefined) return false;
+  if (
+    typeof body.proposalTargetKey !== "string" ||
+    !isAgentInstructionsChangeTargetKey(body.proposalTargetKey)
+  ) {
+    return false;
+  }
+  const [agent] = await db
+    .select({ metadata: agents.metadata })
+    .from(agents)
+    .where(and(eq(agents.id, req.actor.agentId), eq(agents.companyId, companyId)))
+    .limit(1);
+  return readBuiltInAgentMarker(agent?.metadata)?.key === "reflection-coach";
 }
 
 async function sanitizeIssueCreateAttribution<T extends object>(
@@ -16645,6 +16683,15 @@ export function issueRoutes(
         });
         return;
       }
+      // SUP-23042: server-derived creation-time classification for Reflection
+      // Coach proposal cards — see createIsReflectionCoachRecordOnly. Applied
+      // only when the caller selected nothing, so explicit selections above
+      // and the self-selection refusal are untouched.
+      if (
+        await createIsReflectionCoachRecordOnly(db, companyId, req, rawCreateBody)
+      ) {
+        rawCreateBody.deliveryRequirement = "record_only";
+      }
       const requestsWorkspaceInheritanceFromRun =
         !hasExplicitIssueWorkspaceCreateSelection(rawCreateBody);
 
@@ -17589,6 +17636,13 @@ export function issueRoutes(
           error: "Only the board or an authorized non-assignee may select record_only delivery",
         });
         return;
+      }
+      // SUP-23042: same server-derived classification on the children-create
+      // site — see createIsReflectionCoachRecordOnly.
+      if (
+        await createIsReflectionCoachRecordOnly(db, parent.companyId, req, sanitizedBody)
+      ) {
+        sanitizedBody.deliveryRequirement = "record_only";
       }
       await assertNoAgentDelegationCycleAndRecord({
         req,
