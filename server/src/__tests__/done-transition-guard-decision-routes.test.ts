@@ -857,6 +857,9 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.code).toBe("done_transition_missing_tier_declaration");
     expect(res.body.details.remedy).toContain('"Closed at Tier 2 (live): probe `<probe command>` head <probe head sha> post-merge: <post-merge predicate>"');
+    // SUP-22801: the repository-delivery remedy stays merge-head-only — the
+    // record-only grammar must not leak into it.
+    expect(String(res.body.details.remedy)).not.toContain("record-only probe");
     expect(await statusOf(issueId)).toBe("in_review");
 
     const rows = await auditRows(companyId, issueId, "issue.done_tier_declaration_skipped");
@@ -972,6 +975,145 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       expect(res.status, JSON.stringify(res.body)).toBe(expectedStatus);
       expect(await statusOf(issueId)).toBe(expectedStatus === 200 ? "done" : "in_review");
       if (expectedStatus === 409) expect(res.body.code).toBe("done_transition_missing_delivery");
+    }
+  });
+
+  // SUP-22801: record-only Tier 2 live evidence. A record_only card closes
+  // through the shared done-tier evaluator with a machine-checkable
+  // record-only probe declaration and no merge head, on both terminal doors
+  // (PATCH and review auto-approval comment). Prose-only evidence is refused
+  // naming the accepted form, and a repository_delivery card submitting the
+  // record-only grammar is refused by name.
+  const RECORD_ONLY_EVIDENCE =
+    "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records";
+
+  function mockNoOpenPulls() {
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/pulls?")) return new Response(JSON.stringify([]), { status: 200 });
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+  }
+
+  it("PATCH: record_only close with structured record-only Tier 2 evidence needs no merge head (SUP-22801)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D22801A", { deliveryRequirement: "record_only" });
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: "Sweep consumed; closing on live probe evidence.",
+        doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(issueId)).toBe("done");
+    // A record-only close resolves no merge head: any GitHub call this door
+    // makes stays a read-only GET and none touches a delivery commits
+    // endpoint (observed: zero calls on this door).
+    for (const [url, init] of mockGhFetch.mock.calls) {
+      expect(String((init as RequestInit | undefined)?.method ?? "GET")).toBe("GET");
+      expect(String(url)).not.toContain("/commits/");
+    }
+  });
+
+  it("PATCH: record_only close with prose-only Tier 2 evidence is refused naming the record-only form (SUP-22801)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D22801B", { deliveryRequirement: "record_only" });
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "Closed at Tier 2 (live): the sweep consumed everything on schedule." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(String(res.body.error)).toContain("record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>");
+    expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("PATCH: the record_only missing-tier 422 remedy names both record-only forms and no merge head (SUP-22801)", async () => {
+    // Round-1 repair (record-only-remedy-omits-structured-form): the 422
+    // remedy is classification-aware. A record_only card is steered to the
+    // structured record-only doneTier form AND the record-only comment form —
+    // never toward fabricating a merge head it cannot lawfully produce.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D22801E", { deliveryRequirement: "record_only" });
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "The sweep consumed everything on schedule." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    const remedy = String(res.body.details.remedy);
+    // The structured record-only form, verbatim.
+    expect(remedy).toContain(
+      '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }',
+    );
+    // The comment form for a record_only card is the record-only grammar...
+    expect(remedy).toContain(
+      'record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>',
+    );
+    // ...and the remedy demands no merge head anywhere.
+    expect(remedy).not.toContain("post-merge");
+    expect(remedy).not.toContain("probe head sha");
+    // #1101 reverted #1098, so the no-repository Tier 1 landing is not a
+    // writable form at this fold tip — the record_only remedy must not
+    // name it.
+    expect(remedy).not.toContain("noRepositoryLanding");
+    expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("PATCH: repository_delivery close submitting record-only evidence is refused by name (SUP-22801)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D22801C", { deliveryRequirement: "repository_delivery" });
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockMergedBranch();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: "Landed; closing on live probe evidence.",
+        doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+      });
+
+    // Delivery landed, so the refusal is the tier gate refusing the
+    // record-only grammar on a repository card, naming the merge-head form.
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(String(res.body.error)).toContain("deliveryRequirement=record_only");
+    expect(String(res.body.error)).toContain("probe `<probe command>` head <probe head sha> post-merge:");
+    expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("POST comment: record_only auto-approval closes on record-only Tier 2 evidence with no commits resolution (SUP-22801)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D22801D", { deliveryRequirement: "record_only" });
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({
+        body: `## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): ${RECORD_ONLY_EVIDENCE}`,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await statusOf(issueId)).toBe("done");
+    // Unlike the merge-head close in D21258A (commits + pulls GETs), the
+    // record-only close resolves no merge head: any call this door makes is a
+    // read-only GET and none touches a delivery commits endpoint.
+    for (const [url, init] of mockGhFetch.mock.calls) {
+      expect(String((init as RequestInit | undefined)?.method ?? "GET")).toBe("GET");
+      expect(String(url)).not.toContain("/commits/");
     }
   });
 
