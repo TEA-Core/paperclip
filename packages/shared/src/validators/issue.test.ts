@@ -7,6 +7,7 @@ import {
   createAcceptedPlanDecompositionSchema,
   createChildIssueSchema,
   createIssueSchema,
+  doneTierDeclarationSchema,
   issueBlockedInboxAttentionSchema,
   issueExecutionMonitorPolicySchema,
   issueExecutionPolicySchema,
@@ -23,6 +24,19 @@ import {
 import { createAgentSchema } from "./agent.js";
 
 describe("issue validators", () => {
+  it("accepts a strict no-repository Tier 1 landing declaration", () => {
+    const declaration = {
+      tier: "tier1" as const,
+      reason: "No repository artifact was produced",
+      landing: { mode: "noRepositoryLanding" as const },
+    };
+    expect(doneTierDeclarationSchema.parse(declaration)).toEqual(declaration);
+    expect(doneTierDeclarationSchema.safeParse({
+      ...declaration,
+      landing: { mode: "noRepositoryLanding", mergeCommit: "a".repeat(40) },
+    }).success).toBe(false);
+  });
+
   it("uses the same bounded unique upload ID contract for comment and update requests", () => {
     const id = "9af8228f-0be7-45ae-a104-6fbe0af6f1d3";
     expect(

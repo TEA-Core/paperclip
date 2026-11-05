@@ -5432,6 +5432,16 @@ describe("evaluateDoneTierDeclaration", () => {
       })).toBe("Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #123 via done-close-landing-backstop — Landing delegated. Liveness unverified.");
     });
 
+    it("renders a no-repository Tier 1 close without a SHA or PR", () => {
+      expect(renderDoneTierDeclaration(null, {
+        tier: "tier1",
+        reason: "No repository artifact was produced",
+        landing: { mode: "noRepositoryLanding" },
+      })).toBe(
+        "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — No repository artifact was produced. Liveness unverified.",
+      );
+    });
+
     it("preserves the body when the existing Tier 2 declaration matches", () => {
       const body = "Context\n\nClosed at Tier 2 (live): existing evidence\n\nFollow-up";
       expect(renderDoneTierDeclaration(body, {
@@ -6159,6 +6169,66 @@ describe("evaluateDoneTierDeclaration", () => {
   });
 
   describe("Tier 1 via accompanying comment", () => {
+    describe("no-repository landing", () => {
+      const comment = "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — No repository artifact was produced. Liveness unverified.";
+
+      beforeEach(() => {
+        ghFetchMock.mockReset();
+        setupDbMock({ issueWorkProducts: [] });
+      });
+
+      it("preserves record_only acceptance", async () => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          { ...tierIssue, deliveryRequirement: "record_only" },
+          comment,
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed, result.reason).toBe(true);
+        expect(result.tier).toBe("tier1");
+      });
+
+      it("accepts repository_delivery with no pull-request work product or recorded merge commit", async () => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          { ...tierIssue, deliveryRequirement: "repository_delivery" },
+          comment,
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed, result.reason).toBe(true);
+        expect(result.tier).toBe("tier1");
+        expect(ghFetchMock).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        {
+          name: "a pull-request work product",
+          row: { type: "pull_request", metadata: { prNumber: 123 } },
+          reason: "pull_request work product",
+        },
+        {
+          name: "a recorded merge commit",
+          row: { type: "artifact", metadata: { mergeCommitSha: "a".repeat(40) } },
+          reason: "recorded merge commit",
+        },
+      ])("refuses repository_delivery with $name", async ({ row, reason }) => {
+        setupDbMock({ issueWorkProducts: [row] });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          { ...tierIssue, deliveryRequirement: "repository_delivery" },
+          comment,
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain(reason);
+        expect(ghFetchMock).not.toHaveBeenCalled();
+      });
+    });
+
     it("refuses a syntactically complete Tier 1 line that is only arbitrary prose", async () => {
       const result = await evaluateDoneTierDeclaration(
         mockDb,
@@ -6187,15 +6257,17 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(ghFetchMock).not.toHaveBeenCalled();
     });
 
-    it("SUP-21328: accepted Tier 1 forms advertise both landed-at-tip and landing-delegated", () => {
+    it("SUP-21328: accepted Tier 1 forms advertise every landing state", () => {
       expect(TIER1_FORM).toContain("landed-at-tip <sha>");
       expect(TIER1_FORM).toContain("landing-delegated PR #<N>");
       expect(TIER1_FORM).toContain("done-close-landing-backstop");
+      expect(TIER1_FORM).toContain("no-repository-landing");
+      expect(TIER1_FORM).toContain("no pull-request work product or recorded merge commit");
     });
 
     it("SUP-21328: each advertised Tier 1 prose form reaches the landing-token pre-check", async () => {
       const forms = TIER1_FORM.split('" or "').map((form) => form.replace(/^"|"$/g, ""));
-      expect(forms).toHaveLength(2);
+      expect(forms).toHaveLength(3);
       for (const form of forms) {
         const result = await evaluateDoneTierDeclaration(
           mockDb,
@@ -6222,6 +6294,8 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER2_JSON);
       expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_LANDED_JSON);
       expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_DELEGATED_JSON);
+      expect(DONE_TIER_STRUCTURED_FORMS).toContain('"mode": "noRepositoryLanding"');
+      expect(DONE_TIER_STRUCTURED_FORMS).toContain("no pull-request work product or recorded merge commit");
       // SUP-22801: the record-only classification of the structured forms —
       // its Tier 2 entry carries the record-only grammar, never a merge head,
       // and Tier 1 entries are carried over unchanged.
@@ -6231,11 +6305,7 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER2_RECORD_ONLY_JSON);
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_LANDED_JSON);
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_DELEGATED_JSON);
-      // #1101 reverted #1098, so the no-repository Tier 1 landing is not a
-      // writable form at this fold tip — the record-only remedy must not
-      // name it, or it would steer a record_only card toward a form the
-      // structured parser no longer accepts.
-      expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).not.toContain("noRepositoryLanding");
+      expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain('"mode": "noRepositoryLanding"');
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).not.toContain("post-merge");
 
       const result = await evaluateDoneTierDeclaration(
