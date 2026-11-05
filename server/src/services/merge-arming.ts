@@ -3918,7 +3918,7 @@ async function fetchBranchHeadShaOnce(
   const refPath = branch.split("/").map(encodeURIComponent).join("/");
   const url = `${gitHubApiBase("github.com")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
     repo,
-  )}/git/refs/heads/${refPath}`;
+  )}/git/ref/heads/${refPath}`;
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
     "user-agent": "paperclip-merge-arming",

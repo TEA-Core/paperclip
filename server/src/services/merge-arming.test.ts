@@ -551,6 +551,10 @@ describe("approval-time read retry wiring (SUP-17273)", () => {
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.headSha).toBe("abc123def");
     expect(mockGhFetch).toHaveBeenCalledTimes(2);
+    expect(mockGhFetch).toHaveBeenLastCalledWith(
+      "https://api.github.com/repos/owner/repo/git/ref/heads/SUP-42/branch",
+      expect.anything(),
+    );
   });
 
   it("fetchBranchHeadSha: does not retry a deterministic 404", async () => {
@@ -659,8 +663,8 @@ const POST_STATUS_URL = (sha: string) =>
   `https://api.github.com/repos/${OWNER}/${REPO}/statuses/${sha}`;
 // The shared live workspace re-resolve lists open PRs by identifier substring.
 const OPEN_PRS_LIST_URL = `https://api.github.com/repos/${OWNER}/${REPO}/pulls?state=open&per_page=100`;
-// SUP-15016: the no-pr delivery-branch ref read (GET .../git/refs/heads/SUP-42-branch).
-const BRANCH_REF_URL = `https://api.github.com/repos/${OWNER}/${REPO}/git/refs/heads/SUP-42-branch`;
+// SUP-15016: the no-pr delivery-branch ref read (GET .../git/ref/heads/SUP-42-branch).
+const BRANCH_REF_URL = `https://api.github.com/repos/${OWNER}/${REPO}/git/ref/heads/SUP-42-branch`;
 const BRANCH_HEAD = "branch000000000000000000000000000000000001";
 function openPrsListItem(overrides: Record<string, unknown> = {}) {
   return {
@@ -2321,7 +2325,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     const COMPARE_URL = `https://api.github.com/repos/${OWNER}/${REPO}/compare/main...${MERGE_SHA}`;
     const SIDE_COMPARE_URL = `https://api.github.com/repos/${OWNER}/${REPO}/compare/release%2Fother...${MERGE_SHA}`;
     const REFS_MAIN_ROUTE = {
-      url: `https://api.github.com/repos/${OWNER}/${REPO}/git/refs/heads/main`,
+      url: `https://api.github.com/repos/${OWNER}/${REPO}/git/ref/heads/main`,
       body: { object: { sha: MERGE_SHA } },
     };
 
@@ -2643,7 +2647,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         { url: PR_URL, body: carrierMergedPrBody() },
         { url: COMPARE_URL, body: { status: "identical", ahead_by: 0 } },
         { url: `https://api.github.com/repos/${OWNER}/${REPO}/compare/${encodeURIComponent(baseRef)}...${MERGE_SHA}`, body: { status: "identical", ahead_by: 0 } },
-        { url: `https://api.github.com/repos/${OWNER}/${REPO}/git/refs/heads/${baseRef}`, ok: false, status: 404 },
+        { url: `https://api.github.com/repos/${OWNER}/${REPO}/git/ref/heads/${baseRef}`, ok: false, status: 404 },
       ]);
 
       const result = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
@@ -2657,7 +2661,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       const issueId = await insertTerminalCarrierChild({ baseRef: "v1.2.3" });
       installRoutes([
         { url: PR_URL, body: carrierMergedPrBody() },
-        { url: `https://api.github.com/repos/${OWNER}/${REPO}/git/refs/heads/v1.2.3`, ok: false, status },
+        { url: `https://api.github.com/repos/${OWNER}/${REPO}/git/ref/heads/v1.2.3`, ok: false, status },
         { url: `https://api.github.com/repos/${OWNER}/${REPO}/compare/v1.2.3...${MERGE_SHA}`, body: { status: "identical", ahead_by: 0 } },
       ]);
 
