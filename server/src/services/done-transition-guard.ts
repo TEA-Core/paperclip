@@ -1587,6 +1587,59 @@ async function proveTier2Live(
   return acceptTier2(evidence.trim(), sameRun);
 }
 
+async function proveNoRepositoryLanding(
+  db: Db,
+  issue: { id: string; companyId: string },
+  reason: string,
+  sameRun: boolean,
+): Promise<DoneTierDeclarationResult> {
+  let pullRequestRows: { status: string }[];
+  try {
+    pullRequestRows = await db
+      .select({ status: issueWorkProducts.status })
+      .from(issueWorkProducts)
+      .where(
+        and(
+          eq(issueWorkProducts.companyId, issue.companyId),
+          eq(issueWorkProducts.issueId, issue.id),
+          eq(issueWorkProducts.type, "pull_request"),
+        ),
+      );
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : "unknown";
+    return refuseTier1(
+      `Tier 1 "no-repository-landing" could not be verified: the pull_request work-product read failed (${detail}). ` +
+        `Accepted form: ${TIER1_FORM}`,
+    );
+  }
+  if (pullRequestRows.length > 0) {
+    const statuses = [...new Set(pullRequestRows.map((row) => row.status))].join(", ");
+    return refuseTier1(
+      `Tier 1 "no-repository-landing" is accepted only when the issue has zero pull_request work products; ` +
+        `this issue has ${pullRequestRows.length} (${statuses}). A card with a repository deliverable must name ` +
+        `"landed-at-tip" or "landing-delegated". Accepted form: ${TIER1_FORM}`,
+    );
+  }
+  let recordedMergeCommit: string | null;
+  try {
+    recordedMergeCommit = await loadRecordedDeliveryMergeCommit(db, issue);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : "unknown";
+    return refuseTier1(
+      `Tier 1 "no-repository-landing" could not be verified: the recorded delivery merge head read failed (${detail}). ` +
+        `Accepted form: ${TIER1_FORM}`,
+    );
+  }
+  if (recordedMergeCommit !== null) {
+    return refuseTier1(
+      `Tier 1 "no-repository-landing" is accepted only when no delivery merge head is recorded; this issue ` +
+        `has recorded merge commit ${recordedMergeCommit}. A card with a repository deliverable must name ` +
+        `"landed-at-tip" or "landing-delegated". Accepted form: ${TIER1_FORM}`,
+    );
+  }
+  return acceptTier1(reason, sameRun);
+}
+
 async function proveTier1Landing(
   db: Db,
   issue: {
@@ -1622,7 +1675,7 @@ async function proveTier1Landing(
         'Tier 1 "no-repository-landing" is accepted only on a record_only issue; a repository_delivery issue must name "landed-at-tip" or "landing-delegated".',
       );
     }
-    return acceptTier1(reason, sameRun);
+    return proveNoRepositoryLanding(db, issue, reason, sameRun);
   }
   if (hasDelegated) return proveLandingDelegated(db, issue, reason, sameRun);
   return proveLandedAtTip(db, issue, reason, sameRun);

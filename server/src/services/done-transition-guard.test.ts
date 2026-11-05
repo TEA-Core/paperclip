@@ -155,7 +155,7 @@ function filterLabelRowsByName(
  * `select().from().where()` resolves to the `executionWorkspaces` rows exactly
  * as the legacy positional chain did, so pre-existing tests are untouched.
  */
-function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[]; issueWorkProducts?: Record<string, unknown>[] }) {
+function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[]; issueWorkProducts?: Record<string, unknown>[]; issueWorkProductsError?: unknown }) {
   // SUP-15233: the guard reads the issues table twice inside
   // countLadderedChildren: read 1 is the parent_id edge (decomposition
   // children), read 2 is the inArray re-read (blockedBy edge, only present in
@@ -213,8 +213,12 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
   };
   const workProductsChain = {
     from: vi.fn().mockReturnThis(),
-    where: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
-    then: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
+    where: rows.issueWorkProductsError === undefined
+      ? vi.fn().mockResolvedValue(rows.issueWorkProducts ?? [])
+      : vi.fn().mockRejectedValue(rows.issueWorkProductsError),
+    then: rows.issueWorkProductsError === undefined
+      ? vi.fn().mockResolvedValue(rows.issueWorkProducts ?? [])
+      : vi.fn().mockRejectedValue(rows.issueWorkProductsError),
   };
   const selectChain = {
     from: vi.fn().mockReturnThis(),
@@ -6172,6 +6176,7 @@ describe("evaluateDoneTierDeclaration", () => {
   describe("Tier 1 via accompanying comment", () => {
     it("accepts no-repository landing only for record_only issues", async () => {
       const comment = "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — The recorded decision is the complete deliverable. Liveness unverified.";
+      setupDbMock({ issueWorkProducts: [] });
       const accepted = await evaluateDoneTierDeclaration(
         mockDb,
         { ...tierIssue, deliveryRequirement: "record_only" },
@@ -6192,6 +6197,44 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(refused.allowed).toBe(false);
       expect(refused.tier).toBe(null);
       expect(refused.reason).toContain("record_only");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses no-repository landing when any pull_request work product exists", async () => {
+      for (const status of ["open", "merged"] as const) {
+        setupDbMock({
+          issueWorkProducts: [{ id: `wp-${status}`, type: "pull_request", status }],
+        });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          { ...tierIssue, deliveryRequirement: "record_only" },
+          "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — The recorded decision is the complete deliverable. Liveness unverified.",
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed, status).toBe(false);
+        expect(result.tier, status).toBe(null);
+        expect(result.reason, status).toContain("pull_request work product");
+        expect(result.reason, status).toContain(status);
+        expect(result.reason, status).toContain(TIER1_FORM);
+        expect(ghFetchMock).not.toHaveBeenCalled();
+      }
+    });
+
+    it("fails closed when the no-repository work-product read errors", async () => {
+      setupDbMock({ issueWorkProductsError: new Error("work products unavailable") });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        { ...tierIssue, deliveryRequirement: "record_only" },
+        "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — The recorded decision is the complete deliverable. Liveness unverified.",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("could not be verified");
+      expect(result.reason).toContain("work products unavailable");
+      expect(result.reason).toContain(TIER1_FORM);
       expect(ghFetchMock).not.toHaveBeenCalled();
     });
 

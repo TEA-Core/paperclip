@@ -239,7 +239,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     }
   }
 
-  async function seedIssueAwaitingReview(issuePrefix: string, opts: { stageCount?: 1 | 2; deliveryRequirement?: "repository_delivery" | "record_only" } = {}) {
+  async function seedIssueAwaitingReview(issuePrefix: string, opts: { stageCount?: 1 | 2; deliveryRequirement?: "repository_delivery" | "record_only"; seedMergedWorkProduct?: boolean } = {}) {
     const stageCount = opts.stageCount ?? 1;
     const companyId = randomUUID();
     const reviewerAgentId = randomUUID();
@@ -385,13 +385,15 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .set({ sourceIssueId: issueId })
       .where(eq(executionWorkspaces.id, executionWorkspaceId));
     // SUP-21902: recorded delivery merge commit for the Tier 2 origin guard.
-    await db.insert(issueWorkProducts).values({
-      companyId, issueId, type: "pull_request", provider: "github",
-      externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
-      url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
-      reviewState: "none", isPrimary: true, healthStatus: "unknown",
-      metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
-    });
+    if (opts.seedMergedWorkProduct !== false) {
+      await db.insert(issueWorkProducts).values({
+        companyId, issueId, type: "pull_request", provider: "github",
+        externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+        url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+        reviewState: "none", isPrimary: true, healthStatus: "unknown",
+        metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+      });
+    }
 
     return { companyId, reviewerAgentId, implementerAgentId, issueId, identifier };
   }
@@ -979,7 +981,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
   });
 
   it("PATCH: record_only accepts a structured no-repository Tier 1 close", async () => {
-    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23030A", { deliveryRequirement: "record_only" });
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23030A", { deliveryRequirement: "record_only", seedMergedWorkProduct: false });
     await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
 
@@ -1004,6 +1006,40 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(comments.map((entry) => entry.body)).toContain(
       "Recorded the decision; no repository deliverable exists.\n\nClosed at Tier 1 (landed, not liveness-probed): no-repository-landing — The recorded decision is the complete deliverable. Liveness unverified.",
     );
+  });
+
+  it("PATCH: record_only refuses structured no-repository Tier 1 when a PR work product exists", async () => {
+    for (const [prefix, status] of [
+      ["D23030B", "open"],
+      ["D23030C", "merged"],
+    ] as const) {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview(prefix, { deliveryRequirement: "record_only" });
+      await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+      if (status === "open") {
+        await db
+          .update(issueWorkProducts)
+          .set({ status, metadata: { prNumber: 404, repository: "TEA-Core/paperclip" } })
+          .where(and(eq(issueWorkProducts.companyId, companyId), eq(issueWorkProducts.issueId, issueId)));
+      }
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment: "Recorded the decision; no repository deliverable exists.",
+          doneTier: {
+            tier: "tier1",
+            reason: "The recorded decision is the complete deliverable",
+            landing: { mode: "noRepositoryLanding" },
+          },
+        });
+
+      expect(res.status, `${status}: ${JSON.stringify(res.body)}`).toBe(422);
+      expect(res.body.code, status).toBe("done_transition_missing_tier_declaration");
+      expect(String(res.body.error), status).toContain("zero pull_request work products");
+      expect(await statusOf(issueId)).toBe("in_review");
+    }
   });
 
   // SUP-22801: record-only Tier 2 live evidence. A record_only card closes
