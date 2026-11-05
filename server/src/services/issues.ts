@@ -11628,6 +11628,15 @@ export function issueService(db: Db) {
          * `issue_version_conflict` and writes nothing.
          */
         expectedUpdatedAt?: Date;
+        /**
+         * Internal only. Set by the PATCH route's top-level `monitor` alias
+         * translation (SUP-22851) when the write preserves an already-stored
+         * `approvalAuthority: "release_assurance"` policy: the route normalized
+         * that stored policy with the scoped release-assurance trust, so the
+         * defensive re-normalization below must trust it too. Never accept
+         * this from a request body; callers still cannot select the authority.
+         */
+        preservedStoredApprovalAuthority?: boolean;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -11677,6 +11686,7 @@ export function issueService(db: Db) {
         companyGuard,
         expectedUpdatedAt,
         workflowControlledAssignment,
+        preservedStoredApprovalAuthority,
         ...issueData
       } = data;
       if (
@@ -11915,8 +11925,11 @@ export function issueService(db: Db) {
         // Routes already normalize (and redact) before reaching the service, so the
         // only writers still carrying a raw `monitor.externalRef` here are internal
         // ones that need to read it back — see normalizeIssueExecutionPolicy.
+        // SUP-22851: a route that vouches for a preserved stored authority
+        // (the monitor alias translation) normalizes with that trust here too.
         const normalizedPolicy = normalizeIssueExecutionPolicy(issueData.executionPolicy ?? null, {
           preserveMonitorExternalRef: true,
+          ...(preservedStoredApprovalAuthority ? { allowReleaseAssuranceAuthority: true } : {}),
         });
         const normalizedPolicyRecord = (normalizedPolicy as Record<string, unknown> | null) ?? null;
         issueData.executionPolicy = normalizedPolicyRecord;

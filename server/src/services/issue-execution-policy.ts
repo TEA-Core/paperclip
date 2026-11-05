@@ -714,8 +714,15 @@ export function resolvePatchExecutionPolicy(input: {
    *  explicit, authorization-checked re-arm resolves the policy for a pointer
    *  rewrite, so the preservation invariant must not refuse it. */
   rearmPointer?: boolean;
+  /** SUP-22851: set only by the PATCH route's top-level `monitor` alias
+   * translation, whose body is wholly derived from the already-stored policy
+   * (only the schema-validated monitor swaps in). Preserving a stored
+   * `approvalAuthority: "release_assurance"` requires the same scoped trust
+   * the route applied to the stored read. Caller-supplied bodies leave this
+   * unset, so they still cannot select the authority. */
+  allowReleaseAssuranceAuthority?: boolean;
 }): IssueExecutionPolicy | null {
-  const { raw, currentPolicy, stagesKeyAbsent, executionState, rearmPointer } = input;
+  const { raw, currentPolicy, stagesKeyAbsent, executionState, rearmPointer, allowReleaseAssuranceAuthority } = input;
   if (raw === null) return null;
   if (typeof raw !== "object" || Array.isArray(raw)) return null;
 
@@ -725,7 +732,10 @@ export function resolvePatchExecutionPolicy(input: {
     stagesKeyAbsent && storedStages !== null
       ? { ...(raw as Record<string, unknown>), stages: storedStages }
       : raw;
-  const resolved = normalizeIssueExecutionPolicy(effectiveRaw);
+  const resolved = normalizeIssueExecutionPolicy(
+    effectiveRaw,
+    allowReleaseAssuranceAuthority ? { allowReleaseAssuranceAuthority: true } : undefined,
+  );
 
   // Preserve-on-omit carries the stored stages forward unchanged, so no insert
   // is possible on that path; only an explicit `stages` body can move the
