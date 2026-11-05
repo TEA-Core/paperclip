@@ -465,6 +465,7 @@ import {
   type IssueThreadInteractionResolverRestriction,
 } from "../services/issue-thread-interaction-resolution.js";
 import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
+import { readBuiltInAgentMarker } from "../services/built-in-agent-metadata.js";
 import {
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
@@ -1166,6 +1167,32 @@ async function auditAgentIssueCommentAttributionSpoof(input: {
       derivedFrom: "authenticated_actor",
     },
   });
+}
+
+/**
+ * SUP-23042 / SUP-22819: a Reflection Coach proposal card's only deliverable
+ * is an accepted instruction-bundle mutation (`agent:<id>:instructions`),
+ * applied through the governed instructions API — it never produces a
+ * repository merge, so a `repository_delivery` coach card is uncloseable.
+ * Classify coach-filed cards `record_only` at creation, derived server-side
+ * from the built-in agent marker on the creating agent. The caller never
+ * selects the value: an explicit `deliveryRequirement` in the create body
+ * always wins (a card that also owes a repository deliverable keeps
+ * `repository_delivery`), and the assignee self-selection refusal at both
+ * create sites still applies.
+ */
+async function createIsReflectionCoachRecordOnly(
+  db: Db,
+  companyId: string,
+  req: Request,
+): Promise<boolean> {
+  if (req.actor.type !== "agent" || !req.actor.agentId) return false;
+  const [agent] = await db
+    .select({ metadata: agents.metadata })
+    .from(agents)
+    .where(and(eq(agents.id, req.actor.agentId), eq(agents.companyId, companyId)))
+    .limit(1);
+  return readBuiltInAgentMarker(agent?.metadata)?.key === "reflection-coach";
 }
 
 async function sanitizeIssueCreateAttribution<T extends object>(
@@ -16631,6 +16658,16 @@ export function issueRoutes(
         });
         return;
       }
+      // SUP-23042: server-derived creation-time classification for Reflection
+      // Coach proposal cards — see createIsReflectionCoachRecordOnly. Applied
+      // only when the caller selected nothing, so explicit selections above
+      // and the self-selection refusal are untouched.
+      if (
+        rawCreateBody.deliveryRequirement === undefined &&
+        (await createIsReflectionCoachRecordOnly(db, companyId, req))
+      ) {
+        rawCreateBody.deliveryRequirement = "record_only";
+      }
       const requestsWorkspaceInheritanceFromRun =
         !hasExplicitIssueWorkspaceCreateSelection(rawCreateBody);
 
@@ -17575,6 +17612,14 @@ export function issueRoutes(
           error: "Only the board or an authorized non-assignee may select record_only delivery",
         });
         return;
+      }
+      // SUP-23042: same server-derived classification on the children-create
+      // site — see createIsReflectionCoachRecordOnly.
+      if (
+        sanitizedBody.deliveryRequirement === undefined &&
+        (await createIsReflectionCoachRecordOnly(db, parent.companyId, req))
+      ) {
+        sanitizedBody.deliveryRequirement = "record_only";
       }
       await assertNoAgentDelegationCycleAndRecord({
         req,
