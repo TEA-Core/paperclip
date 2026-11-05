@@ -17355,6 +17355,8 @@ export function issueRoutes(
       id: string;
       companyId: string;
       identifier?: string | null;
+      status: string;
+      assigneeAgentId?: string | null;
       executionPolicy: unknown;
       executionState?: unknown;
       createdByAgentId?: string | null;
@@ -17421,7 +17423,7 @@ export function issueRoutes(
       // of the durable activity table — never a bounded comment scan — so a
       // marker is never forgotten because newer comments pushed it out of a
       // `limit`.
-      await db.transaction(async (tx) => {
+      const advisoryComment = await db.transaction(async (tx) => {
         await tx
           .select({ id: issueRows.id })
           .from(issueRows)
@@ -17438,7 +17440,7 @@ export function issueRoutes(
               eq(activityLog.entityId, parent.id),
             ),
           );
-        if (alreadyFlagged.length > 0) return;
+        if (alreadyFlagged.length > 0) return null;
         await logActivityInTransaction(tx as unknown as Db, {
           companyId: parent.companyId,
           actorType: "system",
@@ -17461,13 +17463,28 @@ export function issueRoutes(
         });
         // AC-5: the comment is the ONLY write to the parent. No executionPolicy,
         // status, assignee, or cached classification field is touched.
-        await svc.addComment(
+        return svc.addComment(
           parent.id,
           body,
           {},
           { authorType: "system" },
           tx,
         );
+      });
+      if (!advisoryComment) return;
+      await queueIssueAssignmentWakeup({
+        heartbeat,
+        issue: {
+          id: parent.id,
+          status: parent.status,
+          assigneeAgentId: parent.assigneeAgentId ?? null,
+        },
+        reason: "issue_adr072_close_ladder_incomplete",
+        mutation: "adr072_close_ladder_advisory",
+        contextSource: "issue.adr072_close_ladder_advisory",
+        requestedByActorType: "system",
+        requestedByActorId: "adr072-close-ladder-advisory",
+        wakeCommentId: advisoryComment.id,
       });
     } catch (err) {
       logger.warn(
