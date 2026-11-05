@@ -466,6 +466,7 @@ import {
 } from "../services/issue-thread-interaction-resolution.js";
 import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
 import { readBuiltInAgentMarker } from "../services/built-in-agent-metadata.js";
+import { isAgentInstructionsChangeTargetKey } from "../services/change-consent-gate.js";
 import {
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
@@ -1170,23 +1171,33 @@ async function auditAgentIssueCommentAttributionSpoof(input: {
 }
 
 /**
- * SUP-23042 / SUP-22819: a Reflection Coach proposal card's only deliverable
- * is an accepted instruction-bundle mutation (`agent:<id>:instructions`),
- * applied through the governed instructions API — it never produces a
- * repository merge, so a `repository_delivery` coach card is uncloseable.
- * Classify coach-filed cards `record_only` at creation, derived server-side
- * from the built-in agent marker on the creating agent. The caller never
- * selects the value: an explicit `deliveryRequirement` in the create body
- * always wins (a card that also owes a repository deliverable keeps
- * `repository_delivery`), and the assignee self-selection refusal at both
- * create sites still applies.
+ * SUP-23042 / SUP-22819: a Reflection Coach proposal card whose accepted
+ * confirmation target is `agent:<id>:instructions` owes no git deliverable —
+ * the mutation lands through the governed instructions API, never a
+ * repository merge — so a `repository_delivery` card of that class is
+ * uncloseable. Classification is derived server-side at creation and requires
+ * BOTH trusted signals: the creator carries the built-in `reflection-coach`
+ * agent marker AND the create body carries an explicit, exact
+ * `agent:<id>:instructions` consent target for this proposal. A coach card
+ * without that target (e.g. a draft skill committed under `skills/<slug>/`)
+ * fails closed to `repository_delivery`. An explicit `deliveryRequirement`
+ * always wins, and the assignee self-selection refusal at both create sites
+ * still applies.
  */
 async function createIsReflectionCoachRecordOnly(
   db: Db,
   companyId: string,
   req: Request,
+  body: { deliveryRequirement?: unknown; proposalTargetKey?: unknown },
 ): Promise<boolean> {
   if (req.actor.type !== "agent" || !req.actor.agentId) return false;
+  if (body.deliveryRequirement !== undefined) return false;
+  if (
+    typeof body.proposalTargetKey !== "string" ||
+    !isAgentInstructionsChangeTargetKey(body.proposalTargetKey)
+  ) {
+    return false;
+  }
   const [agent] = await db
     .select({ metadata: agents.metadata })
     .from(agents)
@@ -16663,8 +16674,7 @@ export function issueRoutes(
       // only when the caller selected nothing, so explicit selections above
       // and the self-selection refusal are untouched.
       if (
-        rawCreateBody.deliveryRequirement === undefined &&
-        (await createIsReflectionCoachRecordOnly(db, companyId, req))
+        await createIsReflectionCoachRecordOnly(db, companyId, req, rawCreateBody)
       ) {
         rawCreateBody.deliveryRequirement = "record_only";
       }
@@ -17616,8 +17626,7 @@ export function issueRoutes(
       // SUP-23042: same server-derived classification on the children-create
       // site — see createIsReflectionCoachRecordOnly.
       if (
-        sanitizedBody.deliveryRequirement === undefined &&
-        (await createIsReflectionCoachRecordOnly(db, parent.companyId, req))
+        await createIsReflectionCoachRecordOnly(db, parent.companyId, req, sanitizedBody)
       ) {
         sanitizedBody.deliveryRequirement = "record_only";
       }

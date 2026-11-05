@@ -15,6 +15,16 @@ export function agentInstructionsChangeTargetKey(agentId: string) {
   return `agent:${agentId}:instructions`;
 }
 
+// SUP-23042: exact-match predicate for the instruction-bundle consent target,
+// shared by the reflection-coach creation-time delivery classification.
+export function isAgentInstructionsChangeTargetKey(targetKey: string) {
+  return (
+    targetKey.startsWith("agent:") &&
+    targetKey.endsWith(":instructions") &&
+    targetKey.slice("agent:".length, -":instructions".length).length > 0
+  );
+}
+
 export function agentProfileChangeTargetKey(agentId: string) {
   return `agent:${agentId}:profile`;
 }

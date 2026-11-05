@@ -814,6 +814,19 @@ const createIssueBaseSchema = z.object({
   priority: z.enum(ISSUE_PRIORITIES).optional().default("medium"),
   reviewPolicy: z.enum(ISSUE_REVIEW_POLICIES).optional().nullable(),
   deliveryRequirement: z.enum(ISSUE_DELIVERY_REQUIREMENTS).optional(),
+  // SUP-23042: classification input for the reflection-coach proposal flow.
+  // The server honors it only when the creating actor is the built-in
+  // Reflection Coach and the value is an exact agent-instructions consent
+  // target; it is never persisted on the issue.
+  proposalTargetKey: z
+    .string()
+    .trim()
+    .min(1)
+    .max(255)
+    .describe(
+      "Consent target the reflection proposal will gate (coach flow only); server-side classification input, not stored",
+    )
+    .optional(),
   assigneeAgentId: z.string().guid().optional().nullable(),
   assigneeUserId: z.string().optional().nullable(),
   requestDepth: issueRequestDepthInputSchema.optional().default(0),

@@ -33,14 +33,17 @@ if (!embeddedPostgresSupport.supported) {
  * SUP-23042 — creation-time delivery classification for Reflection Coach
  * proposal cards.
  *
- * A coach card's only deliverable is an accepted instruction-bundle mutation
- * (`agent:<id>:instructions`), applied through the governed instructions API.
- * It never produces a repository merge, so storing it `repository_delivery`
- * leaves it uncloseable (SUP-22819: SUP-22802, SUP-22752). The create path
- * must therefore store a coach-filed card as `record_only` — derived
- * server-side from the built-in Reflection Coach marker, never selected by
- * the caller: an explicit `deliveryRequirement` still wins, and assignee
- * self-selection of `record_only` stays refused.
+ * A coach instruction-bundle card's only deliverable is an accepted
+ * `agent:<id>:instructions` mutation, applied through the governed
+ * instructions API — it never produces a repository merge, so storing it
+ * `repository_delivery` leaves it uncloseable (SUP-22819: SUP-22802,
+ * SUP-22752). The create path stores such a card as `record_only` only when
+ * BOTH trusted signals are present: the creator carries the built-in
+ * Reflection Coach marker AND the create body declares the exact
+ * instruction-bundle consent target. A coach card that commits anything to a
+ * repository (draft skill under `skills/<slug>/`) declares no target and
+ * fails closed to `repository_delivery`. Explicit `deliveryRequirement`
+ * still wins; assignee self-selection of `record_only` stays refused.
  */
 describeEmbeddedPostgres("reflection-coach create — record_only at creation (SUP-23042)", () => {
   let db!: ReturnType<typeof createDb>;
@@ -157,17 +160,16 @@ describeEmbeddedPostgres("reflection-coach create — record_only at creation (S
     return rows[0].deliveryRequirement;
   }
 
-  it("stores a coach-filed proposal card as record_only at creation", async () => {
+  it("stores a coach-filed instruction-bundle proposal card as record_only at creation", async () => {
     const { companyId, coachAgentId } = await seed();
 
     const res = await request(createApp(companyId, { agentId: coachAgentId }))
       .post(`/api/companies/${companyId}/issues`)
       .send({
         title: "Reflection: support-QAE — probe-hygiene rule exists but is never reached",
-        description:
-          "Mutation target key: `agent:00000000-0000-4000-8000-000000000001:instructions`",
         status: "todo",
         assigneeAgentId: coachAgentId,
+        proposalTargetKey: `agent:${randomUUID()}:instructions`,
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
@@ -175,7 +177,42 @@ describeEmbeddedPostgres("reflection-coach create — record_only at creation (S
     expect(await storedDeliveryRequirement(companyId)).toBe("record_only");
   });
 
-  it("keeps an explicitly requested repository_delivery on a coach create", async () => {
+  it("keeps a coach-filed repository-backed proposal at repository_delivery with no declared instruction target", async () => {
+    // SKILL.md §9: a draft skill committed under skills/<skill-slug>/ owes a
+    // repository deliverable; the coach must not be able to file it as
+    // record_only by omitting deliveryRequirement.
+    const omitted = await seed();
+    const omittedRes = await request(
+      createApp(omitted.companyId, { agentId: omitted.coachAgentId }),
+    )
+      .post(`/api/companies/${omitted.companyId}/issues`)
+      .send({
+        title: "Reflection: exec-CTO — new catalog skill with a committed draft",
+        status: "todo",
+        assigneeAgentId: omitted.coachAgentId,
+      });
+    expect(omittedRes.status, JSON.stringify(omittedRes.body)).toBe(201);
+    expect(omittedRes.body.deliveryRequirement).toBe("repository_delivery");
+    expect(await storedDeliveryRequirement(omitted.companyId)).toBe("repository_delivery");
+
+    // A non-instruction target key must not classify either.
+    const invalid = await seed();
+    const invalidRes = await request(
+      createApp(invalid.companyId, { agentId: invalid.coachAgentId }),
+    )
+      .post(`/api/companies/${invalid.companyId}/issues`)
+      .send({
+        title: "Reflection: exec-CTO — company skill mutation proposal",
+        status: "todo",
+        assigneeAgentId: invalid.coachAgentId,
+        proposalTargetKey: `skill:${randomUUID()}`,
+      });
+    expect(invalidRes.status, JSON.stringify(invalidRes.body)).toBe(201);
+    expect(invalidRes.body.deliveryRequirement).toBe("repository_delivery");
+    expect(await storedDeliveryRequirement(invalid.companyId)).toBe("repository_delivery");
+  });
+
+  it("keeps an explicitly requested repository_delivery on a coach create even with a declared target", async () => {
     const { companyId, coachAgentId } = await seed();
 
     const res = await request(createApp(companyId, { agentId: coachAgentId }))
@@ -185,6 +222,7 @@ describeEmbeddedPostgres("reflection-coach create — record_only at creation (S
         status: "todo",
         assigneeAgentId: coachAgentId,
         deliveryRequirement: "repository_delivery",
+        proposalTargetKey: `agent:${randomUUID()}:instructions`,
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
@@ -192,7 +230,7 @@ describeEmbeddedPostgres("reflection-coach create — record_only at creation (S
     expect(await storedDeliveryRequirement(companyId)).toBe("repository_delivery");
   });
 
-  it("does not classify creates by agents that are not the built-in Reflection Coach", async () => {
+  it("ignores the declared target on creates by agents that are not the built-in Reflection Coach", async () => {
     const { companyId, coderAgentId } = await seed();
 
     const res = await request(createApp(companyId, { agentId: coderAgentId }))
@@ -201,6 +239,7 @@ describeEmbeddedPostgres("reflection-coach create — record_only at creation (S
         title: "Ordinary engineering card that owes a repository deliverable",
         status: "todo",
         assigneeAgentId: coderAgentId,
+        proposalTargetKey: `agent:${randomUUID()}:instructions`,
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
@@ -229,7 +268,7 @@ describeEmbeddedPostgres("reflection-coach create — record_only at creation (S
     ).toHaveLength(0);
   });
 
-  it("stores a coach-filed child proposal card as record_only too", async () => {
+  it("stores a coach-filed instruction-bundle child proposal card as record_only too", async () => {
     const { companyId, coachAgentId } = await seed();
 
     const parent = await request(createApp(companyId, "board"))
@@ -242,6 +281,7 @@ describeEmbeddedPostgres("reflection-coach create — record_only at creation (S
       .send({
         title: "Reflection: support-QAE — probe-hygiene rule exists but is never reached",
         status: "todo",
+        proposalTargetKey: `agent:${randomUUID()}:instructions`,
       });
 
     expect(child.status, JSON.stringify(child.body)).toBe(201);

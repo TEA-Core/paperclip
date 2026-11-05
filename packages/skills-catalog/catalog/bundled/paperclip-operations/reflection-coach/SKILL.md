@@ -157,6 +157,7 @@ For each pinned replay issue, ask: "If this rule had been in effect, would the a
 
 From a reflection issue (assigned to the target's manager or the requester):
 
+0. File the reflection issue itself with `proposalTargetKey: "agent:<agentId>:instructions"` in the create body **only** when the proposal's sole deliverable is that instruction bundle — the server then files the card as `record_only` delivery. If the proposal commits anything to a repository (a draft skill under `skills/<skill-slug>/`, an `AGENTS.md` diff, any file), omit `proposalTargetKey` so the card keeps `repository_delivery` and the repository delivery guard still applies.
 1. Attach the proposal document: `PUT /api/issues/{issueId}/documents/reflection-proposal`.
 2. If a draft skill was written, commit it under `skills/<skill-slug>/` (or attach it) and link it in the proposal.
 3. Open the acceptance gate with a task interaction on the reflection issue. Mutations that change instructions, skills, or tool descriptions must use `request_confirmation`, show the diff in `payload.detailsMarkdown`, set `continuationPolicy: wake_assignee_on_accept`, and include the exact `payload.target.key` listed below.
