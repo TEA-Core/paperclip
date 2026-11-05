@@ -6177,47 +6177,16 @@ describe("evaluateDoneTierDeclaration", () => {
         setupDbMock({ issueWorkProducts: [] });
       });
 
-      it("preserves record_only acceptance", async () => {
-        const result = await evaluateDoneTierDeclaration(
-          mockDb,
-          { ...tierIssue, deliveryRequirement: "record_only" },
-          comment,
-          null,
-          () => Promise.resolve([]),
-        );
-        expect(result.allowed, result.reason).toBe(true);
-        expect(result.tier).toBe("tier1");
-      });
-
-      it("accepts repository_delivery with no pull-request work product or recorded merge commit", async () => {
-        const result = await evaluateDoneTierDeclaration(
-          mockDb,
-          { ...tierIssue, deliveryRequirement: "repository_delivery" },
-          comment,
-          null,
-          () => Promise.resolve([]),
-        );
-        expect(result.allowed, result.reason).toBe(true);
-        expect(result.tier).toBe("tier1");
-        expect(ghFetchMock).not.toHaveBeenCalled();
-      });
-
+      // SUP-22570: the form is accepted only on a record_only issue closed by an
+      // identified actor through PATCH /api/issues/{id}; the probe-backed proof
+      // lives in done-transition-no-repository-landing-routes.test.ts.
       it.each([
-        {
-          name: "a pull-request work product",
-          row: { type: "pull_request", metadata: { prNumber: 123 } },
-          reason: "pull_request work product",
-        },
-        {
-          name: "a recorded merge commit",
-          row: { type: "artifact", metadata: { mergeCommitSha: "a".repeat(40) } },
-          reason: "recorded merge commit",
-        },
-      ])("refuses repository_delivery with $name", async ({ row, reason }) => {
-        setupDbMock({ issueWorkProducts: [row] });
+        { name: "a repository_delivery issue", deliveryRequirement: "repository_delivery", reason: "only on a record_only issue" },
+        { name: "a record_only issue without an identified closing actor", deliveryRequirement: "record_only", reason: "identified closing actor" },
+      ])("refuses $name", async ({ deliveryRequirement, reason }) => {
         const result = await evaluateDoneTierDeclaration(
           mockDb,
-          { ...tierIssue, deliveryRequirement: "repository_delivery" },
+          { ...tierIssue, deliveryRequirement: deliveryRequirement as "record_only" | "repository_delivery" },
           comment,
           null,
           () => Promise.resolve([]),
@@ -6257,17 +6226,18 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(ghFetchMock).not.toHaveBeenCalled();
     });
 
-    it("SUP-21328: accepted Tier 1 forms advertise every landing state", () => {
+    it("SUP-21328: accepted Tier 1 forms advertise both landed-at-tip and landing-delegated", () => {
       expect(TIER1_FORM).toContain("landed-at-tip <sha>");
       expect(TIER1_FORM).toContain("landing-delegated PR #<N>");
       expect(TIER1_FORM).toContain("done-close-landing-backstop");
-      expect(TIER1_FORM).toContain("no-repository-landing");
-      expect(TIER1_FORM).toContain("no pull-request work product or recorded merge commit");
+      // SUP-22570: the no-repository form is appended per record_only issue by
+      // noRepositoryTier1FormSuffix, never baked into the shared literal.
+      expect(TIER1_FORM).not.toContain("no-repository-landing");
     });
 
     it("SUP-21328: each advertised Tier 1 prose form reaches the landing-token pre-check", async () => {
       const forms = TIER1_FORM.split('" or "').map((form) => form.replace(/^"|"$/g, ""));
-      expect(forms).toHaveLength(3);
+      expect(forms).toHaveLength(2);
       for (const form of forms) {
         const result = await evaluateDoneTierDeclaration(
           mockDb,
@@ -6294,8 +6264,7 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER2_JSON);
       expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_LANDED_JSON);
       expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_DELEGATED_JSON);
-      expect(DONE_TIER_STRUCTURED_FORMS).toContain('"mode": "noRepositoryLanding"');
-      expect(DONE_TIER_STRUCTURED_FORMS).toContain("no pull-request work product or recorded merge commit");
+      expect(DONE_TIER_STRUCTURED_FORMS).not.toContain("noRepositoryLanding");
       // SUP-22801: the record-only classification of the structured forms —
       // its Tier 2 entry carries the record-only grammar, never a merge head,
       // and Tier 1 entries are carried over unchanged.
