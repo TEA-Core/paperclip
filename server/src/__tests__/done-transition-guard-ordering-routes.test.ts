@@ -1358,7 +1358,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         .send({
           status: "done",
           comment:
-            "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip merge commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa. Liveness unverified.",
+            "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip merge commit 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19. Liveness unverified.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -1835,7 +1835,7 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
           outcome: "restored",
           sourceIssueStatus: "done",
           resolutionNote:
-            "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip merge commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa. Liveness unverified.",
+            "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip merge commit 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19. Liveness unverified.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);

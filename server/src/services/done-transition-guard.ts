@@ -766,7 +766,9 @@ function parseTier1Declaration(body: string): Tier1Parse {
 
 // Tier 1 landing proof (SUP-20671). A matched Tier 1 sentence is accepted only if its <reason>
 // carries exactly one landing-state token and that token's claim verifies:
-//  - `landed-at-tip`: the named commit is an ancestor of the repo default branch right now.
+//  - `landed-at-tip`: the named commit is an ancestor of the repo default branch right now,
+//    AND belongs to this issue (a linked merged PR merge commit, or this issue's recorded
+//    delivery head / work-product commit — SUP-23031; ancestry alone is not possession).
 //  - `landing-delegated`: names a linked `PR #<N>` and `done-close-landing-backstop` as the
 //    post-merge carrier (the async worker itself is unchanged here).
 // TIER1_FORM is token-bearing so every emitted accepted form reaches the landing-token pre-check.
@@ -1010,6 +1012,100 @@ async function proveLandingDelegated(
   return acceptTier1(reason, sameRun);
 }
 
+/**
+ * SUP-23031: possession evidence for the same-repo `landed-at-tip` proof.
+ * Ancestry of the project default branch proves the named sha LANDED, not
+ * that THIS card put it there — a card citing the repo tip of another card's
+ * merge passed the ancestry check while owning none of it (SUP-22365). The
+ * named sha must belong to the closing issue through recorded evidence:
+ *  - a linked pull request recorded as MERGED whose recorded merge commit
+ *    (`merge_commit_sha`) matches the named sha — a cached MERGED row is
+ *    terminal and GitHub-authoritative on its own; a row that does not
+ *    corroborate is hydrated live once before the decision, so a stale-open
+ *    snapshot of a merge that has since happened still corroborates
+ *    (SUP-22973 corroborate semantics);
+ *  - a `pull_request` work product on this issue whose recorded delivery
+ *    head (`metadata.headSha`, stamped at PR open) or recorded merge commit
+ *    (`metadata.mergeCommitSha`, stamped at merge) matches the named sha.
+ * Returns the corroborating source label, or null when nothing ties the sha
+ * to this issue. Throws when the evidence itself cannot be resolved (the
+ * caller fails closed).
+ */
+async function landedAtTipShaPossession(
+  db: Db,
+  issue: { id: string; companyId: string },
+  namedSha: string,
+): Promise<string | null> {
+  const needle = namedSha.trim().toLowerCase();
+  // Recorded shas are full 40-hex provider values; the named sha may be short
+  // (7-40 hex), so a recorded value corroborates when the needle is its
+  // prefix — the same match SUP-22973's corroborate uses.
+  const corroboratesRecorded = (value: unknown): boolean => {
+    const sha = typeof value === "string" ? value.trim().toLowerCase() : "";
+    return /^[0-9a-f]{40}$/.test(sha) && sha.startsWith(needle);
+  };
+  let linked: LinkedPullRequest[];
+  try {
+    linked = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, { includeDrafts: true });
+  } catch (err) {
+    throw new Error(`linked-PR resolution failed: ${err instanceof Error ? err.message : "unknown"}`);
+  }
+  const corroborates = (pr: LinkedPullRequest): boolean =>
+    (pr.merged === true || pr.cachedState === "merged") && corroboratesRecorded(pr.mergeCommitSha);
+  for (const candidate of linked) {
+    if (corroborates(candidate)) {
+      return `linked PR ${candidate.owner}/${candidate.repo}#${candidate.number} merge commit`;
+    }
+    // A cached MERGED row is terminal: a non-corroborating one needs no live
+    // probe. Anything else (stale-open, unhydrated) gets one hydration pass.
+    const terminallyRecorded =
+      (candidate.merged === true || candidate.cachedState === "merged") &&
+      typeof candidate.mergeCommitSha === "string" &&
+      candidate.mergeCommitSha.trim().length > 0;
+    if (terminallyRecorded) continue;
+    try {
+      const tokenCandidates = await resolveGitHubTokenCandidatesForRepo(
+        db,
+        issue.companyId,
+        candidate.owner,
+        candidate.repo,
+      );
+      for (const tokenCandidate of tokenCandidates) {
+        const hydration = await hydrateLinkedPrState(candidate, tokenCandidate.token);
+        if (!hydration.hydrated) continue;
+        if (corroborates(hydration.pr)) {
+          return `linked PR ${candidate.owner}/${candidate.repo}#${candidate.number} merge commit`;
+        }
+        break;
+      }
+    } catch {
+      // Credential or provider failure on the live probe: the cached row
+      // (which did not corroborate) stands and this candidate yields nothing.
+    }
+  }
+  let products: Array<{ metadata: Record<string, unknown> | null }>;
+  try {
+    products = await db
+      .select({ metadata: issueWorkProducts.metadata })
+      .from(issueWorkProducts)
+      .where(
+        and(
+          eq(issueWorkProducts.companyId, issue.companyId),
+          eq(issueWorkProducts.issueId, issue.id),
+          eq(issueWorkProducts.type, "pull_request"),
+        ),
+      );
+  } catch (err) {
+    throw new Error(`work-product read failed: ${err instanceof Error ? err.message : "unknown"}`);
+  }
+  for (const product of products) {
+    const metadata = product.metadata ?? {};
+    if (corroboratesRecorded(metadata.mergeCommitSha)) return "recorded work-product merge commit";
+    if (corroboratesRecorded(metadata.headSha)) return "recorded work-product delivery head";
+  }
+  return null;
+}
+
 async function proveLandedAtTip(
   db: Db,
   issue: {
@@ -1085,6 +1181,22 @@ async function proveLandedAtTip(
       `Tier 1 declaration merge commit ${sha} is not an ancestor of the default branch ${ctx.defaultRef}.`,
     );
   }
+  // SUP-23031: ancestry alone is not possession. The compare only proves the
+  // named sha is ON the project default branch; a stranger's already-landed
+  // commit passes it. Before accepting, the sha must belong to THIS issue
+  // through recorded possession evidence (linked merged PR merge commit, or
+  // this issue's recorded delivery head / work-product commit).
+  let possession: string | null;
+  try {
+    possession = await landedAtTipShaPossession(db, issue, sha);
+  } catch (err) {
+    return refuseTier1(unverifiedTier1(err));
+  }
+  if (possession === null) {
+    return refuseTier1(
+      `Tier 1 declaration merge commit ${sha} is an ancestor of the default branch ${ctx.defaultRef} but does not belong to this issue: it matches no linked merged PR merge commit and no recorded delivery head or work-product commit on this card. Cite this issue's own landing commit.`,
+    );
+  }
   return acceptTier1(reason, sameRun);
 }
 
@@ -1104,8 +1216,9 @@ async function proveLandedAtTip(
  * LIVE against THAT PR's own repository default branch, token via
  * `resolveGitHubTokenCandidatesForRepo` (cross-repo capable, as
  * `proveLandingDelegated` already uses). No new admit path opens:
- *  - a sha that IS an ancestor of the project default branch never reaches
- *    here (the first compare already accepted it);
+ *  - a sha whose project-repo compare RESOLVED never reaches here, whether
+ *    accepted or refused — and since SUP-23031 the same-repo path demands
+ *    possession too, so an ancestor sha this issue does not own refuses there;
  *  - a compare that resolved (ahead_by measurable) never reaches here, so a
  *    project-repo commit that is not at tip still refuses exactly as today;
  *  - no named PR, an unlinked PR number, a merge-commit mismatch, an unmerged
