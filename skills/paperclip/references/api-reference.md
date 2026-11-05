@@ -817,6 +817,13 @@ POST /api/companies/{companyId}/projects
 Omit repository inputs for non-code work. The explicit workspace alternatives
 below remain available when local workspace configuration is needed.
 
+`repoUrl`, `repoRef` and `defaultRef` on a project workspace are board-only. An
+agent key that sets any of them on `POST /api/companies/{companyId}/projects`
+(`workspace`), `POST /api/projects/{projectId}/workspaces` or
+`PATCH /api/projects/{projectId}/workspaces/{workspaceId}` gets 403 and nothing
+is persisted. Agents attach repositories with `repositoryIds` or `repositoryUrls`
+and use `cwd` for a local workspace.
+
 ### Option A: One-call create with workspace
 
 ```
@@ -829,8 +836,6 @@ POST /api/companies/{companyId}/projects
   "workspace": {
     "name": "paperclip-mobile",
     "cwd": "/Users/me/paperclip-mobile",
-    "repoUrl": "https://github.com/acme/paperclip-mobile",
-    "repoRef": "main",
     "isPrimary": true
   }
 }
@@ -849,16 +854,13 @@ POST /api/companies/{companyId}/projects
 POST /api/projects/{projectId}/workspaces
 {
   "cwd": "/Users/me/paperclip-mobile",
-  "repoUrl": "https://github.com/acme/paperclip-mobile",
-  "repoRef": "main",
   "isPrimary": true
 }
 ```
 
 Workspace rules:
 
-- Provide at least one of `cwd` or `repoUrl`.
-- For repo-only setup, omit `cwd` and provide `repoUrl`.
+- Agents provide `cwd`; `repoUrl`, `repoRef` and `defaultRef` are board-only (see above). For repo-only setup, use `repositoryIds` or `repositoryUrls` on project create.
 - The first workspace is primary by default.
 
 Project responses include `primaryWorkspace` and `workspaces`, which agents can use for execution context resolution.
@@ -1405,6 +1407,8 @@ Terminal states: `done`, `cancelled`
 | POST   | `/api/execution-workspaces/:workspaceId/runtime-services/start` | Start configured workspace services |
 | POST   | `/api/execution-workspaces/:workspaceId/runtime-services/restart` | Restart configured workspace services |
 | POST   | `/api/execution-workspaces/:workspaceId/runtime-services/stop` | Stop workspace runtime services |
+
+`cwd`, `providerRef` and `branchName` on an execution workspace are board-only: an agent key that sets any of them on `PATCH /api/execution-workspaces/:workspaceId` gets 403.
 
 ### Companies, Projects, Goals
 

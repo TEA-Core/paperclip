@@ -71,7 +71,7 @@ describe("a host with no root-owned git binary (SUP-22880 / SUP-22570)", () => {
       .rejects.toMatchObject({ kind: "unavailable" } satisfies Partial<HardenedGitError>);
   });
 
-  it("measures with the prior PATH lookup when the caller opts into the fallback, still ignoring inherited GIT_*", async () => {
+  it("measures with the prior PATH lookup when the caller opts into the inherited environment, still ignoring inherited GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE", async () => {
     const dirty = plainRepo("dirty");
     writeFileSync(path.join(dirty, "a.txt"), "undelivered\n");
     const clean = plainRepo("clean");
@@ -80,7 +80,7 @@ describe("a host with no root-owned git binary (SUP-22880 / SUP-22570)", () => {
     process.env.GIT_WORK_TREE = clean;
     process.env.GIT_INDEX_FILE = path.join(clean, ".git", "index");
     try {
-      const out = await runHardenedGit(["-C", dirty, "status", "--porcelain"], { cwd: "/", pathFallback: true });
+      const out = await runHardenedGit(["-C", dirty, "status", "--porcelain"], { cwd: "/", inheritEnvironment: true });
       expect(out).toContain("a.txt");
     } finally {
       for (const [key, value] of [["GIT_DIR", saved.dir], ["GIT_WORK_TREE", saved.tree], ["GIT_INDEX_FILE", saved.index]] as const) {

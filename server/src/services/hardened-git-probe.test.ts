@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   HardenedGitError,
+  normalizeBaseBranch,
   probeNoRepositoryWorktree,
   resolveTrustedGitBinary,
   runHardenedGit,
@@ -156,8 +157,8 @@ describe("hardened git runner (SUP-22880)", () => {
 });
 
 // The pre-existing repository_delivery dirty probe is `git status --porcelain`
-// through this runner (done-transition-guard.ts runGit), with a PATH fallback.
-const WORKTREE_STATUS_OPTIONS = { cwd: "/", pathFallback: true } as const;
+// through this runner in its inherit-environment mode (done-transition-guard.ts runGit).
+const WORKTREE_STATUS_OPTIONS = { cwd: "/", inheritEnvironment: true } as const;
 async function worktreeStatus(repo: string): Promise<string> {
   return runHardenedGit(["-C", repo, "status", "--porcelain"], WORKTREE_STATUS_OPTIONS);
 }
@@ -217,6 +218,68 @@ describe("pre-existing repository_delivery status probe under the hardened runne
     }
   });
 
+  describe("keeps the server's own git configuration, so a dubiously owned workspace is still measured", () => {
+    // GIT_TEST_ASSUME_DIFFERENT_OWNER makes git treat every repository as owned
+    // by another uid, the state a workspace shared across uids is in.
+    async function withEnv<T>(vars: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+      const saved = Object.fromEntries(Object.keys(vars).map((key) => [key, process.env[key]]));
+      Object.assign(process.env, vars);
+      try {
+        return await fn();
+      } finally {
+        for (const [key, value] of Object.entries(saved)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+    }
+
+    it("refuses to read the workspace when nothing marks it safe", async () => {
+      const repo = plainRepo("repo");
+      writeFileSync(path.join(repo, "a.txt"), "undelivered\n");
+      await withEnv({ GIT_TEST_ASSUME_DIFFERENT_OWNER: "1" }, async () => {
+        await expect(worktreeStatus(repo)).rejects.toMatchObject({ kind: "failed" } satisfies Partial<HardenedGitError>);
+      });
+    });
+
+    it("measures it when safe.directory is supplied through GIT_CONFIG_COUNT/KEY/VALUE", async () => {
+      const repo = plainRepo("repo");
+      writeFileSync(path.join(repo, "a.txt"), "undelivered\n");
+      await withEnv(
+        {
+          GIT_TEST_ASSUME_DIFFERENT_OWNER: "1",
+          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_KEY_0: "safe.directory",
+          GIT_CONFIG_VALUE_0: repo,
+        },
+        async () => {
+          expect(await worktreeStatus(repo)).toContain("a.txt");
+        },
+      );
+    });
+
+    it("measures it when safe.directory is supplied through global git configuration", async () => {
+      const repo = plainRepo("repo");
+      writeFileSync(path.join(repo, "a.txt"), "undelivered\n");
+      const globalConfig = path.join(root, "global.gitconfig");
+      writeFileSync(globalConfig, `[safe]\n\tdirectory = ${repo}\n`);
+      await withEnv({ GIT_TEST_ASSUME_DIFFERENT_OWNER: "1", GIT_CONFIG_GLOBAL: globalConfig }, async () => {
+        expect(await worktreeStatus(repo)).toContain("a.txt");
+      });
+    });
+
+    it("leaves the close-gating runner fully stripped of that inherited configuration", async () => {
+      await withEnv(
+        { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "safe.directory", GIT_CONFIG_VALUE_0: "/inherited/path" },
+        async () => {
+          expect(await runHardenedGit(["config", "--get-all", "safe.directory"], WORKTREE_STATUS_OPTIONS)).toContain("/inherited/path");
+          await expect(runHardenedGit(["config", "--get-all", "safe.directory"], { cwd: "/" }))
+            .rejects.toMatchObject({ kind: "failed" } satisfies Partial<HardenedGitError>);
+        },
+      );
+    });
+  });
+
   it("is unmeasured (rejects) rather than clean when git blocks past the timeout", async () => {
     const repo = plainRepo("repo");
     const fifo = path.join(root, "blocking-include");
@@ -224,6 +287,39 @@ describe("pre-existing repository_delivery status probe under the hardened runne
     git(repo, "config", "include.path", fifo);
     await expect(runHardenedGit(["-C", repo, "status", "--porcelain"], { ...WORKTREE_STATUS_OPTIONS, timeoutMs: 500 }))
       .rejects.toMatchObject({ kind: "timeout" } satisfies Partial<HardenedGitError>);
+  });
+});
+
+describe("normalizeBaseBranch", () => {
+  it.each([
+    ["main", "main"],
+    [" main ", "main"],
+    ["origin/main", "main"],
+    ["fold/tea-patches-v2026.722.0", "fold/tea-patches-v2026.722.0"],
+    ["origin/fold/tea-patches-v2026.722.0", "fold/tea-patches-v2026.722.0"],
+  ])("reduces %j to %j", (ref, expected) => {
+    expect(normalizeBaseBranch(ref)).toBe(expected);
+  });
+
+  it.each([
+    ["refs/heads/main"],
+    ["refs/remotes/origin/main"],
+    ["origin/refs/heads/main"],
+    ["origin/refs/remotes/origin/main"],
+    ["HEAD"],
+    ["origin/HEAD"],
+    ["origin/"],
+    ["-main"],
+    ["main/"],
+    ["/main"],
+    ["a..b"],
+    ["main.lock"],
+    ["ma in"],
+    [""],
+    [null],
+    [undefined],
+  ])("refuses %j", (ref) => {
+    expect(normalizeBaseBranch(ref as string | null | undefined)).toBeNull();
   });
 });
 

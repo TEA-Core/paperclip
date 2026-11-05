@@ -431,15 +431,16 @@ async function resolveGitHubRefHeadSha(
   return sha.toLowerCase();
 }
 
-// SUP-22880: the local-worktree probes below read an agent-writable workspace,
-// so they run through the hardened runner (absolute root-owned git, no
-// inherited GIT_* environment, no system/global config, fsmonitor and hooks
-// forced off, timeout). The process cwd is "/", never the probed workspace.
-// Both callers fail open on an unmeasured result, so a host without a
-// root-owned git keeps the prior PATH lookup (still under the stripped
-// environment) rather than turning every unmeasured probe into an allow.
+// SUP-22880: the local-worktree probes below read an agent-writable workspace.
+// They keep the server's own git environment and configuration, so
+// safe.directory and global config still apply and an unmeasured probe is no
+// likelier than before, and lose only the GIT_DIR, GIT_WORK_TREE and
+// GIT_INDEX_FILE variables that would redirect which repository they read.
+// fsmonitor and hooks are forced off, a timeout applies, and the process cwd is
+// "/", never the probed workspace. Both callers fail open on an unmeasured
+// result.
 function runGit(args: string[], cwd: string): Promise<string> {
-  return runHardenedGit(["-C", cwd, ...args], { cwd: "/", pathFallback: true });
+  return runHardenedGit(["-C", cwd, ...args], { cwd: "/", inheritEnvironment: true });
 }
 
 /**

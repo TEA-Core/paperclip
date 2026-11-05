@@ -31,6 +31,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { projectRoutes } from "../routes/projects.js";
+import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
   evaluateDoneTransitionGuardForBackstopClose,
@@ -132,6 +133,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     const unusedStorage = {} as unknown as StorageService;
     app.use("/api", issueRoutes(db, unusedStorage));
     app.use("/api", projectRoutes(db));
+    app.use("/api", executionWorkspaceRoutes(db));
     app.use(errorHandler);
   }, 60_000);
 
@@ -748,6 +750,79 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     const [created] = await db.select({ id: projects.id }).from(projects).where(and(eq(projects.companyId, fixture.companyId), eq(projects.name, "Board project")));
     const [row] = await db.select({ repoUrl: projectWorkspaces.repoUrl, repoRef: projectWorkspaces.repoRef, defaultRef: projectWorkspaces.defaultRef }).from(projectWorkspaces).where(eq(projectWorkspaces.projectId, created!.id));
     expect(row).toEqual({ repoUrl: "https://github.com/TEA-Core/records", repoRef: "main", defaultRef: "release" });
+  });
+
+  async function storedExecutionWorkspaceIdentity(executionWorkspaceId: string) {
+    return db
+      .select({
+        cwd: executionWorkspaces.cwd,
+        providerRef: executionWorkspaces.providerRef,
+        branchName: executionWorkspaces.branchName,
+      })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, executionWorkspaceId))
+      .then((rows) => rows[0]!);
+  }
+
+  it.each([
+    ["cwd", { cwd: "/tmp/agent-chosen" }],
+    ["providerRef", { providerRef: "/tmp/agent-chosen" }],
+    ["branchName", { branchName: "agent-chosen" }],
+  ] as const)("refuses an agent PATCH of the execution workspace %s and leaves the stored row unchanged", async (_field, patch) => {
+    const fixture = await seed();
+    const before = await storedExecutionWorkspaceIdentity(fixture.executionWorkspaceId);
+
+    const res = await request(app).patch(`/api/execution-workspaces/${fixture.executionWorkspaceId}`).send(patch);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Agent keys cannot set the worktree or branch an execution workspace is measured against");
+    expect(await storedExecutionWorkspaceIdentity(fixture.executionWorkspaceId)).toEqual(before);
+  });
+
+  it("still lets an agent change an execution workspace field that is not its worktree identity", async () => {
+    const fixture = await seed();
+
+    const res = await request(app)
+      .patch(`/api/execution-workspaces/${fixture.executionWorkspaceId}`)
+      .send({ name: "Renamed by agent" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+  });
+
+  it("lets a board user change the execution workspace worktree identity", async () => {
+    const fixture = await seed();
+    currentActor = { type: "board", userId: "local-board", source: "local_implicit" } as Express.Request["actor"];
+
+    const res = await request(app)
+      .patch(`/api/execution-workspaces/${fixture.executionWorkspaceId}`)
+      .send({ branchName: "board-chosen", providerRef: fixture.worktree, cwd: fixture.worktree });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await storedExecutionWorkspaceIdentity(fixture.executionWorkspaceId)).toEqual({
+      cwd: fixture.worktree,
+      providerRef: fixture.worktree,
+      branchName: "board-chosen",
+    });
+  });
+
+  it("does not let the closing agent redirect the probe to a clean decoy worktree while its deliverable sits in the real one", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    writeFileSync(path.join(fixture.worktree, "deliverable.md"), "undelivered\n");
+    git(fixture.worktree, "branch", "-m", "hidden");
+    const decoy = path.join(fixture.repoRoot, ".paperclip", "worktrees", `${fixture.identifier}-decoy`);
+    git(fixture.repoRoot, "worktree", "add", "-q", "-b", `${fixture.identifier}-decoy`, decoy, "origin/main");
+
+    const redirect = await request(app)
+      .patch(`/api/execution-workspaces/${fixture.executionWorkspaceId}`)
+      .send({ providerRef: decoy, cwd: decoy });
+    expect(redirect.status, JSON.stringify(redirect.body)).toBe(403);
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("uncommitted changes");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 
   it("does not let the closing agent move the compare base onto its own pushed branch", async () => {

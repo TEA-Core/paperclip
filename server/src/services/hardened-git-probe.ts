@@ -19,7 +19,7 @@ import { PROJECT_REPOSITORIES_DIR } from "@paperclipai/adapter-utils/git-workspa
 // `core.worktree` or an inherited `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`
 // to a different tree than the one it was asked about.
 //
-// Every invocation here therefore:
+// Every close-gating invocation here therefore:
 //   - runs a root-owned Git binary from a fixed system path, never a PATH lookup;
 //   - runs with an environment built from scratch: no inherited `GIT_*`
 //     variable, no system or global configuration, a fixed PATH;
@@ -28,6 +28,9 @@ import { PROJECT_REPOSITORIES_DIR } from "@paperclipai/adapter-utils/git-workspa
 //     command-line configuration, which outranks repository configuration
 //     no matter when the repository writes it;
 //   - is killed after a timeout.
+// The pre-existing fail-open probes opt out of the from-scratch environment
+// (`inheritEnvironment`) so the server's safe.directory and global
+// configuration keep applying; they lose only the three redirecting variables.
 // The record_only no-repository probe additionally never computes a worktree
 // status against the repository's own git dir: it runs against a private
 // snapshot git dir (a copy of the index, the HEAD commit, the shared object
@@ -40,11 +43,18 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_BUFFER = 16 * 1024 * 1024;
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
-// Command-line configuration applied to every invocation (GIT_CONFIG_COUNT
-// entries are command-line scope, so they win over repository config).
-const FORCED_CONFIG: ReadonlyArray<readonly [string, string]> = [
+// The two overrides that stop repository-local configuration from running a
+// program; every invocation carries them.
+const EXECUTION_GUARD_CONFIG: ReadonlyArray<readonly [string, string]> = [
   ["core.fsmonitor", "false"],
   ["core.hooksPath", "/dev/null"],
+];
+
+// Command-line configuration applied to every hardened invocation
+// (GIT_CONFIG_COUNT entries are command-line scope, so they win over repository
+// config).
+const FORCED_CONFIG: ReadonlyArray<readonly [string, string]> = [
+  ...EXECUTION_GUARD_CONFIG,
   ["core.untrackedCache", "false"],
   ["core.excludesFile", "/dev/null"],
   ["core.attributesFile", "/dev/null"],
@@ -114,6 +124,14 @@ function hardenedGitEnv(ceilingDirectory: string | null): NodeJS.ProcessEnv {
   return env;
 }
 
+function inheritedGitEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env.GIT_DIR;
+  delete env.GIT_WORK_TREE;
+  delete env.GIT_INDEX_FILE;
+  return env;
+}
+
 export interface HardenedGitOptions {
   /** Process working directory: a control-plane directory, never a probed workspace. */
   cwd: string;
@@ -121,29 +139,32 @@ export interface HardenedGitOptions {
   /** Stops repository discovery above this directory. */
   ceilingDirectory?: string | null;
   /**
-   * When no trusted git binary exists, run `git` from PATH (still under the
-   * stripped environment) instead of failing. Only for probes that predate the
-   * trusted-binary requirement and fail open on an unmeasured result; a probe
-   * that gates a close must leave this unset and refuse.
+   * For the pre-existing fail-open probes only. Keeps the server's own
+   * environment and git configuration (global and system config, `GIT_CONFIG_*`
+   * `safe.directory` entries, PATH), minus the `GIT_DIR`, `GIT_WORK_TREE` and
+   * `GIT_INDEX_FILE` variables that redirect which repository is read; forces
+   * fsmonitor and hooks off on the command line; and runs `git` from PATH when
+   * no trusted binary exists. A probe that gates a close must leave this unset.
    */
-  pathFallback?: boolean;
+  inheritEnvironment?: boolean;
   /** Written to the process's standard input. */
   input?: string;
 }
 
 /** Run one Git command under the hardened environment; resolves stdout. */
 export function runHardenedGit(args: readonly string[], options: HardenedGitOptions): Promise<string> {
+  const inherit = options.inheritEnvironment === true;
   const trustedGit = resolveTrustedGitBinary();
-  if (!trustedGit && !options.pathFallback) {
+  if (!trustedGit && !inherit) {
     return Promise.reject(new HardenedGitError("unavailable", "no root-owned git binary at a fixed system path"));
   }
   const git = trustedGit ?? "git";
-  const env = hardenedGitEnv(options.ceilingDirectory ?? null);
-  if (!trustedGit && process.env.PATH) env.PATH = process.env.PATH;
+  const env = inherit ? inheritedGitEnv() : hardenedGitEnv(options.ceilingDirectory ?? null);
+  const guardArgs = inherit ? EXECUTION_GUARD_CONFIG.flatMap(([key, value]) => ["-c", `${key}=${value}`]) : [];
   return new Promise((resolve, reject) => {
     const child = execFile(
       git,
-      ["--no-optional-locks", ...args],
+      [...guardArgs, "--no-optional-locks", ...args],
       {
         cwd: options.cwd,
         env,
@@ -348,13 +369,15 @@ export function branchNamesIssue(branch: string, identifier: string): boolean {
 export function normalizeBaseBranch(ref: string | null | undefined): string | null {
   if (typeof ref !== "string") return null;
   let name = ref.trim();
-  for (const prefix of ["refs/remotes/origin/", "refs/heads/", "origin/"]) {
-    if (name.startsWith(prefix)) {
-      name = name.slice(prefix.length);
-      break;
-    }
-  }
-  if (name.length === 0 || name === "HEAD" || name.startsWith("-") || name.startsWith("/") || name.endsWith("/")) {
+  if (name.startsWith("origin/")) name = name.slice("origin/".length);
+  if (
+    name.length === 0 ||
+    name === "HEAD" ||
+    name.startsWith("refs/") ||
+    name.startsWith("-") ||
+    name.startsWith("/") ||
+    name.endsWith("/")
+  ) {
     return null;
   }
   if (!/^[A-Za-z0-9._/-]+$/.test(name) || name.includes("..") || name.includes("//") || name.endsWith(".lock")) {
