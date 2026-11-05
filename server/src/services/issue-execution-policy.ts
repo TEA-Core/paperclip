@@ -12,7 +12,7 @@ import type {
   IssueExecutionState,
   IssueMonitorScheduledBy,
 } from "@paperclipai/shared";
-import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
+import { gitCommitShaSchema, issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 import { resolveSelfApprovalPrincipals } from "./approval-status-reconciler.js";
 import { resolveCallerSeat, seatAuthorityNextAction } from "./seat-authority-refusal.js";
@@ -90,6 +90,15 @@ type TransitionInput = {
    * (`details.callerSeat: "ancestor-hatch"`) on a seat-authority refusal.
    */
   actorViaAncestorHatch?: boolean;
+  /**
+   * R20: whether the policy's stall arbiter can take work now (an agent of
+   * this company that is not paused, terminated or pending approval). The
+   * engine cannot read agents, so the caller resolves it from the agent row.
+   * Absent counts as unavailable: a caller that never checked can never hand
+   * a stalled stage to an agent that will not run it — the round falls
+   * through to the ordinary ceiling behaviour instead.
+   */
+  stallArbiterAvailable?: boolean;
 };
 
 export type ReviewEscalationSignal = {
@@ -165,12 +174,15 @@ export const DEFAULT_MAX_REVIEW_ROUNDS = 10;
 export const BASE_MAX_REVIEW_ROUNDS = 3;
 
 /**
- * R20 stall signal written by a reviewer: a decision-comment line saying the
- * code itself is acceptable (the remaining finding is not something the
- * implementer can change). Line-anchored so prose that merely mentions the
- * phrase does not count; list bullets, block quotes and bold are tolerated.
+ * R20 stall signal written by a reviewer: a decision-comment line that is
+ * exactly `Code acceptable: yes` (the remaining finding is not something the
+ * implementer can change). The whole line must be the marker, case-insensitive;
+ * it may be a list item or block quote and may bold the key or the answer.
+ * Prose that mentions the phrase, or a line that adds anything after `yes`,
+ * does not count.
  */
-const CODE_ACCEPTABLE_MARKER = /^[ \t>*_-]*code acceptable[ \t*_]*:[ \t*_]*yes\b/im;
+const CODE_ACCEPTABLE_MARKER =
+  /^[ \t]*(?:[-*>][ \t]*)?(?:\*\*|__)?code acceptable(?:\*\*|__)?[ \t]*:(?:\*\*|__)?[ \t]*(?:\*\*|__)?yes(?:\*\*|__)?[ \t\r]*$/im;
 
 const COMPLETED_STATUS: IssueExecutionState["status"] = "completed";
 const PENDING_STATUS: IssueExecutionState["status"] = "pending";
@@ -574,15 +586,14 @@ export function normalizeIssueExecutionPolicy(
     // The arbiter is a second opinion outside the reviewers and the author:
     // as the return assignee it would judge its own work, and as a review
     // participant the hand-off would let it approve the stage it arbitrates.
-    if (stallEscalation.toAgentId === returnAssigneeAgentId) {
+    if (sameAgentId(stallEscalation.toAgentId, returnAssigneeAgentId)) {
       throw unprocessable(
         "executionPolicy.stallEscalation.toAgentId must not be the policy's returnAssigneeAgentId; the arbiter would judge its own work",
         { field: "stallEscalation.toAgentId", agentId: stallEscalation.toAgentId },
       );
     }
     const reviewParticipant = stages.some((stage) =>
-      stage.type === "review" &&
-      stage.participants.some((participant) => participant.type === "agent" && participant.agentId === stallEscalation.toAgentId),
+      stage.type === "review" && stageHasAgent(stage, stallEscalation.toAgentId),
     );
     if (reviewParticipant) {
       throw unprocessable(
@@ -623,7 +634,7 @@ export function normalizeIssueExecutionPolicy(
     ...(reviewPreset ? { reviewPreset } : {}),
     ...(authorizationPolicy ? { authorizationPolicy } : {}),
     ...(parsed.data.maxReviewRounds != null ? { maxReviewRounds: parsed.data.maxReviewRounds } : {}),
-    ...(stallEscalation ? { stallEscalation: { afterRounds: stallEscalation.afterRounds, toAgentId: stallEscalation.toAgentId } } : {}),
+    ...(stallEscalation ? { stallEscalation: { afterRounds: stallEscalation.afterRounds, toAgentId: stallEscalation.toAgentId.toLowerCase() } } : {}),
     ...(baseRef ? { baseRef } : {}),
     ...(releaseAssurance ? { approvalAuthority: "release_assurance" as const } : {}),
   };
@@ -1074,9 +1085,17 @@ function resolveEscalatedHoldMinRounds(policy: IssueExecutionPolicy | null): num
   return typeof configured === "number" && configured > 0 ? configured : BASE_MAX_REVIEW_ROUNDS;
 }
 
-function stallArbiterPrincipal(policy: IssueExecutionPolicy | null): IssueExecutionStagePrincipal | null {
-  const agentId = policy?.stallEscalation?.toAgentId;
-  return agentId ? { type: "agent", agentId, userId: null } : null;
+/** Agent ids are uuids; compare them case-insensitively wherever the arbiter is involved. */
+function sameAgentId(left: string | null | undefined, right: string | null | undefined): boolean {
+  return Boolean(left) && Boolean(right) && left!.toLowerCase() === right!.toLowerCase();
+}
+
+function principalIsAgent(principal: IssueExecutionStagePrincipal | null | undefined, agentId: string): boolean {
+  return principal?.type === "agent" && sameAgentId(principal.agentId, agentId);
+}
+
+function stageHasAgent(stage: IssueExecutionStage, agentId: string): boolean {
+  return stage.participants.some((participant) => principalIsAgent(participant, agentId));
 }
 
 /**
@@ -1093,21 +1112,22 @@ function isStallArbiterHold(input: {
   stage: IssueExecutionStage;
   participant: IssueExecutionStagePrincipal;
 }): boolean {
-  const arbiter = stallArbiterPrincipal(input.policy);
+  const arbiterId = input.policy.stallEscalation?.toAgentId;
   const handoff = input.state?.stallHandoff;
   return (
-    arbiter !== null &&
+    Boolean(arbiterId) &&
     handoff?.stageId === input.stage.id &&
-    handoff.arbiterAgentId === arbiter.agentId &&
-    principalsEqual(input.participant, arbiter) &&
-    !stageHasParticipant(input.stage, arbiter)
+    sameAgentId(handoff.arbiterAgentId, arbiterId) &&
+    principalIsAgent(input.participant, arbiterId!) &&
+    !stageHasAgent(input.stage, arbiterId!)
   );
 }
 
+/** Same delivered head, compared only between full git shas: a malformed value is never a stall signal. */
 function sameHeadSha(left: string | null | undefined, right: string | null | undefined): boolean {
-  const a = left?.trim().toLowerCase();
-  const b = right?.trim().toLowerCase();
-  return Boolean(a) && a === b;
+  const a = gitCommitShaSchema.safeParse(left);
+  const b = gitCommitShaSchema.safeParse(right);
+  return a.success && b.success && a.data.toLowerCase() === b.data.toLowerCase();
 }
 
 /**
@@ -1117,7 +1137,8 @@ function sameHeadSha(left: string | null | undefined, right: string | null | und
  * for this round is the head the previous decision already bounced, or the
  * reviewer's decision says the code is acceptable. A loop that still makes
  * progress (a new head, findings about the code) keeps bouncing to the
- * implementer up to the round ceiling. At most one hand-off per stage-run.
+ * implementer up to the round ceiling. At most one hand-off per stage-run, and
+ * none when the caller could not confirm the arbiter can take work now.
  */
 function resolveStallHandoff(input: {
   policy: IssueExecutionPolicy;
@@ -1126,25 +1147,28 @@ function resolveStallHandoff(input: {
   returnAssignee: IssueExecutionStagePrincipal;
   nextRounds: number;
   commentBody: string;
+  arbiterAvailable: boolean;
 }): { arbiter: IssueExecutionStagePrincipal; signals: IssueExecutionStallSignal[] } | null {
   const config = input.policy.stallEscalation;
   if (!config || input.stage.type !== "review") return null;
   if (input.state?.stallHandoff?.stageId === input.stage.id) return null;
   if (input.nextRounds < config.afterRounds) return null;
-  const arbiter = stallArbiterPrincipal(input.policy)!;
+  if (!input.arbiterAvailable) return null;
   // Self-approval guards: the arbiter never receives a stage it already sits
   // on as a reviewer, nor one whose work it authored or will be handed back.
   if (
-    stageHasParticipant(input.stage, arbiter) ||
-    principalsEqual(arbiter, input.returnAssignee) ||
-    principalsEqual(arbiter, input.state?.deliveryAuthor ?? null)
+    stageHasAgent(input.stage, config.toAgentId) ||
+    principalIsAgent(input.returnAssignee, config.toAgentId) ||
+    principalIsAgent(input.state?.deliveryAuthor, config.toAgentId)
   ) {
     return null;
   }
   const signals: IssueExecutionStallSignal[] = [];
   if (sameHeadSha(input.state?.deliveredHeadSha, input.state?.bouncedHeadSha)) signals.push("same_head_rebounced");
   if (CODE_ACCEPTABLE_MARKER.test(input.commentBody)) signals.push("code_acceptable");
-  return signals.length > 0 ? { arbiter, signals } : null;
+  return signals.length > 0
+    ? { arbiter: { type: "agent", agentId: config.toAgentId, userId: null }, signals }
+    : null;
 }
 
 /**
@@ -1862,6 +1886,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
               returnAssignee,
               nextRounds,
               commentBody: decision.body,
+              arbiterAvailable: input.stallArbiterAvailable === true,
             });
         if (stallHandoff) {
           // R20: a stalled loop goes to the arbiter once, on the same card and

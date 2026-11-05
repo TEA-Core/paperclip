@@ -450,6 +450,16 @@ export const issueExecutionMonitorPolicySchema = z.object({
     .default(null),
 }).strict();
 
+/**
+ * A full git commit sha: 40 hex digits (SHA-1) or 64 (SHA-256). The delivered
+ * head recorded on `deliveryIdentity.headSha` must be one, so the R20
+ * same-head stall signal can never be forged with an arbitrary string.
+ */
+export const gitCommitShaSchema = z
+  .string()
+  .trim()
+  .regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i, "must be a full git commit sha (40 or 64 hex digits)");
+
 // R20: bounds only. The cross-field rule (afterRounds within the resolved
 // round ceiling) needs the server's default ceiling, so it is enforced where
 // every policy write normalizes: normalizeIssueExecutionPolicy.
@@ -562,9 +572,10 @@ export const issueExecutionStateSchema = z.object({
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
   changesRequestedCount: z.number().int().nonnegative().optional().default(0),
   pendingSince: z.string().nullable().optional(),
-  // R20 review-stall bookkeeping. Lenient on purpose: a malformed optional key
-  // must never make the whole state unparseable and drop the issue's place in
-  // the review chain.
+  // R20 review-stall bookkeeping, written only by the server. The head keys
+  // accept any string so an odd stored value never makes the state
+  // unparseable; the stall trigger ignores a value that is not a full git sha.
+  // `stallHandoff` is validated: only the engine writes it.
   deliveredHeadSha: z.string().nullable().optional(),
   bouncedHeadSha: z.string().nullable().optional(),
   stallHandoff: z.object({

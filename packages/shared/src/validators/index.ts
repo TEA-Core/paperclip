@@ -446,6 +446,7 @@ export {
   stalledReviewDecisionSchema,
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
+  gitCommitShaSchema,
   issueRecoveryActionReadModelSchema,
   resolveIssueRecoveryActionSchema,
   issueReviewRequestSchema,

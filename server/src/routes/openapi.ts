@@ -7,6 +7,7 @@ import { Router } from "express";
 import { z } from "zod";
 import {
   createAiConnectionSchema,
+  gitCommitShaSchema,
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
   localAiLoginStartSchema,
@@ -4069,7 +4070,7 @@ registry.registerPath({
             })
             .strict(),
           branch: z.string().trim().min(1),
-          headSha: z.string().trim().min(1),
+          headSha: gitCommitShaSchema,
           prNumber: z.number().int().positive().optional(),
           prUrl: z.string().url().optional(),
           sourceIssueId: z.string().uuid().optional(),

@@ -116,6 +116,7 @@ import {
   updateDocumentAnnotationThreadSchema,
   upsertIssueDocumentSchema,
   updateIssueObjectSchema,
+  gitCommitShaSchema,
   updateIssueSchema,
   stripCreateOnlyIssueAttribution,
   isClosedIsolatedExecutionWorkspace,
@@ -502,7 +503,7 @@ const deliveryIdentitySchema = z.object({
     repo: z.string().trim().min(1),
   }).strict(),
   branch: z.string().trim().min(1),
-  headSha: z.string().trim().min(1),
+  headSha: gitCommitShaSchema,
   prNumber: z.number().int().positive().optional(),
   prUrl: z.string().url().optional(),
   sourceIssueId: z.string().uuid().optional(),
@@ -5817,6 +5818,38 @@ export function issueRoutes(
         return Boolean(agent && agent.companyId === input.companyId);
       },
     });
+  // R20: whether the policy's stall arbiter can take work right now. The engine
+  // hands a stalled stage only to an available arbiter; a paused, terminated or
+  // pending agent (or one gone from the company) makes the round fall through
+  // to the ordinary ceiling behaviour instead of wedging on a dead seat. Only
+  // a review changes-requested decision can hand off, so nothing else pays
+  // for the agent read.
+  const resolveStallArbiterAvailable = async (input: {
+    companyId: string;
+    policy: NormalizedExecutionPolicy | null;
+    executionState: unknown;
+    requestedStatus: string | undefined;
+  }): Promise<boolean> => {
+    const arbiterId = input.policy?.stallEscalation?.toAgentId;
+    if (
+      !arbiterId ||
+      !isReviewChangesRequestedTransition({
+        policy: input.policy,
+        executionState: parseIssueExecutionState(input.executionState),
+        requestedStatus: input.requestedStatus,
+      })
+    ) {
+      return false;
+    }
+    const agent = await agentsSvc.getById(arbiterId);
+    return Boolean(
+      agent &&
+        agent.companyId === input.companyId &&
+        agent.status !== "paused" &&
+        agent.status !== "terminated" &&
+        agent.status !== "pending_approval",
+    );
+  };
   const projectsSvc = projectService(db);
   const goalsSvc = goalService(db);
   const issueApprovalsSvc = issueApprovalService(db);
@@ -14098,6 +14131,12 @@ export function issueRoutes(
               },
               allowBoardOverride: req.actor.type === "board",
               commentBody: doneTierResolutionNote,
+              stallArbiterAvailable: await resolveStallArbiterAvailable({
+                companyId: lockedIssue.companyId,
+                policy: executionPolicy,
+                executionState: lockedIssue.executionState,
+                requestedStatus: sourceIssueStatus,
+              }),
             });
             const recoveryDecisionId = transition.decision ? randomUUID() : null;
             if (recoveryDecisionId) {
@@ -19378,6 +19417,12 @@ export function issueRoutes(
       // SUP-16525 §4: only set by the explicit, authorization-checked request
       // validated above — never inferred from the policy diff.
       rearmPointer: rearmExecutionPolicyRequested,
+      stallArbiterAvailable: await resolveStallArbiterAvailable({
+        companyId: existing.companyId,
+        policy: nextExecutionPolicy,
+        executionState: existing.executionState,
+        requestedStatus: requestedTransitionStatus,
+      }),
     });
     const decisionId = transition.decision ? randomUUID() : null;
     if (decisionId) {
@@ -19768,7 +19813,11 @@ export function issueRoutes(
         },
         // R20: the structured head of this review round, compared by the
         // review-stall trigger against the head the last bounce rejected.
-        deliveredHeadSha: requestedDeliveryIdentity.headSha,
+        // Written only for a policy that names a stall arbiter, so a policy
+        // without one keeps its persisted state unchanged.
+        ...(nextExecutionPolicy?.stallEscalation
+          ? { deliveredHeadSha: requestedDeliveryIdentity.headSha }
+          : {}),
       };
       deliveryIdentityWorkspaceBranchWrite = canRecordProjectPrimaryBranch;
     }
@@ -20489,6 +20538,30 @@ export function issueRoutes(
             reviewPolicySensitiveMutationRequested
             && !(await assertLockedReviewPolicyAllowsMutation(tx))
           ) return null;
+          // R20: the once-per-stage-run hand-off must be atomic. The transition
+          // was computed from the unlocked read, so lock the row and re-check:
+          // a concurrent decision that committed first moved lastDecisionId or
+          // already handed this stage to the arbiter. This request is then
+          // refused and the transaction persists nothing (no second decision,
+          // no second hand-off row).
+          if (transition.stallEscalation) {
+            const locked = await svc.getByIdForUpdate(id, tx);
+            const lockedState = parseIssueExecutionState(locked?.executionState ?? null);
+            if (
+              !lockedState ||
+              lockedState.lastDecisionId !== (parseIssueExecutionState(existing.executionState)?.lastDecisionId ?? null) ||
+              lockedState.stallHandoff?.stageId === transition.stallEscalation.stageId
+            ) {
+              throw conflict(
+                "A concurrent decision on this review stage was recorded first; this decision was not recorded and the stage was not handed off again. Re-read the issue before deciding.",
+                {
+                  code: "review_stall_handoff_conflict",
+                  issueId: existing.id,
+                  stageId: transition.stallEscalation.stageId,
+                },
+              );
+            }
+          }
           // SUP-15878: refuse the close under the update lock (after the review
           // policy reauthorization above) with a typed diagnosis instead of
           // letting the transition silently coerce the card back to in_review.

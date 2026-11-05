@@ -1988,6 +1988,7 @@ export {
   stalledReviewDecisionSchema,
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
+  gitCommitShaSchema,
   resolveIssueRecoveryActionSchema,
   issueReviewRequestSchema,
   issueExecutionWorkspaceSettingsSchema,
