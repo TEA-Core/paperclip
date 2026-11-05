@@ -5801,6 +5801,96 @@ registry.registerPath({
 
 // ─── Dashboard ───────────────────────────────────────────────────────────────
 
+const weeklyRecoveryRateOpenApiSchema = z.object({
+  weekStart: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .describe("Monday (UTC) that starts the reporting week, formatted YYYY-MM-DD."),
+  runs: z.number().int().nonnegative().describe("Heartbeat runs in the week."),
+  recoveryActions: z
+    .number()
+    .int()
+    .nonnegative()
+    .describe("Distinct (sourceIssueId, fingerprint) incidents in the week."),
+  recoveryActionRows: z
+    .number()
+    .int()
+    .nonnegative()
+    .describe("Raw recovery-action rows in the week; repeated flap rows remain observable here."),
+  ratePercent: z
+    .number()
+    .nonnegative()
+    .describe("Incident-based recovery rate, incidents / runs as a percentage."),
+});
+
+const recoveryRateAlertOpenApiSchema = z.object({
+  thresholdPercent: z.number().nonnegative(),
+  breached: z.boolean(),
+  breachedWeeks: z.array(weeklyRecoveryRateOpenApiSchema),
+  latestWeek: weeklyRecoveryRateOpenApiSchema.nullable(),
+  latestWeekBreached: z.boolean(),
+});
+
+const recoveryCauseGroupOpenApiSchema = z.object({
+  cause: z.string(),
+  latestRunErrorCode: z.string(),
+  count: z
+    .number()
+    .int()
+    .nonnegative()
+    .describe("Raw recovery-action rows grouped by cause and latest run error code."),
+  activeCount: z.number().int().nonnegative(),
+  resolvedCount: z.number().int().nonnegative(),
+  cancelledCount: z.number().int().nonnegative(),
+});
+
+const recoveryHandoffSummaryOpenApiSchema = z.object({
+  resolvedTakeovers: z.number().int().nonnegative(),
+  handedBack: z.number().int().nonnegative(),
+  ownerCompleted: z.number().int().nonnegative(),
+  otherTakeover: z.number().int().nonnegative(),
+  selfRecovery: z.number().int().nonnegative(),
+  boardOwned: z.number().int().nonnegative(),
+  activeTakeovers: z.number().int().nonnegative(),
+  handedBackRatio: z.number().nonnegative().nullable(),
+  ownerCompletedRatio: z.number().nonnegative().nullable(),
+});
+
+const recoveryCauseRoutingOpenApiSchema = z.object({
+  cause: z.string(),
+  total: z
+    .number()
+    .int()
+    .nonnegative()
+    .describe("Raw recovery-action rows for the cause."),
+  active: z.number().int().nonnegative(),
+  retriedByOriginalSucceeded: z.number().int().nonnegative(),
+  handedBack: z.number().int().nonnegative(),
+  ownerCompleted: z.number().int().nonnegative(),
+  escalated: z.number().int().nonnegative(),
+  falsePositive: z.number().int().nonnegative(),
+  cancelled: z.number().int().nonnegative(),
+});
+
+const recoveryObservabilityResponseOpenApiSchema = z.object({
+  companyId: z.string().uuid(),
+  generatedAt: z.string().datetime(),
+  window: z.object({
+    weeks: z.number().int().min(1).max(104),
+    since: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .describe("Inclusive first Monday (UTC) of the reporting window, formatted YYYY-MM-DD."),
+  }),
+  thresholdPercent: z.number().nonnegative(),
+  weekly: z.array(weeklyRecoveryRateOpenApiSchema),
+  alert: recoveryRateAlertOpenApiSchema,
+  alertArtifactKey: z.string().nullable(),
+  byCause: z.array(recoveryCauseGroupOpenApiSchema),
+  handoff: recoveryHandoffSummaryOpenApiSchema,
+  perCauseRouting: z.array(recoveryCauseRoutingOpenApiSchema),
+});
+
 registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/dashboard",
@@ -5815,6 +5905,8 @@ registry.registerPath({
   path: "/api/companies/{companyId}/recovery-observability",
   tags: ["dashboard"],
   summary: "Get recovery observability report",
+  description:
+    "Returns incident-based weekly recovery telemetry. `weekly.recoveryActions` counts distinct `(sourceIssueId, fingerprint)` incidents, while `weekly.recoveryActionRows` retains the raw action-row count.",
   request: {
     params: z.object({ companyId: z.string() }),
     query: z.object({
@@ -5822,7 +5914,10 @@ registry.registerPath({
       threshold: z.string().optional(),
     }),
   },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: {
+    200: r.ok(recoveryObservabilityResponseOpenApiSchema),
+    401: r.unauthorized,
+  },
 });
 
 // ─── Sidebar ─────────────────────────────────────────────────────────────────

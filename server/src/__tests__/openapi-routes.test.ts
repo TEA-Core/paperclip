@@ -266,6 +266,46 @@ describe("openapi routes", () => {
     expect(wake.responses["409"]).toBeDefined();
     expect(wake.description).toContain("durable queued/deferred receipt");
   });
+  it("documents the recovery observability incident-based response contract", () => {
+    const { spec } = loadSpecRoutes();
+    const operation =
+      spec.paths["/api/companies/{companyId}/recovery-observability"].get;
+    const schema = operation.responses["200"].content["application/json"].schema;
+
+    expect(schema.required).toEqual([
+      "companyId",
+      "generatedAt",
+      "window",
+      "thresholdPercent",
+      "weekly",
+      "alert",
+      "alertArtifactKey",
+      "byCause",
+      "handoff",
+      "perCauseRouting",
+    ]);
+
+    const weekly = schema.properties.weekly.items;
+    expect(weekly.required).toEqual([
+      "weekStart",
+      "runs",
+      "recoveryActions",
+      "recoveryActionRows",
+      "ratePercent",
+    ]);
+    expect(weekly.properties.recoveryActions.description).toContain(
+      "Distinct (sourceIssueId, fingerprint) incidents",
+    );
+    expect(
+      weekly.properties.recoveryActionRows.description.toLowerCase(),
+    ).toContain("raw recovery-action rows");
+    expect(
+      weekly.properties.ratePercent.description.toLowerCase(),
+    ).toContain("incidents / runs");
+
+    expect(schema.properties.alert.properties.latestWeek.nullable).toBe(true);
+    expect(schema.properties.alertArtifactKey.nullable).toBe(true);
+  });
   it("documents the bounded child conformance response shape", () => {
     const { spec } = loadSpecRoutes();
     const operation = spec.paths["/api/issues/{id}/children/conformance"].get;

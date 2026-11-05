@@ -37,6 +37,7 @@ function week(runs: number, recoveryActions: number, weekStart: string): WeeklyR
     weekStart,
     runs,
     recoveryActions,
+    recoveryActionRows: recoveryActions,
     ratePercent: runs > 0 ? Math.round((recoveryActions / runs) * 10000) / 100 : 0,
   };
 }
@@ -219,18 +220,22 @@ describeEmbeddedPostgres("recovery observability report", () => {
     returnOwnerAgentId: string | null;
     finalAssigneeAgentId: string | null;
     finalIssueStatus: string;
+    sourceIssueId?: string;
+    fingerprint?: string;
   }) {
-    const sourceIssueId = randomUUID();
-    await db.insert(issues).values({
-      id: sourceIssueId,
-      companyId: input.companyId,
-      title: `Source ${input.n}`,
-      status: input.finalIssueStatus,
-      priority: "medium",
-      assigneeAgentId: input.finalAssigneeAgentId,
-      issueNumber: input.n,
-      identifier: `SRC-${input.n}`,
-    });
+    const sourceIssueId = input.sourceIssueId ?? randomUUID();
+    if (!input.sourceIssueId) {
+      await db.insert(issues).values({
+        id: sourceIssueId,
+        companyId: input.companyId,
+        title: `Source ${input.n}`,
+        status: input.finalIssueStatus,
+        priority: "medium",
+        assigneeAgentId: input.finalAssigneeAgentId,
+        issueNumber: input.n,
+        identifier: `SRC-${input.n}`,
+      });
+    }
     await db.insert(issueRecoveryActions).values({
       id: randomUUID(),
       companyId: input.companyId,
@@ -242,13 +247,14 @@ describeEmbeddedPostgres("recovery observability report", () => {
       returnOwnerAgentId: input.returnOwnerAgentId,
       previousOwnerAgentId: input.returnOwnerAgentId,
       cause: input.cause,
-      fingerprint: `fp-${input.n}`,
+      fingerprint: input.fingerprint ?? `fp-${input.n}`,
       evidence: { latestRunErrorCode: input.errorCode },
       nextAction: "recover",
       outcome: input.outcome,
       createdAt: input.createdAt,
       updatedAt: input.createdAt,
     });
+    return sourceIssueId;
   }
 
   it("fires the threshold alert on synthetic data crossing 2% of runs", async () => {
@@ -300,6 +306,72 @@ describeEmbeddedPostgres("recovery observability report", () => {
     expect(report.alert.latestWeekBreached).toBe(false);
     // 2026-07-06 is complete by `now` (2026-07-15), so the key is exposed.
     expect(report.alertArtifactKey).toBe(`recovery_rate_alert:${companyId}:2026-07-06`);
+  });
+
+  it("counts repeated rows with one source issue and fingerprint as one incident", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+    const action = {
+      companyId,
+      createdAt: regressionWeek,
+      cause: "legacy_execution_requires_reconciliation",
+      errorCode: "process_lost",
+      status: "resolved",
+      outcome: "restored",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: managerId,
+      finalIssueStatus: "done",
+      fingerprint: "legacy-execution:flap",
+    };
+    const sourceIssueId = await seedRecoveryAction({ ...action, n: 201 });
+    for (let i = 0; i < 4; i += 1) {
+      await seedRecoveryAction({ ...action, n: 202 + i, sourceIssueId });
+    }
+
+    const report = await recoveryObservabilityService(db).report(companyId, { now, weeks: 8 });
+
+    expect(report.weekly.find((w) => w.weekStart === "2026-07-06")).toMatchObject({
+      runs: 100,
+      recoveryActions: 1,
+      recoveryActionRows: 5,
+      ratePercent: 1,
+    });
+    expect(report.alert.breached).toBe(false);
+    expect(report.byCause).toContainEqual(
+      expect.objectContaining({ cause: action.cause, count: 5 }),
+    );
+    expect(report.perCauseRouting).toContainEqual(
+      expect.objectContaining({ cause: action.cause, total: 5 }),
+    );
+  });
+
+  it("counts three fingerprints on one source issue as three incidents", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+    const action = {
+      companyId,
+      createdAt: regressionWeek,
+      cause: "legacy_execution_requires_reconciliation",
+      errorCode: "process_lost",
+      status: "resolved",
+      outcome: "restored",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: managerId,
+      finalIssueStatus: "done",
+    };
+    const sourceIssueId = await seedRecoveryAction({ ...action, n: 301, fingerprint: "fp-a" });
+    await seedRecoveryAction({ ...action, n: 302, sourceIssueId, fingerprint: "fp-b" });
+    await seedRecoveryAction({ ...action, n: 303, sourceIssueId, fingerprint: "fp-c" });
+
+    const report = await recoveryObservabilityService(db).report(companyId, { now, weeks: 8 });
+
+    expect(report.weekly.find((w) => w.weekStart === "2026-07-06")).toMatchObject({
+      runs: 100,
+      recoveryActions: 3,
+      recoveryActionRows: 3,
+      ratePercent: 3,
+    });
+    expect(report.alert.breachedWeeks.map((w) => w.weekStart)).toEqual(["2026-07-06"]);
   });
 
   it("SUP-21344: exposes no artifact key for a breach limited to the current partial week", async () => {
