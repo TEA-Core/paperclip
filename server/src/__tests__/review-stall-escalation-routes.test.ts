@@ -106,8 +106,10 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
       userId: `user-${companyId.slice(0, 8)}`,
     };
     await db.insert(companies).values({ id: companyId, name: "Stall Co", issuePrefix: prefix, requireBoardApprovalForNewAgents: false });
+    // The routes fire real wakeups; the "process" adapter rejects an empty config
+    // at once, so afterEach's drain never waits on a real codex run (slow in CI).
     const agent = (id: string, name: string, status: string) => ({
-      id, companyId, name, role: "engineer", status, adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      id, companyId, name, role: "engineer", status, adapterType: "process", adapterConfig: {}, runtimeConfig: {}, permissions: {},
     });
     await db.insert(agents).values([
       agent(ids.reviewerId, "Reviewer", "idle"),
