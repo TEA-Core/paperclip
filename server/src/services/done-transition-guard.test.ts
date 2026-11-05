@@ -6305,7 +6305,9 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER2_RECORD_ONLY_JSON);
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_LANDED_JSON);
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_DELEGATED_JSON);
-      expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain('"mode": "noRepositoryLanding"');
+      // The no-repository Tier 1 landing (SUP-22570) is appended per issue by
+      // noRepositoryStructuredFormSuffix, never baked into this shared set.
+      expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).not.toContain("noRepositoryLanding");
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).not.toContain("post-merge");
 
       const result = await evaluateDoneTierDeclaration(

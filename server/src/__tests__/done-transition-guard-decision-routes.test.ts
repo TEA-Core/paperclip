@@ -1065,13 +1065,9 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     // ...and the remedy demands no merge head anywhere.
     expect(remedy).not.toContain("post-merge");
     expect(remedy).not.toContain("probe head sha");
-    // SUP-23044 re-admits the structured no-repository Tier 1 landing —
-    // valid on record_only issues and repository_delivery issues with no
-    // pull-request work product or recorded merge commit — so the
-    // record_only remedy names it verbatim, keeping the 422 remedy and the
-    // structured parser in agreement (SUP-15787 invariant).
-    expect(remedy).toContain('"mode": "noRepositoryLanding"');
-    expect(remedy).toContain("no pull-request work product or recorded merge commit");
+    // SUP-22570 re-lands the record_only no-repository Tier 1 form (#1098 was
+    // reverted by #1101), so the record_only remedy names it as a writable form.
+    expect(remedy).toContain('"landing": { "mode": "noRepositoryLanding" }');
     expect(await statusOf(issueId)).toBe("in_review");
   });
 
