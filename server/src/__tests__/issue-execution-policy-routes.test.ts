@@ -2,7 +2,7 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { DEFAULT_MAX_REVIEW_ROUNDS, normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockIssueService = vi.hoisted(() => ({
@@ -1657,7 +1657,7 @@ describe("issue execution policy routes", () => {
   }
 
   it("mints exactly one review-escalation interaction at the round cap (SUP-14805)", async () => {
-    const issue = roundCapReviewIssue({}, { changesRequestedCount: 2 });
+    const issue = roundCapReviewIssue({}, { changesRequestedCount: DEFAULT_MAX_REVIEW_ROUNDS - 1 });
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...issue,
@@ -1674,7 +1674,7 @@ describe("issue execution policy routes", () => {
       }),
     )
       .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-      .send({ status: "in_progress", comment: "Round three — still not converging" });
+      .send({ status: "in_progress", comment: "Final agent round — still not converging" });
 
     expect(res.status).toBe(200);
     // The stage stays pending and the responsible human becomes the assignee.
@@ -1685,7 +1685,7 @@ describe("issue execution policy routes", () => {
     expect(updatePatch.executionState).toMatchObject({
       status: "pending",
       currentParticipant: { type: "user", userId: "board-user" },
-      changesRequestedCount: 3,
+      changesRequestedCount: DEFAULT_MAX_REVIEW_ROUNDS,
     });
 
     // Exactly one interaction is minted, as a user-actor request_confirmation.
@@ -1709,7 +1709,9 @@ describe("issue execution policy routes", () => {
       sourceRunId: "77777777-7777-4777-8777-777777777777",
     });
     expect(createOptions.idempotencyKey).toMatch(
-      /^review-escalation:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:11111111-1111-4111-8111-111111111111:3:[a-f0-9]{16}$/,
+      new RegExp(
+        `^review-escalation:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:11111111-1111-4111-8111-111111111111:${DEFAULT_MAX_REVIEW_ROUNDS}:[a-f0-9]{16}$`,
+      ),
     );
     expect(createOptions.payload).toMatchObject({
       version: 1,
@@ -1720,8 +1722,8 @@ describe("issue execution policy routes", () => {
       allowDeclineReason: true,
     });
     const details = (createOptions.payload as { detailsMarkdown: string }).detailsMarkdown;
-    expect(details).toContain("reaching the round cap of 3");
-    expect(details).toContain("> Round three — still not converging");
+    expect(details).toContain(`reaching the round cap of ${DEFAULT_MAX_REVIEW_ROUNDS}`);
+    expect(details).toContain("> Final agent round — still not converging");
     expect(details).toContain("Return assignee: agent 44444444-4444-4444-8444-444444444444");
     expect(details).toContain("on issue `PAP-2001`");
     expect(details).toContain("a human send-back does not burn a round");
@@ -1791,6 +1793,75 @@ describe("issue execution policy routes", () => {
     const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
     expect(updatePatch.assigneeAgentId).toBeNull();
     expect(updatePatch.assigneeUserId).toBe("board-user");
+    expect(mockIssueThreadInteractionService.create).not.toHaveBeenCalled();
+  });
+
+  it("hands a stalled review to the arbiter and records the hand-off in activity with the decision (R20)", async () => {
+    const arbiterAgentId = "66666666-6666-4666-8666-666666666666";
+    const head = "c0ffee".padEnd(40, "0");
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          type: "review",
+          participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+        },
+      ],
+      stallEscalation: { afterRounds: 2, toAgentId: arbiterAgentId },
+    })!;
+    const issue = roundCapReviewIssue(
+      { executionPolicy: policy },
+      { changesRequestedCount: 1, deliveredHeadSha: head, bouncedHeadSha: head },
+    );
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(
+      await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "77777777-7777-4777-8777-777777777777",
+      }),
+    )
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_progress", comment: "Same finding on the same head" });
+
+    expect(res.status).toBe(200);
+    const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(updatePatch.status).toBe("in_review");
+    expect(updatePatch.assigneeAgentId).toBe(arbiterAgentId);
+    expect(updatePatch.executionState).toMatchObject({
+      status: "pending",
+      currentParticipant: { type: "agent", agentId: arbiterAgentId },
+      changesRequestedCount: 2,
+      stallHandoff: { arbiterAgentId, signals: ["same_head_rebounced"] },
+    });
+    const stallActivity = (mockLogActivity.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>)
+      .map(([, input]) => input)
+      .filter((input) => input.action === "issue.review_stall_escalated");
+    expect(stallActivity).toHaveLength(1);
+    expect(stallActivity[0]).toMatchObject({
+      entityId: issue.id,
+      agentId: "33333333-3333-4333-8333-333333333333",
+      details: {
+        identifier: "PAP-2001",
+        decisionId: expect.any(String),
+        arbiterAgentId,
+        stageId: "11111111-1111-4111-8111-111111111111",
+        changesRequestedCount: 2,
+        afterRounds: 2,
+        maxRounds: DEFAULT_MAX_REVIEW_ROUNDS,
+        signals: ["same_head_rebounced"],
+        deliveredHeadSha: head,
+        returnAssignee: { type: "agent", agentId: "44444444-4444-4444-8444-444444444444" },
+      },
+    });
+    // The arbiter is not the round-cap human: no escalation card.
     expect(mockIssueThreadInteractionService.create).not.toHaveBeenCalled();
   });
   it("dissolves the review when a board user reassigns an in_review task to a non-participant", async () => {
@@ -3659,6 +3730,29 @@ describe("issue execution policy routes", () => {
         agentId: PHANTOM_AGENT_ID,
       });
       expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects a stall arbiter that resolves to no agent or to another company's agent (R20)", async () => {
+      for (const toAgentId of [PHANTOM_AGENT_ID, OTHER_COMPANY_AGENT_ID]) {
+        programPatchTarget(issueFixture());
+        mockIssueService.update.mockClear();
+
+        const res = await patchPolicy({
+          stages: [
+            { type: "review", participants: [{ type: "agent", agentId: REVIEWER_AGENT_ID }] },
+          ],
+          stallEscalation: { afterRounds: 2, toAgentId },
+        });
+
+        expect(res.status).toBe(422);
+        expect(res.body.error).toContain("stallEscalation.toAgentId");
+        expect(res.body.details).toMatchObject({
+          field: "stallEscalation.toAgentId",
+          agentId: toAgentId,
+          companyId: "company-1",
+        });
+        expect(mockIssueService.update).not.toHaveBeenCalled();
+      }
     });
 
     it("accepts a policy where every participant and the return assignee resolve", async () => {

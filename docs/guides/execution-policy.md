@@ -128,6 +128,29 @@ interface IssueExecutionDecision {
 4. Runtime routes back to the **same review stage** (not the beginning), with the same reviewer.
 5. This loop continues until the reviewer approves.
 
+### Round Ceiling and Stall Escalation
+
+Consecutive agent `changes_requested` decisions on one stage are counted in `executionState.changesRequestedCount`; a human decision resets the count. When the count reaches the round ceiling (`maxReviewRounds`, default **10**), the stage stays pending and is handed to the issue's responsible human instead of the implementer.
+
+A loop that stops making progress is caught earlier by the optional `stallEscalation`:
+
+```json
+{
+  "stages": [
+    { "type": "review", "participants": [{ "type": "agent", "agentId": "code-reviewer-agent-id" }] }
+  ],
+  "stallEscalation": { "afterRounds": 2, "toAgentId": "arbiter-agent-id" }
+}
+```
+
+- On an agent `changes_requested` decision on a **review** stage, once the round count reaches `afterRounds`, the runtime checks for a stall signal:
+  - **same head re-bounced**: the head delivered for this round (`executionState.deliveredHeadSha`, recorded from `deliveryIdentity.headSha` on the `in_review` transition) is the head the previous decision already bounced (`executionState.bouncedHeadSha`). A delivery that records no head never counts as the same head.
+  - **code acceptable**: the reviewer's decision comment contains a line `Code acceptable: yes`, meaning the remaining finding is not something the implementer can change.
+- With a stall signal, the stage stays pending on the same issue and is handed once to `toAgentId` (recorded in `executionState.stallHandoff` and as an `issue.review_stall_escalated` activity). The reviewer's decision is still recorded and the round count keeps running, so the ceiling still escalates to the human afterwards.
+- The arbiter **advises only**: it can request changes with a directive (the issue returns to the implementer and the next delivery goes back to the stage reviewer) or park the issue `blocked`; an approval from the arbiter is refused.
+- A stage-run is handed to the arbiter at most once. The arbiter is never the issue's return assignee or delivery author, and never a review-stage participant.
+- Validation: `afterRounds` is a positive integer no greater than the round ceiling; `toAgentId` must be an assignable agent in the issue's company. Without `stallEscalation` the loop runs to the ceiling as before.
+
 ### Policy Variants
 
 **Review only** (no approval stage):

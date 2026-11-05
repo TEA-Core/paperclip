@@ -419,6 +419,7 @@ import {
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
+  REVIEW_STALL_ESCALATED_ACTION,
   resolvePatchExecutionPolicy,
   setIssueExecutionPolicyMonitorScheduledBy,
   type MissingApprovalStageGap,
@@ -3565,11 +3566,13 @@ function diffExecutionParticipants(
 
 type NewExecutionPolicyAgentReference = {
   agentId: string;
-  /** Set for stage participants; absent for the return assignee. */
+  /** Set for stage participants; absent for the return assignee and the stall arbiter. */
   stageIndex?: number;
   stageType?: NormalizedExecutionPolicy["stages"][number]["type"];
   /** True when the reference names the return assignee rather than a participant. */
   isReturnAssignee: boolean;
+  /** True when the reference names the R20 stall arbiter (`stallEscalation.toAgentId`). */
+  isStallArbiter?: boolean;
 };
 
 /**
@@ -3634,6 +3637,13 @@ function collectNewExecutionPolicyAgentReferences(input: {
   if (returnAssigneeAgentId && returnAssigneeAgentId !== input.storedReturnAssigneeAgentId) {
     references.push({ agentId: returnAssigneeAgentId, isReturnAssignee: true });
   }
+  const stallArbiterAgentId = input.executionPolicy?.stallEscalation?.toAgentId ?? null;
+  if (
+    stallArbiterAgentId &&
+    stallArbiterAgentId !== (input.storedExecutionPolicy?.stallEscalation?.toAgentId ?? null)
+  ) {
+    references.push({ agentId: stallArbiterAgentId, isReturnAssignee: false, isStallArbiter: true });
+  }
   return references;
 }
 
@@ -3681,6 +3691,18 @@ async function assertNewExecutionPolicyAgentReferencesResolve(input: {
         + "agent. Send an existing agent id in this company, or clear the field.",
       {
         field: "returnAssigneeAgentId",
+        agentId: unresolved.agentId,
+        companyId: input.companyId,
+      },
+    );
+  }
+  if (unresolved.isStallArbiter) {
+    throw unprocessable(
+      `executionPolicy.stallEscalation.toAgentId ${unresolved.agentId} does not resolve to an agent `
+        + `in company ${input.companyId}; a stalled review would be handed to an agent that cannot be `
+        + "dispatched to. Send an existing agent id in this company, or clear the field.",
+      {
+        field: "stallEscalation.toAgentId",
         agentId: unresolved.agentId,
         companyId: input.companyId,
       },
@@ -14128,6 +14150,22 @@ export function issueRoutes(
                 body: transition.decision.body,
                 createdByRunId: actor.runId ?? null,
               });
+              if (transition.stallEscalation) {
+                await logActivityInTransaction(tx as unknown as Db, {
+                  companyId: lockedIssue.companyId,
+                  actorType: actor.actorType,
+                  boardApiKeyId: actor.boardApiKeyId,
+                  actorId: actor.actorId,
+                  agentId: actor.agentId,
+                  runId: actor.runId,
+                  agentApiKeyId: actor.agentApiKeyId,
+                  action: REVIEW_STALL_ESCALATED_ACTION,
+                  entityType: "issue",
+                  entityId: lockedIssue.id,
+                  issueId: lockedIssue.id,
+                  details: { identifier: lockedIssue.identifier ?? null, decisionId, ...transition.stallEscalation },
+                }, postCommitActivityPublications);
+              }
             }
             if (transition.reviewEscalation && transition.decision) {
               recoveryEscalationPayload = {
@@ -19728,6 +19766,9 @@ export function issueRoutes(
           recordedByRunId: actor.runId,
           recordedAt: new Date().toISOString(),
         },
+        // R20: the structured head of this review round, compared by the
+        // review-stall trigger against the head the last bounce rejected.
+        deliveredHeadSha: requestedDeliveryIdentity.headSha,
       };
       deliveryIdentityWorkspaceBranchWrite = canRecordProjectPrimaryBranch;
     }
@@ -20645,6 +20686,25 @@ export function issueRoutes(
               body: decision.body,
               createdByRunId: actor.runId ?? null,
             });
+            // R20: the hand-off to the stall arbiter commits with the
+            // reviewer's decision that triggered it, never without it.
+            if (transition.stallEscalation) {
+              await logActivityInTransaction(tx as unknown as Db, {
+                companyId: updated.companyId,
+                actorType: actor.actorType,
+                boardApiKeyId: actor.boardApiKeyId,
+                actorId: actor.actorId,
+                agentId: actor.agentId,
+                runId: actor.runId,
+                agentApiKeyId: actor.agentApiKeyId,
+                responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+                action: REVIEW_STALL_ESCALATED_ACTION,
+                entityType: "issue",
+                entityId: updated.id,
+                issueId: updated.id,
+                details: { identifier: updated.identifier ?? null, decisionId, ...transition.stallEscalation },
+              }, postCommitActivityPublications);
+            }
           }
 
           if (shouldRelayStop) {

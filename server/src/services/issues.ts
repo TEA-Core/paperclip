@@ -7138,6 +7138,14 @@ async function assertIssueExecutionPolicyAgentReferencesResolve(
       stageType: "review",
     });
   }
+  // stageIndex sentinels: -1 names the return assignee, -2 the R20 stall arbiter.
+  if (policy.stallEscalation) {
+    references.push({
+      agentId: policy.stallEscalation.toAgentId,
+      stageIndex: -2,
+      stageType: "review",
+    });
+  }
   if (references.length === 0) return;
 
   const agentIds = [...new Set(references.map((reference) => reference.agentId))];
@@ -7156,6 +7164,16 @@ async function assertIssueExecutionPolicyAgentReferencesResolve(
       `executionPolicy.returnAssigneeAgentId ${unresolved.agentId} does not resolve to an agent in company ${companyId}`,
       {
         field: "returnAssigneeAgentId",
+        agentId: unresolved.agentId,
+        companyId,
+      },
+    );
+  }
+  if (unresolved.stageIndex === -2) {
+    throw unprocessable(
+      `executionPolicy.stallEscalation.toAgentId ${unresolved.agentId} does not resolve to an agent in company ${companyId}`,
+      {
+        field: "stallEscalation.toAgentId",
         agentId: unresolved.agentId,
         companyId,
       },
@@ -10474,6 +10492,9 @@ export function issueService(db: Db) {
         if (normalizedPolicy?.returnAssigneeAgentId) {
           await assertAssignableAgent(db, companyId, normalizedPolicy.returnAssigneeAgentId, { kind: "work" });
         }
+        if (normalizedPolicy?.stallEscalation) {
+          await assertAssignableAgent(db, companyId, normalizedPolicy.stallEscalation.toAgentId, { kind: "work" });
+        }
       }
       // Activities logged inside the create transaction must not publish until the
       // transaction commits: a rollback would otherwise leave a phantom
@@ -11923,6 +11944,9 @@ export function issueService(db: Db) {
         patch.executionPolicy = normalizedPolicyRecord;
         if (normalizedPolicy?.returnAssigneeAgentId) {
           await assertAssignableAgent(dbOrTx as Db, existing.companyId, normalizedPolicy.returnAssigneeAgentId, { kind: "work" });
+        }
+        if (normalizedPolicy?.stallEscalation) {
+          await assertAssignableAgent(dbOrTx as Db, existing.companyId, normalizedPolicy.stallEscalation.toAgentId, { kind: "work" });
         }
       }
       let nextProjectId = issueData.projectId !== undefined ? issueData.projectId : existing.projectId;

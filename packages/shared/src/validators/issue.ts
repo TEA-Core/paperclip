@@ -450,6 +450,14 @@ export const issueExecutionMonitorPolicySchema = z.object({
     .default(null),
 }).strict();
 
+// R20: bounds only. The cross-field rule (afterRounds within the resolved
+// round ceiling) needs the server's default ceiling, so it is enforced where
+// every policy write normalizes: normalizeIssueExecutionPolicy.
+export const issueExecutionStallEscalationPolicySchema = z.object({
+  afterRounds: z.number().int().positive().max(50),
+  toAgentId: z.string().trim().uuid(),
+}).strict();
+
 export const issueExecutionPolicySchema = z.object({
   mode: z.enum(ISSUE_EXECUTION_POLICY_MODES).optional().default("normal"),
   commentRequired: z.boolean().optional().default(true),
@@ -474,6 +482,7 @@ export const issueExecutionPolicySchema = z.object({
     .optional()
     .nullable()
     .default(null),
+  stallEscalation: issueExecutionStallEscalationPolicySchema.optional().nullable(),
 }).strict();
 
 export const issueExecutionMonitorStateSchema = z.object({
@@ -553,6 +562,19 @@ export const issueExecutionStateSchema = z.object({
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
   changesRequestedCount: z.number().int().nonnegative().optional().default(0),
   pendingSince: z.string().nullable().optional(),
+  // R20 review-stall bookkeeping. Lenient on purpose: a malformed optional key
+  // must never make the whole state unparseable and drop the issue's place in
+  // the review chain.
+  deliveredHeadSha: z.string().nullable().optional(),
+  bouncedHeadSha: z.string().nullable().optional(),
+  stallHandoff: z.object({
+    stageId: z.string().guid(),
+    arbiterAgentId: z.string().guid(),
+    fromParticipant: issueExecutionStatePrincipalSchema.nullable(),
+    changesRequestedCount: z.number().int().nonnegative(),
+    signals: z.array(z.enum(["same_head_rebounced", "code_acceptable"])),
+    handedOffAt: z.string(),
+  }).nullable().optional(),
   /**
    * Out-of-band publish record written by merge-arming / the approval-status
    * reconciler via jsonb_set (SUP-16977). Enumerated, not modeled: consumers

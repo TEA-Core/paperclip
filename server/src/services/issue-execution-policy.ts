@@ -7,6 +7,8 @@ import type {
   IssueExecutionPolicy,
   IssueExecutionStage,
   IssueExecutionStagePrincipal,
+  IssueExecutionStallHandoff,
+  IssueExecutionStallSignal,
   IssueExecutionState,
   IssueMonitorScheduledBy,
 } from "@paperclipai/shared";
@@ -99,6 +101,27 @@ export type ReviewEscalationSignal = {
   returnAssignee: IssueExecutionStagePrincipal;
 };
 
+/**
+ * R20: emitted ONLY on the transition that hands a stalled review stage to its
+ * stall arbiter. A pure signal like `reviewEscalation`: the route that records
+ * the accompanying `changes_requested` decision writes the activity row.
+ */
+export type StallEscalationSignal = {
+  arbiterAgentId: string;
+  stageId: string;
+  stageType: string;
+  afterRounds: number;
+  maxRounds: number;
+  changesRequestedCount: number;
+  signals: IssueExecutionStallSignal[];
+  fromParticipant: IssueExecutionStagePrincipal | null;
+  returnAssignee: IssueExecutionStagePrincipal;
+  deliveredHeadSha: string | null;
+};
+
+/** Activity action recording a review-stall hand-off to the stall arbiter (R20). */
+export const REVIEW_STALL_ESCALATED_ACTION = "issue.review_stall_escalated";
+
 type TransitionResult = {
   patch: Record<string, unknown>;
   decision?: Pick<IssueExecutionDecision, "stageId" | "stageType" | "outcome" | "body">;
@@ -119,14 +142,30 @@ type TransitionResult = {
    * re-asserting drift PATCH cannot mint a duplicate.
    */
   reviewEscalation?: ReviewEscalationSignal;
+  /**
+   * Set ONLY when a stalled review stage is handed to the policy's stall
+   * arbiter (R20). Never set by drift re-assertion of an existing hand-off.
+   */
+  stallEscalation?: StallEscalationSignal;
 };
 
 /**
  * Consecutive agent-initiated changes-requested rounds tolerated on one stage
  * before the pending review escalates to the responsible human. Policies can
  * override via `maxReviewRounds`; human decisions always reset the counter.
+ * Raised from 3 to 10 together with the stall arbiter (R20): a loop that still
+ * makes progress may run to 10, a stalled one is caught earlier by
+ * `stallEscalation`. Rollback: back to 3 with `stallEscalation` ignored.
  */
-export const DEFAULT_MAX_REVIEW_ROUNDS = 3;
+export const DEFAULT_MAX_REVIEW_ROUNDS = 10;
+
+/**
+ * R20 stall signal written by a reviewer: a decision-comment line saying the
+ * code itself is acceptable (the remaining finding is not something the
+ * implementer can change). Line-anchored so prose that merely mentions the
+ * phrase does not count; list bullets, block quotes and bold are tolerated.
+ */
+const CODE_ACCEPTABLE_MARKER = /^[ \t>*_-]*code acceptable[ \t*_]*:[ \t*_]*yes\b/im;
 
 const COMPLETED_STATUS: IssueExecutionState["status"] = "completed";
 const PENDING_STATUS: IssueExecutionState["status"] = "pending";
@@ -516,6 +555,35 @@ export function normalizeIssueExecutionPolicy(
   const authorizationPolicy = parsed.data.authorizationPolicy;
   const returnAssigneeAgentId = parsed.data.returnAssigneeAgentId ?? null;
   const baseRef = parsed.data.baseRef ?? null;
+  const stallEscalation = parsed.data.stallEscalation ?? null;
+  if (stallEscalation) {
+    const ceiling = parsed.data.maxReviewRounds ?? DEFAULT_MAX_REVIEW_ROUNDS;
+    if (stallEscalation.afterRounds > ceiling) {
+      throw unprocessable(
+        `executionPolicy.stallEscalation.afterRounds (${stallEscalation.afterRounds}) must not exceed the review-round ceiling (${ceiling}); the round ceiling would escalate to a human before the stall arbiter could act`,
+        { field: "stallEscalation.afterRounds", afterRounds: stallEscalation.afterRounds, ceiling },
+      );
+    }
+    // The arbiter is a second opinion outside the reviewers and the author:
+    // as the return assignee it would judge its own work, and as a review
+    // participant the hand-off would let it approve the stage it arbitrates.
+    if (stallEscalation.toAgentId === returnAssigneeAgentId) {
+      throw unprocessable(
+        "executionPolicy.stallEscalation.toAgentId must not be the policy's returnAssigneeAgentId; the arbiter would judge its own work",
+        { field: "stallEscalation.toAgentId", agentId: stallEscalation.toAgentId },
+      );
+    }
+    const reviewParticipant = stages.some((stage) =>
+      stage.type === "review" &&
+      stage.participants.some((participant) => participant.type === "agent" && participant.agentId === stallEscalation.toAgentId),
+    );
+    if (reviewParticipant) {
+      throw unprocessable(
+        "executionPolicy.stallEscalation.toAgentId must not be a review-stage participant; the stall arbiter advises outside the reviewers and never approves the stage",
+        { field: "stallEscalation.toAgentId", agentId: stallEscalation.toAgentId },
+      );
+    }
+  }
 
   if (
     stages.length === 0 &&
@@ -548,6 +616,7 @@ export function normalizeIssueExecutionPolicy(
     ...(reviewPreset ? { reviewPreset } : {}),
     ...(authorizationPolicy ? { authorizationPolicy } : {}),
     ...(parsed.data.maxReviewRounds != null ? { maxReviewRounds: parsed.data.maxReviewRounds } : {}),
+    ...(stallEscalation ? { stallEscalation: { afterRounds: stallEscalation.afterRounds, toAgentId: stallEscalation.toAgentId } } : {}),
     ...(baseRef ? { baseRef } : {}),
     ...(releaseAssurance ? { approvalAuthority: "release_assurance" as const } : {}),
   };
@@ -986,6 +1055,91 @@ function resolveMaxReviewRounds(policy: IssueExecutionPolicy | null): number {
 }
 
 /**
+ * Rounds from which a human non-participant on a pending stage counts as an
+ * escalated hold. Without an explicit `maxReviewRounds` this stays at the
+ * pre-R20 default ceiling (3), not the raised one: holds escalated at round 3
+ * before the ceiling rose must stay held, and a new escalation always lands at
+ * or above the ceiling, so it is recognised too.
+ */
+function resolveEscalatedHoldMinRounds(policy: IssueExecutionPolicy | null): number {
+  const configured = policy?.maxReviewRounds;
+  return typeof configured === "number" && configured > 0 ? configured : 3;
+}
+
+function stallArbiterPrincipal(policy: IssueExecutionPolicy | null): IssueExecutionStagePrincipal | null {
+  const agentId = policy?.stallEscalation?.toAgentId;
+  return agentId ? { type: "agent", agentId, userId: null } : null;
+}
+
+/**
+ * R20: the pending review stage is held by its stall arbiter. The arbiter is
+ * deliberately not a stage participant, so without this the stage-membership
+ * repair would re-seat a configured reviewer on the next PATCH and undo the
+ * hand-off. Only the arbiter the CURRENT policy names, on the stage the
+ * hand-off record names, counts: removing `stallEscalation` from the policy
+ * dissolves the hold back to a configured reviewer.
+ */
+function isStallArbiterHold(input: {
+  policy: IssueExecutionPolicy;
+  state: IssueExecutionState | null;
+  stage: IssueExecutionStage;
+  participant: IssueExecutionStagePrincipal;
+}): boolean {
+  const arbiter = stallArbiterPrincipal(input.policy);
+  const handoff = input.state?.stallHandoff;
+  return (
+    arbiter !== null &&
+    handoff?.stageId === input.stage.id &&
+    handoff.arbiterAgentId === arbiter.agentId &&
+    principalsEqual(input.participant, arbiter) &&
+    !stageHasParticipant(input.stage, arbiter)
+  );
+}
+
+function sameHeadSha(left: string | null | undefined, right: string | null | undefined): boolean {
+  const a = left?.trim().toLowerCase();
+  const b = right?.trim().toLowerCase();
+  return Boolean(a) && a === b;
+}
+
+/**
+ * R20 stall trigger, evaluated on an agent changes-requested decision. A
+ * review stage is handed to its arbiter when the consecutive agent rounds
+ * reach `afterRounds` AND the loop shows a stall signal: the head delivered
+ * for this round is the head the previous decision already bounced, or the
+ * reviewer's decision says the code is acceptable. A loop that still makes
+ * progress (a new head, findings about the code) keeps bouncing to the
+ * implementer up to the round ceiling. At most one hand-off per stage-run.
+ */
+function resolveStallHandoff(input: {
+  policy: IssueExecutionPolicy;
+  state: IssueExecutionState | null;
+  stage: IssueExecutionStage;
+  returnAssignee: IssueExecutionStagePrincipal;
+  nextRounds: number;
+  commentBody: string;
+}): { arbiter: IssueExecutionStagePrincipal; signals: IssueExecutionStallSignal[] } | null {
+  const config = input.policy.stallEscalation;
+  if (!config || input.stage.type !== "review") return null;
+  if (input.state?.stallHandoff?.stageId === input.stage.id) return null;
+  if (input.nextRounds < config.afterRounds) return null;
+  const arbiter = stallArbiterPrincipal(input.policy)!;
+  // Self-approval guards: the arbiter never receives a stage it already sits
+  // on as a reviewer, nor one whose work it authored or will be handed back.
+  if (
+    stageHasParticipant(input.stage, arbiter) ||
+    principalsEqual(arbiter, input.returnAssignee) ||
+    principalsEqual(arbiter, input.state?.deliveryAuthor ?? null)
+  ) {
+    return null;
+  }
+  const signals: IssueExecutionStallSignal[] = [];
+  if (sameHeadSha(input.state?.deliveredHeadSha, input.state?.bouncedHeadSha)) signals.push("same_head_rebounced");
+  if (CODE_ACCEPTABLE_MARKER.test(input.commentBody)) signals.push("code_acceptable");
+  return signals.length > 0 ? { arbiter, signals } : null;
+}
+
+/**
  * The human a review stage escalates to when agents exhaust their
  * changes-requested rounds. Without one the loop keeps handing back to the
  * return assignee (pre-existing behavior) rather than stalling the stage.
@@ -1075,6 +1229,26 @@ function mergeSkippedStageIds(
   return Array.from(new Set([...(previous?.skippedStageIds ?? []), ...(added ?? [])]));
 }
 
+/**
+ * R20 review-stall bookkeeping carried onto a rebuilt state. The delivered head
+ * survives a stage change (the next stage reviews the same delivery); the
+ * bounced head and the arbiter hand-off belong to one stage-run and only carry
+ * while the rebuilt state stays on that stage. Absent keys stay absent so a
+ * state that never used the bookkeeping keeps its exact shape.
+ */
+function carriedStallFields(
+  previous: IssueExecutionState | null,
+  stageId: string | null,
+): Pick<IssueExecutionState, "deliveredHeadSha" | "bouncedHeadSha" | "stallHandoff"> {
+  if (!previous) return {};
+  const sameStage = stageId !== null && previous.currentStageId === stageId;
+  return {
+    ...(previous.deliveredHeadSha ? { deliveredHeadSha: previous.deliveredHeadSha } : {}),
+    ...(sameStage && previous.bouncedHeadSha ? { bouncedHeadSha: previous.bouncedHeadSha } : {}),
+    ...(sameStage && previous.stallHandoff ? { stallHandoff: previous.stallHandoff } : {}),
+  };
+}
+
 function buildCompletedState(
   previous: IssueExecutionState | null,
   currentStage: IssueExecutionStage,
@@ -1100,6 +1274,7 @@ function buildCompletedState(
     changesRequestedCount: 0,
     approvalStatus: previous?.approvalStatus,
     delivery: previous?.delivery,
+    ...carriedStallFields(previous, null),
   };
 }
 
@@ -1125,6 +1300,7 @@ function buildStateWithCompletedStages(input: {
     monitor: input.previous?.monitor ?? null,
     approvalStatus: input.previous?.approvalStatus,
     delivery: input.previous?.delivery,
+    ...carriedStallFields(input.previous, input.previous?.currentStageId ?? null),
   };
 }
 
@@ -1150,6 +1326,7 @@ function buildSkippedStageCompletedState(input: {
     monitor: input.previous?.monitor ?? null,
     approvalStatus: input.previous?.approvalStatus,
     delivery: input.previous?.delivery,
+    ...carriedStallFields(input.previous, null),
   };
 }
 
@@ -1181,6 +1358,7 @@ function buildPendingState(input: {
     pendingSince: new Date().toISOString(),
     approvalStatus: input.previous?.approvalStatus,
     delivery: input.previous?.delivery,
+    ...carriedStallFields(input.previous, input.stage.id),
   };
 }
 
@@ -1212,6 +1390,11 @@ function buildChangesRequestedState(
     reviewRequest: null,
     lastDecisionOutcome: "changes_requested",
     changesRequestedCount,
+    // R20: the bounced round's delivered head becomes the comparison point for
+    // the next round, which starts with no head until its delivery records one.
+    ...(previous?.deliveredHeadSha || previous?.bouncedHeadSha
+      ? { deliveredHeadSha: null, bouncedHeadSha: previous.deliveredHeadSha ?? null }
+      : {}),
   };
 }
 
@@ -1422,7 +1605,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     const escalatedHold =
       currentParticipant.type === "user" &&
       !stageHasParticipant(activeStage, currentParticipant) &&
-      (existingState?.changesRequestedCount ?? 0) >= resolveMaxReviewRounds(input.policy);
+      (existingState?.changesRequestedCount ?? 0) >= resolveEscalatedHoldMinRounds(input.policy);
     if (escalatedHold && !principalsEqual(currentParticipant, actor)) {
       // An empty patch would not override the caller's own requested fields,
       // so a status or assignee change from a non-escalated actor must be
@@ -1452,7 +1635,17 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       }
       return { patch };
     }
-    if (!escalatedHold && !stageHasParticipant(activeStage, currentParticipant)) {
+    // R20: a stage handed to its stall arbiter is held the same way — the
+    // arbiter is not a configured participant, so the membership repair below
+    // would otherwise re-seat a reviewer and undo the hand-off. Every path
+    // after this treats the arbiter as the active participant.
+    const stallArbiterHold = isStallArbiterHold({
+      policy: input.policy,
+      state: existingState,
+      stage: activeStage,
+      participant: currentParticipant,
+    });
+    if (!escalatedHold && !stallArbiterHold && !stageHasParticipant(activeStage, currentParticipant)) {
       const participant = selectStageParticipant(activeStage, {
         preferred: explicitAssignee ?? existingState?.currentParticipant ?? null,
         exclude: resolveReturnAssignee({
@@ -1495,6 +1688,18 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     }
 
     if (principalsEqual(currentParticipant, actor)) {
+      if (requestedStatus === "done" && stallArbiterHold) {
+        // The arbiter is a second opinion, not a reviewer: approving here would
+        // skip the required reviewer (synthesis Q1, "advises only").
+        throw unprocessable(
+          "The stall arbiter advises only and cannot approve this review stage. Request changes with a directive for the implementer (the next delivery returns to the stage reviewer), or park the card blocked naming the blocker and its owner.",
+          {
+            code: "stall_arbiter_cannot_approve",
+            stageId: activeStage.id,
+            arbiterAgentId: currentParticipant.agentId ?? null,
+          },
+        );
+      }
       if (requestedStatus === "done") {
         if (!input.commentBody?.trim()) {
           throw unprocessable(`Approving a review or approval stage requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
@@ -1639,6 +1844,66 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
               },
             };
           }
+        }
+        const stallHandoff = actorIsHuman
+          ? null
+          : resolveStallHandoff({
+              policy: input.policy,
+              state: existingState,
+              stage: activeStage,
+              returnAssignee,
+              nextRounds,
+              commentBody: decision.body,
+            });
+        if (stallHandoff) {
+          // R20: a stalled loop goes to the arbiter once, on the same card and
+          // the same pending stage, instead of back to the implementer. The
+          // reviewer's decision above is still recorded; the round count keeps
+          // running, so the ceiling still escalates to the human after it.
+          const fromParticipant: IssueExecutionStagePrincipal = {
+            type: currentParticipant.type,
+            agentId: currentParticipant.agentId ?? null,
+            userId: currentParticipant.userId ?? null,
+          };
+          const handoff: IssueExecutionStallHandoff = {
+            stageId: activeStage.id,
+            arbiterAgentId: stallHandoff.arbiter.agentId!,
+            fromParticipant,
+            changesRequestedCount: nextRounds,
+            signals: stallHandoff.signals,
+            handedOffAt: new Date().toISOString(),
+          };
+          buildPendingStagePatch({
+            patch,
+            previous: {
+              ...existingState!,
+              bouncedHeadSha: existingState!.deliveredHeadSha ?? null,
+              stallHandoff: handoff,
+            },
+            policy: input.policy,
+            stage: activeStage,
+            participant: stallHandoff.arbiter,
+            returnAssignee,
+            reviewRequest: effectiveReviewRequest,
+            changesRequestedCount: nextRounds,
+          });
+          return {
+            patch,
+            decision,
+            workflowControlledAssignment: true,
+            stallEscalation: {
+              arbiterAgentId: handoff.arbiterAgentId,
+              stageId: activeStage.id,
+              stageType: activeStage.type,
+              afterRounds: input.policy.stallEscalation!.afterRounds,
+              maxRounds: resolveMaxReviewRounds(input.policy),
+              changesRequestedCount: nextRounds,
+              signals: stallHandoff.signals,
+              fromParticipant,
+              returnAssignee,
+              deliveredHeadSha: existingState!.deliveredHeadSha ?? null,
+            },
+          };
         }
         patch.status = "in_progress";
         Object.assign(patch, patchForPrincipal(returnAssignee));

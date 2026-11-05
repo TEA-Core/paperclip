@@ -4920,6 +4920,9 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect(delivery!.headSha).toBe(HEAD_SHA);
     expect(delivery!.recordedByRunId).toBe(runId);
     expect(typeof delivery!.recordedAt).toBe("string");
+    // R20: the delivered head is also stamped as the structured review-round
+    // head the review-stall trigger compares against the last bounced head.
+    expect((row!.executionState as Record<string, unknown>).deliveredHeadSha).toBe(HEAD_SHA);
   });
 
   it("records deliveryIdentity for a project_primary workspace with no persisted branch (SUP-18325)", async () => {
