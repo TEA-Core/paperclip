@@ -3582,7 +3582,7 @@ Duplicate headings receive stable suffixes.
     await plugin.definition.setup(harness.ctx);
     const result = await harness.performAction<{
       source: { rawPath: string; title: string; hash: string };
-      operation: { operationId: string; issue: { originKind: string; originId: string | null; billingCode: string | null; assigneeAgentId: string | null } };
+      operation: { operationId: string; issue: { originKind: string; originId: string | null; billingCode: string | null; assigneeAgentId: string | null; deliveryRequirement: string } };
     }>("ingest-source", {
       companyId: COMPANY_ID,
       wikiId: "engineering",
@@ -3607,8 +3607,10 @@ Duplicate headings receive stable suffixes.
     expect(result.operation.issue.originId).toBe(`wiki:engineering:operation:${result.operation.operationId}`);
     expect(result.operation.issue.billingCode).toBe("plugin-llm-wiki:engineering");
     expect(result.operation.issue.assigneeAgentId).toBe(wikiMaintainerAgent().id);
+    expect(result.operation.issue.deliveryRequirement).toBe("record_only");
 
     const sourceInsert = harness.dbExecutes.find((execute) => execute.sql.includes("wiki_sources"));
+
     expect(sourceInsert?.params).toEqual(expect.arrayContaining([
       COMPANY_ID,
       "engineering",
@@ -4005,7 +4007,9 @@ Duplicate headings receive stable suffixes.
     harness.seed({ agents: [wikiMaintainerAgent()] });
     await plugin.definition.setup(harness.ctx);
 
-    const result = await harness.performAction<{ issue: { originKind: string; billingCode: string | null } }>(
+    const result = await harness.performAction<{
+      issue: { originKind: string; billingCode: string | null; deliveryRequirement: string };
+    }>(
       "create-operation",
       {
         companyId: COMPANY_ID,
@@ -4017,6 +4021,7 @@ Duplicate headings receive stable suffixes.
 
     expect(result.issue.originKind).toBe(`${OPERATION_ORIGIN_KIND}:query`);
     expect(result.issue.billingCode).toBe("plugin-llm-wiki:default");
+    expect(result.issue.deliveryRequirement).toBe("record_only");
     expect(harness.dbExecutes.some((execute) => execute.sql.includes("wiki_resource_bindings"))).toBe(true);
     expect(harness.dbExecutes.some((execute) => execute.sql.includes("wiki_operations"))).toBe(true);
   });

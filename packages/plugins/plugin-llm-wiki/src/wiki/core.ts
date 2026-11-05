@@ -2479,6 +2479,7 @@ export async function createOperationIssue(ctx: PluginContext, input: OperationI
     priority: input.operationType === "query" ? "medium" : "low",
     assigneeAgentId: assignableAgentId,
     billingCode: operationBillingCode(wikiId, space),
+    deliveryRequirement: "record_only",
     surfaceVisibility: "plugin_operation",
     originKind: `${OPERATION_ORIGIN_KIND}:${input.operationType}` as PluginIssueOriginKind,
     originId,

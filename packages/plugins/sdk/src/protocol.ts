@@ -1864,6 +1864,7 @@ export interface WorkerToHostMethods {
       description?: string;
       status?: string;
       priority?: string;
+      deliveryRequirement?: "repository_delivery" | "record_only";
       assigneeAgentId?: string;
       assigneeUserId?: string | null;
       requestDepth?: number;

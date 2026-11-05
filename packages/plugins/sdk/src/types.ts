@@ -19,6 +19,7 @@ import type {
   Project,
   Issue,
   IssueComment,
+  IssueDeliveryRequirement,
   IssueDocument,
   IssueDocumentSummary,
   IssueRelationIssueSummary,
@@ -1466,6 +1467,7 @@ export interface PluginIssuesClient {
     description?: string;
     status?: Issue["status"];
     priority?: Issue["priority"];
+    deliveryRequirement?: IssueDeliveryRequirement;
     assigneeAgentId?: string;
     assigneeUserId?: string | null;
     requestDepth?: number;

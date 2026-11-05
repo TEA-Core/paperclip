@@ -110,6 +110,13 @@ describe("createTestHarness issue interactions", () => {
 
     expect(issue.deliveryRequirement).toBe("repository_delivery");
 
+    const recordOnlyIssue = await harness.ctx.issues.create({
+      companyId: "company-1",
+      title: "Record operation",
+      deliveryRequirement: "record_only",
+    });
+    expect(recordOnlyIssue.deliveryRequirement).toBe("record_only");
+
     const interaction = await harness.ctx.issues.requestCheckboxConfirmation(
       issue.id,
       {
