@@ -17,6 +17,7 @@ import { hasUsableUnblockDescriptor } from "./recovery/service.js";
 const mockResolveLinkedPullRequestsWithState = vi.hoisted(() => vi.fn());
 const mockResolveCardPullRequest = vi.hoisted(() => vi.fn());
 const mockResolveGitHubTokenForRepo = vi.hoisted(() => vi.fn());
+const mockResolveGitHubTokenCandidatesForRepo = vi.hoisted(() => vi.fn());
 const mockEnableAutoMerge = vi.hoisted(() => vi.fn());
 const mockDisableAutoMerge = vi.hoisted(() => vi.fn());
 // The scripted rows of this fixture cannot take the take-back record (it needs a real database): a spy stands in, and
@@ -33,6 +34,8 @@ const mockFetchHeadApprovedStatusViaTokenCandidates = vi.hoisted(() => vi.fn());
 // ejection predicate. Default below is "no ejection" so pre-existing re-enqueue
 // tests keep their old behaviour.
 const mockFetchLastMergeQueueEjectionViaTokenCandidates = vi.hoisted(() => vi.fn());
+const mockVerifyMergedPullRequestOnBaseBranch = vi.hoisted(() => vi.fn());
+const mockResolveCardDeliveryBaseRef = vi.hoisted(() => vi.fn());
 vi.mock("./merge-arming.js", async (importOriginal) => {
   const orig = await importOriginal<typeof import("./merge-arming.js")>();
   return {
@@ -40,6 +43,7 @@ vi.mock("./merge-arming.js", async (importOriginal) => {
     resolveLinkedPullRequestsWithState: mockResolveLinkedPullRequestsWithState,
     resolveCardPullRequest: mockResolveCardPullRequest,
     resolveGitHubTokenForRepo: mockResolveGitHubTokenForRepo,
+    resolveGitHubTokenCandidatesForRepo: mockResolveGitHubTokenCandidatesForRepo,
     enableAutoMerge: mockEnableAutoMerge,
     disableAutoMerge: mockDisableAutoMerge,
     openArmRecord: mockOpenArmRecord,
@@ -47,6 +51,8 @@ vi.mock("./merge-arming.js", async (importOriginal) => {
     fetchHeadViaTokenCandidates: mockFetchHeadViaTokenCandidates,
     fetchHeadApprovedStatusViaTokenCandidates: mockFetchHeadApprovedStatusViaTokenCandidates,
     fetchLastMergeQueueEjectionViaTokenCandidates: mockFetchLastMergeQueueEjectionViaTokenCandidates,
+    verifyMergedPullRequestOnBaseBranch: mockVerifyMergedPullRequestOnBaseBranch,
+    resolveCardDeliveryBaseRef: mockResolveCardDeliveryBaseRef,
   };
 });
 
@@ -473,6 +479,7 @@ beforeEach(() => {
   mockResolveLinkedPullRequestsWithState.mockReset();
   mockResolveCardPullRequest.mockReset();
   mockResolveGitHubTokenForRepo.mockReset();
+  mockResolveGitHubTokenCandidatesForRepo.mockReset();
   mockEnableAutoMerge.mockReset();
   mockDisableAutoMerge.mockReset();
   mockForgetArm.mockReset().mockResolvedValue(undefined);
@@ -490,6 +497,8 @@ beforeEach(() => {
     headCommitAt: "2026-08-18T16:07:16Z",
     lastEjection: null,
   });
+  mockVerifyMergedPullRequestOnBaseBranch.mockReset();
+  mockResolveCardDeliveryBaseRef.mockReset();
   mockCreateGitHubExternalObjectProvider.mockReset();
   mockResolveCarrierOwner.mockReset();
   mockResolveCarrierOwner.mockResolvedValue(null);
@@ -1068,6 +1077,251 @@ describe("createDoneCloseLandingBackstopService", () => {
       });
       expect(mockLogActivity).not.toHaveBeenCalled();
       expect(mockAddComment).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("SUP-23140: recorded finalDelivery discharge", () => {
+    const finalDelivery = {
+      owner: "tea-core",
+      repo: "paperclip",
+      number: 1098,
+      headSha: "cc4757c92cb5f2c3435a4e69fedbe25411821eba",
+      decisionId: "decision-1",
+    };
+    const finalMergeSha = "4840166b1507db592226b3178c9224706edc8a13";
+    const issueExecutionState = { approvalStatus: { finalDelivery } };
+    const finalMergedSnapshot = {
+      ok: true,
+      snapshot: {
+        statusKey: "merged",
+        statusCategory: "succeeded",
+        statusTone: "success",
+        data: {
+          provider: "github",
+          owner: "tea-core",
+          repo: "paperclip",
+          number: 1098,
+          state: "closed",
+          merged: true,
+          draft: false,
+          headRef: "SUP-22668-delivery",
+          headSha: finalDelivery.headSha,
+          headRepoFullName: "tea-core/paperclip",
+          baseRef: "fold/tea-patches-v2026.722.0",
+          merged_at: "2026-11-04T20:10:31Z",
+          merge_commit_sha: finalMergeSha,
+        },
+      },
+    } as unknown as ExternalObjectResolveResult;
+
+    function primeFinalDelivery(
+      mentions: Array<Record<string, unknown>> = [],
+      verification: Record<string, unknown> = { outcome: "proven" },
+      finalSnapshot: ExternalObjectResolveResult = finalMergedSnapshot,
+    ) {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue(mentions);
+      mockResolveGitHubTokenForRepo.mockResolvedValue({
+        token: "ghp_test_token",
+        scope: "company",
+        secretName: "github-token",
+      });
+      mockResolveGitHubTokenCandidatesForRepo.mockResolvedValue([{ token: "ghp_test_token" }]);
+      mockResolveCardDeliveryBaseRef.mockResolvedValue("fold/tea-patches-v2026.722.0");
+      mockVerifyMergedPullRequestOnBaseBranch.mockResolvedValue(verification);
+      return mockResolver(async (input: unknown) =>
+        (input as { object: { externalId: string } }).object.externalId.endsWith("pull/1098")
+          ? finalSnapshot
+          : openSnapshot,
+      );
+    }
+
+    it("AC1: discharges a merged finalDelivery with no mention rows and leaves the card done", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const { service } = makeService(
+        { candidates: [candidateRow()], existingLandingRows: [], issueExecutionState },
+        { wakeup },
+      );
+      primeFinalDelivery();
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 1,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 0,
+        escalated: 0,
+        draftStranded: 0,
+        unarmable: [],
+      });
+
+      expect(mockResolveCardPullRequest).not.toHaveBeenCalled();
+      expect(mockVerifyMergedPullRequestOnBaseBranch).toHaveBeenCalledWith(
+        "ghp_test_token",
+        "tea-core",
+        "paperclip",
+        "fold/tea-patches-v2026.722.0",
+        finalMergeSha,
+        { requireVerifiedBranch: true },
+      );
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "issue.done_close_landing_confirmed",
+        entityId: ISSUE,
+        details: expect.objectContaining({
+          pr: "tea-core/paperclip#1098",
+          prState: "merged",
+        }),
+      }));
+      expect(mockAddComment).toHaveBeenCalledTimes(1);
+      expect(mockAddComment.mock.calls[0]![1]).toContain("tea-core/paperclip#1098");
+      expect(mockUpdate).not.toHaveBeenCalled();
+      expect(wakeup).not.toHaveBeenCalled();
+    });
+
+    it("AC2: a stale foreign mention cannot re-open a card discharged by finalDelivery", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const { service } = makeService(
+        {
+          candidates: [candidateRow()],
+          existingLandingRows: [],
+          issueExecutionState,
+          companyMergeArmingEnabled: false,
+        },
+        { wakeup },
+      );
+      primeFinalDelivery([
+        linkedPr({
+          id: "eo-1083",
+          owner: "tea-core",
+          repo: "paperclip",
+          number: 1083,
+          displayName: "tea-core/paperclip#1083",
+        }),
+      ]);
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 1,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 0,
+        escalated: 0,
+        draftStranded: 0,
+        unarmable: [],
+      });
+
+      expect(mockAddComment).toHaveBeenCalledTimes(1);
+      expect(mockAddComment.mock.calls[0]![1]).toContain("tea-core/paperclip#1098");
+      expect(mockUpdate).not.toHaveBeenCalled();
+      expect(wakeup).not.toHaveBeenCalled();
+    });
+
+    it("does not repeat a previously recorded finalDelivery discharge", async () => {
+      const state: DbState = {
+        candidates: [candidateRow()],
+        existingLandingRows: [],
+        issueExecutionState,
+      };
+      const { service } = makeService(state);
+      const resolve = primeFinalDelivery();
+
+      await service.sweep();
+      state.existingLandingRows.push({
+        action: "issue.done_close_landing_confirmed",
+        entityId: ISSUE,
+        details: { pr: "tea-core/paperclip#1098" },
+      });
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 0,
+        reenqueued: 0,
+        escalated: 0,
+        draftStranded: 0,
+        unarmable: [],
+      });
+
+      expect(resolve).toHaveBeenCalledTimes(1);
+      expect(mockLogActivity).toHaveBeenCalledTimes(1);
+      expect(mockAddComment).toHaveBeenCalledTimes(1);
+      expect(mockUpdate).not.toHaveBeenCalled();
+    });
+
+    it("rotates credentials while proving finalDelivery merge ancestry", async () => {
+      const { service } = makeService({
+        candidates: [candidateRow()], existingLandingRows: [], issueExecutionState,
+      });
+      primeFinalDelivery();
+      mockResolveGitHubTokenCandidatesForRepo.mockResolvedValue([{ token: "expired" }, { token: "working" }]);
+      mockVerifyMergedPullRequestOnBaseBranch
+        .mockResolvedValueOnce({ outcome: "auth-failed", status: 403 })
+        .mockResolvedValueOnce({ outcome: "proven" });
+
+      await service.sweep();
+
+      expect(mockVerifyMergedPullRequestOnBaseBranch.mock.calls.map((call) => call[0])).toEqual(["expired", "working"]);
+      expect(mockLogActivity).toHaveBeenCalledTimes(1);
+      expect(mockAddComment).toHaveBeenCalledTimes(1);
+    });
+
+    it("defers a merged finalDelivery whose live head differs from the certified head", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const { service } = makeService(
+        { candidates: [candidateRow()], existingLandingRows: [], issueExecutionState },
+        { wakeup },
+      );
+      const movedSnapshot = structuredClone(finalMergedSnapshot);
+      if (movedSnapshot.ok) {
+        (movedSnapshot.snapshot.data as Record<string, unknown>).headSha = "d".repeat(40);
+      }
+      primeFinalDelivery([], { outcome: "proven" }, movedSnapshot);
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 1,
+        reenqueued: 0,
+        escalated: 0,
+        draftStranded: 0,
+        unarmable: [],
+      });
+
+      expect(mockVerifyMergedPullRequestOnBaseBranch).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+      expect(mockAddComment).not.toHaveBeenCalled();
+      expect(mockUpdate).not.toHaveBeenCalled();
+      expect(wakeup).not.toHaveBeenCalled();
+    });
+
+    it("defers a merged finalDelivery whose merge commit is not proven on the delivery base", async () => {
+      const wakeup = vi.fn().mockResolvedValue({ id: "wake" });
+      const { service } = makeService(
+        { candidates: [candidateRow()], existingLandingRows: [], issueExecutionState },
+        { wakeup },
+      );
+      primeFinalDelivery([], { outcome: "unproven", reason: "not an ancestor" });
+
+      await expect(service.sweep()).resolves.toEqual({
+        due: true,
+        candidates: 1,
+        confirmed: 0,
+        failed: 0,
+        deferred: 1,
+        reenqueued: 0,
+        escalated: 0,
+        draftStranded: 0,
+        unarmable: [],
+      });
+
+      expect(mockLogActivity).not.toHaveBeenCalled();
+      expect(mockAddComment).not.toHaveBeenCalled();
+      expect(mockUpdate).not.toHaveBeenCalled();
+      expect(wakeup).not.toHaveBeenCalled();
     });
   });
 

@@ -2527,7 +2527,7 @@ type MergedDeliveryVerification =
  * rewritten after the merge), which fails closed per ADR-091 D4. 401/403
  * rotates to the next token candidate, mirroring the neighboring reads.
  */
-async function verifyMergedPullRequestOnBaseBranch(
+export async function verifyMergedPullRequestOnBaseBranch(
   token: string,
   owner: string,
   repo: string,
@@ -2596,7 +2596,7 @@ async function verifyMergedPullRequestOnBaseBranch(
  * base: the caller then refuses, it never falls back to the live PR base.
  * Ordinary bindings are not pinned.
  */
-async function resolveCardDeliveryBaseRef(
+export async function resolveCardDeliveryBaseRef(
   db: Db,
   companyId: string,
   issueId: string,

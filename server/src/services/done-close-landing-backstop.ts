@@ -22,6 +22,9 @@ import {
   consumableReleaseStatusId,
   narrowToDelivered,
   notDeliveredReasonForPr,
+  resolveGitHubTokenCandidatesForRepo,
+  verifyMergedPullRequestOnBaseBranch,
+  resolveCardDeliveryBaseRef,
   MERGE_ARMING_REFUSED_ON_CLOSE_ACTION,
   type LinkedPullRequest,
 } from "./merge-arming.js";
@@ -208,6 +211,8 @@ interface MeasuredLanding {
   // where `"unknown"` fails closed and defers.
   draft: boolean | "unknown";
   closedAt: string | null;
+  headSha: string | null;
+  mergeCommitSha: string | null;
 }
 
 function readMsEnv(name: string, fallbackMs: number): number {
@@ -225,6 +230,35 @@ function readRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
+}
+
+function readFinalDeliveryPullRequest(
+  executionState: Record<string, unknown> | null,
+): LinkedPullRequest | null {
+  const finalDelivery = readRecord(readRecord(executionState?.approvalStatus)?.finalDelivery);
+  const owner = readString(finalDelivery?.owner);
+  const repo = readString(finalDelivery?.repo);
+  const number = finalDelivery?.number;
+  if (!owner || !repo || typeof number !== "number" || !Number.isSafeInteger(number) || number <= 0) {
+    return null;
+  }
+  return {
+    id: "final-delivery",
+    owner,
+    repo,
+    number,
+    nodeId: null,
+    headRefName: null,
+    displayName: `${owner}/${repo}#${number}`,
+    title: null,
+    cachedState: null,
+    lastErrorCode: null,
+    reviewDecision: null,
+  };
+}
+
+function samePullRequestKey(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase();
 }
 
 /** Only this sweep's board-owned draft park may be rediscovered while blocked. */
@@ -460,12 +494,25 @@ export function createDoneCloseLandingBackstopService(
       .where(eq(companies.id, issue.companyId));
     const mergeArmingEnabled = companyRow[0]?.mergeArmingEnabled === true;
 
+    const cardState = await readCardExecutionState(db, issue.id);
+    const finalDeliveryPr = readFinalDeliveryPullRequest(cardState);
+    const finalDeliveryHeadSha = readString(
+      readRecord(readRecord(cardState?.approvalStatus)?.finalDelivery)?.headSha,
+    );
+    const finalDeliveryKey = finalDeliveryPr
+      ? `${finalDeliveryPr.owner}/${finalDeliveryPr.repo}#${finalDeliveryPr.number}`
+      : null;
     const prs: LinkedPullRequest[] = await resolveLinkedPullRequestsWithState(
       db,
       issue.companyId,
       issue.id,
       { includeDrafts: true },
     );
+    if (finalDeliveryPr && finalDeliveryKey && !prs.some((pr) =>
+      samePullRequestKey(`${pr.owner}/${pr.repo}#${pr.number}`, finalDeliveryKey),
+    )) {
+      prs.push(finalDeliveryPr);
+    }
     if (prs.length === 0) {
       // SUP-14917: zero cached mentions — the PR was delivered from a workspace and
       // never posted in-thread, so this sweep used to see nothing. Resolve it the
@@ -629,6 +676,11 @@ export function createDoneCloseLandingBackstopService(
         alreadyRefused.add(refusalKey(pr, head, ejectionReason));
       }
     }
+    if (finalDeliveryKey && [...alreadyConfirmed].some((prKey) =>
+      samePullRequestKey(prKey, finalDeliveryKey),
+    )) {
+      return;
+    }
 
     // Two-pass reconciliation (SUP-14971): measure EVERY linked PR on the card
     // before dispositioning any of them. The card-level question is "did this
@@ -643,7 +695,6 @@ export function createDoneCloseLandingBackstopService(
     // merge on a head the merge boundary has not authorized. Fetch the card's
     // pinned approval stamp once per candidate so the per-PR gate can compare
     // the live head against it. Only needed when the re-enqueue lane is open.
-    const cardState = mergeArmingEnabled ? await readCardExecutionState(db, issue.id) : null;
     const approvedHeadSha = mergeArmingEnabled
       ? await readApprovedHeadSha(db, issue.id)
       : null;
@@ -697,8 +748,85 @@ export function createDoneCloseLandingBackstopService(
               headRepoFullName: readString(data?.headRepoFullName),
             }
           : pr,
-        prKey, state, draft, closedAt,
+        prKey,
+        state,
+        draft,
+        closedAt,
+        headSha: readString(data?.headSha),
+        mergeCommitSha: readString(data?.merge_commit_sha),
       });
+    }
+
+    const finalMeasured = finalDeliveryKey
+      ? measured.find((landing) => samePullRequestKey(landing.prKey, finalDeliveryKey))
+      : undefined;
+    if (finalDeliveryKey && !finalMeasured) return;
+    if (finalMeasured?.state === "merged") {
+      if (
+        !verdictEligible
+        || !finalMeasured.mergeCommitSha
+        || !finalDeliveryHeadSha
+        || finalMeasured.headSha !== finalDeliveryHeadSha
+      ) {
+        counts.deferred += 1;
+        return;
+      }
+      const tokenCandidates = await resolveGitHubTokenCandidatesForRepo(
+        db,
+        issue.companyId,
+        finalMeasured.pr.owner,
+        finalMeasured.pr.repo,
+      );
+      const baseRef = await resolveCardDeliveryBaseRef(db, issue.companyId, issue.id);
+      let verification: Awaited<ReturnType<typeof verifyMergedPullRequestOnBaseBranch>> = {
+        outcome: "unproven",
+        reason: "no GitHub credentials",
+      };
+      for (const candidate of tokenCandidates) {
+        verification = await verifyMergedPullRequestOnBaseBranch(
+          candidate.token,
+          finalMeasured.pr.owner,
+          finalMeasured.pr.repo,
+          baseRef,
+          finalMeasured.mergeCommitSha,
+          { requireVerifiedBranch: true },
+        );
+        if (verification.outcome !== "auth-failed") break;
+      }
+      if (verification.outcome !== "proven") {
+        counts.deferred += 1;
+        return;
+      }
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: DONE_CLOSE_LANDING_ACTOR_ID,
+        agentId: null,
+        runId: null,
+        agentApiKeyId: null,
+        action: DONE_CLOSE_LANDING_CONFIRMED_ACTION,
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          identifier: issue.identifier ?? null,
+          pr: finalMeasured.prKey,
+          prState: finalMeasured.state,
+          closedAt: finalMeasured.closedAt,
+          skipReason: skipReason ?? null,
+          finalDelivery: true,
+          mergeCommitSha: finalMeasured.mergeCommitSha,
+          deliveryBaseRef: baseRef,
+        },
+      });
+      await deps.svc.addComment(
+        issue.id,
+        `[Done-close landing] ${issue.identifier ?? "(unknown issue)"}: recorded finalDelivery ${finalMeasured.prKey} is merged, and merge commit ${finalMeasured.mergeCommitSha} is contained in the verified delivery base ${baseRef}. The landing-delegated obligation is discharged; this card remains done.`,
+        {},
+        { authorType: "system" },
+      );
+      counts.confirmed += 1;
+      return;
     }
 
     // Did ANY linked PR on this card merge? If so, a closed-unmerged sibling is a
