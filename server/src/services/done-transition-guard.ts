@@ -18,7 +18,9 @@ import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
   LEGACY_WORKTREE_GIT_OPTIONS,
   normalizeBaseBranch,
+  otherCardIdentifiers,
   probeNoRepositoryWorktree,
+  readWorktreeHeadFromFiles,
   runHardenedGit,
 } from "./hardened-git-probe.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
@@ -284,9 +286,11 @@ export interface DoneTierDeclarationResult {
   skipped: boolean;
   skipReason: string | null;
   // SUP-22570: set when the accepted declaration is the record_only
-  // no-repository form. The accepting door must re-run
-  // verifyNoRepositoryLandingAtTransition inside its status write.
+  // no-repository form, with what it measured. The accepting door measures
+  // again just before its status write (measureNoRepositoryLandingForClose)
+  // and re-checks that inside the write (verifyNoRepositoryLandingAtTransition).
   landing?: "noRepositoryLanding";
+  noRepositoryMeasurement?: NoRepositoryLandingMeasurement;
   // A remedy specific to this refusal. A door that builds its own generic remedy
   // for a refused declaration uses this one instead when it is set.
   remedy?: string;
@@ -1757,8 +1761,11 @@ async function proveTier2Live(
 // SUP-22570: the record_only no-repository close form. A record_only issue
 // already skips the delivery guard; this form is the truthful Tier 1 sentence
 // for one that has no repository deliverable at all. It is accepted only when
-// every check below holds, and the accepting door re-runs the same checks
-// inside its status write (verifyNoRepositoryLandingAtTransition).
+// every check below holds. The accepting door measures once more just before
+// its status write, outside any transaction (measureNoRepositoryLandingForClose),
+// and the write compares that measurement with the row it locks
+// (verifyNoRepositoryLandingAtTransition) without running Git or calling GitHub,
+// so no Git process or network call runs while the issue row is held.
 //
 // This replaces the no-repository form PR 1114 (SUP-23044) landed on the fold
 // branch, which a repository_delivery card could also use when it had no pull
@@ -1786,11 +1793,58 @@ export interface NoRepositoryLandingSubject {
   id: string;
   companyId: string;
   identifier: string | null;
+  projectWorkspaceId?: string | null;
   executionWorkspaceId?: string | null;
   deliveryRequirement?: IssueDeliveryRequirement | null;
 }
 
-export type NoRepositoryLandingVerdict = { ok: true } | { ok: false; reason: string; remedy?: string };
+/**
+ * What a no-repository close measured: the issue's workspace binding, the
+ * ruling it rests on, the base it was compared against and the probe result.
+ * The close audit records it, and the status write re-checks it.
+ */
+export interface NoRepositoryLandingMeasurement {
+  executionWorkspaceId: string;
+  issueProjectWorkspaceId: string | null;
+  workspaceProjectWorkspaceId: string;
+  recordedWorktreePath: string;
+  repository: string;
+  baseBranch: string;
+  ruling: { documentId: string; revisionNumber: number; revisionCount: number; updatedAt: string };
+  probe: {
+    branch: string;
+    headSha: string;
+    worktreePath: string;
+    gitDir: string;
+    commonDir: string;
+    comparedTips: string[];
+  };
+}
+
+export type NoRepositoryLandingVerdict =
+  | { ok: true; measurement: NoRepositoryLandingMeasurement }
+  | { ok: false; reason: string; remedy?: string };
+
+type NoRepositoryLandingRefusal = Extract<NoRepositoryLandingVerdict, { ok: false }>;
+
+/** The close audit's view of a measurement: the ruling, the binding, the base and the probe result. */
+export function noRepositoryLandingAuditDetails(measurement: NoRepositoryLandingMeasurement) {
+  return {
+    rulingDocumentId: measurement.ruling.documentId,
+    rulingRevisionNumber: measurement.ruling.revisionNumber,
+    executionWorkspaceId: measurement.executionWorkspaceId,
+    projectWorkspaceId: measurement.workspaceProjectWorkspaceId,
+    repository: measurement.repository,
+    baseBranch: measurement.baseBranch,
+    probe: {
+      result: "clean_and_level_with_base",
+      branch: measurement.probe.branch,
+      headSha: measurement.probe.headSha,
+      worktreePath: measurement.probe.worktreePath,
+      comparedTips: measurement.probe.comparedTips,
+    },
+  };
+}
 
 // Repository evidence a no-repository declaration must not carry: a close that
 // claims no repository landing while citing a PR, a commit, a ref or a GitHub
@@ -1811,15 +1865,46 @@ function citedRepositoryEvidence(text: string): string | null {
   return extractCitedCommitShas(text).length > 0 ? "a commit SHA" : null;
 }
 
-function noRepositoryRefusal(reason: string, remedy?: string): NoRepositoryLandingVerdict {
+// A ruling that opens with one of these words, or says nothing else, is a
+// placeholder, not a ruling ("TODO placeholder" closed a card in release
+// assurance's run).
+const PLACEHOLDER_RULING_WORDS: ReadonlySet<string> = new Set([
+  "todo", "tbd", "tba", "fixme", "xxx", "placeholder", "wip", "lorem", "ipsum", "na",
+]);
+const MIN_SUBSTANTIVE_RULING_WORDS = 3;
+
+function placeholderRulingReason(body: string): string | null {
+  const words = body.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  if (words.length > 0 && PLACEHOLDER_RULING_WORDS.has(words[0]!)) {
+    return `it opens with the placeholder "${words[0]}"`;
+  }
+  const substantive = words.filter((word) => word.length > 1 && !PLACEHOLDER_RULING_WORDS.has(word));
+  return substantive.length < MIN_SUBSTANTIVE_RULING_WORDS
+    ? `it has fewer than ${MIN_SUBSTANTIVE_RULING_WORDS} words that are not placeholders`
+    : null;
+}
+
+function noRepositoryRefusal(reason: string, remedy?: string): NoRepositoryLandingRefusal {
   return { ok: false, reason: `Tier 1 "${NO_REPOSITORY_LANDING_TOKEN}" ${reason}`, ...(remedy === undefined ? {} : { remedy }) };
 }
 
-async function verifyNoRepositoryLanding(
+/** Everything the close rests on that the database holds; `probe` aside, the measurement. */
+type NoRepositoryLandingRecord = Omit<NoRepositoryLandingMeasurement, "probe"> & {
+  identifier: string;
+  projectId: string;
+  repositoryLocation: NonNullable<ReturnType<typeof parseRepoUrl>>;
+};
+
+/**
+ * The database half of the proof: classification, closer, workspace kind and
+ * binding, base, ruling and linked pull requests. Reads only; runs no Git and
+ * makes no network call, so the status write can repeat it under the row lock.
+ */
+async function readNoRepositoryLandingRecord(
   db: Db,
   issue: NoRepositoryLandingSubject,
   closingActor: DoneTierClosingActor | null,
-): Promise<NoRepositoryLandingVerdict> {
+): Promise<NoRepositoryLandingRefusal | { ok: true; record: NoRepositoryLandingRecord }> {
   if (issue.deliveryRequirement !== "record_only") {
     return noRepositoryRefusal("is accepted only on a record_only issue.", REPOSITORY_DELIVERY_RECLASSIFY_REMEDY);
   }
@@ -1891,11 +1976,14 @@ async function verifyNoRepositoryLanding(
   }
 
   // The ruling: exactly the "entry-ruling" document linked to THIS issue in
-  // THIS company, and no revision of it written by the closing actor.
+  // THIS company, with a substantive body, and no revision of it written by
+  // the closing actor.
   const ruling = await db
     .select({
       documentId: documents.id,
       latestBody: documents.latestBody,
+      latestRevisionNumber: documents.latestRevisionNumber,
+      updatedAt: documents.updatedAt,
       createdByAgentId: documents.createdByAgentId,
       createdByUserId: documents.createdByUserId,
       updatedByAgentId: documents.updatedByAgentId,
@@ -1916,6 +2004,12 @@ async function verifyNoRepositoryLanding(
     .then((rows) => rows[0] ?? null);
   if (!ruling || ruling.latestBody.trim().length === 0) {
     return noRepositoryRefusal(`requires a non-empty "${ENTRY_RULING_DOCUMENT_KEY}" document on this issue.`);
+  }
+  const placeholder = placeholderRulingReason(ruling.latestBody);
+  if (placeholder) {
+    return noRepositoryRefusal(
+      `requires an "${ENTRY_RULING_DOCUMENT_KEY}" document that states a ruling; this one is a placeholder (${placeholder}).`,
+    );
   }
   const revisions = await db
     .select({ agentId: documentRevisions.createdByAgentId, userId: documentRevisions.createdByUserId })
@@ -1978,26 +2072,58 @@ async function verifyNoRepositoryLanding(
   // repository URL and the company credential: neither is writable by an agent
   // through its workspace, unlike every ref in the managed checkout. With no
   // such base the form refuses.
-  const repository = parseRepoUrl(projectWorkspace?.repoUrl ?? null);
-  if (!repository) {
+  const repositoryLocation = parseRepoUrl(projectWorkspace?.repoUrl ?? null);
+  if (!repositoryLocation) {
     return noRepositoryRefusal("requires the project workspace to name a GitHub repository to measure the default branch against.");
   }
+  return {
+    ok: true,
+    record: {
+      identifier: issue.identifier,
+      projectId: workspace.projectId,
+      executionWorkspaceId: issue.executionWorkspaceId,
+      issueProjectWorkspaceId: issue.projectWorkspaceId ?? null,
+      workspaceProjectWorkspaceId: workspace.projectWorkspaceId,
+      recordedWorktreePath,
+      repository: `${repositoryLocation.hostname}/${repositoryLocation.owner}/${repositoryLocation.repo}`,
+      repositoryLocation,
+      baseBranch,
+      ruling: {
+        documentId: ruling.documentId,
+        revisionNumber: ruling.latestRevisionNumber,
+        revisionCount: revisions.length,
+        updatedAt: ruling.updatedAt.toISOString(),
+      },
+    },
+  };
+}
+
+/** The full proof: the database record, then the hardened probe against the remote base. */
+async function verifyNoRepositoryLanding(
+  db: Db,
+  issue: NoRepositoryLandingSubject,
+  closingActor: DoneTierClosingActor | null,
+): Promise<NoRepositoryLandingVerdict> {
+  const read = await readNoRepositoryLandingRecord(db, issue, closingActor);
+  if (!read.ok) return read;
+  const { record } = read;
   const { token } = await resolveGitHubToken(db, issue.companyId);
   if (!token) {
     return noRepositoryRefusal("requires a configured GitHub credential to measure the default branch against.");
   }
+  const { hostname, owner, repo } = record.repositoryLocation;
   const probe = await probeNoRepositoryWorktree({
-    recordedWorktreePath,
+    recordedWorktreePath: record.recordedWorktreePath,
     managedProjectRoot: path.dirname(
-      resolveManagedProjectWorkspaceDir({ companyId: issue.companyId, projectId: workspace.projectId }),
+      resolveManagedProjectWorkspaceDir({ companyId: issue.companyId, projectId: record.projectId }),
     ),
-    issueIdentifier: issue.identifier,
+    issueIdentifier: record.identifier,
     countCommitsAheadOfBase: async (sha) => {
       const ahead = await githubCompareAheadBy(
-        repository.hostname,
-        repository.owner,
-        repository.repo,
-        baseBranch,
+        hostname,
+        owner,
+        repo,
+        record.baseBranch,
         sha,
         token,
         AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
@@ -2009,48 +2135,150 @@ async function verifyNoRepositoryLanding(
   if (!probe.ok) {
     return noRepositoryRefusal(`refused: ${probe.reason}.`);
   }
-  return { ok: true };
+  return {
+    ok: true,
+    measurement: {
+      executionWorkspaceId: record.executionWorkspaceId,
+      issueProjectWorkspaceId: record.issueProjectWorkspaceId,
+      workspaceProjectWorkspaceId: record.workspaceProjectWorkspaceId,
+      recordedWorktreePath: record.recordedWorktreePath,
+      repository: record.repository,
+      baseBranch: record.baseBranch,
+      ruling: record.ruling,
+      probe: {
+        branch: probe.branch,
+        headSha: probe.headSha,
+        worktreePath: probe.worktreePath,
+        gitDir: probe.gitDir,
+        commonDir: probe.commonDir,
+        comparedTips: probe.comparedTips,
+      },
+    },
+  };
+}
+
+/** What the close request itself would change alongside the status. */
+export interface NoRepositoryLandingCloseRequest {
+  /** The execution workspace the declaration was checked against. */
+  checkedExecutionWorkspaceId: string | null;
+  requestedDeliveryRequirement: unknown;
+  requestedExecutionWorkspaceId: unknown;
+  requestedProjectWorkspaceId: unknown;
+}
+
+// Neither the classification nor the workspace binding the proof rests on may
+// move in the request that lands the close.
+function closeRequestRefusal(
+  issue: NoRepositoryLandingSubject,
+  request: NoRepositoryLandingCloseRequest,
+): NoRepositoryLandingRefusal | null {
+  if (request.requestedDeliveryRequirement !== undefined && request.requestedDeliveryRequirement !== "record_only") {
+    return noRepositoryRefusal("cannot ride a request that changes the delivery requirement away from record_only.");
+  }
+  const workspaceId = issue.executionWorkspaceId ?? null;
+  if (
+    workspaceId !== request.checkedExecutionWorkspaceId ||
+    (request.requestedExecutionWorkspaceId !== undefined && request.requestedExecutionWorkspaceId !== workspaceId)
+  ) {
+    return noRepositoryRefusal("refused: the issue's execution workspace changed after the declaration was checked.");
+  }
+  if (
+    request.requestedProjectWorkspaceId !== undefined &&
+    request.requestedProjectWorkspaceId !== (issue.projectWorkspaceId ?? null)
+  ) {
+    return noRepositoryRefusal("cannot ride a request that changes the issue's project workspace.");
+  }
+  return null;
 }
 
 /**
- * SUP-22570 transactional re-probe: run inside the status write that lands the
- * close, against the row it holds `FOR UPDATE`. The delivery requirement is
- * checked on the locked row, so a flip away from record_only (or a flip TO
- * record_only carried in the same request) cannot ride a probe taken earlier,
- * and the worktree, ruling and linked-PR checks are re-measured at the write.
- * `request` is what the same write will change: neither the delivery
- * requirement nor the execution workspace may move under the close.
+ * SUP-22570: the measurement a door takes just before its status write, outside
+ * any transaction. Every Git process and GitHub call of the close runs here, so
+ * none runs while the write holds the issue row; the write then re-checks this
+ * measurement with verifyNoRepositoryLandingAtTransition.
+ */
+export async function measureNoRepositoryLandingForClose(
+  db: Db,
+  issue: NoRepositoryLandingSubject,
+  closingActor: DoneTierClosingActor,
+  request: NoRepositoryLandingCloseRequest,
+): Promise<NoRepositoryLandingVerdict> {
+  const refusal = closeRequestRefusal(issue, request);
+  if (refusal) return refusal;
+  try {
+    return await verifyNoRepositoryLanding(db, issue, closingActor);
+  } catch (err) {
+    return noRepositoryRefusal(
+      `could not be verified before the close write (${err instanceof Error ? err.message : "unknown"}).`,
+    );
+  }
+}
+
+function changedSinceMeasurement(
+  record: NoRepositoryLandingRecord,
+  measurement: NoRepositoryLandingMeasurement,
+): string | null {
+  if (record.workspaceProjectWorkspaceId !== measurement.workspaceProjectWorkspaceId) {
+    return "the execution workspace's project workspace";
+  }
+  if (record.recordedWorktreePath !== measurement.recordedWorktreePath) return "the recorded worktree path";
+  if (record.repository !== measurement.repository || record.baseBranch !== measurement.baseBranch) {
+    return "the project's repository or default branch";
+  }
+  if (
+    record.ruling.documentId !== measurement.ruling.documentId ||
+    record.ruling.revisionNumber !== measurement.ruling.revisionNumber ||
+    record.ruling.revisionCount !== measurement.ruling.revisionCount ||
+    record.ruling.updatedAt !== measurement.ruling.updatedAt
+  ) {
+    return `the "${ENTRY_RULING_DOCUMENT_KEY}" document`;
+  }
+  return null;
+}
+
+/**
+ * SUP-22570 compare-and-set, inside the status write that lands the close and
+ * against the row it holds `FOR UPDATE`. It runs no Git process and makes no
+ * network call: it re-reads the database half of the proof, requires it to
+ * match what was measured, and requires the worktree's HEAD, read from its ref
+ * files, to still be the measured commit. Any mismatch refuses.
  */
 export async function verifyNoRepositoryLandingAtTransition(
   tx: Db,
   lockedIssue: NoRepositoryLandingSubject,
   closingActor: DoneTierClosingActor,
-  request: {
-    checkedExecutionWorkspaceId: string | null;
-    requestedDeliveryRequirement: unknown;
-    requestedExecutionWorkspaceId: unknown;
-  },
+  request: NoRepositoryLandingCloseRequest,
+  measurement: NoRepositoryLandingMeasurement,
 ): Promise<NoRepositoryLandingVerdict> {
-  if (request.requestedDeliveryRequirement !== undefined && request.requestedDeliveryRequirement !== "record_only") {
-    return noRepositoryRefusal("cannot ride a request that changes the delivery requirement away from record_only.");
-  }
+  const refusal = closeRequestRefusal(lockedIssue, request);
+  if (refusal) return refusal;
   if (lockedIssue.deliveryRequirement !== "record_only") {
     return noRepositoryRefusal("is accepted only on an issue already stored as record_only at the close write.");
   }
-  const lockedWorkspaceId = lockedIssue.executionWorkspaceId ?? null;
   if (
-    lockedWorkspaceId !== request.checkedExecutionWorkspaceId ||
-    (request.requestedExecutionWorkspaceId !== undefined && request.requestedExecutionWorkspaceId !== lockedWorkspaceId)
+    (lockedIssue.executionWorkspaceId ?? null) !== measurement.executionWorkspaceId ||
+    (lockedIssue.projectWorkspaceId ?? null) !== measurement.issueProjectWorkspaceId
   ) {
-    return noRepositoryRefusal("refused: the issue's execution workspace changed after the declaration was checked.");
+    return noRepositoryRefusal("refused: the issue's workspace binding changed after the close was measured.");
   }
+  let read: Awaited<ReturnType<typeof readNoRepositoryLandingRecord>>;
   try {
-    return await verifyNoRepositoryLanding(tx, lockedIssue, closingActor);
+    read = await readNoRepositoryLandingRecord(tx, lockedIssue, closingActor);
   } catch (err) {
     return noRepositoryRefusal(
       `could not be verified at the close write (${err instanceof Error ? err.message : "unknown"}).`,
     );
   }
+  if (!read.ok) return read;
+  const changed = changedSinceMeasurement(read.record, measurement);
+  if (changed) {
+    return noRepositoryRefusal(`refused: ${changed} changed after the close was measured.`);
+  }
+  const head = await readWorktreeHeadFromFiles(measurement.probe.gitDir, measurement.probe.commonDir);
+  if (!head || head.branch !== measurement.probe.branch || head.sha !== measurement.probe.headSha) {
+    return noRepositoryRefusal("refused: the recorded worktree's HEAD moved after the close was measured.");
+  }
+  return { ok: true, measurement };
 }
 
 async function proveNoRepositoryLanding(
@@ -2067,6 +2295,12 @@ async function proveNoRepositoryLanding(
       `Tier 1 "${NO_REPOSITORY_LANDING_TOKEN}" declares no repository landing, but the declaration cites ${evidence}; a no-repository close carries no repository evidence.`,
     );
   }
+  const otherCards = issue.identifier ? otherCardIdentifiers(declarationText, issue.identifier) : [];
+  if (otherCards.length > 0) {
+    return refuseTier1(
+      `Tier 1 "${NO_REPOSITORY_LANDING_TOKEN}" closes ${issue.identifier}, but the declaration names another card (${otherCards.join(", ")}); a no-repository close cites no other card's branch or work.`,
+    );
+  }
   let verdict: NoRepositoryLandingVerdict;
   try {
     verdict = await verifyNoRepositoryLanding(db, issue, closingActor);
@@ -2076,7 +2310,7 @@ async function proveNoRepositoryLanding(
     );
   }
   if (!verdict.ok) return refuseTier1(verdict.reason, verdict.remedy);
-  return { ...acceptTier1(reason, sameRun), landing: "noRepositoryLanding" };
+  return { ...acceptTier1(reason, sameRun), landing: "noRepositoryLanding", noRepositoryMeasurement: verdict.measurement };
 }
 
 async function proveTier1Landing(

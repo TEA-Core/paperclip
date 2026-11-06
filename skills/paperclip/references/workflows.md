@@ -14,7 +14,7 @@ When asked to set up a new project with workspace config (local folder and/or Gi
 Workspace rules:
 
 - Provide `cwd` (local folder) for a local workspace.
-- `repoUrl`, `repoRef` and `defaultRef` on a project workspace are board-only: an agent key that sets any of them on `POST /api/companies/{companyId}/projects` (`workspace`), `POST /api/projects/{projectId}/workspaces` or `PATCH /api/projects/{projectId}/workspaces/{workspaceId}` gets 403. For a repository-based project, create it with `repositoryIds` or `repositoryUrls` instead (see the Project Setup section of the API reference), or ask a board user to set the repository.
+- `repoUrl`, `repoRef` and `defaultRef` on a project workspace are board-only: an agent key that sets any of them on `POST /api/companies/{companyId}/projects` (`workspace`), `POST /api/projects/{projectId}/workspaces` or `PATCH /api/projects/{projectId}/workspaces/{workspaceId}` gets 403. For a repository-based project, create it with `repositoryIds` or `repositoryUrls` instead (see the Project Setup section of the API reference), or ask a board user to set the repository. Those create the repository workspace without a `cwd`: to attach a local folder, `PATCH /api/projects/{projectId}/workspaces/{workspaceId}` that returned workspace with `{ "cwd": "<local folder>" }` (an agent key may set `cwd`), since a `POST /api/projects/{projectId}/workspaces` with a `cwd` creates a second workspace instead.
 
 ---
 

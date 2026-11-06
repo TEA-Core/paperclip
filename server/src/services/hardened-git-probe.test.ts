@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -8,6 +8,7 @@ import {
   LEGACY_WORKTREE_GIT_OPTIONS,
   normalizeBaseBranch,
   probeNoRepositoryWorktree,
+  readWorktreeHeadFromFiles,
   resolveTrustedGitBinary,
   runHardenedGit,
 } from "./hardened-git-probe.js";
@@ -154,6 +155,40 @@ describe("hardened git runner (SUP-22880)", () => {
     await expect(runHardenedGit(["-C", repo, "config", "--list"], { cwd: "/", timeoutMs: 500 }))
       .rejects.toMatchObject({ kind: "timeout" } satisfies Partial<HardenedGitError>);
     expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
+  // A real process tree: whether the kernel delivered the group kill can only be
+  // observed on the platform, so the check polls /proc until a short deadline.
+  function isLiveProcess(pid: number): boolean {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      return stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3) !== "Z";
+    } catch {
+      return false;
+    }
+  }
+
+  async function exitsWithin(pid: number, ms: number): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (isLiveProcess(pid)) {
+      if (Date.now() > deadline) return false;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return true;
+  }
+
+  it("kills the whole process group when the timeout fires, so nothing git started outlives it", async () => {
+    const repo = plainRepo("repo");
+    const pidFile = path.join(root, "grandchild.pid");
+    const started = Date.now();
+    await expect(runHardenedGit(
+      ["-C", repo, "-c", `alias.linger=!sh -c 'sleep 60 & echo $! > ${pidFile}; wait'`, "linger"],
+      { cwd: "/", timeoutMs: 1_000 },
+    )).rejects.toMatchObject({ kind: "timeout" } satisfies Partial<HardenedGitError>);
+    expect(Date.now() - started).toBeLessThan(10_000);
+    const pid = Number.parseInt(readFileSync(pidFile, "utf8"), 10);
+    expect(Number.isInteger(pid)).toBe(true);
+    expect(await exitsWithin(pid, 2_000), `grandchild ${pid} outlived the timeout`).toBe(true);
   });
 });
 
@@ -444,6 +479,19 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
     expect(result).toEqual({ ok: false, reason });
   });
 
+  // A clean linked worktree inside the managed project root but outside
+  // `<repo>/.paperclip/worktrees`, while the issue's real worktree holds the
+  // work on a renamed branch.
+  it("refuses a clean linked worktree under the managed root whose path skips .paperclip", async () => {
+    const layout = managedLayout();
+    writeFileSync(path.join(layout.worktree, "a.txt"), "undelivered\n");
+    git(layout.worktree, "branch", "-m", "hidden");
+    const alternate = path.join(layout.repoRoot, "elsewhere", "worktrees", "SUP-7-alt");
+    git(layout.repoRoot, "worktree", "add", "-q", "-b", "SUP-7-alt", alternate, "origin/main");
+    const result = await probeNoRepositoryWorktree({ ...layout.input, recordedWorktreePath: alternate });
+    expect(result).toEqual({ ok: false, reason: OUTSIDE_LAYOUT });
+  });
+
   it("refuses a clean worktree of a sibling issue in the same project", async () => {
     const layout = managedLayout();
     const sibling = layout.addWorktree("SUP-71-other-card");
@@ -540,57 +588,131 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
     });
   });
 
-  describe("untracked ignore files (ignored-file dirt)", () => {
-    const HIDDEN = "the recorded worktree has untracked ignore files that hide uncommitted content";
+  describe("ignored entries (ignored-file dirt)", () => {
+    const ignoredEntry = (entry: string) => ({
+      ok: false,
+      reason: `the recorded worktree has an ignored entry outside the regenerated-artefact directories (${JSON.stringify(entry)})`,
+    });
 
-    function hideDeliverable(worktree: string) {
-      mkdirSync(path.join(worktree, "hidden"));
-      writeFileSync(path.join(worktree, "hidden", ".gitignore"), "*\n");
-      writeFileSync(path.join(worktree, "hidden", "work.txt"), "undelivered\n");
+    function writeTree(worktree: string, relative: string, content = "x\n") {
+      mkdirSync(path.dirname(path.join(worktree, relative)), { recursive: true });
+      writeFileSync(path.join(worktree, relative), content);
     }
 
-    function trackIgnoreRules(layout: ManagedLayout, rules: string) {
+    /** Commits the ignore rules and the tracked files a real checkout has, and pushes them as the base. */
+    function trackIgnoreRules(layout: ManagedLayout, rules: string, trackedFiles: string[] = []) {
       writeFileSync(path.join(layout.worktree, ".gitignore"), rules);
-      git(layout.worktree, "add", ".gitignore");
+      for (const file of trackedFiles) writeTree(layout.worktree, file, "{}\n");
+      git(layout.worktree, "add", ".gitignore", ...trackedFiles);
       git(layout.worktree, "commit", "-qm", "ignore rules");
       git(layout.worktree, "push", "-q", "origin", "HEAD:main");
     }
 
     it("refuses a directory whose own untracked .gitignore ignores everything, which status reads as clean", async () => {
       const layout = managedLayout();
-      hideDeliverable(layout.worktree);
+      writeTree(layout.worktree, "hidden/.gitignore", "*\n");
+      writeTree(layout.worktree, "hidden/work.txt", "undelivered\n");
       expect(git(layout.worktree, "status", "--porcelain", "--untracked-files=all")).toBe("");
-      expect(await probeNoRepositoryWorktree(layout.input)).toEqual({ ok: false, reason: HIDDEN });
+      expect(await probeNoRepositoryWorktree(layout.input)).toEqual(ignoredEntry("hidden/"));
     });
 
     it("refuses it in another worktree naming the issue", async () => {
       const layout = managedLayout();
-      hideDeliverable(layout.worktree);
+      writeTree(layout.worktree, "hidden/.gitignore", "*\n");
+      writeTree(layout.worktree, "hidden/work.txt", "undelivered\n");
       const fabricated = layout.addWorktree("SUP-7-fresh");
       const result = await probeNoRepositoryWorktree({ ...layout.input, recordedWorktreePath: fabricated });
       expect(result).toEqual({
         ok: false,
-        reason: "another worktree on branch SUP-7-record-ruling has untracked ignore files that hide uncommitted content",
+        reason: 'another worktree on branch SUP-7-record-ruling has an ignored entry outside the regenerated-artefact directories ("hidden/")',
       });
     });
 
-    it("allows an ignored node_modules, including untracked ignore files shipped inside it", async () => {
+    it.each([
+      ["a plain file at the root", "*.log\n", [], "debug.log", "debug.log"],
+      ["a plain file at depth", "*.log\n", ["docs/notes/README.md"], "docs/notes/debug.log", "docs/notes/debug.log"],
+      ["a file under a directory that is not on the list", "notes/\n", [], "notes/deliverable.md", "notes/"],
+      ["a file the list's names do not cover", "build.txt\n", [], "build.txt", "build.txt"],
+    ])("refuses an ignored entry that is %s", async (_label, rules, tracked, file, entry) => {
+      const layout = managedLayout();
+      trackIgnoreRules(layout, rules, tracked);
+      writeTree(layout.worktree, file, "undelivered\n");
+      expect(await probeNoRepositoryWorktree(layout.input)).toEqual(ignoredEntry(entry));
+    });
+
+    it("accepts a root node_modules with content, without inspecting it", async () => {
       const layout = managedLayout();
       trackIgnoreRules(layout, "node_modules/\n");
-      const pkg = path.join(layout.worktree, "node_modules", "pkg");
-      mkdirSync(pkg, { recursive: true });
-      writeFileSync(path.join(pkg, "index.js"), "module.exports = 1;\n");
-      writeFileSync(path.join(pkg, ".gitignore"), "*\n");
+      writeTree(layout.worktree, "node_modules/pkg/index.js", "module.exports = 1;\n");
+      writeTree(layout.worktree, "node_modules/pkg/.gitignore", "*\n");
       expect(await probeNoRepositoryWorktree(layout.input)).toMatchObject({ ok: true });
     });
 
-    it("allows a tracked .gitignore and the build output it ignores", async () => {
+    it("accepts a pnpm monorepo's installed and built tree at every depth", async () => {
       const layout = managedLayout();
-      trackIgnoreRules(layout, "*.log\ndist/\n");
-      writeFileSync(path.join(layout.worktree, "debug.log"), "noise\n");
-      mkdirSync(path.join(layout.worktree, "dist"));
-      writeFileSync(path.join(layout.worktree, "dist", "bundle.js"), "built\n");
+      trackIgnoreRules(
+        layout,
+        "node_modules\n**/node_modules/\ndist/\n.paperclip/\n.paperclip-runtime/\n",
+        ["server/package.json", "ui/package.json", "packages/x/package.json"],
+      );
+      for (const file of [
+        "node_modules/.modules.yaml",
+        "server/node_modules/pkg/index.js",
+        "ui/node_modules/pkg/index.js",
+        "packages/x/node_modules/pkg/index.js",
+        "packages/x/dist/index.js",
+        ".paperclip/config.json",
+        ".paperclip-runtime/claude/state.json",
+      ]) {
+        writeTree(layout.worktree, file);
+      }
       expect(await probeNoRepositoryWorktree(layout.input)).toMatchObject({ ok: true });
+    });
+
+    it("accepts the .paperclip-repositories directory the server excludes through info/exclude", async () => {
+      const layout = managedLayout();
+      writeFileSync(path.join(layout.repoRoot, ".git", "info", "exclude"), "/.paperclip-repositories/\n");
+      writeTree(layout.worktree, ".paperclip-repositories/other/README.md", "a referenced repository\n");
+      expect(await probeNoRepositoryWorktree(layout.input)).toMatchObject({ ok: true });
+    });
+
+    it.each([
+      ["a symlink named node_modules at the root", "node_modules\n", (worktree: string) => {
+        mkdirSync(path.join(root, "stash"));
+        writeFileSync(path.join(root, "stash", "deliverable.md"), "undelivered\n");
+        symlinkSync(path.join(root, "stash"), path.join(worktree, "node_modules"));
+      }, "node_modules"],
+      ["a nested symlinked node_modules", "node_modules\n", (worktree: string) => {
+        mkdirSync(path.join(root, "stash"));
+        symlinkSync(path.join(root, "stash"), path.join(worktree, "server", "node_modules"));
+      }, "server/node_modules"],
+    ])("refuses %s", async (_label, rules, plant, entry) => {
+      const layout = managedLayout();
+      trackIgnoreRules(layout, rules, ["server/package.json"]);
+      plant(layout.worktree);
+      expect(await probeNoRepositoryWorktree(layout.input)).toEqual(ignoredEntry(entry));
+    });
+  });
+
+  describe("other cards named by the recorded worktree's branch", () => {
+    it.each([
+      ["SUP-7-OTHER-999", "OTHER-999"],
+      ["SUP-7-after-SUP-70", "SUP-70"],
+      ["SUP-7-from-sup-70", "SUP-70"],
+      ["SUP-7-XSUP-7", "XSUP-7"],
+    ])("refuses branch %s, which also names %s", async (branch, other) => {
+      const layout = managedLayout();
+      const worktree = layout.addWorktree(branch);
+      expect(await probeNoRepositoryWorktree({ ...layout.input, recordedWorktreePath: worktree })).toEqual({
+        ok: false,
+        reason: `the recorded worktree's branch ${branch} also names another card (${other})`,
+      });
+    });
+
+    it("accepts a branch that names only this card, in any case and with a suffix", async () => {
+      const layout = managedLayout();
+      const worktree = layout.addWorktree("sup-7-notes-v2");
+      expect(await probeNoRepositoryWorktree({ ...layout.input, recordedWorktreePath: worktree })).toMatchObject({ ok: true });
     });
   });
 
@@ -864,5 +986,32 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
       expect(result.ok).toBe(false);
       expect(Date.now() - started).toBeLessThan(15_000);
     });
+  });
+});
+
+// The status write re-reads the worktree's HEAD from its ref files while it
+// holds the issue row, where no Git process may run.
+describe("readWorktreeHeadFromFiles", () => {
+  it.each([
+    ["a loose ref", (_layout: ManagedLayout) => {}],
+    ["a packed ref", (layout: ManagedLayout) => git(layout.repoRoot, "pack-refs", "--all")],
+  ])("reads the branch and commit of a worktree whose branch is %s", async (_label, store) => {
+    const layout = managedLayout();
+    store(layout);
+    const probe = await probeNoRepositoryWorktree(layout.input);
+    expect(probe.ok).toBe(true);
+    const { gitDir, commonDir, headSha } = probe as Extract<typeof probe, { ok: true }>;
+    expect(await readWorktreeHeadFromFiles(gitDir, commonDir)).toEqual({ branch: "SUP-7-record-ruling", sha: headSha });
+  });
+
+  it("returns null when HEAD is detached or a FIFO", async () => {
+    const layout = managedLayout();
+    const gitDir = git(layout.worktree, "rev-parse", "--absolute-git-dir");
+    const commonDir = path.join(layout.repoRoot, ".git");
+    git(layout.worktree, "checkout", "-q", "--detach");
+    expect(await readWorktreeHeadFromFiles(gitDir, commonDir)).toBeNull();
+    rmSync(path.join(gitDir, "HEAD"));
+    execFileSync("mkfifo", [path.join(gitDir, "HEAD")]);
+    expect(await readWorktreeHeadFromFiles(gitDir, commonDir)).toBeNull();
   });
 });

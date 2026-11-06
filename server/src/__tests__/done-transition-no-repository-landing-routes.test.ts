@@ -6,8 +6,9 @@ import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
+  activityLog,
   agents,
   companies,
   companyMemberships,
@@ -15,6 +16,8 @@ import {
   documentRevisions,
   documents,
   executionWorkspaces,
+  externalObjectMentions,
+  externalObjects,
   heartbeatRuns,
   issueComments,
   issueDocuments,
@@ -36,6 +39,7 @@ import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
   evaluateDoneTransitionGuardForBackstopClose,
   type evaluateDoneTierDeclaration,
+  type measureNoRepositoryLandingForClose,
 } from "../services/done-transition-guard.js";
 import type { StorageService } from "../storage/types.js";
 
@@ -49,6 +53,10 @@ const mockGhFetch = vi.hoisted(() => vi.fn());
 const mockEvaluateDoneTierDeclaration = vi.hoisted(() => vi.fn());
 const realEvaluateDoneTierDeclarationRef = vi.hoisted(() => ({
   current: null as typeof evaluateDoneTierDeclaration | null,
+}));
+const mockMeasureNoRepositoryLanding = vi.hoisted(() => vi.fn());
+const realMeasureNoRepositoryLandingRef = vi.hoisted(() => ({
+  current: null as typeof measureNoRepositoryLandingForClose | null,
 }));
 
 vi.mock("../services/secrets.js", () => ({
@@ -68,7 +76,13 @@ vi.mock("../services/done-transition-guard.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/done-transition-guard.js")>();
   realEvaluateDoneTierDeclarationRef.current = actual.evaluateDoneTierDeclaration;
   mockEvaluateDoneTierDeclaration.mockImplementation(actual.evaluateDoneTierDeclaration);
-  return { ...actual, evaluateDoneTierDeclaration: mockEvaluateDoneTierDeclaration };
+  realMeasureNoRepositoryLandingRef.current = actual.measureNoRepositoryLandingForClose;
+  mockMeasureNoRepositoryLanding.mockImplementation(actual.measureNoRepositoryLandingForClose);
+  return {
+    ...actual,
+    evaluateDoneTierDeclaration: mockEvaluateDoneTierDeclaration,
+    measureNoRepositoryLandingForClose: mockMeasureNoRepositoryLanding,
+  };
 });
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -125,8 +139,10 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     db = createDb(tempDb.connectionString);
     app = express();
     app.use(express.json());
+    // A request may name its own actor (concurrent closes by different agents).
     app.use((req, _res, next) => {
-      req.actor = currentActor;
+      const override = req.header("x-test-actor");
+      req.actor = override ? (JSON.parse(override) as Express.Request["actor"]) : currentActor;
       next();
     });
     // The close path never touches attachment storage.
@@ -169,6 +185,8 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     mockResolveSecretValue.mockResolvedValue("test-token");
     mockEvaluateDoneTierDeclaration.mockReset();
     mockEvaluateDoneTierDeclaration.mockImplementation(realEvaluateDoneTierDeclarationRef.current!);
+    mockMeasureNoRepositoryLanding.mockReset();
+    mockMeasureNoRepositoryLanding.mockImplementation(realMeasureNoRepositoryLandingRef.current!);
   });
 
   async function insertCompany(prefix: string) {
@@ -212,6 +230,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     issueId: string;
     authorAgentId: string;
     body?: string;
+    key?: string;
     linkCompanyId?: string;
     documentCompanyId?: string;
   }) {
@@ -237,7 +256,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       companyId: input.linkCompanyId ?? input.companyId,
       issueId: input.issueId,
       documentId,
-      key: "entry-ruling",
+      key: input.key ?? "entry-ruling",
     });
     return documentId;
   }
@@ -253,6 +272,8 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     identifier: string;
     worktree: string;
     repoRoot: string;
+    branch: string;
+    actor: Express.Request["actor"];
   }
 
   /**
@@ -360,6 +381,8 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       identifier,
       worktree,
       repoRoot,
+      branch,
+      actor: currentActor,
     };
   }
 
@@ -604,17 +627,18 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
   }
 
   it.each([
-    ["update-ref moves refs/remotes/origin/main onto it", (fixture: SeededIssue) =>
-      git(fixture.repoRoot, "update-ref", "refs/remotes/origin/main", "HEAD")],
-    ["a local fetch refspec rewrites refs/remotes/origin/main", (fixture: SeededIssue) =>
-      git(fixture.repoRoot, "fetch", "-q", ".", `+refs/heads/${fixture.identifier}-entry-ruling:refs/remotes/origin/main`)],
-    ["the local main branch is moved onto it", (fixture: SeededIssue) =>
-      git(fixture.repoRoot, "update-ref", "refs/heads/main", "HEAD")],
-  ] as const)("refuses a committed, unpushed deliverable when %s", async (_label, moveBase) => {
+    ["update-ref moves refs/remotes/origin/main onto it", "refs/remotes/origin/main", (fixture: SeededIssue) =>
+      git(fixture.repoRoot, "update-ref", "refs/remotes/origin/main", `refs/heads/${fixture.branch}`)],
+    ["a local fetch refspec rewrites refs/remotes/origin/main", "refs/remotes/origin/main", (fixture: SeededIssue) =>
+      git(fixture.repoRoot, "fetch", "-q", ".", `+refs/heads/${fixture.branch}:refs/remotes/origin/main`)],
+    ["the local main branch is moved onto it", "refs/heads/main", (fixture: SeededIssue) =>
+      git(fixture.repoRoot, "update-ref", "refs/heads/main", `refs/heads/${fixture.branch}`)],
+  ] as const)("refuses a committed, unpushed deliverable when %s", async (_label, movedRef, moveBase) => {
     const fixture = await seed();
     await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
     commitOnIssueBranch(fixture);
     moveBase(fixture);
+    expect(git(fixture.repoRoot, "rev-parse", movedRef)).toBe(git(fixture.worktree, "rev-parse", "HEAD"));
 
     const res = await close(fixture.identifier);
 
@@ -905,21 +929,11 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     }, "could not be compared with the project's default branch on the remote"],
     ["the delivery requirement flips to repository_delivery", async (fixture: SeededIssue) => {
       await db.update(issues).set({ deliveryRequirement: "repository_delivery" }).where(eq(issues.id, fixture.issueId));
-    }, "already stored as record_only at the close write"],
+    }, "is accepted only on a record_only issue"],
     ["the closer edits the ruling", async (fixture: SeededIssue) => {
-      const [link] = await db
-        .select({ documentId: issueDocuments.documentId })
-        .from(issueDocuments)
-        .where(and(eq(issueDocuments.issueId, fixture.issueId), eq(issueDocuments.key, "entry-ruling")));
-      await db.insert(documentRevisions).values({
-        companyId: fixture.companyId,
-        documentId: link!.documentId,
-        revisionNumber: 2,
-        body: "Ruling rewritten by the closer",
-        createdByAgentId: fixture.closerAgentId,
-      });
+      await reviseRuling(fixture, fixture.closerAgentId);
     }, "written by someone other than the closing actor"],
-  ] as const)("re-probes at the status write: refuses when %s after the declaration was accepted", async (_label, mutate, expected) => {
+  ] as const)("measures again before the status write: refuses when %s after the declaration was accepted", async (_label, mutate, expected) => {
     const fixture = await seed();
     await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
     mockEvaluateDoneTierDeclaration.mockImplementation(async (...args: Parameters<typeof evaluateDoneTierDeclaration>) => {
@@ -933,6 +947,260 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.error).toContain(expected);
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  async function reviseRuling(fixture: SeededIssue, authorAgentId: string) {
+    const [link] = await db
+      .select({ documentId: issueDocuments.documentId })
+      .from(issueDocuments)
+      .where(and(eq(issueDocuments.issueId, fixture.issueId), eq(issueDocuments.key, "entry-ruling")));
+    await db.insert(documentRevisions).values({
+      companyId: fixture.companyId,
+      documentId: link!.documentId,
+      revisionNumber: 2,
+      body: "Ruling revised: the deliverable remains this recorded decision, with no repository change.",
+      createdByAgentId: authorAgentId,
+    });
+  }
+
+  async function insertSecondProjectWorkspace(fixture: SeededIssue) {
+    const id = randomUUID();
+    await db.insert(projectWorkspaces).values({
+      id,
+      companyId: fixture.companyId,
+      projectId: fixture.projectId,
+      name: "Secondary",
+      cwd: fixture.repoRoot,
+      repoUrl: "https://github.com/TEA-Core/records",
+      repoRef: "main",
+      defaultRef: "main",
+      isPrimary: false,
+    });
+    return id;
+  }
+
+  // The measurement runs before the write transaction; anything that moves
+  // between it and the write must refuse at the compare-and-set.
+  it.each([
+    ["a commit lands on the issue branch", (fixture: SeededIssue) => {
+      writeFileSync(path.join(fixture.worktree, "late.md"), "committed after the measurement\n");
+      git(fixture.worktree, "add", "late.md");
+      git(fixture.worktree, "commit", "-qm", "late");
+    }, "the recorded worktree's HEAD moved after the close was measured"],
+    ["the delivery requirement flips to repository_delivery", async (fixture: SeededIssue) => {
+      await db.update(issues).set({ deliveryRequirement: "repository_delivery" }).where(eq(issues.id, fixture.issueId));
+    }, "already stored as record_only at the close write"],
+    ["another agent revises the ruling", async (fixture: SeededIssue) => {
+      await reviseRuling(fixture, fixture.rulerAgentId);
+    }, 'the "entry-ruling" document changed after the close was measured'],
+    ["the issue moves to another project workspace", async (fixture: SeededIssue) => {
+      const other = await insertSecondProjectWorkspace(fixture);
+      await db.update(issues).set({ projectWorkspaceId: other }).where(eq(issues.id, fixture.issueId));
+    }, "the issue's workspace binding changed after the close was measured"],
+    ["the execution workspace's recorded path is rewritten", async (fixture: SeededIssue) => {
+      await db
+        .update(executionWorkspaces)
+        .set({ providerRef: `${fixture.worktree}/` })
+        .where(eq(executionWorkspaces.id, fixture.executionWorkspaceId));
+    }, "the recorded worktree path changed after the close was measured"],
+  ] as const)("compares the measurement inside the status write: refuses when %s after the measurement", async (_label, mutate, expected) => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    mockMeasureNoRepositoryLanding.mockImplementation(async (...args: Parameters<typeof measureNoRepositoryLandingForClose>) => {
+      const verdict = await realMeasureNoRepositoryLandingRef.current!(...args);
+      expect(verdict.ok, JSON.stringify(verdict)).toBe(true);
+      await mutate(fixture);
+      return verdict;
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain(expected);
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  async function issueRowIsUnlocked(issueId: string): Promise<boolean> {
+    return db
+      .transaction(async (tx) => {
+        await tx.execute(sql`select id from issues where id = ${issueId} for update nowait`);
+        return true;
+      })
+      .catch(() => false);
+  }
+
+  it("never holds the issue row while the probe runs: every GitHub compare finds the row unlocked", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    const rowUnlockedDuringCompare: boolean[] = [];
+    mockGhFetch.mockImplementation(async (url: string) => {
+      rowUnlockedDuringCompare.push(await issueRowIsUnlocked(fixture.issueId));
+      return compareAgainstOrigin(url);
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    // The declaration check and the pre-write measurement each compare the tip.
+    expect(rowUnlockedDuringCompare.length).toBeGreaterThanOrEqual(2);
+    expect(rowUnlockedDuringCompare.every(Boolean), JSON.stringify(rowUnlockedDuringCompare)).toBe(true);
+  });
+
+  it("completes twelve concurrent no-repository closes, more than the database pool holds", async () => {
+    const fixtures: SeededIssue[] = [];
+    for (let index = 0; index < 12; index += 1) {
+      const fixture = await seed();
+      await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+      fixtures.push(fixture);
+    }
+    // Every fixture's tip is its origin's main: level with the base.
+    const levelTips = new Set(fixtures.map((fixture) => git(fixture.worktree, "rev-parse", "HEAD")));
+    mockGhFetch.mockImplementation(async (url: string) => {
+      const sha = /\.\.\.([0-9a-f]{40})$/.exec(url)?.[1];
+      return sha && levelTips.has(sha)
+        ? new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 })
+        : new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+    });
+
+    const responses = await Promise.all(
+      fixtures.map((fixture) =>
+        request(app)
+          .patch(`/api/issues/${fixture.identifier}`)
+          .set("x-test-actor", JSON.stringify(fixture.actor))
+          .send({ status: "done", doneTier: NO_REPOSITORY_DONE_TIER }),
+      ),
+    );
+
+    expect(responses.map((res) => res.status)).toEqual(fixtures.map(() => 200));
+    for (const fixture of fixtures) expect(await statusOf(fixture.issueId)).toBe("done");
+  }, 120_000);
+
+  it("records the ruling and the probe result in the close audit, in the same transaction as the close", async () => {
+    const fixture = await seed();
+    const rulingId = await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [row] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityId, fixture.issueId),
+        eq(activityLog.action, "issue.done_transition_no_repository_landing_verified"),
+      ));
+    expect(row?.details).toMatchObject({
+      rulingDocumentId: rulingId,
+      rulingRevisionNumber: 1,
+      executionWorkspaceId: fixture.executionWorkspaceId,
+      baseBranch: "main",
+      probe: {
+        result: "clean_and_level_with_base",
+        branch: fixture.branch,
+        headSha: git(fixture.worktree, "rev-parse", "HEAD"),
+      },
+    });
+  });
+
+  it("refuses a close request that also moves the issue to another project workspace", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    const other = await insertSecondProjectWorkspace(fixture);
+
+    const res = await request(app)
+      .patch(`/api/issues/${fixture.identifier}`)
+      .send({ status: "done", doneTier: NO_REPOSITORY_DONE_TIER, projectWorkspaceId: other });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("cannot ride a request that changes the issue's project workspace");
+    const [stored] = await db
+      .select({ status: issues.status, projectWorkspaceId: issues.projectWorkspaceId })
+      .from(issues)
+      .where(eq(issues.id, fixture.issueId));
+    expect(stored).toEqual({ status: "in_progress", projectWorkspaceId: fixture.projectWorkspaceId });
+  });
+
+  it.each([
+    ["another card's branch", () => "Delivered on OTHER-999-branch", () => "OTHER-999"],
+    ["a card whose number extends this one's", (fixture: SeededIssue) => `Recorded alongside ${fixture.identifier}0`, (fixture: SeededIssue) => `${fixture.identifier}0`],
+    ["a card whose prefix extends this one's", (fixture: SeededIssue) => `Recorded alongside X${fixture.identifier}`, (fixture: SeededIssue) => `X${fixture.identifier}`],
+  ] as const)("refuses a declaration that names %s", async (_label, reason, other) => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+
+    const res = await close(fixture.identifier, { ...NO_REPOSITORY_DONE_TIER, reason: reason(fixture) });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain(`the declaration names another card (${other(fixture)})`);
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  it("accepts a declaration that names this card itself", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+
+    const res = await close(fixture.identifier, {
+      ...NO_REPOSITORY_DONE_TIER,
+      reason: `The deliverable of ${fixture.identifier} is the recorded entry ruling`,
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+  });
+
+  it.each([["ruling"], ["notes"]])("refuses a ruling filed under the %s key instead of entry-ruling", async (key) => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId, key });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain('requires a non-empty "entry-ruling" document on this issue');
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  it.each([
+    ["TODO placeholder", 'opens with the placeholder "todo"'],
+    ["TBD", 'opens with the placeholder "tbd"'],
+    ["n/a", "fewer than 3 words that are not placeholders"],
+    ["Approved.", "fewer than 3 words that are not placeholders"],
+  ])("refuses a placeholder ruling %j", async (body, expected) => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId, body });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain(expected);
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  it("refuses an issue that mentions a GitHub pull request, with no pull request work product recorded", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    const [object] = await db
+      .insert(externalObjects)
+      .values({
+        companyId: fixture.companyId,
+        providerKey: "github",
+        objectType: "pull_request",
+        externalId: "TEA-Core/other#pull/77",
+        data: { state: "open" },
+      })
+      .returning({ id: externalObjects.id });
+    await db.insert(externalObjectMentions).values({
+      companyId: fixture.companyId,
+      sourceIssueId: fixture.issueId,
+      sourceKind: "comment",
+      objectId: object!.id,
+      providerKey: "github",
+      objectType: "pull_request",
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("cannot be declared on an issue that links pull requests (TEA-Core/other#77)");
     expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 

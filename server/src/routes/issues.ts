@@ -278,6 +278,8 @@ import {
   TIER2_RECORD_ONLY_FORM,
   findMissingAdr072CloseLadderStages,
   renderDoneTierDeclaration,
+  measureNoRepositoryLandingForClose,
+  noRepositoryLandingAuditDetails,
   noRepositoryStructuredFormSuffix,
   noRepositoryTier1FormSuffix,
   TIER1_FORM,
@@ -285,6 +287,8 @@ import {
   writeAuditLog,
   type DoneTierClosingActor,
   type DoneTransitionOverride,
+  type NoRepositoryLandingCloseRequest,
+  type NoRepositoryLandingMeasurement,
 } from "../services/done-transition-guard.js";
 import {
   decideIssueReviewPathRecovery,
@@ -5546,6 +5550,9 @@ export function issueRoutes(
       void writeAuditLog(db, issue, "issue.done_transition_tier1_close", {
         reason: tierResult.reason,
         decisionCarried,
+        ...(tierResult.noRepositoryMeasurement
+          ? { noRepositoryLanding: noRepositoryLandingAuditDetails(tierResult.noRepositoryMeasurement) }
+          : {}),
       });
     }
     // SUP-20525 (SUP-18110 ask 1): resolve the close comment's cited commit
@@ -20396,7 +20403,35 @@ export function issueRoutes(
         && effectiveStatus === "in_review"
         && existing.status !== "in_review"
       );
+    // SUP-22570: a record_only no-repository close is measured here, outside
+    // any transaction: every Git process and GitHub call of the close runs now.
+    // The status write below only compares this measurement with the row it
+    // locks, so nothing slow runs while the issue row is held.
+    const noRepositoryCloseRequest: NoRepositoryLandingCloseRequest = {
+      checkedExecutionWorkspaceId: finalDeliveryIssue.executionWorkspaceId ?? null,
+      requestedDeliveryRequirement: updateFields.deliveryRequirement,
+      requestedExecutionWorkspaceId: updateFields.executionWorkspaceId,
+      requestedProjectWorkspaceId: updateFields.projectWorkspaceId,
+    };
+    const noRepositoryLandingRefusal = (reason: string) =>
+      unprocessable(reason, {
+        code: "done_transition_missing_tier_declaration",
+        issueId: existing.id,
+        identifier: existing.identifier ?? null,
+        stage: "no_repository_landing_transition_recheck",
+      });
+    let noRepositoryMeasurement: NoRepositoryLandingMeasurement | null = null;
     try {
+      if (noRepositoryLandingCloser !== null) {
+        const verdict = await measureNoRepositoryLandingForClose(
+          db,
+          (await svc.getById(id)) ?? existing,
+          noRepositoryLandingCloser,
+          noRepositoryCloseRequest,
+        );
+        if (!verdict.ok) throw noRepositoryLandingRefusal(verdict.reason);
+        noRepositoryMeasurement = verdict.measurement;
+      }
       if (shouldUseTransactionalIssueUpdate) {
         issue = await db.transaction(async (tx) => {
           // ADR-103 M4: validate the re-parent edge inside the write
@@ -20595,32 +20630,36 @@ export function issueRoutes(
             issueUpdateData.executionState = updateFields.executionState;
           }
 
-          // SUP-22570: the transactional re-probe. The record_only
-          // no-repository declaration was proved before this transaction; the
-          // same proof re-runs here, on the row this write locks, immediately
-          // before the status write, so a dirtied worktree, a new commit, a
-          // ruling edit or a delivery-requirement flip in between refuses.
-          if (noRepositoryLandingCloser !== null) {
+          // SUP-22570: compare-and-set against the measurement taken before
+          // this transaction. It re-reads the database half of the proof and
+          // the worktree's ref files, runs no Git process and makes no network
+          // call, and refuses if anything moved since the measurement.
+          if (noRepositoryLandingCloser !== null && noRepositoryMeasurement !== null) {
             const lockedForLanding = await svc.getByIdForUpdate(id, tx);
             if (!lockedForLanding) return null;
             const verdict = await verifyNoRepositoryLandingAtTransition(
               tx as unknown as Db,
               lockedForLanding,
               noRepositoryLandingCloser,
-              {
-                checkedExecutionWorkspaceId: finalDeliveryIssue.executionWorkspaceId ?? null,
-                requestedDeliveryRequirement: updateFields.deliveryRequirement,
-                requestedExecutionWorkspaceId: updateFields.executionWorkspaceId,
-              },
+              noRepositoryCloseRequest,
+              noRepositoryMeasurement,
             );
-            if (!verdict.ok) {
-              throw unprocessable(verdict.reason, {
-                code: "done_transition_missing_tier_declaration",
-                issueId: existing.id,
-                identifier: existing.identifier ?? null,
-                stage: "no_repository_landing_transition_recheck",
-              });
-            }
+            if (!verdict.ok) throw noRepositoryLandingRefusal(verdict.reason);
+            await logActivityInTransaction(tx as unknown as Db, {
+              companyId: existing.companyId,
+              actorType: actor.actorType,
+              boardApiKeyId: actor.boardApiKeyId,
+              actorId: actor.actorId,
+              agentId: actor.agentId,
+              runId: actor.runId,
+              agentApiKeyId: actor.agentApiKeyId,
+              responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+              action: "issue.done_transition_no_repository_landing_verified",
+              entityType: "issue",
+              entityId: existing.id,
+              issueId: existing.id,
+              details: noRepositoryLandingAuditDetails(verdict.measurement),
+            });
           }
 
           const updated = await updateIssue(tx);

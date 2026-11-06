@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { constants as fsConstants, statSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, open, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -30,7 +30,8 @@ import { PROJECT_REPOSITORIES_DIR } from "@paperclipai/adapter-utils/git-workspa
 //   - allows no transport and no lazy fetch, so a promisor remote written into
 //     the repository's configuration cannot make a missing object run
 //     `core.sshCommand`, `remote.*.uploadpack` or any other transport helper;
-//   - is killed after a timeout.
+//   - is killed after a timeout, together with every process it started (it
+//     leads its own process group, and the whole group is killed).
 // The pre-existing fail-open probes opt out of the from-scratch environment
 // (`inheritEnvironment`) so the server's safe.directory and global
 // configuration keep applying; they lose only the three redirecting variables,
@@ -164,6 +165,69 @@ export interface HardenedGitOptions {
 /** How the pre-existing repository_delivery probes run git (done-transition-guard.ts `runGit`). */
 export const LEGACY_WORKTREE_GIT_OPTIONS: Readonly<HardenedGitOptions> = { cwd: "/", inheritEnvironment: true };
 
+/**
+ * Run `file` and resolve its standard output. With a timeout the process leads
+ * its own process group, and the timeout kills the whole group, so a program it
+ * started (a helper, or a shell's background job) cannot outlive it.
+ */
+export function runBoundedProcess(
+  file: string,
+  args: readonly string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; input?: string },
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const killGroup = options.timeoutMs > 0;
+    const child = spawn(file, args, {
+      cwd: options.cwd,
+      env: options.env,
+      detached: killGroup,
+      stdio: ["pipe", "pipe", "ignore"],
+      windowsHide: true,
+    });
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const kill = () => {
+      if (child.pid === undefined) return;
+      try {
+        process.kill(killGroup ? -child.pid : child.pid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    };
+    const finish = (error: HardenedGitError | null, stdout = "") => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(stdout);
+    };
+    if (killGroup) {
+      timer = setTimeout(() => {
+        kill();
+        finish(new HardenedGitError("timeout", "git timed out"));
+      }, options.timeoutMs);
+    }
+    child.stdout!.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_BUFFER) {
+        kill();
+        finish(new HardenedGitError("failed", "git output exceeded the buffer"));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    child.on("error", () => finish(new HardenedGitError("failed", "git failed")));
+    child.on("close", (code) => {
+      if (code === 0) finish(null, Buffer.concat(chunks).toString("utf8"));
+      else finish(new HardenedGitError("failed", "git failed"));
+    });
+    child.stdin!.on("error", () => {});
+    child.stdin!.end(options.input);
+  });
+}
+
 /** Run one Git command under the hardened environment; resolves stdout. */
 export function runHardenedGit(args: readonly string[], options: HardenedGitOptions): Promise<string> {
   const inherit = options.inheritEnvironment === true;
@@ -171,35 +235,12 @@ export function runHardenedGit(args: readonly string[], options: HardenedGitOpti
   if (!trustedGit && !inherit) {
     return Promise.reject(new HardenedGitError("unavailable", "no root-owned git binary at a fixed system path"));
   }
-  const git = trustedGit ?? "git";
-  const env = inherit ? inheritedGitEnv() : hardenedGitEnv(options.ceilingDirectory ?? null);
   const guardArgs = inherit ? EXECUTION_GUARD_CONFIG.flatMap(([key, value]) => ["-c", `${key}=${value}`]) : [];
-  return new Promise((resolve, reject) => {
-    const child = execFile(
-      git,
-      [...guardArgs, "--no-optional-locks", ...args],
-      {
-        cwd: options.cwd,
-        env,
-        timeout: options.timeoutMs ?? (inherit ? 0 : DEFAULT_TIMEOUT_MS),
-        killSignal: "SIGKILL",
-        maxBuffer: MAX_BUFFER,
-        windowsHide: true,
-        encoding: "utf8",
-      },
-      (error, stdout) => {
-        if (error) {
-          const timedOut = "killed" in error && error.killed === true;
-          reject(new HardenedGitError(timedOut ? "timeout" : "failed", timedOut ? "git timed out" : "git failed"));
-          return;
-        }
-        resolve(String(stdout));
-      },
-    );
-    if (options.input !== undefined) {
-      child.stdin?.on("error", () => {});
-      child.stdin?.end(options.input);
-    }
+  return runBoundedProcess(trustedGit ?? "git", [...guardArgs, "--no-optional-locks", ...args], {
+    cwd: options.cwd,
+    env: inherit ? inheritedGitEnv() : hardenedGitEnv(options.ceilingDirectory ?? null),
+    timeoutMs: options.timeoutMs ?? (inherit ? 0 : DEFAULT_TIMEOUT_MS),
+    input: options.input,
   });
 }
 
@@ -289,6 +330,48 @@ async function readOptionalRegularFile(target: string, maxBytes: number): Promis
   }
 }
 
+const MAX_REF_FILE_BYTES = 4096;
+const MAX_PACKED_REFS_BYTES = 64 * 1024 * 1024;
+
+/**
+ * The branch and commit a linked worktree's HEAD names, read from the ref files
+ * without running Git: `<gitDir>/HEAD`, then the loose ref or `packed-refs` in
+ * the common dir. Null when HEAD is not a branch or a file is not a plain,
+ * bounded file (a reftable repository included). The no-repository close
+ * compares this with its measured head while it holds the issue row, where no
+ * Git process may run.
+ */
+export async function readWorktreeHeadFromFiles(
+  gitDir: string,
+  commonDir: string,
+): Promise<{ branch: string; sha: string } | null> {
+  try {
+    const head = (await readRegularFile(path.join(gitDir, "HEAD"), MAX_REF_FILE_BYTES)).toString("utf8").trim();
+    const match = /^ref: refs\/heads\/(\S+)$/.exec(head);
+    if (!match) return null;
+    const branch = match[1]!;
+    const components = branch.split("/");
+    if (components.some((component) => component.length === 0 || component === "." || component === "..")) return null;
+    const loose = await readOptionalRegularFile(path.join(commonDir, "refs", "heads", ...components), MAX_REF_FILE_BYTES);
+    if (loose !== null) {
+      const sha = loose.trim();
+      return SHA_RE.test(sha) ? { branch, sha } : null;
+    }
+    const packed = await readOptionalRegularFile(path.join(commonDir, "packed-refs"), MAX_PACKED_REFS_BYTES);
+    if (packed === null) return null;
+    const refName = `refs/heads/${branch}`;
+    for (const line of packed.split("\n")) {
+      const space = line.indexOf(" ");
+      if (space > 0 && line.slice(space + 1) === refName && SHA_RE.test(line.slice(0, space))) {
+        return { branch, sha: line.slice(0, space) };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Run `fn` against a private git dir that shares the worktree's object store
  * (read-only, as an alternate) and a copy of its index, but whose config,
@@ -373,40 +456,99 @@ async function snapshotStatusIsDirty(
 }
 
 /**
- * Whether an untracked `.gitignore` hides itself, and so whatever sits beside it,
- * from `status` (a hidden directory whose own `.gitignore` says `*`). An
- * untracked ignore file that sits inside content a tracked rule or
- * `info/exclude` already ignores (a provisioned `node_modules`) hides nothing
- * new, and a tracked ignore file is part of the commit. Call only after
- * `status` came back clean: every untracked ignore file is then ignored by
- * something, and the source `check-ignore` names for each says by what.
+ * Ignored directories a record_only close does not count as dirt: regenerated
+ * artefacts (dependency trees, build output, caches) and the directories
+ * Paperclip itself creates in a worktree (`.paperclip` from the worktree
+ * provision script, `.paperclip-runtime` from adapters and the heartbeat,
+ * `.paperclip-repositories` from project-repository provisioning). A name
+ * matches at any depth, but only as an ordinary directory with no symlink on
+ * the path to it. Files inside a listed directory are not inspected; every
+ * other ignored entry is dirt.
  */
-async function hasSelfHidingIgnoreFile(
+export const IGNORED_ARTIFACT_DIRECTORY_NAMES: ReadonlySet<string> = new Set([
+  "node_modules",
+  ".pnpm-store",
+  "dist",
+  "build",
+  ".turbo",
+  ".next",
+  "coverage",
+  "__pycache__",
+  ".venv",
+  "target",
+  PROJECT_REPOSITORIES_DIR,
+  ".paperclip",
+  ".paperclip-runtime",
+]);
+
+async function isIgnoredArtifactDirectory(workTree: string, entry: string): Promise<boolean> {
+  // `ls-files --directory` names a wholly ignored directory once, with a
+  // trailing slash; a file or a symlink is listed without one.
+  if (!entry.endsWith("/")) return false;
+  const components = entry.slice(0, -1).split("/");
+  if (!IGNORED_ARTIFACT_DIRECTORY_NAMES.has(components[components.length - 1]!)) return false;
+  let current = workTree;
+  for (const component of components) {
+    if (component.length === 0 || component === "." || component === "..") return false;
+    current = path.join(current, component);
+    try {
+      if (!(await lstat(current)).isDirectory()) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** The first ignored entry that is not an allowlisted artefact directory; null when there is none. */
+async function firstDisallowedIgnoredEntry(
   snapshotGitDir: string,
   workTree: string,
   options: HardenedGitOptions,
-): Promise<boolean> {
-  const gitArgs = ["-C", workTree, `--git-dir=${snapshotGitDir}`, `--work-tree=${workTree}`];
-  const untrackedIgnoreFiles = (await runHardenedGit(
-    [...gitArgs, "ls-files", "-z", "--others", "--", ":(glob)**/.gitignore"],
+): Promise<string | null> {
+  const entries = (await runHardenedGit(
+    [
+      "-C", workTree, `--git-dir=${snapshotGitDir}`, `--work-tree=${workTree}`,
+      "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory", "--no-empty-directory",
+    ],
     options,
   )).split("\0").filter((record) => record.length > 0);
-  if (untrackedIgnoreFiles.length === 0) return false;
-  const verdicts = (await runHardenedGit(
-    [...gitArgs, "check-ignore", "-v", "-z", "--stdin"],
-    { ...options, input: `${untrackedIgnoreFiles.join("\0")}\0` },
-  )).split("\0");
-  const untracked = new Set(untrackedIgnoreFiles);
-  for (let index = 0; index + 3 < verdicts.length; index += 4) {
-    if (untracked.has(verdicts[index]!)) return true;
+  for (const entry of entries) {
+    if (!(await isIgnoredArtifactDirectory(workTree, entry))) return entry;
   }
-  return false;
+  return null;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /** Whether a branch name carries this issue identifier as its own token. */
 export function branchNamesIssue(branch: string, identifier: string): boolean {
-  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(^|[^A-Za-z0-9])${escaped}(?![0-9])`, "i").test(branch);
+  return new RegExp(`(^|[^A-Za-z0-9])${escapeRegExp(identifier)}(?![0-9])`, "i").test(branch);
+}
+
+/**
+ * Card identifiers `text` names other than `identifier`, upper-cased: any
+ * upper-case `PREFIX-<n>` token, plus this card's own prefix in any case. Each
+ * token stands on its own (no letter or digit before it, no digit after it),
+ * so for SUP-7, `SUP-70` and `XSUP-7` are other cards and `SUP-7-notes` is not.
+ */
+export function otherCardIdentifiers(text: string, identifier: string): string[] {
+  const own = identifier.toUpperCase();
+  const ownPrefix = own.replace(/-\d+$/, "");
+  const found = new Set<string>();
+  const patterns = [
+    /(?<![A-Za-z0-9])[A-Z][A-Z0-9]*-\d+(?![0-9])/g,
+    new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(ownPrefix)}-\\d+(?![0-9])`, "gi"),
+  ];
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const token = match[0].toUpperCase();
+      if (token !== own) found.add(token);
+    }
+  }
+  return [...found];
 }
 
 /** Project default branch, reduced to a branch name; null when it is not one. */
@@ -446,19 +588,26 @@ export interface NoRepositoryWorktreeProbeInput {
 }
 
 export type NoRepositoryWorktreeProbeResult =
-  | { ok: true; branch: string; headSha: string }
+  | {
+      ok: true;
+      branch: string;
+      headSha: string;
+      /** The recorded worktree after symlink resolution, its git dir and the managed checkout's common dir. */
+      worktreePath: string;
+      gitDir: string;
+      commonDir: string;
+      /** Every tip compared with the default branch on the remote, the recorded worktree's first. */
+      comparedTips: string[];
+    }
   | { ok: false; reason: string };
 
 function refuse(reason: string): NoRepositoryWorktreeProbeResult {
   return { ok: false, reason };
 }
 
-interface CleanWorktreeVerdict {
-  ok: boolean;
-  reason?: string;
-  branch?: string;
-  headSha?: string;
-}
+type CleanWorktreeVerdict =
+  | { ok: true; branch: string; headSha: string; gitDir: string }
+  | { ok: false; reason: string };
 
 /**
  * Identity, configuration, index and status checks for one linked worktree of
@@ -541,16 +690,17 @@ async function verifyCleanLinkedWorktree(
         if (await snapshotStatusIsDirty(snapshot, worktreePath, "all", worktreeOptions)) {
           return "has uncommitted changes (modified, staged or untracked)";
         }
-        return (await hasSelfHidingIgnoreFile(snapshot, worktreePath, worktreeOptions))
-          ? "has untracked ignore files that hide uncommitted content"
-          : null;
+        const ignored = await firstDisallowedIgnoredEntry(snapshot, worktreePath, worktreeOptions);
+        return ignored === null
+          ? null
+          : `has an ignored entry outside the regenerated-artefact directories (${JSON.stringify(ignored.slice(0, 200))})`;
       },
     );
     if (dirtyReason) return { ok: false, reason: dirtyReason };
   } catch {
     return { ok: false, reason: "status could not be verified" };
   }
-  return { ok: true, branch: branchRef.slice("refs/heads/".length), headSha };
+  return { ok: true, branch: branchRef.slice("refs/heads/".length), headSha, gitDir: identity.gitDir };
 }
 
 /** Why `sha` may not stand as "level with the default branch"; null when it does. */
@@ -628,13 +778,17 @@ export async function probeNoRepositoryWorktree(
 
   const own = await verifyCleanLinkedWorktree(candidate, commonDir, options);
   if (!own.ok) return refuse(`the recorded worktree ${own.reason}`);
-  if (!branchNamesIssue(own.branch!, input.issueIdentifier)) {
+  if (!branchNamesIssue(own.branch, input.issueIdentifier)) {
     return refuse(`the recorded worktree's branch does not name ${input.issueIdentifier}`);
+  }
+  const otherCards = otherCardIdentifiers(own.branch, input.issueIdentifier);
+  if (otherCards.length > 0) {
+    return refuse(`the recorded worktree's branch ${own.branch} also names another card (${otherCards.join(", ")})`);
   }
 
   try {
-    const checkedTips = new Set<string>([own.headSha!]);
-    const ownRefusal = await aheadOfBaseRefusal("the recorded worktree", own.headSha!, input.countCommitsAheadOfBase);
+    const checkedTips = new Set<string>([own.headSha]);
+    const ownRefusal = await aheadOfBaseRefusal("the recorded worktree", own.headSha, input.countCommitsAheadOfBase);
     if (ownRefusal) return refuse(ownRefusal);
 
     const branches = (await runHardenedGit(
@@ -676,7 +830,15 @@ export async function probeNoRepositoryWorktree(
       const other = await verifyCleanLinkedWorktree(worktreePath, commonDir, options);
       if (!other.ok) return refuse(`another worktree on branch ${branch} ${other.reason}`);
     }
-    return { ok: true, branch: own.branch!, headSha: own.headSha! };
+    return {
+      ok: true,
+      branch: own.branch,
+      headSha: own.headSha,
+      worktreePath: candidate,
+      gitDir: own.gitDir,
+      commonDir,
+      comparedTips: [...checkedTips],
+    };
   } catch {
     return refuse("the managed checkout's branches could not be verified");
   }
