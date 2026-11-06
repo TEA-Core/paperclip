@@ -2076,6 +2076,8 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   actorResponsibleUserId?: string | null;
   trustExplicitResponsibleUserId?: boolean;
   trustExplicitExecutionPolicy?: boolean;
+  /** Internal only: set by routine dispatch when it re-applies the routine's stored policy; not part of any API schema. */
+  reapplyStoredExecutionPolicy?: boolean;
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
   onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
@@ -7117,6 +7119,27 @@ export function guardBRefusalCommentLockKey(issueId: string): string {
   return `issue-comment:guard-b-arming-refusal:${issueId}`;
 }
 
+/**
+ * R20: a stall arbiter named by a policy write must be able to take work: an
+ * assignable agent of this company (missing, cross-company, pending,
+ * terminated or bad-chain agents are refused by assertAssignableAgent) that is
+ * not paused, because a stalled stage handed to a paused agent would not move.
+ */
+async function assertStallArbiterCanTakeWork(db: Db, companyId: string, agentId: string): Promise<void> {
+  await assertAssignableAgent(db, companyId, agentId, { kind: "work" });
+  const status = await db
+    .select({ status: agents.status })
+    .from(agents)
+    .where(eq(agents.id, agentId))
+    .then((rows) => rows[0]?.status ?? null);
+  if (status === "paused") {
+    throw conflict(
+      `executionPolicy.stallEscalation.toAgentId ${agentId} is paused; a stalled review would be handed to an agent that does not run. Resume the agent or name another arbiter.`,
+      { code: "stall_arbiter_paused", field: "stallEscalation.toAgentId", agentId, companyId },
+    );
+  }
+}
+
 async function assertIssueExecutionPolicyAgentReferencesResolve(
   db: Pick<Db, "select">,
   companyId: string,
@@ -7138,6 +7161,14 @@ async function assertIssueExecutionPolicyAgentReferencesResolve(
       stageType: "review",
     });
   }
+  // stageIndex sentinels: -1 names the return assignee, -2 the R20 stall arbiter.
+  if (policy.stallEscalation) {
+    references.push({
+      agentId: policy.stallEscalation.toAgentId,
+      stageIndex: -2,
+      stageType: "review",
+    });
+  }
   if (references.length === 0) return;
 
   const agentIds = [...new Set(references.map((reference) => reference.agentId))];
@@ -7156,6 +7187,16 @@ async function assertIssueExecutionPolicyAgentReferencesResolve(
       `executionPolicy.returnAssigneeAgentId ${unresolved.agentId} does not resolve to an agent in company ${companyId}`,
       {
         field: "returnAssigneeAgentId",
+        agentId: unresolved.agentId,
+        companyId,
+      },
+    );
+  }
+  if (unresolved.stageIndex === -2) {
+    throw unprocessable(
+      `executionPolicy.stallEscalation.toAgentId ${unresolved.agentId} does not resolve to an agent in company ${companyId}`,
+      {
+        field: "stallEscalation.toAgentId",
         agentId: unresolved.agentId,
         companyId,
       },
@@ -10430,6 +10471,7 @@ export function issueService(db: Db) {
         actorResponsibleUserId,
         trustExplicitResponsibleUserId,
         trustExplicitExecutionPolicy,
+        reapplyStoredExecutionPolicy,
         idempotencyKey: rawIdempotencyKey,
         allowDuplicate,
         onDeduplicated,
@@ -10473,6 +10515,10 @@ export function issueService(db: Db) {
         issueData.executionPolicy = (normalizedPolicy as Record<string, unknown> | null) ?? null;
         if (normalizedPolicy?.returnAssigneeAgentId) {
           await assertAssignableAgent(db, companyId, normalizedPolicy.returnAssigneeAgentId, { kind: "work" });
+        }
+        // A routine re-applies its stored policy; an arbiter paused since it was saved must not stop the dispatch.
+        if (normalizedPolicy?.stallEscalation && reapplyStoredExecutionPolicy !== true) {
+          await assertStallArbiterCanTakeWork(db, companyId, normalizedPolicy.stallEscalation.toAgentId);
         }
       }
       // Activities logged inside the create transaction must not publish until the
@@ -11923,6 +11969,20 @@ export function issueService(db: Db) {
         patch.executionPolicy = normalizedPolicyRecord;
         if (normalizedPolicy?.returnAssigneeAgentId) {
           await assertAssignableAgent(dbOrTx as Db, existing.companyId, normalizedPolicy.returnAssigneeAgentId, { kind: "work" });
+        }
+        // Only an arbiter this write introduces is checked: an arbiter paused or
+        // terminated after it was set must not block unrelated policy writes
+        // (monitor re-arms); the hand-off itself skips an unavailable arbiter.
+        const storedStall = existing.executionPolicy?.stallEscalation;
+        const storedArbiterId =
+          storedStall && typeof storedStall === "object" && "toAgentId" in storedStall && typeof storedStall.toAgentId === "string"
+            ? storedStall.toAgentId.toLowerCase()
+            : null;
+        if (
+          normalizedPolicy?.stallEscalation &&
+          normalizedPolicy.stallEscalation.toAgentId !== storedArbiterId
+        ) {
+          await assertStallArbiterCanTakeWork(dbOrTx as Db, existing.companyId, normalizedPolicy.stallEscalation.toAgentId);
         }
       }
       let nextProjectId = issueData.projectId !== undefined ? issueData.projectId : existing.projectId;

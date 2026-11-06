@@ -7,6 +7,7 @@ import { Router } from "express";
 import { z } from "zod";
 import {
   createAiConnectionSchema,
+  GIT_COMMIT_SHA_WIRE_PATTERN,
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
   localAiLoginStartSchema,
@@ -4069,7 +4070,12 @@ registry.registerPath({
             })
             .strict(),
           branch: z.string().trim().min(1),
-          headSha: z.string().trim().min(1),
+          headSha: z
+            .string()
+            .regex(GIT_COMMIT_SHA_WIRE_PATTERN)
+            .describe(
+              "Full git commit sha: 40 or 64 hex digits, either case; surrounding whitespace is trimmed. Any other value is refused with 400.",
+            ),
           prNumber: z.number().int().positive().optional(),
           prUrl: z.string().url().optional(),
           sourceIssueId: z.string().uuid().optional(),

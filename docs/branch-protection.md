@@ -281,6 +281,13 @@ after its well-formed `%HH` escapes are decoded (a bounded number of passes),
 is refused with `422 delivery_identity_branch_write_rejected`; a lone `%` is an
 ordinary character. Provisioning skips the branch carry for such a name.
 
+On both paths `headSha` must be a full git commit sha (40 or 64 hex digits,
+either case; surrounding whitespace is trimmed). The request schema refuses any
+other value with `400`, on every card. A legacy record that holds another
+non-empty value stays usable under the fail-closed rule above. The review
+stall trigger that reads this head is described in
+[Execution policy](guides/execution-policy.md).
+
 A `deliveryIdentity` write is validated against the workspace the card holds at
 the time of the request, so a `PATCH` that carries `deliveryIdentity` and also
 changes `executionWorkspaceId` is refused in every case (agent or board, own

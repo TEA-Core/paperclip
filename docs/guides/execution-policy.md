@@ -128,6 +128,45 @@ interface IssueExecutionDecision {
 4. Runtime routes back to the **same review stage** (not the beginning), with the same reviewer.
 5. This loop continues until the reviewer approves.
 
+### Round Ceiling and Stall Escalation
+
+Consecutive agent `changes_requested` decisions on one stage are counted in `executionState.changesRequestedCount`; a human decision resets the count. When the count reaches the round ceiling, the stage stays pending and is handed to the issue's responsible human instead of the implementer. The ceiling is `maxReviewRounds` when set; otherwise **10** for a policy that carries `stallEscalation` and **3** for a policy that does not, so the raised ceiling never applies without a stall arbiter.
+
+A loop that stops making progress is caught earlier by the optional `stallEscalation`:
+
+```json
+{
+  "stages": [
+    { "type": "review", "participants": [{ "type": "agent", "agentId": "code-reviewer-agent-id" }] }
+  ],
+  "stallEscalation": { "afterRounds": 2, "toAgentId": "arbiter-agent-id" }
+}
+```
+
+- On an agent `changes_requested` decision on a **review** stage, once the round count reaches `afterRounds`, the runtime checks for a stall signal:
+  - **same head re-bounced**: the head delivered for this round (`executionState.deliveredHeadSha`, recorded from `deliveryIdentity.headSha` on the `in_review` transition) is the head the previous decision already bounced (`executionState.bouncedHeadSha`). `deliveryIdentity.headSha` must be a full git commit sha (40 or 64 hex digits, either case; surrounding whitespace is trimmed); a delivery that records no head, or a stored value that is not a full sha, never counts as the same head. The head is recorded only for a policy that carries `stallEscalation`; a policy without it keeps its execution state unchanged. Every delivery write, on any card with or without `stallEscalation`, now refuses a `deliveryIdentity.headSha` that is not a full git sha (40 or 64 hex digits) with 400; this is a deliberate contract tightening required by the R20 release-assurance grade.
+  - **code acceptable**: the reviewer's decision comment has a line that is exactly `Code acceptable: yes` (case-insensitive; it may be a list item or quote and may bold the key or the answer), meaning the remaining finding is not something the implementer can change. Prose that mentions the phrase, a line that adds text after `yes`, or a marker line inside a fenced code block (```` ``` ```` or `~~~`) does not count.
+- With a stall signal, the stage stays pending on the same issue and is handed once to `toAgentId` (recorded in `executionState.stallHandoff` and as an `issue.review_stall_escalated` activity, both in the transaction that records the reviewer's decision). The reviewer's decision is still recorded and the round count keeps running, so the ceiling still escalates to the human afterwards. On a card whose policy carries `stallEscalation`, every stage decision (with or without a stall signal) re-reads the issue under its row lock. When another decision was recorded or a hand-off record appeared since the request read the card, the request gets `409 review_stall_handoff_conflict`, so concurrent decisions are serialised and a plain bounce can never erase a hand-off. When the delivered head (`executionState.deliveredHeadSha`), the round ceiling, the stall policy or the stages changed since the read, the request gets `409 review_stall_policy_changed`, so a decision computed against a refreshed delivery or a lowered ceiling is never recorded. Either refusal persists nothing.
+- The arbiter **advises only**: it can request changes with a directive (the issue returns to the implementer and the next delivery goes back to the stage reviewer) or park the issue `blocked`. An approval by the agent the stage-run's hand-off record names is refused (`422 stall_arbiter_cannot_approve`), even if a later policy edit lists it on the stage or names another arbiter.
+- While it holds the stage, the arbiter may not write the issue's `executionPolicy` or `reviewPolicy` at all (stages, participants, ceiling, `stallEscalation`, or any other policy field): such a PATCH is refused with `403 stall_arbiter_policy_edit_refused` before the body is validated, so a malformed policy body gets the same refusal. A board operator owns policy changes during the hold.
+- A stage-run is handed to the arbiter at most once. The arbiter is never the issue's return assignee or delivery author, and never a review-stage participant. Agent ids are compared case-insensitively and `toAgentId` is stored lowercase.
+- An arbiter that cannot take work when the stall happens (paused, terminated, pending approval, or no longer in the company) gets no hand-off: the round falls through to the ordinary ceiling behaviour.
+- Validation: `afterRounds` is a positive integer no greater than the round ceiling (10 unless `maxReviewRounds` is set); `toAgentId` must be an assignable agent in the issue's company and not paused when the policy write names it; routine dispatch re-applies the routine's stored policy without that availability check, so a routine whose arbiter was paused after it was saved still creates its card (the hand-off then falls back to the ceiling). At `afterRounds` equal to the ceiling, a responsible human receives the stage first; the arbiter acts at that round only when the issue has no responsible human. Without `stallEscalation` the loop keeps the ceiling of 3.
+- Known limitation (SUP-23065): `stallEscalation` is an API-only policy field, like `maxReviewRounds`, `returnAssigneeAgentId` and `baseRef`. A board UI policy edit (reviewer change, monitor) and a PATCH that sends only `stages` replace the stored policy and drop the field. The card then returns to the ceiling of 3 with the human escalation; the required reviewer is never skipped. Set and maintain the field through the API until the follow-up keeps it across these edits.
+- Rollback: a plain binary revert is unsafe. With the pre-R20 code a card whose stored policy carries `stallEscalation` still reads (`GET` 200), but its title, comment and stages PATCHes return 422 until the new code is back, because the old policy schema is strict and rejects the key; a policy replacement through the old API cannot clear it either. Before reverting the build, remove the field with this migration-free cleanup, in one transaction against the instance database:
+
+  ```sql
+  BEGIN;
+  UPDATE issues SET execution_policy = execution_policy - 'stallEscalation' WHERE execution_policy ? 'stallEscalation';
+  UPDATE projects SET default_execution_policy = default_execution_policy - 'stallEscalation' WHERE default_execution_policy ? 'stallEscalation';
+  UPDATE companies SET default_execution_policy = default_execution_policy - 'stallEscalation' WHERE default_execution_policy ? 'stallEscalation';
+  UPDATE routines SET execution_policy = execution_policy - 'stallEscalation' WHERE execution_policy ? 'stallEscalation';
+  UPDATE routine_revisions SET snapshot = snapshot #- '{routine,executionPolicy,stallEscalation}' WHERE snapshot #> '{routine,executionPolicy}' ? 'stallEscalation';
+  COMMIT;
+  ```
+
+  Then confirm each `SELECT count(*) FROM <table> WHERE <column> ? 'stallEscalation'` (and `snapshot #> '{routine,executionPolicy}' ? 'stallEscalation'` for `routine_revisions`) returns 0, and only then revert the build. A card held by its arbiter goes back to a configured reviewer on its next transition under either build. The execution-state keys (`deliveredHeadSha`, `bouncedHeadSha`, `stallHandoff`) need no cleanup: the pre-R20 state schema drops unknown keys.
+
 ### Policy Variants
 
 **Review only** (no approval stage):

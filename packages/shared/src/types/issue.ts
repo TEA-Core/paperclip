@@ -693,6 +693,20 @@ export interface IssueExecutionMonitorPolicy {
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
 }
 
+/**
+ * Progress-aware stall trigger on the review ladder (R20). When a review
+ * stage's consecutive agent changes-requested rounds reach `afterRounds` and
+ * the loop shows a stall signal (the same delivered head bounced again, or the
+ * reviewer's decision says the code is acceptable), the pending stage is
+ * handed once to the `toAgentId` arbiter instead of back to the implementer.
+ * The arbiter advises only: it can request changes with a directive or park
+ * the card blocked, never approve the stage.
+ */
+export interface IssueExecutionStallEscalationPolicy {
+  afterRounds: number;
+  toAgentId: string;
+}
+
 export interface IssueExecutionPolicy {
   mode: IssueExecutionPolicyMode;
   commentRequired: boolean;
@@ -706,9 +720,12 @@ export interface IssueExecutionPolicy {
   /**
    * Maximum consecutive agent-initiated changes-requested rounds before the
    * pending stage escalates to the responsible human. Null uses the server
-   * default. Human decisions reset the round counter.
+   * default: 10 with `stallEscalation`, 3 without. Human decisions reset the
+   * round counter.
    */
   maxReviewRounds?: number | null;
+  /** Absent or null keeps the plain round ceiling with no stall arbiter. */
+  stallEscalation?: IssueExecutionStallEscalationPolicy | null;
   /**
    * Optional git ref that overrides the PR base branch for this issue's
    * delivery (consumed first by deliver.sh Phase 2c). When set, a stacked
@@ -738,6 +755,20 @@ export interface IssueExecutionMonitorState {
 
 export interface IssueReviewRequest {
   instructions: string;
+}
+
+export type IssueExecutionStallSignal = "same_head_rebounced" | "code_acceptable";
+
+/** The one stall-arbiter handoff recorded for a review stage-run (R20). */
+export interface IssueExecutionStallHandoff {
+  stageId: string;
+  arbiterAgentId: string;
+  /** The reviewer whose changes-requested decision triggered the handoff. */
+  fromParticipant: IssueExecutionStagePrincipal | null;
+  /** The consecutive agent changes-requested round that triggered it. */
+  changesRequestedCount: number;
+  signals: IssueExecutionStallSignal[];
+  handedOffAt: string;
 }
 
 export interface IssueExecutionState {
@@ -777,6 +808,20 @@ export interface IssueExecutionState {
    * issue's `updatedAt`.
    */
   pendingSince?: string | null;
+  /**
+   * Head commit delivered to review for the current round, stamped from the
+   * `deliveryIdentity.headSha` recorded on the `in_review` transition. Cleared
+   * when a changes-requested decision hands the round back, so a re-delivery
+   * that records no head reads as unknown rather than as the same head.
+   */
+  deliveredHeadSha?: string | null;
+  /** The delivered head the most recent changes-requested decision bounced. */
+  bouncedHeadSha?: string | null;
+  /**
+   * Set once the current review stage-run was handed to its stall arbiter;
+   * its presence for the active stage keeps the handoff to exactly one.
+   */
+  stallHandoff?: IssueExecutionStallHandoff | null;
   /**
    * Out-of-band publish record written by merge-arming / the approval-status
    * reconciler via jsonb_set (SUP-16977). Kept as `unknown`: the consumers

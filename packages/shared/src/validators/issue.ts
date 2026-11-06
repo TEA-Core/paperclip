@@ -450,6 +450,34 @@ export const issueExecutionMonitorPolicySchema = z.object({
     .default(null),
 }).strict();
 
+const GIT_COMMIT_SHA_DIGITS = "(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})";
+
+/**
+ * A full git commit sha: 40 hex digits (SHA-1) or 64 (SHA-256), either case,
+ * surrounding whitespace trimmed. The delivered head recorded on
+ * `deliveryIdentity.headSha` must be one, so the R20 same-head stall signal can
+ * never be forged with an arbitrary string.
+ */
+export const gitCommitShaSchema = z
+  .string()
+  .trim()
+  .regex(new RegExp(`^${GIT_COMMIT_SHA_DIGITS}$`), "must be a full git commit sha (40 or 64 hex digits)");
+
+/**
+ * The same rule as a wire pattern for API documentation: a pattern cannot
+ * trim, so it admits the surrounding whitespace `gitCommitShaSchema` trims
+ * away, and it spells out both hex cases instead of relying on a regex flag.
+ */
+export const GIT_COMMIT_SHA_WIRE_PATTERN = new RegExp(`^\\s*${GIT_COMMIT_SHA_DIGITS}\\s*$`);
+
+// R20: bounds only. The cross-field rule (afterRounds within the resolved
+// round ceiling) needs the server's default ceiling, so it is enforced where
+// every policy write normalizes: normalizeIssueExecutionPolicy.
+export const issueExecutionStallEscalationPolicySchema = z.object({
+  afterRounds: z.number().int().positive().max(50),
+  toAgentId: z.string().trim().uuid(),
+}).strict();
+
 export const issueExecutionPolicySchema = z.object({
   mode: z.enum(ISSUE_EXECUTION_POLICY_MODES).optional().default("normal"),
   commentRequired: z.boolean().optional().default(true),
@@ -474,6 +502,7 @@ export const issueExecutionPolicySchema = z.object({
     .optional()
     .nullable()
     .default(null),
+  stallEscalation: issueExecutionStallEscalationPolicySchema.optional().nullable(),
 }).strict();
 
 export const issueExecutionMonitorStateSchema = z.object({
@@ -553,6 +582,20 @@ export const issueExecutionStateSchema = z.object({
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
   changesRequestedCount: z.number().int().nonnegative().optional().default(0),
   pendingSince: z.string().nullable().optional(),
+  // R20 review-stall bookkeeping, written only by the server. The head keys
+  // accept any string so an odd stored value never makes the state
+  // unparseable; the stall trigger ignores a value that is not a full git sha.
+  // `stallHandoff` is validated: only the engine writes it.
+  deliveredHeadSha: z.string().nullable().optional(),
+  bouncedHeadSha: z.string().nullable().optional(),
+  stallHandoff: z.object({
+    stageId: z.string().guid(),
+    arbiterAgentId: z.string().guid(),
+    fromParticipant: issueExecutionStatePrincipalSchema.nullable(),
+    changesRequestedCount: z.number().int().nonnegative(),
+    signals: z.array(z.enum(["same_head_rebounced", "code_acceptable"])),
+    handedOffAt: z.string(),
+  }).nullable().optional(),
   /**
    * Out-of-band publish record written by merge-arming / the approval-status
    * reconciler via jsonb_set (SUP-16977). Enumerated, not modeled: consumers

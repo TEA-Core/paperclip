@@ -4767,6 +4767,8 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
      * (non-ancestor) owner — the laundering shape D1 must refuse.
      */
     unrelatedOwner?: boolean;
+    /** R20: give the card a review stage plus a stallEscalation arbiter. */
+    stallPolicy?: boolean;
   }
 
   async function seedIssue(opts: SeedOpts = {}) {
@@ -4822,6 +4824,31 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
       runtimeConfig: {},
       permissions: {},
     });
+    // R20 stall policy: a human reviewer (so the in_review hand-off wakes no
+    // agent run this suite would have to drain) and an agent stall arbiter.
+    const reviewerUserId = "stall-reviewer-user";
+    const arbiterAgentId = randomUUID();
+    if (opts.stallPolicy) {
+      await db.insert(companyMemberships).values({
+        companyId,
+        principalType: "user",
+        principalId: reviewerUserId,
+        status: "active",
+        membershipRole: "operator",
+        updatedAt: now,
+      });
+      await db.insert(agents).values({
+        id: arbiterAgentId,
+        companyId,
+        name: "Arbiter",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+    }
     if (opts.executionRunId) {
       await db.insert(heartbeatRuns).values({
         id: opts.executionRunId,
@@ -4886,6 +4913,21 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
       // (the card's parent) so the shared-workspace carrier row passes the ADR-083
       // gate — UNLESS the test explicitly asks for an unrelated (non-ancestor) owner.
       ...(carrierOwnerIssueId && !opts.unrelatedOwner ? { parentId: carrierOwnerIssueId } : {}),
+      ...(opts.stallPolicy
+        ? {
+            executionPolicy: {
+              mode: "normal",
+              commentRequired: true,
+              stages: [{
+                id: randomUUID(),
+                type: "review",
+                approvalsNeeded: 1,
+                participants: [{ id: randomUUID(), type: "user", userId: reviewerUserId }],
+              }],
+              stallEscalation: { afterRounds: 2, toAgentId: arbiterAgentId },
+            },
+          }
+        : {}),
     });
 
     return { companyId, issueId, agentId };
@@ -4920,6 +4962,34 @@ describeEmbeddedPostgres("PATCH /issues/:id delivery identity (ADR-091 D1 SUP-14
     expect(delivery!.headSha).toBe(HEAD_SHA);
     expect(delivery!.recordedByRunId).toBe(runId);
     expect(typeof delivery!.recordedAt).toBe("string");
+    // R20: a card whose policy names no stall arbiter keeps its execution state
+    // unchanged: no structured head is stamped.
+    expect(row!.executionState).not.toHaveProperty("deliveredHeadSha");
+  });
+
+  it("stamps the structured delivered head on in_review only for a policy with stallEscalation (R20)", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId, stallPolicy: true });
+    currentActor = agentActor(companyId, agentId, runId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "SUP-14824-branch",
+          headSha: HEAD_SHA,
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [row] = await db
+      .select({ executionState: issues.executionState, status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(row!.status).toBe("in_review");
+    expect(row!.executionState).toMatchObject({ status: "pending", deliveredHeadSha: HEAD_SHA });
   });
 
   it("records deliveryIdentity for a project_primary workspace with no persisted branch (SUP-18325)", async () => {
