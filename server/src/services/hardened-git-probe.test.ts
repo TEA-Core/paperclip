@@ -10,6 +10,7 @@ import {
   normalizeBaseBranch,
   otherCardIdentifiers,
   probeNoRepositoryWorktree,
+  recheckRecordedWorktree,
   resolveTrustedGitBinary,
   runHardenedGit,
 } from "./hardened-git-probe.js";
@@ -213,6 +214,30 @@ describe("hardened git runner (SUP-22880)", () => {
     const pid = Number.parseInt(readFileSync(pidFile, "utf8"), 10);
     expect(Number.isInteger(pid)).toBe(true);
     expect(await exitsWithin(pid, 2_000), `grandchild ${pid} outlived the timeout`).toBe(true);
+  });
+
+  it("gives each process only the time left on a shared deadline, so spent time is not given back", async () => {
+    const repo = plainRepo("repo");
+    const deadline = { at: Date.now() + 60_000, expired: false };
+    const args = ["-C", repo, "rev-parse", "--is-inside-work-tree"];
+    expect((await runHardenedGit(args, { cwd: "/", deadline })).trim()).toBe("true");
+    expect(deadline.expired).toBe(false);
+
+    deadline.at = Date.now() - 1;
+    await expect(runHardenedGit(args, { cwd: "/", deadline }))
+      .rejects.toMatchObject({ kind: "timeout" } satisfies Partial<HardenedGitError>);
+    expect(deadline.expired).toBe(true);
+  });
+
+  it("kills a process still running when the shared deadline passes, marking the deadline expired", async () => {
+    const repo = plainRepo("repo");
+    const fifo = path.join(root, "blocking-include");
+    execFileSync("mkfifo", [fifo]);
+    git(repo, "config", "include.path", fifo);
+    const deadline = { at: Date.now() + 500, expired: false };
+    await expect(runHardenedGit(["-C", repo, "config", "--list"], { cwd: "/", deadline }))
+      .rejects.toMatchObject({ kind: "timeout" } satisfies Partial<HardenedGitError>);
+    expect(deadline.expired).toBe(true);
   });
 });
 
@@ -753,7 +778,6 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
   describe("other cards named by the recorded worktree's branch", () => {
     it.each([
       ["SUP-7-OTHER-999", "OTHER-999"],
-      ["SUP-7-other-999", "OTHER-999"],
       ["SUP-7-after-SUP-70", "SUP-70"],
       ["SUP-7-from-sup-70", "SUP-70"],
       ["SUP-7-XSUP-7", "XSUP-7"],
@@ -766,10 +790,37 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
       });
     });
 
-    it.each(["sup-7-notes-v2", "SUP-7-iso-8601-dates"])("accepts branch %s, which names only this card", async (branch) => {
+    // The default branch is the identifier and the lower-cased issue title, so
+    // a word-number token from a title names no card.
+    it.each([
+      "sup-7-notes-v2",
+      "SUP-7-iso-8601-dates",
+      "SUP-7-ISO-8601-dates",
+      "SUP-7-decide-phase-2-scope",
+      "SUP-7-sprint-12-retro",
+      "SUP-7-q3-2026-planning",
+      "SUP-7-upgrade-node-20",
+    ])("accepts branch %s, which names only this card", async (branch) => {
       const layout = managedLayout();
       const worktree = layout.addWorktree(branch);
       expect(await probeNoRepositoryWorktree({ ...layout.input, recordedWorktreePath: worktree })).toMatchObject({ ok: true });
+    });
+
+    // A standard name is exempt except under this card's own prefix.
+    it.each([
+      ["ISO-7-after-iso-9", "ISO-9"],
+      ["ISO-7-after-ISO-9", "ISO-9"],
+    ])("refuses branch %s for card ISO-7, which names another card of the same prefix", async (branch, other) => {
+      const layout = managedLayout();
+      const worktree = layout.addWorktree(branch);
+      expect(await probeNoRepositoryWorktree({
+        ...layout.input,
+        issueIdentifier: "ISO-7",
+        recordedWorktreePath: worktree,
+      })).toEqual({
+        ok: false,
+        reason: `the recorded worktree's branch ${branch} also names another card (${other})`,
+      });
     });
   });
 
@@ -781,8 +832,14 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
       ["alongside SUP-70 and XSUP-7", ["SUP-70", "XSUP-7"]],
       ["recorded with ISO-8601 timestamps, SHA-256 digests and UTF-8 text", []],
       ["the ruling for SUP-7 and sup-7", []],
+      ["decided in phase-2 of sprint-12", ["PHASE-2", "SPRINT-12"]],
     ])("finds the other cards in %j", (text, expected) => {
       expect(otherCardIdentifiers(text, "SUP-7").sort()).toEqual(expected);
+    });
+
+    it("never exempts this card's own prefix as a standard name", () => {
+      expect(otherCardIdentifiers("closes ISO-7 beside ISO-9, iso-9 and ISO-8601", "ISO-7").sort())
+        .toEqual(["ISO-8601", "ISO-9"]);
     });
   });
 
@@ -869,6 +926,48 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
     expect(result).toEqual({
       ok: false,
       reason: "branch SUP-7-record-ruling has 1 commit(s) not on the project's default branch",
+    });
+  });
+
+  describe("recheckRecordedWorktree (the close write's re-check under one shared budget)", () => {
+    async function measured(layout: ManagedLayout) {
+      const result = await probeNoRepositoryWorktree(layout.input);
+      if (!result.ok) throw new Error(result.reason);
+      return { worktreePath: result.worktreePath, commonDir: result.commonDir, branch: result.branch, headSha: result.headSha };
+    }
+
+    it("passes a clean worktree on the measured branch and commit within the normal budget", async () => {
+      const layout = managedLayout();
+      expect(await recheckRecordedWorktree(await measured(layout))).toEqual({ ok: true });
+    });
+
+    it("refuses with a timed-out reason, not a status one, when the shared budget is spent", async () => {
+      const layout = managedLayout();
+      const result = await recheckRecordedWorktree({ ...(await measured(layout)), budgetMs: 1 });
+      expect(result).toEqual({
+        ok: false,
+        reason: "the recorded worktree could not be re-checked within 1 ms (timed out at the close write)",
+      });
+    });
+
+    it("names the dirt, not a timeout, when the worktree is dirty within the budget", async () => {
+      const layout = managedLayout();
+      const input = await measured(layout);
+      writeFileSync(path.join(layout.worktree, "late.md"), "written after the measurement\n");
+      expect(await recheckRecordedWorktree(input)).toEqual({
+        ok: false,
+        reason: "the recorded worktree has uncommitted changes (modified, staged or untracked)",
+      });
+    });
+
+    it("refuses a moved HEAD", async () => {
+      const layout = managedLayout();
+      const input = await measured(layout);
+      git(layout.worktree, "commit", "-q", "--allow-empty", "-m", "SUP-7 moved");
+      expect(await recheckRecordedWorktree(input)).toEqual({
+        ok: false,
+        reason: "the recorded worktree's HEAD moved after the close was measured",
+      });
     });
   });
 

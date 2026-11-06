@@ -2264,9 +2264,10 @@ function changedSinceMeasurement(
  * against the row it holds `FOR UPDATE`. It makes no network call: it re-reads
  * the database half of the proof and requires it to match what was measured,
  * then re-checks the one measured worktree (index, status and ignored entries
- * on the measured branch and commit, no GitHub compare, a 5 s timeout), so
- * dirt written after the measurement refuses. Any mismatch refuses, including
- * an issue another request already closed (done or cancelled).
+ * on the measured branch and commit, no GitHub compare, one shared 15 s budget
+ * for the whole re-check), so dirt written after the measurement refuses. Any
+ * mismatch refuses, including an issue another request already closed (done or
+ * cancelled).
  */
 export async function verifyNoRepositoryLandingAtTransition(
   tx: Db,

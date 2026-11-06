@@ -20409,9 +20409,10 @@ export function issueRoutes(
         && existing.status !== "in_review"
       );
     // SUP-22570: a record_only no-repository close is measured here, outside
-    // any transaction: every Git process and GitHub call of the close runs now.
+    // any transaction: every GitHub compare and the full Git probe run now.
     // The status write below only compares this measurement with the row it
-    // locks, so nothing slow runs while the issue row is held.
+    // locks, and runs one bounded Git re-check of the measured worktree (a
+    // shared 15 s budget, no GitHub call) while the issue row is held.
     const noRepositoryCloseRequest: NoRepositoryLandingCloseRequest = {
       checkedExecutionWorkspaceId: finalDeliveryIssue.executionWorkspaceId ?? null,
       requestedDeliveryRequirement: updateFields.deliveryRequirement,
@@ -20637,9 +20638,9 @@ export function issueRoutes(
 
           // SUP-22570: compare-and-set against the measurement taken before
           // this transaction. It re-reads the database half of the proof,
-          // re-checks the measured worktree with a bounded Git status (no
-          // GitHub call), and refuses if anything moved or got dirty since the
-          // measurement.
+          // re-checks the measured worktree with a Git status under one
+          // shared 15 s budget (no GitHub call), and refuses if anything moved,
+          // got dirty or ran out of budget since the measurement.
           if (noRepositoryLandingCloser !== null && noRepositoryMeasurement !== null) {
             const lockedForLanding = await svc.getByIdForUpdate(id, tx);
             if (!lockedForLanding) return null;
@@ -20895,9 +20896,11 @@ export function issueRoutes(
           httpStatus: 422,
           code: "done_transition_missing_tier_declaration",
           error: err.message,
-          remedy:
-            "Bring the issue's own worktree back to a clean, zero-ahead state (or deliver its content through a " +
-            "repository close form), keep the issue record_only, and close again.",
+          remedy: err.message.includes("timed out at the close write")
+            ? "The worktree re-check at the close write ran out of its time budget before it finished; that is " +
+              "not a dirty-worktree finding. Retry the close, or use the board close path."
+            : "Bring the issue's own worktree back to a clean, zero-ahead state (or deliver its content through a " +
+              "repository close form), keep the issue record_only, and close again.",
           runId: actor.runId ?? null,
         });
       }

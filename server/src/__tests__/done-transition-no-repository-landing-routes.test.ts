@@ -41,6 +41,7 @@ import {
   type evaluateDoneTierDeclaration,
   type measureNoRepositoryLandingForClose,
 } from "../services/done-transition-guard.js";
+import type { recheckRecordedWorktree } from "../services/hardened-git-probe.js";
 import type { StorageService } from "../storage/types.js";
 
 // SUP-22570: the record_only no-repository close, end to end through
@@ -53,6 +54,10 @@ const mockGhFetch = vi.hoisted(() => vi.fn());
 const mockEvaluateDoneTierDeclaration = vi.hoisted(() => vi.fn());
 const realEvaluateDoneTierDeclarationRef = vi.hoisted(() => ({
   current: null as typeof evaluateDoneTierDeclaration | null,
+}));
+const mockRecheckRecordedWorktree = vi.hoisted(() => vi.fn());
+const realRecheckRecordedWorktreeRef = vi.hoisted(() => ({
+  current: null as typeof recheckRecordedWorktree | null,
 }));
 const mockMeasureNoRepositoryLanding = vi.hoisted(() => vi.fn());
 const realMeasureNoRepositoryLandingRef = vi.hoisted(() => ({
@@ -71,6 +76,13 @@ vi.mock("../services/github-fetch.js", () => ({
   gitHubApiBase: (hostname: string) =>
     hostname === "github.com" || hostname === "www.github.com" ? "https://api.github.com" : `https://${hostname}/api/v3`,
 }));
+
+vi.mock("../services/hardened-git-probe.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/hardened-git-probe.js")>();
+  realRecheckRecordedWorktreeRef.current = actual.recheckRecordedWorktree;
+  mockRecheckRecordedWorktree.mockImplementation(actual.recheckRecordedWorktree);
+  return { ...actual, recheckRecordedWorktree: mockRecheckRecordedWorktree };
+});
 
 vi.mock("../services/done-transition-guard.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/done-transition-guard.js")>();
@@ -187,6 +199,8 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     mockEvaluateDoneTierDeclaration.mockImplementation(realEvaluateDoneTierDeclarationRef.current!);
     mockMeasureNoRepositoryLanding.mockReset();
     mockMeasureNoRepositoryLanding.mockImplementation(realMeasureNoRepositoryLandingRef.current!);
+    mockRecheckRecordedWorktree.mockReset();
+    mockRecheckRecordedWorktree.mockImplementation(realRecheckRecordedWorktreeRef.current!);
   });
 
   async function insertCompany(prefix: string) {
@@ -285,6 +299,8 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     options: {
       deliveryRequirement?: "record_only" | "repository_delivery";
       workspace?: Partial<typeof executionWorkspaces.$inferInsert>;
+      /** The issue-title slug after the identifier in the worktree's branch (the default template). */
+      branchSlug?: string;
     } = {},
   ): Promise<SeededIssue> {
     seedSequence += 1;
@@ -297,7 +313,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     const executionWorkspaceId = randomUUID();
     const issueId = randomUUID();
     const identifier = `${prefix}-1`;
-    const branch = `${identifier}-entry-ruling`;
+    const branch = `${identifier}-${options.branchSlug ?? "entry-ruling"}`;
 
     const repoRoot = resolveManagedProjectWorkspaceDir({ companyId, projectId, repoName: "paperclip" });
     const origin = path.join(home, "origins", `${prefix}.git`);
@@ -1081,6 +1097,40 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 
+  // The re-check under the row lock shares one 15 s budget; running out of it
+  // says nothing about the worktree, so its remedy is to retry, not to clean.
+  it.each([
+    ["the re-check runs out of its budget", "timed out at the close write", "Retry the close", "Bring the issue's own worktree"],
+    ["the worktree is dirtied after the measurement", "has uncommitted changes", "Bring the issue's own worktree", "Retry the close"],
+  ] as const)("posts the matching remedy comment when %s", async (label, reasonText, remedyText, otherRemedyText) => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    if (reasonText === "timed out at the close write") {
+      mockRecheckRecordedWorktree.mockImplementation((input: Parameters<typeof recheckRecordedWorktree>[0]) =>
+        realRecheckRecordedWorktreeRef.current!({ ...input, budgetMs: 1 }));
+    } else {
+      mockMeasureNoRepositoryLanding.mockImplementation(async (...args: Parameters<typeof measureNoRepositoryLandingForClose>) => {
+        const verdict = await realMeasureNoRepositoryLandingRef.current!(...args);
+        writeFileSync(path.join(fixture.worktree, "late.md"), "written after the measurement\n");
+        return verdict;
+      });
+    }
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, `${label}: ${JSON.stringify(res.body)}`).toBe(422);
+    expect(res.body.error).toContain(reasonText);
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+    const refusals = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, fixture.issueId))
+      .then((rows) => rows.map((row) => row.body).filter((body) => body.includes("Remedy: ")));
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]).toContain(remedyText);
+    expect(refusals[0]).not.toContain(otherRemedyText);
+  });
+
   async function issueRowIsUnlocked(issueId: string): Promise<boolean> {
     return db
       .transaction(async (tx) => {
@@ -1261,6 +1311,32 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     const res = await close(fixture.identifier, { ...NO_REPOSITORY_DONE_TIER, reason: reason(fixture) });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
+  });
+
+  it.each([
+    ["a phase number", "decide-phase-2-scope"],
+    ["a sprint number", "sprint-12-retro"],
+    ["a quarter and year", "q3-2026-planning"],
+    ["a runtime version", "upgrade-node-20"],
+  ] as const)("closes a worktree on its default-template branch whose title slug carries %s", async (_label, slug) => {
+    const fixture = await seed({ branchSlug: slug });
+    expect(fixture.branch).toBe(`${fixture.identifier}-${slug}`);
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(fixture.issueId)).toBe("done");
+  });
+
+  it("still refuses a declaration that carries a word-number token, whatever its case", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+
+    const res = await close(fixture.identifier, { ...NO_REPOSITORY_DONE_TIER, reason: "Decided in phase-2 of the rollout" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("the declaration names another card (PHASE-2)");
   });
 
   /** Commits ignore rules on the issue branch and makes them the remote default branch. */

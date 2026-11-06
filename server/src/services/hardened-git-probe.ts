@@ -143,10 +143,31 @@ function inheritedGitEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
+/**
+ * One wall-clock budget shared by every Git process and file copy of a
+ * check: each step gets only the time left, and `expired` records that the
+ * budget ran out (rather than a step failing for another reason).
+ */
+export interface ProbeDeadline {
+  at: number;
+  expired: boolean;
+}
+
+function remainingBudget(deadline: ProbeDeadline): number {
+  const remaining = deadline.at - Date.now();
+  if (remaining <= 0) {
+    deadline.expired = true;
+    throw new HardenedGitError("timeout", "the shared deadline passed");
+  }
+  return remaining;
+}
+
 export interface HardenedGitOptions {
   /** Process working directory: a control-plane directory, never a probed workspace. */
   cwd: string;
   timeoutMs?: number;
+  /** Replaces `timeoutMs`: the process gets the time left on this shared budget. */
+  deadline?: ProbeDeadline;
   /** Stops repository discovery above this directory. */
   ceilingDirectory?: string | null;
   /**
@@ -242,12 +263,26 @@ export function runHardenedGit(args: readonly string[], options: HardenedGitOpti
     return Promise.reject(new HardenedGitError("unavailable", "no root-owned git binary at a fixed system path"));
   }
   const guardArgs = inherit ? EXECUTION_GUARD_CONFIG.flatMap(([key, value]) => ["-c", `${key}=${value}`]) : [];
-  return runBoundedProcess(trustedGit ?? "git", [...guardArgs, "--no-optional-locks", ...args], {
+  const { deadline } = options;
+  let timeoutMs = options.timeoutMs ?? (inherit ? 0 : DEFAULT_TIMEOUT_MS);
+  if (deadline) {
+    try {
+      timeoutMs = remainingBudget(deadline);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+  const run = runBoundedProcess(trustedGit ?? "git", [...guardArgs, "--no-optional-locks", ...args], {
     cwd: options.cwd,
     env: inherit ? inheritedGitEnv() : hardenedGitEnv(options.ceilingDirectory ?? null),
-    timeoutMs: options.timeoutMs ?? (inherit ? 0 : DEFAULT_TIMEOUT_MS),
+    timeoutMs,
     input: options.input,
     successExitCodes: options.successExitCodes,
+  });
+  if (!deadline) return run;
+  return run.catch((error: unknown) => {
+    if (error instanceof HardenedGitError && error.kind === "timeout") deadline.expired = true;
+    throw error;
   });
 }
 
@@ -344,13 +379,22 @@ async function readRegularFile(target: string, maxBytes: number): Promise<Buffer
  * never holding it in memory, and returns the bytes copied so the caller can
  * charge them against a shared budget.
  */
-async function copyRegularFile(source: string, destination: string, maxBytes: number): Promise<number> {
+async function copyRegularFile(
+  source: string,
+  destination: string,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<number> {
   return withRegularFile(source, maxBytes, async (handle, size) => {
     if (size === 0) {
       await writeFile(destination, "");
       return 0;
     }
-    await pipeline(handle.createReadStream({ start: 0, end: size - 1, autoClose: false }), createWriteStream(destination));
+    await pipeline(
+      handle.createReadStream({ start: 0, end: size - 1, autoClose: false }),
+      createWriteStream(destination),
+      { signal },
+    );
     if ((await handle.stat()).size !== size) throw new HardenedGitError("failed", "file changed while it was copied");
     return size;
   });
@@ -377,6 +421,7 @@ async function withSnapshotGitDir<T>(
     headSha: string | null;
     config: string;
     exclude: string | null;
+    deadline?: ProbeDeadline;
   },
   fn: (snapshotGitDir: string) => Promise<T>,
 ): Promise<T> {
@@ -395,7 +440,18 @@ async function withSnapshotGitDir<T>(
     let indexBudget = MAX_INDEX_FILE_BYTES;
     for (const name of await readdir(input.identity.gitDir)) {
       if (name === "index" || name.startsWith("sharedindex.")) {
-        indexBudget -= await copyRegularFile(path.join(input.identity.gitDir, name), path.join(snapshot, name), indexBudget);
+        const signal = input.deadline ? AbortSignal.timeout(remainingBudget(input.deadline)) : undefined;
+        try {
+          indexBudget -= await copyRegularFile(
+            path.join(input.identity.gitDir, name),
+            path.join(snapshot, name),
+            indexBudget,
+            signal,
+          );
+        } catch (error) {
+          if (input.deadline && signal?.aborted) input.deadline.expired = true;
+          throw error;
+        }
       }
     }
     return await fn(snapshot);
@@ -550,21 +606,48 @@ const NON_CARD_IDENTIFIER_PREFIXES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Card identifiers `text` names other than `identifier`, upper-cased: every
- * `PREFIX-<n>` token in any case, except the standard names above. Each token
- * stands on its own (no letter or digit before it, no digit after it), so for
- * SUP-7, `SUP-70`, `XSUP-7` and `other-999` are other cards and `SUP-7-notes`
- * is not. A word-number token such as `phase-2` also counts, so a declaration
- * or branch carrying one refuses (fail closed).
+ * Upper-cased tokens of `text` matching `patterns` other than `identifier`.
+ * Each token stands on its own (no letter or digit before it, no digit after
+ * it), so for SUP-7, `SUP-70` and `XSUP-7` are other cards and `SUP-7-notes` is
+ * not. A standard name (`ISO-8601`) is not a card, except under this card's own
+ * prefix: for card ISO-7, `ISO-9` is another card.
  */
-export function otherCardIdentifiers(text: string, identifier: string): string[] {
+function otherCardTokens(text: string, identifier: string, patterns: readonly RegExp[]): string[] {
   const own = identifier.toUpperCase();
+  const ownPrefix = own.replace(/-\d+$/, "");
   const found = new Set<string>();
-  for (const match of text.matchAll(/(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]*-\d+(?![0-9])/g)) {
-    const token = match[0].toUpperCase();
-    if (token !== own && !NON_CARD_IDENTIFIER_PREFIXES.has(token.replace(/-\d+$/, ""))) found.add(token);
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const token = match[0].toUpperCase();
+      const prefix = token.replace(/-\d+$/, "");
+      if (token !== own && (prefix === ownPrefix || !NON_CARD_IDENTIFIER_PREFIXES.has(prefix))) found.add(token);
+    }
   }
   return [...found];
+}
+
+/**
+ * Card identifiers a declaration names other than `identifier`: every
+ * `<word>-<number>` token in any case, so `other-999`, `SUP-70` and `phase-2`
+ * all refuse the declaration (fail closed).
+ */
+export function otherCardIdentifiers(text: string, identifier: string): string[] {
+  return otherCardTokens(text, identifier, [/(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]*-\d+(?![0-9])/g]);
+}
+
+/**
+ * Card identifiers the recorded worktree's branch names other than
+ * `identifier`: any upper-case `PREFIX-<n>` token, plus this card's own prefix
+ * in any case. A default-template branch is the lower-cased issue title after
+ * the identifier, so `phase-2`, `sprint-12` or `q3-2026` in it name no card;
+ * a lower-case foreign card's branch is refused by the attribution rule.
+ */
+function otherCardIdentifiersInBranch(branch: string, identifier: string): string[] {
+  const ownPrefix = identifier.toUpperCase().replace(/-\d+$/, "");
+  return otherCardTokens(branch, identifier, [
+    /(?<![A-Za-z0-9])[A-Z][A-Z0-9]*-\d+(?![0-9])/g,
+    new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(ownPrefix)}-\\d+(?![0-9])`, "gi"),
+  ]);
 }
 
 /** Project default branch, reduced to a branch name; null when it is not one. */
@@ -701,7 +784,7 @@ async function verifyCleanLinkedWorktree(
   }
   try {
     const dirtyReason = await withSnapshotGitDir(
-      { identity, headSha, config: snapshotConfig(identity.objectFormat), exclude },
+      { identity, headSha, config: snapshotConfig(identity.objectFormat), exclude, deadline: worktreeOptions.deadline },
       async (snapshot) => {
         const trackedPaths = new Set<string>();
         for (const entry of await listIndexEntries(snapshot, worktreePath, worktreeOptions)) {
@@ -810,7 +893,7 @@ export async function probeNoRepositoryWorktree(
   if (!branchNamesIssue(own.branch, input.issueIdentifier)) {
     return refuse(`the recorded worktree's branch does not name ${input.issueIdentifier}`);
   }
-  const otherCards = otherCardIdentifiers(own.branch, input.issueIdentifier);
+  const otherCards = otherCardIdentifiersInBranch(own.branch, input.issueIdentifier);
   if (otherCards.length > 0) {
     return refuse(`the recorded worktree's branch ${own.branch} also names another card (${otherCards.join(", ")})`);
   }
@@ -887,26 +970,36 @@ export async function probeNoRepositoryWorktree(
   }
 }
 
-const IN_TRANSACTION_RECHECK_TIMEOUT_MS = 5_000;
+const IN_TRANSACTION_RECHECK_BUDGET_MS = 15_000;
 
 /**
  * The status write's re-check, inside its transaction: the measured worktree
  * must still be clean (index, status, ignored entries) on the measured branch
- * and commit. One worktree, no GitHub call, and a short timeout bounds how
- * long it can hold the issue row.
+ * and commit. One worktree, no GitHub call, and one shared 15 s budget for
+ * every Git process and the snapshot copy bounds how long it can hold the
+ * issue row; the budget running out refuses with a distinct "timed out"
+ * reason, never "status could not be verified".
  */
 export async function recheckRecordedWorktree(input: {
   worktreePath: string;
   commonDir: string;
   branch: string;
   headSha: string;
-  timeoutMs?: number;
+  budgetMs?: number;
 }): Promise<{ ok: true } | { ok: false; reason: string }> {
   if (!resolveTrustedGitBinary()) return { ok: false, reason: "no root-owned git binary is installed at a fixed system path" };
+  const budgetMs = input.budgetMs ?? IN_TRANSACTION_RECHECK_BUDGET_MS;
+  const deadline: ProbeDeadline = { at: Date.now() + budgetMs, expired: false };
   const verdict = await verifyCleanLinkedWorktree(input.worktreePath, input.commonDir, {
     cwd: path.dirname(input.commonDir),
-    timeoutMs: input.timeoutMs ?? IN_TRANSACTION_RECHECK_TIMEOUT_MS,
+    deadline,
   });
+  if (deadline.expired) {
+    return {
+      ok: false,
+      reason: `the recorded worktree could not be re-checked within ${budgetMs} ms (timed out at the close write)`,
+    };
+  }
   if (!verdict.ok) return { ok: false, reason: `the recorded worktree ${verdict.reason}` };
   if (verdict.branch !== input.branch || verdict.headSha !== input.headSha) {
     return { ok: false, reason: "the recorded worktree's HEAD moved after the close was measured" };
