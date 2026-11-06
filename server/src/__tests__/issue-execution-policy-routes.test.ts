@@ -3081,6 +3081,21 @@ describe("issue execution policy routes", () => {
       );
     }
 
+    // Escalation decisions commit inside rejectInteraction's transaction hook, so the
+    // mocked service must run it like the real one does.
+    function rejectRunningTransactionHooks(resolved: unknown) {
+      mockIssueThreadInteractionService.rejectInteraction.mockImplementationOnce(
+        async (_issue: unknown, _id: unknown, _body: unknown, _actor: unknown, hooks?: {
+          afterResolveInTransaction?: (tx: unknown, resolved: unknown) => Promise<void>;
+        }) => {
+          await mockDb.transaction(async (tx) => {
+            await hooks?.afterResolveInTransaction?.(tx, resolved);
+          });
+          return resolved;
+        },
+      );
+    }
+
     it("accepting the escalation on the final stage records an approved decision, completes the stage, and closes the card done", async () => {
       const issue = escalatedRoundCapIssue();
       const pending = pendingEscalationInteraction();
@@ -3281,7 +3296,7 @@ describe("issue execution policy routes", () => {
         async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }),
       );
       mockIssueThreadInteractionService.getForIssue.mockResolvedValueOnce(pending);
-      mockIssueThreadInteractionService.acceptInteraction.mockResolvedValueOnce({
+      acceptRunningTransactionHooks({
         interaction: {
           ...pending,
           status: "accepted",
@@ -3402,7 +3417,7 @@ describe("issue execution policy routes", () => {
         assigneeUserId: null,
       } as any);
       mockIssueThreadInteractionService.getForIssue.mockResolvedValueOnce(pending);
-      mockIssueThreadInteractionService.rejectInteraction.mockResolvedValueOnce({
+      rejectRunningTransactionHooks({
         ...pending,
         status: "rejected",
         result: { version: 1, outcome: "rejected", reason },

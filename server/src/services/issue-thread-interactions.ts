@@ -2494,10 +2494,6 @@ export function issueThreadInteractionService(
         );
       }
       const rejectedInteraction = hydrateInteraction(resolved);
-      await args.mutationOptions?.afterResolveInTransaction?.(
-        tx,
-        rejectedInteraction,
-      );
       const rejectedPlanNeedsRevision =
         lockedCurrent.kind === "request_confirmation" &&
         readAcceptedPlanConfirmationTarget(
@@ -2526,6 +2522,10 @@ export function issueThreadInteractionService(
       } else {
         await touchIssue(tx, args.issue.id);
       }
+      await args.mutationOptions?.afterResolveInTransaction?.(
+        tx,
+        rejectedInteraction,
+      );
       await enqueueTerminalIssueInteractionChatPublications(
         tx as unknown as Db,
         rejectedInteraction,

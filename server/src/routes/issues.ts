@@ -23643,7 +23643,7 @@ export function issueRoutes(
       // Terminal final-stage only: nonterminal accepts keep the three-argument call.
       const acceptArgs: [typeof issue, string, typeof req.body, typeof acceptActor] = [issue, interactionId, req.body, acceptActor];
       const deferredPostCommit = { activityPublications: [] as ActivityPublication[], postCommitActions: [] as IssuePostCommitAction[] };
-      const applyEscalationApproval = (dbLike: Db, deferred?: typeof deferredPostCommit) => applyReviewEscalationDecision({
+      const applyEscalationApproval = (dbLike: Db) => applyReviewEscalationDecision({
         db: dbLike,
         issue,
         requestedStatus: "done",
@@ -23657,19 +23657,19 @@ export function issueRoutes(
         // guard above already allowed it); a non-final stage still only advances
         // the pointer via the engine's `in_review` patch.
         finalStageDisposition: reviewEscalationCompletesLadder ? "done" : "handback",
-        ...(deferred ? { deferredPostCommit: deferred } : {}),
+        deferredPostCommit,
       });
-      const terminalEscalationResolution: { value: Awaited<ReturnType<typeof applyEscalationApproval>> } = { value: null };
-      const { interaction, createdIssues, continuationIssue } = escalationApproval
+      const acceptedEscalationDecision: { value: Awaited<ReturnType<typeof applyEscalationApproval>> } = { value: null };
+      const { interaction, createdIssues, continuationIssue } = reviewEscalationAccept
         ? await interactionSvc.acceptInteraction(...acceptArgs, {
             // The decision commits in the interaction's transaction, under the issue
             // lock taken by the revalidation, so a stale verdict leaves both pending.
             afterResolveInTransaction: async (tx) => {
-              terminalEscalationResolution.value = await applyEscalationApproval(tx as unknown as Db, deferredPostCommit);
-              if (terminalEscalationResolution.value && escalationCertifiedDelivery) {
+              acceptedEscalationDecision.value = await applyEscalationApproval(tx as unknown as Db);
+              if (acceptedEscalationDecision.value && escalationCertifiedDelivery) {
                 const finalDelivery = {
                   ...escalationCertifiedDelivery,
-                  decisionId: terminalEscalationResolution.value.decisionId,
+                  decisionId: acceptedEscalationDecision.value.decisionId,
                 };
                 await tx.update(issueRows).set({
                   executionState: sql`jsonb_set(
@@ -23681,21 +23681,23 @@ export function issueRoutes(
                 }).where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)));
               }
             },
-            beforeResolveInTransaction: async (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => {
-              const [lockedIssue] = await tx.select().from(issueRows)
-                .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)))
-                .for("update");
-              if (!lockedIssue) throw notFound("Issue not found");
-              if (lockedIssue.deliveryRequirement !== issue.deliveryRequirement) {
-                throw conflict("Card delivery classification changed before the final delivery preflight; retry the final verdict", {
-                  code: "approval_final_delivery_preflight_stale",
-                  reason: "head_moved: delivery classification changed before final delivery preflight",
+            ...(escalationApproval ? {
+              beforeResolveInTransaction: async (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => {
+                const [lockedIssue] = await tx.select().from(issueRows)
+                  .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)))
+                  .for("update");
+                if (!lockedIssue) throw notFound("Issue not found");
+                if (lockedIssue.deliveryRequirement !== issue.deliveryRequirement) {
+                  throw conflict("Card delivery classification changed before the final delivery preflight; retry the final verdict", {
+                    code: "approval_final_delivery_preflight_stale",
+                    reason: "head_moved: delivery classification changed before final delivery preflight",
+                  });
+                }
+                await preflightTerminalApproval(lockedIssue, escalationApproval!.patch, escalationApproval!.decision, lockedIssue.executionPolicy, {
+                  locked: { prefetch: escalationApproval!.prefetch, tx: tx as unknown as Db },
                 });
-              }
-              await preflightTerminalApproval(lockedIssue, escalationApproval!.patch, escalationApproval!.decision, lockedIssue.executionPolicy, {
-                locked: { prefetch: escalationApproval!.prefetch, tx: tx as unknown as Db },
-              });
-            },
+              },
+            } : {}),
           })
         : await interactionSvc.acceptInteraction(...acceptArgs);
       for (const publication of deferredPostCommit.activityPublications) publishActivity(publication);
@@ -23711,9 +23713,7 @@ export function issueRoutes(
         interaction.status === "accepted" &&
         isReviewEscalationInteraction(current)
       ) {
-        const escalationResolution = escalationApproval
-          ? terminalEscalationResolution.value
-          : await applyEscalationApproval(db);
+        const escalationResolution = acceptedEscalationDecision.value;
         if (escalationResolution) {
           resolvedContinuationIssue = escalationResolution;
           // SUP-17163: accepting a review round-cap escalation records an
@@ -24062,52 +24062,65 @@ export function issueRoutes(
         res.json(await interactionSvc.getById(current.id));
         return;
       }
-      const interaction = await interactionSvc.rejectInteraction(
+      const rejectActor = {
+        agentId: actor.agentId,
+        runId: actor.runId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+        resolverPolicyRestriction:
+          resolutionAuthorization.resolverPolicyRestriction,
+      };
+      const rejectArgs: [typeof issue, string, typeof req.body, typeof rejectActor] = [
         issue,
         interactionId,
         req.body,
-        {
-          agentId: actor.agentId,
-          runId: actor.runId,
-          userId: actor.actorType === "user" ? actor.actorId : null,
-          resolverPolicyRestriction:
-            resolutionAuthorization.resolverPolicyRestriction,
-        },
-      );
-      let resolvedContinuationIssue: {
-        id: string;
-        status: string;
-        assigneeAgentId: string | null;
-        assigneeUserId: string | null;
-      } | null = null;
+        rejectActor,
+      ];
+      const rejectDeferredPostCommit = {
+        activityPublications: [] as ActivityPublication[],
+        postCommitActions: [] as IssuePostCommitAction[],
+      };
+      const rejectedEscalationDecision: {
+        value: Awaited<ReturnType<typeof applyReviewEscalationDecision>>;
+      } = { value: null };
       // SUP-14919: rejecting a review round-cap escalation records a
       // changes-requested decision and hands the card back to its return
-      // assignee so the continuation wake below has an agent to wake.
-      if (
-        interaction.kind === "request_confirmation" &&
-        interaction.status === "rejected" &&
+      // assignee so the continuation wake below has an agent to wake. The
+      // decision commits in the interaction's transaction, so a stale
+      // snapshot refuses it and leaves the interaction pending.
+      const interaction =
+        current.kind === "request_confirmation" &&
         isReviewEscalationInteraction(current)
-      ) {
-        const reason =
-          typeof interaction.result?.reason === "string" &&
-          interaction.result.reason.trim().length > 0
-            ? interaction.result.reason.trim()
-            : "Review changes requested via the round-cap escalation.";
-        const escalationResolution = await applyReviewEscalationDecision({
-          db,
-          issue,
-          requestedStatus: "in_progress",
-          decisionBody: reason,
-          actor: {
-            agentId: actor.agentId,
-            userId: actor.actorType === "user" ? actor.actorId : null,
-            runId: actor.runId,
-          },
-        });
-        if (escalationResolution) {
-          resolvedContinuationIssue = escalationResolution;
-        }
-      }
+          ? await interactionSvc.rejectInteraction(...rejectArgs, {
+              afterResolveInTransaction: async (tx, resolved) => {
+                if (resolved.kind !== "request_confirmation") return;
+                const reason =
+                  typeof resolved.result?.reason === "string" &&
+                  resolved.result.reason.trim().length > 0
+                    ? resolved.result.reason.trim()
+                    : "Review changes requested via the round-cap escalation.";
+                rejectedEscalationDecision.value =
+                  await applyReviewEscalationDecision({
+                    db: tx as unknown as Db,
+                    issue,
+                    requestedStatus: "in_progress",
+                    decisionBody: reason,
+                    actor: {
+                      agentId: actor.agentId,
+                      userId:
+                        actor.actorType === "user" ? actor.actorId : null,
+                      runId: actor.runId,
+                    },
+                    deferredPostCommit: rejectDeferredPostCommit,
+                  });
+              },
+            })
+          : await interactionSvc.rejectInteraction(...rejectArgs);
+      for (const publication of rejectDeferredPostCommit.activityPublications)
+        publishActivity(publication);
+      await flushIssuePostCommitActions(
+        rejectDeferredPostCommit.postCommitActions,
+      );
+      const resolvedContinuationIssue = rejectedEscalationDecision.value;
 
       await logActivity(db, {
         companyId: issue.companyId,

@@ -13,6 +13,7 @@ import {
   issueComments,
   issueExecutionDecisions,
   issueRecoveryActions,
+  issueThreadInteractions,
   issues,
   projects,
 } from "@paperclipai/db";
@@ -42,11 +43,11 @@ const activityFault = vi.hoisted(() => ({ action: null as string | null }));
 // Deterministic interleaving: `beforeLock` runs once, on the request's first
 // row-lock read, after the route computed its decision from the unlocked read
 // and before the locked re-check reads the row.
-// `afterResolve` runs once, right after an interaction accept or reject commits
-// and before the route writes the escalation stage decision.
+// `beforeResolve` runs once, right before an interaction accept or reject opens its
+// transaction: after the route read the card, before the resolution locks it.
 const lockInterleave = vi.hoisted(() => ({
   beforeLock: null as null | (() => Promise<void>),
-  afterResolve: null as null | (() => Promise<void>),
+  beforeResolve: null as null | (() => Promise<void>),
 }));
 vi.mock("../services/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/index.js")>();
@@ -71,18 +72,21 @@ vi.mock("../services/index.js", async (importOriginal) => {
     },
     issueThreadInteractionService: (...args: Parameters<typeof actual.issueThreadInteractionService>) => {
       const svc = actual.issueThreadInteractionService(...args);
-      const afterResolve = async <T,>(result: T): Promise<T> => {
-        const hook = lockInterleave.afterResolve;
-        lockInterleave.afterResolve = null;
+      const beforeResolve = async () => {
+        const hook = lockInterleave.beforeResolve;
+        lockInterleave.beforeResolve = null;
         if (hook) await hook();
-        return result;
       };
       return {
         ...svc,
-        acceptInteraction: async (...resolveArgs: Parameters<typeof svc.acceptInteraction>) =>
-          afterResolve(await svc.acceptInteraction(...resolveArgs)),
-        rejectInteraction: async (...resolveArgs: Parameters<typeof svc.rejectInteraction>) =>
-          afterResolve(await svc.rejectInteraction(...resolveArgs)),
+        acceptInteraction: async (...resolveArgs: Parameters<typeof svc.acceptInteraction>) => {
+          await beforeResolve();
+          return svc.acceptInteraction(...resolveArgs);
+        },
+        rejectInteraction: async (...resolveArgs: Parameters<typeof svc.rejectInteraction>) => {
+          await beforeResolve();
+          return svc.rejectInteraction(...resolveArgs);
+        },
       };
     },
     logActivity: async (...args: Parameters<typeof actual.logActivity>) => {
@@ -122,7 +126,7 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
   afterEach(async () => {
     activityFault.action = null;
     lockInterleave.beforeLock = null;
-    lockInterleave.afterResolve = null;
+    lockInterleave.beforeResolve = null;
     if (seededRunIds.length > 0) {
       await db.update(heartbeatRuns).set({ status: "cancelled" }).where(inArray(heartbeatRuns.id, seededRunIds));
       seededRunIds.length = 0;
@@ -1175,8 +1179,8 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     headSha,
   });
 
-  function refreshDeliveryAfterResolve(issueId: string, delivery: Record<string, unknown>) {
-    lockInterleave.afterResolve = async () => {
+  function refreshDeliveryBeforeResolve(issueId: string, delivery: Record<string, unknown>) {
+    lockInterleave.beforeResolve = async () => {
       const current = await issueRow(issueId);
       await db
         .update(issues)
@@ -1208,62 +1212,64 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     });
   }, 60_000);
 
-  it("refuses an escalation accept that would erase a same-head PR binding refreshed after the read (SUP-23260)", async () => {
-    const seeded = await seedCompany();
-    const headSha = "a".repeat(40);
-    const { issueId, stageId } = await seedPlainPendingReview(seeded, {
-      maxReviewRounds: 3,
-      secondStage: true,
-      escalated: true,
-      delivery: sameHeadDelivery(headSha),
-    });
-    const interaction = await seedEscalationInteraction(seeded, issueId, stageId);
-    const refreshed = {
-      ...sameHeadDelivery(headSha),
-      prNumber: 1117,
-      prUrl: "https://github.com/TEA-Core/paperclip/pull/1117",
-    };
-    refreshDeliveryAfterResolve(issueId, refreshed);
+  it.each([
+    { door: "final-stage accept", action: "accept", secondStage: false },
+    { door: "non-final accept", action: "accept", secondStage: true },
+    { door: "reject", action: "reject", secondStage: false },
+  ] as const)(
+    "refuses an escalation $door that would erase a same-head PR binding refreshed after the read and leaves the interaction retryable (SUP-23260)",
+    async ({ action, secondStage }) => {
+      const seeded = await seedCompany();
+      const headSha = "a".repeat(40);
+      const { issueId, stageId } = await seedPlainPendingReview(seeded, {
+        maxReviewRounds: 3,
+        secondStage,
+        escalated: true,
+        delivery: sameHeadDelivery(headSha),
+      });
+      const interaction = await seedEscalationInteraction(seeded, issueId, stageId);
+      const refreshed = {
+        ...sameHeadDelivery(headSha),
+        prNumber: 1117,
+        prUrl: "https://github.com/TEA-Core/paperclip/pull/1117",
+      };
+      const resolve = () =>
+        request(app(boardActor(seeded)))
+          .post(`/api/issues/${issueId}/interactions/${interaction.id}/${action}`)
+          .send(action === "reject" ? { reason: "Needs another round." } : {});
+      const resolutionActivity = async () =>
+        (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).filter((row) =>
+          row.action.startsWith("issue.thread_interaction_"),
+        );
+      const interactionStatus = async () =>
+        (await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction.id)))[0]
+          ?.status;
+      const before = await issueRow(issueId);
+      refreshDeliveryBeforeResolve(issueId, refreshed);
 
-    const res = await request(app(boardActor(seeded)))
-      .post(`/api/issues/${issueId}/interactions/${interaction.id}/accept`)
-      .send({});
+      const refused = await resolve();
 
-    expect(lockInterleave.afterResolve).toBeNull();
-    expect(res.status, JSON.stringify(res.body)).toBe(409);
-    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
-    expect(await decisionRows(issueId)).toHaveLength(0);
-    const row = await issueRow(issueId);
-    expect(row.status).toBe("in_review");
-    expect(row.executionState).toMatchObject({ status: "pending", delivery: refreshed });
-  }, 60_000);
+      expect(lockInterleave.beforeResolve).toBeNull();
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+      expect(await decisionRows(issueId)).toHaveLength(0);
+      expect(await resolutionActivity()).toHaveLength(0);
+      expect(await interactionStatus()).toBe("pending");
+      const afterRefusal = await issueRow(issueId);
+      expect(afterRefusal.status).toBe(before.status);
+      expect(afterRefusal.assigneeAgentId).toBe(before.assigneeAgentId);
+      expect(afterRefusal.assigneeUserId).toBe(before.assigneeUserId);
+      expect(afterRefusal.executionState).toMatchObject({ status: "pending", delivery: refreshed });
 
-  it("refuses an escalation reject that would erase a same-head PR binding refreshed after the read (SUP-23260)", async () => {
-    const seeded = await seedCompany();
-    const headSha = "a".repeat(40);
-    const { issueId, stageId } = await seedPlainPendingReview(seeded, {
-      maxReviewRounds: 3,
-      escalated: true,
-      delivery: sameHeadDelivery(headSha),
-    });
-    const interaction = await seedEscalationInteraction(seeded, issueId, stageId);
-    const refreshed = {
-      ...sameHeadDelivery(headSha),
-      prNumber: 1117,
-      prUrl: "https://github.com/TEA-Core/paperclip/pull/1117",
-    };
-    refreshDeliveryAfterResolve(issueId, refreshed);
+      const retried = await resolve();
 
-    const res = await request(app(boardActor(seeded)))
-      .post(`/api/issues/${issueId}/interactions/${interaction.id}/reject`)
-      .send({ reason: "Needs another round." });
-
-    expect(lockInterleave.afterResolve).toBeNull();
-    expect(res.status, JSON.stringify(res.body)).toBe(409);
-    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
-    expect(await decisionRows(issueId)).toHaveLength(0);
-    expect((await issueRow(issueId)).executionState).toMatchObject({ status: "pending", delivery: refreshed });
-  }, 60_000);
+      expect(retried.status, JSON.stringify(retried.body)).toBe(200);
+      expect(await decisionRows(issueId)).toHaveLength(1);
+      expect(await interactionStatus()).toBe(action === "accept" ? "accepted" : "rejected");
+      expect((await issueRow(issueId)).executionState).toMatchObject({ delivery: refreshed });
+    },
+    60_000,
+  );
 
   async function resolveRecovery(seeded: Seeded, issueId: string, note: string) {
     const [action] = await db.insert(issueRecoveryActions).values({
