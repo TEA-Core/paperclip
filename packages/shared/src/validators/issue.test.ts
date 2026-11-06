@@ -135,6 +135,29 @@ describe("issue validators", () => {
     ).toBeUndefined();
   });
 
+  it("accepts the structured no-repository Tier 1 declaration and rejects variants carrying evidence", () => {
+    const declaration = {
+      tier: "tier1",
+      reason: "The deliverable is the recorded entry ruling",
+      landing: { mode: "noRepositoryLanding" },
+    };
+    expect(doneTierDeclarationSchema.safeParse(declaration).success).toBe(true);
+    expect(doneTierDeclarationSchema.safeParse({
+      ...declaration,
+      landing: { mode: "noRepositoryLanding", mergeCommit: "3f9c1e0a25b8" },
+    }).success).toBe(false);
+    expect(doneTierDeclarationSchema.safeParse({ tier: "tier1", reason: declaration.reason }).success).toBe(false);
+  });
+
+  it.each([
+    ["constructor inside landing", '{"tier":"tier1","reason":"r","landing":{"mode":"noRepositoryLanding","constructor":{"x":1}}}'],
+    ["prototype inside landing", '{"tier":"tier1","reason":"r","landing":{"mode":"noRepositoryLanding","prototype":{"x":1}}}'],
+    ["constructor at the top level", '{"tier":"tier1","reason":"r","constructor":{},"landing":{"mode":"noRepositoryLanding"}}'],
+    ["prototype on a Tier 2 declaration", '{"tier":"tier2","probeEvidence":"probe `x` head 3f9c1e0a25b8 post-merge: y","prototype":{}}'],
+  ])("rejects an own %s key as an unknown key, without a dedicated check", (_label, raw) => {
+    expect(doneTierDeclarationSchema.safeParse(JSON.parse(raw)).success).toBe(false);
+  });
+
   it("accepts delivery requirements on create and update while rejecting unknown values", () => {
     expect(createIssueSchema.parse({ title: "Default delivery" }).deliveryRequirement).toBeUndefined();
     expect(

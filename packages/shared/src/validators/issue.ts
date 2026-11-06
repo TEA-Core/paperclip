@@ -1111,6 +1111,8 @@ const doneTierLandingDelegatedSchema = z
   })
   .strict();
 
+// SUP-22570: the record_only close with no repository deliverable. It carries
+// no repository evidence by construction; the server proves the claim.
 const doneTierNoRepositoryLandingSchema = z
   .object({
     mode: z.literal("noRepositoryLanding"),

@@ -563,6 +563,24 @@ describe("paperclip MCP tools", () => {
     }).success).toBe(false);
   });
 
+  it.each(["paperclipUpdateIssue", "paperclipAddComment"])(
+    "%s advertises the full structured doneTier declaration to tool clients",
+    (toolName) => {
+      const advertised = z.toJSONSchema(getTool(toolName).schema.shape.doneTier, { io: "input" }) as {
+        oneOf?: Array<{ properties?: Record<string, { const?: string; oneOf?: Array<{ properties?: { mode?: { const?: string } } }> }> }>;
+      };
+
+      const tiers = advertised.oneOf?.map((branch) => branch.properties?.tier?.const).sort();
+      expect(tiers).toEqual(["tier1", "tier2"]);
+      const tier1 = advertised.oneOf?.find((branch) => branch.properties?.tier?.const === "tier1");
+      expect(tier1?.properties?.landing?.oneOf?.map((landing) => landing.properties?.mode?.const).sort()).toEqual([
+        "landedAtTip",
+        "landingDelegated",
+        "noRepositoryLanding",
+      ]);
+    },
+  );
+
   it("exposes paperclipCreateApproval as a mergeable object schema", () => {
     const tool = getTool("paperclipCreateApproval");
 

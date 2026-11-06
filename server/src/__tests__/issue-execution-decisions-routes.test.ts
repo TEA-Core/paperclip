@@ -148,6 +148,32 @@ async function seedAgent(db: Db, companyId: string, permissions: Record<string, 
   return agent!;
 }
 
+// The done-transition guard writes its audit rows fire-and-forget (`void writeAuditLog`),
+// so a refused request can return before its activity_log insert commits. That insert
+// can land between the activity_log delete and the companies delete in teardown and
+// block it with activity_log_company_id_companies_id_fk. Re-clear the log and retry.
+// Once the company is gone a still-late insert fails the same FK and is swallowed.
+function causedByActivityLogCompanyFk(error: unknown): boolean {
+  for (let current: unknown = error, depth = 0; current && depth < 6; depth += 1) {
+    if ((current as { constraint_name?: unknown }).constraint_name === "activity_log_company_id_companies_id_fk") return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+async function deleteCompaniesAfterLateAuditWrites(db: Db) {
+  for (let attempt = 0; ; attempt += 1) {
+    await db.delete(activityLog);
+    try {
+      await db.delete(companies);
+      return;
+    } catch (error) {
+      if (attempt >= 4 || !causedByActivityLogCompanyFk(error)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
+    }
+  }
+}
+
 async function seedProject(db: Db, companyId: string, name: string) {
   const [project] = await db.insert(projects).values({
     companyId,
@@ -244,7 +270,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     await db.delete(agents);
     await db.delete(executionWorkspaces);
     await db.delete(projects);
-    await db.delete(companies);
+    await deleteCompaniesAfterLateAuditWrites(db);
   });
 
   afterAll(async () => {

@@ -279,9 +279,17 @@ import {
   TIER2_RECORD_ONLY_FORM,
   findMissingAdr072CloseLadderStages,
   renderDoneTierDeclaration,
+  measureNoRepositoryLandingForClose,
+  noRepositoryLandingAuditDetails,
+  noRepositoryStructuredFormSuffix,
+  noRepositoryTier1FormSuffix,
   TIER1_FORM,
+  verifyNoRepositoryLandingAtTransition,
   writeAuditLog,
+  type DoneTierClosingActor,
   type DoneTransitionOverride,
+  type NoRepositoryLandingCloseRequest,
+  type NoRepositoryLandingMeasurement,
 } from "../services/done-transition-guard.js";
 import {
   decideIssueReviewPathRecovery,
@@ -5308,7 +5316,7 @@ export function issueRoutes(
   }
 
   type DoneTransitionGuardOutcome =
-    | { ok: true; overrideAccepted?: boolean }
+    | { ok: true; overrideAccepted?: boolean; noRepositoryLanding?: boolean }
     | { ok: false; status: number; body: Record<string, unknown> };
 
   // Single evaluator for BOTH done-transition guards, shared by every route that can
@@ -5348,6 +5356,10 @@ export function issueRoutes(
     // door that passes none keeps the seat-blind body.
     caller?: RefusalCaller;
     persistRefusalComment?: boolean;
+    // SUP-22570: only a door that re-runs verifyNoRepositoryLandingAtTransition
+    // inside its status write passes the closing actor; every other door leaves
+    // it unset, and the record_only no-repository form then refuses.
+    noRepositoryLandingCloser?: DoneTierClosingActor;
   }): Promise<DoneTransitionGuardOutcome> {
     const {
       issue,
@@ -5489,6 +5501,7 @@ export function issueRoutes(
       commentBody,
       runId,
       (issueId) => svc.listComments(issueId, { order: "desc", limit: 100 }),
+      input.noRepositoryLandingCloser ?? null,
     );
     if (tierResult.skipped) {
       void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
@@ -5515,19 +5528,23 @@ export function issueRoutes(
       const tier2CommentForm = issue.deliveryRequirement === "record_only"
         ? TIER2_RECORD_ONLY_FORM
         : TIER2_FORM;
-      const remedy = input.createDoor
+      const remedy = tierResult.remedy ?? (input.createDoor
         ? "An issue cannot be created already done with a done-tier declaration: createIssueSchema accepts neither a close comment nor the structured doneTier field. Create the issue in a non-terminal status first, then close it via PATCH /api/issues/{id} with the structured doneTier field in the same request body: " +
           `${structuredForms}` +
+          noRepositoryStructuredFormSuffix(issue) +
           `. Alternatively, include a done-tier declaration in the close comment: ` +
           `${tier2CommentForm}` +
           ` or ${TIER1_FORM}` +
+          noRepositoryTier1FormSuffix(issue) +
           ` — per SUP-12693.`
         : "Provide a done-tier declaration, preferably as the structured doneTier field in this same request body: " +
           `${structuredForms}` +
+          noRepositoryStructuredFormSuffix(issue) +
           `. Alternatively, include a done-tier declaration in the close comment: ` +
           `${tier2CommentForm}` +
           ` or ${TIER1_FORM}` +
-          ` — per SUP-12693.`;
+          noRepositoryTier1FormSuffix(issue) +
+          ` — per SUP-12693.`);
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
       // a record-write failure propagates to the route's error handler (5xx) rather than
       // returning a 422 with no thread-readable code/remedy (SUP-15878 precedent).
@@ -5555,9 +5572,17 @@ export function issueRoutes(
       };
     }
     if (tierResult.tier === "tier1") {
+      // Written per request, before and outside the close transaction, exactly as
+      // on the base branch (f012e6fb1): concurrent closes of one issue each write
+      // one row here even though only the first commits (the others refuse at the
+      // compare-and-set). Left in place on purpose; only the verification row,
+      // which is written in the transaction, is one per transition.
       void writeAuditLog(db, issue, "issue.done_transition_tier1_close", {
         reason: tierResult.reason,
         decisionCarried,
+        ...(tierResult.noRepositoryMeasurement
+          ? { noRepositoryLanding: noRepositoryLandingAuditDetails(tierResult.noRepositoryMeasurement) }
+          : {}),
       });
     }
     // SUP-20525 (SUP-18110 ask 1): resolve the close comment's cited commit
@@ -5617,7 +5642,7 @@ export function issueRoutes(
         "cited-SHA resolution failed; done transition allowed (fail open)",
       );
     }
-    return { ok: true, overrideAccepted };
+    return { ok: true, overrideAccepted, noRepositoryLanding: tierResult.landing === "noRepositoryLanding" };
   }
 
   // Every route that can resolve a blocker routes its dependent wake through these
@@ -20059,6 +20084,9 @@ export function issueRoutes(
     // certify the issue until that request-owned mutation has finished.
     let deferFinalDeliveryPrefetch = false;
     let doneOverrideAccepted = false;
+    // SUP-22570: the closer of an accepted record_only no-repository close; the
+    // same checks re-run inside the update transaction below.
+    let noRepositoryLandingCloser: DoneTierClosingActor | null = null;
     let originalDeliveryBinding: string | null = null;
     // Refuse before evaluateDoneTransitionGuards. That guard writes
     // issue.done_tier_declaration_skipped, and the later side-effect reject
@@ -20078,6 +20106,10 @@ export function issueRoutes(
               reason: (req.body.doneTransitionOverride as { reason?: string }).reason,
             }
           : null;
+      const closingActor: DoneTierClosingActor = {
+        agentId: actor.agentId ?? null,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      };
       const outcome = await evaluateDoneTransitionGuards({
         issue: finalDeliveryIssue,
         override,
@@ -20086,12 +20118,14 @@ export function issueRoutes(
         decisionCarried: !!transition.decision,
         boardActor: req.actor.type === "board",
         caller: refusalCaller,
+        noRepositoryLandingCloser: closingActor,
       });
       if (!outcome.ok) {
         res.status(outcome.status).json(outcome.body);
         return;
       }
       doneOverrideAccepted = outcome.overrideAccepted === true;
+      if (outcome.noRepositoryLanding === true) noRepositoryLandingCloser = closingActor;
       if (terminalApprovalNeedsClassificationCheck) {
         finalDeliveryPrefetch = await prefetchFinalDelivery(finalDeliveryIssue);
         deferFinalDeliveryPrefetch = Boolean(existing.assigneeAgentId && (assigneeWillChange || terminalizingIssue));
@@ -20481,6 +20515,8 @@ export function issueRoutes(
       // SUP-16525: a policy write that must satisfy INV-LADDER-1 is re-asserted
       // against the locked row, so it has to run on the transactional path.
       || invariantPolicyToRecheck !== null
+      // SUP-22570: a record_only no-repository close re-probes inside the write.
+      || noRepositoryLandingCloser !== null
       || (
         missingApprovalStageGap !== null
         && requestedTransitionStatus === "done"
@@ -20494,7 +20530,36 @@ export function issueRoutes(
         && effectiveStatus === "in_review"
         && existing.status !== "in_review"
       );
+    // SUP-22570: a record_only no-repository close is measured here, outside
+    // any transaction: every GitHub compare and the full Git probe run now.
+    // The status write below only compares this measurement with the row it
+    // locks, and runs one bounded Git re-check of the measured worktree (a
+    // shared 15 s budget, no GitHub call) while the issue row is held.
+    const noRepositoryCloseRequest: NoRepositoryLandingCloseRequest = {
+      checkedExecutionWorkspaceId: finalDeliveryIssue.executionWorkspaceId ?? null,
+      requestedDeliveryRequirement: updateFields.deliveryRequirement,
+      requestedExecutionWorkspaceId: updateFields.executionWorkspaceId,
+      requestedProjectWorkspaceId: updateFields.projectWorkspaceId,
+    };
+    const noRepositoryLandingRefusal = (reason: string) =>
+      unprocessable(reason, {
+        code: "done_transition_missing_tier_declaration",
+        issueId: existing.id,
+        identifier: existing.identifier ?? null,
+        stage: "no_repository_landing_transition_recheck",
+      });
+    let noRepositoryMeasurement: NoRepositoryLandingMeasurement | null = null;
     try {
+      if (noRepositoryLandingCloser !== null) {
+        const verdict = await measureNoRepositoryLandingForClose(
+          db,
+          (await svc.getById(id)) ?? existing,
+          noRepositoryLandingCloser,
+          noRepositoryCloseRequest,
+        );
+        if (!verdict.ok) throw noRepositoryLandingRefusal(verdict.reason);
+        noRepositoryMeasurement = verdict.measurement;
+      }
       if (shouldUseTransactionalIssueUpdate) {
         issue = await db.transaction(async (tx) => {
           // ADR-103 M4: validate the re-parent edge inside the write
@@ -20735,6 +20800,39 @@ export function issueRoutes(
             issueUpdateData.executionState = updateFields.executionState;
           }
 
+          // SUP-22570: compare-and-set against the measurement taken before
+          // this transaction. It re-reads the database half of the proof,
+          // re-checks the measured worktree with a Git status under one
+          // shared 15 s budget (no GitHub call), and refuses if anything moved,
+          // got dirty or ran out of budget since the measurement.
+          if (noRepositoryLandingCloser !== null && noRepositoryMeasurement !== null) {
+            const lockedForLanding = await svc.getByIdForUpdate(id, tx);
+            if (!lockedForLanding) return null;
+            const verdict = await verifyNoRepositoryLandingAtTransition(
+              tx as unknown as Db,
+              lockedForLanding,
+              noRepositoryLandingCloser,
+              noRepositoryCloseRequest,
+              noRepositoryMeasurement,
+            );
+            if (!verdict.ok) throw noRepositoryLandingRefusal(verdict.reason);
+            await logActivityInTransaction(tx as unknown as Db, {
+              companyId: existing.companyId,
+              actorType: actor.actorType,
+              boardApiKeyId: actor.boardApiKeyId,
+              actorId: actor.actorId,
+              agentId: actor.agentId,
+              runId: actor.runId,
+              agentApiKeyId: actor.agentApiKeyId,
+              responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+              action: "issue.done_transition_no_repository_landing_verified",
+              entityType: "issue",
+              entityId: existing.id,
+              issueId: existing.id,
+              details: noRepositoryLandingAuditDetails(verdict.measurement),
+            });
+          }
+
           const updated = await updateIssue(tx);
 
           if (!updated) return null;
@@ -20965,6 +21063,28 @@ export function issueRoutes(
           remedy: missingApprovalStageRefusal?.remedy ?? missingApprovalStageGap.remediation,
           runId: actor.runId ?? null,
           callerSeat: missingApprovalStageRefusal?.callerSeat,
+        });
+      }
+      if (
+        noRepositoryLandingCloser !== null
+        && err instanceof HttpError
+        && err.status === 422
+        && (err.details as Record<string, unknown> | null | undefined)?.stage
+          === "no_repository_landing_transition_recheck"
+      ) {
+        // SUP-22570 / SUP-17125: the transactional re-probe refused and the
+        // update rolled back; leave the same thread-readable refusal record the
+        // pre-transaction tier refusal leaves, fail-closed.
+        await postTerminalStatusRefusalComment(svc, existing.id, {
+          httpStatus: 422,
+          code: "done_transition_missing_tier_declaration",
+          error: err.message,
+          remedy: err.message.includes("timed out at the close write")
+            ? "The worktree re-check at the close write ran out of its time budget before it finished; that is " +
+              "not a dirty-worktree finding. Retry the close, or use the board close path."
+            : "Fix what the refusal names, or retry if it says the worktree or the remote could not be verified; " +
+              "keep the issue record_only and close again; the board close path stays available.",
+          runId: actor.runId ?? null,
         });
       }
       throw err;

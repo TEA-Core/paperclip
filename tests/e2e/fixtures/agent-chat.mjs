@@ -161,22 +161,22 @@ if (command.action === "hold") {
   await comment("Active turn settled after feature disable.");
 } else if (command.action === "project" || command.action === "handoff") {
   try {
+    // An agent key may not choose the repository or ref a project workspace is
+    // measured against (board only). So the agent creates the project on the
+    // checkout it runs in (no clone), and the board registers the synthetic
+    // delivery repository on that workspace. The board here is an
+    // unauthenticated request, the local_trusted board the spec's own
+    // `request` is.
+    const needsDeliveryRepo =
+      command.action === "handoff" && !command.projectId && !command.workspace && !command.urls && !command.ids;
     const args = {
       name: command.name ?? "Fixture project",
       repositoryUrls: command.urls,
       repositoryIds: command.ids,
       workspace:
         command.workspace ??
-        (command.action === "handoff" && !command.urls && !command.ids
-          ? {
-              name: "Primary",
-              sourceType: "git_repo",
-              repoUrl: DELIVERY_REPO_URL,
-              repoRef: DELIVERY_DEFAULT_REF,
-              defaultRef: DELIVERY_DEFAULT_REF,
-              cwd: process.cwd(),
-              isPrimary: true,
-            }
+        (needsDeliveryRepo
+          ? { name: "Primary", sourceType: "git_repo", cwd: process.cwd(), isPrimary: true }
           : undefined),
       idempotencyKey: command.key ?? current.id,
     };
@@ -185,6 +185,16 @@ if (command.action === "hold") {
       : command.direct
         ? await api(`/companies/${task.companyId}/projects`, "POST", args)
         : await mcp("create_project", args);
+    if (needsDeliveryRepo && !project.workspaces?.some((w) => w.repoUrl === DELIVERY_REPO_URL)) {
+      const primary = project.workspaces.find((w) => w.isPrimary);
+      const registered = await fetch(`${base}/api/projects/${project.id}/workspaces/${primary.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoUrl: DELIVERY_REPO_URL, repoRef: DELIVERY_DEFAULT_REF, defaultRef: DELIVERY_DEFAULT_REF }),
+      });
+      if (!registered.ok)
+        throw new Error(`Delivery repository registration failed: ${registered.status} ${await registered.text()}`);
+    }
     const retry = command.projectId
       ? project
       : await mcp("create_project", args);
