@@ -18,6 +18,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { REVIEW_STALL_ESCALATED_ACTION } from "../services/issue-execution-policy.js";
+import { issueService } from "../services/issues.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -717,6 +718,34 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     expect(valid.status, JSON.stringify(valid.body)).toBe(200);
     expect((await issueRow(issueId)).executionPolicy).toMatchObject({
       stallEscalation: { afterRounds: 2, toAgentId: seeded.arbiterId.toLowerCase() },
+    });
+  }, 60_000);
+
+  it("re-applies a stored policy at routine dispatch even when its arbiter is paused, but refuses a newly written one", async () => {
+    const seeded = await seedCompany();
+    const issuesSvc = issueService(db);
+    const policy = stallPolicy(seeded, randomUUID(), seeded.pausedId);
+
+    await expect(
+      issuesSvc.create(seeded.companyId, {
+        title: "API-written policy",
+        status: "todo",
+        assigneeAgentId: seeded.coderId,
+        responsibleUserId: seeded.userId,
+        executionPolicy: policy,
+      }),
+    ).rejects.toMatchObject({ status: 409, details: { code: "stall_arbiter_paused" } });
+
+    const dispatched = await issuesSvc.create(seeded.companyId, {
+      title: "Routine-dispatched policy",
+      status: "todo",
+      assigneeAgentId: seeded.coderId,
+      responsibleUserId: seeded.userId,
+      executionPolicy: policy,
+      trustExplicitExecutionPolicy: true,
+    });
+    expect((await issueRow(dispatched.id)).executionPolicy).toMatchObject({
+      stallEscalation: { afterRounds: 2, toAgentId: seeded.pausedId.toLowerCase() },
     });
   }, 60_000);
 

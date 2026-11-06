@@ -10513,7 +10513,8 @@ export function issueService(db: Db) {
         if (normalizedPolicy?.returnAssigneeAgentId) {
           await assertAssignableAgent(db, companyId, normalizedPolicy.returnAssigneeAgentId, { kind: "work" });
         }
-        if (normalizedPolicy?.stallEscalation) {
+        // A routine re-applies its stored policy; an arbiter paused since it was saved must not stop the dispatch.
+        if (normalizedPolicy?.stallEscalation && trustExplicitExecutionPolicy !== true) {
           await assertStallArbiterCanTakeWork(db, companyId, normalizedPolicy.stallEscalation.toAgentId);
         }
       }
