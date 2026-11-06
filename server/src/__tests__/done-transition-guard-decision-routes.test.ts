@@ -1033,7 +1033,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.code).toBe("done_transition_missing_tier_declaration");
-    expect(String(res.body.error)).toContain("record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>");
+    expect(String(res.body.error)).toContain("record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>");
     expect(await statusOf(issueId)).toBe("in_review");
   });
 
@@ -1056,11 +1056,11 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     const remedy = String(res.body.details.remedy);
     // The structured record-only form, verbatim.
     expect(remedy).toContain(
-      '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }',
+      '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>" }',
     );
     // The comment form for a record_only card is the record-only grammar...
     expect(remedy).toContain(
-      'record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>',
+      'record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>',
     );
     // ...and the remedy demands no merge head anywhere.
     expect(remedy).not.toContain("post-merge");

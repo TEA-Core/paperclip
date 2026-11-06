@@ -6169,6 +6169,18 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(ghFetchMock).not.toHaveBeenCalled();
     });
 
+    it("refuses a malformed observation range before a later observed delimiter without backtracking", async () => {
+      const result = await evaluateObservation(
+        "2026-11-06T21:02:39.1234567Z-2026-11-06T21:04:24.162190Z observed 2026-11-06T21:05:00Z",
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("machine-checkable");
+      expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveGitHubToken).not.toHaveBeenCalled();
+    });
+
     it("keeps the merge-head grammar working on a record_only card that has a recorded merged work product (SUP-21258)", async () => {
       setupTier2OriginMocks();
       mockRefHeadResolutions([
@@ -6354,7 +6366,7 @@ describe("evaluateDoneTierDeclaration", () => {
       // its Tier 2 entry carries the record-only grammar, never a merge head,
       // and Tier 1 entries are carried over unchanged.
       expect(DONE_TIER_TIER2_RECORD_ONLY_JSON).toBe(
-        '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }',
+        '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>" }',
       );
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER2_RECORD_ONLY_JSON);
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_LANDED_JSON);
