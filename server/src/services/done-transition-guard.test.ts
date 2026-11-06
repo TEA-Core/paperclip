@@ -317,9 +317,10 @@ vi.mock("./merge-arming.js", async (importOriginal) => {
 });
 
 const mockExecFile = vi.hoisted(() => vi.fn());
-vi.mock("node:child_process", () => ({
-  execFile: mockExecFile,
-}));
+vi.mock("node:child_process", async () => {
+  const { spawnFromExecFile } = await import("../__tests__/helpers/spawn-from-exec-file.js");
+  return { execFile: mockExecFile, spawn: spawnFromExecFile(mockExecFile) };
+});
 
 import { ghFetch } from "./github-fetch.js";
 import { resolveGitHubToken } from "./github-credential.js";
