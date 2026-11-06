@@ -650,6 +650,11 @@ function otherCardIdentifiersInBranch(branch: string, identifier: string): strin
   ]);
 }
 
+/** The card a rescue branch (`paperclip/rescue/<ISSUE-ID>/<timestamp>`) names; null for any other branch. */
+function rescueBranchOwner(branch: string): string | null {
+  return /^paperclip\/rescue\/([^/]+)\/.+$/.exec(branch)?.[1] ?? null;
+}
+
 /** Project default branch, reduced to a branch name; null when it is not one. */
 export function normalizeBaseBranch(ref: string | null | undefined): string | null {
   if (typeof ref !== "string") return null;
@@ -688,6 +693,13 @@ export interface NoRepositoryWorktreeProbeInput {
    * company and project (a board-only field): those branches are that card's.
    */
   attributedBranches: ReadonlySet<string>;
+  /**
+   * Which of `candidates` are the identifier of an existing issue of this
+   * company other than this card. Asked once, with the second path segments of
+   * the rescue branches the server keeps (`paperclip/rescue/<ISSUE-ID>/<time>`):
+   * such a branch is attributed to that card.
+   */
+  existingOtherCardIdentifiers: (candidates: readonly string[]) => Promise<ReadonlySet<string>>;
   /**
    * Commits `sha` carries beyond the project's default branch, measured on the
    * remote (a source the agent cannot write). Throws when it cannot be
@@ -837,9 +849,10 @@ async function aheadOfBaseRefusal(
  * repository deliverable — clean, zero commits ahead of the project's default
  * branch — that no other branch or worktree naming the issue in the managed
  * checkout carries one either, and that every other local branch belongs to a
- * card: one of the project's branches, or a branch registered to another
- * issue's execution workspace. Any other branch refuses, whatever its tip, so
- * another card's name cannot carry this card's work.
+ * card: one of the project's branches, a branch registered to another issue's
+ * execution workspace, or the rescue branch of another existing card of the
+ * company. Any other branch refuses, whatever its tip, so another card's name
+ * cannot carry this card's work.
  *
  * The recorded workspace path is only a candidate: it must resolve (symlinks
  * included) into `<managedProjectRoot>/<repo>/.paperclip/worktrees/…`, the
@@ -910,16 +923,28 @@ export async function probeNoRepositoryWorktree(
     const branches = (await runHardenedGit(
       ["-C", repoRoot, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/"],
       options,
-    )).split("\n").filter((line) => line.length > 0);
-    for (const line of branches) {
+    )).split("\n").filter((line) => line.length > 0).map((line) => {
       const space = line.indexOf(" ");
-      const sha = line.slice(0, space);
-      const name = line.slice(space + 1).slice("refs/heads/".length);
+      return { sha: line.slice(0, space), name: line.slice(space + 1).slice("refs/heads/".length) };
+    });
+    const rescueOwners = [...new Set(branches.flatMap(({ name }) => {
+      const owner = branchNamesIssue(name, input.issueIdentifier) ? null : rescueBranchOwner(name);
+      return owner === null ? [] : [owner];
+    }))];
+    const rescuedCards = rescueOwners.length > 0 ? await input.existingOtherCardIdentifiers(rescueOwners) : new Set<string>();
+    for (const { sha, name } of branches) {
       if (!SHA_RE.test(sha)) continue;
       if (!branchNamesIssue(name, input.issueIdentifier)) {
-        if (input.projectBranches.has(name) || input.attributedBranches.has(name)) continue;
+        const rescueOwner = rescueBranchOwner(name);
+        if (
+          input.projectBranches.has(name) ||
+          input.attributedBranches.has(name) ||
+          (rescueOwner !== null && rescuedCards.has(rescueOwner))
+        ) {
+          continue;
+        }
         return refuse(
-          `branch ${name} belongs to no card: it is not this card's, not one of the project's branches, and not registered to another card's workspace`,
+          `branch ${name} belongs to no card: it is not this card's, not one of the project's branches, not registered to another card's workspace, and not another card's rescue branch`,
         );
       }
       if (checkedTips.has(sha)) continue;

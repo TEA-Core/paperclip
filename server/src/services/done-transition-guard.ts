@@ -2185,6 +2185,20 @@ async function verifyNoRepositoryLanding(
     issueIdentifier: record.identifier,
     projectBranches,
     attributedBranches: new Set(record.attributedBranches),
+    existingOtherCardIdentifiers: async (candidates) =>
+      new Set(
+        await db
+          .select({ identifier: issues.identifier })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, issue.companyId),
+              ne(issues.id, issue.id),
+              inArray(issues.identifier, [...candidates]),
+            ),
+          )
+          .then((rows) => rows.flatMap((row) => (row.identifier ? [row.identifier] : []))),
+      ),
     countCommitsAheadOfBase: async (sha) => {
       const ahead = await githubCompareAheadBy(
         hostname,

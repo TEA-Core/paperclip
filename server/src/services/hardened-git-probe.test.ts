@@ -90,6 +90,7 @@ interface ManagedLayout {
     issueIdentifier: string;
     projectBranches: ReadonlySet<string>;
     attributedBranches: ReadonlySet<string>;
+    existingOtherCardIdentifiers: (candidates: readonly string[]) => Promise<ReadonlySet<string>>;
     countCommitsAheadOfBase: (sha: string) => Promise<number>;
   };
 }
@@ -135,6 +136,7 @@ function managedLayout(): ManagedLayout {
       issueIdentifier: "SUP-7",
       projectBranches: new Set(["main"]),
       attributedBranches: new Set<string>(),
+      existingOtherCardIdentifiers: async () => new Set<string>(),
       countCommitsAheadOfBase: countOnOrigin(origin),
     },
   };
@@ -868,7 +870,7 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
       branchAt(layout, name, ahead);
       expect(await probeNoRepositoryWorktree(layout.input)).toEqual({
         ok: false,
-        reason: `branch ${name} belongs to no card: it is not this card's, not one of the project's branches, and not registered to another card's workspace`,
+        reason: `branch ${name} belongs to no card: it is not this card's, not one of the project's branches, not registered to another card's workspace, and not another card's rescue branch`,
       });
     });
 
@@ -879,7 +881,82 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
         .toMatchObject({ ok: true });
       expect(await probeNoRepositoryWorktree(layout.input)).toEqual({
         ok: false,
-        reason: "branch release belongs to no card: it is not this card's, not one of the project's branches, and not registered to another card's workspace",
+        reason: "branch release belongs to no card: it is not this card's, not one of the project's branches, not registered to another card's workspace, and not another card's rescue branch",
+      });
+    });
+
+    // The server keeps `paperclip/rescue/<ISSUE-ID>/<timestamp>` branches that
+    // hold a dirty-quarantined card's work; they belong to the card they name.
+    describe("rescue branches", () => {
+      const NO_CARD = (name: string) => ({
+        ok: false,
+        reason: `branch ${name} belongs to no card: it is not this card's, not one of the project's branches, not registered to another card's workspace, and not another card's rescue branch`,
+      });
+
+      it("skips another existing card's ahead rescue branch, asking once for the identifiers it names", async () => {
+        const layout = managedLayout();
+        branchAt(layout, "paperclip/rescue/SUP-9/20261106T000000Z", true);
+        branchAt(layout, "paperclip/rescue/SUP-9/20261106T010000Z", false);
+        branchAt(layout, "paperclip/rescue/SUP-11/20261106T000000Z", false);
+        const asked: string[][] = [];
+        const result = await probeNoRepositoryWorktree({
+          ...layout.input,
+          existingOtherCardIdentifiers: async (candidates) => {
+            asked.push([...candidates].sort());
+            return new Set(["SUP-9", "SUP-11"]);
+          },
+        });
+        expect(result).toMatchObject({ ok: true });
+        expect(asked).toEqual([["SUP-11", "SUP-9"]]);
+      });
+
+      it("refuses a rescue branch whose named card does not exist", async () => {
+        const layout = managedLayout();
+        branchAt(layout, "paperclip/rescue/NOPE-1/20261106T000000Z", false);
+        expect(await probeNoRepositoryWorktree(layout.input)).toEqual(NO_CARD("paperclip/rescue/NOPE-1/20261106T000000Z"));
+      });
+
+      it("keeps this card's own rescue branch this card's, and refuses it when it is ahead", async () => {
+        const layout = managedLayout();
+        branchAt(layout, "paperclip/rescue/SUP-7/20261106T000000Z", true);
+        const asked: string[][] = [];
+        const result = await probeNoRepositoryWorktree({
+          ...layout.input,
+          existingOtherCardIdentifiers: async (candidates) => {
+            asked.push([...candidates]);
+            return new Set(candidates);
+          },
+        });
+        expect(result).toEqual({
+          ok: false,
+          reason: "branch paperclip/rescue/SUP-7/20261106T000000Z has 1 commit(s) not on the project's default branch",
+        });
+        expect(asked).toEqual([]);
+      });
+
+      it.each([
+        ["a branch under another prefix", "other/rescue/SUP-9/20261106T000000Z"],
+        ["a rescue branch with no timestamp segment", "paperclip/rescue/SUP-9"],
+      ])("does not treat %s as a rescue branch", async (_label, name) => {
+        const layout = managedLayout();
+        branchAt(layout, name, false);
+        expect(await probeNoRepositoryWorktree({
+          ...layout.input,
+          existingOtherCardIdentifiers: async () => new Set(["SUP-9"]),
+        })).toEqual(NO_CARD(name));
+      });
+
+      it("does not ask when no branch is rescue-shaped", async () => {
+        const layout = managedLayout();
+        let asked = 0;
+        await probeNoRepositoryWorktree({
+          ...layout.input,
+          existingOtherCardIdentifiers: async () => {
+            asked += 1;
+            return new Set<string>();
+          },
+        });
+        expect(asked).toBe(0);
       });
     });
 

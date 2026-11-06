@@ -435,7 +435,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     return db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]?.status);
   }
 
-  const BELONGS_TO_NO_CARD = "belongs to no card: it is not this card's, not one of the project's branches, and not registered to another card's workspace";
+  const BELONGS_TO_NO_CARD = "belongs to no card: it is not this card's, not one of the project's branches, not registered to another card's workspace, and not another card's rescue branch";
 
   it("closes a record_only issue whose own worktree is empty and whose entry ruling another agent wrote", async () => {
     const fixture = await seed();
@@ -1444,18 +1444,24 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
   }
 
   /** Another card of the same project whose execution workspace registers `branchName`. */
-  async function registerSiblingCard(fixture: SeededIssue, branchName: string) {
+  async function insertSiblingCard(fixture: SeededIssue) {
     const siblingIssueId = randomUUID();
+    const identifier = `${fixture.identifier.replace(/-\d+$/, "")}-2`;
     await db.insert(issues).values({
       id: siblingIssueId,
       companyId: fixture.companyId,
       projectId: fixture.projectId,
-      identifier: `${fixture.identifier.replace(/-\d+$/, "")}-2`,
+      identifier,
       title: "A sibling card",
       status: "in_progress",
       priority: "medium",
       createdByUserId: "cloud-user-1",
     });
+    return { siblingIssueId, identifier };
+  }
+
+  async function registerSiblingCard(fixture: SeededIssue, branchName: string) {
+    const { siblingIssueId } = await insertSiblingCard(fixture);
     const worktree = path.join(fixture.repoRoot, ".paperclip", "worktrees", branchName);
     await db.insert(executionWorkspaces).values({
       companyId: fixture.companyId,
@@ -1583,6 +1589,50 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.error).toContain("the project's repository or default branch changed after the close was measured");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  // The server keeps the rescue branch of a dirty-quarantined card in the
+  // shared checkout: `paperclip/rescue/<ISSUE-ID>/<timestamp>`.
+  it("closes with another existing card's ahead rescue branch in the checkout", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    const sibling = await insertSiblingCard(fixture);
+    branchInCheckout(fixture, `paperclip/rescue/${sibling.identifier}/20261106T000000Z`, true);
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(fixture.issueId)).toBe("done");
+  });
+
+  it("refuses this card's own ahead rescue branch, which holds undelivered work", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    const rescue = `paperclip/rescue/${fixture.identifier}/20261106T000000Z`;
+    branchInCheckout(fixture, rescue, true);
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain(`branch ${rescue} has 1 commit(s) not on the project's default branch`);
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  it.each([
+    ["names no issue", () => "paperclip/rescue/NOPE-1/20261106T000000Z"],
+    ["names an issue of another company", (_fixture: SeededIssue, foreign: string) => `paperclip/rescue/${foreign}/20261106T000000Z`],
+  ] as const)("refuses a rescue-shaped branch that %s", async (_label, name) => {
+    const foreignCompany = await seed();
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    const branch = name(fixture, foreignCompany.identifier);
+    branchInCheckout(fixture, branch, true);
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain(`branch ${branch} ${BELONGS_TO_NO_CARD}`);
     expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 

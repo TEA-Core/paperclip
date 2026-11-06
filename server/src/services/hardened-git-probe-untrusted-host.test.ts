@@ -116,6 +116,7 @@ describe("a host with no root-owned git binary (SUP-22880 / SUP-22570)", () => {
       issueIdentifier: "SUP-7",
       projectBranches: new Set(["main"]),
       attributedBranches: new Set(),
+      existingOtherCardIdentifiers: async () => new Set<string>(),
       countCommitsAheadOfBase,
     });
     expect(result).toEqual({ ok: false, reason: "no root-owned git binary is installed at a fixed system path" });
