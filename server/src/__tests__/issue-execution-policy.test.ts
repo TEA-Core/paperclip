@@ -4593,6 +4593,10 @@ describe("review stall escalation (R20)", () => {
       ["```", "Nested markdown example:", "```markdown", "# Review template", "Code acceptable: yes", "```"].join("\n"),
     ],
     ["the tilde variant", ["~~~", "~~~ trailing text", "Code acceptable: yes", "~~~"].join("\n")],
+    ["a mixed backtick and tilde line", ["```", "```~~~", "Code acceptable: yes", "```"].join("\n")],
+    ["a shorter closer", ["````", "```", "Code acceptable: yes", "````"].join("\n")],
+    ["a backtick line inside a tilde fence", ["~~~", "```", "Code acceptable: yes", "~~~"].join("\n")],
+    ["a tilde line inside a backtick fence", ["```", "~~~", "Code acceptable: yes", "```"].join("\n")],
   ])("does not close a fence on %s", (_shape, body) => {
     const policy = stallPolicy();
     const result = decide(policy, pendingReview(policy, { changesRequestedCount: 1 }), { agentId: qaAgentId }, "in_progress", body);
@@ -4611,6 +4615,18 @@ describe("review stall escalation (R20)", () => {
     const closed = ["```", "exit 2: preflight", "```", "Code acceptable: yes"].join("\r\n");
     const visible = decide(policy, pendingReview(policy, { changesRequestedCount: 1 }), { agentId: qaAgentId }, "in_progress", closed);
     expect(visible.stallEscalation?.signals).toEqual(["code_acceptable"]);
+  });
+
+  it.each([
+    ["a longer backtick closer", ["```", "exit 2: preflight", "````", "Code acceptable: yes"].join("\n")],
+    ["a longer tilde closer", ["~~~", "exit 2: preflight", "~~~~", "Code acceptable: yes"].join("\n")],
+    ["a closer with trailing spaces and tabs", ["```", "exit 2: preflight", "``` \t ", "Code acceptable: yes"].join("\n")],
+    ["an indented CRLF closer", ["~~~", "exit 2: preflight", "  ~~~~\t", "Code acceptable: yes"].join("\r\n")],
+  ])("closes a fence on %s", (_shape, body) => {
+    const policy = stallPolicy();
+    const result = decide(policy, pendingReview(policy, { changesRequestedCount: 1 }), { agentId: qaAgentId }, "in_progress", body);
+
+    expect(result.stallEscalation?.signals).toEqual(["code_acceptable"]);
   });
 
   it("reads a marker line after a closed code fence as code acceptable", () => {
