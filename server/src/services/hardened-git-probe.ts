@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
-import { constants as fsConstants, statSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { constants as fsConstants, createWriteStream, statSync } from "node:fs";
+import { type FileHandle, lstat, mkdir, mkdtemp, open, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import { PROJECT_REPOSITORIES_DIR } from "@paperclipai/adapter-utils/git-workspace-sync";
 
 // SUP-22880 / SUP-22570: the one Git runner for probes that read a workspace an
@@ -294,31 +295,59 @@ async function readHeadCommit(worktreePath: string, options: HardenedGitOptions)
 }
 
 /**
- * Reads a file inside the agent-writable repository. It is opened without
- * following a symlink and without blocking on a FIFO, must be a regular file no
- * larger than `maxBytes`, and is read through the handle, so a swapped-in FIFO,
- * `/dev/zero` link or oversize file fails instead of hanging a thread or
- * exhausting memory. Throws on anything else.
+ * Opens a file inside the agent-writable repository without following a symlink
+ * and without blocking on a FIFO, and hands `fn` the handle only if it is a
+ * regular file no larger than `maxBytes`, so a swapped-in FIFO, `/dev/zero`
+ * link or oversize file fails instead of hanging a thread or exhausting memory.
+ * Throws on anything else.
  */
-async function readRegularFile(target: string, maxBytes: number): Promise<Buffer> {
+async function withRegularFile<T>(
+  target: string,
+  maxBytes: number,
+  fn: (handle: FileHandle, size: number) => Promise<T>,
+): Promise<T> {
   const handle = await open(target, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | (fsConstants.O_NOFOLLOW ?? 0));
   try {
     const stat = await handle.stat();
     if (!stat.isFile() || stat.size > maxBytes) {
       throw new HardenedGitError("failed", "not a regular file within the size limit");
     }
-    const buffer = Buffer.allocUnsafe(stat.size + 1);
+    return await fn(handle, stat.size);
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Buffers a small file whole: only for files whose limit is a few kilobytes. */
+async function readRegularFile(target: string, maxBytes: number): Promise<Buffer> {
+  return withRegularFile(target, maxBytes, async (handle, size) => {
+    const buffer = Buffer.allocUnsafe(size + 1);
     let filled = 0;
     while (filled < buffer.length) {
       const { bytesRead } = await handle.read(buffer, filled, buffer.length - filled, null);
       if (bytesRead === 0) break;
       filled += bytesRead;
     }
-    if (filled > stat.size) throw new HardenedGitError("failed", "file grew while it was read");
+    if (filled > size) throw new HardenedGitError("failed", "file grew while it was read");
     return buffer.subarray(0, filled);
-  } finally {
-    await handle.close();
-  }
+  });
+}
+
+/**
+ * Streams a bounded regular file to `destination` through the validated handle,
+ * never holding it in memory, and returns the bytes copied so the caller can
+ * charge them against a shared budget.
+ */
+async function copyRegularFile(source: string, destination: string, maxBytes: number): Promise<number> {
+  return withRegularFile(source, maxBytes, async (handle, size) => {
+    if (size === 0) {
+      await writeFile(destination, "");
+      return 0;
+    }
+    await pipeline(handle.createReadStream({ start: 0, end: size - 1, autoClose: false }), createWriteStream(destination));
+    if ((await handle.stat()).size !== size) throw new HardenedGitError("failed", "file changed while it was copied");
+    return size;
+  });
 }
 
 async function readOptionalRegularFile(target: string, maxBytes: number): Promise<string | null> {
@@ -332,6 +361,35 @@ async function readOptionalRegularFile(target: string, maxBytes: number): Promis
 
 const MAX_REF_FILE_BYTES = 4096;
 const MAX_PACKED_REFS_BYTES = 64 * 1024 * 1024;
+const MAX_PACKED_REF_LINE_BYTES = 8192;
+const PACKED_REFS_CHUNK_BYTES = 64 * 1024;
+
+/**
+ * The commit `packed-refs` lists for `refName`, read in chunks through the
+ * validated handle so an oversize or hostile file never sits in memory: only the
+ * unfinished last line is carried between chunks, and a line longer than any
+ * real ref line fails.
+ */
+async function findPackedRef(handle: FileHandle, size: number, refName: string): Promise<string | null> {
+  const needle = Buffer.from(` ${refName}\n`);
+  const chunk = Buffer.allocUnsafe(PACKED_REFS_CHUNK_BYTES);
+  let pending = Buffer.alloc(0);
+  let total = 0;
+  for (let done = false; !done; ) {
+    const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+    total += bytesRead;
+    if (total > size) throw new HardenedGitError("failed", "file grew while it was read");
+    done = bytesRead === 0;
+    pending = Buffer.concat([pending, done ? Buffer.from("\n") : chunk.subarray(0, bytesRead)]);
+    for (let at = pending.indexOf(needle); at !== -1; at = pending.indexOf(needle, at + 1)) {
+      const sha = pending.subarray(pending.lastIndexOf(0x0a, at) + 1, at).toString("latin1");
+      if (SHA_RE.test(sha)) return sha;
+    }
+    pending = pending.subarray(pending.lastIndexOf(0x0a) + 1);
+    if (pending.length > MAX_PACKED_REF_LINE_BYTES) throw new HardenedGitError("failed", "packed-refs line too long");
+  }
+  return null;
+}
 
 /**
  * The branch and commit a linked worktree's HEAD names, read from the ref files
@@ -357,16 +415,13 @@ export async function readWorktreeHeadFromFiles(
       const sha = loose.trim();
       return SHA_RE.test(sha) ? { branch, sha } : null;
     }
-    const packed = await readOptionalRegularFile(path.join(commonDir, "packed-refs"), MAX_PACKED_REFS_BYTES);
-    if (packed === null) return null;
-    const refName = `refs/heads/${branch}`;
-    for (const line of packed.split("\n")) {
-      const space = line.indexOf(" ");
-      if (space > 0 && line.slice(space + 1) === refName && SHA_RE.test(line.slice(0, space))) {
-        return { branch, sha: line.slice(0, space) };
-      }
-    }
-    return null;
+    const sha = await withRegularFile(path.join(commonDir, "packed-refs"), MAX_PACKED_REFS_BYTES, (handle, size) =>
+      findPackedRef(handle, size, `refs/heads/${branch}`),
+    ).catch((error: unknown) => {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+      throw error;
+    });
+    return sha === null ? null : { branch, sha };
   } catch {
     return null;
   }
@@ -399,12 +454,10 @@ async function withSnapshotGitDir<T>(
     );
     await writeFile(path.join(snapshot, "config"), input.config);
     if (input.exclude !== null) await writeFile(path.join(snapshot, "info", "exclude"), input.exclude);
+    let indexBudget = MAX_INDEX_FILE_BYTES;
     for (const name of await readdir(input.identity.gitDir)) {
       if (name === "index" || name.startsWith("sharedindex.")) {
-        await writeFile(
-          path.join(snapshot, name),
-          await readRegularFile(path.join(input.identity.gitDir, name), MAX_INDEX_FILE_BYTES),
-        );
+        indexBudget -= await copyRegularFile(path.join(input.identity.gitDir, name), path.join(snapshot, name), indexBudget);
       }
     }
     return await fn(snapshot);

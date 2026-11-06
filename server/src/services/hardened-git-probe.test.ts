@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -29,6 +29,25 @@ function git(cwd: string, ...args: string[]): string {
     stdio: "pipe",
   }).toString().trim();
 }
+
+// Peak growth of memory held outside the JS heap (every Buffer) while `run`
+// executes, sampled between awaits: a whole file read into memory shows up as
+// its size, a streamed copy as a few chunks.
+async function peakBufferGrowth<T>(run: () => Promise<T>): Promise<{ result: T; growth: number }> {
+  const baseline = process.memoryUsage().arrayBuffers;
+  let peak = baseline;
+  const sampler = setInterval(() => {
+    peak = Math.max(peak, process.memoryUsage().arrayBuffers);
+  }, 1);
+  try {
+    const result = await run();
+    return { result, growth: peak - baseline };
+  } finally {
+    clearInterval(sampler);
+  }
+}
+
+const MIB = 1024 * 1024;
 
 let root: string;
 let marker: string;
@@ -980,6 +999,27 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
         expect(await probePromptly(layout.input)).toEqual(UNVERIFIED);
       });
 
+      function sparseSharedIndex(layout: ManagedLayout, name: string, mebibytes: number) {
+        const file = path.join(git(layout.worktree, "rev-parse", "--absolute-git-dir"), name);
+        writeFileSync(file, "");
+        truncateSync(file, mebibytes * MIB);
+      }
+
+      it("refuses promptly when the index and shared index files together exceed the combined size budget", async () => {
+        const layout = managedLayout();
+        sparseSharedIndex(layout, "sharedindex.one", 130);
+        sparseSharedIndex(layout, "sharedindex.two", 130);
+        expect(await probePromptly(layout.input)).toEqual(UNVERIFIED);
+      });
+
+      it("copies a large shared index in chunks rather than reading it into memory", async () => {
+        const layout = managedLayout();
+        sparseSharedIndex(layout, "sharedindex.big", 100);
+        const { result, growth } = await peakBufferGrowth(() => probePromptly(layout.input));
+        expect(result).toMatchObject({ ok: true });
+        expect(growth, `buffers grew by ${growth} bytes`).toBeLessThan(32 * MIB);
+      });
+
       it("refuses promptly when another worktree naming the issue has a FIFO as its index", async () => {
         const layout = managedLayout();
         const fabricated = layout.addWorktree("SUP-7-fresh");
@@ -1034,6 +1074,68 @@ describe("readWorktreeHeadFromFiles", () => {
     expect(probe.ok).toBe(true);
     const { gitDir, commonDir, headSha } = probe as Extract<typeof probe, { ok: true }>;
     expect(await readWorktreeHeadFromFiles(gitDir, commonDir)).toEqual({ branch: "SUP-7-record-ruling", sha: headSha });
+  });
+
+  describe("a packed-refs file read in chunks", () => {
+    const BRANCH = "SUP-7-record-ruling";
+    const CHUNK = 64 * 1024;
+
+    function packedLayout() {
+      const layout = managedLayout();
+      git(layout.repoRoot, "pack-refs", "--all");
+      const gitDir = git(layout.worktree, "rev-parse", "--absolute-git-dir");
+      const commonDir = path.join(layout.repoRoot, ".git");
+      return { layout, gitDir, commonDir, packedRefs: path.join(commonDir, "packed-refs"), sha: git(layout.worktree, "rev-parse", "HEAD") };
+    }
+
+    // The branch's own line starts `offset` bytes into the file, so it can
+    // straddle a read boundary at any position.
+    function packedRefsWithLineAt(offset: number, line: string) {
+      let content = "# pack-refs with: peeled fully-peeled sorted \n";
+      let n = 0;
+      while (content.length + 100 < offset) content += `${"a".repeat(40)} refs/heads/filler-${n++}\n`;
+      const gap = offset - content.length;
+      if (gap === 1) content += "\n";
+      else if (gap >= 2) content += `#${"p".repeat(gap - 2)}\n`;
+      return `${content}${line}`;
+    }
+
+    it("finds the branch wherever its line falls relative to a read boundary, past lines that only look like it", async () => {
+      const { gitDir, commonDir, packedRefs, sha } = packedLayout();
+      const decoys = `x y refs/heads/${BRANCH}\n${"b".repeat(40)} refs/heads/other/${BRANCH}\n`;
+      const line = `${sha} refs/heads/${BRANCH}\n`;
+      for (let before = 1; before <= decoys.length + line.length + 1; before += 1) {
+        writeFileSync(packedRefs, packedRefsWithLineAt(CHUNK - before, `${decoys}${line}`));
+        expect(await readWorktreeHeadFromFiles(gitDir, commonDir), `line ${before} bytes before the boundary`).toEqual({
+          branch: BRANCH,
+          sha,
+        });
+      }
+    });
+
+    it("finds the branch on a final line with no newline", async () => {
+      const { gitDir, commonDir, packedRefs, sha } = packedLayout();
+      writeFileSync(packedRefs, packedRefsWithLineAt(CHUNK - 3, `${sha} refs/heads/${BRANCH}`));
+      expect(await readWorktreeHeadFromFiles(gitDir, commonDir)).toEqual({ branch: BRANCH, sha });
+    });
+
+    it("returns null when the branch is not listed", async () => {
+      const { gitDir, commonDir, packedRefs, sha } = packedLayout();
+      writeFileSync(packedRefs, packedRefsWithLineAt(CHUNK + 10, `${sha} refs/heads/${BRANCH}-2\n`));
+      expect(await readWorktreeHeadFromFiles(gitDir, commonDir)).toBeNull();
+    });
+
+    it("returns null promptly, without buffering the file, for a huge packed-refs with no line breaks", async () => {
+      const { gitDir, commonDir, packedRefs } = packedLayout();
+      rmSync(packedRefs);
+      writeFileSync(packedRefs, "");
+      truncateSync(packedRefs, 60 * MIB);
+      const started = performance.now();
+      const { result, growth } = await peakBufferGrowth(() => readWorktreeHeadFromFiles(gitDir, commonDir));
+      expect(result).toBeNull();
+      expect(performance.now() - started).toBeLessThan(2_000);
+      expect(growth, `buffers grew by ${growth} bytes`).toBeLessThan(16 * MIB);
+    });
   });
 
   it("returns null when HEAD is detached or a FIFO", async () => {
