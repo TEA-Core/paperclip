@@ -3,6 +3,7 @@ import { issues, issueExecutionDecisions, type Db } from "@paperclipai/db";
 import type { IssueExecutionDecisionOutcome } from "@paperclipai/shared";
 import {
   applyIssueExecutionPolicyTransition,
+  assertExecutionDecisionSnapshotCurrent,
   isReviewChangesRequestedTransition,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -165,6 +166,8 @@ export async function applyReviewEscalationDecision(args: {
   const activityPublications = args.deferredPostCommit?.activityPublications ?? [];
   const postCommitActions = args.deferredPostCommit?.postCommitActions ?? [];
   const updatedIssue = await db.transaction(async (tx) => {
+    const lockedIssue = await issueService(db).getByIdForUpdate(issue.id, tx);
+    assertExecutionDecisionSnapshotCurrent(existingState, policy, lockedIssue, issue.id);
     await tx.insert(issueExecutionDecisions).values({
       id: decisionId,
       companyId: issue.companyId,

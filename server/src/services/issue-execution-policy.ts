@@ -13,7 +13,7 @@ import type {
   IssueMonitorScheduledBy,
 } from "@paperclipai/shared";
 import { gitCommitShaSchema, issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
-import { unprocessable } from "../errors.js";
+import { conflict, unprocessable } from "../errors.js";
 import { resolveSelfApprovalPrincipals } from "./approval-status-reconciler.js";
 import { resolveCallerSeat, seatAuthorityNextAction } from "./seat-authority-refusal.js";
 
@@ -1183,6 +1183,29 @@ export function deliveryBindingDiffers(
     deliveryBindingValue(left, "prUrl") !== deliveryBindingValue(right, "prUrl") ||
     deliveryBindingValue(left, "headSha") !== deliveryBindingValue(right, "headSha")
   );
+}
+
+export function assertExecutionDecisionSnapshotCurrent(
+  readState: IssueExecutionState | null,
+  readPolicy: IssueExecutionPolicy | null,
+  locked: { executionState?: unknown; executionPolicy?: unknown } | null | undefined,
+  issueId: string,
+): void {
+  const lockedState = parseIssueExecutionState(locked?.executionState ?? null);
+  if (
+    (lockedState?.deliveredHeadSha ?? null) !== (readState?.deliveredHeadSha ?? null) ||
+    stallHoldControlsDiffer(readPolicy, normalizeIssueExecutionPolicy(locked?.executionPolicy ?? null)) ||
+    deliveryBindingDiffers(readState, lockedState)
+  ) {
+    throw conflict(
+      "The delivered head, the delivery binding (pull request number, URL or head) or the execution policy (round ceiling, stall arbiter or stages) changed while this decision was in flight; this decision was not recorded and the stage was not handed off. Re-read the issue before deciding.",
+      {
+        code: "review_stall_policy_changed",
+        issueId,
+        stageId: readState?.currentStageId ?? null,
+      },
+    );
+  }
 }
 
 /**

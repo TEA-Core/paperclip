@@ -21,6 +21,7 @@ import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { REVIEW_STALL_ESCALATED_ACTION } from "../services/issue-execution-policy.js";
 import { issueService } from "../services/issues.js";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { routineService } from "../services/routines.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import {
@@ -41,7 +42,12 @@ const activityFault = vi.hoisted(() => ({ action: null as string | null }));
 // Deterministic interleaving: `beforeLock` runs once, on the request's first
 // row-lock read, after the route computed its decision from the unlocked read
 // and before the locked re-check reads the row.
-const lockInterleave = vi.hoisted(() => ({ beforeLock: null as null | (() => Promise<void>) }));
+// `afterResolve` runs once, right after an interaction accept or reject commits
+// and before the route writes the escalation stage decision.
+const lockInterleave = vi.hoisted(() => ({
+  beforeLock: null as null | (() => Promise<void>),
+  afterResolve: null as null | (() => Promise<void>),
+}));
 vi.mock("../services/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/index.js")>();
   const failAfterWrite = (action: string) => {
@@ -61,6 +67,22 @@ vi.mock("../services/index.js", async (importOriginal) => {
           if (hook) await hook();
           return svc.getByIdForUpdate(...lockArgs);
         },
+      };
+    },
+    issueThreadInteractionService: (...args: Parameters<typeof actual.issueThreadInteractionService>) => {
+      const svc = actual.issueThreadInteractionService(...args);
+      const afterResolve = async <T,>(result: T): Promise<T> => {
+        const hook = lockInterleave.afterResolve;
+        lockInterleave.afterResolve = null;
+        if (hook) await hook();
+        return result;
+      };
+      return {
+        ...svc,
+        acceptInteraction: async (...resolveArgs: Parameters<typeof svc.acceptInteraction>) =>
+          afterResolve(await svc.acceptInteraction(...resolveArgs)),
+        rejectInteraction: async (...resolveArgs: Parameters<typeof svc.rejectInteraction>) =>
+          afterResolve(await svc.rejectInteraction(...resolveArgs)),
       };
     },
     logActivity: async (...args: Parameters<typeof actual.logActivity>) => {
@@ -100,6 +122,7 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
   afterEach(async () => {
     activityFault.action = null;
     lockInterleave.beforeLock = null;
+    lockInterleave.afterResolve = null;
     if (seededRunIds.length > 0) {
       await db.update(heartbeatRuns).set({ status: "cancelled" }).where(inArray(heartbeatRuns.id, seededRunIds));
       seededRunIds.length = 0;
@@ -832,6 +855,7 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
       changesRequestedCount?: number;
       delivery?: Record<string, unknown>;
       secondStage?: boolean;
+      escalated?: boolean;
     } = {},
   ) {
     const issueId = randomUUID();
@@ -842,7 +866,8 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
       title: "Plain review",
       status: "in_review",
       priority: "medium",
-      assigneeAgentId: seeded.reviewerId,
+      assigneeAgentId: shape.escalated ? null : seeded.reviewerId,
+      assigneeUserId: shape.escalated ? seeded.userId : null,
       responsibleUserId: seeded.userId,
       createdByUserId: seeded.userId,
       deliveryRequirement: "record_only",
@@ -852,13 +877,15 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
         currentStageId: stageId,
         currentStageIndex: 0,
         currentStageType: "review",
-        currentParticipant: { type: "agent", agentId: seeded.reviewerId },
+        currentParticipant: shape.escalated
+          ? { type: "user", agentId: null, userId: seeded.userId }
+          : { type: "agent", agentId: seeded.reviewerId },
         returnAssignee: { type: "agent", agentId: seeded.coderId },
         deliveryAuthor: { type: "agent", agentId: seeded.coderId },
         completedStageIds: [],
         lastDecisionId: null,
         lastDecisionOutcome: null,
-        changesRequestedCount: shape.changesRequestedCount ?? 1,
+        changesRequestedCount: shape.changesRequestedCount ?? (shape.escalated ? 3 : 1),
         ...(shape.delivery ? { delivery: shape.delivery } : {}),
       },
     });
@@ -1114,6 +1141,128 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     const row = await issueRow(issueId);
     expect(row.status).toBe("in_review");
     expect(row.executionPolicy).toMatchObject({ maxReviewRounds: 2 });
+  }, 60_000);
+
+  async function seedEscalationInteraction(seeded: Seeded, issueId: string, stageId: string) {
+    return issueThreadInteractionService(db).create(
+      { id: issueId, companyId: seeded.companyId },
+      {
+        kind: "request_confirmation",
+        title: "Review round cap reached — your decision is needed",
+        summary: "Review stage hit the round cap and was escalated to you.",
+        addresseeAgentId: null,
+        resolverPolicy: "human_only",
+        continuationPolicy: "wake_assignee",
+        sourceRunId: null,
+        idempotencyKey: `review-escalation:${issueId}:${stageId}:3:${randomUUID().slice(0, 8)}`,
+        payload: {
+          version: 1,
+          prompt: "Approve this review, or request further changes (round cap reached).",
+          acceptLabel: "Approve & advance",
+          rejectLabel: "Request changes",
+          rejectRequiresReason: true,
+          allowDeclineReason: true,
+          detailsMarkdown: "Escalated.",
+        },
+      },
+      { agentId: null, userId: seeded.userId },
+    );
+  }
+
+  const sameHeadDelivery = (headSha: string) => ({
+    repo: { owner: "TEA-Core", repo: "paperclip" },
+    branch: "fm/plain-card",
+    headSha,
+  });
+
+  function refreshDeliveryAfterResolve(issueId: string, delivery: Record<string, unknown>) {
+    lockInterleave.afterResolve = async () => {
+      const current = await issueRow(issueId);
+      await db
+        .update(issues)
+        .set({ executionState: { ...(current.executionState as Record<string, unknown>), delivery } })
+        .where(eq(issues.id, issueId));
+    };
+  }
+
+  it("records an escalation accept when the snapshot is still current", async () => {
+    const seeded = await seedCompany();
+    const headSha = "a".repeat(40);
+    const { issueId, stageId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 3,
+      secondStage: true,
+      escalated: true,
+      delivery: sameHeadDelivery(headSha),
+    });
+    const interaction = await seedEscalationInteraction(seeded, issueId, stageId);
+
+    const res = await request(app(boardActor(seeded)))
+      .post(`/api/issues/${issueId}/interactions/${interaction.id}/accept`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await decisionRows(issueId)).toHaveLength(1);
+    expect((await issueRow(issueId)).executionState).toMatchObject({
+      lastDecisionOutcome: "approved",
+      delivery: sameHeadDelivery(headSha),
+    });
+  }, 60_000);
+
+  it("refuses an escalation accept that would erase a same-head PR binding refreshed after the read (SUP-23260)", async () => {
+    const seeded = await seedCompany();
+    const headSha = "a".repeat(40);
+    const { issueId, stageId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 3,
+      secondStage: true,
+      escalated: true,
+      delivery: sameHeadDelivery(headSha),
+    });
+    const interaction = await seedEscalationInteraction(seeded, issueId, stageId);
+    const refreshed = {
+      ...sameHeadDelivery(headSha),
+      prNumber: 1117,
+      prUrl: "https://github.com/TEA-Core/paperclip/pull/1117",
+    };
+    refreshDeliveryAfterResolve(issueId, refreshed);
+
+    const res = await request(app(boardActor(seeded)))
+      .post(`/api/issues/${issueId}/interactions/${interaction.id}/accept`)
+      .send({});
+
+    expect(lockInterleave.afterResolve).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    expect(row.executionState).toMatchObject({ status: "pending", delivery: refreshed });
+  }, 60_000);
+
+  it("refuses an escalation reject that would erase a same-head PR binding refreshed after the read (SUP-23260)", async () => {
+    const seeded = await seedCompany();
+    const headSha = "a".repeat(40);
+    const { issueId, stageId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 3,
+      escalated: true,
+      delivery: sameHeadDelivery(headSha),
+    });
+    const interaction = await seedEscalationInteraction(seeded, issueId, stageId);
+    const refreshed = {
+      ...sameHeadDelivery(headSha),
+      prNumber: 1117,
+      prUrl: "https://github.com/TEA-Core/paperclip/pull/1117",
+    };
+    refreshDeliveryAfterResolve(issueId, refreshed);
+
+    const res = await request(app(boardActor(seeded)))
+      .post(`/api/issues/${issueId}/interactions/${interaction.id}/reject`)
+      .send({ reason: "Needs another round." });
+
+    expect(lockInterleave.afterResolve).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    expect((await issueRow(issueId)).executionState).toMatchObject({ status: "pending", delivery: refreshed });
   }, 60_000);
 
   async function resolveRecovery(seeded: Seeded, issueId: string, note: string) {

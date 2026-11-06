@@ -432,8 +432,7 @@ import {
   resolvePatchExecutionPolicy,
   isSeatedStallArbiter,
   setIssueExecutionPolicyMonitorScheduledBy,
-  stallHoldControlsDiffer,
-  deliveryBindingDiffers,
+  assertExecutionDecisionSnapshotCurrent,
   type MissingApprovalStageGap,
   type ReviewEscalationSignal,
 } from "../services/issue-execution-policy.js";
@@ -3865,29 +3864,6 @@ class AutoApprovalIssueMissingError extends Error {
   constructor() {
     super("Issue not found during auto-approval transaction");
     this.name = "AutoApprovalIssueMissingError";
-  }
-}
-
-function assertExecutionDecisionSnapshotCurrent(
-  readState: ReturnType<typeof parseIssueExecutionState>,
-  readPolicy: ReturnType<typeof normalizeIssueExecutionPolicy>,
-  locked: { executionState?: unknown; executionPolicy?: unknown } | null | undefined,
-  issueId: string,
-): void {
-  const lockedState = parseIssueExecutionState(locked?.executionState ?? null);
-  if (
-    (lockedState?.deliveredHeadSha ?? null) !== (readState?.deliveredHeadSha ?? null) ||
-    stallHoldControlsDiffer(readPolicy, normalizeIssueExecutionPolicy(locked?.executionPolicy ?? null)) ||
-    deliveryBindingDiffers(readState, lockedState)
-  ) {
-    throw conflict(
-      "The delivered head, the delivery binding (pull request number, URL or head) or the execution policy (round ceiling, stall arbiter or stages) changed while this decision was in flight; this decision was not recorded and the stage was not handed off. Re-read the issue before deciding.",
-      {
-        code: "review_stall_policy_changed",
-        issueId,
-        stageId: readState?.currentStageId ?? null,
-      },
-    );
   }
 }
 
