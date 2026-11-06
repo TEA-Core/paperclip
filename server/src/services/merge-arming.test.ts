@@ -861,6 +861,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       draft?: boolean;
       number?: number;
       headRefName?: string;
+      headSha?: string;
       baseRef?: string | null;
       owner?: string;
       repo?: string;
@@ -874,6 +875,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       draft: overrides.draft ?? false,
       node_id: "PR_node_id_12345",
       head: { ref: overrides.headRefName ?? "SUP-42-branch" },
+      ...(overrides.headSha === undefined ? {} : { headSha: overrides.headSha }),
       ...(overrides.baseRef === undefined ? {} : { baseRef: overrides.baseRef }),
       title: `Fix thing (SUP-${number})`,
     };
@@ -3279,6 +3281,24 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(byNumber.get(42)?.baseRefName).toBe("main");
       expect(byNumber.get(43)?.baseRefName).toBe("release-1");
       expect(byNumber.get(44)?.baseRefName ?? null).toBeNull();
+    });
+  });
+
+  describe("SUP-23243: cached GitHub headSha propagates to LinkedPullRequest.headSha", () => {
+    it("maps headSha for open and closed linked pull requests", async () => {
+      const issueId = await insertIssue();
+      const openHeadSha = "c0ffee1234560000000000000000000000000000";
+      const closedHeadSha = "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19";
+      await insertMention(issueId, { number: 42, headSha: openHeadSha });
+      await insertMention(issueId, { number: 43, state: "closed", headSha: closedHeadSha });
+
+      const open = await resolveLinkedPullRequests(db, companyId, issueId);
+      const all = await resolveLinkedPullRequestsWithState(db, companyId, issueId);
+      const byNumber = new Map(all.map((pr) => [pr.number, pr]));
+
+      expect(open[0]?.headSha).toBe(openHeadSha);
+      expect(byNumber.get(42)?.headSha).toBe(openHeadSha);
+      expect(byNumber.get(43)?.headSha).toBe(closedHeadSha);
     });
   });
 

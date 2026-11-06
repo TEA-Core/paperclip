@@ -214,6 +214,7 @@ export interface LinkedPullRequest {
   draft?: boolean;
   /** Live head repository of a hydrated PR; absent on cached mention rows. */
   headRepoFullName?: string | null;
+  headSha?: string | null;
   /**
    * Base branch the PR targets (e.g. "main"), when known. The done-transition
    * guard reads this to probe whether a merge queue covers the branch.
@@ -440,6 +441,7 @@ export async function resolveLinkedPullRequests(
         reviewDecision: null,
         draft: draft === true,
         headRepoFullName: readString(row.data?.headRepoFullName),
+        headSha: readString(row.data?.headSha),
         baseRefName: baseRefFromData(row.data),
         mergeCommitSha: readString(row.data?.merge_commit_sha),
         merged: row.data?.merged === true,
@@ -508,6 +510,7 @@ export async function resolveLinkedPullRequestsWithState(
         reviewDecision: null,
         draft: draft === true,
         headRepoFullName: readString(row.data?.headRepoFullName),
+        headSha: readString(row.data?.headSha),
         baseRefName: baseRefFromData(row.data),
         mergeCommitSha: readString(row.data?.merge_commit_sha),
         merged: row.data?.merged === true,

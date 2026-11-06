@@ -2018,10 +2018,10 @@ export interface CitedShaResolution {
 }
 
 const CITED_SHA_PATTERNS: RegExp[] = [
-  /`([0-9a-f]{7,40})`/gi,
-  /\b[A-Za-z0-9_.-]+@([0-9a-f]{7,40})(?![0-9a-f])/gi,
-  /github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/commit\/([0-9a-f]{7,40})(?![0-9a-f])/gi,
-  /\b(?:commits?|shas?)\s*[:#]?\s*([0-9a-f]{7,40})(?![0-9a-f])/gi,
+  /`([0-9a-f]{40})`/gi,
+  /\b[A-Za-z0-9_.-]+@([0-9a-f]{40})(?![0-9a-f])/gi,
+  /github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/commit\/([0-9a-f]{40})(?![0-9a-f])/gi,
+  /\b(?:commits?|shas?)\s*[:#]?\s*([0-9a-f]{40})(?![0-9a-f])/gi,
 ];
 
 const CITED_SHA_MAX = 10;
@@ -2146,6 +2146,21 @@ export async function resolveCitedCommits(
     return control === "present";
   };
 
+  let linkedPrs: LinkedPullRequest[] | null | undefined;
+  const matchesLinkedPr = async (sha: string): Promise<boolean | null> => {
+    if (linkedPrs === undefined) {
+      try {
+        linkedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id);
+      } catch {
+        linkedPrs = null;
+      }
+    }
+    if (linkedPrs === null) return null;
+    return linkedPrs.some((pr) =>
+      [pr.mergeCommitSha, pr.headSha].some((candidate) => candidate?.trim().toLowerCase() === sha),
+    );
+  };
+
   const results: CitedCommitResolution[] = [];
   for (const sha of shas) {
     const outcome = await githubCommitRefProbe(apiHostname, repoOwner, repoName, sha, authToken);
@@ -2153,9 +2168,20 @@ export async function resolveCitedCommits(
       results.push({ sha, status: "resolved" });
       continue;
     }
-    if (outcome === "absent" && (await controlPresent())) {
-      results.push({ sha, status: "nonexistent" });
-      continue;
+    if (outcome === "absent") {
+      const linkedMatch = await matchesLinkedPr(sha);
+      if (linkedMatch === true) {
+        results.push({ sha, status: "resolved" });
+        continue;
+      }
+      if (linkedMatch === null) {
+        results.push({ sha, status: "unverifiable" });
+        continue;
+      }
+      if (await controlPresent()) {
+        results.push({ sha, status: "nonexistent" });
+        continue;
+      }
     }
     results.push({ sha, status: "unverifiable" });
   }
