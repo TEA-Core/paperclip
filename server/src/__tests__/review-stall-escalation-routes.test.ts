@@ -743,10 +743,33 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
       responsibleUserId: seeded.userId,
       executionPolicy: policy,
       trustExplicitExecutionPolicy: true,
+      reapplyStoredExecutionPolicy: true,
     });
     expect((await issueRow(dispatched.id)).executionPolicy).toMatchObject({
       stallEscalation: { afterRounds: 2, toAgentId: seeded.pausedId.toLowerCase() },
     });
+  }, 60_000);
+
+  it("refuses a paused arbiter on the public create route even when the policy has explicitly empty stages", async () => {
+    const seeded = await seedCompany();
+
+    const res = await request(app(boardActor(seeded)))
+      .post(`/api/companies/${seeded.companyId}/issues`)
+      .send({
+        title: "API-written empty-stage policy",
+        status: "todo",
+        assigneeAgentId: seeded.coderId,
+        executionPolicy: {
+          stages: [],
+          baseRef: "main",
+          stallEscalation: { afterRounds: 2, toAgentId: seeded.pausedId },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "stall_arbiter_paused" });
+    const created = await db.select({ id: issues.id }).from(issues).where(eq(issues.title, "API-written empty-stage policy"));
+    expect(created).toHaveLength(0);
   }, 60_000);
 
   it.each(["paused", "terminated"])(

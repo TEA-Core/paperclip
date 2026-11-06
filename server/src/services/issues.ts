@@ -2076,6 +2076,8 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   actorResponsibleUserId?: string | null;
   trustExplicitResponsibleUserId?: boolean;
   trustExplicitExecutionPolicy?: boolean;
+  /** Internal only: set by routine dispatch when it re-applies the routine's stored policy; not part of any API schema. */
+  reapplyStoredExecutionPolicy?: boolean;
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
   onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
@@ -10469,6 +10471,7 @@ export function issueService(db: Db) {
         actorResponsibleUserId,
         trustExplicitResponsibleUserId,
         trustExplicitExecutionPolicy,
+        reapplyStoredExecutionPolicy,
         idempotencyKey: rawIdempotencyKey,
         allowDuplicate,
         onDeduplicated,
@@ -10514,7 +10517,7 @@ export function issueService(db: Db) {
           await assertAssignableAgent(db, companyId, normalizedPolicy.returnAssigneeAgentId, { kind: "work" });
         }
         // A routine re-applies its stored policy; an arbiter paused since it was saved must not stop the dispatch.
-        if (normalizedPolicy?.stallEscalation && trustExplicitExecutionPolicy !== true) {
+        if (normalizedPolicy?.stallEscalation && reapplyStoredExecutionPolicy !== true) {
           await assertStallArbiterCanTakeWork(db, companyId, normalizedPolicy.stallEscalation.toAgentId);
         }
       }

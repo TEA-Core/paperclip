@@ -2166,6 +2166,7 @@ export function routineService(
             // ladder (`stages: []`) must be honoured as "no ladder" on the card
             // instead of collapsing to null and inheriting the project default.
             trustExplicitExecutionPolicy: input.routine.executionPolicy != null,
+            reapplyStoredExecutionPolicy: input.routine.executionPolicy != null,
             executionWorkspaceId: input.executionWorkspaceId ?? null,
             executionWorkspacePreference: routineWorkspace.executionWorkspacePreference,
             executionWorkspaceSettings: routineWorkspace.executionWorkspaceSettings,
