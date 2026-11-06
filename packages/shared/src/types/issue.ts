@@ -1479,6 +1479,10 @@ export interface ConnectionIntentResult {
   supersededByInteractionId?: string | null;
 }
 
+export interface RequestConfirmationAdoptionCarrier {
+  issueId: string;
+}
+
 export interface RequestConfirmationPayload {
   version: 1;
   prompt: string;
@@ -1494,6 +1498,7 @@ export interface RequestConfirmationPayload {
   toolAction?: RequestConfirmationToolActionPayload;
   secretProposal?: RequestConfirmationSecretProposalPayload;
   connectionAuthorization?: RequestConfirmationConnectionAuthorizationPayload;
+  adoptionCarrier?: RequestConfirmationAdoptionCarrier | null;
 }
 
 export interface RequestCheckboxConfirmationOption {

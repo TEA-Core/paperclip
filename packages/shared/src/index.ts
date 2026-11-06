@@ -2020,6 +2020,7 @@ export {
   requestConfirmationIssueDocumentTargetSchema,
   requestConfirmationCustomTargetSchema,
   requestConfirmationTargetSchema,
+  requestConfirmationAdoptionCarrierSchema,
   requestConfirmationPayloadSchema,
   requestConfirmationResumeFailureSchema,
   requestConfirmationResultSchema,

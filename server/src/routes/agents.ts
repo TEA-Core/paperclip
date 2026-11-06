@@ -239,6 +239,7 @@ import {
   agentInstructionsChangeTargetKey,
   agentProfileChangeTargetKey,
   changeConsentGateService,
+  REFLECTION_COACH_ADOPTION_CARRIER_REQUIRED,
   touchesAgentProfileChangeConsentFields,
 } from "../services/change-consent-gate.js";
 import {
@@ -2775,6 +2776,9 @@ export function agentRoutes(
         });
       } catch (err) {
         if (err instanceof HttpError && err.status === 403) {
+          const details = err.details;
+          const code = details && typeof details === "object" && "code" in details ? details.code : null;
+          if (code === REFLECTION_COACH_ADOPTION_CARRIER_REQUIRED) throw err;
           throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
         }
         throw err;

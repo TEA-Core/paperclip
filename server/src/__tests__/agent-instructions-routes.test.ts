@@ -39,6 +39,10 @@ const mockEnvironmentService = vi.hoisted(() => ({
   getById: vi.fn(),
 }));
 
+const mockChangeConsentGate = vi.hoisted(() => ({
+  assertConsented: vi.fn(),
+}));
+
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockSyncInstructionsBundleConfigFromFilePath = vi.hoisted(() => vi.fn());
 const mockFindServerAdapter = vi.hoisted(() => vi.fn());
@@ -76,6 +80,13 @@ vi.mock("../adapters/index.js", () => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/change-consent-gate.js", async () => ({
+    ...(await vi.importActual<typeof import("../services/change-consent-gate.js")>(
+      "../services/change-consent-gate.js",
+    )),
+    changeConsentGateService: () => mockChangeConsentGate,
+  }));
+
   vi.doMock("../services/index.js", () => ({
     agentService: () => mockAgentService,
     agentInstructionsService: () => mockAgentInstructionsService,
@@ -620,6 +631,89 @@ describe("agent instructions bundle routes", () => {
       }),
       expect.any(Object),
     );
+  });
+
+  describe("agent writes gated by change consent", () => {
+    const targetAgentId = "11111111-1111-4111-8111-111111111111";
+    const coachActor = {
+      type: "agent",
+      agentId: "coach-agent",
+      companyId: "company-1",
+      runId: "33333333-3333-4333-8333-333333333333",
+      source: "agent_key",
+    };
+    const writes: Array<[string, (baseUrl: string) => request.Test]> = [
+      [
+        "PUT instructions-bundle/file",
+        (baseUrl) => request(baseUrl)
+          .put(`/api/agents/${targetAgentId}/instructions-bundle/file`)
+          .send({ path: "AGENTS.md", content: "# Updated Agent\n" }),
+      ],
+      [
+        "DELETE instructions-bundle/file",
+        (baseUrl) => request(baseUrl)
+          .delete(`/api/agents/${targetAgentId}/instructions-bundle/file`)
+          .query({ path: "AGENTS.md" }),
+      ],
+      [
+        "PATCH instructions-bundle",
+        (baseUrl) => request(baseUrl)
+          .patch(`/api/agents/${targetAgentId}/instructions-bundle`)
+          .send({ entryFile: "AGENTS.md" }),
+      ],
+    ];
+
+    beforeEach(() => {
+      mockAgentService.getById.mockImplementation(async (id: string) =>
+        id === "coach-agent" ? makeReflectionCoachAgent({ id: "coach-agent" }) : makeAgent());
+      mockAccessService.decide.mockResolvedValue({
+        allowed: false,
+        action: "agent_config:update",
+        reason: "deny_missing_consent",
+        explanation: "Accepted consent is required for this suggested change.",
+        grant: { permissionKey: "agents:suggest-changes" },
+      });
+    });
+
+    it.each(writes)(
+      "%s surfaces the adoption-carrier refusal and writes nothing",
+      async (_label, perform) => {
+        const { forbidden } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+        mockChangeConsentGate.assertConsented.mockRejectedValueOnce(
+          forbidden("Reflection Coach instruction-bundle mutations require an adoption carrier.", {
+            code: "reflection_coach_adoption_carrier_required",
+            targetKeys: [`agent:${targetAgentId}:instructions`],
+          }),
+        );
+
+        const res = await requestApp(await createApp(coachActor), perform);
+
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(res.body.details).toMatchObject({ code: "reflection_coach_adoption_carrier_required" });
+        expect(res.body.details).not.toHaveProperty("reason", "deny_missing_consent");
+        expect(mockChangeConsentGate.assertConsented).toHaveBeenCalledWith(expect.objectContaining({
+          actorAgentId: "coach-agent",
+          targetKeys: [`agent:${targetAgentId}:instructions`],
+        }));
+        expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+        expect(mockAgentInstructionsService.deleteFile).not.toHaveBeenCalled();
+        expect(mockAgentInstructionsService.updateBundle).not.toHaveBeenCalled();
+        expect(mockAgentService.update).not.toHaveBeenCalled();
+      },
+    );
+
+    it("keeps masking any other consent refusal as the generic missing-consent denial", async () => {
+      const { forbidden } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      mockChangeConsentGate.assertConsented.mockRejectedValueOnce(
+        forbidden("No accepted confirmation.", { code: "change_consent_not_found" }),
+      );
+
+      const res = await requestApp(await createApp(coachActor), writes[0]![1]);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toEqual({ reason: "deny_missing_consent" });
+      expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+    });
   });
 
   it("preserves managed instructions config when switching adapters", async () => {

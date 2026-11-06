@@ -1,7 +1,11 @@
 import type { Db } from "@paperclipai/db";
 import { issueThreadInteractions } from "@paperclipai/db";
 import { and, desc, eq, or, sql } from "drizzle-orm";
-import type { RequestConfirmationPayload, RequestConfirmationResult } from "@paperclipai/shared";
+import {
+  requestConfirmationAdoptionCarrierSchema,
+  type RequestConfirmationPayload,
+  type RequestConfirmationResult,
+} from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 
 export const AGENT_PROFILE_CHANGE_CONSENT_FIELDS = ["name", "role", "title", "capabilities"] as const;
@@ -60,6 +64,19 @@ function payloadHasDisplayedDiff(payload: RequestConfirmationPayload) {
   if (!details) return false;
   if (/```diff\b/i.test(details)) return true;
   return /(^|\n)[+-][^\n]+/.test(details);
+}
+
+export const REFLECTION_COACH_ADOPTION_CARRIER_REQUIRED =
+  "reflection_coach_adoption_carrier_required";
+
+function isInstructionConsentTargetKey(targetKey: string) {
+  if (isAgentInstructionsChangeTargetKey(targetKey)) return true;
+  const legacyPrefix = "reflection-coach:agent-instructions:";
+  return targetKey.startsWith(legacyPrefix) && targetKey.length > legacyPrefix.length;
+}
+
+function namesAdoptionCarrier(payload: RequestConfirmationPayload) {
+  return requestConfirmationAdoptionCarrierSchema.safeParse(payload.adoptionCarrier).success;
 }
 
 function requestConfirmationResultConsumed(result: RequestConfirmationResult | null) {
@@ -202,6 +219,22 @@ export function changeConsentGateService(db: Db) {
             + "created in a previous run and not already consumed.",
           {
             code: "reflection_coach_mutation_gate_required",
+            targetKeys,
+          },
+        );
+      }
+
+      const acceptedPayload = accepted.payload as RequestConfirmationPayload;
+      const acceptedTargetKey = acceptedPayload.target?.type === "custom" ? acceptedPayload.target.key : null;
+      if (
+        acceptedTargetKey
+        && isInstructionConsentTargetKey(acceptedTargetKey)
+        && !namesAdoptionCarrier(acceptedPayload)
+      ) {
+        throw forbidden(
+          "Reflection Coach instruction-bundle mutations require the accepted confirmation to name an adoption carrier issue in payload.adoptionCarrier.issueId.",
+          {
+            code: REFLECTION_COACH_ADOPTION_CARRIER_REQUIRED,
             targetKeys,
           },
         );
