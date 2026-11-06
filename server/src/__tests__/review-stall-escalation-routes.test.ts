@@ -13,12 +13,14 @@ import {
   issueExecutionDecisions,
   issueRecoveryActions,
   issues,
+  projects,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { REVIEW_STALL_ESCALATED_ACTION } from "../services/issue-execution-policy.js";
 import { issueService } from "../services/issues.js";
+import { routineService } from "../services/routines.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -358,6 +360,56 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     expect(row.executionState).not.toHaveProperty("stallHandoff");
   }, 60_000);
 
+  // One stale hand-off per compared policy control (N5 afterRounds, N8 stage
+  // type, N9 participants): the board commits the edit between the reviewer's
+  // read and its row lock; the hand-off computed from the old policy is refused.
+  it.each<[string, (policy: StoredPolicy, seeded: Seeded) => Record<string, unknown>]>([
+    ["raised afterRounds from 2 to 5", (policy) => ({ ...policy, stallEscalation: { ...policy.stallEscalation, afterRounds: 5 } })],
+    ["changed the stage type from review to approval", (policy) => ({ ...policy, stages: policy.stages.map((stage) => ({ ...stage, type: "approval" })) })],
+    [
+      "added a second reviewer to the stage",
+      (policy, seeded) => ({
+        ...policy,
+        stages: policy.stages.map((stage) => ({
+          ...stage,
+          participants: [...stage.participants, { id: randomUUID(), type: "agent", agentId: seeded.secondReviewerId }],
+        })),
+      }),
+    ],
+    [
+      "swapped the stage reviewer",
+      (policy, seeded) => ({
+        ...policy,
+        stages: policy.stages.map((stage) => ({ ...stage, participants: [{ id: randomUUID(), type: "agent", agentId: seeded.secondReviewerId }] })),
+      }),
+    ],
+  ])(
+    "refuses a stale hand-off when the board %s before the row lock",
+    async (_change, edit) => {
+      const seeded = await seedCompany();
+      const { issueId } = await seedPendingReview(seeded);
+      const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+      lockInterleave.beforeLock = async () => {
+        const current = (await issueRow(issueId)).executionPolicy as StoredPolicy;
+        await db.update(issues).set({ executionPolicy: edit(current, seeded) }).where(eq(issues.id, issueId));
+      };
+
+      const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress", comment: "Same finding on the same head.\nCode acceptable: yes" });
+
+      expect(lockInterleave.beforeLock).toBeNull();
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+      expect(await stallRows(issueId)).toHaveLength(0);
+      expect(await decisionRows(issueId)).toHaveLength(0);
+      const row = await issueRow(issueId);
+      expect(row.assigneeAgentId).toBe(seeded.reviewerId);
+      expect(row.executionState).not.toHaveProperty("stallHandoff");
+    },
+    60_000,
+  );
+
   async function seedArbiterHold(seeded: Seeded, shape: { reviewers?: string[]; twoStage?: boolean } = {}) {
     const seededIssue = await seedPendingReview(
       seeded,
@@ -484,6 +536,40 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     expect((await issueRow(issueId)).executionState).toMatchObject({ currentStageId: stageId, completedStageIds: [] });
   }, 60_000);
 
+  it("lets the configured reviewer approve after an arbiter round (P17r)", async () => {
+    const seeded = await seedCompany();
+    const { issueId, stageId, approvalStageId } = await seedArbiterHold(seeded, { twoStage: true });
+
+    // The arbiter answers with a directive; the implementer redelivers; the
+    // stage goes back to its configured reviewer, who approves it.
+    const arbiterRun = await liveRun(seeded, seeded.arbiterId, issueId);
+    const directive = await request(app(agentActor(seeded, seeded.arbiterId, arbiterRun)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_progress", comment: "Regenerate the stale fixture and redeliver." });
+    expect(directive.status, JSON.stringify(directive.body)).toBe(200);
+    expect((await issueRow(issueId)).assigneeAgentId).toBe(seeded.coderId);
+
+    const coderRun = await liveRun(seeded, seeded.coderId, issueId);
+    const redelivery = await request(app(agentActor(seeded, seeded.coderId, coderRun)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_review", comment: "Redelivered with the regenerated fixture." });
+    expect(redelivery.status, JSON.stringify(redelivery.body)).toBe(200);
+    expect((await issueRow(issueId)).assigneeAgentId).toBe(seeded.reviewerId);
+
+    const reviewerRun = await liveRun(seeded, seeded.reviewerId, issueId);
+    const approval = await request(app(agentActor(seeded, seeded.reviewerId, reviewerRun)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done", comment: "Approved: the fixture is regenerated." });
+
+    expect(approval.status, JSON.stringify(approval.body)).toBe(200);
+    expect((await issueRow(issueId)).executionState).toMatchObject({
+      currentStageId: approvalStageId,
+      completedStageIds: [stageId],
+    });
+    const outcomes = (await decisionRows(issueId)).map((row) => `${row.outcome}:${row.actorAgentId}`).sort();
+    expect(outcomes).toEqual([`approved:${seeded.reviewerId}`, `changes_requested:${seeded.arbiterId}`].sort());
+  }, 90_000);
+
   // Mixed concurrent decisions by the stage's reviewer on a two-reviewer stage
   // without the same-head signal: only the marker decision hands off.
   const plainBounce = { status: "in_progress", comment: "Another finding in the retry path." };
@@ -609,6 +695,35 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     expect(row.executionState).not.toHaveProperty("stallHandoff");
   }, 60_000);
 
+  it("refuses an ordinary bounce whose delivered head was refreshed before the row lock", async () => {
+    const seeded = await seedCompany();
+    // No stall signal: the reviewer's decision is an ordinary bounce, guarded
+    // only because the card carries stallEscalation.
+    const { issueId } = await seedMixedRace(seeded);
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    const refreshedHead = "d".repeat(40);
+    lockInterleave.beforeLock = async () => {
+      const current = await issueRow(issueId);
+      await db
+        .update(issues)
+        .set({ executionState: { ...(current.executionState as Record<string, unknown>), deliveredHeadSha: refreshedHead } })
+        .where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(plainBounce);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    expect(row.assigneeAgentId).toBe(seeded.reviewerId);
+    expect(row.executionState).toMatchObject({ deliveredHeadSha: refreshedHead });
+  }, 60_000);
+
   it("refuses an ordinary bounce computed before the board lowered the round ceiling", async () => {
     const seeded = await seedCompany();
     // Ceiling 4 and round 3 next, no stall signal: an ordinary bounce to the coder.
@@ -640,6 +755,47 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     expect(row.status).toBe("in_review");
     expect(row.assigneeAgentId).toBe(seeded.reviewerId);
     expect(row.executionPolicy).toMatchObject({ maxReviewRounds: 2 });
+  }, 60_000);
+
+  it("refuses an ordinary bounce on a card that keeps only a hand-off record when the ceiling was lowered (G2)", async () => {
+    const seeded = await seedCompany();
+    // This stage-run was handed off earlier; the stall policy has since been
+    // dropped (SUP-23065) and the reviewer is seated again. Only the hand-off
+    // record makes the decision a guarded one.
+    const { issueId } = await seedPendingReview(
+      seeded,
+      (stageId) => ({
+        changesRequestedCount: 2,
+        bouncedHeadSha: "b".repeat(40),
+        stallHandoff: {
+          stageId,
+          arbiterAgentId: seeded.arbiterId,
+          fromParticipant: { type: "agent", agentId: seeded.reviewerId, userId: null },
+          changesRequestedCount: 1,
+          signals: ["same_head_rebounced"],
+          handedOffAt: "2026-11-05T00:00:00.000Z",
+        },
+      }),
+      { maxReviewRounds: 4 },
+    );
+    const { stallEscalation: _dropped, ...withoutStall } = (await issueRow(issueId)).executionPolicy as StoredPolicy;
+    await db.update(issues).set({ executionPolicy: withoutStall }).where(eq(issues.id, issueId));
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    lockInterleave.beforeLock = async () => {
+      await db.update(issues).set({ executionPolicy: { ...withoutStall, maxReviewRounds: 2 } }).where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(plainBounce);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    expect(row.assigneeAgentId).toBe(seeded.reviewerId);
   }, 60_000);
 
   async function resolveRecovery(seeded: Seeded, issueId: string, note: string) {
@@ -771,6 +927,63 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     const created = await db.select({ id: issues.id }).from(issues).where(eq(issues.title, "API-written empty-stage policy"));
     expect(created).toHaveLength(0);
   }, 60_000);
+
+  it.each(["paused", "terminated"])(
+    "dispatches a routine whose stored policy names a %s arbiter, while public creates naming it stay refused (G7)",
+    async (status) => {
+      const seeded = await seedCompany();
+      const projectId = randomUUID();
+      await db.insert(projects).values({ id: projectId, companyId: seeded.companyId, name: "Stall routines", status: "in_progress" });
+      const routines = routineService(db, { heartbeat: { wakeup: async () => null } as never });
+      const policy = stallPolicy(seeded, randomUUID());
+      const routine = await routines.create(
+        seeded.companyId,
+        {
+          projectId,
+          goalId: null,
+          parentIssueId: null,
+          title: "Stall routine",
+          description: "Dispatch with a stored stall policy",
+          assigneeAgentId: seeded.coderId,
+          priority: "medium",
+          status: "active",
+          concurrencyPolicy: "coalesce_if_active",
+          catchUpPolicy: "skip_missed",
+          executionPolicy: policy as never,
+          variables: [],
+        },
+        { userId: seeded.userId },
+      );
+      // The arbiter becomes unavailable after the routine stored its policy.
+      await db.update(agents).set({ status }).where(eq(agents.id, seeded.arbiterId));
+
+      const run = await routines.runRoutine(routine.id, { source: "manual" });
+
+      expect(run.status).toBe("issue_created");
+      expect((await issueRow(run.linkedIssueId!)).executionPolicy).toMatchObject({
+        stallEscalation: { afterRounds: 2, toAgentId: seeded.arbiterId.toLowerCase() },
+      });
+
+      const board = app(boardActor(seeded));
+      const titles = ["API policy with stages", "API policy with empty stages", "Smuggled reapply option"];
+      for (const [title, executionPolicy] of [
+        [titles[0], policy],
+        [titles[1], { stages: [], baseRef: "main", stallEscalation: policy.stallEscalation }],
+      ] as const) {
+        const res = await request(board)
+          .post(`/api/companies/${seeded.companyId}/issues`)
+          .send({ title, status: "todo", assigneeAgentId: seeded.coderId, executionPolicy });
+        expect(res.status, `${title}: ${JSON.stringify(res.body)}`).toBe(409);
+      }
+      // The routine-only create option is not part of the public schema.
+      const smuggled = await request(board)
+        .post(`/api/companies/${seeded.companyId}/issues`)
+        .send({ title: titles[2], status: "todo", assigneeAgentId: seeded.coderId, executionPolicy: policy, reapplyStoredExecutionPolicy: true });
+      expect(smuggled.status, JSON.stringify(smuggled.body)).toBe(400);
+      expect(await db.select({ id: issues.id }).from(issues).where(inArray(issues.title, titles))).toHaveLength(0);
+    },
+    90_000,
+  );
 
   it.each(["paused", "terminated"])(
     "skips the hand-off when the arbiter became %s after the policy was set",
