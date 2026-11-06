@@ -1,7 +1,11 @@
 import type { Db } from "@paperclipai/db";
 import { issueThreadInteractions } from "@paperclipai/db";
 import { and, desc, eq, or, sql } from "drizzle-orm";
-import type { RequestConfirmationPayload, RequestConfirmationResult } from "@paperclipai/shared";
+import {
+  requestConfirmationAdoptionCarrierSchema,
+  type RequestConfirmationPayload,
+  type RequestConfirmationResult,
+} from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 
 export const AGENT_PROFILE_CHANGE_CONSENT_FIELDS = ["name", "role", "title", "capabilities"] as const;
@@ -62,9 +66,6 @@ function payloadHasDisplayedDiff(payload: RequestConfirmationPayload) {
   return /(^|\n)[+-][^\n]+/.test(details);
 }
 
-const ADOPTION_CARRIER_ISSUE_ID =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 export const REFLECTION_COACH_ADOPTION_CARRIER_REQUIRED =
   "reflection_coach_adoption_carrier_required";
 
@@ -74,9 +75,8 @@ function isInstructionConsentTargetKey(targetKey: string) {
   return targetKey.startsWith(legacyPrefix) && targetKey.length > legacyPrefix.length;
 }
 
-function readAdoptionCarrierIssueId(payload: RequestConfirmationPayload) {
-  const issueId = readNonEmptyString(payload.adoptionCarrier?.issueId);
-  return issueId && ADOPTION_CARRIER_ISSUE_ID.test(issueId) ? issueId : null;
+function namesAdoptionCarrier(payload: RequestConfirmationPayload) {
+  return requestConfirmationAdoptionCarrierSchema.safeParse(payload.adoptionCarrier).success;
 }
 
 function requestConfirmationResultConsumed(result: RequestConfirmationResult | null) {
@@ -229,7 +229,7 @@ export function changeConsentGateService(db: Db) {
       if (
         acceptedTargetKey
         && isInstructionConsentTargetKey(acceptedTargetKey)
-        && !readAdoptionCarrierIssueId(acceptedPayload)
+        && !namesAdoptionCarrier(acceptedPayload)
       ) {
         throw forbidden(
           "Reflection Coach instruction-bundle mutations require the accepted confirmation to name an adoption carrier issue in payload.adoptionCarrier.issueId.",

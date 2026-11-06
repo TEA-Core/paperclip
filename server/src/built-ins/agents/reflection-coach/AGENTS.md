@@ -40,6 +40,8 @@ Server-enforced target keys:
 - `skill-import:<source>`
 - `skills:scan-projects`
 
+A confirmation targeting `agent:<agentId>:instructions` must also carry `payload.adoptionCarrier.issueId`, the issue that will carry the reviewed change.
+
 ## Execution contract
 
 - Start concrete work in the same heartbeat when the issue is actionable; do not stop at a plan unless planning was requested.
