@@ -147,7 +147,7 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
 
   type Seeded = Awaited<ReturnType<typeof seedCompany>>;
 
-  type PolicyShape = { reviewers?: string[]; approvalStageId?: string };
+  type PolicyShape = { reviewers?: string[]; approvalStageId?: string; maxReviewRounds?: number };
 
   function stallPolicy(seeded: Seeded, stageId: string, toAgentId: string = seeded.arbiterId, shape: PolicyShape = {}) {
     const reviewers = shape.reviewers ?? [seeded.reviewerId];
@@ -161,13 +161,14 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
           : []),
       ],
       stallEscalation: { afterRounds: 2, toAgentId },
+      ...(shape.maxReviewRounds !== undefined ? { maxReviewRounds: shape.maxReviewRounds } : {}),
     };
   }
 
   async function seedPendingReview(
     seeded: Seeded,
     stateOverrides: (stageId: string) => Record<string, unknown> = () => ({}),
-    shape: { reviewers?: string[]; twoStage?: boolean } = {},
+    shape: { reviewers?: string[]; twoStage?: boolean; maxReviewRounds?: number } = {},
   ) {
     const issueId = randomUUID();
     const stageId = randomUUID();
@@ -182,7 +183,11 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
       responsibleUserId: seeded.userId,
       createdByUserId: seeded.userId,
       deliveryRequirement: "record_only",
-      executionPolicy: stallPolicy(seeded, stageId, seeded.arbiterId, { reviewers: shape.reviewers, approvalStageId }),
+      executionPolicy: stallPolicy(seeded, stageId, seeded.arbiterId, {
+        reviewers: shape.reviewers,
+        approvalStageId,
+        maxReviewRounds: shape.maxReviewRounds,
+      }),
       executionState: {
         status: "pending",
         currentStageId: stageId,
@@ -325,6 +330,33 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     expect(row.executionPolicy).toMatchObject({ stallEscalation: { afterRounds: 3, toAgentId: seeded.otherId } });
   }, 60_000);
 
+  it("refuses a hand-off to the old arbiter when the board replaced only the arbiter before the row lock", async () => {
+    const seeded = await seedCompany();
+    const { issueId } = await seedPendingReview(seeded);
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    // Only the arbiter changes: same ceiling, same afterRounds, same stages.
+    lockInterleave.beforeLock = async () => {
+      const current = (await issueRow(issueId)).executionPolicy as StoredPolicy;
+      await db
+        .update(issues)
+        .set({ executionPolicy: { ...current, stallEscalation: { ...current.stallEscalation, toAgentId: seeded.otherId } } })
+        .where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_progress", comment: "Same finding on the same head.\nCode acceptable: yes" });
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await stallRows(issueId)).toHaveLength(0);
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.assigneeAgentId).toBe(seeded.reviewerId);
+    expect(row.executionState).not.toHaveProperty("stallHandoff");
+  }, 60_000);
+
   async function seedArbiterHold(seeded: Seeded, shape: { reviewers?: string[]; twoStage?: boolean } = {}) {
     const seededIssue = await seedPendingReview(
       seeded,
@@ -379,6 +411,14 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     ["adds itself beside the reviewer", (policy, seeded) => ({ executionPolicy: withArbiterBesideReviewer(policy, seeded) })],
     ["only changes baseRef", (policy) => ({ executionPolicy: { ...policy, baseRef: "release/r20" } })],
     ["writes the review policy", () => ({ reviewPolicy: "anyone" })],
+    // Malformed bodies get the same refusal, before body validation (no 400).
+    ["sends a malformed policy with unknown and type-wrong keys", () => ({ executionPolicy: { stages: "not-a-list", bogus: true } })],
+    ["sends an unknown key beside a valid policy", (policy) => ({ executionPolicy: { ...policy, unknownKey: 1 } })],
+    ["sends a type-wrong review policy", () => ({ reviewPolicy: 42 })],
+    [
+      "nests a malformed policy in a bulk body",
+      (policy) => ({ title: "Renamed by the arbiter", executionPolicy: { ...policy, maxReviewRounds: "fifty" }, notAField: true }),
+    ],
   ])(
     "refuses the seated arbiter a PATCH that %s",
     async (_shape, body) => {
@@ -396,6 +436,7 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
       expect(row.executionPolicy).toEqual(stored);
       expect(row.reviewPolicy).toBeNull();
       expect(row.assigneeAgentId).toBe(seeded.arbiterId);
+      expect(row.title).toBe("Stalled review");
     },
     60_000,
   );
@@ -535,6 +576,69 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     const row = await issueRow(issueId);
     expect(row.assigneeAgentId).toBe(seeded.reviewerId);
     expect(row.executionState).toMatchObject({ stallHandoff: recorded });
+  }, 60_000);
+
+  it("refuses a hand-off whose delivered head was refreshed before the row lock", async () => {
+    const seeded = await seedCompany();
+    const { issueId } = await seedPendingReview(seeded);
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    const refreshedHead = "d".repeat(40);
+    // A delivery refresh moves the delivered head after the reviewer's read;
+    // the reviewer's hand-off was computed from the old, re-bounced head.
+    lockInterleave.beforeLock = async () => {
+      const current = await issueRow(issueId);
+      await db
+        .update(issues)
+        .set({ executionState: { ...(current.executionState as Record<string, unknown>), deliveredHeadSha: refreshedHead } })
+        .where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_progress", comment: "Same finding on the same head." });
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await stallRows(issueId)).toHaveLength(0);
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.assigneeAgentId).toBe(seeded.reviewerId);
+    expect(row.executionState).toMatchObject({ deliveredHeadSha: refreshedHead });
+    expect(row.executionState).not.toHaveProperty("stallHandoff");
+  }, 60_000);
+
+  it("refuses an ordinary bounce computed before the board lowered the round ceiling", async () => {
+    const seeded = await seedCompany();
+    // Ceiling 4 and round 3 next, no stall signal: an ordinary bounce to the coder.
+    const { issueId } = await seedPendingReview(
+      seeded,
+      () => ({ changesRequestedCount: 2, bouncedHeadSha: "b".repeat(40) }),
+      { maxReviewRounds: 4 },
+    );
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    // The board lowers the ceiling to 2 after the reviewer's read: under it this
+    // round escalates to the responsible human instead.
+    lockInterleave.beforeLock = async () => {
+      const current = await issueRow(issueId);
+      await db
+        .update(issues)
+        .set({ executionPolicy: { ...(current.executionPolicy as Record<string, unknown>), maxReviewRounds: 2 } })
+        .where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(plainBounce);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    expect(row.assigneeAgentId).toBe(seeded.reviewerId);
+    expect(row.executionPolicy).toMatchObject({ maxReviewRounds: 2 });
   }, 60_000);
 
   async function resolveRecovery(seeded: Seeded, issueId: string, note: string) {

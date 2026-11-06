@@ -1148,9 +1148,10 @@ function stallHoldSignature(policy: IssueExecutionPolicy | null): string {
 
 /**
  * R20: whether `previous` and `next` differ in any control that governs a
- * stall hand-off. The decision transaction compares the policy it computed the
- * hand-off from with the policy re-read under the row lock, and refuses a
- * hand-off decided against a policy that has since changed.
+ * stall hand-off or the round ceiling. The decision transaction compares the
+ * policy a decision on a stall-escalation card was computed from with the
+ * policy re-read under the row lock, and refuses the decision (hand-off or
+ * ordinary bounce) when the policy has since changed.
  */
 export function stallHoldControlsDiffer(previous: IssueExecutionPolicy | null, next: IssueExecutionPolicy | null): boolean {
   return stallHoldSignature(previous) !== stallHoldSignature(next);

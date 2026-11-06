@@ -18626,6 +18626,28 @@ export function issueRoutes(
       }) as typeof res.json;
       next();
     },
+    // R20: while an agent is seated as the stall arbiter of the pending stage it
+    // may not write the execution policy or the review policy at all. Any such
+    // write could lift its own hold (ceiling, afterRounds, arbiter, the stall
+    // policy) or seat it as a reviewer of the stage it arbitrates. Checked
+    // before body validation so a malformed policy body gets the same refusal.
+    async (req, _res, next) => {
+      const body = req.body as Record<string, unknown> | undefined;
+      if (req.actor.type === "agent" && body && (body.executionPolicy !== undefined || body.reviewPolicy !== undefined)) {
+        const issue = await svc.getById(req.params.id as string);
+        if (
+          issue &&
+          issue.companyId === req.actor.companyId &&
+          isSeatedStallArbiter(parseIssueExecutionState(issue.executionState), req.actor.agentId)
+        ) {
+          throw forbidden(
+            "The stall arbiter holding this review stage cannot change the issue's execution policy or review policy. Decide the stage (request changes with a directive, or park it blocked); a board operator owns policy changes while the hold stands.",
+            { code: "stall_arbiter_policy_edit_refused", issueId: issue.id },
+          );
+        }
+      }
+      next();
+    },
     validateIssueMutationBody(updateIssueRouteSchema),
     async (req, res) => {
     const id = req.params.id as string;
@@ -18870,20 +18892,6 @@ export function issueRoutes(
       req.body.reviewPolicy !== undefined
       || updateFields.status === "done"
       || updateFields.status === "cancelled";
-    // R20: while an agent is seated as the stall arbiter of the pending stage it
-    // may not write the execution policy or the review policy at all. Any such
-    // write could lift its own hold (ceiling, afterRounds, arbiter, the stall
-    // policy) or seat it as a reviewer of the stage it arbitrates.
-    if (
-      (req.body.executionPolicy !== undefined || req.body.reviewPolicy !== undefined) &&
-      req.actor.type === "agent" &&
-      isSeatedStallArbiter(parseIssueExecutionState(existing.executionState), actor.agentId)
-    ) {
-      throw forbidden(
-        "The stall arbiter holding this review stage cannot change the issue's execution policy or review policy. Decide the stage (request changes with a directive, or park it blocked); a board operator owns policy changes while the hold stands.",
-        { code: "stall_arbiter_policy_edit_refused", issueId: existing.id },
-      );
-    }
     if (
       (reviewVerdictRequested || reviewPolicyChangeRequested)
       && existing.reviewPolicy != null
@@ -20562,16 +20570,18 @@ export function issueRoutes(
             reviewPolicySensitiveMutationRequested
             && !(await assertLockedReviewPolicyAllowsMutation(tx))
           ) return null;
-          // R20: the once-per-stage-run hand-off must be atomic and must use the
-          // policy that holds at commit. Every decision on a stall-escalation
-          // card (with or without a stall signal) and every hand-off was
-          // computed from the unlocked read, so lock the row and re-check: a
-          // concurrent decision that committed first moved lastDecisionId, or a
-          // hand-off record appeared or changed since the read — a plain bounce
-          // would otherwise erase it and let the stage-run hand off again. A
-          // hand-off is also refused when a concurrent policy write changed the
-          // ceiling, the stall policy or the stages it was decided from. A
-          // refused request persists nothing (no decision, no hand-off row).
+          // R20: the once-per-stage-run hand-off must be atomic, and every
+          // decision on a stall-escalation card must use the state and policy
+          // that hold at commit. Each such decision (with or without a stall
+          // signal) was computed from the unlocked read, so lock the row and
+          // re-check: a concurrent decision that committed first moved
+          // lastDecisionId, or a hand-off record appeared or changed since the
+          // read — a plain bounce would otherwise erase it and let the
+          // stage-run hand off again. A concurrent delivery refresh that moved
+          // the delivered head, or a policy write that changed the ceiling, the
+          // stall policy or the stages, would otherwise be overwritten by a
+          // decision computed against the old values. A refused request
+          // persists nothing (no decision, no hand-off row).
           if (stallLockGuardRequired) {
             const locked = await svc.getByIdForUpdate(id, tx);
             const lockedState = parseIssueExecutionState(locked?.executionState ?? null);
@@ -20589,15 +20599,15 @@ export function issueRoutes(
               );
             }
             if (
-              transition.stallEscalation &&
+              (lockedState?.deliveredHeadSha ?? null) !== (stallGuardReadState?.deliveredHeadSha ?? null) ||
               stallHoldControlsDiffer(previousExecutionPolicy, normalizeIssueExecutionPolicy(locked?.executionPolicy ?? null))
             ) {
               throw conflict(
-                "The execution policy changed while this decision was in flight (round ceiling, stall arbiter or stages); this decision was not recorded and the stage was not handed off. Re-read the issue before deciding.",
+                "The delivered head or the execution policy (round ceiling, stall arbiter or stages) changed while this decision was in flight; this decision was not recorded and the stage was not handed off. Re-read the issue before deciding.",
                 {
                   code: "review_stall_policy_changed",
                   issueId: existing.id,
-                  stageId: transition.stallEscalation.stageId,
+                  stageId: stallGuardReadState?.currentStageId ?? null,
                 },
               );
             }
