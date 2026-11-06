@@ -1793,6 +1793,7 @@ export interface NoRepositoryLandingSubject {
   id: string;
   companyId: string;
   identifier: string | null;
+  status?: string | null;
   projectWorkspaceId?: string | null;
   executionWorkspaceId?: string | null;
   deliveryRequirement?: IssueDeliveryRequirement | null;
@@ -2241,7 +2242,8 @@ function changedSinceMeasurement(
  * against the row it holds `FOR UPDATE`. It runs no Git process and makes no
  * network call: it re-reads the database half of the proof, requires it to
  * match what was measured, and requires the worktree's HEAD, read from its ref
- * files, to still be the measured commit. Any mismatch refuses.
+ * files, to still be the measured commit. Any mismatch refuses, including an
+ * issue another request already closed (done or cancelled).
  */
 export async function verifyNoRepositoryLandingAtTransition(
   tx: Db,
@@ -2252,6 +2254,11 @@ export async function verifyNoRepositoryLandingAtTransition(
 ): Promise<NoRepositoryLandingVerdict> {
   const refusal = closeRequestRefusal(lockedIssue, request);
   if (refusal) return refusal;
+  // A racing close of the same issue already committed: one transition writes
+  // one verification row, so the others refuse instead of closing it again.
+  if (lockedIssue.status === "done" || lockedIssue.status === "cancelled") {
+    return noRepositoryRefusal("refused: the issue's status changed after the close was measured.");
+  }
   if (lockedIssue.deliveryRequirement !== "record_only") {
     return noRepositoryRefusal("is accepted only on an issue already stored as record_only at the close write.");
   }

@@ -390,6 +390,14 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     return request(app).patch(`/api/issues/${identifier}`).send({ status: "done", doneTier });
   }
 
+  async function activityCount(issueId: string, action: string) {
+    return db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, action)))
+      .then((rows) => rows.length);
+  }
+
   async function statusOf(issueId: string) {
     return db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]?.status);
   }
@@ -1021,6 +1029,26 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 
+  // A terminal status is the one mismatch that leaves the row changed by someone
+  // else, so the issue keeps the status the other request gave it.
+  it.each(["done", "cancelled"] as const)("refuses at the compare-and-set when another request already moved the issue to %s", async (terminal) => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    mockMeasureNoRepositoryLanding.mockImplementation(async (...args: Parameters<typeof measureNoRepositoryLandingForClose>) => {
+      const verdict = await realMeasureNoRepositoryLandingRef.current!(...args);
+      expect(verdict.ok, JSON.stringify(verdict)).toBe(true);
+      await db.update(issues).set({ status: terminal }).where(eq(issues.id, fixture.issueId));
+      return verdict;
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("the issue's status changed after the close was measured");
+    expect(await statusOf(fixture.issueId)).toBe(terminal);
+    expect(await activityCount(fixture.issueId, "issue.done_transition_no_repository_landing_verified")).toBe(0);
+  });
+
   // The recorded worktree's status is the last step of the measurement, so
   // content written while the GitHub compare runs is still caught.
   it("refuses when the worktree is dirtied during the pre-write measurement's GitHub compare", async () => {
@@ -1107,6 +1135,60 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(responses.map((res) => res.status)).toEqual(fixtures.map(() => 200));
     for (const fixture of fixtures) expect(await statusOf(fixture.issueId)).toBe("done");
   }, 120_000);
+
+  it("lets exactly one of twelve concurrent closes of one issue through; the rest refuse at the compare-and-set", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    // Hold every request at its first GitHub compare until all twelve have read
+    // the issue as in_progress, so none can start after the first close commits.
+    const racers = 12;
+    let arrived = 0;
+    let release!: () => void;
+    const allArrived = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (arrived < racers) {
+        arrived += 1;
+        if (arrived === racers) release();
+        await allArrived;
+      }
+      return compareAgainstOrigin(url);
+    });
+
+    const responses = await Promise.all(
+      Array.from({ length: racers }, () =>
+        request(app)
+          .patch(`/api/issues/${fixture.identifier}`)
+          .set("x-test-actor", JSON.stringify(fixture.actor))
+          .send({ status: "done", doneTier: NO_REPOSITORY_DONE_TIER }),
+      ),
+    );
+
+    const statuses = responses.map((res) => res.status).sort((a, b) => a - b);
+    expect(statuses, JSON.stringify(responses.map((res) => res.body))).toEqual([200, ...Array(racers - 1).fill(422)]);
+    for (const res of responses.filter((candidate) => candidate.status === 422)) {
+      expect(res.body.error).toContain("the issue's status changed after the close was measured");
+    }
+    expect(await statusOf(fixture.issueId)).toBe("done");
+    expect(await activityCount(fixture.issueId, "issue.done_transition_no_repository_landing_verified")).toBe(1);
+    expect(await activityCount(fixture.issueId, "issue.updated")).toBe(1);
+  }, 120_000);
+
+  it("answers a sequential re-close of an issue already closed with the form as before: 200, no second verification", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    const first = await close(fixture.identifier);
+    expect(first.status, JSON.stringify(first.body)).toBe(200);
+    const verified = await activityCount(fixture.issueId, "issue.done_transition_no_repository_landing_verified");
+    expect(verified).toBe(1);
+
+    const again = await close(fixture.identifier);
+
+    expect(again.status, JSON.stringify(again.body)).toBe(200);
+    expect(await statusOf(fixture.issueId)).toBe("done");
+    expect(await activityCount(fixture.issueId, "issue.done_transition_no_repository_landing_verified")).toBe(verified);
+  });
 
   it("records the ruling and the probe result in the close audit, in the same transaction as the close", async () => {
     const fixture = await seed();

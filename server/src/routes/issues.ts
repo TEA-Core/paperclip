@@ -5547,6 +5547,11 @@ export function issueRoutes(
       };
     }
     if (tierResult.tier === "tier1") {
+      // Written per request, before and outside the close transaction, exactly as
+      // on the base branch (f012e6fb1): concurrent closes of one issue each write
+      // one row here even though only the first commits (the others refuse at the
+      // compare-and-set). Left in place on purpose; only the verification row,
+      // which is written in the transaction, is one per transition.
       void writeAuditLog(db, issue, "issue.done_transition_tier1_close", {
         reason: tierResult.reason,
         decisionCarried,
