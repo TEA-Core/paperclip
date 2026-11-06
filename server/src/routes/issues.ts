@@ -3868,6 +3868,29 @@ class AutoApprovalIssueMissingError extends Error {
   }
 }
 
+function assertExecutionDecisionSnapshotCurrent(
+  readState: ReturnType<typeof parseIssueExecutionState>,
+  readPolicy: ReturnType<typeof normalizeIssueExecutionPolicy>,
+  locked: { executionState?: unknown; executionPolicy?: unknown } | null | undefined,
+  issueId: string,
+): void {
+  const lockedState = parseIssueExecutionState(locked?.executionState ?? null);
+  if (
+    (lockedState?.deliveredHeadSha ?? null) !== (readState?.deliveredHeadSha ?? null) ||
+    stallHoldControlsDiffer(readPolicy, normalizeIssueExecutionPolicy(locked?.executionPolicy ?? null)) ||
+    deliveryBindingDiffers(readState, lockedState)
+  ) {
+    throw conflict(
+      "The delivered head, the delivery binding (pull request number, URL or head) or the execution policy (round ceiling, stall arbiter or stages) changed while this decision was in flight; this decision was not recorded and the stage was not handed off. Re-read the issue before deciding.",
+      {
+        code: "review_stall_policy_changed",
+        issueId,
+        stageId: readState?.currentStageId ?? null,
+      },
+    );
+  }
+}
+
 function toCompactIssue(issue: any): CompactIssue {
   return {
     id: issue.id,
@@ -20667,20 +20690,7 @@ export function issueRoutes(
                 },
               );
             }
-            if (
-              (lockedState?.deliveredHeadSha ?? null) !== (stallGuardReadState?.deliveredHeadSha ?? null) ||
-              stallHoldControlsDiffer(previousExecutionPolicy, normalizeIssueExecutionPolicy(locked?.executionPolicy ?? null)) ||
-              deliveryBindingDiffers(stallGuardReadState, lockedState)
-            ) {
-              throw conflict(
-                "The delivered head, the delivery binding (pull request number, URL or head) or the execution policy (round ceiling, stall arbiter or stages) changed while this decision was in flight; this decision was not recorded and the stage was not handed off. Re-read the issue before deciding.",
-                {
-                  code: "review_stall_policy_changed",
-                  issueId: existing.id,
-                  stageId: stallGuardReadState?.currentStageId ?? null,
-                },
-              );
-            }
+            assertExecutionDecisionSnapshotCurrent(stallGuardReadState, previousExecutionPolicy, locked, existing.id);
           }
           // SUP-15878: refuse the close under the update lock (after the review
           // policy reauthorization above) with a typed diagnosis instead of
@@ -25494,12 +25504,19 @@ export function issueRoutes(
       const postCommitIssueActions: IssuePostCommitAction[] = [];
       try {
         txResult = await db.transaction(async (tx) => {
+          // The approval was computed from the unlocked read. Lock the row on
+          // `tx` and refuse it when the ceiling or the delivery binding moved
+          // since; nothing is written then (no comment, decision or state).
+          const lockedIssue = decisionId ? await svc.getByIdForUpdate(id, tx) : null;
+          if (decisionId) {
+            if (!lockedIssue) throw new AutoApprovalIssueMissingError();
+            assertExecutionDecisionSnapshotCurrent(currentExecutionState, currentExecutionPolicy, lockedIssue, currentIssue.id);
+          }
           if (
+            lockedIssue &&
             terminalApprovalNeedsDeliveryClassificationCheck &&
             (finalDeliveryPrefetch || currentIssue.deliveryRequirement === "record_only")
           ) {
-            const lockedIssue = await svc.getByIdForUpdate(id, tx);
-            if (!lockedIssue) throw new AutoApprovalIssueMissingError();
             if (lockedIssue.deliveryRequirement !== currentIssue.deliveryRequirement) {
               throw conflict("Card delivery classification changed before the final delivery preflight; retry the final verdict", {
                 code: "approval_final_delivery_preflight_stale",

@@ -10,6 +10,7 @@ import {
   companyMemberships,
   createDb,
   heartbeatRuns,
+  issueComments,
   issueExecutionDecisions,
   issueRecoveryActions,
   issues,
@@ -798,7 +799,7 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     expect(row.assigneeAgentId).toBe(seeded.reviewerId);
   }, 60_000);
 
-  function plainPolicy(seeded: Seeded, stageId: string, maxReviewRounds?: number) {
+  function plainPolicy(seeded: Seeded, stageId: string, maxReviewRounds?: number, secondStage = false) {
     return {
       mode: "normal",
       commentRequired: true,
@@ -809,6 +810,16 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
           approvalsNeeded: 1,
           participants: [{ id: randomUUID(), type: "agent", agentId: seeded.reviewerId }],
         },
+        ...(secondStage
+          ? [
+              {
+                id: randomUUID(),
+                type: "review",
+                approvalsNeeded: 1,
+                participants: [{ id: randomUUID(), type: "agent", agentId: seeded.arbiterId }],
+              },
+            ]
+          : []),
       ],
       ...(maxReviewRounds !== undefined ? { maxReviewRounds } : {}),
     };
@@ -820,6 +831,7 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
       maxReviewRounds?: number;
       changesRequestedCount?: number;
       delivery?: Record<string, unknown>;
+      secondStage?: boolean;
     } = {},
   ) {
     const issueId = randomUUID();
@@ -834,7 +846,7 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
       responsibleUserId: seeded.userId,
       createdByUserId: seeded.userId,
       deliveryRequirement: "record_only",
-      executionPolicy: plainPolicy(seeded, stageId, shape.maxReviewRounds),
+      executionPolicy: plainPolicy(seeded, stageId, shape.maxReviewRounds, shape.secondStage),
       executionState: {
         status: "pending",
         currentStageId: stageId,
@@ -1019,6 +1031,90 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     },
     60_000,
   );
+
+  const approvalComment = { body: "## Review: APPROVED\n\nLooks good." };
+
+  it("approves through the comment door when the snapshot is still current", async () => {
+    const seeded = await seedCompany();
+    const { issueId } = await seedPlainPendingReview(seeded, { maxReviewRounds: 50, secondStage: true });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send(approvalComment);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await decisionRows(issueId)).toHaveLength(1);
+    expect((await issueRow(issueId)).executionState).toMatchObject({ lastDecisionOutcome: "approved" });
+  }, 60_000);
+
+  it("refuses a comment-door approval that would erase a same-head PR binding refreshed after the read (SUP-23260)", async () => {
+    const seeded = await seedCompany();
+    const headSha = "a".repeat(40);
+    const { issueId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 50,
+      secondStage: true,
+      delivery: {
+        repo: { owner: "TEA-Core", repo: "paperclip" },
+        branch: "fm/plain-card",
+        headSha,
+      },
+    });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    const refreshed = {
+      repo: { owner: "TEA-Core", repo: "paperclip" },
+      branch: "fm/plain-card",
+      headSha,
+      prNumber: 1117,
+      prUrl: "https://github.com/TEA-Core/paperclip/pull/1117",
+    };
+    lockInterleave.beforeLock = async () => {
+      const current = await issueRow(issueId);
+      await db
+        .update(issues)
+        .set({ executionState: { ...(current.executionState as Record<string, unknown>), delivery: refreshed } })
+        .where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send(approvalComment);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    expect(row.executionState).toMatchObject({ status: "pending", delivery: refreshed });
+  }, 60_000);
+
+  it("refuses a comment-door approval computed before the board lowered the round ceiling (SUP-23260)", async () => {
+    const seeded = await seedCompany();
+    const { issueId } = await seedPlainPendingReview(seeded, { maxReviewRounds: 4, changesRequestedCount: 2, secondStage: true });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    lockInterleave.beforeLock = async () => {
+      const current = await issueRow(issueId);
+      await db
+        .update(issues)
+        .set({ executionPolicy: { ...(current.executionPolicy as Record<string, unknown>), maxReviewRounds: 2 } })
+        .where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send(approvalComment);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    expect(row.executionPolicy).toMatchObject({ maxReviewRounds: 2 });
+  }, 60_000);
 
   async function resolveRecovery(seeded: Seeded, issueId: string, note: string) {
     const [action] = await db.insert(issueRecoveryActions).values({
