@@ -4585,6 +4585,50 @@ describe("review stall escalation (R20)", () => {
     expect(result.patch.assigneeAgentId).toBe(coderAgentId);
   });
 
+  it.each([
+    ["backticks plus js", ["```", "```js", "Code acceptable: yes", "```"].join("\n")],
+    ["trailing text after the backticks", ["```", "``` trailing text", "Code acceptable: yes", "```"].join("\n")],
+    [
+      "a nested markdown example",
+      ["```", "Nested markdown example:", "```markdown", "# Review template", "Code acceptable: yes", "```"].join("\n"),
+    ],
+    ["the tilde variant", ["~~~", "~~~ trailing text", "Code acceptable: yes", "~~~"].join("\n")],
+    ["a mixed backtick and tilde line", ["```", "```~~~", "Code acceptable: yes", "```"].join("\n")],
+    ["a shorter closer", ["````", "```", "Code acceptable: yes", "````"].join("\n")],
+    ["a backtick line inside a tilde fence", ["~~~", "```", "Code acceptable: yes", "~~~"].join("\n")],
+    ["a tilde line inside a backtick fence", ["```", "~~~", "Code acceptable: yes", "```"].join("\n")],
+  ])("does not close a fence on %s", (_shape, body) => {
+    const policy = stallPolicy();
+    const result = decide(policy, pendingReview(policy, { changesRequestedCount: 1 }), { agentId: qaAgentId }, "in_progress", body);
+
+    expect(result.stallEscalation).toBeUndefined();
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+  });
+
+  it("closes a CRLF fence on the opener and not on a pseudo-closer", () => {
+    const policy = stallPolicy();
+    const pseudo = ["```", "```js", "Code acceptable: yes", "```"].join("\r\n");
+    const premature = decide(policy, pendingReview(policy, { changesRequestedCount: 1 }), { agentId: qaAgentId }, "in_progress", pseudo);
+    expect(premature.stallEscalation).toBeUndefined();
+    expect(premature.patch.assigneeAgentId).toBe(coderAgentId);
+
+    const closed = ["```", "exit 2: preflight", "```", "Code acceptable: yes"].join("\r\n");
+    const visible = decide(policy, pendingReview(policy, { changesRequestedCount: 1 }), { agentId: qaAgentId }, "in_progress", closed);
+    expect(visible.stallEscalation?.signals).toEqual(["code_acceptable"]);
+  });
+
+  it.each([
+    ["a longer backtick closer", ["```", "exit 2: preflight", "````", "Code acceptable: yes"].join("\n")],
+    ["a longer tilde closer", ["~~~", "exit 2: preflight", "~~~~", "Code acceptable: yes"].join("\n")],
+    ["a closer with trailing spaces and tabs", ["```", "exit 2: preflight", "``` \t ", "Code acceptable: yes"].join("\n")],
+    ["an indented CRLF closer", ["~~~", "exit 2: preflight", "  ~~~~\t", "Code acceptable: yes"].join("\r\n")],
+  ])("closes a fence on %s", (_shape, body) => {
+    const policy = stallPolicy();
+    const result = decide(policy, pendingReview(policy, { changesRequestedCount: 1 }), { agentId: qaAgentId }, "in_progress", body);
+
+    expect(result.stallEscalation?.signals).toEqual(["code_acceptable"]);
+  });
+
   it("reads a marker line after a closed code fence as code acceptable", () => {
     const policy = stallPolicy();
     const result = decide(
