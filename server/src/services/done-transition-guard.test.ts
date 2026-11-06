@@ -6016,6 +6016,64 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(mockResolveGitHubToken).not.toHaveBeenCalled();
     });
 
+    async function evaluateObservation(observation: string, verdict: "pass" | "fail" = "pass") {
+      return evaluateDoneTierDeclaration(
+        mockDb,
+        recordOnlyTierIssue(),
+        tier2Line(
+          `record-only probe \`curl -fsS https://ops.example.com/healthz\` target https://ops.example.com observed ${observation} result: ${verdict} endpoint healthy`,
+        ),
+        null,
+        () => Promise.resolve([]),
+      );
+    }
+
+    it("accepts observation ranges including the SUP-23277 sweep and equal endpoints", async () => {
+      for (const observation of [
+        "2026-11-06T21:02:39.503559Z-2026-11-06T21:04:24.162190Z",
+        "2026-11-06T21:02:39.503559Z-2026-11-06T21:02:39.503559Z",
+        "2026-11-06T21:02:39.1Z-2026-11-06T21:02:39.100000Z",
+        "2026-11-06T21:02:39.100000Z-2026-11-06T21:02:39.1Z",
+      ]) {
+        const result = await evaluateObservation(observation);
+        expect(result.allowed, observation).toBe(true);
+        expect(result.tier, observation).toBe("tier2");
+      }
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveGitHubToken).not.toHaveBeenCalled();
+    });
+
+    it.each(["1", "12", "123", "1234", "12345", "123456"])(
+      "accepts %s fractional digits on a single instant and both range ends",
+      async (fraction) => {
+        for (const observation of [
+          `2026-11-06T21:02:39.${fraction}Z`,
+          `2026-11-06T21:02:39.${fraction}Z-2026-11-06T21:04:24.${fraction}Z`,
+        ]) {
+          const result = await evaluateObservation(observation);
+          expect(result.allowed, observation).toBe(true);
+          expect(result.tier, observation).toBe("tier2");
+        }
+      },
+    );
+
+    it("keeps observation-range evidence record-only on a repository_delivery card", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(
+          "record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2026-11-06T21:02:39.503559Z-2026-11-06T21:04:24.162190Z result: pass endpoint healthy",
+        ),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("deliveryRequirement=record_only");
+      expect(result.reason).toContain("probe `<probe command>` head <probe head sha> post-merge:");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
     it("accepts a real leap-day observation instant while refusing the same day on a non-leap year", async () => {
       // SUP-22801 round-1 repair: the strict component + round-trip check must
       // not over-reject real calendar instants — 2024-02-29 is a real UTC day
@@ -6089,6 +6147,38 @@ describe("evaluateDoneTierDeclaration", () => {
         expect(result.reason, evidence).toContain(TIER2_RECORD_ONLY_FORM);
       }
       expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses over-precise instants and invalid observation ranges", async () => {
+      for (const [observation, verdict, expected] of [
+        ["2026-11-06T21:02:39.1234567Z", "pass", "machine-checkable"],
+        ["2026-11-06T21:02:39.1234567Z-2026-11-06T21:04:24.162190Z", "pass", "machine-checkable"],
+        ["2026-11-06T21:02:39.503559Z-2026-11-06T21:04:24.1234567Z", "pass", "machine-checkable"],
+        ["2026-02-29T09:15:00Z-2026-11-06T21:04:24.162190Z", "pass", "not a real UTC calendar instant"],
+        ["2026-11-06T21:02:39.503559Z-2026-11-04T24:00:00Z", "pass", "not a real UTC calendar instant"],
+        ["2026-11-06T21:04:24.162190Z-2026-11-06T21:02:39.503559Z", "pass", "range end must not be before its start"],
+        ["2026-11-06T21:02:39.503559Z-2026-11-06T21:02:39.503558Z", "pass", "range end must not be before its start"],
+        ["2026-11-06T21:02:39.503559Z-2026-11-06T21:04:24.162190Z", "fail", "failing predicate"],
+      ] as const) {
+        const result = await evaluateObservation(observation, verdict);
+        expect(result.allowed, observation).toBe(false);
+        expect(result.tier, observation).toBe(null);
+        expect(result.reason, observation).toContain(expected);
+        expect(result.reason, observation).toContain(TIER2_RECORD_ONLY_FORM);
+      }
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses a malformed observation range before a later observed delimiter without backtracking", async () => {
+      const result = await evaluateObservation(
+        "2026-11-06T21:02:39.1234567Z-2026-11-06T21:04:24.162190Z observed 2026-11-06T21:05:00Z",
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("machine-checkable");
+      expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveGitHubToken).not.toHaveBeenCalled();
     });
 
     it("keeps the merge-head grammar working on a record_only card that has a recorded merged work product (SUP-21258)", async () => {
@@ -6276,7 +6366,7 @@ describe("evaluateDoneTierDeclaration", () => {
       // its Tier 2 entry carries the record-only grammar, never a merge head,
       // and Tier 1 entries are carried over unchanged.
       expect(DONE_TIER_TIER2_RECORD_ONLY_JSON).toBe(
-        '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }',
+        '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>" }',
       );
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER2_RECORD_ONLY_JSON);
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_LANDED_JSON);

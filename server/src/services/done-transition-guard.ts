@@ -120,7 +120,7 @@ export const TIER2_FORM =
 // message (SUP-15787 invariant). Accepted ONLY on record_only cards; a
 // repository_delivery card keeps the merge-head form above unchanged.
 export const TIER2_RECORD_ONLY_FORM =
-  '"Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>"';
+  '"Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>"';
 export const TIER1_FORM =
   '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."' +
   ' or "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
@@ -147,7 +147,7 @@ export const DONE_TIER_STRUCTURED_FORMS =
 // set by noRepositoryStructuredFormSuffix, never listed in it, so a
 // repository_delivery remedy stays byte-identical.
 export const DONE_TIER_TIER2_RECORD_ONLY_JSON =
-  '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }';
+  '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>" }';
 export const DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS =
   `${DONE_TIER_TIER2_RECORD_ONLY_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
 // SUP-22570: the record_only close form. Advertised only on record_only issues,
@@ -1459,15 +1459,18 @@ const TIER2_PROBE_SHAPE_RE = /^probe `([^`]+)` head ([0-9a-f]{7,40}) post-merge:
 // SUP-22801: record-only Tier 2 live-evidence grammar, the classification-aware
 // sibling of TIER2_PROBE_SHAPE_RE for `deliveryRequirement=record_only` cards.
 // Machine-checkable components: a backticked probe command, the observed target,
-// a strict UTC ISO-8601 observation instant (Z-suffixed; validated as a real
-// calendar instant), and an explicit pass/fail verdict with the predicate and
-// observed result. The literal `record-only probe` marker makes the two Tier 2
-// grammars mutually recognisable, so a record-only declaration on a
-// repository_delivery card is refused by name, not by generic shape mismatch.
+// a strict UTC ISO-8601 observation instant or range (Z-suffixed; each endpoint
+// validated as real calendar instants), and an explicit pass/fail verdict with
+// the predicate and observed result. The literal `record-only probe` marker
+// makes the two Tier 2 grammars mutually recognisable, so a record-only
+// declaration on a repository_delivery card is refused by name, not by generic shape mismatch.
 // A `fail` verdict is accepted by the shape only so it can be refused with the
 // specific failing-predicate message — a failing probe is never live proof.
-const TIER2_RECORD_ONLY_PROBE_SHAPE_RE =
-  /^record-only probe `([^`]+)` target (.+?) observed (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z) result: (pass|fail) (.+)$/i;
+const UTC_INSTANT_SHAPE = String.raw`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z`;
+const TIER2_RECORD_ONLY_PROBE_SHAPE_RE = new RegExp(
+  `^record-only probe \`([^\`]+)\` target ((?:(?! observed ).)+) observed (${UTC_INSTANT_SHAPE})(?:-(${UTC_INSTANT_SHAPE}))? result: (pass|fail) (.+)$`,
+  "i",
+);
 
 function refuseTier2(reason: string): DoneTierDeclarationResult {
   return {
@@ -1549,7 +1552,7 @@ async function loadRecordedDeliveryMergeCommit(
 // day), so a bare NaN check accepted fabricated observation timestamps that
 // name no real calendar instant. The round-trip comparison is the fail-closed
 // backstop for any component range this table misses.
-const UTC_INSTANT_COMPONENTS_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/;
+const UTC_INSTANT_COMPONENTS_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?Z$/;
 
 function isRealUtcCalendarInstant(observedAt: string): boolean {
   const parts = UTC_INSTANT_COMPONENTS_RE.exec(observedAt);
@@ -1588,13 +1591,19 @@ function isRealUtcCalendarInstant(observedAt: string): boolean {
   );
 }
 
+function utcInstantSortKey(observedAt: string): string {
+  const [second = "", fraction = ""] = observedAt.slice(0, -1).split(".");
+  return `${second}.${fraction.padEnd(6, "0")}`;
+}
+
 // SUP-22801: record-only Tier 2 live proof. Pure and fail-closed — a
 // record_only card has no repository landing to resolve, so nothing here touches
 // GitHub or the database; every component of the accepted form is checked
-// locally: the shape, non-blank command/target/predicate, a real UTC instant,
-// and a `pass` verdict. Non-empty prose, missing components, an impossible
-// calendar instant, or a failing predicate are all refusals naming the accepted
-// form verbatim (SUP-15787 invariant).
+// locally: the shape, non-blank command/target/predicate, real UTC instants,
+// chronological range endpoints, and a `pass` verdict. Non-empty prose, missing
+// components, an impossible calendar instant, an inverted range, or a failing
+// predicate are all refusals naming the accepted form verbatim
+// (SUP-15787 invariant).
 function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierDeclarationResult {
   const shape = TIER2_RECORD_ONLY_PROBE_SHAPE_RE.exec(evidence.trim());
   if (!shape) {
@@ -1605,7 +1614,7 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
-  const [, probeCommand, observedTarget, observedAt, verdict, predicateResult] = shape;
+  const [, probeCommand, observedTarget, observedAt, observedRangeEnd, verdict, predicateResult] = shape;
   if (!probeCommand!.trim() || !observedTarget!.trim() || !predicateResult!.trim()) {
     return refuseTier2(
       "record-only close Tier 2 probe evidence has a blank probe command, observed target, or " +
@@ -1613,10 +1622,20 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
-  if (!isRealUtcCalendarInstant(observedAt!)) {
+  const invalidInstant = [observedAt!, observedRangeEnd].find(
+    (instant) => instant !== undefined && !isRealUtcCalendarInstant(instant),
+  );
+  if (invalidInstant) {
     return refuseTier2(
-      `record-only close Tier 2 probe evidence names observed instant ${observedAt}, which is not a ` +
+      `record-only close Tier 2 probe evidence names observed instant ${invalidInstant}, which is not a ` +
         "real UTC calendar instant; the observation time must be a valid Z-suffixed ISO-8601 timestamp. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
+  }
+  if (observedRangeEnd && utcInstantSortKey(observedRangeEnd) < utcInstantSortKey(observedAt!)) {
+    return refuseTier2(
+      `record-only close Tier 2 probe evidence names observation range ${observedAt}-${observedRangeEnd}, ` +
+        "whose end is before its start; the range end must not be before its start. " +
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
