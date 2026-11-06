@@ -161,6 +161,7 @@ From a reflection issue (assigned to the target's manager or the requester):
 1. Attach the proposal document: `PUT /api/issues/{issueId}/documents/reflection-proposal`.
 2. If a draft skill was written, commit it under `skills/<skill-slug>/` (or attach it) and link it in the proposal.
 3. Open the acceptance gate with a task interaction on the reflection issue. Mutations that change instructions, skills, or tool descriptions must use `request_confirmation`, show the diff in `payload.detailsMarkdown`, set `continuationPolicy: wake_assignee_on_accept`, and include the exact `payload.target.key` listed below.
+   For an instruction-bundle target (`agent:<agentId>:instructions`), also set `payload.adoptionCarrier` to `{ "issueId": "<adoption carrier issue id>" }` naming the carrier issue. The server refuses the later instructions-bundle PUT without that issue id.
 4. Leave a comment summarizing: target agent, window, clusters found, surfaces touched, link to the proposal, link to the interaction, and the next-step owner.
 
 Server-enforced mutation target keys:

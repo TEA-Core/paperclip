@@ -1880,6 +1880,10 @@ export const requestConfirmationSecretProposalPayloadSchema = z.object({
   expiresAt: z.string().datetime({ offset: true }),
 });
 
+export const requestConfirmationAdoptionCarrierSchema = z.object({
+  issueId: z.string().guid(),
+}).strict();
+
 export const requestConfirmationPayloadSchema = z.object({
   version: z.literal(1),
   prompt: z.string().trim().min(1).max(1000),
@@ -1900,6 +1904,7 @@ export const requestConfirmationPayloadSchema = z.object({
   target: requestConfirmationTargetSchema.nullable().optional(),
   toolAction: requestConfirmationToolActionPayloadSchema.optional(),
   secretProposal: requestConfirmationSecretProposalPayloadSchema.optional(),
+  adoptionCarrier: requestConfirmationAdoptionCarrierSchema.nullable().optional(),
 });
 
 export const requestCheckboxConfirmationOptionSchema = z.object({

@@ -1193,6 +1193,7 @@ export type {
   RequestConfirmationCustomTarget,
   RequestConfirmationTarget,
   RequestConfirmationPayload,
+  RequestConfirmationAdoptionCarrier,
   RequestConfirmationResult,
   RequestConfirmationToolActionPayload,
   RequestConfirmationToolActionResult,

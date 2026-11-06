@@ -484,6 +484,7 @@ export {
   requestConfirmationCustomTargetSchema,
   requestConfirmationTargetSchema,
   requestConfirmationPayloadSchema,
+  requestConfirmationAdoptionCarrierSchema,
   requestConfirmationResumeFailureSchema,
   requestConfirmationResultSchema,
   requestConfirmationSecretProposalPayloadSchema,

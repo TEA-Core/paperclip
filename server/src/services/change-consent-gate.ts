@@ -62,6 +62,23 @@ function payloadHasDisplayedDiff(payload: RequestConfirmationPayload) {
   return /(^|\n)[+-][^\n]+/.test(details);
 }
 
+const ADOPTION_CARRIER_ISSUE_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export const REFLECTION_COACH_ADOPTION_CARRIER_REQUIRED =
+  "reflection_coach_adoption_carrier_required";
+
+function isInstructionConsentTargetKey(targetKey: string) {
+  if (isAgentInstructionsChangeTargetKey(targetKey)) return true;
+  const legacyPrefix = "reflection-coach:agent-instructions:";
+  return targetKey.startsWith(legacyPrefix) && targetKey.length > legacyPrefix.length;
+}
+
+function readAdoptionCarrierIssueId(payload: RequestConfirmationPayload) {
+  const issueId = readNonEmptyString(payload.adoptionCarrier?.issueId);
+  return issueId && ADOPTION_CARRIER_ISSUE_ID.test(issueId) ? issueId : null;
+}
+
 function requestConfirmationResultConsumed(result: RequestConfirmationResult | null) {
   const consumed = result as ConsumedRequestConfirmationResult | null;
   return Boolean(readNonEmptyString(consumed?.consumedByRunId) || readNonEmptyString(consumed?.consumedAt));
@@ -202,6 +219,22 @@ export function changeConsentGateService(db: Db) {
             + "created in a previous run and not already consumed.",
           {
             code: "reflection_coach_mutation_gate_required",
+            targetKeys,
+          },
+        );
+      }
+
+      const acceptedPayload = accepted.payload as RequestConfirmationPayload;
+      const acceptedTargetKey = acceptedPayload.target?.type === "custom" ? acceptedPayload.target.key : null;
+      if (
+        acceptedTargetKey
+        && isInstructionConsentTargetKey(acceptedTargetKey)
+        && !readAdoptionCarrierIssueId(acceptedPayload)
+      ) {
+        throw forbidden(
+          "Reflection Coach instruction-bundle mutations require the accepted confirmation to name an adoption carrier issue in payload.adoptionCarrier.issueId.",
+          {
+            code: REFLECTION_COACH_ADOPTION_CARRIER_REQUIRED,
             targetKeys,
           },
         );
