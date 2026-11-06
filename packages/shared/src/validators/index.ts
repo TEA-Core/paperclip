@@ -447,6 +447,7 @@ export {
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
   gitCommitShaSchema,
+  GIT_COMMIT_SHA_WIRE_PATTERN,
   issueRecoveryActionReadModelSchema,
   resolveIssueRecoveryActionSchema,
   issueReviewRequestSchema,

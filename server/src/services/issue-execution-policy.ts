@@ -1123,6 +1123,88 @@ function isStallArbiterHold(input: {
   );
 }
 
+/**
+ * R20: the policy controls that decide whether, when and to whom a stalled
+ * review stage is handed off — the round ceiling, the stall policy and each
+ * stage's identity and participants (agent ids case-folded) — in a comparable
+ * form. Two policies with equal signatures hand a stall off identically.
+ */
+function stallHoldSignature(policy: IssueExecutionPolicy | null): string {
+  return JSON.stringify([
+    policy?.maxReviewRounds ?? null,
+    policy?.stallEscalation?.afterRounds ?? null,
+    policy?.stallEscalation?.toAgentId.toLowerCase() ?? null,
+    (policy?.stages ?? []).map((stage) => [
+      stage.id,
+      stage.type,
+      stage.participants.map((participant) =>
+        participant.type === "agent" ? `agent:${(participant.agentId ?? "").toLowerCase()}` : `user:${participant.userId ?? ""}`,
+      ),
+    ]),
+  ]);
+}
+
+/**
+ * R20: whether `previous` and `next` differ in any control that governs a
+ * stall hand-off. The decision transaction compares the policy it computed the
+ * hand-off from with the policy re-read under the row lock, and refuses a
+ * hand-off decided against a policy that has since changed.
+ */
+export function stallHoldControlsDiffer(previous: IssueExecutionPolicy | null, next: IssueExecutionPolicy | null): boolean {
+  return stallHoldSignature(previous) !== stallHoldSignature(next);
+}
+
+/**
+ * R20: the stage-run's hand-off record seats `agentId` as the stall arbiter of
+ * the pending stage. Keyed on the hand-off record, not on the current policy:
+ * a later policy edit (by anyone) that names another arbiter or lists this
+ * agent as a stage participant does not turn the arbiter into a reviewer of
+ * the stage-run it was handed.
+ */
+function seatedByStallHandoff(state: IssueExecutionState | null, stageId: string | null, agentId: string): boolean {
+  const handoff = state?.stallHandoff;
+  return Boolean(handoff) && handoff!.stageId === stageId && sameAgentId(handoff!.arbiterAgentId, agentId);
+}
+
+/**
+ * R20: `actorAgentId` currently holds the pending stage as its stall arbiter.
+ * While seated, the arbiter may not write the execution policy or the review
+ * policy at all: any such write could lift its own hold (ceiling, afterRounds,
+ * arbiter, the stall policy) or seat it as a reviewer of the stage it
+ * arbitrates.
+ */
+export function isSeatedStallArbiter(state: IssueExecutionState | null, actorAgentId: string | null | undefined): boolean {
+  return (
+    Boolean(actorAgentId) &&
+    state?.status === PENDING_STATUS &&
+    principalIsAgent(state.currentParticipant, actorAgentId!) &&
+    seatedByStallHandoff(state, state.currentStageId, actorAgentId!)
+  );
+}
+
+/**
+ * The decision comment without fenced code blocks (``` or ~~~): a marker line
+ * quoted inside a code fence is an example, not the reviewer's verdict. An
+ * unclosed fence runs to the end of the comment, as in Markdown.
+ */
+function commentOutsideCodeFences(body: string): string {
+  let fence: string | null = null;
+  const kept: string[] = [];
+  for (const line of body.split("\n")) {
+    const marker = /^[ \t]*(`{3,}|~{3,})/.exec(line)?.[1] ?? null;
+    if (fence !== null) {
+      if (marker !== null && marker[0] === fence[0] && marker.length >= fence.length) fence = null;
+      continue;
+    }
+    if (marker !== null) {
+      fence = marker;
+      continue;
+    }
+    kept.push(line);
+  }
+  return kept.join("\n");
+}
+
 /** Same delivered head, compared only between full git shas: a malformed value is never a stall signal. */
 function sameHeadSha(left: string | null | undefined, right: string | null | undefined): boolean {
   const a = gitCommitShaSchema.safeParse(left);
@@ -1165,7 +1247,7 @@ function resolveStallHandoff(input: {
   }
   const signals: IssueExecutionStallSignal[] = [];
   if (sameHeadSha(input.state?.deliveredHeadSha, input.state?.bouncedHeadSha)) signals.push("same_head_rebounced");
-  if (CODE_ACCEPTABLE_MARKER.test(input.commentBody)) signals.push("code_acceptable");
+  if (CODE_ACCEPTABLE_MARKER.test(commentOutsideCodeFences(input.commentBody))) signals.push("code_acceptable");
   return signals.length > 0
     ? { arbiter: { type: "agent", agentId: config.toAgentId, userId: null }, signals }
     : null;
@@ -1720,9 +1802,14 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     }
 
     if (principalsEqual(currentParticipant, actor)) {
-      if (requestedStatus === "done" && stallArbiterHold) {
+      if (
+        requestedStatus === "done" &&
+        (stallArbiterHold || (currentParticipant.type === "agent" && Boolean(currentParticipant.agentId) && seatedByStallHandoff(existingState, activeStage.id, currentParticipant.agentId!)))
+      ) {
         // The arbiter is a second opinion, not a reviewer: approving here would
-        // skip the required reviewer (synthesis Q1, "advises only").
+        // skip the required reviewer (synthesis Q1, "advises only"). Keyed on the
+        // hand-off record as well as the hold, so a later policy edit that names
+        // another arbiter or lists this agent on the stage cannot lift it.
         throw unprocessable(
           "The stall arbiter advises only and cannot approve this review stage. Request changes with a directive for the implementer (the next delivery returns to the stage reviewer), or park the card blocked naming the blocker and its owner.",
           {

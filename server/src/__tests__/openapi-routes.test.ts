@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
+import { gitCommitShaSchema } from "@paperclipai/shared";
 import { errorHandler } from "../middleware/index.js";
 import { COMPANY_IMPORT_ROUTE_PATH } from "../routes/company-import-paths.js";
 import { OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH } from "../services/tool-access.js";
@@ -522,6 +523,31 @@ describe("openapi routes", () => {
     expect(identity.required).toEqual(["repo", "branch", "headSha"]);
     expect(identity.description).toContain("delivery_identity_write_rejected");
     expect(identity.description).toContain("in_review");
+  });
+
+  it("documents the deliveryIdentity.headSha pattern the live delivery write applies", () => {
+    const { spec } = loadSpecRoutes();
+    const headSha =
+      spec.paths["/api/issues/{id}"].patch.requestBody.content["application/json"].schema.properties.deliveryIdentity
+        .properties.headSha;
+    const mirror = new RegExp(headSha.pattern);
+    const full = "0123456789abcdef0123456789abcdef01234567";
+
+    for (const value of [
+      full,
+      full.toUpperCase(),
+      "0123456789AbCdEf0123456789aBcDeF01234567",
+      `  ${full}\n`,
+      "f".repeat(64),
+      "F".repeat(64),
+      "abc1234",
+      "g".repeat(40),
+      `${full}0`,
+      `${full} trailing`,
+      "",
+    ]) {
+      expect(mirror.test(value), JSON.stringify(value)).toBe(gitCommitShaSchema.safeParse(value).success);
+    }
   });
 
   it("publishes the complete board contract for chat channels", () => {

@@ -1989,6 +1989,7 @@ export {
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
   gitCommitShaSchema,
+  GIT_COMMIT_SHA_WIRE_PATTERN,
   resolveIssueRecoveryActionSchema,
   issueReviewRequestSchema,
   issueExecutionWorkspaceSettingsSchema,

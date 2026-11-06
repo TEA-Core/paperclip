@@ -4572,6 +4572,32 @@ describe("review stall escalation (R20)", () => {
     expect(result.patch.assigneeAgentId).toBe(coderAgentId);
   });
 
+  it.each([
+    ["a backtick fence", "Template for the arbiter:\n```\nCode acceptable: yes\n```"],
+    ["a tilde fence with an info string", "~~~md\nCode acceptable: yes\n~~~"],
+    ["an unclosed fence", "Example:\n```text\nCode acceptable: yes"],
+    ["a longer outer fence holding a shorter one", "````\n```\n```\nCode acceptable: yes\n````"],
+  ])("does not read a marker line inside %s as code acceptable", (_fence, body) => {
+    const policy = stallPolicy();
+    const result = decide(policy, pendingReview(policy, { changesRequestedCount: 1 }), { agentId: qaAgentId }, "in_progress", body);
+
+    expect(result.stallEscalation).toBeUndefined();
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+  });
+
+  it("reads a marker line after a closed code fence as code acceptable", () => {
+    const policy = stallPolicy();
+    const result = decide(
+      policy,
+      pendingReview(policy, { changesRequestedCount: 1 }),
+      { agentId: qaAgentId },
+      "in_progress",
+      "The wall is upstream:\n```\nexit 2: preflight\n```\nCode acceptable: yes",
+    );
+
+    expect(result.stallEscalation?.signals).toEqual(["code_acceptable"]);
+  });
+
   it("compares arbiter ids case-insensitively", () => {
     const policy = normalizeIssueExecutionPolicy({
       stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
@@ -4684,6 +4710,27 @@ describe("review stall escalation (R20)", () => {
       decide(policy, arbiterHold(policy), { agentId: arbiterAgentId }, "done", "Looks fine to me"),
     ).toThrow("The stall arbiter advises only and cannot approve this review stage");
   });
+
+  const otherAgentId = "55555555-5555-4555-8555-555555555555";
+  it.each([
+    ["listed beside the reviewer, stallEscalation repointed", [qaAgentId, arbiterAgentId], { afterRounds: 2, toAgentId: otherAgentId }],
+    ["listed beside the reviewer, stallEscalation dropped", [qaAgentId, arbiterAgentId], undefined],
+    ["replacing the reviewer, stallEscalation dropped", [arbiterAgentId], undefined],
+  ] as const)(
+    "refuses an approval by the handed-off arbiter %s after the hand-off",
+    (_shape, participants, stallEscalation) => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [
+          { type: "review", participants: participants.map((agentId) => ({ type: "agent", agentId })) },
+          { type: "approval", participants: [{ type: "user", userId: boardUserId }] },
+        ],
+        ...(stallEscalation ? { stallEscalation } : {}),
+      })!;
+      expect(() =>
+        decide(policy, arbiterHold(policy), { agentId: arbiterAgentId }, "done", "Approved on the arbiter's reading"),
+      ).toThrow("The stall arbiter advises only and cannot approve this review stage");
+    },
+  );
 
   it("routes the arbiter's directive to the implementer and the next delivery back to the reviewer", () => {
     const policy = stallPolicy();

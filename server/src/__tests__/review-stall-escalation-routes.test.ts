@@ -34,6 +34,10 @@ import {
 // same unit of work would. A row written inside the decision transaction rolls
 // back with it; a row written outside it would survive as an orphan.
 const activityFault = vi.hoisted(() => ({ action: null as string | null }));
+// Deterministic interleaving: `beforeLock` runs once, on the request's first
+// row-lock read, after the route computed its decision from the unlocked read
+// and before the locked re-check reads the row.
+const lockInterleave = vi.hoisted(() => ({ beforeLock: null as null | (() => Promise<void>) }));
 vi.mock("../services/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/index.js")>();
   const failAfterWrite = (action: string) => {
@@ -43,6 +47,18 @@ vi.mock("../services/index.js", async (importOriginal) => {
   };
   return {
     ...actual,
+    issueService: (...args: Parameters<typeof actual.issueService>) => {
+      const svc = actual.issueService(...args);
+      return {
+        ...svc,
+        getByIdForUpdate: async (...lockArgs: Parameters<typeof svc.getByIdForUpdate>) => {
+          const hook = lockInterleave.beforeLock;
+          lockInterleave.beforeLock = null;
+          if (hook) await hook();
+          return svc.getByIdForUpdate(...lockArgs);
+        },
+      };
+    },
     logActivity: async (...args: Parameters<typeof actual.logActivity>) => {
       const result = await actual.logActivity(...args);
       failAfterWrite(args[1].action);
@@ -79,6 +95,7 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
 
   afterEach(async () => {
     activityFault.action = null;
+    lockInterleave.beforeLock = null;
     if (seededRunIds.length > 0) {
       await db.update(heartbeatRuns).set({ status: "cancelled" }).where(inArray(heartbeatRuns.id, seededRunIds));
       seededRunIds.length = 0;
@@ -99,9 +116,11 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     const ids = {
       companyId,
       reviewerId: randomUUID(),
+      secondReviewerId: randomUUID(),
       coderId: randomUUID(),
       arbiterId: randomUUID(),
       pausedId: randomUUID(),
+      otherId: randomUUID(),
       terminatedId: randomUUID(),
       userId: `user-${companyId.slice(0, 8)}`,
     };
@@ -113,9 +132,11 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     });
     await db.insert(agents).values([
       agent(ids.reviewerId, "Reviewer", "idle"),
+      agent(ids.secondReviewerId, "Second reviewer", "idle"),
       agent(ids.coderId, "Coder", "idle"),
       agent(ids.arbiterId, "Arbiter", "idle"),
       agent(ids.pausedId, "Paused", "paused"),
+      agent(ids.otherId, "Other", "idle"),
       agent(ids.terminatedId, "Gone", "terminated"),
     ]);
     await db.insert(companyMemberships).values({
@@ -126,11 +147,19 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
 
   type Seeded = Awaited<ReturnType<typeof seedCompany>>;
 
-  function stallPolicy(seeded: Seeded, stageId: string, toAgentId: string = seeded.arbiterId) {
+  type PolicyShape = { reviewers?: string[]; approvalStageId?: string };
+
+  function stallPolicy(seeded: Seeded, stageId: string, toAgentId: string = seeded.arbiterId, shape: PolicyShape = {}) {
+    const reviewers = shape.reviewers ?? [seeded.reviewerId];
     return {
       mode: "normal",
       commentRequired: true,
-      stages: [{ id: stageId, type: "review", approvalsNeeded: 1, participants: [{ id: randomUUID(), type: "agent", agentId: seeded.reviewerId }] }],
+      stages: [
+        { id: stageId, type: "review", approvalsNeeded: 1, participants: reviewers.map((agentId) => ({ id: randomUUID(), type: "agent", agentId })) },
+        ...(shape.approvalStageId
+          ? [{ id: shape.approvalStageId, type: "approval", approvalsNeeded: 1, participants: [{ id: randomUUID(), type: "user", userId: seeded.userId }] }]
+          : []),
+      ],
       stallEscalation: { afterRounds: 2, toAgentId },
     };
   }
@@ -138,9 +167,11 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
   async function seedPendingReview(
     seeded: Seeded,
     stateOverrides: (stageId: string) => Record<string, unknown> = () => ({}),
+    shape: { reviewers?: string[]; twoStage?: boolean } = {},
   ) {
     const issueId = randomUUID();
     const stageId = randomUUID();
+    const approvalStageId = shape.twoStage ? randomUUID() : undefined;
     await db.insert(issues).values({
       id: issueId,
       companyId: seeded.companyId,
@@ -151,7 +182,7 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
       responsibleUserId: seeded.userId,
       createdByUserId: seeded.userId,
       deliveryRequirement: "record_only",
-      executionPolicy: stallPolicy(seeded, stageId),
+      executionPolicy: stallPolicy(seeded, stageId, seeded.arbiterId, { reviewers: shape.reviewers, approvalStageId }),
       executionState: {
         status: "pending",
         currentStageId: stageId,
@@ -169,7 +200,7 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
         ...stateOverrides(stageId),
       },
     });
-    return { issueId, stageId };
+    return { issueId, stageId, approvalStageId };
   }
 
   async function liveRun(seeded: Seeded, agentId: string, issueId: string) {
@@ -265,6 +296,245 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     expect(row.status).toBe("in_review");
     expect(row.assigneeAgentId).toBe(seeded.reviewerId);
     expect(row.executionState).not.toHaveProperty("stallHandoff");
+  }, 60_000);
+
+  it("refuses a hand-off decided against a policy the board changed before the row lock", async () => {
+    const seeded = await seedCompany();
+    const { issueId, stageId } = await seedPendingReview(seeded);
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    // The reviewer's decision was computed from the old policy (arbiter, afterRounds 2);
+    // the board commits a new arbiter and afterRounds 3 before the decision locks the row.
+    const boardPolicy = { ...stallPolicy(seeded, stageId), stallEscalation: { afterRounds: 3, toAgentId: seeded.otherId } };
+    lockInterleave.beforeLock = async () => {
+      await db.update(issues).set({ executionPolicy: boardPolicy }).where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_progress", comment: "Same finding on the same head.\nCode acceptable: yes" });
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await stallRows(issueId)).toHaveLength(0);
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    expect(row.assigneeAgentId).toBe(seeded.reviewerId);
+    expect(row.executionState).not.toHaveProperty("stallHandoff");
+    expect(row.executionPolicy).toMatchObject({ stallEscalation: { afterRounds: 3, toAgentId: seeded.otherId } });
+  }, 60_000);
+
+  async function seedArbiterHold(seeded: Seeded, shape: { reviewers?: string[]; twoStage?: boolean } = {}) {
+    const seededIssue = await seedPendingReview(
+      seeded,
+      (stageId) => ({
+        currentParticipant: { type: "agent", agentId: seeded.arbiterId },
+        changesRequestedCount: 2,
+        stallHandoff: {
+          stageId,
+          arbiterAgentId: seeded.arbiterId,
+          fromParticipant: { type: "agent", agentId: seeded.reviewerId, userId: null },
+          changesRequestedCount: 2,
+          signals: ["same_head_rebounced"],
+          handedOffAt: "2026-11-05T00:00:00.000Z",
+        },
+      }),
+      shape,
+    );
+    await db.update(issues).set({ assigneeAgentId: seeded.arbiterId }).where(eq(issues.id, seededIssue.issueId));
+    const stored = (await issueRow(seededIssue.issueId)).executionPolicy as StoredPolicy;
+    return { ...seededIssue, stored };
+  }
+
+  type StoredPolicy = ReturnType<typeof stallPolicy>;
+
+  // F-R2-1's first step: list the arbiter on the review stage and point the
+  // stall policy elsewhere, so validation (arbiter not a participant) passes.
+  const withArbiterBesideReviewer = (policy: StoredPolicy, seeded: Seeded) => ({
+    ...policy,
+    stages: policy.stages.map((stage) =>
+      stage.type === "review"
+        ? { ...stage, participants: [...stage.participants, { id: randomUUID(), type: "agent", agentId: seeded.arbiterId }] }
+        : stage,
+    ),
+    stallEscalation: { afterRounds: 2, toAgentId: seeded.otherId },
+  });
+
+  it.each<[string, (policy: StoredPolicy, seeded: Seeded) => Record<string, unknown>]>([
+    ["raises the round ceiling", (policy) => ({ executionPolicy: { ...policy, maxReviewRounds: 50 } })],
+    ["moves afterRounds", (policy) => ({ executionPolicy: { ...policy, stallEscalation: { ...policy.stallEscalation, afterRounds: 1 } } })],
+    ["names another arbiter", (policy, seeded) => ({ executionPolicy: { ...policy, stallEscalation: { ...policy.stallEscalation, toAgentId: seeded.otherId } } })],
+    ["drops stallEscalation", ({ stallEscalation: _dropped, ...policy }) => ({ executionPolicy: policy })],
+    ["sends only the stages", (policy) => ({ executionPolicy: { stages: policy.stages } })],
+    [
+      "rewrites the stage reviewers",
+      (policy, seeded) => ({
+        executionPolicy: {
+          ...policy,
+          stages: policy.stages.map((stage) => ({ ...stage, participants: [{ id: randomUUID(), type: "agent", agentId: seeded.otherId }] })),
+        },
+      }),
+    ],
+    ["adds itself beside the reviewer", (policy, seeded) => ({ executionPolicy: withArbiterBesideReviewer(policy, seeded) })],
+    ["only changes baseRef", (policy) => ({ executionPolicy: { ...policy, baseRef: "release/r20" } })],
+    ["writes the review policy", () => ({ reviewPolicy: "anyone" })],
+  ])(
+    "refuses the seated arbiter a PATCH that %s",
+    async (_shape, body) => {
+      const seeded = await seedCompany();
+      const { issueId, stored } = await seedArbiterHold(seeded);
+      const runId = await liveRun(seeded, seeded.arbiterId, issueId);
+
+      const res = await request(app(agentActor(seeded, seeded.arbiterId, runId)))
+        .patch(`/api/issues/${issueId}`)
+        .send(body(stored, seeded));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "stall_arbiter_policy_edit_refused" });
+      const row = await issueRow(issueId);
+      expect(row.executionPolicy).toEqual(stored);
+      expect(row.reviewPolicy).toBeNull();
+      expect(row.assigneeAgentId).toBe(seeded.arbiterId);
+    },
+    60_000,
+  );
+
+  it("keeps the arbiter from approving the review stage after it tries to add itself to it (F-R2-1)", async () => {
+    const seeded = await seedCompany();
+    const { issueId, stageId, stored } = await seedArbiterHold(seeded, { twoStage: true });
+    const runId = await liveRun(seeded, seeded.arbiterId, issueId);
+    const arbiter = app(agentActor(seeded, seeded.arbiterId, runId));
+
+    const selfAdd = await request(arbiter).patch(`/api/issues/${issueId}`).send({ executionPolicy: withArbiterBesideReviewer(stored, seeded) });
+    const done = await request(arbiter).patch(`/api/issues/${issueId}`).send({ status: "done", comment: "Approved on my reading." });
+
+    expect(selfAdd.status, JSON.stringify(selfAdd.body)).toBe(403);
+    expect(done.status, JSON.stringify(done.body)).toBe(422);
+    expect(done.body.details).toMatchObject({ code: "stall_arbiter_cannot_approve" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.assigneeAgentId).toBe(seeded.arbiterId);
+    expect(row.executionState).toMatchObject({ currentStageId: stageId, completedStageIds: [] });
+  }, 60_000);
+
+  it("keeps the handed-off arbiter from approving when the board later lists it on the review stage", async () => {
+    const seeded = await seedCompany();
+    const { issueId, stageId, stored } = await seedArbiterHold(seeded, {
+      twoStage: true,
+      reviewers: [seeded.reviewerId, seeded.secondReviewerId],
+    });
+
+    const boardEdit = await request(app(boardActor(seeded)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionPolicy: withArbiterBesideReviewer(stored, seeded) });
+    expect(boardEdit.status, JSON.stringify(boardEdit.body)).toBe(200);
+    expect((await issueRow(issueId)).assigneeAgentId).toBe(seeded.arbiterId);
+
+    const runId = await liveRun(seeded, seeded.arbiterId, issueId);
+    const done = await request(app(agentActor(seeded, seeded.arbiterId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done", comment: "Approved on my reading." });
+
+    expect(done.status, JSON.stringify(done.body)).toBe(422);
+    expect(done.body.details).toMatchObject({ code: "stall_arbiter_cannot_approve" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    expect((await issueRow(issueId)).executionState).toMatchObject({ currentStageId: stageId, completedStageIds: [] });
+  }, 60_000);
+
+  // Mixed concurrent decisions by the stage's reviewer on a two-reviewer stage
+  // without the same-head signal: only the marker decision hands off.
+  const plainBounce = { status: "in_progress", comment: "Another finding in the retry path." };
+  const markerBounce = { status: "in_progress", comment: "Only a nit is left.\nCode acceptable: yes" };
+  const seedMixedRace = (seeded: Seeded) =>
+    seedPendingReview(seeded, () => ({ bouncedHeadSha: "b".repeat(40) }), {
+      reviewers: [seeded.reviewerId, seeded.secondReviewerId],
+    });
+
+  it("refuses a plain decision that would erase a hand-off committed after its read (F-R2-2)", async () => {
+    const seeded = await seedCompany();
+    const { issueId } = await seedMixedRace(seeded);
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    const reviewer = app(agentActor(seeded, seeded.reviewerId, runId));
+    const raced: { stall?: request.Response } = {};
+    // The plain decision has read the card; the stall decision commits its
+    // hand-off before the plain decision takes the row lock.
+    lockInterleave.beforeLock = async () => {
+      raced.stall = await request(reviewer).patch(`/api/issues/${issueId}`).send(markerBounce);
+    };
+
+    const plain = await request(reviewer).patch(`/api/issues/${issueId}`).send(plainBounce);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(raced.stall?.status, JSON.stringify(raced.stall?.body)).toBe(200);
+    expect(plain.status, JSON.stringify(plain.body)).toBe(409);
+    expect(plain.body.details).toMatchObject({ code: "review_stall_handoff_conflict" });
+    expect(await stallRows(issueId)).toHaveLength(1);
+    expect(await decisionRows(issueId)).toHaveLength(1);
+    const row = await issueRow(issueId);
+    expect(row.assigneeAgentId).toBe(seeded.arbiterId);
+    expect(row.executionState).toMatchObject({ stallHandoff: { arbiterAgentId: seeded.arbiterId } });
+  }, 60_000);
+
+  it("refuses a hand-off computed before a concurrent plain decision committed", async () => {
+    const seeded = await seedCompany();
+    const { issueId } = await seedMixedRace(seeded);
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    const reviewer = app(agentActor(seeded, seeded.reviewerId, runId));
+    const raced: { plain?: request.Response } = {};
+    // The stall decision has read the card; the plain decision commits its
+    // bounce before the stall decision takes the row lock.
+    lockInterleave.beforeLock = async () => {
+      raced.plain = await request(reviewer).patch(`/api/issues/${issueId}`).send(plainBounce);
+    };
+
+    const stall = await request(reviewer).patch(`/api/issues/${issueId}`).send(markerBounce);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(raced.plain?.status, JSON.stringify(raced.plain?.body)).toBe(200);
+    expect(stall.status, JSON.stringify(stall.body)).toBe(409);
+    expect(stall.body.details).toMatchObject({ code: "review_stall_handoff_conflict" });
+    expect(await stallRows(issueId)).toHaveLength(0);
+    expect(await decisionRows(issueId)).toHaveLength(1);
+    const row = await issueRow(issueId);
+    expect(row.assigneeAgentId).toBe(seeded.coderId);
+    expect(row.executionState ?? {}).not.toHaveProperty("stallHandoff");
+  }, 60_000);
+
+  it("never writes a hand-off over a hand-off record that appeared before the row lock", async () => {
+    const seeded = await seedCompany();
+    const { issueId, stageId } = await seedPendingReview(seeded);
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    const recorded = {
+      stageId,
+      arbiterAgentId: seeded.arbiterId,
+      fromParticipant: { type: "agent", agentId: seeded.reviewerId, userId: null },
+      changesRequestedCount: 1,
+      signals: ["code_acceptable"],
+      handedOffAt: "2026-11-06T00:00:00.000Z",
+    };
+    // The stage-run's hand-off record lands after this decision's read, with
+    // the decision pointer unchanged: only the hand-off comparison sees it.
+    lockInterleave.beforeLock = async () => {
+      const current = await issueRow(issueId);
+      await db
+        .update(issues)
+        .set({ executionState: { ...(current.executionState as Record<string, unknown>), stallHandoff: recorded } })
+        .where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_progress", comment: "Same finding on the same head.\nCode acceptable: yes" });
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_handoff_conflict" });
+    expect(await stallRows(issueId)).toHaveLength(0);
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.assigneeAgentId).toBe(seeded.reviewerId);
+    expect(row.executionState).toMatchObject({ stallHandoff: recorded });
   }, 60_000);
 
   async function resolveRecovery(seeded: Seeded, issueId: string, note: string) {
