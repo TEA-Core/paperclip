@@ -6032,6 +6032,8 @@ describe("evaluateDoneTierDeclaration", () => {
       for (const observation of [
         "2026-11-06T21:02:39.503559Z-2026-11-06T21:04:24.162190Z",
         "2026-11-06T21:02:39.503559Z-2026-11-06T21:02:39.503559Z",
+        "2026-11-06T21:02:39.1Z-2026-11-06T21:02:39.100000Z",
+        "2026-11-06T21:02:39.100000Z-2026-11-06T21:02:39.1Z",
       ]) {
         const result = await evaluateObservation(observation);
         expect(result.allowed, observation).toBe(true);

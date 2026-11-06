@@ -1459,11 +1459,11 @@ const TIER2_PROBE_SHAPE_RE = /^probe `([^`]+)` head ([0-9a-f]{7,40}) post-merge:
 // SUP-22801: record-only Tier 2 live-evidence grammar, the classification-aware
 // sibling of TIER2_PROBE_SHAPE_RE for `deliveryRequirement=record_only` cards.
 // Machine-checkable components: a backticked probe command, the observed target,
-// a strict UTC ISO-8601 observation instant (Z-suffixed; validated as a real
-// calendar instant), and an explicit pass/fail verdict with the predicate and
-// observed result. The literal `record-only probe` marker makes the two Tier 2
-// grammars mutually recognisable, so a record-only declaration on a
-// repository_delivery card is refused by name, not by generic shape mismatch.
+// a strict UTC ISO-8601 observation instant or range (Z-suffixed; each endpoint
+// validated as real calendar instants), and an explicit pass/fail verdict with
+// the predicate and observed result. The literal `record-only probe` marker
+// makes the two Tier 2 grammars mutually recognisable, so a record-only
+// declaration on a repository_delivery card is refused by name, not by generic shape mismatch.
 // A `fail` verdict is accepted by the shape only so it can be refused with the
 // specific failing-predicate message — a failing probe is never live proof.
 const UTC_INSTANT_SHAPE = String.raw`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z`;
@@ -1599,10 +1599,11 @@ function utcInstantSortKey(observedAt: string): string {
 // SUP-22801: record-only Tier 2 live proof. Pure and fail-closed — a
 // record_only card has no repository landing to resolve, so nothing here touches
 // GitHub or the database; every component of the accepted form is checked
-// locally: the shape, non-blank command/target/predicate, a real UTC instant,
-// and a `pass` verdict. Non-empty prose, missing components, an impossible
-// calendar instant, or a failing predicate are all refusals naming the accepted
-// form verbatim (SUP-15787 invariant).
+// locally: the shape, non-blank command/target/predicate, real UTC instants,
+// chronological range endpoints, and a `pass` verdict. Non-empty prose, missing
+// components, an impossible calendar instant, an inverted range, or a failing
+// predicate are all refusals naming the accepted form verbatim
+// (SUP-15787 invariant).
 function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierDeclarationResult {
   const shape = TIER2_RECORD_ONLY_PROBE_SHAPE_RE.exec(evidence.trim());
   if (!shape) {
