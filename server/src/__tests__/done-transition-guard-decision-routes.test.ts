@@ -2102,21 +2102,21 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
       const runId = await seedRun(companyId, reviewerAgentId, issueId);
       currentActor = agentActor(companyId, reviewerAgentId, runId);
-      mockMergedBranchWithCommitProbes({ afc6278bea3c: "absent" });
+      mockMergedBranchWithCommitProbes({ afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60: "absent" });
 
       const res = await request(app)
         .patch(`/api/issues/${identifier}`)
         .send({
           status: "done",
           comment:
-            "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe re-hit the endpoint; cited commit afc6278bea3c.",
+            "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe re-hit the endpoint; cited commit afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60.",
         });
 
       // The tier line passed; the provably nonexistent cited SHA is the refusal.
       expect(res.status, JSON.stringify(res.body)).toBe(422);
       expect(res.body.code).toBe("done_transition_cited_sha_unresolvable");
-      expect(res.body.details.shas).toEqual(["afc6278bea3c"]);
-      expect(res.body.details.remedy).toContain("afc6278bea3c");
+      expect(res.body.details.shas).toEqual(["afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60"]);
+      expect(res.body.details.remedy).toContain("afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60");
       expect(await statusOf(issueId)).toBe("in_review");
 
       // Thread-readable refusal record per the SUP-17125 contract.
@@ -2127,7 +2127,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       const body = records[0]?.body ?? "";
       expect(body).toContain("[Terminal status refused] done_transition_cited_sha_unresolvable");
       expect(body).toContain("HTTP 422");
-      expect(body).toContain("afc6278bea3c");
+      expect(body).toContain("afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60");
       expect(body).toContain(`Refusing run: ${runId}`);
 
       // The resolution itself is audited with the per-SHA verdict.
@@ -2141,7 +2141,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       );
       expect(rows[0]?.details).toMatchObject({
         decisionCarried: false,
-        results: [{ sha: "afc6278bea3c", status: "nonexistent" }],
+        results: [{ sha: "afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60", status: "nonexistent" }],
       });
     });
 
@@ -2149,13 +2149,13 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D20525B");
       await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
       currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
-      mockMergedBranchWithCommitProbes({ "674fef15d2": "present" });
+      mockMergedBranchWithCommitProbes({ "674fef15d2a83c19e74b602df591a38c44be7096": "present" });
 
       const res = await request(app)
         .patch(`/api/issues/${identifier}`)
         .send({
           status: "done",
-          comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 674fef15d2 post-merge: probe re-hit the endpoint; cited commit 674fef15d2.",
+          comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 674fef15d2a83c19e74b602df591a38c44be7096 post-merge: probe re-hit the endpoint; cited commit 674fef15d2a83c19e74b602df591a38c44be7096.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -2168,8 +2168,8 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       // re-slice deliberately removed (verified by running this test: the
       // observed call list is exactly these two).
       expect(commitProbeCalls()).toEqual([
-        "https://api.github.com/repos/TEA-Core/paperclip/commits/674fef15d2",
-        "https://api.github.com/repos/TEA-Core/paperclip/commits/674fef15d2",
+        "https://api.github.com/repos/TEA-Core/paperclip/commits/674fef15d2a83c19e74b602df591a38c44be7096",
+        "https://api.github.com/repos/TEA-Core/paperclip/commits/674fef15d2a83c19e74b602df591a38c44be7096",
       ]);
       const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
       expect(comments.filter((c) => c.authorType === "system")).toHaveLength(0);
@@ -2181,13 +2181,13 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
       // The SHA probe says absent, but the control ref does not resolve either,
       // so absence is unproven: the citation is unverifiable and the close holds.
-      mockMergedBranchWithCommitProbes({ afc6278bea3c: "absent" }, 404);
+      mockMergedBranchWithCommitProbes({ afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60: "absent" }, 404);
 
       const res = await request(app)
         .patch(`/api/issues/${identifier}`)
         .send({
           status: "done",
-          comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe re-hit the endpoint; cited commit afc6278bea3c.",
+          comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe re-hit the endpoint; cited commit afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -2201,7 +2201,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         { timeout: 5000 },
       );
       expect(rows[0]?.details).toMatchObject({
-        results: [{ sha: "afc6278bea3c", status: "unverifiable" }],
+        results: [{ sha: "afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60", status: "unverifiable" }],
       });
     });
 
@@ -2217,11 +2217,11 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         isInstanceAdmin: false,
         runId: randomUUID(),
       };
-      mockMergedBranchWithCommitProbes({ afc6278bea3c: "absent" });
+      mockMergedBranchWithCommitProbes({ afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60: "absent" });
 
       const res = await request(app)
         .patch(`/api/issues/${identifier}`)
-        .send({ status: "done", comment: "Board close citing merge commit afc6278bea3c." });
+        .send({ status: "done", comment: "Board close citing merge commit afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60." });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(await statusOf(issueId)).toBe("done");
