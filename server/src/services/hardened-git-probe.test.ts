@@ -5,10 +5,11 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   HardenedGitError,
+  IGNORED_ARTIFACT_DIRECTORY_NAMES,
   LEGACY_WORKTREE_GIT_OPTIONS,
   normalizeBaseBranch,
+  otherCardIdentifiers,
   probeNoRepositoryWorktree,
-  readWorktreeHeadFromFiles,
   resolveTrustedGitBinary,
   runHardenedGit,
 } from "./hardened-git-probe.js";
@@ -86,6 +87,8 @@ interface ManagedLayout {
     recordedWorktreePath: string;
     managedProjectRoot: string;
     issueIdentifier: string;
+    defaultBranch: string;
+    attributedBranches: ReadonlySet<string>;
     countCommitsAheadOfBase: (sha: string) => Promise<number>;
   };
 }
@@ -129,6 +132,8 @@ function managedLayout(): ManagedLayout {
       recordedWorktreePath: worktree,
       managedProjectRoot,
       issueIdentifier: "SUP-7",
+      defaultBranch: "main",
+      attributedBranches: new Set<string>(),
       countCommitsAheadOfBase: countOnOrigin(origin),
     },
   };
@@ -711,11 +716,44 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
       plant(layout.worktree);
       expect(await probeNoRepositoryWorktree(layout.input)).toEqual(ignoredEntry(entry));
     });
+
+    // An untracked or modified ignore file must not be what makes a listed name
+    // ignored: a committed rule (or the server's exclude line) has to.
+    it.each([
+      ["target at the root", [], "target/.gitignore", "target/work.md", "target/"],
+      [".paperclip at the root", [], ".paperclip/.gitignore", ".paperclip/work.md", ".paperclip/"],
+      ["node_modules under a tracked directory", ["server/package.json"], "server/node_modules/.gitignore", "server/node_modules/work.md", "server/node_modules/"],
+    ])("refuses %s that only its own untracked .gitignore ignores", async (_label, tracked, ignoreFile, work, entry) => {
+      const layout = managedLayout();
+      trackIgnoreRules(layout, "*.log\n", tracked);
+      writeTree(layout.worktree, ignoreFile, "*\n");
+      writeTree(layout.worktree, work, "undelivered\n");
+      expect(git(layout.worktree, "status", "--porcelain", "--untracked-files=all")).toBe("");
+      expect(await probeNoRepositoryWorktree(layout.input)).toEqual({
+        ok: false,
+        reason: `the recorded worktree has a regenerated-artefact directory that no committed ignore rule ignores (${JSON.stringify(entry)})`,
+      });
+    });
+
+    it("pins the allowlist to exactly these thirteen names", () => {
+      expect([...IGNORED_ARTIFACT_DIRECTORY_NAMES].sort()).toEqual([
+        ".next", ".paperclip", ".paperclip-repositories", ".paperclip-runtime", ".pnpm-store", ".turbo", ".venv",
+        "__pycache__", "build", "coverage", "dist", "node_modules", "target",
+      ]);
+    });
+
+    it.each(["data", "out", "tmp", "logs"])("refuses an ignored %s directory, which is not on the list", async (name) => {
+      const layout = managedLayout();
+      trackIgnoreRules(layout, `${name}/\n`);
+      writeTree(layout.worktree, `${name}/state.bin`, "undelivered\n");
+      expect(await probeNoRepositoryWorktree(layout.input)).toEqual(ignoredEntry(`${name}/`));
+    });
   });
 
   describe("other cards named by the recorded worktree's branch", () => {
     it.each([
       ["SUP-7-OTHER-999", "OTHER-999"],
+      ["SUP-7-other-999", "OTHER-999"],
       ["SUP-7-after-SUP-70", "SUP-70"],
       ["SUP-7-from-sup-70", "SUP-70"],
       ["SUP-7-XSUP-7", "XSUP-7"],
@@ -728,10 +766,60 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
       });
     });
 
-    it("accepts a branch that names only this card, in any case and with a suffix", async () => {
+    it.each(["sup-7-notes-v2", "SUP-7-iso-8601-dates"])("accepts branch %s, which names only this card", async (branch) => {
       const layout = managedLayout();
-      const worktree = layout.addWorktree("sup-7-notes-v2");
+      const worktree = layout.addWorktree(branch);
       expect(await probeNoRepositoryWorktree({ ...layout.input, recordedWorktreePath: worktree })).toMatchObject({ ok: true });
+    });
+  });
+
+  describe("otherCardIdentifiers", () => {
+    it.each([
+      ["Delivered on OTHER-999-branch", ["OTHER-999"]],
+      ["delivered on other-999-work", ["OTHER-999"]],
+      ["Mixed Other-999 case", ["OTHER-999"]],
+      ["alongside SUP-70 and XSUP-7", ["SUP-70", "XSUP-7"]],
+      ["recorded with ISO-8601 timestamps, SHA-256 digests and UTF-8 text", []],
+      ["the ruling for SUP-7 and sup-7", []],
+    ])("finds the other cards in %j", (text, expected) => {
+      expect(otherCardIdentifiers(text, "SUP-7").sort()).toEqual(expected);
+    });
+  });
+
+  // Unattributed foreign branches refuse; branches registered to another
+  // card's workspace are that card's.
+  describe("local branches that are not this card's", () => {
+    function branchAt(layout: ManagedLayout, name: string, ahead: boolean) {
+      if (!ahead) {
+        git(layout.repoRoot, "branch", name, "SUP-7-record-ruling");
+        return;
+      }
+      const worktree = layout.addWorktree(name);
+      writeFileSync(path.join(worktree, "work.md"), "SUP-7's deliverable\n");
+      git(worktree, "add", "work.md");
+      git(worktree, "commit", "-qm", "work");
+      git(worktree, "push", "-q", "origin", name);
+    }
+
+    it.each([
+      ["an ahead OTHER-999-work", "OTHER-999-work", true],
+      ["an ahead lower-case other-999-work", "other-999-work", true],
+      ["an ahead SUP-70-work", "SUP-70-work", true],
+      ["a same-SHA OTHER-999-same", "OTHER-999-same", false],
+    ] as const)("refuses %s that no card's workspace registers", async (_label, name, ahead) => {
+      const layout = managedLayout();
+      branchAt(layout, name, ahead);
+      expect(await probeNoRepositoryWorktree(layout.input)).toEqual({
+        ok: false,
+        reason: `branch ${name} belongs to no card: it is not this card's, not the project's default branch, and not registered to another card's workspace`,
+      });
+    });
+
+    it("accepts a sibling card's ahead branch registered to its workspace, and the default branch", async () => {
+      const layout = managedLayout();
+      branchAt(layout, "SUP-71-sibling", true);
+      expect(await probeNoRepositoryWorktree({ ...layout.input, attributedBranches: new Set(["SUP-71-sibling"]) }))
+        .toMatchObject({ ok: true });
     });
   });
 
@@ -1058,94 +1146,5 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
       expect(result.ok).toBe(false);
       expect(Date.now() - started).toBeLessThan(15_000);
     });
-  });
-});
-
-// The status write re-reads the worktree's HEAD from its ref files while it
-// holds the issue row, where no Git process may run.
-describe("readWorktreeHeadFromFiles", () => {
-  it.each([
-    ["a loose ref", (_layout: ManagedLayout) => {}],
-    ["a packed ref", (layout: ManagedLayout) => git(layout.repoRoot, "pack-refs", "--all")],
-  ])("reads the branch and commit of a worktree whose branch is %s", async (_label, store) => {
-    const layout = managedLayout();
-    store(layout);
-    const probe = await probeNoRepositoryWorktree(layout.input);
-    expect(probe.ok).toBe(true);
-    const { gitDir, commonDir, headSha } = probe as Extract<typeof probe, { ok: true }>;
-    expect(await readWorktreeHeadFromFiles(gitDir, commonDir)).toEqual({ branch: "SUP-7-record-ruling", sha: headSha });
-  });
-
-  describe("a packed-refs file read in chunks", () => {
-    const BRANCH = "SUP-7-record-ruling";
-    const CHUNK = 64 * 1024;
-
-    function packedLayout() {
-      const layout = managedLayout();
-      git(layout.repoRoot, "pack-refs", "--all");
-      const gitDir = git(layout.worktree, "rev-parse", "--absolute-git-dir");
-      const commonDir = path.join(layout.repoRoot, ".git");
-      return { layout, gitDir, commonDir, packedRefs: path.join(commonDir, "packed-refs"), sha: git(layout.worktree, "rev-parse", "HEAD") };
-    }
-
-    // The branch's own line starts `offset` bytes into the file, so it can
-    // straddle a read boundary at any position.
-    function packedRefsWithLineAt(offset: number, line: string) {
-      let content = "# pack-refs with: peeled fully-peeled sorted \n";
-      let n = 0;
-      while (content.length + 100 < offset) content += `${"a".repeat(40)} refs/heads/filler-${n++}\n`;
-      const gap = offset - content.length;
-      if (gap === 1) content += "\n";
-      else if (gap >= 2) content += `#${"p".repeat(gap - 2)}\n`;
-      return `${content}${line}`;
-    }
-
-    it("finds the branch wherever its line falls relative to a read boundary, past lines that only look like it", async () => {
-      const { gitDir, commonDir, packedRefs, sha } = packedLayout();
-      const decoys = `x y refs/heads/${BRANCH}\n${"b".repeat(40)} refs/heads/other/${BRANCH}\n`;
-      const line = `${sha} refs/heads/${BRANCH}\n`;
-      for (let before = 1; before <= decoys.length + line.length + 1; before += 1) {
-        writeFileSync(packedRefs, packedRefsWithLineAt(CHUNK - before, `${decoys}${line}`));
-        expect(await readWorktreeHeadFromFiles(gitDir, commonDir), `line ${before} bytes before the boundary`).toEqual({
-          branch: BRANCH,
-          sha,
-        });
-      }
-    });
-
-    it("finds the branch on a final line with no newline", async () => {
-      const { gitDir, commonDir, packedRefs, sha } = packedLayout();
-      writeFileSync(packedRefs, packedRefsWithLineAt(CHUNK - 3, `${sha} refs/heads/${BRANCH}`));
-      expect(await readWorktreeHeadFromFiles(gitDir, commonDir)).toEqual({ branch: BRANCH, sha });
-    });
-
-    it("returns null when the branch is not listed", async () => {
-      const { gitDir, commonDir, packedRefs, sha } = packedLayout();
-      writeFileSync(packedRefs, packedRefsWithLineAt(CHUNK + 10, `${sha} refs/heads/${BRANCH}-2\n`));
-      expect(await readWorktreeHeadFromFiles(gitDir, commonDir)).toBeNull();
-    });
-
-    it("returns null promptly, without buffering the file, for a huge packed-refs with no line breaks", async () => {
-      const { gitDir, commonDir, packedRefs } = packedLayout();
-      rmSync(packedRefs);
-      writeFileSync(packedRefs, "");
-      truncateSync(packedRefs, 60 * MIB);
-      const started = performance.now();
-      const { result, growth } = await peakBufferGrowth(() => readWorktreeHeadFromFiles(gitDir, commonDir));
-      expect(result).toBeNull();
-      expect(performance.now() - started).toBeLessThan(2_000);
-      expect(growth, `buffers grew by ${growth} bytes`).toBeLessThan(16 * MIB);
-    });
-  });
-
-  it("returns null when HEAD is detached or a FIFO", async () => {
-    const layout = managedLayout();
-    const gitDir = git(layout.worktree, "rev-parse", "--absolute-git-dir");
-    const commonDir = path.join(layout.repoRoot, ".git");
-    git(layout.worktree, "checkout", "-q", "--detach");
-    expect(await readWorktreeHeadFromFiles(gitDir, commonDir)).toBeNull();
-    rmSync(path.join(gitDir, "HEAD"));
-    execFileSync("mkfifo", [path.join(gitDir, "HEAD")]);
-    expect(await readWorktreeHeadFromFiles(gitDir, commonDir)).toBeNull();
   });
 });

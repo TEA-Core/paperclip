@@ -20636,9 +20636,10 @@ export function issueRoutes(
           }
 
           // SUP-22570: compare-and-set against the measurement taken before
-          // this transaction. It re-reads the database half of the proof and
-          // the worktree's ref files, runs no Git process and makes no network
-          // call, and refuses if anything moved since the measurement.
+          // this transaction. It re-reads the database half of the proof,
+          // re-checks the measured worktree with a bounded Git status (no
+          // GitHub call), and refuses if anything moved or got dirty since the
+          // measurement.
           if (noRepositoryLandingCloser !== null && noRepositoryMeasurement !== null) {
             const lockedForLanding = await svc.getByIdForUpdate(id, tx);
             if (!lockedForLanding) return null;

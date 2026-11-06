@@ -1,5 +1,5 @@
 import path from "node:path";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, ne } from "drizzle-orm";
 import {
   agents,
   documentRevisions,
@@ -20,7 +20,7 @@ import {
   normalizeBaseBranch,
   otherCardIdentifiers,
   probeNoRepositoryWorktree,
-  readWorktreeHeadFromFiles,
+  recheckRecordedWorktree,
   runHardenedGit,
 } from "./hardened-git-probe.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
@@ -1762,10 +1762,12 @@ async function proveTier2Live(
 // already skips the delivery guard; this form is the truthful Tier 1 sentence
 // for one that has no repository deliverable at all. It is accepted only when
 // every check below holds. The accepting door measures once more just before
-// its status write, outside any transaction (measureNoRepositoryLandingForClose),
-// and the write compares that measurement with the row it locks
-// (verifyNoRepositoryLandingAtTransition) without running Git or calling GitHub,
-// so no Git process or network call runs while the issue row is held.
+// its status write, outside any transaction (measureNoRepositoryLandingForClose):
+// every GitHub compare and the full Git probe run there. The write then
+// compares that measurement with the row it locks and re-checks the one
+// measured worktree with a short, bounded Git status
+// (verifyNoRepositoryLandingAtTransition), so dirt written after the
+// measurement refuses while no network call runs under the row lock.
 //
 // This replaces the no-repository form PR 1114 (SUP-23044) landed on the fold
 // branch, which a repository_delivery card could also use when it had no pull
@@ -1816,7 +1818,6 @@ export interface NoRepositoryLandingMeasurement {
     branch: string;
     headSha: string;
     worktreePath: string;
-    gitDir: string;
     commonDir: string;
     comparedTips: string[];
   };
@@ -1894,6 +1895,8 @@ type NoRepositoryLandingRecord = Omit<NoRepositoryLandingMeasurement, "probe"> &
   identifier: string;
   projectId: string;
   repositoryLocation: NonNullable<ReturnType<typeof parseRepoUrl>>;
+  /** Branch names registered to other issues' execution workspaces in this project. */
+  attributedBranches: string[];
 };
 
 /**
@@ -2077,6 +2080,23 @@ async function readNoRepositoryLandingRecord(
   if (!repositoryLocation) {
     return noRepositoryRefusal("requires the project workspace to name a GitHub repository to measure the default branch against.");
   }
+  // Branches registered to ANOTHER issue's execution workspace in this company
+  // and project belong to that card (branchName is board-only for agents);
+  // the probe refuses every other branch that is neither this card's nor the
+  // default branch.
+  const attributedBranches = await db
+    .selectDistinct({ branchName: executionWorkspaces.branchName })
+    .from(executionWorkspaces)
+    .where(
+      and(
+        eq(executionWorkspaces.companyId, issue.companyId),
+        eq(executionWorkspaces.projectId, workspace.projectId),
+        isNotNull(executionWorkspaces.sourceIssueId),
+        ne(executionWorkspaces.sourceIssueId, issue.id),
+        isNotNull(executionWorkspaces.branchName),
+      ),
+    )
+    .then((rows) => rows.map((row) => row.branchName!).sort());
   return {
     ok: true,
     record: {
@@ -2088,6 +2108,7 @@ async function readNoRepositoryLandingRecord(
       recordedWorktreePath,
       repository: `${repositoryLocation.hostname}/${repositoryLocation.owner}/${repositoryLocation.repo}`,
       repositoryLocation,
+      attributedBranches,
       baseBranch,
       ruling: {
         documentId: ruling.documentId,
@@ -2119,6 +2140,8 @@ async function verifyNoRepositoryLanding(
       resolveManagedProjectWorkspaceDir({ companyId: issue.companyId, projectId: record.projectId }),
     ),
     issueIdentifier: record.identifier,
+    defaultBranch: record.baseBranch,
+    attributedBranches: new Set(record.attributedBranches),
     countCommitsAheadOfBase: async (sha) => {
       const ahead = await githubCompareAheadBy(
         hostname,
@@ -2150,7 +2173,6 @@ async function verifyNoRepositoryLanding(
         branch: probe.branch,
         headSha: probe.headSha,
         worktreePath: probe.worktreePath,
-        gitDir: probe.gitDir,
         commonDir: probe.commonDir,
         comparedTips: probe.comparedTips,
       },
@@ -2239,11 +2261,12 @@ function changedSinceMeasurement(
 
 /**
  * SUP-22570 compare-and-set, inside the status write that lands the close and
- * against the row it holds `FOR UPDATE`. It runs no Git process and makes no
- * network call: it re-reads the database half of the proof, requires it to
- * match what was measured, and requires the worktree's HEAD, read from its ref
- * files, to still be the measured commit. Any mismatch refuses, including an
- * issue another request already closed (done or cancelled).
+ * against the row it holds `FOR UPDATE`. It makes no network call: it re-reads
+ * the database half of the proof and requires it to match what was measured,
+ * then re-checks the one measured worktree (index, status and ignored entries
+ * on the measured branch and commit, no GitHub compare, a 5 s timeout), so
+ * dirt written after the measurement refuses. Any mismatch refuses, including
+ * an issue another request already closed (done or cancelled).
  */
 export async function verifyNoRepositoryLandingAtTransition(
   tx: Db,
@@ -2281,9 +2304,14 @@ export async function verifyNoRepositoryLandingAtTransition(
   if (changed) {
     return noRepositoryRefusal(`refused: ${changed} changed after the close was measured.`);
   }
-  const head = await readWorktreeHeadFromFiles(measurement.probe.gitDir, measurement.probe.commonDir);
-  if (!head || head.branch !== measurement.probe.branch || head.sha !== measurement.probe.headSha) {
-    return noRepositoryRefusal("refused: the recorded worktree's HEAD moved after the close was measured.");
+  const recheck = await recheckRecordedWorktree({
+    worktreePath: measurement.probe.worktreePath,
+    commonDir: measurement.probe.commonDir,
+    branch: measurement.probe.branch,
+    headSha: measurement.probe.headSha,
+  });
+  if (!recheck.ok) {
+    return noRepositoryRefusal(`refused at the close write: ${recheck.reason}.`);
   }
   return { ok: true, measurement };
 }

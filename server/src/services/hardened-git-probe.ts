@@ -161,6 +161,8 @@ export interface HardenedGitOptions {
   inheritEnvironment?: boolean;
   /** Written to the process's standard input. */
   input?: string;
+  /** Exit codes other than 0 that still mean success (`check-ignore` exits 1 when nothing matched). */
+  successExitCodes?: readonly number[];
 }
 
 /** How the pre-existing repository_delivery probes run git (done-transition-guard.ts `runGit`). */
@@ -174,7 +176,7 @@ export const LEGACY_WORKTREE_GIT_OPTIONS: Readonly<HardenedGitOptions> = { cwd: 
 export function runBoundedProcess(
   file: string,
   args: readonly string[],
-  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; input?: string },
+  options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; input?: string; successExitCodes?: readonly number[] },
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const killGroup = options.timeoutMs > 0;
@@ -221,8 +223,11 @@ export function runBoundedProcess(
     });
     child.on("error", () => finish(new HardenedGitError("failed", "git failed")));
     child.on("close", (code) => {
-      if (code === 0) finish(null, Buffer.concat(chunks).toString("utf8"));
-      else finish(new HardenedGitError("failed", "git failed"));
+      if (code === 0 || (code !== null && options.successExitCodes?.includes(code))) {
+        finish(null, Buffer.concat(chunks).toString("utf8"));
+      } else {
+        finish(new HardenedGitError("failed", "git failed"));
+      }
     });
     child.stdin!.on("error", () => {});
     child.stdin!.end(options.input);
@@ -242,6 +247,7 @@ export function runHardenedGit(args: readonly string[], options: HardenedGitOpti
     env: inherit ? inheritedGitEnv() : hardenedGitEnv(options.ceilingDirectory ?? null),
     timeoutMs: options.timeoutMs ?? (inherit ? 0 : DEFAULT_TIMEOUT_MS),
     input: options.input,
+    successExitCodes: options.successExitCodes,
   });
 }
 
@@ -359,74 +365,6 @@ async function readOptionalRegularFile(target: string, maxBytes: number): Promis
   }
 }
 
-const MAX_REF_FILE_BYTES = 4096;
-const MAX_PACKED_REFS_BYTES = 64 * 1024 * 1024;
-const MAX_PACKED_REF_LINE_BYTES = 8192;
-const PACKED_REFS_CHUNK_BYTES = 64 * 1024;
-
-/**
- * The commit `packed-refs` lists for `refName`, read in chunks through the
- * validated handle so an oversize or hostile file never sits in memory: only the
- * unfinished last line is carried between chunks, and a line longer than any
- * real ref line fails.
- */
-async function findPackedRef(handle: FileHandle, size: number, refName: string): Promise<string | null> {
-  const needle = Buffer.from(` ${refName}\n`);
-  const chunk = Buffer.allocUnsafe(PACKED_REFS_CHUNK_BYTES);
-  let pending = Buffer.alloc(0);
-  let total = 0;
-  for (let done = false; !done; ) {
-    const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
-    total += bytesRead;
-    if (total > size) throw new HardenedGitError("failed", "file grew while it was read");
-    done = bytesRead === 0;
-    pending = Buffer.concat([pending, done ? Buffer.from("\n") : chunk.subarray(0, bytesRead)]);
-    for (let at = pending.indexOf(needle); at !== -1; at = pending.indexOf(needle, at + 1)) {
-      const sha = pending.subarray(pending.lastIndexOf(0x0a, at) + 1, at).toString("latin1");
-      if (SHA_RE.test(sha)) return sha;
-    }
-    pending = pending.subarray(pending.lastIndexOf(0x0a) + 1);
-    if (pending.length > MAX_PACKED_REF_LINE_BYTES) throw new HardenedGitError("failed", "packed-refs line too long");
-  }
-  return null;
-}
-
-/**
- * The branch and commit a linked worktree's HEAD names, read from the ref files
- * without running Git: `<gitDir>/HEAD`, then the loose ref or `packed-refs` in
- * the common dir. Null when HEAD is not a branch or a file is not a plain,
- * bounded file (a reftable repository included). The no-repository close
- * compares this with its measured head while it holds the issue row, where no
- * Git process may run.
- */
-export async function readWorktreeHeadFromFiles(
-  gitDir: string,
-  commonDir: string,
-): Promise<{ branch: string; sha: string } | null> {
-  try {
-    const head = (await readRegularFile(path.join(gitDir, "HEAD"), MAX_REF_FILE_BYTES)).toString("utf8").trim();
-    const match = /^ref: refs\/heads\/(\S+)$/.exec(head);
-    if (!match) return null;
-    const branch = match[1]!;
-    const components = branch.split("/");
-    if (components.some((component) => component.length === 0 || component === "." || component === "..")) return null;
-    const loose = await readOptionalRegularFile(path.join(commonDir, "refs", "heads", ...components), MAX_REF_FILE_BYTES);
-    if (loose !== null) {
-      const sha = loose.trim();
-      return SHA_RE.test(sha) ? { branch, sha } : null;
-    }
-    const sha = await withRegularFile(path.join(commonDir, "packed-refs"), MAX_PACKED_REFS_BYTES, (handle, size) =>
-      findPackedRef(handle, size, `refs/heads/${branch}`),
-    ).catch((error: unknown) => {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
-      throw error;
-    });
-    return sha === null ? null : { branch, sha };
-  } catch {
-    return null;
-  }
-}
-
 /**
  * Run `fn` against a private git dir that shares the worktree's object store
  * (read-only, as an alternate) and a copy of its index, but whose config,
@@ -515,8 +453,10 @@ async function snapshotStatusIsDirty(
  * provision script, `.paperclip-runtime` from adapters and the heartbeat,
  * `.paperclip-repositories` from project-repository provisioning). A name
  * matches at any depth, but only as an ordinary directory with no symlink on
- * the path to it. Files inside a listed directory are not inspected; every
- * other ignored entry is dirt.
+ * the path to it, and only when a rule the repository commits (or the line the
+ * server writes to `info/exclude`) ignores it: an untracked or modified ignore
+ * file cannot make a listed name ignored. Files inside a listed directory are
+ * not inspected; every other ignored entry is dirt.
  */
 export const IGNORED_ARTIFACT_DIRECTORY_NAMES: ReadonlySet<string> = new Set([
   "node_modules",
@@ -553,23 +493,46 @@ async function isIgnoredArtifactDirectory(workTree: string, entry: string): Prom
   return true;
 }
 
-/** The first ignored entry that is not an allowlisted artefact directory; null when there is none. */
+/**
+ * The first ignored entry that refuses, with whether its name is on the
+ * allowlist (then no committed rule ignores it); null when there is none.
+ * `trackedPaths` are the paths the index holds; the status check has already
+ * shown each unmodified.
+ */
 async function firstDisallowedIgnoredEntry(
   snapshotGitDir: string,
   workTree: string,
+  trackedPaths: ReadonlySet<string>,
   options: HardenedGitOptions,
-): Promise<string | null> {
+): Promise<{ entry: string; listed: boolean } | null> {
+  const gitArgs = ["-C", workTree, `--git-dir=${snapshotGitDir}`, `--work-tree=${workTree}`];
   const entries = (await runHardenedGit(
-    [
-      "-C", workTree, `--git-dir=${snapshotGitDir}`, `--work-tree=${workTree}`,
-      "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory", "--no-empty-directory",
-    ],
+    [...gitArgs, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory", "--no-empty-directory"],
     options,
   )).split("\0").filter((record) => record.length > 0);
+  const listed: string[] = [];
   for (const entry of entries) {
-    if (!(await isIgnoredArtifactDirectory(workTree, entry))) return entry;
+    if (!(await isIgnoredArtifactDirectory(workTree, entry))) return { entry, listed: false };
+    listed.push(entry);
   }
-  return null;
+  if (listed.length === 0) return null;
+  // Which rule ignores each listed directory itself (named without the trailing
+  // slash, so a `.gitignore` inside it does not count): `source NUL line NUL
+  // pattern NUL path NUL`, with an empty source for a path no rule ignores.
+  const verdicts = (await runHardenedGit(
+    [...gitArgs, "check-ignore", "-v", "-n", "-z", "--stdin"],
+    { ...options, input: `${listed.map((entry) => entry.slice(0, -1)).join("\0")}\0`, successExitCodes: [1] },
+  )).split("\0");
+  const serverExclude = path.join(snapshotGitDir, "info", "exclude");
+  const committed = new Set<string>();
+  for (let index = 0; index + 3 < verdicts.length; index += 4) {
+    const [source, , pattern, directory] = verdicts.slice(index, index + 4) as [string, string, string, string];
+    const committedSource =
+      source === serverExclude || (path.posix.basename(source) === ".gitignore" && trackedPaths.has(source));
+    if (committedSource && !pattern.startsWith("!")) committed.add(`${directory}/`);
+  }
+  const uncommitted = listed.find((entry) => !committed.has(entry));
+  return uncommitted === undefined ? null : { entry: uncommitted, listed: true };
 }
 
 function escapeRegExp(text: string): string {
@@ -581,25 +544,25 @@ export function branchNamesIssue(branch: string, identifier: string): boolean {
   return new RegExp(`(^|[^A-Za-z0-9])${escapeRegExp(identifier)}(?![0-9])`, "i").test(branch);
 }
 
+// Standard names written like card identifiers (ISO-8601, SHA-256, UTF-8, RFC-9110 …).
+const NON_CARD_IDENTIFIER_PREFIXES: ReadonlySet<string> = new Set([
+  "CVE", "CWE", "ECMA", "HTTP", "IEC", "IEEE", "ISO", "RFC", "SHA", "TLS", "UTF",
+]);
+
 /**
- * Card identifiers `text` names other than `identifier`, upper-cased: any
- * upper-case `PREFIX-<n>` token, plus this card's own prefix in any case. Each
- * token stands on its own (no letter or digit before it, no digit after it),
- * so for SUP-7, `SUP-70` and `XSUP-7` are other cards and `SUP-7-notes` is not.
+ * Card identifiers `text` names other than `identifier`, upper-cased: every
+ * `PREFIX-<n>` token in any case, except the standard names above. Each token
+ * stands on its own (no letter or digit before it, no digit after it), so for
+ * SUP-7, `SUP-70`, `XSUP-7` and `other-999` are other cards and `SUP-7-notes`
+ * is not. A word-number token such as `phase-2` also counts, so a declaration
+ * or branch carrying one refuses (fail closed).
  */
 export function otherCardIdentifiers(text: string, identifier: string): string[] {
   const own = identifier.toUpperCase();
-  const ownPrefix = own.replace(/-\d+$/, "");
   const found = new Set<string>();
-  const patterns = [
-    /(?<![A-Za-z0-9])[A-Z][A-Z0-9]*-\d+(?![0-9])/g,
-    new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(ownPrefix)}-\\d+(?![0-9])`, "gi"),
-  ];
-  for (const pattern of patterns) {
-    for (const match of text.matchAll(pattern)) {
-      const token = match[0].toUpperCase();
-      if (token !== own) found.add(token);
-    }
+  for (const match of text.matchAll(/(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]*-\d+(?![0-9])/g)) {
+    const token = match[0].toUpperCase();
+    if (token !== own && !NON_CARD_IDENTIFIER_PREFIXES.has(token.replace(/-\d+$/, ""))) found.add(token);
   }
   return [...found];
 }
@@ -631,6 +594,13 @@ export interface NoRepositoryWorktreeProbeInput {
   /** `<instanceRoot>/projects/<companyId>/<projectId>`, derived from server env and immutable ids. */
   managedProjectRoot: string;
   issueIdentifier: string;
+  /** The project's default branch: its local branch carries no card's work. */
+  defaultBranch: string;
+  /**
+   * Branch names registered to ANOTHER issue's execution workspace in this
+   * company and project (a board-only field): those branches are that card's.
+   */
+  attributedBranches: ReadonlySet<string>;
   /**
    * Commits `sha` carries beyond the project's default branch, measured on the
    * remote (a source the agent cannot write). Throws when it cannot be
@@ -645,9 +615,8 @@ export type NoRepositoryWorktreeProbeResult =
       ok: true;
       branch: string;
       headSha: string;
-      /** The recorded worktree after symlink resolution, its git dir and the managed checkout's common dir. */
+      /** The recorded worktree after symlink resolution and the managed checkout's common dir. */
       worktreePath: string;
-      gitDir: string;
       commonDir: string;
       /** Every tip compared with the default branch on the remote, the recorded worktree's first. */
       comparedTips: string[];
@@ -659,7 +628,7 @@ function refuse(reason: string): NoRepositoryWorktreeProbeResult {
 }
 
 type CleanWorktreeVerdict =
-  | { ok: true; branch: string; headSha: string; gitDir: string }
+  | { ok: true; branch: string; headSha: string }
   | { ok: false; reason: string };
 
 /**
@@ -734,26 +703,30 @@ async function verifyCleanLinkedWorktree(
     const dirtyReason = await withSnapshotGitDir(
       { identity, headSha, config: snapshotConfig(identity.objectFormat), exclude },
       async (snapshot) => {
+        const trackedPaths = new Set<string>();
         for (const entry of await listIndexEntries(snapshot, worktreePath, worktreeOptions)) {
           if (entry.stage !== "0") return "has unmerged index entries";
           if (entry.tag === "S") return "has skip-worktree index entries";
           if (entry.tag !== "H") return "has assume-unchanged index entries";
           if (entry.mode === "160000") return "has submodules";
+          trackedPaths.add(entry.path);
         }
         if (await snapshotStatusIsDirty(snapshot, worktreePath, "all", worktreeOptions)) {
           return "has uncommitted changes (modified, staged or untracked)";
         }
-        const ignored = await firstDisallowedIgnoredEntry(snapshot, worktreePath, worktreeOptions);
-        return ignored === null
-          ? null
-          : `has an ignored entry outside the regenerated-artefact directories (${JSON.stringify(ignored.slice(0, 200))})`;
+        const ignored = await firstDisallowedIgnoredEntry(snapshot, worktreePath, trackedPaths, worktreeOptions);
+        if (ignored === null) return null;
+        const entry = JSON.stringify(ignored.entry.slice(0, 200));
+        return ignored.listed
+          ? `has a regenerated-artefact directory that no committed ignore rule ignores (${entry})`
+          : `has an ignored entry outside the regenerated-artefact directories (${entry})`;
       },
     );
     if (dirtyReason) return { ok: false, reason: dirtyReason };
   } catch {
     return { ok: false, reason: "status could not be verified" };
   }
-  return { ok: true, branch: branchRef.slice("refs/heads/".length), headSha, gitDir: identity.gitDir };
+  return { ok: true, branch: branchRef.slice("refs/heads/".length), headSha };
 }
 
 /** Why `sha` may not stand as "level with the default branch"; null when it does. */
@@ -775,8 +748,11 @@ async function aheadOfBaseRefusal(
 /**
  * SUP-22570: prove that the issue's own managed git worktree carries no
  * repository deliverable — clean, zero commits ahead of the project's default
- * branch — and that no other branch or worktree naming the issue in the managed
- * checkout carries one either.
+ * branch — that no other branch or worktree naming the issue in the managed
+ * checkout carries one either, and that every other local branch belongs to a
+ * card: the default branch, or a branch registered to another issue's
+ * execution workspace. Any other branch refuses, whatever its tip, so another
+ * card's name cannot carry this card's work.
  *
  * The recorded workspace path is only a candidate: it must resolve (symlinks
  * included) into `<managedProjectRoot>/<repo>/.paperclip/worktrees/…`, the
@@ -784,8 +760,8 @@ async function aheadOfBaseRefusal(
  * worktree of that managed checkout. "Ahead of the default branch" is measured
  * by the caller-supplied `countCommitsAheadOfBase` against the remote — never
  * against a ref in the managed checkout, whose refs every agent worktree can
- * write — and a tip it cannot measure refuses. The branch-name and worktree
- * scans below read refs an agent can write, so they are advisory; the remote
+ * write — and a tip it cannot measure refuses. The branch and worktree scans
+ * below read refs an agent can write, so they are advisory; the remote
  * comparison of the recorded worktree's tip is the authority. Every Git process
  * runs from the managed checkout as its working directory.
  */
@@ -852,7 +828,14 @@ export async function probeNoRepositoryWorktree(
       const space = line.indexOf(" ");
       const sha = line.slice(0, space);
       const name = line.slice(space + 1).slice("refs/heads/".length);
-      if (!SHA_RE.test(sha) || !branchNamesIssue(name, input.issueIdentifier) || checkedTips.has(sha)) continue;
+      if (!SHA_RE.test(sha)) continue;
+      if (!branchNamesIssue(name, input.issueIdentifier)) {
+        if (name === input.defaultBranch || input.attributedBranches.has(name)) continue;
+        return refuse(
+          `branch ${name} belongs to no card: it is not this card's, not the project's default branch, and not registered to another card's workspace`,
+        );
+      }
+      if (checkedTips.has(sha)) continue;
       if (checkedTips.size >= MAX_COMPARED_TIPS) {
         return refuse(
           `too_many_branch_tips: the recorded worktree and the branches naming this issue have more than ${MAX_COMPARED_TIPS} distinct tips to compare with the default branch`,
@@ -896,11 +879,37 @@ export async function probeNoRepositoryWorktree(
       branch: own.branch,
       headSha: own.headSha,
       worktreePath: candidate,
-      gitDir: own.gitDir,
       commonDir,
       comparedTips: [...checkedTips],
     };
   } catch {
     return refuse("the managed checkout's branches could not be verified");
   }
+}
+
+const IN_TRANSACTION_RECHECK_TIMEOUT_MS = 5_000;
+
+/**
+ * The status write's re-check, inside its transaction: the measured worktree
+ * must still be clean (index, status, ignored entries) on the measured branch
+ * and commit. One worktree, no GitHub call, and a short timeout bounds how
+ * long it can hold the issue row.
+ */
+export async function recheckRecordedWorktree(input: {
+  worktreePath: string;
+  commonDir: string;
+  branch: string;
+  headSha: string;
+  timeoutMs?: number;
+}): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (!resolveTrustedGitBinary()) return { ok: false, reason: "no root-owned git binary is installed at a fixed system path" };
+  const verdict = await verifyCleanLinkedWorktree(input.worktreePath, input.commonDir, {
+    cwd: path.dirname(input.commonDir),
+    timeoutMs: input.timeoutMs ?? IN_TRANSACTION_RECHECK_TIMEOUT_MS,
+  });
+  if (!verdict.ok) return { ok: false, reason: `the recorded worktree ${verdict.reason}` };
+  if (verdict.branch !== input.branch || verdict.headSha !== input.headSha) {
+    return { ok: false, reason: "the recorded worktree's HEAD moved after the close was measured" };
+  }
+  return { ok: true };
 }

@@ -1237,6 +1237,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
 
   it.each([
     ["another card's branch", () => "Delivered on OTHER-999-branch", () => "OTHER-999"],
+    ["another card in lower case", () => "delivered on other-999-work", () => "OTHER-999"],
     ["a card whose number extends this one's", (fixture: SeededIssue) => `Recorded alongside ${fixture.identifier}0`, (fixture: SeededIssue) => `${fixture.identifier}0`],
     ["a card whose prefix extends this one's", (fixture: SeededIssue) => `Recorded alongside X${fixture.identifier}`, (fixture: SeededIssue) => `X${fixture.identifier}`],
   ] as const)("refuses a declaration that names %s", async (_label, reason, other) => {
@@ -1250,16 +1251,147 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 
-  it("accepts a declaration that names this card itself", async () => {
+  it.each([
+    ["this card itself", (fixture: SeededIssue) => `The deliverable of ${fixture.identifier} is the recorded entry ruling`],
+    ["a standard name written like an identifier", () => "The ruling is recorded with ISO-8601 timestamps"],
+  ] as const)("accepts a declaration that names %s", async (_label, reason) => {
     const fixture = await seed();
     await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
 
-    const res = await close(fixture.identifier, {
-      ...NO_REPOSITORY_DONE_TIER,
-      reason: `The deliverable of ${fixture.identifier} is the recorded entry ruling`,
-    });
+    const res = await close(fixture.identifier, { ...NO_REPOSITORY_DONE_TIER, reason: reason(fixture) });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
+  });
+
+  /** Commits ignore rules on the issue branch and makes them the remote default branch. */
+  function commitIgnoreRules(fixture: SeededIssue, rules: string) {
+    writeFileSync(path.join(fixture.worktree, ".gitignore"), rules);
+    git(fixture.worktree, "add", ".gitignore");
+    git(fixture.worktree, "commit", "-qm", "ignore rules");
+    git(fixture.worktree, "push", "-q", "origin", "HEAD:main");
+  }
+
+  // The status write re-checks the measured worktree with a bounded Git
+  // status, so dirt written between the measurement and the write refuses.
+  it.each([
+    ["an untracked file", "late.md", "has uncommitted changes"],
+    ["an ignored file", "late.log", 'has an ignored entry outside the regenerated-artefact directories ("late.log")'],
+  ] as const)("re-checks the worktree inside the status write: refuses %s written after the measurement", async (_label, file, expected) => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    commitIgnoreRules(fixture, "*.log\n");
+    mockMeasureNoRepositoryLanding.mockImplementation(async (...args: Parameters<typeof measureNoRepositoryLandingForClose>) => {
+      const verdict = await realMeasureNoRepositoryLandingRef.current!(...args);
+      expect(verdict.ok, JSON.stringify(verdict)).toBe(true);
+      writeFileSync(path.join(fixture.worktree, file), "written after the measurement\n");
+      return verdict;
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain(`refused at the close write: the recorded worktree ${expected}`);
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  it("refuses work hidden in an allowlisted directory that only its own untracked .gitignore ignores", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    mkdirSync(path.join(fixture.worktree, ".paperclip"));
+    writeFileSync(path.join(fixture.worktree, ".paperclip", ".gitignore"), "*\n");
+    writeFileSync(path.join(fixture.worktree, ".paperclip", "deliverable.md"), "undelivered\n");
+    expect(git(fixture.worktree, "status", "--porcelain", "--untracked-files=all")).toBe("");
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain('has a regenerated-artefact directory that no committed ignore rule ignores (".paperclip/")');
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  /** A branch in the managed checkout: ahead (its own pushed commit) or at this card's tip. */
+  function branchInCheckout(fixture: SeededIssue, name: string, ahead: boolean) {
+    if (!ahead) {
+      git(fixture.repoRoot, "branch", name, fixture.branch);
+      return;
+    }
+    const worktree = path.join(fixture.repoRoot, ".paperclip", "worktrees", name);
+    git(fixture.repoRoot, "worktree", "add", "-q", "-b", name, worktree, "origin/main");
+    writeFileSync(path.join(worktree, "work.md"), "work\n");
+    git(worktree, "add", "work.md");
+    git(worktree, "commit", "-qm", "work");
+    git(worktree, "push", "-q", "origin", name);
+  }
+
+  /** Another card of the same project whose execution workspace registers `branchName`. */
+  async function registerSiblingCard(fixture: SeededIssue, branchName: string) {
+    const siblingIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: siblingIssueId,
+      companyId: fixture.companyId,
+      projectId: fixture.projectId,
+      identifier: `${fixture.identifier.replace(/-\d+$/, "")}-2`,
+      title: "A sibling card",
+      status: "in_progress",
+      priority: "medium",
+      createdByUserId: "cloud-user-1",
+    });
+    const worktree = path.join(fixture.repoRoot, ".paperclip", "worktrees", branchName);
+    await db.insert(executionWorkspaces).values({
+      companyId: fixture.companyId,
+      projectId: fixture.projectId,
+      projectWorkspaceId: fixture.projectWorkspaceId,
+      sourceIssueId: siblingIssueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: branchName,
+      status: "active",
+      cwd: worktree,
+      baseRef: "main",
+      branchName,
+      providerType: "git_worktree",
+      providerRef: worktree,
+    });
+  }
+
+  const BELONGS_TO_NO_CARD = "belongs to no card: it is not this card's, not the project's default branch, and not registered to another card's workspace";
+
+  it.each([
+    ["an ahead OTHER-999-work", () => "OTHER-999-work", true],
+    ["an ahead lower-case other-999-work", () => "other-999-work", true],
+    ["an ahead branch of another card of this company", (fixture: SeededIssue) => `${fixture.identifier}0-work`, true],
+    ["a foreign branch at this card's own tip", () => "OTHER-999-same", false],
+  ] as const)("refuses %s that no card's workspace registers", async (_label, name, ahead) => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    branchInCheckout(fixture, name(fixture), ahead);
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain(`branch ${name(fixture)} ${BELONGS_TO_NO_CARD}`);
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  it.each([
+    ["a sibling card's ahead branch registered to its workspace", async (fixture: SeededIssue) => {
+      const branch = `${fixture.identifier.replace(/-\d+$/, "")}-2-sibling`;
+      await registerSiblingCard(fixture, branch);
+      branchInCheckout(fixture, branch, true);
+    }],
+    ["another branch of this card at its tip", async (fixture: SeededIssue) => {
+      branchInCheckout(fixture, `${fixture.branch}-extra`, false);
+    }],
+  ] as const)("closes with %s and the default branch in the checkout", async (_label, arrange) => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    await arrange(fixture);
+    expect(git(fixture.repoRoot, "branch", "--list", "main")).not.toBe("");
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(fixture.issueId)).toBe("done");
   });
 
   it.each([["ruling"], ["notes"]])("refuses a ruling filed under the %s key instead of entry-ruling", async (key) => {

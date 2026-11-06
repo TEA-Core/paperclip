@@ -521,8 +521,6 @@ export const runnerApiReference: Record<string, { section: string; description?:
           "workspace": {
             "name": "paperclip-mobile",
             "cwd": "/Users/me/paperclip-mobile",
-            "repoUrl": "https://github.com/acme/paperclip-mobile",
-            "repoRef": "main",
             "isPrimary": true
           }
         }
@@ -551,8 +549,6 @@ export const runnerApiReference: Record<string, { section: string; description?:
       {
         "body": {
           "cwd": "/Users/me/paperclip-mobile",
-          "repoUrl": "https://github.com/acme/paperclip-mobile",
-          "repoRef": "main",
           "isPrimary": true
         }
       }

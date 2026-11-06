@@ -114,6 +114,8 @@ describe("a host with no root-owned git binary (SUP-22880 / SUP-22570)", () => {
       recordedWorktreePath: plainRepo("repo"),
       managedProjectRoot: root,
       issueIdentifier: "SUP-7",
+      defaultBranch: "main",
+      attributedBranches: new Set(),
       countCommitsAheadOfBase,
     });
     expect(result).toEqual({ ok: false, reason: "no root-owned git binary is installed at a fixed system path" });
