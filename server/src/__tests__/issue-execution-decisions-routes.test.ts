@@ -1120,7 +1120,14 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
           unsubscribe();
         }
         expect(response.status, JSON.stringify(response.body)).toBe(409);
-        expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+        // A recorded PR number that moved since the read is a delivery-binding change: PATCH and
+        // comment lock the row and refuse it with the snapshot guard (SUP-23260) before the final
+        // delivery preflight runs. The escalation door runs that preflight first.
+        expect(response.body.details).toMatchObject({
+          code: change === "recorded PR identity" && door !== "escalation"
+            ? "review_stall_policy_changed"
+            : "approval_final_delivery_preflight_stale",
+        });
         const stored = await fixture.read();
         expect(stored.status).toBe(change === "status" ? "blocked" : "in_review");
         expect(stored.executionState).toMatchObject({
