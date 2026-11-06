@@ -1466,8 +1466,11 @@ const TIER2_PROBE_SHAPE_RE = /^probe `([^`]+)` head ([0-9a-f]{7,40}) post-merge:
 // repository_delivery card is refused by name, not by generic shape mismatch.
 // A `fail` verdict is accepted by the shape only so it can be refused with the
 // specific failing-predicate message — a failing probe is never live proof.
-const TIER2_RECORD_ONLY_PROBE_SHAPE_RE =
-  /^record-only probe `([^`]+)` target (.+?) observed (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z) result: (pass|fail) (.+)$/i;
+const UTC_INSTANT_SHAPE = String.raw`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z`;
+const TIER2_RECORD_ONLY_PROBE_SHAPE_RE = new RegExp(
+  `^record-only probe \`([^\`]+)\` target (.+?) observed (${UTC_INSTANT_SHAPE})(?:-(${UTC_INSTANT_SHAPE}))? result: (pass|fail) (.+)$`,
+  "i",
+);
 
 function refuseTier2(reason: string): DoneTierDeclarationResult {
   return {
@@ -1549,7 +1552,7 @@ async function loadRecordedDeliveryMergeCommit(
 // day), so a bare NaN check accepted fabricated observation timestamps that
 // name no real calendar instant. The round-trip comparison is the fail-closed
 // backstop for any component range this table misses.
-const UTC_INSTANT_COMPONENTS_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/;
+const UTC_INSTANT_COMPONENTS_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?Z$/;
 
 function isRealUtcCalendarInstant(observedAt: string): boolean {
   const parts = UTC_INSTANT_COMPONENTS_RE.exec(observedAt);
@@ -1588,6 +1591,11 @@ function isRealUtcCalendarInstant(observedAt: string): boolean {
   );
 }
 
+function utcInstantSortKey(observedAt: string): string {
+  const [second = "", fraction = ""] = observedAt.slice(0, -1).split(".");
+  return `${second}.${fraction.padEnd(6, "0")}`;
+}
+
 // SUP-22801: record-only Tier 2 live proof. Pure and fail-closed — a
 // record_only card has no repository landing to resolve, so nothing here touches
 // GitHub or the database; every component of the accepted form is checked
@@ -1605,7 +1613,7 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
-  const [, probeCommand, observedTarget, observedAt, verdict, predicateResult] = shape;
+  const [, probeCommand, observedTarget, observedAt, observedRangeEnd, verdict, predicateResult] = shape;
   if (!probeCommand!.trim() || !observedTarget!.trim() || !predicateResult!.trim()) {
     return refuseTier2(
       "record-only close Tier 2 probe evidence has a blank probe command, observed target, or " +
@@ -1613,10 +1621,20 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
-  if (!isRealUtcCalendarInstant(observedAt!)) {
+  const invalidInstant = [observedAt!, observedRangeEnd].find(
+    (instant) => instant !== undefined && !isRealUtcCalendarInstant(instant),
+  );
+  if (invalidInstant) {
     return refuseTier2(
-      `record-only close Tier 2 probe evidence names observed instant ${observedAt}, which is not a ` +
+      `record-only close Tier 2 probe evidence names observed instant ${invalidInstant}, which is not a ` +
         "real UTC calendar instant; the observation time must be a valid Z-suffixed ISO-8601 timestamp. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
+  }
+  if (observedRangeEnd && utcInstantSortKey(observedRangeEnd) < utcInstantSortKey(observedAt!)) {
+    return refuseTier2(
+      `record-only close Tier 2 probe evidence names observation range ${observedAt}-${observedRangeEnd}, ` +
+        "whose end is before its start; the range end must not be before its start. " +
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
