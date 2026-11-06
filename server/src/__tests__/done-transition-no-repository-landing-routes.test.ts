@@ -140,6 +140,8 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
   // The bare repository the latest fixture was cloned from: what GitHub holds.
   // The agent's worktree and the managed checkout's refs cannot write it.
   let currentOrigin = "";
+  // What GitHub answers to a read of the repository itself.
+  let repositoryAnswer = { status: 200, defaultBranch: "main" };
 
   beforeAll(async () => {
     previousSchedulingSuppression = process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
@@ -178,6 +180,11 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
   // commits `sha` has beyond `<base>` in the origin repository, and 404s for a
   // commit origin has never received (a commit only the local checkout holds).
   function compareAgainstOrigin(url: string): Response {
+    if (/\/repos\/[^/]+\/[^/]+$/.test(url)) {
+      return new Response(JSON.stringify({ default_branch: repositoryAnswer.defaultBranch }), {
+        status: repositoryAnswer.status,
+      });
+    }
     const match = /\/compare\/([^/]+)\.\.\.([0-9a-f]{40})$/.exec(url);
     if (!match) return new Response(JSON.stringify({}), { status: 404 });
     try {
@@ -188,7 +195,15 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     }
   }
 
+  // Replaces GitHub's answer to the compare calls only; reading the repository
+  // itself keeps answering as it does by default.
+  function answerCompares(answer: (url: string) => Response | Promise<Response>) {
+    mockGhFetch.mockImplementation(async (url: string) =>
+      /\/compare\//.test(url) ? answer(url) : compareAgainstOrigin(url));
+  }
+
   beforeEach(() => {
+    repositoryAnswer = { status: 200, defaultBranch: "main" };
     mockGhFetch.mockReset();
     mockGhFetch.mockImplementation(async (url: string) => compareAgainstOrigin(url));
     mockGetByName.mockReset();
@@ -301,6 +316,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       workspace?: Partial<typeof executionWorkspaces.$inferInsert>;
       /** The issue-title slug after the identifier in the worktree's branch (the default template). */
       branchSlug?: string;
+      projectWorkspace?: Partial<typeof projectWorkspaces.$inferInsert>;
     } = {},
   ): Promise<SeededIssue> {
     seedSequence += 1;
@@ -343,6 +359,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       repoRef: "main",
       defaultRef: "main",
       isPrimary: true,
+      ...options.projectWorkspace,
     });
     await db.insert(executionWorkspaces).values({
       id: executionWorkspaceId,
@@ -417,6 +434,8 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
   async function statusOf(issueId: string) {
     return db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]?.status);
   }
+
+  const BELONGS_TO_NO_CARD = "belongs to no card: it is not this card's, not one of the project's branches, and not registered to another card's workspace";
 
   it("closes a record_only issue whose own worktree is empty and whose entry ruling another agent wrote", async () => {
     const fixture = await seed();
@@ -703,11 +722,11 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
   it.each([
     ["no GitHub credential is configured", () => mockGetByName.mockResolvedValue(null), "requires a configured GitHub credential"],
     ["GitHub answers the compare call with a server error", () =>
-      mockGhFetch.mockImplementation(async () => new Response("{}", { status: 500 })), "could not be compared with the project's default branch on the remote"],
+      answerCompares(() => new Response("{}", { status: 500 })), "could not be compared with the project's default branch on the remote"],
     ["the compare call answers without a commit count", () =>
-      mockGhFetch.mockImplementation(async () => new Response(JSON.stringify({}), { status: 200 })), "could not be compared with the project's default branch on the remote"],
+      answerCompares(() => new Response(JSON.stringify({}), { status: 200 })), "could not be compared with the project's default branch on the remote"],
     ["the GitHub request cannot connect", () =>
-      mockGhFetch.mockImplementation(async () => { throw new Error("ECONNREFUSED"); }), "could not be compared with the project's default branch on the remote"],
+      answerCompares(() => { throw new Error("ECONNREFUSED"); }), "could not be compared with the project's default branch on the remote"],
   ] as const)("fails closed when %s", async (_label, breakBase, expected) => {
     const fixture = await seed();
     await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
@@ -726,7 +745,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     mockEvaluateDoneTierDeclaration.mockImplementation(async (...args: Parameters<typeof evaluateDoneTierDeclaration>) => {
       const result = await realEvaluateDoneTierDeclarationRef.current!(...args);
       expect(result.allowed, result.reason).toBe(true);
-      mockGhFetch.mockImplementation(async () => { throw new Error("ECONNREFUSED"); });
+      answerCompares(() => { throw new Error("ECONNREFUSED"); });
       return result;
     });
 
@@ -1097,24 +1116,42 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 
-  // The re-check under the row lock shares one 15 s budget; running out of it
-  // says nothing about the worktree, so its remedy is to retry, not to clean.
+  // A refusal at the status write's stage leaves one remedy comment. Running
+  // out of the re-check's budget says nothing about the worktree, so its remedy
+  // is to retry; every other refusal gets the neutral remedy, which names no
+  // worktree cleaning.
+  const NEUTRAL_REMEDY = "Fix what the refusal names, or retry if it says the worktree or the remote could not be verified";
+  const TIMEOUT_REMEDY = "Retry the close, or use the board close path";
   it.each([
-    ["the re-check runs out of its budget", "timed out at the close write", "Retry the close", "Bring the issue's own worktree"],
-    ["the worktree is dirtied after the measurement", "has uncommitted changes", "Bring the issue's own worktree", "Retry the close"],
-  ] as const)("posts the matching remedy comment when %s", async (label, reasonText, remedyText, otherRemedyText) => {
-    const fixture = await seed();
-    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
-    if (reasonText === "timed out at the close write") {
+    ["the re-check runs out of its budget", "timed out at the close write", TIMEOUT_REMEDY, (_fixture: SeededIssue) => {
       mockRecheckRecordedWorktree.mockImplementation((input: Parameters<typeof recheckRecordedWorktree>[0]) =>
         realRecheckRecordedWorktreeRef.current!({ ...input, budgetMs: 1 }));
-    } else {
+    }],
+    ["the worktree is dirtied after the measurement", "has uncommitted changes", NEUTRAL_REMEDY, (fixture: SeededIssue) => {
       mockMeasureNoRepositoryLanding.mockImplementation(async (...args: Parameters<typeof measureNoRepositoryLandingForClose>) => {
         const verdict = await realMeasureNoRepositoryLandingRef.current!(...args);
         writeFileSync(path.join(fixture.worktree, "late.md"), "written after the measurement\n");
         return verdict;
       });
-    }
+    }],
+    ["an unattributed branch appears after the declaration", `branch other-999-work ${BELONGS_TO_NO_CARD}`, NEUTRAL_REMEDY, (fixture: SeededIssue) => {
+      mockEvaluateDoneTierDeclaration.mockImplementation(async (...args: Parameters<typeof evaluateDoneTierDeclaration>) => {
+        const result = await realEvaluateDoneTierDeclarationRef.current!(...args);
+        git(fixture.repoRoot, "branch", "other-999-work", "origin/main");
+        return result;
+      });
+    }],
+    ["the repository's default branch cannot be read after the declaration", "the repository's default branch could not be read from GitHub", NEUTRAL_REMEDY, (_fixture: SeededIssue) => {
+      mockEvaluateDoneTierDeclaration.mockImplementation(async (...args: Parameters<typeof evaluateDoneTierDeclaration>) => {
+        const result = await realEvaluateDoneTierDeclarationRef.current!(...args);
+        repositoryAnswer = { status: 500, defaultBranch: "main" };
+        return result;
+      });
+    }],
+  ] as const)("posts the matching remedy comment when %s", async (label, reasonText, remedyText, arrange) => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    arrange(fixture);
 
     const res = await close(fixture.identifier);
 
@@ -1128,7 +1165,14 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       .then((rows) => rows.map((row) => row.body).filter((body) => body.includes("Remedy: ")));
     expect(refusals).toHaveLength(1);
     expect(refusals[0]).toContain(remedyText);
-    expect(refusals[0]).not.toContain(otherRemedyText);
+    expect(refusals[0]).not.toContain("Bring the issue's own worktree");
+    if (remedyText === NEUTRAL_REMEDY) {
+      expect(refusals[0]).toContain("the board close path stays available");
+      expect(refusals[0]).not.toContain(TIMEOUT_REMEDY);
+      expect(refusals[0]).not.toMatch(/clean/i);
+    } else {
+      expect(refusals[0]).not.toContain(NEUTRAL_REMEDY);
+    }
   });
 
   async function issueRowIsUnlocked(issueId: string): Promise<boolean> {
@@ -1166,7 +1210,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     }
     // Every fixture's tip is its origin's main: level with the base.
     const levelTips = new Set(fixtures.map((fixture) => git(fixture.worktree, "rev-parse", "HEAD")));
-    mockGhFetch.mockImplementation(async (url: string) => {
+    answerCompares((url) => {
       const sha = /\.\.\.([0-9a-f]{40})$/.exec(url)?.[1];
       return sha && levelTips.has(sha)
         ? new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 })
@@ -1430,8 +1474,6 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     });
   }
 
-  const BELONGS_TO_NO_CARD = "belongs to no card: it is not this card's, not the project's default branch, and not registered to another card's workspace";
-
   it.each([
     ["an ahead OTHER-999-work", () => "OTHER-999-work", true],
     ["an ahead lower-case other-999-work", () => "other-999-work", true],
@@ -1468,6 +1510,80 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(await statusOf(fixture.issueId)).toBe("done");
+  });
+
+  // The managed checkout's own branches are the project's: the clone's local
+  // branch is the remote's HEAD branch, and the heartbeat checks out repoRef.
+  it.each([
+    [
+      "repoRef main with defaultRef release: the local main is the project's reference branch",
+      { repoRef: "main", defaultRef: "release" },
+      "release",
+      // GitHub names a different default branch, so only repoRef exempts main.
+      "trunk",
+    ],
+    [
+      "a fold-style defaultRef and repoRef: the local main is the repository's default branch on GitHub",
+      { repoRef: "fold/patches", defaultRef: "fold/patches" },
+      "fold/patches",
+      "main",
+    ],
+  ] as const)("closes with %s", async (_label, refs, baseBranch, githubDefaultBranch) => {
+    const fixture = await seed({ projectWorkspace: refs });
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    git(fixture.repoRoot, "push", "-q", currentOrigin, `refs/remotes/origin/main:refs/heads/${baseBranch}`);
+    repositoryAnswer = { status: 200, defaultBranch: githubDefaultBranch };
+    expect(git(fixture.repoRoot, "branch", "--list", "main")).not.toBe("");
+    expect(git(fixture.repoRoot, "branch", "--list", baseBranch)).toBe("");
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(fixture.issueId)).toBe("done");
+  });
+
+  it("still refuses an unattributed branch when the project's reference branches are exempt", async () => {
+    const fixture = await seed({ projectWorkspace: { repoRef: "main", defaultRef: "release" } });
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    git(fixture.repoRoot, "push", "-q", currentOrigin, "refs/remotes/origin/main:refs/heads/release");
+    branchInCheckout(fixture, "other-999-work", true);
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain(`branch other-999-work ${BELONGS_TO_NO_CARD}`);
+  });
+
+  it.each([
+    ["answers with an error", { status: 500, defaultBranch: "main" }],
+    ["names no default branch", { status: 200, defaultBranch: "" }],
+  ] as const)("refuses, naming the repository read, when GitHub %s for the repository itself", async (_label, answer) => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    repositoryAnswer = answer;
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("the repository's default branch could not be read from GitHub");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  it("refuses at the compare-and-set when the project's reference branch changes after the measurement", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    mockMeasureNoRepositoryLanding.mockImplementation(async (...args: Parameters<typeof measureNoRepositoryLandingForClose>) => {
+      const verdict = await realMeasureNoRepositoryLandingRef.current!(...args);
+      expect(verdict.ok, JSON.stringify(verdict)).toBe(true);
+      await db.update(projectWorkspaces).set({ repoRef: "release" }).where(eq(projectWorkspaces.id, fixture.projectWorkspaceId));
+      return verdict;
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("the project's repository or default branch changed after the close was measured");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 
   it.each([["ruling"], ["notes"]])("refuses a ruling filed under the %s key instead of entry-ruling", async (key) => {

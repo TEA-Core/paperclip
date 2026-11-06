@@ -677,8 +677,12 @@ export interface NoRepositoryWorktreeProbeInput {
   /** `<instanceRoot>/projects/<companyId>/<projectId>`, derived from server env and immutable ids. */
   managedProjectRoot: string;
   issueIdentifier: string;
-  /** The project's default branch: its local branch carries no card's work. */
-  defaultBranch: string;
+  /**
+   * The project's own branches (its default and reference branches and the
+   * repository's default branch on the remote): their local branches carry no
+   * card's work.
+   */
+  projectBranches: ReadonlySet<string>;
   /**
    * Branch names registered to ANOTHER issue's execution workspace in this
    * company and project (a board-only field): those branches are that card's.
@@ -833,9 +837,9 @@ async function aheadOfBaseRefusal(
  * repository deliverable — clean, zero commits ahead of the project's default
  * branch — that no other branch or worktree naming the issue in the managed
  * checkout carries one either, and that every other local branch belongs to a
- * card: the default branch, or a branch registered to another issue's
- * execution workspace. Any other branch refuses, whatever its tip, so another
- * card's name cannot carry this card's work.
+ * card: one of the project's branches, or a branch registered to another
+ * issue's execution workspace. Any other branch refuses, whatever its tip, so
+ * another card's name cannot carry this card's work.
  *
  * The recorded workspace path is only a candidate: it must resolve (symlinks
  * included) into `<managedProjectRoot>/<repo>/.paperclip/worktrees/…`, the
@@ -913,9 +917,9 @@ export async function probeNoRepositoryWorktree(
       const name = line.slice(space + 1).slice("refs/heads/".length);
       if (!SHA_RE.test(sha)) continue;
       if (!branchNamesIssue(name, input.issueIdentifier)) {
-        if (name === input.defaultBranch || input.attributedBranches.has(name)) continue;
+        if (input.projectBranches.has(name) || input.attributedBranches.has(name)) continue;
         return refuse(
-          `branch ${name} belongs to no card: it is not this card's, not the project's default branch, and not registered to another card's workspace`,
+          `branch ${name} belongs to no card: it is not this card's, not one of the project's branches, and not registered to another card's workspace`,
         );
       }
       if (checkedTips.has(sha)) continue;

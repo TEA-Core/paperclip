@@ -20899,8 +20899,8 @@ export function issueRoutes(
           remedy: err.message.includes("timed out at the close write")
             ? "The worktree re-check at the close write ran out of its time budget before it finished; that is " +
               "not a dirty-worktree finding. Retry the close, or use the board close path."
-            : "Bring the issue's own worktree back to a clean, zero-ahead state (or deliver its content through a " +
-              "repository close form), keep the issue record_only, and close again.",
+            : "Fix what the refusal names, or retry if it says the worktree or the remote could not be verified; " +
+              "keep the issue record_only and close again; the board close path stays available.",
           runId: actor.runId ?? null,
         });
       }

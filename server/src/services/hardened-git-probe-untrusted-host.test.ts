@@ -114,7 +114,7 @@ describe("a host with no root-owned git binary (SUP-22880 / SUP-22570)", () => {
       recordedWorktreePath: plainRepo("repo"),
       managedProjectRoot: root,
       issueIdentifier: "SUP-7",
-      defaultBranch: "main",
+      projectBranches: new Set(["main"]),
       attributedBranches: new Set(),
       countCommitsAheadOfBase,
     });

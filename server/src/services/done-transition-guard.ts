@@ -1813,6 +1813,8 @@ export interface NoRepositoryLandingMeasurement {
   recordedWorktreePath: string;
   repository: string;
   baseBranch: string;
+  /** The project workspace's reference branch, reduced to a branch name; board-only like the base. */
+  repoRef: string | null;
   ruling: { documentId: string; revisionNumber: number; revisionCount: number; updatedAt: string };
   probe: {
     branch: string;
@@ -1975,6 +1977,7 @@ async function readNoRepositoryLandingRecord(
     )
     .then((rows) => rows[0] ?? null);
   const baseBranch = normalizeBaseBranch(projectWorkspace?.defaultRef ?? projectWorkspace?.repoRef ?? null);
+  const repoRef = normalizeBaseBranch(projectWorkspace?.repoRef ?? null);
   if (!baseBranch) {
     return noRepositoryRefusal("requires the project workspace to name its default branch.");
   }
@@ -2082,8 +2085,8 @@ async function readNoRepositoryLandingRecord(
   }
   // Branches registered to ANOTHER issue's execution workspace in this company
   // and project belong to that card (branchName is board-only for agents);
-  // the probe refuses every other branch that is neither this card's nor the
-  // default branch.
+  // the probe refuses every other branch that is neither this card's nor one
+  // of the project's own branches.
   const attributedBranches = await db
     .selectDistinct({ branchName: executionWorkspaces.branchName })
     .from(executionWorkspaces)
@@ -2110,6 +2113,7 @@ async function readNoRepositoryLandingRecord(
       repositoryLocation,
       attributedBranches,
       baseBranch,
+      repoRef,
       ruling: {
         documentId: ruling.documentId,
         revisionNumber: ruling.latestRevisionNumber,
@@ -2118,6 +2122,39 @@ async function readNoRepositoryLandingRecord(
       },
     },
   };
+}
+
+/**
+ * The repository's own default branch, read from GitHub (never from the
+ * managed checkout's origin/HEAD, which an agent worktree can write). Null when
+ * it cannot be read: a failed request, a non-OK answer or no default_branch.
+ */
+async function readGitHubDefaultBranch(
+  hostname: string,
+  owner: string,
+  repo: string,
+  token: string,
+): Promise<string | null> {
+  try {
+    const response = await ghFetch(
+      `${gitHubApiBase(hostname)}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
+      {
+        headers: {
+          accept: "application/vnd.github+json",
+          "user-agent": "paperclip-done-transition-guard",
+          "x-github-api-version": "2022-11-28",
+          authorization: `Bearer ${token}`,
+        },
+        signal: AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
+      },
+    );
+    if (!response.ok) return null;
+    const repository = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+    const branch = repository?.default_branch;
+    return typeof branch === "string" && branch.length > 0 ? branch : null;
+  } catch {
+    return null;
+  }
 }
 
 /** The full proof: the database record, then the hardened probe against the remote base. */
@@ -2134,13 +2171,19 @@ async function verifyNoRepositoryLanding(
     return noRepositoryRefusal("requires a configured GitHub credential to measure the default branch against.");
   }
   const { hostname, owner, repo } = record.repositoryLocation;
+  const githubDefaultBranch = await readGitHubDefaultBranch(hostname, owner, repo, token);
+  if (!githubDefaultBranch) {
+    return noRepositoryRefusal("refused: the repository's default branch could not be read from GitHub.");
+  }
+  const projectBranches = new Set([record.baseBranch, githubDefaultBranch]);
+  if (record.repoRef) projectBranches.add(record.repoRef);
   const probe = await probeNoRepositoryWorktree({
     recordedWorktreePath: record.recordedWorktreePath,
     managedProjectRoot: path.dirname(
       resolveManagedProjectWorkspaceDir({ companyId: issue.companyId, projectId: record.projectId }),
     ),
     issueIdentifier: record.identifier,
-    defaultBranch: record.baseBranch,
+    projectBranches,
     attributedBranches: new Set(record.attributedBranches),
     countCommitsAheadOfBase: async (sha) => {
       const ahead = await githubCompareAheadBy(
@@ -2168,6 +2211,7 @@ async function verifyNoRepositoryLanding(
       recordedWorktreePath: record.recordedWorktreePath,
       repository: record.repository,
       baseBranch: record.baseBranch,
+      repoRef: record.repoRef,
       ruling: record.ruling,
       probe: {
         branch: probe.branch,
@@ -2245,7 +2289,11 @@ function changedSinceMeasurement(
     return "the execution workspace's project workspace";
   }
   if (record.recordedWorktreePath !== measurement.recordedWorktreePath) return "the recorded worktree path";
-  if (record.repository !== measurement.repository || record.baseBranch !== measurement.baseBranch) {
+  if (
+    record.repository !== measurement.repository ||
+    record.baseBranch !== measurement.baseBranch ||
+    record.repoRef !== measurement.repoRef
+  ) {
     return "the project's repository or default branch";
   }
   if (

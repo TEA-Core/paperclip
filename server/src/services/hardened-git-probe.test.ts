@@ -88,7 +88,7 @@ interface ManagedLayout {
     recordedWorktreePath: string;
     managedProjectRoot: string;
     issueIdentifier: string;
-    defaultBranch: string;
+    projectBranches: ReadonlySet<string>;
     attributedBranches: ReadonlySet<string>;
     countCommitsAheadOfBase: (sha: string) => Promise<number>;
   };
@@ -133,7 +133,7 @@ function managedLayout(): ManagedLayout {
       recordedWorktreePath: worktree,
       managedProjectRoot,
       issueIdentifier: "SUP-7",
-      defaultBranch: "main",
+      projectBranches: new Set(["main"]),
       attributedBranches: new Set<string>(),
       countCommitsAheadOfBase: countOnOrigin(origin),
     },
@@ -868,7 +868,18 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
       branchAt(layout, name, ahead);
       expect(await probeNoRepositoryWorktree(layout.input)).toEqual({
         ok: false,
-        reason: `branch ${name} belongs to no card: it is not this card's, not the project's default branch, and not registered to another card's workspace`,
+        reason: `branch ${name} belongs to no card: it is not this card's, not one of the project's branches, and not registered to another card's workspace`,
+      });
+    });
+
+    it("skips a local branch the project names and refuses it once the project does not", async () => {
+      const layout = managedLayout();
+      branchAt(layout, "release", false);
+      expect(await probeNoRepositoryWorktree({ ...layout.input, projectBranches: new Set(["main", "release"]) }))
+        .toMatchObject({ ok: true });
+      expect(await probeNoRepositoryWorktree(layout.input)).toEqual({
+        ok: false,
+        reason: "branch release belongs to no card: it is not this card's, not one of the project's branches, and not registered to another card's workspace",
       });
     });
 
