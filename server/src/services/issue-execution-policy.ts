@@ -166,7 +166,9 @@ type TransitionResult = {
  * `stallEscalation`: a loop that still makes progress may run to 10, a stalled
  * one is caught earlier by the arbiter. A policy without `stallEscalation`
  * keeps `BASE_MAX_REVIEW_ROUNDS`, so the raise never yields a bare 10.
- * Rollback: set this back to 3 with `stallEscalation` ignored.
+ * Do not roll back by editing this constant: the rollback procedure (clear
+ * stored `stallEscalation` first) is in docs/guides/execution-policy.md,
+ * "Round Ceiling and Stall Escalation".
  */
 export const DEFAULT_MAX_REVIEW_ROUNDS = 10;
 
