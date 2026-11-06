@@ -1021,6 +1021,38 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 
+  // The recorded worktree's status is the last step of the measurement, so
+  // content written while the GitHub compare runs is still caught.
+  it("refuses when the worktree is dirtied during the pre-write measurement's GitHub compare", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    let measuring = false;
+    let dirtied = false;
+    mockMeasureNoRepositoryLanding.mockImplementation(async (...args: Parameters<typeof measureNoRepositoryLandingForClose>) => {
+      measuring = true;
+      try {
+        return await realMeasureNoRepositoryLandingRef.current!(...args);
+      } finally {
+        measuring = false;
+      }
+    });
+    mockGhFetch.mockImplementation(async (url: string) => {
+      const response = compareAgainstOrigin(url);
+      if (measuring && !dirtied) {
+        dirtied = true;
+        writeFileSync(path.join(fixture.worktree, "late.md"), "written during the measurement\n");
+      }
+      return response;
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(dirtied).toBe(true);
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("has uncommitted changes");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
   async function issueRowIsUnlocked(issueId: string): Promise<boolean> {
     return db
       .transaction(async (tx) => {

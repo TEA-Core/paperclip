@@ -830,6 +830,14 @@ export async function probeNoRepositoryWorktree(
       const other = await verifyCleanLinkedWorktree(worktreePath, commonDir, options);
       if (!other.ok) return refuse(`another worktree on branch ${branch} ${other.reason}`);
     }
+
+    const final = await verifyCleanLinkedWorktree(candidate, commonDir, options);
+    if (!final.ok) return refuse(`the recorded worktree ${final.reason}`);
+    if (final.branch !== own.branch || final.headSha !== own.headSha) {
+      return refuse(
+        `the recorded worktree moved from ${own.branch} at ${own.headSha.slice(0, 12)} to ${final.branch} at ${final.headSha.slice(0, 12)} while it was being verified`,
+      );
+    }
     return {
       ok: true,
       branch: own.branch,
