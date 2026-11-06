@@ -1188,7 +1188,9 @@ export function isSeatedStallArbiter(state: IssueExecutionState | null, actorAge
 /**
  * The decision comment without fenced code blocks (``` or ~~~): a marker line
  * quoted inside a code fence is an example, not the reviewer's verdict. An
- * unclosed fence runs to the end of the comment, as in Markdown.
+ * unclosed fence runs to the end of the comment, as in Markdown. A fence
+ * closes only when the trimmed line equals the opener, so a pseudo-closer
+ * cannot end it. trim also keeps a CRLF closing line working.
  */
 function commentOutsideCodeFences(body: string): string {
   let fence: string | null = null;
@@ -1196,7 +1198,7 @@ function commentOutsideCodeFences(body: string): string {
   for (const line of body.split("\n")) {
     const marker = /^[ \t]*(`{3,}|~{3,})/.exec(line)?.[1] ?? null;
     if (fence !== null) {
-      if (marker !== null && marker[0] === fence[0] && marker.length >= fence.length) fence = null;
+      if (line.trim() === fence) fence = null;
       continue;
     }
     if (marker !== null) {
