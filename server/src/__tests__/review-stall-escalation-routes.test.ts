@@ -798,6 +798,228 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     expect(row.assigneeAgentId).toBe(seeded.reviewerId);
   }, 60_000);
 
+  function plainPolicy(seeded: Seeded, stageId: string, maxReviewRounds?: number) {
+    return {
+      mode: "normal",
+      commentRequired: true,
+      stages: [
+        {
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: seeded.reviewerId }],
+        },
+      ],
+      ...(maxReviewRounds !== undefined ? { maxReviewRounds } : {}),
+    };
+  }
+
+  async function seedPlainPendingReview(
+    seeded: Seeded,
+    shape: {
+      maxReviewRounds?: number;
+      changesRequestedCount?: number;
+      delivery?: Record<string, unknown>;
+    } = {},
+  ) {
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: seeded.companyId,
+      title: "Plain review",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: seeded.reviewerId,
+      responsibleUserId: seeded.userId,
+      createdByUserId: seeded.userId,
+      deliveryRequirement: "record_only",
+      executionPolicy: plainPolicy(seeded, stageId, shape.maxReviewRounds),
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: seeded.reviewerId },
+        returnAssignee: { type: "agent", agentId: seeded.coderId },
+        deliveryAuthor: { type: "agent", agentId: seeded.coderId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        changesRequestedCount: shape.changesRequestedCount ?? 1,
+        ...(shape.delivery ? { delivery: shape.delivery } : {}),
+      },
+    });
+    return { issueId, stageId };
+  }
+
+  const plainFinding = { status: "in_progress", comment: "finding" };
+
+  it("records an ordinary bounce on a plain card when the snapshot is still current", async () => {
+    const seeded = await seedCompany();
+    const { issueId } = await seedPlainPendingReview(seeded, { maxReviewRounds: 50 });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(plainFinding);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_progress");
+    expect(row.assigneeAgentId).toBe(seeded.coderId);
+    expect(row.executionPolicy).not.toHaveProperty("stallEscalation");
+    expect(await decisionRows(issueId)).toHaveLength(1);
+  }, 60_000);
+
+  it("refuses a plain-card bounce that would erase a same-head PR binding refreshed after the read (SUP-23260)", async () => {
+    const seeded = await seedCompany();
+    const headSha = "a".repeat(40);
+    const { issueId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 50,
+      delivery: {
+        repo: { owner: "TEA-Core", repo: "paperclip" },
+        branch: "fm/plain-card",
+        headSha,
+      },
+    });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    const refreshed = {
+      repo: { owner: "TEA-Core", repo: "paperclip" },
+      branch: "fm/plain-card",
+      headSha,
+      prNumber: 1117,
+      prUrl: "https://github.com/TEA-Core/paperclip/pull/1117",
+    };
+    // Same head, new PR binding. A compare that only looks at deliveredHeadSha
+    // (absent on both sides) lets this return 200 and wipes the fields.
+    lockInterleave.beforeLock = async () => {
+      const current = await issueRow(issueId);
+      await db
+        .update(issues)
+        .set({ executionState: { ...(current.executionState as Record<string, unknown>), delivery: refreshed } })
+        .where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(plainFinding);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    expect(row.assigneeAgentId).toBe(seeded.reviewerId);
+    expect(row.executionState).toMatchObject({ delivery: refreshed });
+  }, 60_000);
+
+  it("refuses a plain-card bounce when only delivery.headSha moved after the read (SUP-23260)", async () => {
+    const seeded = await seedCompany();
+    const headSha = "a".repeat(40);
+    const { issueId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 50,
+      delivery: {
+        repo: { owner: "TEA-Core", repo: "paperclip" },
+        branch: "fm/plain-card",
+        headSha,
+        prNumber: 1117,
+        prUrl: "https://github.com/TEA-Core/paperclip/pull/1117",
+      },
+    });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    const movedHead = "b".repeat(40);
+    lockInterleave.beforeLock = async () => {
+      const current = await issueRow(issueId);
+      const state = current.executionState;
+      const previousDelivery =
+        state && typeof state === "object" && "delivery" in state && state.delivery && typeof state.delivery === "object"
+          ? state.delivery
+          : {};
+      const delivery = { ...previousDelivery, headSha: movedHead };
+      await db
+        .update(issues)
+        .set({ executionState: { ...(state && typeof state === "object" ? state : {}), delivery } })
+        .where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(plainFinding);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    const stored = row.executionState;
+    const storedHead =
+      stored && typeof stored === "object" && "delivery" in stored && stored.delivery && typeof stored.delivery === "object" && "headSha" in stored.delivery
+        ? stored.delivery.headSha
+        : null;
+    expect(storedHead).toBe(movedHead);
+  }, 60_000);
+
+  it("refuses a plain-card bounce computed before the board lowered the round ceiling (SUP-23260)", async () => {
+    const seeded = await seedCompany();
+    // No stallEscalation and no hand-off record. Ceiling 4, next round 3: the
+    // unlocked read is a bounce to the coder. Dropping the plain-card arm lets
+    // this return 200 and assign the coder.
+    const { issueId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 4,
+      changesRequestedCount: 2,
+    });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    lockInterleave.beforeLock = async () => {
+      const current = await issueRow(issueId);
+      await db
+        .update(issues)
+        .set({ executionPolicy: { ...(current.executionPolicy as Record<string, unknown>), maxReviewRounds: 2 } })
+        .where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(plainFinding);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    expect(row.assigneeAgentId).toBe(seeded.reviewerId);
+    expect(row.executionPolicy).toMatchObject({ maxReviewRounds: 2 });
+    expect(row.executionPolicy).not.toHaveProperty("stallEscalation");
+    expect(row.executionState ?? {}).not.toHaveProperty("stallHandoff");
+  }, 60_000);
+
+  it.each([12, 20, 50])(
+    "returns all %i concurrent plain-card decisions without a pool wait (SUP-23260)",
+    async (count) => {
+      const seeded = await seedCompany();
+      const { issueId } = await seedPlainPendingReview(seeded, {
+        maxReviewRounds: 50,
+        changesRequestedCount: 0,
+      });
+      const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+      const reviewer = app(agentActor(seeded, seeded.reviewerId, runId));
+
+      const responses = await Promise.all(
+        Array.from({ length: count }, (_, index) =>
+          request(reviewer).patch(`/api/issues/${issueId}`).send({ status: "in_progress", comment: `finding ${index}` }),
+        ),
+      );
+
+      expect(responses, JSON.stringify(responses.map((res) => ({ status: res.status, body: res.body })))).toHaveLength(count);
+      expect(responses.every((res) => res.status === 200)).toBe(true);
+      expect(await decisionRows(issueId)).toHaveLength(count);
+    },
+    60_000,
+  );
+
   async function resolveRecovery(seeded: Seeded, issueId: string, note: string) {
     const [action] = await db.insert(issueRecoveryActions).values({
       companyId: seeded.companyId,

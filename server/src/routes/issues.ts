@@ -433,6 +433,7 @@ import {
   isSeatedStallArbiter,
   setIssueExecutionPolicyMonitorScheduledBy,
   stallHoldControlsDiffer,
+  deliveryBindingDiffers,
   type MissingApprovalStageGap,
   type ReviewEscalationSignal,
 } from "../services/issue-execution-policy.js";
@@ -20446,14 +20447,17 @@ export function issueRoutes(
       finalIssueStatus: () => issue?.status,
     });
     const decision = transition.decision && decisionId ? transition.decision : null;
-    // R20: the state this request's transition was computed from, and whether
-    // its decision must be re-checked under the row lock (see the guard inside
-    // the transaction). Cards without stallEscalation are unaffected.
+    // Snapshot this request's transition was computed from. Stall cards
+    // re-check the hand-off record under the row lock. Every execution
+    // decision also re-checks the ceiling and the delivery binding, so a
+    // board edit or a same-head PR refresh that landed after the read is not
+    // overwritten (SUP-23260).
     const stallGuardReadState = parseIssueExecutionState(existing.executionState);
     const stallLockGuardRequired =
       Boolean(transition.stallEscalation) ||
       (decision !== null &&
         Boolean(previousExecutionPolicy?.stallEscalation || nextExecutionPolicy?.stallEscalation || stallGuardReadState?.stallHandoff));
+    const executionDecisionLostUpdateGuardRequired = decision !== null;
     let attachmentComment: Awaited<ReturnType<typeof svc.addComment>> | null =
       null;
     let comment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
@@ -20635,24 +20639,24 @@ export function issueRoutes(
             reviewPolicySensitiveMutationRequested
             && !(await assertLockedReviewPolicyAllowsMutation(tx))
           ) return null;
-          // R20: the once-per-stage-run hand-off must be atomic, and every
-          // decision on a stall-escalation card must use the state and policy
-          // that hold at commit. Each such decision (with or without a stall
-          // signal) was computed from the unlocked read, so lock the row and
-          // re-check: a concurrent decision that committed first moved
-          // lastDecisionId, or a hand-off record appeared or changed since the
-          // read — a plain bounce would otherwise erase it and let the
-          // stage-run hand off again. A concurrent delivery refresh that moved
-          // the delivered head, or a policy write that changed the ceiling, the
-          // stall policy or the stages, would otherwise be overwritten by a
-          // decision computed against the old values. A refused request
-          // persists nothing (no decision, no hand-off row).
-          if (stallLockGuardRequired) {
+          // The hand-off must be atomic on a stall card, and every execution
+          // decision must use the ceiling and delivery binding that hold at
+          // commit. Each was computed from the unlocked read, so lock the row
+          // on this transaction and re-check. A concurrent decision or a
+          // hand-off record that appeared since the read is a hand-off
+          // conflict (stall cards only). A moved delivered head, a changed
+          // ceiling or other stall-hold control, or a changed delivery
+          // binding (prNumber, prUrl, headSha) refuses the decision. A
+          // refused request persists nothing. The lock read uses `tx`; do not
+          // call a service on the outer pool from inside this transaction.
+          if (stallLockGuardRequired || executionDecisionLostUpdateGuardRequired) {
             const locked = await svc.getByIdForUpdate(id, tx);
             const lockedState = parseIssueExecutionState(locked?.executionState ?? null);
             if (
-              (lockedState?.lastDecisionId ?? null) !== (stallGuardReadState?.lastDecisionId ?? null) ||
-              JSON.stringify(lockedState?.stallHandoff ?? null) !== JSON.stringify(stallGuardReadState?.stallHandoff ?? null)
+              stallLockGuardRequired && (
+                (lockedState?.lastDecisionId ?? null) !== (stallGuardReadState?.lastDecisionId ?? null) ||
+                JSON.stringify(lockedState?.stallHandoff ?? null) !== JSON.stringify(stallGuardReadState?.stallHandoff ?? null)
+              )
             ) {
               throw conflict(
                 "A concurrent decision on this review stage was recorded first; this decision was not recorded and the stage was not handed off again. Re-read the issue before deciding.",
@@ -20665,10 +20669,11 @@ export function issueRoutes(
             }
             if (
               (lockedState?.deliveredHeadSha ?? null) !== (stallGuardReadState?.deliveredHeadSha ?? null) ||
-              stallHoldControlsDiffer(previousExecutionPolicy, normalizeIssueExecutionPolicy(locked?.executionPolicy ?? null))
+              stallHoldControlsDiffer(previousExecutionPolicy, normalizeIssueExecutionPolicy(locked?.executionPolicy ?? null)) ||
+              deliveryBindingDiffers(stallGuardReadState, lockedState)
             ) {
               throw conflict(
-                "The delivered head or the execution policy (round ceiling, stall arbiter or stages) changed while this decision was in flight; this decision was not recorded and the stage was not handed off. Re-read the issue before deciding.",
+                "The delivered head, the delivery binding (pull request number, URL or head) or the execution policy (round ceiling, stall arbiter or stages) changed while this decision was in flight; this decision was not recorded and the stage was not handed off. Re-read the issue before deciding.",
                 {
                   code: "review_stall_policy_changed",
                   issueId: existing.id,
