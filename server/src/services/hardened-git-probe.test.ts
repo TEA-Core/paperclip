@@ -765,6 +765,38 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
     });
   });
 
+  describe("the recorded worktree moving while the probe compares its tip", () => {
+    it.each([
+      ["an empty commit lands on its branch", (layout: ManagedLayout) =>
+        git(layout.worktree, "commit", "-q", "--allow-empty", "-m", "SUP-7 moved"), "SUP-7-record-ruling"],
+      ["it switches to another issue-named branch at the same commit", (layout: ManagedLayout) =>
+        git(layout.worktree, "checkout", "-q", "-b", "SUP-7-other"), "SUP-7-other"],
+    ])("refuses, naming the move, when %s", async (_label, move, movedBranch) => {
+      const layout = managedLayout();
+      const startedAt = git(layout.worktree, "rev-parse", "HEAD");
+      let moved = false;
+
+      const result = await probeNoRepositoryWorktree({
+        ...layout.input,
+        countCommitsAheadOfBase: async () => {
+          if (!moved) {
+            moved = true;
+            move(layout);
+          }
+          return 0;
+        },
+      });
+
+      expect(moved).toBe(true);
+      expect(result).toEqual({
+        ok: false,
+        reason:
+          `the recorded worktree moved from SUP-7-record-ruling at ${startedAt.slice(0, 12)} ` +
+          `to ${movedBranch} at ${git(layout.worktree, "rev-parse", "HEAD").slice(0, 12)} while it was being verified`,
+      });
+    });
+  });
+
   describe("bounds the comparisons made while the close holds the issue row", () => {
     // `count` more commits land on the remote default branch; the managed
     // checkout fetches them and gets one branch naming the issue at each, so
