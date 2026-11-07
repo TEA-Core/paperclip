@@ -394,6 +394,36 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.allowed).toBe(true);
     });
 
+    it("allows control-plane-operation-no-deliverable only without a legitimate delivery branch", async () => {
+      const override: DoneTransitionOverride = { disposition: "control-plane-operation-no-deliverable" };
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
+      expect(result.allowed).toBe(true);
+      expect(result.reason).toContain("control-plane-operation-no-deliverable");
+    });
+
+    it("refuses control-plane-operation-no-deliverable when the issue owns a delivery branch", async () => {
+      vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce(ownDeliveryBranch("SUP-12345-work"));
+      const override: DoneTransitionOverride = { disposition: "control-plane-operation-no-deliverable" };
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("legitimate delivery branch");
+    });
+
+    it("allows control-plane-operation-no-deliverable for an issue-owned workspace with no delivery branch", async () => {
+      vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce({
+        branch: null,
+        branchIsOwn: true,
+        carrier: false,
+        legitimate: true,
+        ownerIssueId: null,
+        refusalReason: null,
+      });
+      const override: DoneTransitionOverride = { disposition: "control-plane-operation-no-deliverable" };
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
+      expect(result.allowed).toBe(true);
+      expect(result.reason).toContain("control-plane-operation-no-deliverable");
+    });
+
     it("does not treat unknown disposition as override", async () => {
       const override: DoneTransitionOverride = { disposition: "some-unknown-disposition" };
       setupDbMock({
@@ -7328,6 +7358,82 @@ describe("evaluateDoneTierDeclaration", () => {
 
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("multiple repositories");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("accepts the named PR from this issue's own pull_request work product", async () => {
+      vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce(ownDeliveryBranch("SUP-12345-work"));
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueWorkProducts: [{
+          id: "work-product-1",
+          title: "Own PR",
+          status: "open",
+          metadata: { repository: "TEA-Core/paperclip", prNumber: 4161, headRef: "SUP-12345-work" },
+        }],
+      });
+      ghFetchMock.mockResolvedValue(new Response("provider unavailable", { status: 503 }));
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4161; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("does not link a same-headRef pull request work product from another repository", async () => {
+      vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce(ownDeliveryBranch("SUP-12345-work"));
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueWorkProducts: [{
+          id: "work-product-1",
+          title: "Cross-repository PR",
+          status: "open",
+          metadata: { repository: "TEA-Core/other-repository", prNumber: 4161, headRef: "SUP-12345-work" },
+        }],
+      });
+      ghFetchMock.mockResolvedValue(new Response("provider unavailable", { status: 503 }));
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4161; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("not a linked pull request");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("does not link the same PR number from a foreign-headRef work product", async () => {
+      vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce(ownDeliveryBranch("SUP-12345-work"));
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueWorkProducts: [{
+          id: "work-product-1",
+          title: "Foreign PR",
+          status: "open",
+          metadata: { repository: "TEA-Core/paperclip", prNumber: 4161, headRef: "SUP-99999-foreign" },
+        }],
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4161; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("not a linked pull request");
       expect(ghFetchMock).not.toHaveBeenCalled();
     });
 

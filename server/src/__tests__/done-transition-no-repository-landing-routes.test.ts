@@ -640,9 +640,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(res.body.error).toContain("a no-repository close carries no repository evidence");
   });
 
-  it("refuses an issue that records a pull request work product", async () => {
-    const fixture = await seed();
-    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+  async function insertPullRequestProduct(fixture: SeededIssue, metadata?: Record<string, unknown>) {
     await db.insert(issueWorkProducts).values({
       companyId: fixture.companyId,
       issueId: fixture.issueId,
@@ -655,12 +653,66 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       reviewState: "none",
       isPrimary: false,
       healthStatus: "unknown",
+      ...(metadata === undefined ? {} : { metadata }),
+    });
+  }
+
+  it("refuses an issue that records a pull request work product", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    await insertPullRequestProduct(fixture);
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("records a pull request work product");
+  });
+
+  it("discounts a foreign-headRef pull request work product", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    await insertPullRequestProduct(fixture, {
+      repository: "TEA-Core/records",
+      prNumber: 9,
+      headRef: "SUP-99999-foreign",
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(fixture.issueId)).toBe("done");
+  });
+
+  it("still refuses a pull request work product on this issue's own delivery branch", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    await insertPullRequestProduct(fixture, {
+      repository: "TEA-Core/records",
+      prNumber: 9,
+      headRef: fixture.branch,
     });
 
     const res = await close(fixture.identifier);
 
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.error).toContain("records a pull request work product");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  it("refuses a pull request work product for an issue-owned workspace with no delivery branch", async () => {
+    const fixture = await seed({ workspace: { branchName: null } });
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    await insertPullRequestProduct(fixture, {
+      repository: "TEA-Core/records",
+      prNumber: 9,
+      headRef: fixture.branch,
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("records a pull request work product");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 
   function commitOnIssueBranch(fixture: SeededIssue) {

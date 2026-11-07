@@ -72,6 +72,7 @@ const NO_DELIVERABLE_HEAD_DISPOSITIONS = new Set([
   "upstream-equivalent-fix-no-deliverable-head",
   "child-delivery-parent-close",
   "merged-elsewhere",
+  "control-plane-operation-no-deliverable",
 ]);
 
 // SUP-14579 (ADR-072 close-ladder shape): the three stages a top-level
@@ -951,6 +952,86 @@ export async function loadOwnDraftPredicate(
     );
 }
 
+type PullRequestWorkProductLink = {
+  kind: "own" | "foreign" | "unknown";
+  pr: LinkedPullRequest | null;
+};
+
+async function readPullRequestWorkProductLinks(
+  db: Db,
+  issue: {
+    id: string;
+    companyId: string;
+    projectId?: string | null;
+    projectWorkspaceId?: string | null;
+    executionWorkspaceId?: string | null;
+  },
+): Promise<PullRequestWorkProductLink[]> {
+  const products = await db
+    .select({
+      id: issueWorkProducts.id,
+      title: issueWorkProducts.title,
+      status: issueWorkProducts.status,
+      metadata: issueWorkProducts.metadata,
+    })
+    .from(issueWorkProducts)
+    .where(
+      and(
+        eq(issueWorkProducts.companyId, issue.companyId),
+        eq(issueWorkProducts.issueId, issue.id),
+        eq(issueWorkProducts.type, "pull_request"),
+      ),
+    );
+  if (products.length === 0) return [];
+  const fields = await loadTier1RepoFields(db, issue);
+  const context = await resolveIssueRepoContext(db, { companyId: issue.companyId, ...fields });
+  const parsed = parseRepoUrl(context?.repoUrl ?? null);
+  const deliveryRepo = parsed?.hostname === "github.com" ? `${parsed.owner}/${parsed.repo}`.toLowerCase() : null;
+  const ownership = await resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id);
+  return products.map((product) => {
+    const metadata = product.metadata ?? {};
+    const headRef = typeof metadata.headRef === "string" && metadata.headRef.length > 0 ? metadata.headRef : null;
+    const branchIsKnown = headRef !== null && ownership.legitimate && ownership.branch !== null;
+    const branchMatches = branchIsKnown && ownership.branch === headRef;
+    const repository = typeof metadata.repository === "string"
+      ? /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(metadata.repository)
+      : null;
+    const repositoryName = repository ? `${repository[1]}/${repository[2]}`.toLowerCase() : null;
+    const own = branchMatches && deliveryRepo !== null && repositoryName === deliveryRepo;
+    const prNumber = typeof metadata.prNumber === "number" && Number.isInteger(metadata.prNumber) && metadata.prNumber > 0
+      ? metadata.prNumber
+      : null;
+    let pr: LinkedPullRequest | null = null;
+    if (repository && prNumber !== null) {
+      const owner = repository[1]!;
+      const repo = repository[2]!;
+      pr = {
+        id: product.id,
+        owner,
+        repo,
+        number: prNumber,
+        nodeId: null,
+        headRefName: headRef,
+        displayName: `${owner}/${repo}#${prNumber}`,
+        title: product.title,
+        cachedState: product.status,
+        lastErrorCode: null,
+        reviewDecision: null,
+        draft: false,
+        headRepoFullName: `${owner}/${repo}`,
+      };
+    }
+    const kind = !branchIsKnown
+      ? "unknown"
+      : own
+        ? "own"
+        : !branchMatches || (deliveryRepo !== null && repositoryName !== null)
+          ? "foreign"
+          : "unknown";
+    return { kind, pr };
+  });
+}
+
 async function proveLandingDelegated(
   db: Db,
   issue: { id: string; companyId: string; identifier: string | null },
@@ -972,6 +1053,15 @@ async function proveLandingDelegated(
   let linked: LinkedPullRequest[];
   try {
     linked = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, { includeDrafts: true });
+    const workProductLinks = await readPullRequestWorkProductLinks(db, issue);
+    const seen = new Set(linked.map((candidate) => `${candidate.owner}/${candidate.repo}#${candidate.number}`.toLowerCase()));
+    for (const link of workProductLinks) {
+      if (link.kind !== "own" || link.pr === null) continue;
+      const key = `${link.pr.owner}/${link.pr.repo}#${link.pr.number}`.toLowerCase();
+      if (seen.has(key)) continue;
+      linked.push(link.pr);
+      seen.add(key);
+    }
   } catch (err) {
     return refuseTier1(unverifiedTier1(err));
   }
@@ -2110,17 +2200,8 @@ async function readNoRepositoryLandingRecord(
       `cannot be declared on an issue that links pull requests (${linkedPrs.map((pr) => pr.displayName).join(", ")}).`,
     );
   }
-  const pullRequestProducts = await db
-    .select({ id: issueWorkProducts.id })
-    .from(issueWorkProducts)
-    .where(
-      and(
-        eq(issueWorkProducts.companyId, issue.companyId),
-        eq(issueWorkProducts.issueId, issue.id),
-        eq(issueWorkProducts.type, "pull_request"),
-      ),
-    );
-  if (pullRequestProducts.length > 0) {
+  const pullRequestProducts = await readPullRequestWorkProductLinks(db, issue);
+  if (pullRequestProducts.some((product) => product.kind !== "foreign")) {
     return noRepositoryRefusal("cannot be declared on an issue that records a pull request work product.");
   }
 
@@ -4235,6 +4316,30 @@ async function evaluateDoneTransitionGuardCore(
   // the mechanism C / A / D refusals, is the fix: the disposition is a waiver of
   // the head check, and it can no longer reach (or waive) a ladder this parent
   // owes (SUP-13724 §1). A card that owes a ladder was already refused above.
+  let overrideRefusal: string | null = null;
+  if (override?.disposition === "control-plane-operation-no-deliverable") {
+    try {
+      const ownership = await resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id);
+      if (ownership.legitimate && ownership.branch !== null) {
+        overrideRefusal = "Override refused: control-plane-operation-no-deliverable requires no legitimate delivery branch, but this issue has one.";
+      }
+    } catch (err) {
+      overrideRefusal = `Override refused: control-plane-operation-no-deliverable could not verify delivery-branch ownership (${err instanceof Error ? err.message : "unknown"}).`;
+    }
+  }
+  if (overrideRefusal !== null) {
+    return {
+      allowed: false,
+      reason: overrideRefusal,
+      aheadBy: null,
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
   if (override && NO_DELIVERABLE_HEAD_DISPOSITIONS.has(override.disposition)) {
     void writeAuditLog(db, issue, "issue.done_transition_override", {
       disposition: override.disposition,
