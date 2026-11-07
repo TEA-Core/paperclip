@@ -202,29 +202,72 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
   async function assertSkipped(sweep: RecoverySweepName, failingIssueId: string, run: () => Promise<unknown>) {
     const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined as never);
     try {
-      await expect(run()).resolves.toBeDefined();
+      const result = await run();
+      expect(result).toBeDefined();
       expect(errorSpy).toHaveBeenCalledWith(
         expect.objectContaining({ issueId: failingIssueId, sweep }),
         expect.stringContaining("skipped a card"),
       );
+      return result;
     } finally {
       errorSpy.mockRestore();
     }
   }
 
-  it.each(RECOVERY_SWEEP_NAMES)("skips one injected write failure in %s and still processes the later card", async (sweep) => {
+  async function sweepEffectApplied(sweep: RecoverySweepName, issueId: string, seeded: Seed): Promise<boolean> {
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    switch (sweep) {
+      case "recovery.reconcile_stranded_assigned_issues":
+      case "recovery.reconcile_stillborn_assigned_backlog":
+      case "recovery.reconcile_dispatch_suppression_parks":
+      case "recovery.reconcile_todo_stranded_cards":
+      case "recovery.host_restart_strand_sweep":
+        return issue?.status === "blocked";
+      case "recovery.reconcile_unassigned_blocking_issue":
+        return issue?.assigneeAgentId === seeded.agentId;
+      case "recovery.sweep_stale_issue_locks":
+        return issue?.checkoutRunId === null;
+      case "recovery.reconcile_exhausted_recovery_drain":
+        return issue?.monitorNextCheckAt != null;
+      case "recovery.reconcile_blocked_without_blockers":
+        return (
+          await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))
+        ).length > 0;
+      case "recovery.reconcile_stale_recovery_action_wakes":
+        return (
+          await db.select({ attemptCount: issueRecoveryActions.attemptCount }).from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))
+        ).some((row) => row.attemptCount > 0);
+      case "task_watchdogs.reconcile_task_watchdogs":
+        return (
+          await db.select({ triggerCount: issueWatchdogs.triggerCount }).from(issueWatchdogs).where(eq(issueWatchdogs.issueId, issueId))
+        ).some((row) => row.triggerCount > 0);
+      default: {
+        const unmapped: never = sweep;
+        throw new Error(`no effect check for ${String(unmapped)}`);
+      }
+    }
+  }
+
+  const SWEEP_CASES = RECOVERY_SWEEP_NAMES.flatMap((sweep) => [
+    [sweep, true] as const,
+    [sweep, false] as const,
+  ]);
+
+  it.each(SWEEP_CASES)("skips one injected write failure in %s (failing card first: %s) and still processes the ordinary card", async (sweep, failingFirst) => {
     const seeded = await seedCompany();
-    const failing = await drive(sweep, seeded, "Failing card", 1);
-    const later = await drive(sweep, seeded, "Ordinary card", 2);
+    const first = await drive(sweep, seeded, failingFirst ? "Failing card" : "Ordinary card", 1);
+    const second = await drive(sweep, seeded, failingFirst ? "Ordinary card" : "Failing card", 2);
+    const failing = failingFirst ? first : second;
+    const ordinary = failingFirst ? second : first;
     const before = await db.select({ updatedAt: issues.updatedAt }).from(issues).where(eq(issues.id, failing)).then((rows) => rows[0]);
     await db.execute(sql`alter table issues disable trigger fm_refuse_issues`);
     await db.update(issues).set({ title: REFUSE_TITLE, updatedAt: before?.updatedAt ?? new Date(Date.now() - 3 * 60 * 60 * 1000) }).where(eq(issues.id, failing));
     await db.execute(sql`alter table issues enable trigger fm_refuse_issues`);
-    await assertSkipped(sweep, failing, () => runSweep(sweep, seeded));
-    const laterRow = await db.select().from(issues).where(eq(issues.id, later)).then((rows) => rows[0]);
-    expect(laterRow).toBeTruthy();
-    if (sweep === "recovery.reconcile_stranded_assigned_issues" || sweep === "recovery.reconcile_stillborn_assigned_backlog") {
-      expect(laterRow?.status).toBe("blocked");
+    const result = await assertSkipped(sweep, failing, () => runSweep(sweep, seeded));
+    expect(await sweepEffectApplied(sweep, failing, seeded)).toBe(false);
+    expect(await sweepEffectApplied(sweep, ordinary, seeded)).toBe(true);
+    if (sweep === "task_watchdogs.reconcile_task_watchdogs") {
+      expect(result).toMatchObject({ checked: 2, triggered: 1, skipped: 1 });
     }
   });
 

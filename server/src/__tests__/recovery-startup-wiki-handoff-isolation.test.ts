@@ -516,6 +516,57 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
     }
   });
 
+  const EXCLUDED_WIKI_GUARD_KEYS: Array<[string, Record<string, unknown>]> = [
+    ["statusVersion", { statusVersion: 1 }],
+    ["monitorNextCheckAt", { monitorNextCheckAt: new Date("2026-11-08T00:00:00.000Z") }],
+    ["monitorWakeRequestedAt", { monitorWakeRequestedAt: new Date("2026-11-08T00:00:00.000Z") }],
+    ["monitorLastTriggeredAt", { monitorLastTriggeredAt: new Date("2026-11-08T00:00:00.000Z") }],
+    ["monitorAttemptCount", { monitorAttemptCount: 1 }],
+    ["monitorNotes", { monitorNotes: "note" }],
+    ["monitorScheduledBy", { monitorScheduledBy: "assignee" }],
+    ["executionPolicy", { executionPolicy: { mode: "normal", commentRequired: true, stages: [] } }],
+    ["priority", { priority: "low" }],
+    ["labelIds", { labelIds: [] }],
+  ];
+
+  it.each(["non-canonical assignee", "unassigned", "user-assigned"] as const)(
+    "refuses every excluded key written alone on a %s Wiki handoff",
+    async (shape) => {
+      const seeded = await seedCompany();
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: seeded.companyId,
+        title: "[PPC ER] Weekly Report — handoff to Wiki Maintainer",
+        status: "in_review",
+        priority: "medium",
+        assigneeAgentId: shape === "non-canonical assignee" ? seeded.intruderId : null,
+        assigneeUserId: shape === "user-assigned" ? `board-${randomUUID()}` : null,
+        issueNumber: 21,
+        identifier: `${seeded.prefix}-21`,
+      });
+      const svc = issueService(db);
+      const reason = shape === "non-canonical assignee" ? "wiki_handoff_non_canonical_assignee" : "wiki_handoff_unassigned";
+
+      for (const [key, patch] of EXCLUDED_WIKI_GUARD_KEYS) {
+        await expect(svc.update(issueId, patch), key).rejects.toMatchObject({
+          status: 422,
+          details: expect.objectContaining({ reason }),
+        });
+      }
+      await expect(
+        db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]),
+      ).resolves.toMatchObject({
+        priority: "medium",
+        statusVersion: 0,
+        monitorNextCheckAt: null,
+        monitorAttemptCount: 0,
+        monitorNotes: null,
+        monitorScheduledBy: null,
+      });
+    },
+  );
+
   it("still refuses an explicit non-canonical assignee write on a Wiki handoff", async () => {
     const seeded = await seedCompany();
     const wikiIssueId = await seedWikiHandoff({ ...seeded, issueNumber: 5 });

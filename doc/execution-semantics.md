@@ -645,7 +645,16 @@ the native status-decision commits send `statusVersion` with
 those keys never form a write on their own and are not allow-listed. Known
 consequence: a non-canonical Wiki handoff card with an exhausted recovery action
 is skipped at every tick and does not get a monitor, because the guard refuses
-its `executionPolicy` write. The base build crashed startup on the same card.
+its `executionPolicy` write. The same holds for a non-canonical Wiki handoff
+card that is `in_progress`, or `in_review` with an invokable participant, whose
+latest run failed on provider quota: the monitor write is refused, so the card
+gets no monitor and no board item, and the sweep logs one error per tick. An
+exhausted card also loses its recovery-issue fallback, because that fallback runs
+only after the monitor arm succeeds. The base build crashed startup on the same
+cards. A follow-up change owns this gap. Latent gap, unchanged by this change:
+an explicit `executionPolicy: undefined` in the update data is dropped before the
+allow-list check, so it skips the guard, and the update then writes a null
+execution policy.
 
 The boundary is the write path. Per-card isolation is required for every
 startup sweep that writes issue rows through the guarded issue service
@@ -660,8 +669,10 @@ failure, still stops startup.
 Each card is processed inside the shared `runRecoverySweepIssue` helper in these
 startup sweeps. The helper accepts only the names in `RECOVERY_SWEEP_NAMES`
 (`server/src/lib/recovery-sweep-isolation.ts`), so a call site with an
-unregistered name fails typecheck, and the sweep isolation table test runs one
-injected-failure case per registered name. Each line says how the card body
+unregistered name fails typecheck, and the sweep isolation table test runs an
+injected-failure case per registered name, with the failing card in both
+iteration positions, and checks that the sweep's effect landed on the other
+card and not on the refused one. Each line says how the card body
 reaches `issueService.update`, the guarded path:
 
 - `reconcileStrandedAssignedIssues`: `blockIssueWithUnresolvedBlockers`,

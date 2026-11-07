@@ -2041,7 +2041,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       };
       for (const row of rows) {
         result.checked += 1;
-        await runRecoverySweepIssue({ id: row.issueId }, "task_watchdogs.reconcile_task_watchdogs", async () => {
+        const completed = await runRecoverySweepIssue({ id: row.issueId }, "task_watchdogs.reconcile_task_watchdogs", async () => {
         const evaluated = await evaluateWatchdog(row, { runId: opts.runId ?? null });
         if (evaluated.state === "triggered") {
           result.triggered += 1;
@@ -2060,6 +2060,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           result.skipped += 1;
         }
         });
+        if (!completed) result.skipped += 1;
       }
       return result;
     },
