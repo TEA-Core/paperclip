@@ -20691,10 +20691,12 @@ export function issueRoutes(
           ) return null;
           // Re-check the snapshot on this write transaction after any runner
           // stop authorized by the earlier compare. A refused decision writes
-          // no decision row, comment, state change, activity row or wake. It
-          // does not cancel a run when the snapshot was already stale at the
-          // pre-stop compare. The lock read uses `tx`; do not call a service
-          // on the outer pool from inside this transaction.
+          // no decision row, comment, state change or wake; the done-guard
+          // preflight audit rows (issue.done_transition_guard_skipped and
+          // issue.done_tier_declaration_skipped) may remain. It does not
+          // cancel a run when the snapshot was already stale at the pre-stop
+          // compare. The lock read uses `tx`; do not call a service on the
+          // outer pool from inside this transaction.
           await assertPatchExecutionDecisionLock(tx);
           // SUP-15878: refuse the close under the update lock (after the review
           // policy reauthorization above) with a typed diagnosis instead of
