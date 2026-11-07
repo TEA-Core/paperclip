@@ -15,6 +15,7 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
+import { readBuildCommit } from "../build-commit.js";
 import {
   LEGACY_WORKTREE_GIT_OPTIONS,
   normalizeBaseBranch,
@@ -2818,20 +2819,54 @@ export async function evaluateDoneTierDeclaration(
 
 export type CitedCommitStatus = "resolved" | "nonexistent" | "unverifiable";
 
+export interface CitedCommitRepository {
+  hostname: string;
+  owner: string;
+  repo: string;
+}
+
 export interface CitedCommitResolution {
   sha: string;
   status: CitedCommitStatus;
+  probedRepos?: CitedCommitRepository[];
+  reason?: string;
 }
 
 export interface CitedShaResolution {
   results: CitedCommitResolution[];
 }
 
-const CITED_SHA_PATTERNS: RegExp[] = [
-  /`([0-9a-f]{40})`/gi,
-  /\b[A-Za-z0-9_.-]+@([0-9a-f]{40})(?![0-9a-f])/gi,
-  /github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/commit\/([0-9a-f]{40})(?![0-9a-f])/gi,
-  /\b(?:commits?|shas?)\s*[:#]?\s*([0-9a-f]{40})(?![0-9a-f])/gi,
+interface CitedCommitReference {
+  sha: string;
+  explicitRepos: CitedCommitRepository[];
+  ambiguous: boolean;
+}
+
+interface CitedRepoCandidate extends CitedCommitRepository {
+  controlRef: string | null;
+}
+
+interface CitedShaPattern {
+  regex: RegExp;
+  shaIndex: number;
+  repo?: (match: RegExpMatchArray) => CitedCommitRepository | null;
+}
+
+const CITED_SHA_PATTERNS: CitedShaPattern[] = [
+  { regex: /`([0-9a-f]{40})`/gi, shaIndex: 1 },
+  {
+    regex: /\b(?:([A-Za-z0-9_.-]+)\/)?([A-Za-z0-9_.-]+)@([0-9a-f]{40})(?![0-9a-f])/gi,
+    shaIndex: 3,
+    repo: (match) => match[1]
+      ? { hostname: "github.com", owner: match[1], repo: match[2]! }
+      : null,
+  },
+  {
+    regex: /github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/commit\/([0-9a-f]{40})(?![0-9a-f])/gi,
+    shaIndex: 3,
+    repo: (match) => ({ hostname: "github.com", owner: match[1]!, repo: match[2]! }),
+  },
+  { regex: /\b(?:commits?|shas?)\s*[:#]?\s*([0-9a-f]{40})(?![0-9a-f])/gi, shaIndex: 1 },
 ];
 
 const CITED_SHA_MAX = 10;
@@ -2840,20 +2875,48 @@ function looksLikeShaCandidate(token: string): boolean {
   return /[0-9]/.test(token) && /[a-f]/.test(token);
 }
 
-export function extractCitedCommitShas(text: string | null | undefined): string[] {
+function citedRepoKey(repo: CitedCommitRepository): string {
+  return `${repo.hostname.toLowerCase()}/${repo.owner.toLowerCase()}/${repo.repo.toLowerCase()}`;
+}
+
+function mergeCitedRepoCandidates(...groups: CitedRepoCandidate[][]): CitedRepoCandidate[] {
+  const merged = new Map<string, CitedRepoCandidate>();
+  for (const candidate of groups.flat()) {
+    const key = citedRepoKey(candidate);
+    const existing = merged.get(key);
+    if (existing) existing.controlRef ??= candidate.controlRef;
+    else merged.set(key, { ...candidate });
+  }
+  return [...merged.values()];
+}
+
+function extractCitedCommitReferences(text: string | null | undefined): CitedCommitReference[] {
   if (!text) return [];
-  const seen = new Set<string>();
+  const references = new Map<string, CitedCommitReference>();
   for (const pattern of CITED_SHA_PATTERNS) {
-    for (const match of text.matchAll(pattern)) {
-      const raw = match[1];
+    for (const match of text.matchAll(pattern.regex)) {
+      const raw = match[pattern.shaIndex];
       if (!raw) continue;
       const sha = raw.toLowerCase();
       if (!looksLikeShaCandidate(sha)) continue;
-      seen.add(sha);
-      if (seen.size >= CITED_SHA_MAX) return [...seen];
+      const reference = references.get(sha) ?? { sha, explicitRepos: [], ambiguous: false };
+      const repo = pattern.repo?.(match) ?? null;
+      if (repo) {
+        if (!reference.explicitRepos.some((candidate) => citedRepoKey(candidate) === citedRepoKey(repo))) {
+          reference.explicitRepos.push(repo);
+        }
+      } else {
+        reference.ambiguous = true;
+      }
+      references.set(sha, reference);
+      if (references.size >= CITED_SHA_MAX) return [...references.values()];
     }
   }
-  return [...seen];
+  return [...references.values()];
+}
+
+export function extractCitedCommitShas(text: string | null | undefined): string[] {
+  return extractCitedCommitReferences(text).map((reference) => reference.sha);
 }
 
 type CommitRefProbeOutcome = "present" | "absent" | "error";
@@ -2890,6 +2953,22 @@ async function githubCommitRefProbe(
   return "error";
 }
 
+async function resolveServedBuildRepo(): Promise<CitedCommitRepository | null> {
+  const configured = parseRepoUrl(process.env.PAPERCLIP_BUILD_REPO_URL ?? null);
+  if (configured) return configured;
+  try {
+    const origin = await runHardenedGit(["config", "--get", "remote.origin.url"], {
+      cwd: process.cwd(),
+      timeoutMs: 1500,
+      inheritEnvironment: true,
+    });
+    const parsed = parseRepoUrl(origin.trim());
+    if (parsed) return parsed;
+  } catch {
+  }
+  return null;
+}
+
 export async function resolveCitedCommits(
   db: Db,
   issue: {
@@ -2902,98 +2981,175 @@ export async function resolveCitedCommits(
   },
   text: string | null | undefined,
 ): Promise<CitedShaResolution> {
-  const shas = extractCitedCommitShas(text);
-  if (shas.length === 0) return { results: [] };
+  const references = extractCitedCommitReferences(text);
+  if (references.length === 0) return { results: [] };
 
-  const unverifiableAll = (): CitedShaResolution => ({
-    results: shas.map((sha) => ({ sha, status: "unverifiable" as const })),
-  });
-
-  let ctx: IssueRepoContext | null;
+  let globalCandidates: CitedRepoCandidate[] = [];
+  let repositoryContextFailed = false;
   try {
     const fields = await loadTier1RepoFields(db, issue);
-    ctx = await resolveIssueRepoContext(db, {
+    const ctx = await resolveIssueRepoContext(db, {
       companyId: issue.companyId,
       projectId: fields.projectId,
       projectWorkspaceId: fields.projectWorkspaceId,
       executionWorkspaceId: fields.executionWorkspaceId,
     });
+    const parsed = parseRepoUrl(ctx?.repoUrl ?? null);
+    if (parsed) {
+      globalCandidates = mergeCitedRepoCandidates(globalCandidates, [
+        { ...parsed, controlRef: ctx?.defaultRef ?? null },
+      ]);
+    } else if (ctx?.repoUrl) {
+      repositoryContextFailed = true;
+    }
   } catch {
-    return unverifiableAll();
+    repositoryContextFailed = true;
   }
-  if (!ctx?.repoUrl || !ctx.defaultRef) return unverifiableAll();
-  const parsed = parseRepoUrl(ctx.repoUrl);
-  if (!parsed) return unverifiableAll();
 
-  let token: string | null;
+  let linkedPrs: LinkedPullRequest[] = [];
+  let linkedPrLookupFailed = false;
   try {
-    const tokenResult = await resolveGitHubToken(db, issue.companyId);
-    token = tokenResult.token;
+    linkedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id);
   } catch {
-    return unverifiableAll();
+    linkedPrLookupFailed = true;
   }
-  if (!token) return unverifiableAll();
+  for (const pr of linkedPrs) {
+    const candidates: CitedRepoCandidate[] = [{
+      hostname: "github.com",
+      owner: pr.owner,
+      repo: pr.repo,
+      controlRef: pr.baseRefName ?? null,
+    }];
+    const headRepo = pr.headRepoFullName
+      ? parseRepoUrl(`https://github.com/${pr.headRepoFullName}`)
+      : null;
+    if (headRepo) candidates.push({ ...headRepo, controlRef: null });
+    globalCandidates = mergeCitedRepoCandidates(globalCandidates, candidates);
+  }
 
-  const apiHostname = parsed.hostname;
-  const repoOwner = parsed.owner;
-  const repoName = parsed.repo;
-  const defaultRef = ctx.defaultRef;
+  const buildCommit = readBuildCommit();
+  if (buildCommit) {
+    const servedRepo = await resolveServedBuildRepo();
+    if (servedRepo) {
+      globalCandidates = mergeCitedRepoCandidates(globalCandidates, [
+        { ...servedRepo, controlRef: buildCommit },
+      ]);
+    }
+  }
+
+  const candidatesFor = (reference: CitedCommitReference) => mergeCitedRepoCandidates(
+    reference.explicitRepos.map((repo) => ({ ...repo, controlRef: null })),
+    globalCandidates,
+  );
+  const publicRepos = (candidates: CitedRepoCandidate[]): CitedCommitRepository[] =>
+    candidates.map(({ hostname, owner, repo }) => ({ hostname, owner, repo }));
+  const unverifiable = (
+    reference: CitedCommitReference,
+    candidates: CitedRepoCandidate[],
+    reason: string,
+  ): CitedCommitResolution => ({
+    sha: reference.sha,
+    status: "unverifiable",
+    reason,
+    probedRepos: publicRepos(candidates),
+  });
+
+  let token: string | null = null;
+  try {
+    token = (await resolveGitHubToken(db, issue.companyId)).token;
+  } catch {
+  }
+  if (!token) {
+    return {
+      results: references.map((reference) => unverifiable(
+        reference,
+        [],
+        "github_credential_unavailable",
+      )),
+    };
+  }
   const authToken = token;
-
-  // Positive control (probed lazily, once, only when a SHA probe first reports
-  // absence): the default branch ref must resolve in the same repo with the
-  // same credential before any "nonexistent" verdict is trusted. The remote-
-  // tracking prefix is stripped exactly as the compare probe does (SUP-13691).
-  let control: CommitRefProbeOutcome | null = null;
-  const controlPresent = async (): Promise<boolean> => {
-    if (control === null) {
-      const controlRef =
-        defaultRef.startsWith("origin/") && defaultRef.length > "origin/".length
-          ? defaultRef.slice("origin/".length)
-          : defaultRef;
-      control = await githubCommitRefProbe(apiHostname, repoOwner, repoName, controlRef, authToken);
+  const controlOutcomes = new Map<string, CommitRefProbeOutcome>();
+  const controlPresent = async (candidate: CitedRepoCandidate): Promise<boolean> => {
+    if (!candidate.controlRef) return false;
+    const controlRef = candidate.controlRef.startsWith("origin/") && candidate.controlRef.length > "origin/".length
+      ? candidate.controlRef.slice("origin/".length)
+      : candidate.controlRef;
+    const key = `${citedRepoKey(candidate)}:${controlRef}`;
+    let outcome = controlOutcomes.get(key);
+    if (outcome === undefined) {
+      outcome = await githubCommitRefProbe(
+        candidate.hostname,
+        candidate.owner,
+        candidate.repo,
+        controlRef,
+        authToken,
+      );
+      controlOutcomes.set(key, outcome);
     }
-    return control === "present";
-  };
-
-  let linkedPrs: LinkedPullRequest[] | null | undefined;
-  const matchesLinkedPr = async (sha: string): Promise<boolean | null> => {
-    if (linkedPrs === undefined) {
-      try {
-        linkedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id);
-      } catch {
-        linkedPrs = null;
-      }
-    }
-    if (linkedPrs === null) return null;
-    return linkedPrs.some((pr) =>
-      [pr.mergeCommitSha, pr.headSha].some((candidate) => candidate?.trim().toLowerCase() === sha),
-    );
+    return outcome === "present";
   };
 
   const results: CitedCommitResolution[] = [];
-  for (const sha of shas) {
-    const outcome = await githubCommitRefProbe(apiHostname, repoOwner, repoName, sha, authToken);
-    if (outcome === "present") {
-      results.push({ sha, status: "resolved" });
+  for (const reference of references) {
+    const candidates = candidatesFor(reference);
+    const outcomes: { candidate: CitedRepoCandidate; outcome: CommitRefProbeOutcome }[] = [];
+    for (const candidate of candidates) {
+      const outcome = await githubCommitRefProbe(
+        candidate.hostname,
+        candidate.owner,
+        candidate.repo,
+        reference.sha,
+        authToken,
+      );
+      outcomes.push({ candidate, outcome });
+      if (outcome === "present") break;
+    }
+    if (outcomes.some(({ outcome }) => outcome === "present")) {
+      results.push({ sha: reference.sha, status: "resolved" });
       continue;
     }
-    if (outcome === "absent") {
-      const linkedMatch = await matchesLinkedPr(sha);
-      if (linkedMatch === true) {
-        results.push({ sha, status: "resolved" });
-        continue;
-      }
-      if (linkedMatch === null) {
-        results.push({ sha, status: "unverifiable" });
-        continue;
-      }
-      if (await controlPresent()) {
-        results.push({ sha, status: "nonexistent" });
-        continue;
-      }
+    if (
+      outcomes.length > 0
+      && outcomes.every(({ outcome }) => outcome === "absent")
+      && linkedPrs.some((pr) => [pr.mergeCommitSha, pr.headSha]
+        .some((candidate) => candidate?.trim().toLowerCase() === reference.sha))
+    ) {
+      results.push({ sha: reference.sha, status: "resolved" });
+      continue;
     }
-    results.push({ sha, status: "unverifiable" });
+
+    const probedCandidates = outcomes.map(({ candidate }) => candidate);
+    let reason: string;
+    if (outcomes.some(({ outcome }) => outcome === "error")) {
+      reason = "commit_probe_error";
+    } else if (linkedPrLookupFailed) {
+      reason = "linked_pull_request_lookup_failed";
+    } else if (repositoryContextFailed) {
+      reason = "repository_context_unavailable";
+    } else if (outcomes.length === 0) {
+      reason = "repository_scope_unavailable";
+    } else if (reference.ambiguous) {
+      reason = "ambiguous_repository_scope";
+    } else {
+      let controlsPresent = true;
+      for (const { candidate } of outcomes) {
+        if (!(await controlPresent(candidate))) {
+          controlsPresent = false;
+          break;
+        }
+      }
+      if (controlsPresent) {
+        results.push({
+          sha: reference.sha,
+          status: "nonexistent",
+          probedRepos: publicRepos(probedCandidates),
+        });
+        continue;
+      }
+      reason = "positive_control_unavailable";
+    }
+    results.push(unverifiable(reference, probedCandidates, reason));
   }
   return { results };
 }

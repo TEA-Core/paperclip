@@ -2105,7 +2105,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         .send({
           status: "done",
           comment:
-            "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe re-hit the endpoint; cited commit afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60.",
+            "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe re-hit the endpoint; cited commit TEA-Core/paperclip@afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60.",
         });
 
       // The tier line passed; the provably nonexistent cited SHA is the refusal.
@@ -2137,7 +2137,11 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       );
       expect(rows[0]?.details).toMatchObject({
         decisionCarried: false,
-        results: [{ sha: "afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60", status: "nonexistent" }],
+        results: [{
+          sha: "afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60",
+          status: "nonexistent",
+          probedRepos: [{ hostname: "github.com", owner: "TEA-Core", repo: "paperclip" }],
+        }],
       });
     });
 
@@ -2175,7 +2179,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D20525C");
       await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
       currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
-      // The SHA probe says absent, but the control ref does not resolve either,
+      // The bare SHA probe says absent, but its repository scope is ambiguous,
       // so absence is unproven: the citation is unverifiable and the close holds.
       mockMergedBranchWithCommitProbes({ afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60: "absent" }, 404);
 
@@ -2197,7 +2201,12 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         { timeout: 5000 },
       );
       expect(rows[0]?.details).toMatchObject({
-        results: [{ sha: "afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60", status: "unverifiable" }],
+        results: [{
+          sha: "afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60",
+          status: "unverifiable",
+          reason: "ambiguous_repository_scope",
+          probedRepos: [{ hostname: "github.com", owner: "TEA-Core", repo: "paperclip" }],
+        }],
       });
     });
 
