@@ -8200,6 +8200,7 @@ export function recoveryService(
             { err, issueId: candidate.id, agentId, idempotencyKey, source },
             "failed to enqueue dependency wake from issue graph liveness backstop",
           );
+          throw err;
         }
         });
       }
@@ -8467,6 +8468,7 @@ export function recoveryService(
             { err, issueId: candidate.id, agentId, source },
             "failed to enqueue pending review re-arm wake",
           );
+          throw err;
         }
         });
       }
@@ -10242,7 +10244,7 @@ export function recoveryService(
     );
 
     for (const candidate of issueRows) {
-      await runRecoverySweepIssue(candidate, "recovery.reconcile_dispatch_suppression_parks", async () => {
+      await runRecoverySweepIssue(candidate, "recovery.reconcile_dispatch_suppression_parks_write", async () => {
       const lastRealActivity = [
         candidate.updatedAt,
         commentLatestById.get(candidate.id) ?? null,
@@ -11767,7 +11769,7 @@ export function recoveryService(
         ),
       );
     for (const action of openCancelledBlockerActions) {
-      await runRecoverySweepIssue({ id: action.sourceIssueId, identifier: null }, "recovery.reconcile_cancelled_only_blocker_dependents", async () => {
+      await runRecoverySweepIssue({ id: action.sourceIssueId, identifier: null }, "recovery.reconcile_cancelled_only_blocker_dependents_resolve", async () => {
       const [source] = await db.select().from(issues).where(eq(issues.id, action.sourceIssueId));
       let resolutionNote: string | null = null;
       if (!source) {
@@ -12056,7 +12058,7 @@ export function recoveryService(
         ),
       );
     for (const action of openUndispatchableActions) {
-      await runRecoverySweepIssue({ id: action.sourceIssueId, identifier: null }, "recovery.reconcile_undispatchable_assigned", async () => {
+      await runRecoverySweepIssue({ id: action.sourceIssueId, identifier: null }, "recovery.reconcile_undispatchable_assigned_resolve", async () => {
       const [source] = await db
         .select()
         .from(issues)
