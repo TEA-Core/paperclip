@@ -4,6 +4,7 @@ import { heartbeatRuns, issueComments, issues } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
 import { issueService } from "../issues.js";
 import { isChatDrivenWake } from "./successful-run-handoff.js";
+import { runRecoverySweepIssue } from "../../lib/recovery-sweep-isolation.js";
 import {
   buildStrandedRecoveryEscalationNotice,
   type StrandedRecoveryNoticeSeed,
@@ -632,26 +633,27 @@ export async function sweepCompletedRunStrandedIssues(
   for (const item of plan.escalations) {
     const candidate = candidates.find((c) => c.id === item.issueId);
     if (!candidate) continue;
-
+    await runRecoverySweepIssue(candidate, "recovery.completed_run_strand_sweep", async () => {
     // Cheap pre-check only; the authoritative never-escalate guard lives inside
     // the escalation write (row lock + re-validated shape + no-live-run) and
     // cannot be raced.
-    if (await hasLiveRun(db, candidate.companyId, candidate.id)) continue;
+    if (await hasLiveRun(db, candidate.companyId, candidate.id)) return;
 
     const sourceRun = facts.get(candidate.id)?.latestRun ?? null;
-    if (!sourceRun) continue;
+    if (!sourceRun) return;
 
     const escalated = await (input.escalateIssue ?? defaultEscalateCompletedRunStrand)(
       db,
       candidate,
       { sourceRun },
     );
-    if (!escalated) continue;
+    if (!escalated) return;
     report.escalated.push(candidate.id);
     logger.info(
       { issueId: candidate.id, identifier: candidate.identifier, sourceRunId: sourceRun.id },
       "completed-run strand sweep escalated stranded card",
     );
+    });
   }
 
   if (report.skipped.capExceeded.length > 0) {

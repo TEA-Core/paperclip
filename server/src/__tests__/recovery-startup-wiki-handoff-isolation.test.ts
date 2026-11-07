@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -20,7 +20,6 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { unprocessable } from "../errors.js";
 import { issueService } from "../services/issues.js";
 import { recoveryService } from "../services/recovery/service.js";
 
@@ -294,12 +293,13 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
     creatorId: string;
     issueNumber: number;
     downstreamId: string;
+    title?: string;
   }) {
     const blockerId = randomUUID();
     await db.insert(issues).values({
       id: blockerId,
       companyId: input.companyId,
-      title: `Orphan blocker ${input.issueNumber}`,
+      title: input.title ?? `Orphan blocker ${input.issueNumber}`,
       status: "todo",
       priority: "medium",
       createdByAgentId: input.creatorId,
@@ -327,15 +327,14 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
       issueNumber: 8,
       identifier: `${seeded.prefix}-8`,
     });
-    const refusedBlockerId = await seedOrphanBlocker({ ...seeded, creatorId: seeded.coderId, issueNumber: 9, downstreamId });
+    const refusedBlockerId = await seedOrphanBlocker({
+      ...seeded,
+      creatorId: seeded.coderId,
+      issueNumber: 9,
+      downstreamId,
+      title: "[PPC ER] Weekly Report — handoff to Wiki Maintainer",
+    });
     const ordinaryBlockerId = await seedOrphanBlocker({ ...seeded, creatorId: seeded.coderId, issueNumber: 10, downstreamId });
-    issueUpdateHook.failures.set(refusedBlockerId, () =>
-      unprocessable("Refusing assigneeAgentId write on a Wiki handoff", {
-        guard: "assignee_review_gate",
-        subGuard: "wiki_handoff",
-        reason: "wiki_handoff_non_canonical_assignee",
-      }),
-    );
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => ({ id: randomUUID() }) as never) });
 
     const result = await recovery.reconcileStrandedAssignedIssues();
@@ -415,6 +414,66 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
     ]);
     expect(wiki?.monitorNextCheckAt).toBeNull();
     expect(ordinary?.monitorNextCheckAt).not.toBeNull();
+  });
+
+  it("continues the stale-lock sweep when one card's raw row write is refused by the database", async () => {
+    const seeded = await seedCompany();
+    const seedLockedCard = async (title: string, issueNumber: number) => {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        invocationSource: "manual",
+        status: "failed",
+        startedAt: new Date("2026-11-07T10:00:00.000Z"),
+        finishedAt: new Date("2026-11-07T10:01:00.000Z"),
+      });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: seeded.companyId,
+        title,
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: seeded.coderId,
+        checkoutRunId: runId,
+        issueNumber,
+        identifier: `${seeded.prefix}-${issueNumber}`,
+      });
+      return issueId;
+    };
+    const refusedIssueId = await seedLockedCard("Refused stale lock", 13);
+    const ordinaryIssueId = await seedLockedCard("Ordinary stale lock", 14);
+    await db.execute(sql`
+      create or replace function test_refuse_stale_lock_clear() returns trigger as $$
+      begin
+        if new.title = 'Refused stale lock' and new.checkout_run_id is null then
+          raise exception 'injected stale lock write refusal';
+        end if;
+        return new;
+      end
+      $$ language plpgsql
+    `);
+    await db.execute(sql`
+      create trigger test_refuse_stale_lock_clear before update on issues
+      for each row execute function test_refuse_stale_lock_clear()
+    `);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    try {
+      const result = await recovery.sweepStaleIssueLocks();
+
+      expect(result.issueIds).toEqual([ordinaryIssueId]);
+      const [refused, ordinary] = await Promise.all([
+        db.select().from(issues).where(eq(issues.id, refusedIssueId)).then((rows) => rows[0]),
+        db.select().from(issues).where(eq(issues.id, ordinaryIssueId)).then((rows) => rows[0]),
+      ]);
+      expect(refused?.checkoutRunId).not.toBeNull();
+      expect(ordinary?.checkoutRunId).toBeNull();
+    } finally {
+      await db.execute(sql`drop trigger if exists test_refuse_stale_lock_clear on issues`);
+    }
   });
 
   it("still refuses an explicit non-canonical assignee write on a Wiki handoff", async () => {

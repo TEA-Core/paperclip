@@ -10,7 +10,8 @@ import { logger } from "../../middleware/logger.js";
 import { issueService } from "../issues.js";
 import { applyIssueMonitorPolicyTransition, parseIssueExecutionState } from "../issue-execution-policy.js";
 import { readHostRestartMarker, resolveHostBootId } from "../host-boot-identity.js";
-import { blockIssueWithUnresolvedBlockers, runRecoverySweepIssue } from "./service.js";
+import { blockIssueWithUnresolvedBlockers } from "./service.js";
+import { runRecoverySweepIssue } from "../../lib/recovery-sweep-isolation.js";
 import {
   buildImmediateExecutionPathRecoveryNoticeSeed,
   buildStrandedRecoveryEscalationNotice,
