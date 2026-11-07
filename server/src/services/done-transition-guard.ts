@@ -981,7 +981,7 @@ async function readPullRequestWorkProductLinks(
   return products.map((product) => {
     const metadata = product.metadata ?? {};
     const headRef = typeof metadata.headRef === "string" && metadata.headRef.length > 0 ? metadata.headRef : null;
-    const own = headRef !== null && ownership.legitimate && ownership.branch === headRef;
+    const own = headRef !== null && ownership.legitimate && ownership.branch !== null && ownership.branch === headRef;
     const repository = typeof metadata.repository === "string"
       ? /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(metadata.repository)
       : null;
@@ -1008,7 +1008,7 @@ async function readPullRequestWorkProductLinks(
         headRepoFullName: `${owner}/${repo}`,
       };
     }
-    return { kind: headRef === null ? "unknown" : own ? "own" : "foreign", pr };
+    return { kind: headRef === null || !ownership.legitimate || ownership.branch === null ? "unknown" : own ? "own" : "foreign", pr };
   });
 }
 
@@ -4300,7 +4300,7 @@ async function evaluateDoneTransitionGuardCore(
   if (override?.disposition === "control-plane-operation-no-deliverable") {
     try {
       const ownership = await resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id);
-      if (ownership.legitimate) {
+      if (ownership.legitimate && ownership.branch !== null) {
         overrideRefusal = "Override refused: control-plane-operation-no-deliverable requires no legitimate delivery branch, but this issue has one.";
       }
     } catch (err) {

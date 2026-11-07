@@ -699,6 +699,22 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 
+  it("refuses a pull request work product for an issue-owned workspace with no delivery branch", async () => {
+    const fixture = await seed({ workspace: { branchName: null } });
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    await insertPullRequestProduct(fixture, {
+      repository: "TEA-Core/records",
+      prNumber: 9,
+      headRef: fixture.branch,
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("records a pull request work product");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
   function commitOnIssueBranch(fixture: SeededIssue) {
     writeFileSync(path.join(fixture.worktree, "deliverable.md"), "work\n");
     git(fixture.worktree, "add", "deliverable.md");

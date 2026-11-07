@@ -409,6 +409,21 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.reason).toContain("legitimate delivery branch");
     });
 
+    it("allows control-plane-operation-no-deliverable for an issue-owned workspace with no delivery branch", async () => {
+      vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce({
+        branch: null,
+        branchIsOwn: true,
+        carrier: false,
+        legitimate: true,
+        ownerIssueId: null,
+        refusalReason: null,
+      });
+      const override: DoneTransitionOverride = { disposition: "control-plane-operation-no-deliverable" };
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
+      expect(result.allowed).toBe(true);
+      expect(result.reason).toContain("control-plane-operation-no-deliverable");
+    });
+
     it("does not treat unknown disposition as override", async () => {
       const override: DoneTransitionOverride = { disposition: "some-unknown-disposition" };
       setupDbMock({
