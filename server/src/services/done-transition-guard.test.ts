@@ -7386,6 +7386,32 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.tier).toBe("tier1");
     });
 
+    it("does not link a same-headRef pull request work product from another repository", async () => {
+      vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce(ownDeliveryBranch("SUP-12345-work"));
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueWorkProducts: [{
+          id: "work-product-1",
+          title: "Cross-repository PR",
+          status: "open",
+          metadata: { repository: "TEA-Core/other-repository", prNumber: 4161, headRef: "SUP-12345-work" },
+        }],
+      });
+      ghFetchMock.mockResolvedValue(new Response("provider unavailable", { status: 503 }));
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4161; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("not a linked pull request");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
     it("does not link the same PR number from a foreign-headRef work product", async () => {
       vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce(ownDeliveryBranch("SUP-12345-work"));
       setupDbMock({

@@ -959,7 +959,13 @@ type PullRequestWorkProductLink = {
 
 async function readPullRequestWorkProductLinks(
   db: Db,
-  issue: { id: string; companyId: string },
+  issue: {
+    id: string;
+    companyId: string;
+    projectId?: string | null;
+    projectWorkspaceId?: string | null;
+    executionWorkspaceId?: string | null;
+  },
 ): Promise<PullRequestWorkProductLink[]> {
   const products = await db
     .select({
@@ -977,14 +983,21 @@ async function readPullRequestWorkProductLinks(
       ),
     );
   if (products.length === 0) return [];
+  const fields = await loadTier1RepoFields(db, issue);
+  const context = await resolveIssueRepoContext(db, { companyId: issue.companyId, ...fields });
+  const parsed = parseRepoUrl(context?.repoUrl ?? null);
+  const deliveryRepo = parsed?.hostname === "github.com" ? `${parsed.owner}/${parsed.repo}`.toLowerCase() : null;
   const ownership = await resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id);
   return products.map((product) => {
     const metadata = product.metadata ?? {};
     const headRef = typeof metadata.headRef === "string" && metadata.headRef.length > 0 ? metadata.headRef : null;
-    const own = headRef !== null && ownership.legitimate && ownership.branch !== null && ownership.branch === headRef;
+    const branchIsKnown = headRef !== null && ownership.legitimate && ownership.branch !== null;
+    const branchMatches = branchIsKnown && ownership.branch === headRef;
     const repository = typeof metadata.repository === "string"
       ? /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(metadata.repository)
       : null;
+    const repositoryName = repository ? `${repository[1]}/${repository[2]}`.toLowerCase() : null;
+    const own = branchMatches && deliveryRepo !== null && repositoryName === deliveryRepo;
     const prNumber = typeof metadata.prNumber === "number" && Number.isInteger(metadata.prNumber) && metadata.prNumber > 0
       ? metadata.prNumber
       : null;
@@ -1008,7 +1021,14 @@ async function readPullRequestWorkProductLinks(
         headRepoFullName: `${owner}/${repo}`,
       };
     }
-    return { kind: headRef === null || !ownership.legitimate || ownership.branch === null ? "unknown" : own ? "own" : "foreign", pr };
+    const kind = !branchIsKnown
+      ? "unknown"
+      : own
+        ? "own"
+        : !branchMatches || (deliveryRepo !== null && repositoryName !== null)
+          ? "foreign"
+          : "unknown";
+    return { kind, pr };
   });
 }
 
