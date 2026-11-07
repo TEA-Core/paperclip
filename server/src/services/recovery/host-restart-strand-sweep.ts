@@ -11,6 +11,7 @@ import { issueService } from "../issues.js";
 import { applyIssueMonitorPolicyTransition, parseIssueExecutionState } from "../issue-execution-policy.js";
 import { readHostRestartMarker, resolveHostBootId } from "../host-boot-identity.js";
 import { blockIssueWithUnresolvedBlockers } from "./service.js";
+import { runRecoverySweepIssue } from "../../lib/recovery-sweep-isolation.js";
 import {
   buildImmediateExecutionPathRecoveryNoticeSeed,
   buildStrandedRecoveryEscalationNotice,
@@ -795,10 +796,10 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
   for (const repair of plan.repairs) {
     const candidate = candidates.find((c) => c.id === repair.issueId);
     if (!candidate) continue;
-
+    await runRecoverySweepIssue(candidate, "recovery.host_restart_strand_sweep", async () => {
     if (repair.kind === "rearm") {
       const patch = buildRearmMonitorPatch({ now, candidate });
-      if (!patch) continue;
+      if (!patch) return;
       const rowsAffected = await (input.rearmMonitor ?? defaultRearmMonitor)(db, candidate, patch);
       if (rowsAffected > 0) {
         report.reArmed.push(candidate.id);
@@ -807,21 +808,22 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
           "host-restart strand sweep re-armed monitor",
         );
       }
-      continue;
+      return;
     }
 
     if (repair.kind === "escalate" && repair.escalation) {
       // Cheap pre-check only; the authoritative never-touch-live-run guard lives
       // inside the escalation write (row lock + NOT-EXISTS) and cannot be raced.
-      if (await hasLiveRun(db, candidate.companyId, candidate.id)) continue;
+      if (await hasLiveRun(db, candidate.companyId, candidate.id)) return;
       const escalated = await (input.escalateIssue ?? defaultEscalateIssue)(db, candidate, repair.escalation, bootId);
-      if (!escalated) continue;
+      if (!escalated) return;
       report.escalated.push(candidate.id);
       logger.info(
         { issueId: candidate.id, identifier: candidate.identifier, reason: repair.escalation.reason, bootId },
         "host-restart strand sweep escalated stranded card",
       );
     }
+    });
   }
 
   if (report.skipped.capExceeded.length > 0) {

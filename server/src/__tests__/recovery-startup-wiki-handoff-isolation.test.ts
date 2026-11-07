@@ -1,0 +1,533 @@
+import { randomUUID } from "node:crypto";
+import { eq, sql } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  activityLog,
+  agentWakeupRequests,
+  agents,
+  companies,
+  createDb,
+  heartbeatRunEvents,
+  heartbeatRuns,
+  issueComments,
+  issueRecoveryActions,
+  issueRelations,
+  issues,
+  pluginManagedResources,
+  plugins,
+} from "@paperclipai/db";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
+import { logger } from "../middleware/logger.js";
+import { issueService } from "../services/issues.js";
+import { recoveryService } from "../services/recovery/service.js";
+
+const issueUpdateHook = vi.hoisted(() => ({
+  failures: new Map<string, () => Error>(),
+}));
+
+vi.mock("../services/issues.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/issues.js")>("../services/issues.js");
+  return {
+    ...actual,
+    issueService: (...args: Parameters<typeof actual.issueService>) => {
+      const service = actual.issueService(...args);
+      const update = service.update.bind(service);
+      service.update = async (...updateArgs: Parameters<typeof update>) => {
+        const issueId = updateArgs[0];
+        const failure = issueUpdateHook.failures.get(issueId);
+        if (failure) throw failure();
+        return update(...updateArgs);
+      };
+      return service;
+    },
+  };
+});
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping startup wiki-handoff recovery tests on this host: ${
+      embeddedPostgresSupport.reason ?? "unsupported environment"
+    }`,
+  );
+}
+
+describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-startup-wiki-guard-");
+    db = createDb(tempDb.connectionString);
+  }, 30_000);
+
+  afterEach(async () => {
+    issueUpdateHook.failures.clear();
+    await db.delete(issueComments);
+    await db.delete(issueRecoveryActions);
+    await db.delete(agentWakeupRequests);
+    await db.delete(issueRelations);
+    await db.delete(activityLog);
+    await db.delete(heartbeatRunEvents);
+    await db.delete(heartbeatRuns);
+    await db.delete(issues);
+    await db.delete(pluginManagedResources);
+    await db.delete(agents);
+    await db.delete(plugins);
+    await db.delete(companies);
+  });
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedCompany() {
+    const companyId = randomUUID();
+    const maintainerId = randomUUID();
+    const intruderId = randomUUID();
+    const coderId = randomUUID();
+    const prefix = `WG${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Startup Wiki Guard",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const pluginId = randomUUID();
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      packageName: "@paperclipai/plugin-llm-wiki",
+      version: "0.1.0",
+      apiVersion: 1,
+      categories: [],
+      manifestJson: {} as never,
+      status: "ready",
+      installOrder: 1,
+    });
+    await db.insert(agents).values([
+      {
+        id: maintainerId,
+        companyId,
+        name: "Wiki Maintainer",
+        role: "knowledge-maintainer",
+        status: "paused",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: intruderId,
+        companyId,
+        name: "coder-LE",
+        role: "engineer",
+        status: "paused",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: coderId,
+        companyId,
+        name: "Coder",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ] as never);
+    await db.insert(pluginManagedResources).values({
+      companyId,
+      pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      resourceKind: "agent",
+      resourceKey: "wiki-maintainer",
+      resourceId: maintainerId,
+      defaultsJson: {},
+    });
+    return { companyId, maintainerId, intruderId, coderId, prefix };
+  }
+
+  function reviewState(agentId: string, stageId: string) {
+    return {
+      status: "pending",
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId, userId: null },
+      returnAssignee: { type: "agent", agentId, userId: null },
+      reviewRequest: null,
+      completedStageIds: [],
+      skippedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    };
+  }
+
+  async function seedWikiHandoff(input: {
+    companyId: string;
+    prefix: string;
+    intruderId: string;
+    issueNumber: number;
+  }) {
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: input.companyId,
+      title: "[PPC ER] Weekly Report — handoff to Wiki Maintainer",
+      description: null,
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: input.intruderId,
+      issueNumber: input.issueNumber,
+      identifier: `${input.prefix}-${input.issueNumber}`,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          {
+            id: stageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "agent", agentId: input.intruderId, userId: null }],
+          },
+        ],
+      },
+      executionState: reviewState(input.intruderId, stageId),
+    });
+    return issueId;
+  }
+
+  async function seedOrdinaryStranded(input: {
+    companyId: string;
+    prefix: string;
+    coderId: string;
+    issueNumber: number;
+  }) {
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: input.companyId,
+      title: "Ordinary stranded card",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: input.coderId,
+      issueNumber: input.issueNumber,
+      identifier: `${input.prefix}-${input.issueNumber}`,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: input.companyId,
+      agentId: input.coderId,
+      invocationSource: "manual",
+      status: "failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      error: "model_not_found: requested model does not exist",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-11-07T10:00:00.000Z"),
+      finishedAt: new Date("2026-11-07T10:01:00.000Z"),
+      contextSnapshot: { issueId },
+    });
+    return issueId;
+  }
+
+  it("parks a non-canonical Wiki handoff without throwing and still processes the other stranded card", async () => {
+    const seeded = await seedCompany();
+    const wikiIssueId = await seedWikiHandoff({ ...seeded, issueNumber: 1 });
+    const ordinaryIssueId = await seedOrdinaryStranded({ ...seeded, issueNumber: 2 });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.issueIds).toEqual(expect.arrayContaining([wikiIssueId, ordinaryIssueId]));
+    const [wiki, ordinary] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, wikiIssueId)).then((rows) => rows[0]),
+      db.select().from(issues).where(eq(issues.id, ordinaryIssueId)).then((rows) => rows[0]),
+    ]);
+    expect(wiki).toMatchObject({ status: "blocked", assigneeAgentId: seeded.intruderId });
+    expect(ordinary?.status).toBe("blocked");
+  });
+
+  it.each([
+    {
+      family: "stranded assigned",
+      sweep: "recovery.reconcile_stranded_assigned_issues",
+    },
+    {
+      family: "orphan blocker",
+      sweep: "recovery.reconcile_unassigned_blocking_issue",
+    },
+  ])("skips one injected write failure in the $family sweep, processes the later card, and logs the skip", async ({ sweep }) => {
+    const seeded = await seedCompany();
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined as never);
+    try {
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => ({ id: randomUUID() }) as never) });
+      if (sweep === "recovery.reconcile_stranded_assigned_issues") {
+        const failingIssueId = await seedWikiHandoff({ ...seeded, issueNumber: 3 });
+        const ordinaryIssueId = await seedOrdinaryStranded({ ...seeded, issueNumber: 4 });
+        issueUpdateHook.failures.set(failingIssueId, () => new Error(`injected recovery write failure for ${failingIssueId}`));
+        const result = await recovery.reconcileStrandedAssignedIssues();
+        expect(result.issueIds).toContain(ordinaryIssueId);
+        expect(result.issueIds).not.toContain(failingIssueId);
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.objectContaining({ issueId: failingIssueId, sweep }),
+          expect.stringContaining("skipped a card"),
+        );
+        return;
+      }
+      const downstreamId = randomUUID();
+      await db.insert(issues).values({
+        id: downstreamId,
+        companyId: seeded.companyId,
+        title: "Downstream card",
+        status: "blocked",
+        priority: "medium",
+        issueNumber: 8,
+        identifier: `${seeded.prefix}-8`,
+      });
+      const failingIssueId = await seedOrphanBlocker({ ...seeded, creatorId: seeded.coderId, issueNumber: 9, downstreamId });
+      const ordinaryIssueId = await seedOrphanBlocker({ ...seeded, creatorId: seeded.coderId, issueNumber: 10, downstreamId });
+      issueUpdateHook.failures.set(failingIssueId, () => new Error(`injected recovery write failure for ${failingIssueId}`));
+      const result = await recovery.reconcileStrandedAssignedIssues();
+      expect(result.orphanBlockersAssigned).toBe(1);
+      expect(result.issueIds).toContain(ordinaryIssueId);
+      expect(result.issueIds).not.toContain(failingIssueId);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ issueId: failingIssueId, sweep }),
+        expect.stringContaining("skipped a card"),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("rethrows a lost database connection instead of skipping every card", async () => {
+    const seeded = await seedCompany();
+    const failingIssueId = await seedWikiHandoff({ ...seeded, issueNumber: 6 });
+    await seedOrdinaryStranded({ ...seeded, issueNumber: 7 });
+    issueUpdateHook.failures.set(failingIssueId, () =>
+      Object.assign(new Error("write CONNECTION_CLOSED db.example.internal:5432"), { code: "CONNECTION_CLOSED" }),
+    );
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    await expect(recovery.reconcileStrandedAssignedIssues()).rejects.toMatchObject({ code: "CONNECTION_CLOSED" });
+  });
+
+  async function seedOrphanBlocker(input: {
+    companyId: string;
+    prefix: string;
+    creatorId: string;
+    issueNumber: number;
+    downstreamId: string;
+    title?: string;
+  }) {
+    const blockerId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId: input.companyId,
+      title: input.title ?? `Orphan blocker ${input.issueNumber}`,
+      status: "todo",
+      priority: "medium",
+      createdByAgentId: input.creatorId,
+      issueNumber: input.issueNumber,
+      identifier: `${input.prefix}-${input.issueNumber}`,
+    });
+    await db.insert(issueRelations).values({
+      companyId: input.companyId,
+      issueId: blockerId,
+      relatedIssueId: input.downstreamId,
+      type: "blocks",
+    });
+    return blockerId;
+  }
+
+  it("continues the orphan-blocker sweep when one blocker's assignee write throws", async () => {
+    const seeded = await seedCompany();
+    const downstreamId = randomUUID();
+    await db.insert(issues).values({
+      id: downstreamId,
+      companyId: seeded.companyId,
+      title: "Downstream card",
+      status: "blocked",
+      priority: "medium",
+      issueNumber: 18,
+      identifier: `${seeded.prefix}-18`,
+    });
+    const refusedBlockerId = await seedOrphanBlocker({ ...seeded, creatorId: seeded.coderId, issueNumber: 19, downstreamId });
+    const ordinaryBlockerId = await seedOrphanBlocker({ ...seeded, creatorId: seeded.coderId, issueNumber: 20, downstreamId });
+    issueUpdateHook.failures.set(refusedBlockerId, () => new Error("injected assignee write failure"));
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined as never);
+    try {
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => ({ id: randomUUID() }) as never) });
+      const result = await recovery.reconcileStrandedAssignedIssues();
+      expect(result.orphanBlockersAssigned).toBe(1);
+      expect(result.issueIds).toContain(ordinaryBlockerId);
+      expect(result.issueIds).not.toContain(refusedBlockerId);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          issueId: refusedBlockerId,
+          sweep: "recovery.reconcile_unassigned_blocking_issue",
+        }),
+        expect.stringContaining("skipped a card"),
+      );
+      const [refused, ordinary] = await Promise.all([
+        db.select().from(issues).where(eq(issues.id, refusedBlockerId)).then((rows) => rows[0]),
+        db.select().from(issues).where(eq(issues.id, ordinaryBlockerId)).then((rows) => rows[0]),
+      ]);
+      expect(refused?.assigneeAgentId).toBeNull();
+      expect(ordinary?.assigneeAgentId).toBe(seeded.coderId);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  async function seedExhaustedInReview(input: {
+    companyId: string;
+    prefix: string;
+    agentId: string;
+    issueNumber: number;
+    wikiHandoff: boolean;
+  }) {
+    const issueId = input.wikiHandoff
+      ? await seedWikiHandoff({
+          companyId: input.companyId,
+          prefix: input.prefix,
+          intruderId: input.agentId,
+          issueNumber: input.issueNumber,
+        })
+      : randomUUID();
+    if (!input.wikiHandoff) {
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: input.companyId,
+        title: "Ordinary in-review card",
+        status: "in_review",
+        priority: "medium",
+        assigneeAgentId: input.agentId,
+        issueNumber: input.issueNumber,
+        identifier: `${input.prefix}-${input.issueNumber}`,
+      });
+    }
+    await db.insert(issueRecoveryActions).values({
+      id: randomUUID(),
+      companyId: input.companyId,
+      sourceIssueId: issueId,
+      kind: "workspace_validation",
+      status: "escalated",
+      ownerType: "board",
+      previousOwnerAgentId: input.agentId,
+      cause: "workspace_validation_failed",
+      fingerprint: `workspace:provision:failure:${issueId}`,
+      attemptCount: 5,
+      maxAttempts: 5,
+      nextAction: "Repair the worktree provisioning failure.",
+      outcome: "exhausted",
+      evidence: { identifier: null },
+      lastAttemptAt: new Date("2026-11-07T09:00:00.000Z"),
+    });
+    return issueId;
+  }
+
+  it("continues the exhausted-recovery drain when the monitor re-arm on a non-canonical Wiki handoff is refused", async () => {
+    const seeded = await seedCompany();
+    const wikiIssueId = await seedExhaustedInReview({ ...seeded, agentId: seeded.intruderId, issueNumber: 11, wikiHandoff: true });
+    const ordinaryIssueId = await seedExhaustedInReview({ ...seeded, agentId: seeded.coderId, issueNumber: 12, wikiHandoff: false });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const result = await recovery.reconcileExhaustedRecoveryDrain();
+
+    expect(result.checked).toBe(2);
+    expect(result.issueIds).toContain(ordinaryIssueId);
+    expect(result.issueIds).not.toContain(wikiIssueId);
+    const [wiki, ordinary] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, wikiIssueId)).then((rows) => rows[0]),
+      db.select().from(issues).where(eq(issues.id, ordinaryIssueId)).then((rows) => rows[0]),
+    ]);
+    expect(wiki?.monitorNextCheckAt).toBeNull();
+    expect(ordinary?.monitorNextCheckAt).not.toBeNull();
+  });
+
+  it("continues the stale-lock sweep when one card's raw row write is refused by the database", async () => {
+    const seeded = await seedCompany();
+    const seedLockedCard = async (title: string, issueNumber: number) => {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        invocationSource: "manual",
+        status: "failed",
+        startedAt: new Date("2026-11-07T10:00:00.000Z"),
+        finishedAt: new Date("2026-11-07T10:01:00.000Z"),
+      });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: seeded.companyId,
+        title,
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: seeded.coderId,
+        checkoutRunId: runId,
+        issueNumber,
+        identifier: `${seeded.prefix}-${issueNumber}`,
+      });
+      return issueId;
+    };
+    const refusedIssueId = await seedLockedCard("Refused stale lock", 13);
+    const ordinaryIssueId = await seedLockedCard("Ordinary stale lock", 14);
+    await db.execute(sql`
+      create or replace function test_refuse_stale_lock_clear() returns trigger as $$
+      begin
+        if new.title = 'Refused stale lock' and new.checkout_run_id is null then
+          raise exception 'injected stale lock write refusal';
+        end if;
+        return new;
+      end
+      $$ language plpgsql
+    `);
+    await db.execute(sql`
+      create trigger test_refuse_stale_lock_clear before update on issues
+      for each row execute function test_refuse_stale_lock_clear()
+    `);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    try {
+      const result = await recovery.sweepStaleIssueLocks();
+
+      expect(result.issueIds).toEqual([ordinaryIssueId]);
+      const [refused, ordinary] = await Promise.all([
+        db.select().from(issues).where(eq(issues.id, refusedIssueId)).then((rows) => rows[0]),
+        db.select().from(issues).where(eq(issues.id, ordinaryIssueId)).then((rows) => rows[0]),
+      ]);
+      expect(refused?.checkoutRunId).not.toBeNull();
+      expect(ordinary?.checkoutRunId).toBeNull();
+    } finally {
+      await db.execute(sql`drop trigger if exists test_refuse_stale_lock_clear on issues`);
+    }
+  });
+
+  it("still refuses an explicit non-canonical assignee write on a Wiki handoff", async () => {
+    const seeded = await seedCompany();
+    const wikiIssueId = await seedWikiHandoff({ ...seeded, issueNumber: 5 });
+    const svc = issueService(db);
+
+    await expect(svc.update(wikiIssueId, { status: "blocked", blockedByIssueIds: [] })).resolves.toMatchObject({
+      status: "blocked",
+      assigneeAgentId: seeded.intruderId,
+    });
+    await expect(svc.update(wikiIssueId, { assigneeAgentId: seeded.coderId })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_non_canonical_assignee" }),
+    });
+  });
+});

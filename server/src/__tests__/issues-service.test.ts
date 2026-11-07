@@ -8716,6 +8716,7 @@ describeEmbeddedPostgres("issueService.update Wiki handoff guard", () => {
     await db.delete(pluginManagedResources);
     await db.delete(issues);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(plugins);
     await db.delete(companies);
   });
@@ -8810,6 +8811,174 @@ describeEmbeddedPostgres("issueService.update Wiki handoff guard", () => {
     await expect(svc.getById(issueId)).resolves.toMatchObject({
       title: "Ordinary issue",
       assigneeAgentId: otherAgentId,
+    });
+  });
+
+  it("refuses a user-only assignee write on an unassigned Wiki handoff", async () => {
+    const companyId = randomUUID();
+    const pluginId = randomUUID();
+    const canonicalAgentId = randomUUID();
+    const issueId = randomUUID();
+    const userId = `board-${randomUUID()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      packageName: "@paperclipai/plugin-llm-wiki",
+      version: "0.1.0",
+      apiVersion: 1,
+      categories: [],
+      manifestJson: {} as never,
+      status: "ready",
+      installOrder: 1,
+    });
+    await db.insert(agents).values({
+      id: canonicalAgentId,
+      companyId,
+      name: "Wiki Maintainer",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(pluginManagedResources).values({
+      companyId,
+      pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      resourceKind: "agent",
+      resourceKey: "wiki-maintainer",
+      resourceId: canonicalAgentId,
+      defaultsJson: {},
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: userId,
+      status: "active",
+      membershipRole: "member",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Handoff to Wiki Maintainer",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      executionPolicy: { mode: "normal", stages: [] },
+      executionState: null,
+    });
+
+    await expect(svc.update(issueId, { assigneeUserId: userId })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
+    });
+    await expect(svc.getById(issueId)).resolves.toMatchObject({
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    });
+  });
+
+  it("admits allow-listed bookkeeping and refuses other keys on a non-canonical Wiki handoff", async () => {
+    const companyId = randomUUID();
+    const pluginId = randomUUID();
+    const canonicalAgentId = randomUUID();
+    const intruderId = randomUUID();
+    const userId = `board-${randomUUID()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      packageName: "@paperclipai/plugin-llm-wiki",
+      version: "0.1.0",
+      apiVersion: 1,
+      categories: [],
+      manifestJson: {} as never,
+      status: "ready",
+      installOrder: 1,
+    });
+    await db.insert(agents).values([
+      { id: canonicalAgentId, companyId, name: "Wiki Maintainer", role: "engineer", status: "active", adapterType: "process", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+      { id: intruderId, companyId, name: "coder-LE", role: "engineer", status: "idle", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+    ]);
+    await db.insert(pluginManagedResources).values({
+      companyId, pluginId, pluginKey: "paperclipai.plugin-llm-wiki", resourceKind: "agent", resourceKey: "wiki-maintainer", resourceId: canonicalAgentId, defaultsJson: {},
+    });
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "member",
+    });
+    const shapes = [
+      { name: "canonical", assigneeAgentId: canonicalAgentId, assigneeUserId: null, status: "todo" },
+      { name: "non-canonical", assigneeAgentId: intruderId, assigneeUserId: null, status: "in_review" },
+      { name: "unassigned", assigneeAgentId: null, assigneeUserId: null, status: "todo" },
+      { name: "user-owned", assigneeAgentId: null, assigneeUserId: userId, status: "todo" },
+      { name: "incident", assigneeAgentId: intruderId, assigneeUserId: null, status: "in_review" },
+    ];
+    const ids: string[] = [];
+    for (const [index, shape] of shapes.entries()) {
+      const id = randomUUID();
+      ids.push(id);
+      await db.insert(issues).values({
+        id,
+        companyId,
+        title: "Handoff to Wiki Maintainer",
+        status: shape.status,
+        priority: "medium",
+        assigneeAgentId: shape.assigneeAgentId,
+        assigneeUserId: shape.assigneeUserId,
+        issueNumber: index + 1,
+        identifier: `T${index + 1}`,
+      });
+    }
+    for (const id of ids) {
+      await expect(svc.update(id, { status: "todo", companyGuard: companyId })).resolves.toMatchObject({ id });
+      await expect(svc.update(id, { blockedByIssueIds: [] })).resolves.toMatchObject({ id });
+      await expect(
+        svc.update(id, { status: "todo", lastStatusDecisionId: null, unblockDescriptor: null }),
+      ).resolves.toMatchObject({ id });
+    }
+    await expect(svc.update(ids[1]!, { priority: "low" })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_non_canonical_assignee" }),
+    });
+    await expect(svc.update(ids[2]!, { hiddenAt: null })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
+    });
+    await expect(svc.update(ids[2]!, { parentId: null })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
+    });
+    await expect(svc.update(ids[2]!, { billingCode: "x" })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
+    });
+    await expect(svc.update(ids[2]!, { requestDepth: 1 })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
+    });
+    await expect(svc.update(ids[2]!, { labelIds: [] })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
+    });
+    await expect(svc.update(ids[2]!, { status: "todo", assigneeUserId: userId })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
+    });
+    await expect(svc.update(ids[3]!, { assigneeUserId: userId })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
     });
   });
 
