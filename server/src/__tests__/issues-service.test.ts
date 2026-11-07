@@ -8944,6 +8944,9 @@ describeEmbeddedPostgres("issueService.update Wiki handoff guard", () => {
     for (const id of ids) {
       await expect(svc.update(id, { status: "todo", companyGuard: companyId })).resolves.toMatchObject({ id });
       await expect(svc.update(id, { blockedByIssueIds: [] })).resolves.toMatchObject({ id });
+      await expect(
+        svc.update(id, { status: "todo", lastStatusDecisionId: null, unblockDescriptor: null }),
+      ).resolves.toMatchObject({ id });
     }
     await expect(svc.update(ids[1]!, { priority: "low" })).rejects.toMatchObject({
       status: 422,

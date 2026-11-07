@@ -633,17 +633,19 @@ startup can finish and the listener stays open.
 The Wiki handoff guard runs on any issue write that is not purely status and
 blocker bookkeeping. `assigneeUserId` is guarded, the same as
 `assigneeAgentId`. The guard is skipped only when every present key is in this
-allow-list: `status`, `blockedByIssueIds`, `unblockDescriptor`,
-`companyGuard`. A status-only or blocker-only park still passes. Any other key,
+allow-list: `status`, `blockedByIssueIds`, `lastStatusDecisionId`,
+`unblockDescriptor`, `companyGuard`. A status-only or blocker-only park still
+passes, and so does the native policy-review cleanup, which writes `status`,
+`lastStatusDecisionId` and `unblockDescriptor` together. Any other key,
 including `priority`, `labelIds`, `hiddenAt`, `parentId`, `billingCode`,
-`requestDepth`, and the monitor and status-version columns, runs the guard. The
+`requestDepth`, `statusVersion`, and the monitor columns, runs the guard. The
 monitor re-arm paths always send `executionPolicy` with the monitor columns, and
-the native status-decision writes send `statusVersion` and
-`lastStatusDecisionId` with actor fields, so those keys are never a write on
-their own and are not allow-listed. Known consequence: a non-canonical Wiki
-handoff card with an exhausted recovery action is skipped at every tick and does
-not get a monitor, because the guard refuses its `executionPolicy` write. The
-base build crashed startup on the same card.
+the native status-decision commits send `statusVersion` with
+`actorAgentId` and `actorUserId` (null values still count as present keys), so
+those keys never form a write on their own and are not allow-listed. Known
+consequence: a non-canonical Wiki handoff card with an exhausted recovery action
+is skipped at every tick and does not get a monitor, because the guard refuses
+its `executionPolicy` write. The base build crashed startup on the same card.
 
 The boundary is the write path. Per-card isolation is required for every
 startup sweep that writes issue rows through the guarded issue service
