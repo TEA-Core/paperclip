@@ -509,6 +509,7 @@ describe("openapi routes", () => {
     );
     expect(override.description).toContain("child-delivery-parent-close");
     expect(override.description).toContain("merged-elsewhere");
+    expect(override.description).toContain("control-plane-operation-no-deliverable");
     expect(override.description).toContain("done_transition_missing_delivery");
 
     const identity = schema.properties.deliveryIdentity;
