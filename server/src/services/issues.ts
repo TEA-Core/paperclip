@@ -12160,24 +12160,13 @@ export function issueService(db: Db) {
         //   dispatch-suppression park, todo-stranded park, escalateDispositionRepair
         // blockedByIssueIds: blockIssueWithUnresolvedBlockers,
         //   resolveContinuationWaitingOnReview, reconcileActiveRecoveryActions
-        // statusVersion, lastStatusDecisionId: status-decision receipt bumps that
-        //   do not assign
         // unblockDescriptor: repairNativeBlockedWait
         // companyGuard: blockIssueWithUnresolvedBlockers company scope
-        // monitorNextCheckAt, monitorWakeRequestedAt, monitorNotes, monitorScheduledBy:
-        //   applyIssueMonitorPolicyTransition, used by scheduleProviderQuotaRecoveryMonitor
-        //   and armExhaustedBoardMonitor
         const wikiHandoffUnguardedWriteKeys = new Set([
           "status",
           "blockedByIssueIds",
-          "statusVersion",
-          "lastStatusDecisionId",
           "unblockDescriptor",
           "companyGuard",
-          "monitorNextCheckAt",
-          "monitorWakeRequestedAt",
-          "monitorNotes",
-          "monitorScheduledBy",
         ]);
         const presentWriteKeys = Object.entries(data)
           .filter(([, value]) => value !== undefined)

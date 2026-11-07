@@ -10525,7 +10525,6 @@ export function recoveryService(
     }
 
     for (const wake of candidates) {
-      await runRecoverySweepIssue({ id: issueIdByWake.get(wake.id) ?? wake.id, identifier: null }, "recovery.reconcile_deferred_wakeup_replay", async () => {
       const issueId = issueIdByWake.get(wake.id);
 
       // A wake with no `payload.issueId` — a generic timer or on-demand wake —
@@ -10539,7 +10538,7 @@ export function recoveryService(
       // enqueueWakeup's own same-scope coalescing, which merges onto the agent's
       // existing queued/running run instead of starting a second one.
       if (issueId) {
-        if (!openIssueIds.has(issueId)) return; // issue no longer open/visible.
+        if (!openIssueIds.has(issueId)) continue; // issue no longer open/visible.
 
         // The worktree-execution cutoff is still armed over this card, so the
         // suppression that produced the skip has NOT lifted. Hold the row
@@ -10553,7 +10552,7 @@ export function recoveryService(
           && issueCreatedAt < opts.issueCreatedAtGte
         ) {
           result.cutoffHeldSkipped++;
-          return;
+          continue;
         }
 
         // SUP-16879: the execution blocker that produced this skip is still in
@@ -10572,7 +10571,7 @@ export function recoveryService(
           && durableNoReplayHoldIssueIds.has(issueId)
         ) {
           result.executionBlockerHeldSkipped++;
-          return;
+          continue;
         }
 
         // Idempotency (A): another path already owns a live execution path for
@@ -10582,7 +10581,7 @@ export function recoveryService(
           (await hasQueuedIssueWake(wake.companyId, issueId, wake.agentId))
         ) {
           result.livePathSkipped++;
-          return;
+          continue;
         }
       }
 
@@ -10603,7 +10602,7 @@ export function recoveryService(
           ),
         )
         .returning({ id: agentWakeupRequests.id });
-      if (claimed.length === 0) return;
+      if (claimed.length === 0) continue;
 
       const replaySource: "timer" | "assignment" | "on_demand" | "automation" =
         wake.source === "timer" || wake.source === "on_demand" || wake.source === "automation"
@@ -10648,7 +10647,6 @@ export function recoveryService(
         // what catches the resulting stranded card.
         result.reDriveFailed++;
       }
-      });
     }
 
     if (result.reDriven > 0) {
@@ -11474,14 +11472,13 @@ export function recoveryService(
       const identifierByBlocker = new Map(blockerRows.map((row) => [row.id, row.identifier]));
 
       for (const blocker of blockers) {
-        await runRecoverySweepIssue({ id: blocker.blockerIssueId, identifier: identifierByBlocker.get(blocker.blockerIssueId) ?? null }, "recovery.reconcile_unfinalizable_workspace_barriers", async () => {
         const gatedCandidateIds = blocker.gatedDependentIssueIds.filter((dependentId) =>
           candidateIds.has(dependentId),
         );
 
         if (gatedCandidateIds.length === 0) {
           result.skipped += 1;
-          return;
+          continue;
         }
 
         result.reported += 1;
@@ -11512,7 +11509,6 @@ export function recoveryService(
             },
           });
         }
-        });
       }
     }
 

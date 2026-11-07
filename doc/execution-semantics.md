@@ -633,12 +633,17 @@ startup can finish and the listener stays open.
 The Wiki handoff guard runs on any issue write that is not purely status and
 blocker bookkeeping. `assigneeUserId` is guarded, the same as
 `assigneeAgentId`. The guard is skipped only when every present key is in this
-allow-list: `status`, `blockedByIssueIds`, `statusVersion`,
-`lastStatusDecisionId`, `unblockDescriptor`, `companyGuard`,
-`monitorNextCheckAt`, `monitorWakeRequestedAt`, `monitorNotes`,
-`monitorScheduledBy`. A status-only or blocker-only park still passes. Any
-other key, including `priority`, `labelIds`, `hiddenAt`, `parentId`,
-`billingCode`, and `requestDepth`, runs the guard.
+allow-list: `status`, `blockedByIssueIds`, `unblockDescriptor`,
+`companyGuard`. A status-only or blocker-only park still passes. Any other key,
+including `priority`, `labelIds`, `hiddenAt`, `parentId`, `billingCode`,
+`requestDepth`, and the monitor and status-version columns, runs the guard. The
+monitor re-arm paths always send `executionPolicy` with the monitor columns, and
+the native status-decision writes send `statusVersion` and
+`lastStatusDecisionId` with actor fields, so those keys are never a write on
+their own and are not allow-listed. Known consequence: a non-canonical Wiki
+handoff card with an exhausted recovery action is skipped at every tick and does
+not get a monitor, because the guard refuses its `executionPolicy` write. The
+base build crashed startup on the same card.
 
 The boundary is the write path. Per-card isolation is required for every
 startup sweep that writes issue rows through the guarded issue service
@@ -656,21 +661,22 @@ startup sweeps:
 - Stranded assigned issues, including the unassigned-blocking-issue pass
   (`reconcileStrandedAssignedIssues`, `reconcileUnassignedBlockingIssues`).
 - Issue-graph liveness: resolved-dependency wake backstop, dispatch-suppression
-  parks (park resolution and park write), deferred-wakeup replay, todo-stranded
-  parks, and blocked-without-blockers (`reconcileIssueGraphLiveness`, also run
+  parks (park resolution and park write), todo-stranded parks, and
+  blocked-without-blockers (`reconcileIssueGraphLiveness`, also run
   directly for the last).
 - Stillborn assigned backlog, exhausted recovery drain, stale recovery-action
   wakes, pending-review re-arm, and undispatchable assigned issues (action
   resolution and escalation).
 - Cancelled-only-blocker dependents (action resolution and detection),
-  unfinalizable workspace barriers, stale `in_review` child archive, stale issue
+  stale `in_review` child archive, stale issue
   locks (the per-card lock clear only), and completed-run strand escalation.
 - Host-restart strand repairs (`sweepHostRestartStrandedIssues`).
-- Task watchdog reconciliation and the fired-never-rearmed monitor detector.
+- Task watchdog reconciliation (`reconcileTaskWatchdogs`).
 
-Several of these loops write only recovery-action, wake, activity or lock
-columns rather than calling `issueService.update`; the helper is applied to them
-as well. It is not a requirement of the boundary above.
+A few of these loops (the stale issue lock clear and the stale recovery-action
+wake reconciliation) write only lock columns, recovery-action rows or wake rows
+rather than calling `issueService.update`; the helper is applied to them as
+well. It is not a requirement of the boundary above.
 
 Active recovery-action reconciliation (`reconcileActiveRecoveryActions`)
 isolates each action with its own `try`/`catch`; it logs and skips the action
@@ -689,10 +695,9 @@ fails startup:
   lock columns with a direct drizzle update, resolves the watchdog recovery
   action, and inserts a watchdog decision row. For an open evaluation issue it
   also calls `issuesSvc.update(id, { status: "done" })` and adds a comment. That
-  patch carries only `status`, so neither the Wiki handoff guard (it runs only
-  on assignee agent, assignee user, title, description or execution policy/state writes) nor the
-  assignee review-stage gate (it runs only when the patch has `assigneeAgentId`)
-  is reached. It is not wrapped, and it runs inside the fold's open transaction.
+  patch carries only `status`, an allow-listed key, so the Wiki handoff guard
+  does not run, and the assignee review-stage gate (it runs only when the patch
+  has `assigneeAgentId`) is not reached. It is not wrapped, and it runs inside the fold's open transaction.
 - `promoteDueScheduledRetries`, per due retry run: promotes the run to `queued`
   or cancels a suppressed retry, updates the wake request, and clears the
   execution lock columns on `issues` with a direct drizzle update. No
@@ -715,6 +720,13 @@ fails startup:
   `reconcileStrandedAssignedIssues`: rewrites `evidence` on the
   `issue_recovery_actions` row with a direct drizzle update. It writes no issue
   row.
+- `reconcileDeferredWakeupReplay`, per deferred wake: a compare-and-swap on the
+  `agent_wakeup_requests` row, then `enqueueWakeup`, whose throw is already caught
+  per wake and counted as `reDriveFailed`. No `issueService.update`.
+- `reconcileUnfinalizableWorkspaceBarriers`, per blocker: report-only; writes
+  one activity-log row. No `issueService.update`.
+- `detectStaleIssueMonitors`, per stale monitor: one select and one activity-log
+  insert. No `issueService.update`.
 - Native-runner restart recovery fails closed by design and rethrows.
   Hot-restart adoption, the orphaned-run reap and the abandoned run scratch sweep
   are each caught as a whole by the caller, so startup continues after them.
