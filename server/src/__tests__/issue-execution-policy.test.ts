@@ -1,5 +1,6 @@
+import { isDeepStrictEqual } from "node:util";
 import { describe, expect, it } from "vitest";
-import { BASE_MAX_REVIEW_ROUNDS, DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, isReviewChangesRequestedTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { BASE_MAX_REVIEW_ROUNDS, DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertExecutionDecisionSnapshotCurrent, assertPatchableExecutionPolicyWrite, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, foldExecutionPolicyAgentIds, foldExecutionStateAgentIds, isReviewChangesRequestedTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
 import { HttpError } from "../errors.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
@@ -5359,5 +5360,93 @@ describe("approvalStatus preservation across monitor transitions (SUP-16977)", (
     });
     // No approvalStatus key is invented on a blank card.
     expect(state.approvalStatus).toBeUndefined();
+  });
+});
+
+describe("raw execution-row agent-id fold agrees with the decision snapshot compare", () => {
+  const stageId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const otherAgentId = "44444444-4444-4444-8444-444444444444";
+  type Principal = { type: "agent" | "user"; agentId?: string; userId?: string };
+
+  const stateWithSeat = (currentParticipant: Principal) => ({
+    status: "pending",
+    currentStageId: stageId,
+    currentStageIndex: 0,
+    currentStageType: "review",
+    currentParticipant,
+    returnAssignee: null,
+    completedStageIds: [],
+    lastDecisionId: null,
+    lastDecisionOutcome: null,
+  });
+  const policyWith = (participants: Principal[], toAgentId: string) => ({
+    mode: "normal",
+    commentRequired: true,
+    stages: [{ id: stageId, type: "review", phase: "pre_merge", approvalsNeeded: 1, participants }],
+    stallEscalation: { afterRounds: 2, toAgentId },
+  });
+  const seatedAgent = (agentId: string): Principal => ({ type: "agent", agentId });
+  const seatedUser = (userId: string): Principal => ({ type: "user", userId });
+
+  function decisionCompareAccepts(read: { state: unknown; policy: unknown }, locked: { state: unknown; policy: unknown }) {
+    try {
+      assertExecutionDecisionSnapshotCurrent(
+        parseIssueExecutionState(read.state),
+        normalizeIssueExecutionPolicy(read.policy),
+        { executionState: locked.state, executionPolicy: locked.policy },
+        "issue-1",
+      );
+      return true;
+    } catch (error) {
+      expect(error).toBeInstanceOf(HttpError);
+      return false;
+    }
+  }
+
+  const cases: Array<{ name: string; read: Principal | string; locked: Principal | string; part: "seat" | "participant" | "arbiter"; same: boolean }> = [
+    { name: "seated agent id differs only in case", part: "seat", read: seatedAgent(qaAgentId), locked: seatedAgent(qaAgentId.toUpperCase()), same: true },
+    { name: "seated agent is a different agent", part: "seat", read: seatedAgent(qaAgentId), locked: seatedAgent(otherAgentId), same: false },
+    { name: "seated user id differs only in case", part: "seat", read: seatedUser(boardUserId), locked: seatedUser(boardUserId.toUpperCase()), same: false },
+    { name: "policy participant agent id differs only in case", part: "participant", read: seatedAgent(qaAgentId), locked: seatedAgent(qaAgentId.toUpperCase()), same: true },
+    { name: "policy participant is a different agent", part: "participant", read: seatedAgent(qaAgentId), locked: seatedAgent(otherAgentId), same: false },
+    { name: "policy participant user id differs only in case", part: "participant", read: seatedUser(boardUserId), locked: seatedUser(boardUserId.toUpperCase()), same: false },
+    { name: "stall arbiter id differs only in case", part: "arbiter", read: ctoAgentId, locked: ctoAgentId.toUpperCase(), same: true },
+    { name: "stall arbiter is a different agent", part: "arbiter", read: ctoAgentId, locked: otherAgentId, same: false },
+  ];
+
+  it.each(cases)("$name", ({ part, read, locked, same }) => {
+    const build = (value: Principal | string) => {
+      if (part === "seat") return { state: stateWithSeat(value as Principal), policy: policyWith([seatedAgent(qaAgentId)], ctoAgentId) };
+      if (part === "participant") return { state: stateWithSeat(seatedAgent(qaAgentId)), policy: policyWith([value as Principal], ctoAgentId) };
+      return { state: stateWithSeat(seatedAgent(qaAgentId)), policy: policyWith([seatedAgent(qaAgentId)], value as string) };
+    };
+    const readRow = build(read);
+    const lockedRow = build(locked);
+
+    const foldEqual =
+      isDeepStrictEqual(foldExecutionStateAgentIds(readRow.state), foldExecutionStateAgentIds(lockedRow.state)) &&
+      isDeepStrictEqual(foldExecutionPolicyAgentIds(readRow.policy), foldExecutionPolicyAgentIds(lockedRow.policy));
+
+    expect(foldEqual).toBe(same);
+    expect(decisionCompareAccepts(readRow, lockedRow)).toBe(foldEqual);
+  });
+
+  it("folds the seat with trim + lowercase and a policy id with lowercase only", () => {
+    expect(foldExecutionStateAgentIds(stateWithSeat(seatedAgent(` ${qaAgentId.toUpperCase()} `)))).toMatchObject({
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+    });
+    const policy = foldExecutionPolicyAgentIds(policyWith([seatedAgent(` ${qaAgentId.toUpperCase()} `)], ctoAgentId.toUpperCase())) as ReturnType<typeof policyWith>;
+    expect(policy.stages[0].participants[0]).toMatchObject({ agentId: ` ${qaAgentId} ` });
+    expect(policy.stallEscalation.toAgentId).toBe(ctoAgentId);
+  });
+
+  it("leaves user ids and non-execution shapes untouched", () => {
+    const userState = stateWithSeat(seatedUser("Board-User"));
+    expect(foldExecutionStateAgentIds(userState)).toBe(userState);
+    expect(foldExecutionStateAgentIds(null)).toBeNull();
+    expect(foldExecutionPolicyAgentIds(undefined)).toBeNull();
+    expect(foldExecutionPolicyAgentIds(policyWith([seatedUser("Board-User")], ctoAgentId))).toMatchObject({
+      stages: [{ participants: [{ type: "user", userId: "Board-User" }] }],
+    });
   });
 });
