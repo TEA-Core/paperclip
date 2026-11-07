@@ -858,6 +858,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     issueId: string,
     overrides: {
       state?: string | null;
+      merged?: boolean;
       draft?: boolean;
       number?: number;
       headRefName?: string;
@@ -872,6 +873,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     const repo = overrides.repo ?? REPO;
     const data: Record<string, unknown> = {
       state: overrides.state ?? "open",
+      merged: overrides.merged ?? false,
       draft: overrides.draft ?? false,
       node_id: "PR_node_id_12345",
       head: { ref: overrides.headRefName ?? "SUP-42-branch" },
@@ -1975,7 +1977,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
 
       expect(result.kind).toBe("resolved");
       if (result.kind === "resolved") {
-        expect(result.headSha).toBe(APPROVED_HEAD);
+        expect(result.headSha).toBe(MERGE_SHA);
         expect(result.displayName).toBe(`${OWNER}/${REPO}#42`);
       }
     });
@@ -2057,9 +2059,54 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
 
       expect(result.kind).toBe("resolved");
       if (result.kind === "resolved") {
-        expect(result.headSha).toBe(APPROVED_HEAD);
+        expect(result.headSha).toBe(MERGE_SHA);
         expect(result.displayName).toBe(`${OWNER}/${REPO}#42`);
       }
+    });
+
+    it("does not reapply open-head delivery identity checks after proving a merged delivery", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([
+        {
+          url: PR_URL,
+          body: {
+            ...mergedPrHeadBody(),
+            title: "Renamed after merge",
+            head: {
+              ref: "deleted-after-merge",
+              sha: LIVE_HEAD,
+              repo: { full_name: "fork-owner/fork-repo" },
+            },
+          },
+        },
+        { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") {
+        expect(result.headSha).toBe(MERGE_SHA);
+        expect(result.displayName).toBe(`${OWNER}/${REPO}#42`);
+      }
+    });
+
+    it("accepts a cached merged delivery when no recorded PR binding remains", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "closed", merged: true, baseRef: "main" });
+      installRoutes([
+        { url: PR_URL, body: mergedPrHeadBody() },
+        { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result).toEqual({
+        kind: "resolved",
+        headSha: MERGE_SHA,
+        displayName: `${OWNER}/${REPO}#42`,
+        pr: { owner: OWNER, repo: REPO, number: 42 },
+      });
     });
 
     it("preflightFinalDelivery keeps refusing the closed-UNMERGED delivery", async () => {
@@ -5241,6 +5288,30 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       if (result.kind === "resolved") {
         expect(result.headSha).toBe(APPROVED_HEAD);
       }
+    });
+
+    it("preflight accepts an open anchored PR on a shared workspace", async () => {
+      const issueId = await insertSharedCard();
+      await insertMention(issueId, { number: 42, headRefName: "SUP-42-adr-074-alarm-pin-tamper" });
+      installRoutes([{
+        url: PR_URL,
+        body: {
+          state: "open",
+          draft: false,
+          merged: false,
+          title: "Fix thing (SUP-42)",
+          head: {
+            ref: "SUP-42-adr-074-alarm-pin-tamper",
+            sha: APPROVED_HEAD,
+            repo: { full_name: `${OWNER}/${REPO}` },
+          },
+        },
+      }]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") expect(result.headSha).toBe(APPROVED_HEAD);
     });
 
     it("still refuses a PR the shared card merely CITED (another card's identifier prefix)", async () => {
