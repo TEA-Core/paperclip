@@ -921,6 +921,40 @@ describe("startServer feedback export wiring", () => {
     }
   }, 30_000);
 
+  it("keeps the listener open when stranded recovery finishes after a per-issue write failure", async () => {
+    const { cleanup } = useIsolatedSecretsDir("paperclip-startup-wiki-guard-");
+    const originalHome = process.env.PAPERCLIP_HOME;
+    const isolatedHome = mkdtempSync(path.join(tmpdir(), "paperclip-startup-wiki-guard-home-"));
+    process.env.PAPERCLIP_HOME = isolatedHome;
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    heartbeatServiceMock.reconcileStrandedAssignedIssues.mockResolvedValueOnce({
+      assignmentDispatched: 0,
+      dispatchRequeued: 0,
+      continuationRequeued: 0,
+      successfulRunHandoffEscalated: 0,
+      escalated: 1,
+      skipped: 1,
+      issueIds: [],
+    });
+
+    try {
+      const started = await startServer();
+
+      expect(started.server).toBe(fakeServer);
+      expect(fakeServer.listen).toHaveBeenCalled();
+      expect(fakeServer.close).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalled();
+    } finally {
+      if (originalHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = originalHome;
+      rmSync(isolatedHome, { recursive: true, force: true });
+      cleanup();
+    }
+  });
+
   it("exits nonzero from the main module when startup recovery fails after the listener binds", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,

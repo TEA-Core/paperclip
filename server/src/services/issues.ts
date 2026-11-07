@@ -12153,32 +12153,46 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
-        await assertWikiHandoffWriteIntegrity({
-          db: tx as Db,
-          companyId: receiptExisting.companyId,
-          issue: {
-            title:
-              issueData.title !== undefined ? issueData.title : receiptExisting.title,
-            description:
-              issueData.description !== undefined
-                ? issueData.description
-                : receiptExisting.description,
-            executionPolicy:
-              issueData.executionPolicy !== undefined
-                ? issueData.executionPolicy
-                : receiptExisting.executionPolicy,
-            executionState:
-              issueData.executionState !== undefined
-                ? issueData.executionState
-                : receiptExisting.executionState,
-          },
-          incomingAssigneeAgentId:
-            issueData.assigneeAgentId !== undefined
-              ? issueData.assigneeAgentId
-              : receiptExisting.assigneeAgentId,
-          checkReviewStage: false,
-          workflowControlledAssignment,
-        });
+        // A status or blocker write that does not change the assignee, title,
+        // description, or execution policy/state is not an assignee write.
+        // Substituting the locked assignee made a recovery park of an already
+        // non-canonical Wiki handoff look like a new assignee write and refuse
+        // with wiki_handoff_non_canonical_assignee. Identity and assignee writes
+        // still present the resulting assignee to the guard.
+        const wikiHandoffIdentityWrite =
+          issueData.assigneeAgentId !== undefined ||
+          issueData.title !== undefined ||
+          issueData.description !== undefined ||
+          issueData.executionPolicy !== undefined ||
+          issueData.executionState !== undefined;
+        if (wikiHandoffIdentityWrite) {
+          await assertWikiHandoffWriteIntegrity({
+            db: tx as Db,
+            companyId: receiptExisting.companyId,
+            issue: {
+              title:
+                issueData.title !== undefined ? issueData.title : receiptExisting.title,
+              description:
+                issueData.description !== undefined
+                  ? issueData.description
+                  : receiptExisting.description,
+              executionPolicy:
+                issueData.executionPolicy !== undefined
+                  ? issueData.executionPolicy
+                  : receiptExisting.executionPolicy,
+              executionState:
+                issueData.executionState !== undefined
+                  ? issueData.executionState
+                  : receiptExisting.executionState,
+            },
+            incomingAssigneeAgentId:
+              issueData.assigneeAgentId !== undefined
+                ? issueData.assigneeAgentId
+                : receiptExisting.assigneeAgentId,
+            checkReviewStage: false,
+            workflowControlledAssignment,
+          });
+        }
         if (
           issueData.assigneeAgentId !== undefined &&
           !workflowControlledAssignment
