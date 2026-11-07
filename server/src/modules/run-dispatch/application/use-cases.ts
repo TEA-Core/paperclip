@@ -1,3 +1,4 @@
+import { MAX_QUEUED_ISSUE_RUN_AGE_MS } from "../domain/policy.js";
 import type { RunDispatchWriter, ScheduledRetryReader } from "./ports.js";
 import type { PostCommitEffect, PromoteScheduledRetryOutcome } from "./types.js";
 
@@ -24,6 +25,27 @@ export function createPromoteScheduledRetry(deps: { writer: RunDispatchWriter })
 }
 
 const MAX_DUE_RETRIES_PER_SWEEP = 50;
+const MAX_STALE_QUEUED_RUNS_PER_SWEEP = 50;
+
+export function createSweepStaleQueuedRuns(deps: {
+  reader: Pick<ScheduledRetryReader, "listStaleQueuedRuns">;
+  cancelStaleQueuedRun: ReturnType<typeof createCancelStaleQueuedRun>;
+}) {
+  return async function sweepStaleQueuedRuns(input: { now?: Date }) {
+    const now = input.now ?? new Date();
+    const cutoff = new Date(now.getTime() - MAX_QUEUED_ISSUE_RUN_AGE_MS);
+    const staleRuns = await deps.reader.listStaleQueuedRuns({ cutoff, limit: MAX_STALE_QUEUED_RUNS_PER_SWEEP });
+    const cancelledRunIds: string[] = [];
+    const postCommitEffects: PostCommitEffect[] = [];
+    for (const run of staleRuns.slice(0, MAX_STALE_QUEUED_RUNS_PER_SWEEP)) {
+      const result = await deps.cancelStaleQueuedRun({ ...run, expectedStatus: "queued", now });
+      if (result.outcome !== "cancelled") continue;
+      cancelledRunIds.push(run.runId);
+      postCommitEffects.push(...(result.postCommitEffects ?? []));
+    }
+    return { cancelled: cancelledRunIds.length, runIds: cancelledRunIds, postCommitEffects };
+  };
+}
 
 export function createPromoteDueScheduledRetries(deps: {
   reader: ScheduledRetryReader;

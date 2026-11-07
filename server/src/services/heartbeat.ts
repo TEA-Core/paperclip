@@ -17725,6 +17725,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { promoted: result.promoted, runIds: result.runIds };
   }
 
+  async function sweepStaleQueuedRuns(now = new Date()) {
+    const result = await runDispatch.sweepStaleQueuedRuns({ now });
+    applyRunDispatchPostCommitEffects(result.postCommitEffects);
+    return { cancelled: result.cancelled, runIds: result.runIds };
+  }
+
   async function getIssueRetryRun(
     companyId: string,
     issueId: string,
@@ -22361,6 +22367,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
+    await sweepStaleQueuedRuns();
     await resumeExecutionWaitComments();
     const cutoff = await getWorktreeExecutionCutoff();
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
@@ -34336,6 +34343,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     promoteDueScheduledRetries,
     retryScheduledRetryNow,
 
+    sweepStaleQueuedRuns,
     resumeQueuedRuns,
 
     scheduleBoundedRetry: async (
