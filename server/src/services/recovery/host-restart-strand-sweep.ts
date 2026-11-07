@@ -10,7 +10,7 @@ import { logger } from "../../middleware/logger.js";
 import { issueService } from "../issues.js";
 import { applyIssueMonitorPolicyTransition, parseIssueExecutionState } from "../issue-execution-policy.js";
 import { readHostRestartMarker, resolveHostBootId } from "../host-boot-identity.js";
-import { blockIssueWithUnresolvedBlockers } from "./service.js";
+import { blockIssueWithUnresolvedBlockers, logRecoverySweepIssueFailure } from "./service.js";
 import {
   buildImmediateExecutionPathRecoveryNoticeSeed,
   buildStrandedRecoveryEscalationNotice,
@@ -795,32 +795,35 @@ export async function sweepHostRestartStrandedIssues(input: HostRestartStrandSwe
   for (const repair of plan.repairs) {
     const candidate = candidates.find((c) => c.id === repair.issueId);
     if (!candidate) continue;
+    try {
+      if (repair.kind === "rearm") {
+        const patch = buildRearmMonitorPatch({ now, candidate });
+        if (!patch) continue;
+        const rowsAffected = await (input.rearmMonitor ?? defaultRearmMonitor)(db, candidate, patch);
+        if (rowsAffected > 0) {
+          report.reArmed.push(candidate.id);
+          logger.info(
+            { issueId: candidate.id, identifier: candidate.identifier, bootId },
+            "host-restart strand sweep re-armed monitor",
+          );
+        }
+        continue;
+      }
 
-    if (repair.kind === "rearm") {
-      const patch = buildRearmMonitorPatch({ now, candidate });
-      if (!patch) continue;
-      const rowsAffected = await (input.rearmMonitor ?? defaultRearmMonitor)(db, candidate, patch);
-      if (rowsAffected > 0) {
-        report.reArmed.push(candidate.id);
+      if (repair.kind === "escalate" && repair.escalation) {
+        // Cheap pre-check only; the authoritative never-touch-live-run guard lives
+        // inside the escalation write (row lock + NOT-EXISTS) and cannot be raced.
+        if (await hasLiveRun(db, candidate.companyId, candidate.id)) continue;
+        const escalated = await (input.escalateIssue ?? defaultEscalateIssue)(db, candidate, repair.escalation, bootId);
+        if (!escalated) continue;
+        report.escalated.push(candidate.id);
         logger.info(
-          { issueId: candidate.id, identifier: candidate.identifier, bootId },
-          "host-restart strand sweep re-armed monitor",
+          { issueId: candidate.id, identifier: candidate.identifier, reason: repair.escalation.reason, bootId },
+          "host-restart strand sweep escalated stranded card",
         );
       }
-      continue;
-    }
-
-    if (repair.kind === "escalate" && repair.escalation) {
-      // Cheap pre-check only; the authoritative never-touch-live-run guard lives
-      // inside the escalation write (row lock + NOT-EXISTS) and cannot be raced.
-      if (await hasLiveRun(db, candidate.companyId, candidate.id)) continue;
-      const escalated = await (input.escalateIssue ?? defaultEscalateIssue)(db, candidate, repair.escalation, bootId);
-      if (!escalated) continue;
-      report.escalated.push(candidate.id);
-      logger.info(
-        { issueId: candidate.id, identifier: candidate.identifier, reason: repair.escalation.reason, bootId },
-        "host-restart strand sweep escalated stranded card",
-      );
+    } catch (err) {
+      logRecoverySweepIssueFailure(candidate, "recovery.host_restart_strand_sweep", err);
     }
   }
 

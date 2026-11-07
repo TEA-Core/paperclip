@@ -1385,6 +1385,17 @@ async function unresolvedBlockerIssues(db: Db, companyId: string, issueId: strin
  *
  * The empty case is logged rather than blocked, so the heal path stays observable.
  */
+export function logRecoverySweepIssueFailure(
+  issue: { id: string; identifier?: string | null },
+  source: string,
+  err: unknown,
+) {
+  logger.error(
+    { err, issueId: issue.id, identifier: issue.identifier ?? null, source },
+    "recovery sweep issue failed; leaving the card unchanged and continuing",
+  );
+}
+
 export async function blockIssueWithUnresolvedBlockers(
   db: Db,
   issue: { id: string; companyId: string; identifier: string | null; status: string },
@@ -2896,6 +2907,7 @@ export function recoveryService(
     const issueIds: string[] = [];
     const seen = new Set<string>();
     for (const candidate of candidates) {
+      try {
       if (seen.has(candidate.id)) continue;
       seen.add(candidate.id);
 
@@ -3046,6 +3058,10 @@ export function recoveryService(
         assigned += 1;
         issueIds.push(candidate.id);
       } else {
+        skipped += 1;
+      }
+      } catch (err) {
+        logRecoverySweepIssueFailure(candidate, "recovery.reconcile_unassigned_blocking_issue", err);
         skipped += 1;
       }
     }
@@ -6047,6 +6063,7 @@ export function recoveryService(
     }
 
     for (const issue of candidates) {
+      try {
       if (issue.conversationAgentId) {
         const lastRun = await getLatestIssueRun(issue.companyId, issue.id);
         if (lastRun?.status === "succeeded") {
@@ -7624,6 +7641,10 @@ export function recoveryService(
         result.continuationRequeued += 1;
         result.issueIds.push(issue.id);
       } else {
+        result.skipped += 1;
+      }
+      } catch (err) {
+        logRecoverySweepIssueFailure(issue, "recovery.reconcile_stranded_assigned_issues", err);
         result.skipped += 1;
       }
     }
@@ -9248,6 +9269,7 @@ export function recoveryService(
     result.candidateLimitSkipped = Math.max(0, (rows[0]?.totalCount ?? 0) - rows.length);
 
     for (const { action, issue } of rows) {
+      try {
       if (isStrandedIssueRecoveryIssue(issue)) continue;
 
       const monitorable = isMonitorableIssueShape({
@@ -9304,6 +9326,9 @@ export function recoveryService(
         }
       } else {
         result.noInvokableOwner++;
+      }
+      } catch (err) {
+        logRecoverySweepIssueFailure(issue, "recovery.reconcile_exhausted_recovery_drain", err);
       }
     }
 
@@ -9561,6 +9586,7 @@ export function recoveryService(
       );
 
       for (const candidate of companyCandidates) {
+        try {
         const readiness = readinessMap.get(candidate.id);
         if (!readiness || readiness.unresolvedBlockerCount !== 0) continue;
 
@@ -9948,6 +9974,9 @@ export function recoveryService(
             fingerprint: `bwob:${companyId}:${candidate.id}`,
           },
         });
+        } catch (err) {
+          logRecoverySweepIssueFailure(candidate, "recovery.reconcile_blocked_without_blockers", err);
+        }
       }
     }
 
@@ -10223,6 +10252,7 @@ export function recoveryService(
     );
 
     for (const candidate of issueRows) {
+      try {
       const lastRealActivity = [
         candidate.updatedAt,
         commentLatestById.get(candidate.id) ?? null,
@@ -10328,6 +10358,9 @@ export function recoveryService(
 
       result.parked++;
       result.issueIds.push(candidate.id);
+      } catch (err) {
+        logRecoverySweepIssueFailure(candidate, "recovery.reconcile_dispatch_suppression_parks", err);
+      }
     }
 
     if (result.parked > 0) {
@@ -10836,6 +10869,7 @@ export function recoveryService(
     );
 
     for (const candidate of issueRows) {
+      try {
       const assignee = candidate.assigneeAgentId
         ? assigneeById.get(candidate.assigneeAgentId)
         : null;
@@ -10954,6 +10988,9 @@ export function recoveryService(
 
       result.parked += 1;
       result.issueIds.push(candidate.id);
+      } catch (err) {
+        logRecoverySweepIssueFailure(candidate, "recovery.reconcile_todo_stranded_cards", err);
+      }
     }
 
     if (result.parked > 0) {
@@ -11032,6 +11069,7 @@ export function recoveryService(
 
     result.checked = candidates.length;
     for (const candidate of candidates) {
+      try {
       const effectiveMaxAttempts = candidate.maxAttempts ?? MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
 
       if (candidate.attemptCount >= effectiveMaxAttempts) {
@@ -11201,6 +11239,13 @@ export function recoveryService(
         logger.warn(
           { err, recoveryActionId: candidate.id, sourceIssueId: candidate.sourceIssueId },
           "failed to re-fire stale recovery action wake",
+        );
+      }
+      } catch (err) {
+        logRecoverySweepIssueFailure(
+          { id: candidate.sourceIssueId, identifier: null },
+          "recovery.reconcile_stale_recovery_action_wakes",
+          err,
         );
       }
     }
@@ -11914,6 +11959,7 @@ export function recoveryService(
       .limit(STILLBORN_ASSIGNED_BACKLOG_CANDIDATE_LIMIT);
 
     for (const candidate of candidates) {
+      try {
       if (await hasActiveExecutionPath(candidate.companyId, candidate.id, candidate.assigneeAgentId)) {
         result.skipped += 1;
         continue;
@@ -11966,6 +12012,10 @@ export function recoveryService(
           recoveryActionId: action?.id ?? null,
         },
       });
+      } catch (err) {
+        logRecoverySweepIssueFailure(candidate, "recovery.reconcile_stillborn_assigned_backlog", err);
+        result.skipped += 1;
+      }
     }
 
     const shouldLog =
