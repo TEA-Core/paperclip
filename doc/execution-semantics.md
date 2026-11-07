@@ -699,7 +699,8 @@ fails startup:
   also calls `issuesSvc.update(id, { status: "done" })` and adds a comment. That
   patch carries only `status`, an allow-listed key, so the Wiki handoff guard
   does not run, and the assignee review-stage gate (it runs only when the patch
-  has `assigneeAgentId`) is not reached. It is not wrapped, and it runs inside the fold's open transaction.
+  has `assigneeAgentId`) is not reached. It is not wrapped, and it runs inside
+  the fold's open transaction.
 - `promoteDueScheduledRetries`, per due retry run: promotes the run to `queued`
   or cancels a suppressed retry, updates the wake request, and clears the
   execution lock columns on `issues` with a direct drizzle update. No
