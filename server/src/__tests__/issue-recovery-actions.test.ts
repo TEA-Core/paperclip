@@ -5607,6 +5607,191 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(successor.maxAttempts).toBe(5);
   });
 
+  // -- SUP-22273: re-mint depth cap while the owner is live --
+
+  async function seedRecentRun(companyId: string, agentId: string, startedAt: Date) {
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "manual",
+      status: "succeeded",
+      startedAt,
+      finishedAt: new Date(startedAt.getTime() + 60_000),
+    });
+  }
+
+  it("caps a re-minted successor one below the ceiling while the owner ran since the predecessor was updated", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const fingerprint = "stranded:owner-live-cap:fingerprint";
+    const baseInput = {
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue" as const,
+      ownerType: "agent" as const,
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint,
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" as const },
+    };
+
+    const first = await svc.upsertSourceScoped(baseInput);
+    expect(first.attemptCount).toBe(1);
+    await db
+      .update(issueRecoveryActions)
+      .set({ attemptCount: 5 })
+      .where(eq(issueRecoveryActions.id, first.id));
+    await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      fingerprint,
+      status: "resolved",
+      outcome: "false_positive",
+      resolutionNote: "Cycle resolved.",
+    });
+
+    // Owner ran after the predecessor's last update (the resolve): live, not
+    // wedged.
+    await seedRecentRun(companyId, managerId, new Date());
+
+    // Without the cap this exact shape mints terminal at the ceiling (the test
+    // above). With SUP-22273 the successor carries headroom instead.
+    const successor = await svc.upsertSourceScoped(baseInput);
+    expect(successor.status).toBe("active");
+    expect(successor.outcome).toBeNull();
+    expect(successor.attemptCount).toBe(4);
+    expect(successor.attemptCount).toBeLessThan(successor.maxAttempts ?? 5);
+  });
+
+  it("does not cap a re-mint when the owner's run predates the predecessor's update", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const fingerprint = "stranded:owner-idle-cap:fingerprint";
+    const baseInput = {
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue" as const,
+      ownerType: "agent" as const,
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint,
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" as const },
+    };
+
+    const first = await svc.upsertSourceScoped(baseInput);
+    await db
+      .update(issueRecoveryActions)
+      .set({ attemptCount: 5 })
+      .where(eq(issueRecoveryActions.id, first.id));
+    await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      fingerprint,
+      status: "resolved",
+      outcome: "false_positive",
+      resolutionNote: "Cycle resolved.",
+    });
+
+    // 2h ago: inside the 6h window, but BEFORE the predecessor's updatedAt —
+    // the anchor is the predecessor's last update, not any recent run.
+    await seedRecentRun(companyId, managerId, new Date(Date.now() - 2 * 60 * 60_000));
+
+    const successor = await svc.upsertSourceScoped(baseInput);
+    expect(successor.status).toBe("escalated");
+    expect(successor.outcome).toBe("exhausted");
+    expect(successor.attemptCount).toBe(5);
+    expect(successor.maxAttempts).toBe(5);
+  });
+
+  it("caps a board-owned review_stage_unarmed re-mint while the pending participant (previousOwnerAgentId) is live", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const fingerprint = `review_stage_unarmed:${companyId}:${sourceIssueId}`;
+    const baseInput = {
+      companyId,
+      sourceIssueId,
+      kind: "review_stage_unarmed" as const,
+      ownerType: "board" as const,
+      ownerAgentId: null,
+      previousOwnerAgentId: coderId,
+      cause: "review_stage_unarmed",
+      fingerprint,
+      nextAction: "Restore a live execution path.",
+      wakePolicy: null,
+    };
+
+    const first = await svc.upsertSourceScoped(baseInput);
+    expect(first.attemptCount).toBe(1);
+    await db
+      .update(issueRecoveryActions)
+      .set({ attemptCount: 5 })
+      .where(eq(issueRecoveryActions.id, first.id));
+    await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      kind: "review_stage_unarmed",
+      fingerprint,
+      status: "resolved",
+      outcome: "false_positive",
+      resolutionNote: "Cycle resolved.",
+    });
+
+    // The pending participant the board row was minted for is live.
+    await seedRecentRun(companyId, coderId, new Date());
+
+    const successor = await svc.upsertSourceScoped(baseInput);
+    expect(successor.status).toBe("active");
+    expect(successor.outcome).toBeNull();
+    expect(successor.attemptCount).toBe(4);
+    expect(successor.attemptCount).toBeLessThan(successor.maxAttempts ?? 5);
+  });
+
+  it("kind scope: a live owner does not cap other kinds' re-mint depth", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const fingerprint = "missing-disposition:owner-live:fingerprint";
+    const baseInput = {
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition" as const,
+      ownerType: "agent" as const,
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_state",
+      fingerprint,
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" as const },
+    };
+
+    const first = await svc.upsertSourceScoped(baseInput);
+    await db
+      .update(issueRecoveryActions)
+      .set({ attemptCount: 5 })
+      .where(eq(issueRecoveryActions.id, first.id));
+    await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      fingerprint,
+      status: "resolved",
+      outcome: "false_positive",
+      resolutionNote: "Cycle resolved.",
+    });
+
+    await seedRecentRun(companyId, managerId, new Date());
+
+    // Out-of-scope kind: the run-agnostic ceiling still mints terminal at 5.
+    const successor = await svc.upsertSourceScoped(baseInput);
+    expect(successor.status).toBe("escalated");
+    expect(successor.outcome).toBe("exhausted");
+    expect(successor.attemptCount).toBe(5);
+    expect(successor.maxAttempts).toBe(5);
+  });
+
   it("mints a re-minted successor terminal at an explicit successor ceiling", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     const svc = issueRecoveryActionService(db);

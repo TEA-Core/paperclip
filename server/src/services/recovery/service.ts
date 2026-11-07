@@ -112,7 +112,11 @@ import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { authorizationService } from "../authorization.js";
 import { unadmittedChatWakeupCondition } from "../durable-chat-wakeup.js";
-import { DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS, issueRecoveryActionService } from "../issue-recovery-actions.js";
+import {
+  DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS,
+  OWNER_LIVE_SWEEP_HOLD_KINDS,
+  issueRecoveryActionService,
+} from "../issue-recovery-actions.js";
 import {
   legacyExecutionNeedsReconciliation,
   terminalizeLegacyExecution,
@@ -10990,6 +10994,11 @@ export function recoveryService(
   //   - terminal/missing source issues are dropped (nothing left to recover)
   //   - `monitor_only` / `manual_repair_required` policies and non-wakeable
   //     causes are skipped without burning an attempt
+  //   - SUP-22273: stranded-participant kinds (`stranded_assigned_issue`,
+  //     `review_stage_unarmed`) whose owner (or pending participant) ran
+  //     within the participant live window are held — no attempt burn, no
+  //     ceiling escalation — until the live window expires or the bounded
+  //     hold deadline passes
   //   - ordinary `board_escalation` actions may be rerouted to an invokable
   //     owner; pending-participant board repairs stay manual across sweeps
   //   - attemptCount/lastAttemptAt are bumped under a compare-and-swap on the
@@ -11011,6 +11020,7 @@ export function recoveryService(
       skippedTerminalSource: 0,
       skippedBackoff: 0,
       skippedPauseHold: 0,
+      skippedOwnerLive: 0,
       enqueueFailed: 0,
       issueIds: [] as string[],
       actionIds: [] as string[],
@@ -11033,10 +11043,18 @@ export function recoveryService(
     result.checked = candidates.length;
     for (const candidate of candidates) {
       const effectiveMaxAttempts = candidate.maxAttempts ?? MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
+      const wakePolicyType = readRecoveryWakePolicyType(candidate);
 
-      if (candidate.attemptCount >= effectiveMaxAttempts) {
-        result.maxAttemptsReached += 1;
-        await escalateExhaustedRecoveryAction(candidate, effectiveMaxAttempts, now);
+      // This action was deliberately sent to the board because its pending
+      // participant cannot run. A different agent may be invokable, but
+      // reassigning the action to it recreates the failed recovery path.
+      // Board repair must explicitly restore/re-arm or reset the workflow.
+      if (
+        candidate.ownerType === "board" &&
+        wakePolicyType === "board_escalation" &&
+        readNonEmptyString(parseObject(candidate.wakePolicy).reason) === "pending_participant_unavailable"
+      ) {
+        result.nonWakeableSkipped += 1;
         continue;
       }
 
@@ -11045,10 +11063,52 @@ export function recoveryService(
         .from(issues)
         .where(eq(issues.id, candidate.sourceIssueId))
         .then((rows) => rows[0] ?? null);
+      const terminalSource =
+        !sourceIssue || sourceIssue.status === "done" || sourceIssue.status === "cancelled";
 
-      // Nothing left to recover: the source issue is gone or already terminal.
-      if (!sourceIssue || sourceIssue.status === "done" || sourceIssue.status === "cancelled") {
-        result.skippedTerminalSource += 1;
+      if (terminalSource) {
+        if (candidate.attemptCount >= effectiveMaxAttempts) {
+          result.maxAttemptsReached += 1;
+          await escalateExhaustedRecoveryAction(candidate, effectiveMaxAttempts, now);
+        } else {
+          result.skippedTerminalSource += 1;
+        }
+        continue;
+      }
+
+      // SUP-22273: for the two stranded-participant kinds a live owner is not
+      // a wedge. If the owner agent — or, on a board-owned row, the pending
+      // participant it was minted for — has run anywhere after this action's
+      // last attempt (within the participant live window), the sweep must
+      // neither burn an attempt nor escalate, including at the attempt
+      // ceiling: the parent incident (SUP-21921) churned ~20 live-reviewer
+      // cards to 5/5 -> board exactly that way. Checked before the
+      // exhaustion check so an at-ceiling row with a live owner is held
+      // rather than escalated. Expiry preserved: once no owner run falls in
+      // the window, the sweep counts attempts (and escalates at the ceiling)
+      // exactly as before. The hold also expires two live windows after the
+      // row's last update, which remains fixed while the row is held.
+      const holdOwnerLiveAgentId =
+        OWNER_LIVE_SWEEP_HOLD_KINDS.has(candidate.kind) &&
+        (candidate.ownerAgentId ?? candidate.previousOwnerAgentId);
+      if (
+        holdOwnerLiveAgentId &&
+        candidate.updatedAt.getTime() + 2 * REVIEW_PARTICIPANT_LIVE_WINDOW_MS > now.getTime() &&
+        (await participantRanSince(
+          db,
+          candidate.companyId,
+          holdOwnerLiveAgentId,
+          candidate.lastAttemptAt?.getTime() ?? 0,
+          REVIEW_PARTICIPANT_LIVE_WINDOW_MS,
+        ))
+      ) {
+        result.skippedOwnerLive += 1;
+        continue;
+      }
+
+      if (candidate.attemptCount >= effectiveMaxAttempts) {
+        result.maxAttemptsReached += 1;
+        await escalateExhaustedRecoveryAction(candidate, effectiveMaxAttempts, now);
         continue;
       }
 
@@ -11072,7 +11132,6 @@ export function recoveryService(
 
       // Mirror the early-return guards in enqueueSourceScopedStrandedRecoveryWake
       // so we don't burn an attempt on actions that can never be re-fired.
-      const wakePolicyType = readRecoveryWakePolicyType(candidate);
       if (wakePolicyType === "monitor_only" || wakePolicyType === "manual_repair_required") {
         result.nonWakeableSkipped += 1;
         continue;
@@ -11086,19 +11145,6 @@ export function recoveryService(
         continue;
       }
       if (!candidate.ownerAgentId && wakePolicyType !== "board_escalation") {
-        result.nonWakeableSkipped += 1;
-        continue;
-      }
-
-      // This action was deliberately sent to the board because its pending
-      // participant cannot run. A different agent may be invokable, but
-      // reassigning the action to it recreates the failed recovery path.
-      // Board repair must explicitly restore/re-arm or reset the workflow.
-      if (
-        candidate.ownerType === "board" &&
-        wakePolicyType === "board_escalation" &&
-        readNonEmptyString(parseObject(candidate.wakePolicy).reason) === "pending_participant_unavailable"
-      ) {
         result.nonWakeableSkipped += 1;
         continue;
       }
