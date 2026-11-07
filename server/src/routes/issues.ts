@@ -432,7 +432,7 @@ import {
   resolvePatchExecutionPolicy,
   isSeatedStallArbiter,
   setIssueExecutionPolicyMonitorScheduledBy,
-  stallHoldControlsDiffer,
+  assertExecutionDecisionSnapshotCurrent,
   type MissingApprovalStageGap,
   type ReviewEscalationSignal,
 } from "../services/issue-execution-policy.js";
@@ -20446,14 +20446,17 @@ export function issueRoutes(
       finalIssueStatus: () => issue?.status,
     });
     const decision = transition.decision && decisionId ? transition.decision : null;
-    // R20: the state this request's transition was computed from, and whether
-    // its decision must be re-checked under the row lock (see the guard inside
-    // the transaction). Cards without stallEscalation are unaffected.
+    // Snapshot this request's transition was computed from. Stall cards
+    // re-check the hand-off record under the row lock. Every execution
+    // decision also re-checks the ceiling and the delivery binding, so a
+    // board edit or a same-head PR refresh that landed after the read is not
+    // overwritten (SUP-23260).
     const stallGuardReadState = parseIssueExecutionState(existing.executionState);
     const stallLockGuardRequired =
       Boolean(transition.stallEscalation) ||
       (decision !== null &&
         Boolean(previousExecutionPolicy?.stallEscalation || nextExecutionPolicy?.stallEscalation || stallGuardReadState?.stallHandoff));
+    const executionDecisionLostUpdateGuardRequired = decision !== null;
     let attachmentComment: Awaited<ReturnType<typeof svc.addComment>> | null =
       null;
     let comment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
@@ -20635,24 +20638,24 @@ export function issueRoutes(
             reviewPolicySensitiveMutationRequested
             && !(await assertLockedReviewPolicyAllowsMutation(tx))
           ) return null;
-          // R20: the once-per-stage-run hand-off must be atomic, and every
-          // decision on a stall-escalation card must use the state and policy
-          // that hold at commit. Each such decision (with or without a stall
-          // signal) was computed from the unlocked read, so lock the row and
-          // re-check: a concurrent decision that committed first moved
-          // lastDecisionId, or a hand-off record appeared or changed since the
-          // read — a plain bounce would otherwise erase it and let the
-          // stage-run hand off again. A concurrent delivery refresh that moved
-          // the delivered head, or a policy write that changed the ceiling, the
-          // stall policy or the stages, would otherwise be overwritten by a
-          // decision computed against the old values. A refused request
-          // persists nothing (no decision, no hand-off row).
-          if (stallLockGuardRequired) {
+          // The hand-off must be atomic on a stall card, and every execution
+          // decision must use the ceiling and delivery binding that hold at
+          // commit. Each was computed from the unlocked read, so lock the row
+          // on this transaction and re-check. A concurrent decision or a
+          // hand-off record that appeared since the read is a hand-off
+          // conflict (stall cards only). A moved delivered head, a changed
+          // ceiling or other stall-hold control, or a changed delivery
+          // binding (prNumber, prUrl, headSha) refuses the decision. A
+          // refused request persists nothing. The lock read uses `tx`; do not
+          // call a service on the outer pool from inside this transaction.
+          if (stallLockGuardRequired || executionDecisionLostUpdateGuardRequired) {
             const locked = await svc.getByIdForUpdate(id, tx);
             const lockedState = parseIssueExecutionState(locked?.executionState ?? null);
             if (
-              (lockedState?.lastDecisionId ?? null) !== (stallGuardReadState?.lastDecisionId ?? null) ||
-              JSON.stringify(lockedState?.stallHandoff ?? null) !== JSON.stringify(stallGuardReadState?.stallHandoff ?? null)
+              stallLockGuardRequired && (
+                (lockedState?.lastDecisionId ?? null) !== (stallGuardReadState?.lastDecisionId ?? null) ||
+                JSON.stringify(lockedState?.stallHandoff ?? null) !== JSON.stringify(stallGuardReadState?.stallHandoff ?? null)
+              )
             ) {
               throw conflict(
                 "A concurrent decision on this review stage was recorded first; this decision was not recorded and the stage was not handed off again. Re-read the issue before deciding.",
@@ -20663,19 +20666,7 @@ export function issueRoutes(
                 },
               );
             }
-            if (
-              (lockedState?.deliveredHeadSha ?? null) !== (stallGuardReadState?.deliveredHeadSha ?? null) ||
-              stallHoldControlsDiffer(previousExecutionPolicy, normalizeIssueExecutionPolicy(locked?.executionPolicy ?? null))
-            ) {
-              throw conflict(
-                "The delivered head or the execution policy (round ceiling, stall arbiter or stages) changed while this decision was in flight; this decision was not recorded and the stage was not handed off. Re-read the issue before deciding.",
-                {
-                  code: "review_stall_policy_changed",
-                  issueId: existing.id,
-                  stageId: stallGuardReadState?.currentStageId ?? null,
-                },
-              );
-            }
+            assertExecutionDecisionSnapshotCurrent(stallGuardReadState, previousExecutionPolicy, locked, existing.id);
           }
           // SUP-15878: refuse the close under the update lock (after the review
           // policy reauthorization above) with a typed diagnosis instead of
@@ -23652,7 +23643,7 @@ export function issueRoutes(
       // Terminal final-stage only: nonterminal accepts keep the three-argument call.
       const acceptArgs: [typeof issue, string, typeof req.body, typeof acceptActor] = [issue, interactionId, req.body, acceptActor];
       const deferredPostCommit = { activityPublications: [] as ActivityPublication[], postCommitActions: [] as IssuePostCommitAction[] };
-      const applyEscalationApproval = (dbLike: Db, deferred?: typeof deferredPostCommit) => applyReviewEscalationDecision({
+      const applyEscalationApproval = (dbLike: Db) => applyReviewEscalationDecision({
         db: dbLike,
         issue,
         requestedStatus: "done",
@@ -23666,19 +23657,19 @@ export function issueRoutes(
         // guard above already allowed it); a non-final stage still only advances
         // the pointer via the engine's `in_review` patch.
         finalStageDisposition: reviewEscalationCompletesLadder ? "done" : "handback",
-        ...(deferred ? { deferredPostCommit: deferred } : {}),
+        deferredPostCommit,
       });
-      const terminalEscalationResolution: { value: Awaited<ReturnType<typeof applyEscalationApproval>> } = { value: null };
-      const { interaction, createdIssues, continuationIssue } = escalationApproval
+      const acceptedEscalationDecision: { value: Awaited<ReturnType<typeof applyEscalationApproval>> } = { value: null };
+      const { interaction, createdIssues, continuationIssue } = reviewEscalationAccept
         ? await interactionSvc.acceptInteraction(...acceptArgs, {
             // The decision commits in the interaction's transaction, under the issue
             // lock taken by the revalidation, so a stale verdict leaves both pending.
             afterResolveInTransaction: async (tx) => {
-              terminalEscalationResolution.value = await applyEscalationApproval(tx as unknown as Db, deferredPostCommit);
-              if (terminalEscalationResolution.value && escalationCertifiedDelivery) {
+              acceptedEscalationDecision.value = await applyEscalationApproval(tx as unknown as Db);
+              if (acceptedEscalationDecision.value && escalationCertifiedDelivery) {
                 const finalDelivery = {
                   ...escalationCertifiedDelivery,
-                  decisionId: terminalEscalationResolution.value.decisionId,
+                  decisionId: acceptedEscalationDecision.value.decisionId,
                 };
                 await tx.update(issueRows).set({
                   executionState: sql`jsonb_set(
@@ -23690,21 +23681,23 @@ export function issueRoutes(
                 }).where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)));
               }
             },
-            beforeResolveInTransaction: async (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => {
-              const [lockedIssue] = await tx.select().from(issueRows)
-                .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)))
-                .for("update");
-              if (!lockedIssue) throw notFound("Issue not found");
-              if (lockedIssue.deliveryRequirement !== issue.deliveryRequirement) {
-                throw conflict("Card delivery classification changed before the final delivery preflight; retry the final verdict", {
-                  code: "approval_final_delivery_preflight_stale",
-                  reason: "head_moved: delivery classification changed before final delivery preflight",
+            ...(escalationApproval ? {
+              beforeResolveInTransaction: async (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => {
+                const [lockedIssue] = await tx.select().from(issueRows)
+                  .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)))
+                  .for("update");
+                if (!lockedIssue) throw notFound("Issue not found");
+                if (lockedIssue.deliveryRequirement !== issue.deliveryRequirement) {
+                  throw conflict("Card delivery classification changed before the final delivery preflight; retry the final verdict", {
+                    code: "approval_final_delivery_preflight_stale",
+                    reason: "head_moved: delivery classification changed before final delivery preflight",
+                  });
+                }
+                await preflightTerminalApproval(lockedIssue, escalationApproval!.patch, escalationApproval!.decision, lockedIssue.executionPolicy, {
+                  locked: { prefetch: escalationApproval!.prefetch, tx: tx as unknown as Db },
                 });
-              }
-              await preflightTerminalApproval(lockedIssue, escalationApproval!.patch, escalationApproval!.decision, lockedIssue.executionPolicy, {
-                locked: { prefetch: escalationApproval!.prefetch, tx: tx as unknown as Db },
-              });
-            },
+              },
+            } : {}),
           })
         : await interactionSvc.acceptInteraction(...acceptArgs);
       for (const publication of deferredPostCommit.activityPublications) publishActivity(publication);
@@ -23720,9 +23713,7 @@ export function issueRoutes(
         interaction.status === "accepted" &&
         isReviewEscalationInteraction(current)
       ) {
-        const escalationResolution = escalationApproval
-          ? terminalEscalationResolution.value
-          : await applyEscalationApproval(db);
+        const escalationResolution = acceptedEscalationDecision.value;
         if (escalationResolution) {
           resolvedContinuationIssue = escalationResolution;
           // SUP-17163: accepting a review round-cap escalation records an
@@ -24071,52 +24062,65 @@ export function issueRoutes(
         res.json(await interactionSvc.getById(current.id));
         return;
       }
-      const interaction = await interactionSvc.rejectInteraction(
+      const rejectActor = {
+        agentId: actor.agentId,
+        runId: actor.runId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+        resolverPolicyRestriction:
+          resolutionAuthorization.resolverPolicyRestriction,
+      };
+      const rejectArgs: [typeof issue, string, typeof req.body, typeof rejectActor] = [
         issue,
         interactionId,
         req.body,
-        {
-          agentId: actor.agentId,
-          runId: actor.runId,
-          userId: actor.actorType === "user" ? actor.actorId : null,
-          resolverPolicyRestriction:
-            resolutionAuthorization.resolverPolicyRestriction,
-        },
-      );
-      let resolvedContinuationIssue: {
-        id: string;
-        status: string;
-        assigneeAgentId: string | null;
-        assigneeUserId: string | null;
-      } | null = null;
+        rejectActor,
+      ];
+      const rejectDeferredPostCommit = {
+        activityPublications: [] as ActivityPublication[],
+        postCommitActions: [] as IssuePostCommitAction[],
+      };
+      const rejectedEscalationDecision: {
+        value: Awaited<ReturnType<typeof applyReviewEscalationDecision>>;
+      } = { value: null };
       // SUP-14919: rejecting a review round-cap escalation records a
       // changes-requested decision and hands the card back to its return
-      // assignee so the continuation wake below has an agent to wake.
-      if (
-        interaction.kind === "request_confirmation" &&
-        interaction.status === "rejected" &&
+      // assignee so the continuation wake below has an agent to wake. The
+      // decision commits in the interaction's transaction, so a stale
+      // snapshot refuses it and leaves the interaction pending.
+      const interaction =
+        current.kind === "request_confirmation" &&
         isReviewEscalationInteraction(current)
-      ) {
-        const reason =
-          typeof interaction.result?.reason === "string" &&
-          interaction.result.reason.trim().length > 0
-            ? interaction.result.reason.trim()
-            : "Review changes requested via the round-cap escalation.";
-        const escalationResolution = await applyReviewEscalationDecision({
-          db,
-          issue,
-          requestedStatus: "in_progress",
-          decisionBody: reason,
-          actor: {
-            agentId: actor.agentId,
-            userId: actor.actorType === "user" ? actor.actorId : null,
-            runId: actor.runId,
-          },
-        });
-        if (escalationResolution) {
-          resolvedContinuationIssue = escalationResolution;
-        }
-      }
+          ? await interactionSvc.rejectInteraction(...rejectArgs, {
+              afterResolveInTransaction: async (tx, resolved) => {
+                if (resolved.kind !== "request_confirmation") return;
+                const reason =
+                  typeof resolved.result?.reason === "string" &&
+                  resolved.result.reason.trim().length > 0
+                    ? resolved.result.reason.trim()
+                    : "Review changes requested via the round-cap escalation.";
+                rejectedEscalationDecision.value =
+                  await applyReviewEscalationDecision({
+                    db: tx as unknown as Db,
+                    issue,
+                    requestedStatus: "in_progress",
+                    decisionBody: reason,
+                    actor: {
+                      agentId: actor.agentId,
+                      userId:
+                        actor.actorType === "user" ? actor.actorId : null,
+                      runId: actor.runId,
+                    },
+                    deferredPostCommit: rejectDeferredPostCommit,
+                  });
+              },
+            })
+          : await interactionSvc.rejectInteraction(...rejectArgs);
+      for (const publication of rejectDeferredPostCommit.activityPublications)
+        publishActivity(publication);
+      await flushIssuePostCommitActions(
+        rejectDeferredPostCommit.postCommitActions,
+      );
+      const resolvedContinuationIssue = rejectedEscalationDecision.value;
 
       await logActivity(db, {
         companyId: issue.companyId,
@@ -25489,12 +25493,19 @@ export function issueRoutes(
       const postCommitIssueActions: IssuePostCommitAction[] = [];
       try {
         txResult = await db.transaction(async (tx) => {
+          // The approval was computed from the unlocked read. Lock the row on
+          // `tx` and refuse it when the ceiling or the delivery binding moved
+          // since; nothing is written then (no comment, decision or state).
+          const lockedIssue = decisionId ? await svc.getByIdForUpdate(id, tx) : null;
+          if (decisionId) {
+            if (!lockedIssue) throw new AutoApprovalIssueMissingError();
+            assertExecutionDecisionSnapshotCurrent(currentExecutionState, currentExecutionPolicy, lockedIssue, currentIssue.id);
+          }
           if (
+            lockedIssue &&
             terminalApprovalNeedsDeliveryClassificationCheck &&
             (finalDeliveryPrefetch || currentIssue.deliveryRequirement === "record_only")
           ) {
-            const lockedIssue = await svc.getByIdForUpdate(id, tx);
-            if (!lockedIssue) throw new AutoApprovalIssueMissingError();
             if (lockedIssue.deliveryRequirement !== currentIssue.deliveryRequirement) {
               throw conflict("Card delivery classification changed before the final delivery preflight; retry the final verdict", {
                 code: "approval_final_delivery_preflight_stale",

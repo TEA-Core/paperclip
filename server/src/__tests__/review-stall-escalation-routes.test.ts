@@ -10,8 +10,10 @@ import {
   companyMemberships,
   createDb,
   heartbeatRuns,
+  issueComments,
   issueExecutionDecisions,
   issueRecoveryActions,
+  issueThreadInteractions,
   issues,
   projects,
 } from "@paperclipai/db";
@@ -20,6 +22,7 @@ import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { REVIEW_STALL_ESCALATED_ACTION } from "../services/issue-execution-policy.js";
 import { issueService } from "../services/issues.js";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { routineService } from "../services/routines.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import {
@@ -40,7 +43,12 @@ const activityFault = vi.hoisted(() => ({ action: null as string | null }));
 // Deterministic interleaving: `beforeLock` runs once, on the request's first
 // row-lock read, after the route computed its decision from the unlocked read
 // and before the locked re-check reads the row.
-const lockInterleave = vi.hoisted(() => ({ beforeLock: null as null | (() => Promise<void>) }));
+// `beforeResolve` runs once, right before an interaction accept or reject opens its
+// transaction: after the route read the card, before the resolution locks it.
+const lockInterleave = vi.hoisted(() => ({
+  beforeLock: null as null | (() => Promise<void>),
+  beforeResolve: null as null | (() => Promise<void>),
+}));
 vi.mock("../services/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/index.js")>();
   const failAfterWrite = (action: string) => {
@@ -59,6 +67,25 @@ vi.mock("../services/index.js", async (importOriginal) => {
           lockInterleave.beforeLock = null;
           if (hook) await hook();
           return svc.getByIdForUpdate(...lockArgs);
+        },
+      };
+    },
+    issueThreadInteractionService: (...args: Parameters<typeof actual.issueThreadInteractionService>) => {
+      const svc = actual.issueThreadInteractionService(...args);
+      const beforeResolve = async () => {
+        const hook = lockInterleave.beforeResolve;
+        lockInterleave.beforeResolve = null;
+        if (hook) await hook();
+      };
+      return {
+        ...svc,
+        acceptInteraction: async (...resolveArgs: Parameters<typeof svc.acceptInteraction>) => {
+          await beforeResolve();
+          return svc.acceptInteraction(...resolveArgs);
+        },
+        rejectInteraction: async (...resolveArgs: Parameters<typeof svc.rejectInteraction>) => {
+          await beforeResolve();
+          return svc.rejectInteraction(...resolveArgs);
         },
       };
     },
@@ -99,6 +126,7 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
   afterEach(async () => {
     activityFault.action = null;
     lockInterleave.beforeLock = null;
+    lockInterleave.beforeResolve = null;
     if (seededRunIds.length > 0) {
       await db.update(heartbeatRuns).set({ status: "cancelled" }).where(inArray(heartbeatRuns.id, seededRunIds));
       seededRunIds.length = 0;
@@ -797,6 +825,451 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     expect(row.status).toBe("in_review");
     expect(row.assigneeAgentId).toBe(seeded.reviewerId);
   }, 60_000);
+
+  function plainPolicy(seeded: Seeded, stageId: string, maxReviewRounds?: number, secondStage = false) {
+    return {
+      mode: "normal",
+      commentRequired: true,
+      stages: [
+        {
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: seeded.reviewerId }],
+        },
+        ...(secondStage
+          ? [
+              {
+                id: randomUUID(),
+                type: "review",
+                approvalsNeeded: 1,
+                participants: [{ id: randomUUID(), type: "agent", agentId: seeded.arbiterId }],
+              },
+            ]
+          : []),
+      ],
+      ...(maxReviewRounds !== undefined ? { maxReviewRounds } : {}),
+    };
+  }
+
+  async function seedPlainPendingReview(
+    seeded: Seeded,
+    shape: {
+      maxReviewRounds?: number;
+      changesRequestedCount?: number;
+      delivery?: Record<string, unknown>;
+      secondStage?: boolean;
+      escalated?: boolean;
+    } = {},
+  ) {
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: seeded.companyId,
+      title: "Plain review",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: shape.escalated ? null : seeded.reviewerId,
+      assigneeUserId: shape.escalated ? seeded.userId : null,
+      responsibleUserId: seeded.userId,
+      createdByUserId: seeded.userId,
+      deliveryRequirement: "record_only",
+      executionPolicy: plainPolicy(seeded, stageId, shape.maxReviewRounds, shape.secondStage),
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: shape.escalated
+          ? { type: "user", agentId: null, userId: seeded.userId }
+          : { type: "agent", agentId: seeded.reviewerId },
+        returnAssignee: { type: "agent", agentId: seeded.coderId },
+        deliveryAuthor: { type: "agent", agentId: seeded.coderId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        changesRequestedCount: shape.changesRequestedCount ?? (shape.escalated ? 3 : 1),
+        ...(shape.delivery ? { delivery: shape.delivery } : {}),
+      },
+    });
+    return { issueId, stageId };
+  }
+
+  const plainFinding = { status: "in_progress", comment: "finding" };
+
+  it("records an ordinary bounce on a plain card when the snapshot is still current", async () => {
+    const seeded = await seedCompany();
+    const { issueId } = await seedPlainPendingReview(seeded, { maxReviewRounds: 50 });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(plainFinding);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_progress");
+    expect(row.assigneeAgentId).toBe(seeded.coderId);
+    expect(row.executionPolicy).not.toHaveProperty("stallEscalation");
+    expect(await decisionRows(issueId)).toHaveLength(1);
+  }, 60_000);
+
+  it("refuses a plain-card bounce that would erase a same-head PR binding refreshed after the read (SUP-23260)", async () => {
+    const seeded = await seedCompany();
+    const headSha = "a".repeat(40);
+    const { issueId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 50,
+      delivery: {
+        repo: { owner: "TEA-Core", repo: "paperclip" },
+        branch: "fm/plain-card",
+        headSha,
+      },
+    });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    const refreshed = {
+      repo: { owner: "TEA-Core", repo: "paperclip" },
+      branch: "fm/plain-card",
+      headSha,
+      prNumber: 1117,
+      prUrl: "https://github.com/TEA-Core/paperclip/pull/1117",
+    };
+    // Same head, new PR binding. A compare that only looks at deliveredHeadSha
+    // (absent on both sides) lets this return 200 and wipes the fields.
+    lockInterleave.beforeLock = async () => {
+      const current = await issueRow(issueId);
+      await db
+        .update(issues)
+        .set({ executionState: { ...(current.executionState as Record<string, unknown>), delivery: refreshed } })
+        .where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(plainFinding);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    expect(row.assigneeAgentId).toBe(seeded.reviewerId);
+    expect(row.executionState).toMatchObject({ delivery: refreshed });
+  }, 60_000);
+
+  it("refuses a plain-card bounce when only delivery.headSha moved after the read (SUP-23260)", async () => {
+    const seeded = await seedCompany();
+    const headSha = "a".repeat(40);
+    const { issueId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 50,
+      delivery: {
+        repo: { owner: "TEA-Core", repo: "paperclip" },
+        branch: "fm/plain-card",
+        headSha,
+        prNumber: 1117,
+        prUrl: "https://github.com/TEA-Core/paperclip/pull/1117",
+      },
+    });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    const movedHead = "b".repeat(40);
+    lockInterleave.beforeLock = async () => {
+      const current = await issueRow(issueId);
+      const state = current.executionState;
+      const previousDelivery =
+        state && typeof state === "object" && "delivery" in state && state.delivery && typeof state.delivery === "object"
+          ? state.delivery
+          : {};
+      const delivery = { ...previousDelivery, headSha: movedHead };
+      await db
+        .update(issues)
+        .set({ executionState: { ...(state && typeof state === "object" ? state : {}), delivery } })
+        .where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(plainFinding);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    const stored = row.executionState;
+    const storedHead =
+      stored && typeof stored === "object" && "delivery" in stored && stored.delivery && typeof stored.delivery === "object" && "headSha" in stored.delivery
+        ? stored.delivery.headSha
+        : null;
+    expect(storedHead).toBe(movedHead);
+  }, 60_000);
+
+  it("refuses a plain-card bounce computed before the board lowered the round ceiling (SUP-23260)", async () => {
+    const seeded = await seedCompany();
+    // No stallEscalation and no hand-off record. Ceiling 4, next round 3: the
+    // unlocked read is a bounce to the coder. Dropping the plain-card arm lets
+    // this return 200 and assign the coder.
+    const { issueId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 4,
+      changesRequestedCount: 2,
+    });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    lockInterleave.beforeLock = async () => {
+      const current = await issueRow(issueId);
+      await db
+        .update(issues)
+        .set({ executionPolicy: { ...(current.executionPolicy as Record<string, unknown>), maxReviewRounds: 2 } })
+        .where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(plainFinding);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    expect(row.assigneeAgentId).toBe(seeded.reviewerId);
+    expect(row.executionPolicy).toMatchObject({ maxReviewRounds: 2 });
+    expect(row.executionPolicy).not.toHaveProperty("stallEscalation");
+    expect(row.executionState ?? {}).not.toHaveProperty("stallHandoff");
+  }, 60_000);
+
+  it.each([12, 20, 50])(
+    "returns all %i concurrent plain-card decisions without a pool wait (SUP-23260)",
+    async (count) => {
+      const seeded = await seedCompany();
+      const { issueId } = await seedPlainPendingReview(seeded, {
+        maxReviewRounds: 50,
+        changesRequestedCount: 0,
+      });
+      const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+      const reviewer = app(agentActor(seeded, seeded.reviewerId, runId));
+
+      const responses = await Promise.all(
+        Array.from({ length: count }, (_, index) =>
+          request(reviewer).patch(`/api/issues/${issueId}`).send({ status: "in_progress", comment: `finding ${index}` }),
+        ),
+      );
+
+      expect(responses, JSON.stringify(responses.map((res) => ({ status: res.status, body: res.body })))).toHaveLength(count);
+      expect(responses.every((res) => res.status === 200)).toBe(true);
+      expect(await decisionRows(issueId)).toHaveLength(count);
+    },
+    60_000,
+  );
+
+  const approvalComment = { body: "## Review: APPROVED\n\nLooks good." };
+
+  it("approves through the comment door when the snapshot is still current", async () => {
+    const seeded = await seedCompany();
+    const { issueId } = await seedPlainPendingReview(seeded, { maxReviewRounds: 50, secondStage: true });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send(approvalComment);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await decisionRows(issueId)).toHaveLength(1);
+    expect((await issueRow(issueId)).executionState).toMatchObject({ lastDecisionOutcome: "approved" });
+  }, 60_000);
+
+  it("refuses a comment-door approval that would erase a same-head PR binding refreshed after the read (SUP-23260)", async () => {
+    const seeded = await seedCompany();
+    const headSha = "a".repeat(40);
+    const { issueId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 50,
+      secondStage: true,
+      delivery: {
+        repo: { owner: "TEA-Core", repo: "paperclip" },
+        branch: "fm/plain-card",
+        headSha,
+      },
+    });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    const refreshed = {
+      repo: { owner: "TEA-Core", repo: "paperclip" },
+      branch: "fm/plain-card",
+      headSha,
+      prNumber: 1117,
+      prUrl: "https://github.com/TEA-Core/paperclip/pull/1117",
+    };
+    lockInterleave.beforeLock = async () => {
+      const current = await issueRow(issueId);
+      await db
+        .update(issues)
+        .set({ executionState: { ...(current.executionState as Record<string, unknown>), delivery: refreshed } })
+        .where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send(approvalComment);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    expect(row.executionState).toMatchObject({ status: "pending", delivery: refreshed });
+  }, 60_000);
+
+  it("refuses a comment-door approval computed before the board lowered the round ceiling (SUP-23260)", async () => {
+    const seeded = await seedCompany();
+    const { issueId } = await seedPlainPendingReview(seeded, { maxReviewRounds: 4, changesRequestedCount: 2, secondStage: true });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    lockInterleave.beforeLock = async () => {
+      const current = await issueRow(issueId);
+      await db
+        .update(issues)
+        .set({ executionPolicy: { ...(current.executionPolicy as Record<string, unknown>), maxReviewRounds: 2 } })
+        .where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send(approvalComment);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    expect(row.executionPolicy).toMatchObject({ maxReviewRounds: 2 });
+  }, 60_000);
+
+  async function seedEscalationInteraction(seeded: Seeded, issueId: string, stageId: string) {
+    return issueThreadInteractionService(db).create(
+      { id: issueId, companyId: seeded.companyId },
+      {
+        kind: "request_confirmation",
+        title: "Review round cap reached — your decision is needed",
+        summary: "Review stage hit the round cap and was escalated to you.",
+        addresseeAgentId: null,
+        resolverPolicy: "human_only",
+        continuationPolicy: "wake_assignee",
+        sourceRunId: null,
+        idempotencyKey: `review-escalation:${issueId}:${stageId}:3:${randomUUID().slice(0, 8)}`,
+        payload: {
+          version: 1,
+          prompt: "Approve this review, or request further changes (round cap reached).",
+          acceptLabel: "Approve & advance",
+          rejectLabel: "Request changes",
+          rejectRequiresReason: true,
+          allowDeclineReason: true,
+          detailsMarkdown: "Escalated.",
+        },
+      },
+      { agentId: null, userId: seeded.userId },
+    );
+  }
+
+  const sameHeadDelivery = (headSha: string) => ({
+    repo: { owner: "TEA-Core", repo: "paperclip" },
+    branch: "fm/plain-card",
+    headSha,
+  });
+
+  function refreshDeliveryBeforeResolve(issueId: string, delivery: Record<string, unknown>) {
+    lockInterleave.beforeResolve = async () => {
+      const current = await issueRow(issueId);
+      await db
+        .update(issues)
+        .set({ executionState: { ...(current.executionState as Record<string, unknown>), delivery } })
+        .where(eq(issues.id, issueId));
+    };
+  }
+
+  it("records an escalation accept when the snapshot is still current", async () => {
+    const seeded = await seedCompany();
+    const headSha = "a".repeat(40);
+    const { issueId, stageId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 3,
+      secondStage: true,
+      escalated: true,
+      delivery: sameHeadDelivery(headSha),
+    });
+    const interaction = await seedEscalationInteraction(seeded, issueId, stageId);
+
+    const res = await request(app(boardActor(seeded)))
+      .post(`/api/issues/${issueId}/interactions/${interaction.id}/accept`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await decisionRows(issueId)).toHaveLength(1);
+    expect((await issueRow(issueId)).executionState).toMatchObject({
+      lastDecisionOutcome: "approved",
+      delivery: sameHeadDelivery(headSha),
+    });
+  }, 60_000);
+
+  it.each([
+    { door: "final-stage accept", action: "accept", secondStage: false },
+    { door: "non-final accept", action: "accept", secondStage: true },
+    { door: "reject", action: "reject", secondStage: false },
+  ] as const)(
+    "refuses an escalation $door that would erase a same-head PR binding refreshed after the read and leaves the interaction retryable (SUP-23260)",
+    async ({ action, secondStage }) => {
+      const seeded = await seedCompany();
+      const headSha = "a".repeat(40);
+      const { issueId, stageId } = await seedPlainPendingReview(seeded, {
+        maxReviewRounds: 3,
+        secondStage,
+        escalated: true,
+        delivery: sameHeadDelivery(headSha),
+      });
+      const interaction = await seedEscalationInteraction(seeded, issueId, stageId);
+      const refreshed = {
+        ...sameHeadDelivery(headSha),
+        prNumber: 1117,
+        prUrl: "https://github.com/TEA-Core/paperclip/pull/1117",
+      };
+      const resolve = () =>
+        request(app(boardActor(seeded)))
+          .post(`/api/issues/${issueId}/interactions/${interaction.id}/${action}`)
+          .send(action === "reject" ? { reason: "Needs another round." } : {});
+      const resolutionActivity = async () =>
+        (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).filter((row) =>
+          row.action.startsWith("issue.thread_interaction_"),
+        );
+      const interactionStatus = async () =>
+        (await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction.id)))[0]
+          ?.status;
+      const before = await issueRow(issueId);
+      refreshDeliveryBeforeResolve(issueId, refreshed);
+
+      const refused = await resolve();
+
+      expect(lockInterleave.beforeResolve).toBeNull();
+      expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+      expect(refused.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+      expect(await decisionRows(issueId)).toHaveLength(0);
+      expect(await resolutionActivity()).toHaveLength(0);
+      expect(await interactionStatus()).toBe("pending");
+      const afterRefusal = await issueRow(issueId);
+      expect(afterRefusal.status).toBe(before.status);
+      expect(afterRefusal.assigneeAgentId).toBe(before.assigneeAgentId);
+      expect(afterRefusal.assigneeUserId).toBe(before.assigneeUserId);
+      expect(afterRefusal.executionState).toMatchObject({ status: "pending", delivery: refreshed });
+
+      const retried = await resolve();
+
+      expect(retried.status, JSON.stringify(retried.body)).toBe(200);
+      expect(await decisionRows(issueId)).toHaveLength(1);
+      expect(await interactionStatus()).toBe(action === "accept" ? "accepted" : "rejected");
+      expect((await issueRow(issueId)).executionState).toMatchObject({ delivery: refreshed });
+    },
+    60_000,
+  );
 
   async function resolveRecovery(seeded: Seeded, issueId: string, note: string) {
     const [action] = await db.insert(issueRecoveryActions).values({
