@@ -20,6 +20,7 @@ import type { IssueWatchdog, IssueWatchdogSummary } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
 import { parseObject } from "../adapters/utils.js";
 import { logActivity } from "./activity-log.js";
+import { runRecoverySweepIssue } from "../lib/recovery-sweep-isolation.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -2040,6 +2041,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       };
       for (const row of rows) {
         result.checked += 1;
+        await runRecoverySweepIssue({ id: row.issueId }, "task_watchdogs.reconcile_task_watchdogs", async () => {
         const evaluated = await evaluateWatchdog(row, { runId: opts.runId ?? null });
         if (evaluated.state === "triggered") {
           result.triggered += 1;
@@ -2057,6 +2059,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         } else {
           result.skipped += 1;
         }
+        });
       }
       return result;
     },
@@ -2135,7 +2138,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         if (!detection) continue;
         result.detected += 1;
         result.detections.push(detection);
-        if (await hasReportedMonitorStaleFingerprint(db, detection)) continue;
+        await runRecoverySweepIssue(row, "task_watchdogs.detect_stale_issue_monitors", async () => {
+        if (await hasReportedMonitorStaleFingerprint(db, detection)) return;
         await logActivity(db, {
           companyId: row.companyId,
           actorType: "system",
@@ -2156,6 +2160,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           },
         });
         result.reported += 1;
+        });
       }
       return result;
     },

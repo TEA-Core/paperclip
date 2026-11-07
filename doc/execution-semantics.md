@@ -619,20 +619,50 @@ A `blocked` issue is stalled when the unresolved blocker leaf has no active run,
 Paperclip now treats crash/restart recovery as a stranded-assigned-work problem, not just a stranded-run problem.
 
 The HTTP listener binds before startup recovery so surviving runners can
-reconnect. A per-issue failure of any error class inside a startup recovery
-sweep that writes an issue — including an assignee-review refusal — is logged
-with the issue identifier, the sweep name, and the error class and message,
-and the card is skipped for that sweep. Writes made earlier in the same
-iteration (recovery action, comment, wake) may already have persisted. The
-sweep continues with the remaining issues so startup can finish and the
-listener stays open. A lost database connection (connection closed or ended)
-is not a per-card failure and is rethrown. Recovery-action reconciliation
-already logs and skips an individual failed action the same way. A failure of
-the sweep itself, or any other fatal startup failure after binding, still
-closes the HTTP listener before ending database clients: a
-rejected `startServer()` must not leave a port accepting requests against a
-closed pool. That failure is logged and rethrown. When the server runs as the
-main module, the entrypoint reports eligible failures to Sentry and exits
+reconnect. A per-card failure of any error class inside the startup recovery
+sweeps listed below — including an assignee-review refusal — is logged with the
+issue identifier, the sweep name, and the error class and message, and the card
+is skipped for that sweep. Writes made earlier in the same iteration (recovery
+action, comment, wake) may already have persisted. The sweep continues with the
+remaining cards so startup can finish and the listener stays open. A lost
+database connection (`CONNECTION_CLOSED`, `CONNECTION_ENDED`,
+`CONNECTION_DESTROYED`, anywhere on the error `cause` chain) is not a per-card
+failure and is rethrown.
+
+Each card is processed inside the shared `runRecoverySweepIssue` helper in these
+startup sweeps:
+
+- Stranded assigned issues, including the unassigned-blocking-issue pass
+  (`reconcileStrandedAssignedIssues`, `reconcileUnassignedBlockingIssues`).
+- Issue-graph liveness: resolved-dependency wake backstop, dispatch-suppression
+  parks (park resolution and park write), deferred-wakeup replay, todo-stranded
+  parks, and blocked-without-blockers (`reconcileIssueGraphLiveness`, also run
+  directly for the last).
+- Stillborn assigned backlog, exhausted recovery drain, stale recovery-action
+  wakes, pending-review re-arm, and undispatchable assigned issues (action
+  resolution and escalation).
+- Cancelled-only-blocker dependents (action resolution and detection),
+  unfinalizable workspace barriers, stale `in_review` child archive, stale issue
+  locks (the per-card lock clear), and completed-run strand escalation.
+- Host-restart strand repairs (`sweepHostRestartStrandedIssues`).
+- Task watchdog reconciliation and the fired-never-rearmed monitor detector.
+
+Active recovery-action reconciliation (`reconcileActiveRecoveryActions`)
+isolates each action with its own `try`/`catch`; it logs and skips the action
+and does not rethrow a lost database connection.
+
+These startup steps are not issue-card write loops and are not wrapped: the
+native-runner restart recovery (fail closed by design, it rethrows), hot-restart
+adoption, orphaned-run reap, abandoned run scratch sweep (each caught as a whole
+by the caller), the run-, wake- and session-goal-level steps (scheduled-retry
+promotion, queued-run resume, session-goal recovery, the silent-active-run scan
+and hard-stop, and the run terminalization pre-pass of the stale-lock sweep),
+which act on run, wake and session rows rather than issue rows. A failure there
+still fails startup. A failure of a sweep itself, or any other fatal startup
+failure after binding, closes the HTTP listener before ending database
+clients: a rejected `startServer()` must not leave a port accepting requests
+against a closed pool. That failure is logged and rethrown. When the server runs
+as the main module, the entrypoint reports eligible failures to Sentry and exits
 nonzero so the supervisor restarts it. Embedding callers such as the CLI
 receive the rejection with no leaked listener and decide how to recover; the
 server does not hard-kill them.
