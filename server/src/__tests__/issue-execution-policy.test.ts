@@ -1,4 +1,3 @@
-import { isDeepStrictEqual } from "node:util";
 import { describe, expect, it } from "vitest";
 import { BASE_MAX_REVIEW_ROUNDS, DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertExecutionDecisionSnapshotCurrent, assertPatchableExecutionPolicyWrite, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, foldExecutionPolicyAgentIds, foldExecutionStateAgentIds, isReviewChangesRequestedTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
 import { HttpError } from "../errors.js";
@@ -5423,9 +5422,11 @@ describe("raw execution-row agent-id fold agrees with the decision snapshot comp
     const readRow = build(read);
     const lockedRow = build(locked);
 
+    // Plain jsonb shapes built by one builder: JSON text equality is deep equality here.
+    const sameJson = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
     const foldEqual =
-      isDeepStrictEqual(foldExecutionStateAgentIds(readRow.state), foldExecutionStateAgentIds(lockedRow.state)) &&
-      isDeepStrictEqual(foldExecutionPolicyAgentIds(readRow.policy), foldExecutionPolicyAgentIds(lockedRow.policy));
+      sameJson(foldExecutionStateAgentIds(readRow.state), foldExecutionStateAgentIds(lockedRow.state)) &&
+      sameJson(foldExecutionPolicyAgentIds(readRow.policy), foldExecutionPolicyAgentIds(lockedRow.policy));
 
     expect(foldEqual).toBe(same);
     expect(decisionCompareAccepts(readRow, lockedRow)).toBe(foldEqual);
