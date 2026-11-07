@@ -20316,9 +20316,12 @@ export function issueRoutes(
       const isIssuingRunStageHandoff = transition.workflowControlledAssignment &&
         !terminalApprovalNeedsClassificationCheck &&
         actor.runId !== null &&
-        runToStopForReassignment?.id === actor.runId;
+        runToStopForReassignment?.id === actor.runId &&
+        runToStopForReassignment.contextSnapshot?.issueId === existing.id;
       // A stage issuer must finish its own PATCH. Its running execution still
       // holds the issue lock, so the next stage waits for normal finalization.
+      // Admission rediscovers that lock by the run's context issueId, so an
+      // issuer scoped to no issue or another issue takes the post-commit cancel.
       if (!isIssuingRunStageHandoff && runToStopForReassignment) {
         if (terminalApprovalNeedsClassificationCheck) {
           const cancelled = await heartbeat.cancelRun(

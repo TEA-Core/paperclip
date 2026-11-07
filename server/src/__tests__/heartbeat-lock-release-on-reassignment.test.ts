@@ -71,7 +71,10 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
     await tempDb?.cleanup();
   });
 
-  async function seedCrossAgentScenario(opts: { holderStatus: "queued" | "running" }) {
+  async function seedCrossAgentScenario(opts: {
+    holderStatus: "queued" | "running";
+    holderContext?: (issueId: string) => Record<string, unknown>;
+  }) {
     const companyId = randomUUID();
     const coderAgentId = randomUUID();
     const reviewerAgentId = randomUUID();
@@ -129,7 +132,8 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
       triggerDetail: "system",
       status: opts.holderStatus,
       wakeupRequestId,
-      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      contextSnapshot: opts.holderContext?.(issueId) ??
+        { issueId, taskId: issueId, wakeReason: "issue_assigned" },
     });
 
     await db.insert(issues).values({
@@ -156,9 +160,9 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
     };
   }
 
-  it("defers the next stage behind its issuing run after the handoff PATCH and promotes it on stop", async () => {
-    const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId } =
-      await seedCrossAgentScenario({ holderStatus: "running" });
+  async function seedStageHandoff(holderContext?: (issueId: string) => Record<string, unknown>) {
+    const seeded = await seedCrossAgentScenario({ holderStatus: "running", holderContext });
+    const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId } = seeded;
     const policy = normalizeIssueExecutionPolicy({
       stages: [
         { type: "review", participants: [{ type: "agent", agentId: coderAgentId }] },
@@ -204,6 +208,35 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
     const unusedStorage = {} as Parameters<typeof issueRoutes>[1];
     client.use("/api", issueRoutes(db, unusedStorage, {}));
     client.use(errorHandler);
+    return { ...seeded, policy, busyRun, client };
+  }
+
+  // Admission only rediscovers a cleared execution lock through the holder's
+  // contextSnapshot.issueId, so a holder that lookup cannot see must not be
+  // exempted from the post-commit cancel or the successor would overlap it.
+  it.each([
+    ["has no issueId in its context", () => ({ wakeReason: "timer" })],
+    ["is scoped to a different issue", () => ({ issueId: randomUUID(), wakeReason: "issue_assigned" })],
+  ])("saves the handoff, then cancels an issuing run that %s", async (_label, holderContext) => {
+    const { reviewerAgentId, issueId, holderRunId, policy, client } = await seedStageHandoff(holderContext);
+    const response = await request(client).patch(`/api/issues/${issueId}`).send({
+      status: "done", comment: "Review passed; the next reviewer can continue.",
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: reviewerAgentId,
+      executionState: { currentStageId: policy.stages[1]!.id },
+    });
+    expect((await heartbeat.getRun(holderRunId))?.status).toBe("cancelled");
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue).toMatchObject({ status: "in_review", assigneeAgentId: reviewerAgentId });
+    expect(issue.executionRunId).not.toBe(holderRunId);
+  });
+
+  it("defers the next stage behind its issuing run after the handoff PATCH and promotes it on stop", async () => {
+    const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId, policy, busyRun, client } =
+      await seedStageHandoff();
     const response = await request(client).patch(`/api/issues/${issueId}`).send({
       status: "done", comment: "Review passed; the next reviewer can continue after this run stops.",
     });
