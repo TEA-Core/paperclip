@@ -433,6 +433,8 @@ import {
   isSeatedStallArbiter,
   setIssueExecutionPolicyMonitorScheduledBy,
   assertExecutionDecisionSnapshotCurrent,
+  foldExecutionPolicyAgentIds,
+  foldExecutionStateAgentIds,
   type MissingApprovalStageGap,
   type ReviewEscalationSignal,
 } from "../services/issue-execution-policy.js";
@@ -4689,6 +4691,15 @@ export function issueRoutes(
     return { ...snapshot, binding, resolution: await resolveFinalDeliveryResolution(issue) };
   }
 
+  function issueRowWithFoldedDecisionAgentIds(row: object): Record<string, unknown> {
+    const record = row as Record<string, unknown>;
+    return {
+      ...record,
+      executionPolicy: foldExecutionPolicyAgentIds(record.executionPolicy),
+      executionState: foldExecutionStateAgentIds(record.executionState),
+    };
+  }
+
   async function preflightTerminalApproval(
     issue: FinalDeliveryIssue & { status?: string; updatedAt?: Date },
     patch: Record<string, unknown>,
@@ -4727,7 +4738,10 @@ export function issueRoutes(
         prefetched.updatedAtMs !== new Date(issue.updatedAt as Date).getTime() ||
         prefetched.assigneeAgentId !== (issue.assigneeAgentId ?? null) ||
         prefetched.assigneeUserId !== (issue.assigneeUserId ?? null) ||
-        !isDeepStrictEqual(prefetched.executionPolicy, issue.executionPolicy ?? null) ||
+        !isDeepStrictEqual(
+          foldExecutionPolicyAgentIds(prefetched.executionPolicy),
+          foldExecutionPolicyAgentIds(issue.executionPolicy ?? null),
+        ) ||
         prefetched.binding !== lockedBinding ||
         (certifiedPr &&
           (lockedRepo?.owner.toLowerCase() !== certifiedPr.owner.toLowerCase() ||
@@ -20313,8 +20327,8 @@ export function issueRoutes(
         afterStop.executionLockedAt.getTime() === afterStop.updatedAt.getTime();
       if (
         !afterStop ||
-        !isDeepStrictEqual(withoutRunRelease(afterStop), withoutRunRelease(existing)) ||
-        (interruptedRunId === null && !adoptedOwnCheckout && !isDeepStrictEqual(afterStop, existing)) ||
+        !isDeepStrictEqual(issueRowWithFoldedDecisionAgentIds(withoutRunRelease(afterStop)), issueRowWithFoldedDecisionAgentIds(withoutRunRelease(existing))) ||
+        (interruptedRunId === null && !adoptedOwnCheckout && !isDeepStrictEqual(issueRowWithFoldedDecisionAgentIds(afterStop), issueRowWithFoldedDecisionAgentIds(existing))) ||
         (await readFinalDeliveryBinding(db, afterStop)) !== originalDeliveryBinding
       ) {
         throw conflict("Card or delivery binding changed before the final delivery preflight; retry the final verdict", {

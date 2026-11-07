@@ -1461,6 +1461,96 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(fixture.armCalls).toEqual([]);
   });
 
+  async function recaseAgentSeat(fixture: Awaited<ReturnType<typeof pendingDelivery>>, change: { seat?: boolean; policyAgentId?: (agentId: string) => string }) {
+    const row = await fixture.read();
+    const policy = structuredClone(row.executionPolicy) as { stages: Array<{ participants: Array<{ agentId?: string }> }> };
+    const state = structuredClone(row.executionState) as { currentParticipant: { agentId: string } };
+    const participant = policy.stages[0]!.participants[0]!;
+    const original = participant.agentId!;
+    if (change.policyAgentId) participant.agentId = change.policyAgentId(original);
+    if (change.seat) state.currentParticipant.agentId = state.currentParticipant.agentId.toUpperCase();
+    expect(change.seat ? state.currentParticipant.agentId : participant.agentId).not.toBe(original);
+    await db.update(issues).set({ executionPolicy: policy, executionState: state }).where(eq(issues.id, fixture.issue.id));
+  }
+
+  it("approves a final PATCH when only the letter case of the seated agent id and the policy participant agent id changes after the external preflight", async () => {
+    const fixture = await pendingDelivery({ holdPull: true });
+    const { app, comment } = await staleRunFinalReview(fixture);
+    const pending = request(app).patch(`/api/issues/${fixture.issue.id}`)
+      .send({ status: "done", comment }).then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, pending, () =>
+      recaseAgentSeat(fixture, { seat: true, policyAgentId: (agentId) => agentId.toUpperCase() }));
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.status).toBe("done");
+    expect(stored.executionState).toMatchObject({ lastDecisionOutcome: "approved", completedStageIds: [fixture.stageId] });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([
+      expect.objectContaining({ outcome: "approved", stageId: fixture.stageId }),
+    ]);
+  });
+
+  it("approves a final PATCH when only the letter case of a policy participant agent id changes between the external preflight and the lock", async () => {
+    const fixture = await pendingDelivery({ holdPull: true });
+    const authorId = (await fixture.read()).createdByAgentId!;
+    const seated = await fixture.read();
+    const seededPolicy = structuredClone(seated.executionPolicy) as { stages: Array<{ participants: Array<Record<string, unknown>> }> };
+    seededPolicy.stages[0]!.participants.push({ type: "agent", agentId: authorId, userId: null });
+    await db.update(issues).set({ executionPolicy: seededPolicy }).where(eq(issues.id, fixture.issue.id));
+    const approval = fixture.approve().then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, approval, async () => {
+      const row = await fixture.read();
+      const policy = structuredClone(row.executionPolicy) as { stages: Array<{ participants: Array<{ type: string; agentId?: string }> }> };
+      const agent = policy.stages[0]!.participants.find((participant) => participant.type === "agent")!;
+      expect(agent.agentId).toBe(authorId);
+      agent.agentId = authorId.toUpperCase();
+      expect(agent.agentId).not.toBe(authorId);
+      await db.update(issues).set({ executionPolicy: policy }).where(eq(issues.id, fixture.issue.id));
+    });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect((await fixture.read()).status).toBe("done");
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([expect.objectContaining({ outcome: "approved" })]);
+  });
+
+  it("refuses a final PATCH when the policy participant changes to a different agent after the external preflight", async () => {
+    const fixture = await pendingDelivery({ holdPull: true });
+    const { app, comment } = await staleRunFinalReview(fixture);
+    const other = await seedAgent(db, fixture.company.id);
+    const pending = request(app).patch(`/api/issues/${fixture.issue.id}`)
+      .send({ status: "done", comment }).then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, pending, () =>
+      recaseAgentSeat(fixture, { policyAgentId: () => other.id }));
+
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_progress");
+    expect(stored.executionState).toMatchObject({ status: "pending", completedStageIds: [], lastDecisionId: null });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+  });
+
+  it("refuses a final PATCH when only the letter case of a policy participant user id changes after the external preflight", async () => {
+    const fixture = await pendingDelivery({ holdPull: true });
+    const approval = fixture.approve().then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, approval, async () => {
+      const row = await fixture.read();
+      const policy = structuredClone(row.executionPolicy) as { stages: Array<{ participants: Array<{ userId?: string }> }> };
+      const participant = policy.stages[0]!.participants[0]!;
+      expect(participant.userId).toBe("board-user");
+      participant.userId = "BOARD-USER";
+      await db.update(issues).set({ executionPolicy: policy }).where(eq(issues.id, fixture.issue.id));
+    });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_review");
+    expect(stored.executionState).toMatchObject({ status: "pending", completedStageIds: [], lastDecisionId: null });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(fixture.writes).toEqual([]);
+  });
+
   it.each([
     ["title", "NEW.title := 'Renamed while the run was cancelled';"],
     ["execution policy", `NEW.execution_policy := NEW.execution_policy || '{"commentRequired": true}'::jsonb;`],

@@ -1126,6 +1126,55 @@ function isStallArbiterHold(input: {
 }
 
 /**
+ * The one case-fold rule for agent ids in a stored execution row, shared by
+ * the decision snapshot compare and the route's raw-row compares. The seated
+ * participant folds trim + lowercase; the policy's participant list and
+ * `stallEscalation.toAgentId` fold lowercase only. User ids are never folded.
+ */
+function foldSeatedAgentId(agentId: string | null | undefined): string {
+  return (agentId ?? "").trim().toLowerCase();
+}
+
+function foldPolicyAgentId(agentId: string | null | undefined): string {
+  return (agentId ?? "").toLowerCase();
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Raw jsonb `executionState` with the seated agent id folded; every other field is untouched. */
+export function foldExecutionStateAgentIds(state: unknown): unknown {
+  if (!isPlainRecord(state) || !isPlainRecord(state.currentParticipant)) return state;
+  const participant = state.currentParticipant;
+  if (participant.type !== "agent" || typeof participant.agentId !== "string") return state;
+  return { ...state, currentParticipant: { ...participant, agentId: foldSeatedAgentId(participant.agentId) } };
+}
+
+/** Raw jsonb `executionPolicy` with stage participant and `stallEscalation.toAgentId` agent ids folded; every other field is untouched. */
+export function foldExecutionPolicyAgentIds(policy: unknown): unknown {
+  if (!isPlainRecord(policy)) return policy ?? null;
+  const folded: Record<string, unknown> = { ...policy };
+  if (Array.isArray(policy.stages)) {
+    folded.stages = policy.stages.map((stage) => {
+      if (!isPlainRecord(stage) || !Array.isArray(stage.participants)) return stage;
+      return {
+        ...stage,
+        participants: stage.participants.map((participant) =>
+          isPlainRecord(participant) && participant.type === "agent" && typeof participant.agentId === "string"
+            ? { ...participant, agentId: foldPolicyAgentId(participant.agentId) }
+            : participant,
+        ),
+      };
+    });
+  }
+  if (isPlainRecord(policy.stallEscalation) && typeof policy.stallEscalation.toAgentId === "string") {
+    folded.stallEscalation = { ...policy.stallEscalation, toAgentId: foldPolicyAgentId(policy.stallEscalation.toAgentId) };
+  }
+  return folded;
+}
+
+/**
  * R20: the policy controls that decide whether, when and to whom a stalled
  * review stage is handed off — the round ceiling, the stall policy and each
  * stage's identity and participants (agent ids case-folded) — in a comparable
@@ -1135,12 +1184,12 @@ function stallHoldSignature(policy: IssueExecutionPolicy | null): string {
   return JSON.stringify([
     policy?.maxReviewRounds ?? null,
     policy?.stallEscalation?.afterRounds ?? null,
-    policy?.stallEscalation?.toAgentId.toLowerCase() ?? null,
+    policy?.stallEscalation ? foldPolicyAgentId(policy.stallEscalation.toAgentId) : null,
     (policy?.stages ?? []).map((stage) => [
       stage.id,
       stage.type,
       stage.participants.map((participant) =>
-        participant.type === "agent" ? `agent:${(participant.agentId ?? "").toLowerCase()}` : `user:${participant.userId ?? ""}`,
+        participant.type === "agent" ? `agent:${foldPolicyAgentId(participant.agentId)}` : `user:${participant.userId ?? ""}`,
       ),
     ]),
   ]);
@@ -1190,7 +1239,7 @@ function executionDecisionParticipantSignature(
 ): string | null {
   if (!participant) return null;
   if (participant.type === "agent") {
-    const agentId = participant.agentId?.trim().toLowerCase() ?? "";
+    const agentId = foldSeatedAgentId(participant.agentId);
     return agentId.length > 0 ? `agent:${agentId}` : "agent:";
   }
   const userId = participant.userId?.trim() ?? "";
