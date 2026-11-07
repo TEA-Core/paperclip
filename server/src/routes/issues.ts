@@ -4688,6 +4688,57 @@ export function issueRoutes(
     const binding = await readFinalDeliveryBinding(db, issue);
     return { ...snapshot, binding, resolution: await resolveFinalDeliveryResolution(issue) };
   }
+  function executionStateWithFoldedSeatedAgentId(state: unknown): unknown {
+    if (!state || typeof state !== "object" || Array.isArray(state)) return state;
+    const record = state as Record<string, unknown>;
+    const participant = record.currentParticipant;
+    if (!participant || typeof participant !== "object" || Array.isArray(participant)) return state;
+    const principal = participant as Record<string, unknown>;
+    if (principal.type !== "agent" || typeof principal.agentId !== "string") return state;
+    return {
+      ...record,
+      currentParticipant: { ...principal, agentId: principal.agentId.trim().toLowerCase() },
+    };
+  }
+
+  function executionPolicyWithFoldedAgentIds(policy: unknown): unknown {
+    if (!policy || typeof policy !== "object" || Array.isArray(policy)) return policy ?? null;
+    const record = policy as Record<string, unknown>;
+    const stages = Array.isArray(record.stages)
+      ? record.stages.map((stage) => {
+          if (!stage || typeof stage !== "object" || Array.isArray(stage)) return stage;
+          const stageRecord = stage as Record<string, unknown>;
+          if (!Array.isArray(stageRecord.participants)) return stage;
+          return {
+            ...stageRecord,
+            participants: stageRecord.participants.map((participant) => {
+              if (!participant || typeof participant !== "object" || Array.isArray(participant)) return participant;
+              const principal = participant as Record<string, unknown>;
+              if (principal.type !== "agent" || typeof principal.agentId !== "string") return participant;
+              return { ...principal, agentId: principal.agentId.toLowerCase() };
+            }),
+          };
+        })
+      : record.stages;
+    const stall = record.stallEscalation;
+    const stallRecord = stall && typeof stall === "object" && !Array.isArray(stall)
+      ? stall as Record<string, unknown>
+      : null;
+    const stallEscalation = stallRecord && typeof stallRecord.toAgentId === "string"
+      ? { ...stallRecord, toAgentId: stallRecord.toAgentId.toLowerCase() }
+      : stall;
+    return { ...record, stages, stallEscalation };
+  }
+
+  function issueRowWithFoldedDecisionAgentIds(row: object): Record<string, unknown> {
+    const record = row as Record<string, unknown>;
+    return {
+      ...record,
+      executionPolicy: executionPolicyWithFoldedAgentIds(record.executionPolicy),
+      executionState: executionStateWithFoldedSeatedAgentId(record.executionState),
+    };
+  }
+
 
   async function preflightTerminalApproval(
     issue: FinalDeliveryIssue & { status?: string; updatedAt?: Date },
@@ -4727,7 +4778,10 @@ export function issueRoutes(
         prefetched.updatedAtMs !== new Date(issue.updatedAt as Date).getTime() ||
         prefetched.assigneeAgentId !== (issue.assigneeAgentId ?? null) ||
         prefetched.assigneeUserId !== (issue.assigneeUserId ?? null) ||
-        !isDeepStrictEqual(prefetched.executionPolicy, issue.executionPolicy ?? null) ||
+        !isDeepStrictEqual(
+          executionPolicyWithFoldedAgentIds(prefetched.executionPolicy),
+          executionPolicyWithFoldedAgentIds(issue.executionPolicy ?? null),
+        ) ||
         prefetched.binding !== lockedBinding ||
         (certifiedPr &&
           (lockedRepo?.owner.toLowerCase() !== certifiedPr.owner.toLowerCase() ||
@@ -20306,8 +20360,8 @@ export function issueRoutes(
         afterStop.executionLockedAt.getTime() === afterStop.updatedAt.getTime();
       if (
         !afterStop ||
-        !isDeepStrictEqual(withoutRunRelease(afterStop), withoutRunRelease(existing)) ||
-        (interruptedRunId === null && !adoptedOwnCheckout && !isDeepStrictEqual(afterStop, existing)) ||
+        !isDeepStrictEqual(issueRowWithFoldedDecisionAgentIds(withoutRunRelease(afterStop)), issueRowWithFoldedDecisionAgentIds(withoutRunRelease(existing))) ||
+        (interruptedRunId === null && !adoptedOwnCheckout && !isDeepStrictEqual(issueRowWithFoldedDecisionAgentIds(afterStop), issueRowWithFoldedDecisionAgentIds(existing))) ||
         (await readFinalDeliveryBinding(db, afterStop)) !== originalDeliveryBinding
       ) {
         throw conflict("Card or delivery binding changed before the final delivery preflight; retry the final verdict", {
