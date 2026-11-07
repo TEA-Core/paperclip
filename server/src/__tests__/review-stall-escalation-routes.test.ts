@@ -1040,7 +1040,7 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
   }, 60_000);
 
   it.each([12, 20, 50])(
-    "returns all %i concurrent plain-card decisions without a pool wait (SUP-23260)",
+    "commits exactly one of %i concurrent plain-card decisions and refuses the rest",
     async (count) => {
       const seeded = await seedCompany();
       const { issueId } = await seedPlainPendingReview(seeded, {
@@ -1056,12 +1056,103 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
         ),
       );
 
+      const successes = responses.filter((res) => res.status === 200);
+      const conflicts = responses.filter((res) => res.status === 409);
       expect(responses, JSON.stringify(responses.map((res) => ({ status: res.status, body: res.body })))).toHaveLength(count);
-      expect(responses.every((res) => res.status === 200)).toBe(true);
-      expect(await decisionRows(issueId)).toHaveLength(count);
+      expect(successes).toHaveLength(1);
+      expect(conflicts).toHaveLength(count - 1);
+      expect(conflicts.every((res) => res.body?.details?.code === "review_stall_policy_changed")).toBe(true);
+      expect(await decisionRows(issueId)).toHaveLength(1);
+      expect((await issueRow(issueId)).executionState).toMatchObject({ changesRequestedCount: 1 });
     },
     60_000,
   );
+
+  it("refuses a plain-card bounce when only delivery.prUrl was added after the read", async () => {
+    const seeded = await seedCompany();
+    const headSha = "a".repeat(40);
+    const prUrl = "https://github.com/TEA-Core/paperclip/pull/1117";
+    const { issueId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 50,
+      delivery: {
+        repo: { owner: "TEA-Core", repo: "paperclip" },
+        branch: "fm/plain-card",
+        headSha,
+        prNumber: 1117,
+      },
+    });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    lockInterleave.beforeLock = async () => {
+      const current = await issueRow(issueId);
+      const state = current.executionState as Record<string, unknown>;
+      const delivery = { ...(state.delivery as Record<string, unknown>), prUrl };
+      await db.update(issues).set({ executionState: { ...state, delivery } }).where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(plainFinding);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    expect(row.executionState).toMatchObject({ delivery: { prNumber: 1117, prUrl, headSha } });
+  }, 60_000);
+
+  it.each([
+    {
+      arm: "lastDecisionId",
+      mutate: (state: Record<string, unknown>) => ({ ...state, lastDecisionId: randomUUID() }),
+      status: undefined as string | undefined,
+    },
+    {
+      arm: "changesRequestedCount",
+      mutate: (state: Record<string, unknown>) => ({ ...state, changesRequestedCount: 4 }),
+      status: undefined as string | undefined,
+    },
+    {
+      arm: "status",
+      mutate: (state: Record<string, unknown>) => state,
+      status: "blocked" as string | undefined,
+    },
+  ])("refuses a plain-card bounce when only $arm changed after the read", async ({ arm, mutate, status }) => {
+    const seeded = await seedCompany();
+    const { issueId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 50,
+      changesRequestedCount: 0,
+    });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    lockInterleave.beforeLock = async () => {
+      const current = await issueRow(issueId);
+      const executionState = mutate(current.executionState as Record<string, unknown>);
+      await db
+        .update(issues)
+        .set({ executionState, ...(status ? { status } : {}) })
+        .where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(plainFinding);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe(status ?? "in_review");
+    if (arm === "changesRequestedCount") {
+      expect(row.executionState).toMatchObject({ changesRequestedCount: 4, lastDecisionId: null });
+    }
+    if (arm === "lastDecisionId") {
+      const stored = row.executionState as Record<string, unknown>;
+      expect(typeof stored.lastDecisionId).toBe("string");
+      expect(stored.changesRequestedCount).toBe(0);
+    }
+  }, 60_000);
 
   const approvalComment = { body: "## Review: APPROVED\n\nLooks good." };
 
@@ -1270,6 +1361,99 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     },
     60_000,
   );
+
+  it("refuses a stale participant bounce after an escalation accept closed the card done", async () => {
+    const seeded = await seedCompany();
+    const { issueId, stageId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 3,
+      escalated: true,
+    });
+    const interaction = await seedEscalationInteraction(seeded, issueId, stageId);
+    lockInterleave.beforeLock = async () => {
+      const accepted = await request(app(boardActor(seeded)))
+        .post(`/api/issues/${issueId}/interactions/${interaction.id}/accept`)
+        .send({});
+      expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    };
+
+    const bounce = await request(app(boardActor(seeded)))
+      .patch(`/api/issues/${issueId}`)
+      .send(plainFinding);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(bounce.status, JSON.stringify(bounce.body)).toBe(409);
+    expect(bounce.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(1);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("done");
+    expect((await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction.id)))[0]?.status).toBe("accepted");
+  }, 60_000);
+
+  it("refuses a stale approval comment after an escalation reject", async () => {
+    const seeded = await seedCompany();
+    const { issueId, stageId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 3,
+      escalated: true,
+    });
+    const interaction = await seedEscalationInteraction(seeded, issueId, stageId);
+    lockInterleave.beforeLock = async () => {
+      const rejected = await request(app(boardActor(seeded)))
+        .post(`/api/issues/${issueId}/interactions/${interaction.id}/reject`)
+        .send({ reason: "Needs another round." });
+      expect(rejected.status, JSON.stringify(rejected.body)).toBe(200);
+    };
+
+    const approval = await request(app(boardActor(seeded)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send(approvalComment);
+
+    expect(lockInterleave.beforeLock).toBeNull();
+    expect(approval.status, JSON.stringify(approval.body)).toBe(409);
+    expect(approval.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(1);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(0);
+    expect((await issueRow(issueId)).status).toBe("in_progress");
+    expect((await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction.id)))[0]?.status).toBe("rejected");
+  }, 60_000);
+
+  it("records one of two concurrent escalation accepts and leaves the other pending", async () => {
+    const seeded = await seedCompany();
+    const { issueId, stageId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 3,
+      secondStage: true,
+      escalated: true,
+    });
+    const current = await issueRow(issueId);
+    const policy = current.executionPolicy as { stages: Array<Record<string, unknown>> };
+    policy.stages[1] = {
+      ...policy.stages[1],
+      participants: [{ id: randomUUID(), type: "user", userId: seeded.userId }],
+    };
+    await db.update(issues).set({ executionPolicy: policy }).where(eq(issues.id, issueId));
+    const first = await seedEscalationInteraction(seeded, issueId, stageId);
+    const second = await seedEscalationInteraction(seeded, issueId, stageId);
+    const accept = (interactionId: string) =>
+      request(app(boardActor(seeded)))
+        .post(`/api/issues/${issueId}/interactions/${interactionId}/accept`)
+        .send({});
+
+    const responses = await Promise.all([accept(first.id), accept(second.id)]);
+
+    const conflicts = responses.filter((res) => res.status === 409);
+    expect(responses.filter((res) => res.status === 200)).toHaveLength(1);
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]?.body?.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(1);
+    const pending = (await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId)))
+      .find((row) => row.status === "pending");
+    expect(pending).toBeTruthy();
+
+    const retried = await accept(pending!.id);
+
+    expect(retried.status, JSON.stringify(retried.body)).toBe(200);
+    expect(await decisionRows(issueId)).toHaveLength(2);
+    expect((await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, pending!.id)))[0]?.status).toBe("accepted");
+  }, 60_000);
 
   async function resolveRecovery(seeded: Seeded, issueId: string, note: string) {
     const [action] = await db.insert(issueRecoveryActions).values({

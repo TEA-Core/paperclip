@@ -20639,13 +20639,14 @@ export function issueRoutes(
             && !(await assertLockedReviewPolicyAllowsMutation(tx))
           ) return null;
           // The hand-off must be atomic on a stall card, and every execution
-          // decision must use the ceiling and delivery binding that hold at
-          // commit. Each was computed from the unlocked read, so lock the row
-          // on this transaction and re-check. A concurrent decision or a
-          // hand-off record that appeared since the read is a hand-off
-          // conflict (stall cards only). A moved delivered head, a changed
-          // ceiling or other stall-hold control, or a changed delivery
-          // binding (prNumber, prUrl, headSha) refuses the decision. A
+          // decision must use the snapshot it was computed from. Each was
+          // computed from the unlocked read, so lock the row on this
+          // transaction and re-check. A concurrent decision or a hand-off
+          // record that appeared since the read is a hand-off conflict (stall
+          // cards only). A moved delivered head, a changed ceiling or other
+          // stall-hold control, a changed delivery binding (prNumber, prUrl,
+          // headSha), a different last decision, a different review-round
+          // counter, or a different issue status refuses the decision. A
           // refused request persists nothing. The lock read uses `tx`; do not
           // call a service on the outer pool from inside this transaction.
           if (stallLockGuardRequired || executionDecisionLostUpdateGuardRequired) {
@@ -20666,7 +20667,13 @@ export function issueRoutes(
                 },
               );
             }
-            assertExecutionDecisionSnapshotCurrent(stallGuardReadState, previousExecutionPolicy, locked, existing.id);
+            assertExecutionDecisionSnapshotCurrent(
+              stallGuardReadState,
+              previousExecutionPolicy,
+              locked,
+              existing.id,
+              existing.status,
+            );
           }
           // SUP-15878: refuse the close under the update lock (after the review
           // policy reauthorization above) with a typed diagnosis instead of
@@ -24091,6 +24098,16 @@ export function issueRoutes(
         current.kind === "request_confirmation" &&
         isReviewEscalationInteraction(current)
           ? await interactionSvc.rejectInteraction(...rejectArgs, {
+              beforeResolveInTransaction: async (tx) => {
+                const locked = await svc.getByIdForUpdate(issue.id, tx);
+                assertExecutionDecisionSnapshotCurrent(
+                  parseIssueExecutionState(issue.executionState),
+                  normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
+                  locked,
+                  issue.id,
+                  issue.status,
+                );
+              },
               afterResolveInTransaction: async (tx, resolved) => {
                 if (resolved.kind !== "request_confirmation") return;
                 const reason =
@@ -24111,6 +24128,7 @@ export function issueRoutes(
                       runId: actor.runId,
                     },
                     deferredPostCommit: rejectDeferredPostCommit,
+                    skipStatusCompare: true,
                   });
               },
             })
@@ -25494,12 +25512,18 @@ export function issueRoutes(
       try {
         txResult = await db.transaction(async (tx) => {
           // The approval was computed from the unlocked read. Lock the row on
-          // `tx` and refuse it when the ceiling or the delivery binding moved
-          // since; nothing is written then (no comment, decision or state).
+          // `tx` and refuse it when the snapshot moved since; nothing is
+          // written then (no comment, decision or state).
           const lockedIssue = decisionId ? await svc.getByIdForUpdate(id, tx) : null;
           if (decisionId) {
             if (!lockedIssue) throw new AutoApprovalIssueMissingError();
-            assertExecutionDecisionSnapshotCurrent(currentExecutionState, currentExecutionPolicy, lockedIssue, currentIssue.id);
+            assertExecutionDecisionSnapshotCurrent(
+              currentExecutionState,
+              currentExecutionPolicy,
+              lockedIssue,
+              currentIssue.id,
+              currentIssue.status,
+            );
           }
           if (
             lockedIssue &&
