@@ -303,6 +303,144 @@ describeEmbeddedPostgres("execution policy — implicit return-assignee collisio
     ]);
   });
 
+  // SUP-22135: the create fix (SUP-22098) writes the explicit stage-less
+  // policy, but the PATCH path collapsed it back. The route parsed the STORED
+  // policy without preserveEmptyPolicy (so `currentPolicy` arrived null and the
+  // SUP-13925 guard refused the faithful round-trip), and
+  // resolvePatchExecutionPolicy normalized guard-admitted bodies without the
+  // preserve (so a stage-less partial write silently wiped the stored shape —
+  // after which the project default re-injected the ladder the caller
+  // declined).
+  async function createIssueWithExplicitEmptyPolicy(companyId: string, projectId: string, closerAgentId: string) {
+    const created = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "No ladder, PATCHed on purpose",
+        status: "todo",
+        assigneeAgentId: closerAgentId,
+        projectId,
+        deliveryRequirement: "record_only",
+        executionPolicy: { mode: "normal", commentRequired: true, stages: [] },
+      });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    expect(created.body.executionPolicy).toMatchObject({ mode: "normal", stages: [] });
+    return created.body.id as string;
+  }
+
+  it("preserves an explicit empty executionPolicy.stages across a PATCH round-trip", async () => {
+    const { companyId, closerAgentId, reviewerAgentId } = await seedCompanyWithAgents();
+    const projectId = await seedProjectWithDefaultPolicy(companyId, reviewerAgentId);
+    const issueId = await createIssueWithExplicitEmptyPolicy(companyId, projectId, closerAgentId);
+
+    const patched = await request(createApp(companyId))
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionPolicy: { mode: "normal", commentRequired: true, stages: [] } });
+
+    expect(patched.status, JSON.stringify(patched.body)).toBe(200);
+    expect(patched.body.executionPolicy).toMatchObject({ mode: "normal", stages: [] });
+
+    const stored = await db.select().from(issues).where(eq(issues.id, issueId));
+    const storedPolicy = stored[0]?.executionPolicy as { stages?: unknown[] } | null;
+    expect(storedPolicy).toMatchObject({ mode: "normal" });
+    expect(storedPolicy?.stages).toEqual([]);
+  });
+
+  it("preserves an explicit empty executionPolicy across a partial PATCH of unrelated fields", async () => {
+    const { companyId, closerAgentId, reviewerAgentId } = await seedCompanyWithAgents();
+    const projectId = await seedProjectWithDefaultPolicy(companyId, reviewerAgentId);
+    const issueId = await createIssueWithExplicitEmptyPolicy(companyId, projectId, closerAgentId);
+
+    const patched = await request(createApp(companyId))
+      .patch(`/api/issues/${issueId}`)
+      .send({ description: "Unrelated field change" });
+
+    expect(patched.status, JSON.stringify(patched.body)).toBe(200);
+    expect(patched.body.description).toBe("Unrelated field change");
+
+    const stored = await db.select().from(issues).where(eq(issues.id, issueId));
+    const storedPolicy = stored[0]?.executionPolicy as { stages?: unknown[] } | null;
+    expect(storedPolicy).toMatchObject({ mode: "normal" });
+    expect(storedPolicy?.stages).toEqual([]);
+  });
+
+  it("keeps a stage-less partial policy PATCH from wiping the stored explicit-empty policy", async () => {
+    const { companyId, closerAgentId, reviewerAgentId } = await seedCompanyWithAgents();
+    const projectId = await seedProjectWithDefaultPolicy(companyId, reviewerAgentId);
+    const issueId = await createIssueWithExplicitEmptyPolicy(companyId, projectId, closerAgentId);
+
+    const patched = await request(createApp(companyId))
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionPolicy: { mode: "auto" } });
+
+    expect(patched.status, JSON.stringify(patched.body)).toBe(200);
+    expect(patched.body.executionPolicy).toMatchObject({ mode: "auto", stages: [] });
+
+    const stored = await db.select().from(issues).where(eq(issues.id, issueId));
+    const storedPolicy = stored[0]?.executionPolicy as { stages?: unknown[] } | null;
+    expect(storedPolicy).toMatchObject({ mode: "auto" });
+    expect(storedPolicy?.stages).toEqual([]);
+  });
+
+  it("still refuses an explicit empty stages PATCH over a stored ladder", async () => {
+    const { companyId, closerAgentId, reviewerAgentId } = await seedCompanyWithAgents();
+    const projectId = await seedProjectWithDefaultPolicy(companyId, reviewerAgentId);
+
+    const created = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Ladder stays guarded",
+        status: "todo",
+        assigneeAgentId: closerAgentId,
+        projectId,
+        deliveryRequirement: "record_only",
+      });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    expect(created.body.executionPolicy?.stages?.length).toBe(1);
+
+    const patched = await request(createApp(companyId))
+      .patch(`/api/issues/${created.body.id}`)
+      .send({ executionPolicy: { mode: "normal", commentRequired: true, stages: [] } });
+
+    expect(patched.status, JSON.stringify(patched.body)).toBe(422);
+    expect(patched.body.error).toMatch(/executionPolicy\.stages must not be empty/);
+
+    const stored = await db.select().from(issues).where(eq(issues.id, created.body.id));
+    const storedPolicy = stored[0]?.executionPolicy as { stages?: unknown[] } | null;
+    expect(storedPolicy?.stages?.length).toBe(1);
+  });
+
+  it("keeps omitted-policy PATCH semantics unchanged on a default-injected issue", async () => {
+    const { companyId, closerAgentId, reviewerAgentId } = await seedCompanyWithAgents();
+    const projectId = await seedProjectWithDefaultPolicy(companyId, reviewerAgentId);
+
+    const created = await request(createApp(companyId))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Default ladder untouched",
+        status: "todo",
+        assigneeAgentId: closerAgentId,
+        projectId,
+        deliveryRequirement: "record_only",
+      });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+
+    const patched = await request(createApp(companyId))
+      .patch(`/api/issues/${created.body.id}`)
+      .send({ description: "Unrelated change" });
+
+    expect(patched.status, JSON.stringify(patched.body)).toBe(200);
+    expect(patched.body.executionPolicy?.stages).toEqual([
+      expect.objectContaining({
+        type: "review",
+        participants: [expect.objectContaining({ type: "agent", agentId: reviewerAgentId })],
+      }),
+    ]);
+
+    const stored = await db.select().from(issues).where(eq(issues.id, created.body.id));
+    const storedPolicy = stored[0]?.executionPolicy as { stages?: { participants?: { agentId?: string }[] }[] } | null;
+    expect(storedPolicy?.stages?.[0]?.participants?.[0]?.agentId).toBe(reviewerAgentId);
+  });
+
   it("accepts a board PATCH that changes delivery classification", async () => {
     const { companyId, closerAgentId } = await seedCompanyWithAgents();
     const created = await request(createApp(companyId))

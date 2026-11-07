@@ -138,7 +138,11 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp(db: unknown = {}) {
+async function createApp(
+  db: unknown = {
+    transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback({}),
+  },
+) {
   const { issueRoutes } = await vi.importActual<typeof import("../routes/issues.js")>(
     "../routes/issues.js",
   );
@@ -718,7 +722,10 @@ describe("issue activity event routes", () => {
       updatedAt: new Date(),
     }));
 
-    const res = await request(await createApp())
+    mockIssueService.getByIdForUpdate.mockResolvedValue(issue);
+    const res = await request(await createApp({
+      transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback({}),
+    }))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
       .send({ executionPolicy: nextPolicy });
 
