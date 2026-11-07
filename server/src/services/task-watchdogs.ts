@@ -2138,8 +2138,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         if (!detection) continue;
         result.detected += 1;
         result.detections.push(detection);
-        await runRecoverySweepIssue(row, "task_watchdogs.detect_stale_issue_monitors", async () => {
-        if (await hasReportedMonitorStaleFingerprint(db, detection)) return;
+        if (await hasReportedMonitorStaleFingerprint(db, detection)) continue;
         await logActivity(db, {
           companyId: row.companyId,
           actorType: "system",
@@ -2160,7 +2159,6 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           },
         });
         result.reported += 1;
-        });
       }
       return result;
     },
