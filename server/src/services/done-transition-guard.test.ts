@@ -291,6 +291,12 @@ vi.mock("./github-credential.js", () => ({
   resolveGitHubTokenCandidatesForRepo: mockResolveGitHubTokenCandidatesForRepo,
 }));
 
+const mockReadBuildCommit = vi.hoisted(() => vi.fn());
+vi.mock("../build-commit.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../build-commit.js")>();
+  return { ...actual, readBuildCommit: mockReadBuildCommit };
+});
+
 vi.mock("./activity-log.js", () => ({
   logActivity: vi.fn().mockResolvedValue(undefined),
 }));
@@ -7962,6 +7968,9 @@ describe("resolveCitedCommits (SUP-20525)", () => {
     mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
     mockResolveGitHubToken.mockReset();
     mockResolveGitHubToken.mockResolvedValue({ token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" });
+    mockReadBuildCommit.mockReset();
+    mockReadBuildCommit.mockReturnValue(null);
+    mockExecFile.mockReset();
     setupDbMock({ executionWorkspaces: [mockExecutionWorkspaceRow()] });
   });
 
@@ -8101,7 +8110,7 @@ describe("resolveCitedCommits (SUP-20525)", () => {
     const citedSha = "674fef15d2000000000000000000000000000000";
     const buildSha = "0ea666699d3f0a7ef86f98cb21a574e95be61d22";
     const servedRepoUrl = `https://api.github.com/repos/Served-Org/control-plane/commits/${citedSha}`;
-    vi.stubEnv("PAPERCLIP_BUILD_COMMIT", buildSha);
+    mockReadBuildCommit.mockReturnValue(buildSha);
     vi.stubEnv("PAPERCLIP_BUILD_REPO_URL", "https://github.com/Served-Org/control-plane");
     try {
       ghFetchMock.mockImplementation(async (url: string) =>
@@ -8112,6 +8121,28 @@ describe("resolveCitedCommits (SUP-20525)", () => {
 
       expect(resolution).toEqual({ results: [{ sha: citedSha, status: "resolved" }] });
       expect(probeUrls()).toEqual([shaUrl(citedSha), servedRepoUrl]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("does not fall back to upstream paperclip when the served repository is unavailable", async () => {
+    const citedSha = "674fef15d2000000000000000000000000000000";
+    const upstreamUrl = `https://api.github.com/repos/paperclipai/paperclip/commits/${citedSha}`;
+    mockReadBuildCommit.mockReturnValue("0ea666699d3f0a7ef86f98cb21a574e95be61d22");
+    vi.stubEnv("PAPERCLIP_BUILD_REPO_URL", "");
+    mockGitProbeUnavailable();
+    ghFetchMock.mockImplementation(async (url: string) =>
+      url === upstreamUrl ? okResponse({ sha: citedSha }) : noCommitFound422(),
+    );
+
+    try {
+      const resolution = await resolveCitedCommits(mockDb, issue, `Control plane fix at \`${citedSha}\`.`);
+
+      expect(resolution).toEqual({
+        results: [unverifiableProject(citedSha, "ambiguous_repository_scope")],
+      });
+      expect(probeUrls()).toEqual([shaUrl(citedSha)]);
     } finally {
       vi.unstubAllEnvs();
     }

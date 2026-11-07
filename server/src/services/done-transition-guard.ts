@@ -2966,7 +2966,7 @@ async function resolveServedBuildRepo(): Promise<CitedCommitRepository | null> {
     if (parsed) return parsed;
   } catch {
   }
-  return parseRepoUrl("https://github.com/paperclipai/paperclip");
+  return null;
 }
 
 export async function resolveCitedCommits(
