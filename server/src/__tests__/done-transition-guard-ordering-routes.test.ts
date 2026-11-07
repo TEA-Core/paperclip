@@ -1338,6 +1338,14 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect(records).toHaveLength(1);
       expect(records[0]?.body).toContain("[Terminal status refused] done_transition_missing_tier_declaration");
       expect(records[0]?.body).toContain("HTTP 422");
+
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const tier2Audits = await db
+        .select({ action: activityLog.action })
+        .from(activityLog)
+        .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
+        .then((rows) => rows.filter((r) => r.action === "issue.done_transition_tier2_close"));
+      expect(tier2Audits).toHaveLength(0);
     });
 
     it("AC2: a verified landed-at-tip Tier 1 line closes the card", async () => {
@@ -1384,19 +1392,20 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
       expect(audit).toHaveLength(1);
     });
 
-    it("AC3: Tier 2 acceptance-probe output in the close comment closes the card", async () => {
+    it("AC3: Tier 2 acceptance-probe output closes the card and records its evidence", async () => {
       const { companyId, agentId, issueId, identifier, branchName } = await seedIssue("SUP13939C");
       currentActor = agentActor(companyId, agentId, await seedRun(companyId, agentId, issueId));
       mockEvaluateDoneTransitionGuard.mockResolvedValue(deliveryAllowed(branchName));
       mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
       mockResolveSecretValue.mockResolvedValue("test-token");
+      const probeEvidence =
+        "probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: acceptance probe — GET /api/health returned 200 and the patched path executed without the regression.";
 
       const res = await request(app)
         .patch(`/api/issues/${identifier}`)
         .send({
           status: "done",
-          comment:
-            "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: acceptance probe — GET /api/health returned 200 and the patched path executed without the regression.",
+          comment: `Closed at Tier 2 (live): ${probeEvidence}`,
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -1407,12 +1416,36 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         .where(eq(issues.id, issueId));
       expect(statusRows[0]?.status).toBe("done");
 
-      const audit = await db
+      const tier1Audits = await db
         .select({ action: activityLog.action })
         .from(activityLog)
         .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
         .then((rows) => rows.filter((r) => r.action === "issue.done_transition_tier1_close"));
-      expect(audit).toHaveLength(0);
+      expect(tier1Audits).toHaveLength(0);
+
+      const tier2Audits = await vi.waitFor(
+        async () => {
+          const found = await db
+            .select({ action: activityLog.action, details: activityLog.details })
+            .from(activityLog)
+            .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
+            .then((rows) => rows.filter((r) => r.action === "issue.done_transition_tier2_close"));
+          if (found.length === 0) throw new Error("waiting for tier2 close audit row");
+          return found;
+        },
+        { timeout: 5000 },
+      );
+      expect(tier2Audits).toHaveLength(1);
+      expect(tier2Audits[0]?.details).toMatchObject({
+        probeEvidence,
+        probeCommand: "curl -sf https://tea-core.example/healthz",
+        probeTarget: "https://tea-core.example/healthz",
+        observed: null,
+        observedRangeEnd: null,
+        tierForm: "live",
+        probeHead: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19",
+        mergeCommit: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19",
+      });
     });
 
     it("AC4: a board actor closes without evidence, bypassing the gate with an audited bypass row", async () => {
