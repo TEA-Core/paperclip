@@ -3783,7 +3783,7 @@ async function resolveSingleMergedMentionCarrier(
   | { kind: "resolved"; headSha: string; displayName: string; pr: { owner: string; repo: string; number: number } }
   | { kind: "unresolvable"; reason: string }
 > {
-  const mentioned = await resolveLinkedPullRequestsWithState(db, companyId, issueId);
+  const mentioned = await resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts: true });
   const mergedCarriers: Array<{
     kind: "resolved";
     headSha: string;

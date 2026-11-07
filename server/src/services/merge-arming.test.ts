@@ -2161,6 +2161,21 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       expect(postStatusShas()).toEqual([]);
     });
 
+    it("accepts a draft-cached mentioned PR when the live read proves it merged", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "closed", draft: true });
+      installRoutes(mergedCarrierRoutes());
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") {
+        expect(result.headSha).toBe(APPROVED_HEAD);
+        expect(result.displayName).toBe(`${OWNER}/${REPO}#42`);
+        expect(result.pr).toEqual({ owner: OWNER, repo: REPO, number: 42 });
+      }
+    });
+
     it("resolveApprovalDecisionHead stays open-PR-only for the same card (no carrier fallback)", async () => {
       const issueId = await insertMentionOnlyCard();
       installRoutes(mergedCarrierRoutes());
