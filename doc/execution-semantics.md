@@ -619,14 +619,17 @@ A `blocked` issue is stalled when the unresolved blocker leaf has no active run,
 Paperclip now treats crash/restart recovery as a stranded-assigned-work problem, not just a stranded-run problem.
 
 The HTTP listener binds before startup recovery so surviving runners can
-reconnect. A per-issue failure inside a startup recovery sweep that writes an
-issue — including an assignee-review refusal — is logged with the issue
-identifier and skipped. The card is left unchanged, any recovery action already
-recorded for that card stays, and the sweep continues with the remaining
-issues so startup can finish and the listener stays open. Recovery-action
-reconciliation already logs and skips an individual failed action the same way.
-A failure of the sweep itself, or any other fatal startup failure after
-binding, still closes the HTTP listener before ending database clients: a
+reconnect. A per-issue failure of any error class inside a startup recovery
+sweep that writes an issue — including an assignee-review refusal — is logged
+with the issue identifier, the sweep name, and the error class and message,
+and the card is skipped for that sweep. Writes made earlier in the same
+iteration (recovery action, comment, wake) may already have persisted. The
+sweep continues with the remaining issues so startup can finish and the
+listener stays open. A lost database connection (connection closed or ended)
+is not a per-card failure and is rethrown. Recovery-action reconciliation
+already logs and skips an individual failed action the same way. A failure of
+the sweep itself, or any other fatal startup failure after binding, still
+closes the HTTP listener before ending database clients: a
 rejected `startServer()` must not leave a port accepting requests against a
 closed pool. That failure is logged and rethrown. When the server runs as the
 main module, the entrypoint reports eligible failures to Sentry and exits

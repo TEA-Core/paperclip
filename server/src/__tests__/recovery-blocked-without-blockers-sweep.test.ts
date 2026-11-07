@@ -2040,7 +2040,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(action.recoveryIssueId).not.toBeNull();
   });
 
-  it("board monitor re-arm rethrows a 422 without a clearReason from the drain", async () => {
+  it("board monitor re-arm skips only the card, not the drain, on a 422 without a clearReason", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
     const issueId = randomUUID();
     await db.insert(issues).values({
@@ -2061,15 +2061,22 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     );
     try {
       const heartbeat = heartbeatService(db);
-      await expect(heartbeat.reconcileExhaustedRecoveryDrain()).rejects.toThrow(
-        "Monitor can only be scheduled",
-      );
+      await expect(heartbeat.reconcileExhaustedRecoveryDrain()).resolves.toMatchObject({
+        checked: 1,
+        monitorArmed: 0,
+        recoveryIssueMinted: 0,
+      });
     } finally {
       mockMonitorTransitionFailure.error = null;
     }
+    const [action] = await db
+      .select({ recoveryIssueId: issueRecoveryActions.recoveryIssueId })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action.recoveryIssueId).toBeNull();
   });
 
-  it("board monitor re-arm rethrows non-422 transition errors from the drain", async () => {
+  it("board monitor re-arm skips only the card, not the drain, on non-422 transition errors", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
     const issueId = randomUUID();
     await db.insert(issues).values({
@@ -2087,12 +2094,19 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     mockMonitorTransitionFailure.error = new HttpError(500, "monitor transition exploded");
     try {
       const heartbeat = heartbeatService(db);
-      await expect(heartbeat.reconcileExhaustedRecoveryDrain()).rejects.toThrow(
-        "monitor transition exploded",
-      );
+      await expect(heartbeat.reconcileExhaustedRecoveryDrain()).resolves.toMatchObject({
+        checked: 1,
+        monitorArmed: 0,
+        recoveryIssueMinted: 0,
+      });
     } finally {
       mockMonitorTransitionFailure.error = null;
     }
+    const [action] = await db
+      .select({ recoveryIssueId: issueRecoveryActions.recoveryIssueId })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action.recoveryIssueId).toBeNull();
   });
 
   it("SUP-21344-review: a due self-armed board monitor is claimed by the monitor tick, not re-armed by the drain", async () => {
