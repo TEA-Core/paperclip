@@ -4059,7 +4059,7 @@ registry.registerPath({
         .optional()
         .nullable()
         .describe(
-          "Sanctioned no-deliverable-head waiver for a transition to `done`. `disposition` must be one of `upstream-equivalent-fix-no-deliverable-head`, `child-delivery-parent-close`, or `merged-elsewhere` (any other value is refused, 409 `done_transition_missing_delivery`). A no-deliverable-head override does not clear a review-ladder refusal.",
+          "Sanctioned no-deliverable-head waiver for a transition to `done`. `disposition` must be one of `upstream-equivalent-fix-no-deliverable-head`, `child-delivery-parent-close`, `merged-elsewhere`, or `control-plane-operation-no-deliverable` (any other value is refused, 409 `done_transition_missing_delivery`). A no-deliverable-head override does not clear a review-ladder refusal.",
         ),
       deliveryIdentity: z
         .object({
