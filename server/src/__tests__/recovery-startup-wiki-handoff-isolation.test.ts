@@ -20,6 +20,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { logger } from "../middleware/logger.js";
 import { issueService } from "../services/issues.js";
 import { recoveryService } from "../services/recovery/service.js";
 
@@ -256,23 +257,57 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
     expect(ordinary?.status).toBe("blocked");
   });
 
-  it("continues the sweep when one card's issue write throws a non-guard error", async () => {
+  it.each([
+    {
+      family: "stranded assigned",
+      sweep: "recovery.reconcile_stranded_assigned_issues",
+    },
+    {
+      family: "orphan blocker",
+      sweep: "recovery.reconcile_unassigned_blocking_issue",
+    },
+  ])("skips one injected write failure in the $family sweep, processes the later card, and logs the skip", async ({ sweep }) => {
     const seeded = await seedCompany();
-    const failingIssueId = await seedWikiHandoff({ ...seeded, issueNumber: 3 });
-    const ordinaryIssueId = await seedOrdinaryStranded({ ...seeded, issueNumber: 4 });
-    issueUpdateHook.failures.set(failingIssueId, () => new Error(`injected recovery write failure for ${failingIssueId}`));
-    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
-
-    const result = await recovery.reconcileStrandedAssignedIssues();
-
-    expect(result.issueIds).toContain(ordinaryIssueId);
-    expect(result.issueIds).not.toContain(failingIssueId);
-    const [failing, ordinary] = await Promise.all([
-      db.select().from(issues).where(eq(issues.id, failingIssueId)).then((rows) => rows[0]),
-      db.select().from(issues).where(eq(issues.id, ordinaryIssueId)).then((rows) => rows[0]),
-    ]);
-    expect(failing).toMatchObject({ status: "in_review", assigneeAgentId: seeded.intruderId });
-    expect(ordinary?.status).toBe("blocked");
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined as never);
+    try {
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => ({ id: randomUUID() }) as never) });
+      if (sweep === "recovery.reconcile_stranded_assigned_issues") {
+        const failingIssueId = await seedWikiHandoff({ ...seeded, issueNumber: 3 });
+        const ordinaryIssueId = await seedOrdinaryStranded({ ...seeded, issueNumber: 4 });
+        issueUpdateHook.failures.set(failingIssueId, () => new Error(`injected recovery write failure for ${failingIssueId}`));
+        const result = await recovery.reconcileStrandedAssignedIssues();
+        expect(result.issueIds).toContain(ordinaryIssueId);
+        expect(result.issueIds).not.toContain(failingIssueId);
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.objectContaining({ issueId: failingIssueId, sweep }),
+          expect.stringContaining("skipped a card"),
+        );
+        return;
+      }
+      const downstreamId = randomUUID();
+      await db.insert(issues).values({
+        id: downstreamId,
+        companyId: seeded.companyId,
+        title: "Downstream card",
+        status: "blocked",
+        priority: "medium",
+        issueNumber: 8,
+        identifier: `${seeded.prefix}-8`,
+      });
+      const failingIssueId = await seedOrphanBlocker({ ...seeded, creatorId: seeded.coderId, issueNumber: 9, downstreamId });
+      const ordinaryIssueId = await seedOrphanBlocker({ ...seeded, creatorId: seeded.coderId, issueNumber: 10, downstreamId });
+      issueUpdateHook.failures.set(failingIssueId, () => new Error(`injected recovery write failure for ${failingIssueId}`));
+      const result = await recovery.reconcileStrandedAssignedIssues();
+      expect(result.orphanBlockersAssigned).toBe(1);
+      expect(result.issueIds).toContain(ordinaryIssueId);
+      expect(result.issueIds).not.toContain(failingIssueId);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ issueId: failingIssueId, sweep }),
+        expect.stringContaining("skipped a card"),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   it("rethrows a lost database connection instead of skipping every card", async () => {
@@ -315,7 +350,7 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
     return blockerId;
   }
 
-  it("continues the orphan-blocker sweep when one blocker's assignee write is refused as a non-canonical Wiki handoff", async () => {
+  it("continues the orphan-blocker sweep when one blocker's assignee write throws", async () => {
     const seeded = await seedCompany();
     const downstreamId = randomUUID();
     await db.insert(issues).values({
@@ -324,30 +359,35 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
       title: "Downstream card",
       status: "blocked",
       priority: "medium",
-      issueNumber: 8,
-      identifier: `${seeded.prefix}-8`,
+      issueNumber: 18,
+      identifier: `${seeded.prefix}-18`,
     });
-    const refusedBlockerId = await seedOrphanBlocker({
-      ...seeded,
-      creatorId: seeded.coderId,
-      issueNumber: 9,
-      downstreamId,
-      title: "[PPC ER] Weekly Report — handoff to Wiki Maintainer",
-    });
-    const ordinaryBlockerId = await seedOrphanBlocker({ ...seeded, creatorId: seeded.coderId, issueNumber: 10, downstreamId });
-    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => ({ id: randomUUID() }) as never) });
-
-    const result = await recovery.reconcileStrandedAssignedIssues();
-
-    expect(result.orphanBlockersAssigned).toBe(1);
-    expect(result.issueIds).toContain(ordinaryBlockerId);
-    expect(result.issueIds).not.toContain(refusedBlockerId);
-    const [refused, ordinary] = await Promise.all([
-      db.select().from(issues).where(eq(issues.id, refusedBlockerId)).then((rows) => rows[0]),
-      db.select().from(issues).where(eq(issues.id, ordinaryBlockerId)).then((rows) => rows[0]),
-    ]);
-    expect(refused?.assigneeAgentId).toBeNull();
-    expect(ordinary?.assigneeAgentId).toBe(seeded.coderId);
+    const refusedBlockerId = await seedOrphanBlocker({ ...seeded, creatorId: seeded.coderId, issueNumber: 19, downstreamId });
+    const ordinaryBlockerId = await seedOrphanBlocker({ ...seeded, creatorId: seeded.coderId, issueNumber: 20, downstreamId });
+    issueUpdateHook.failures.set(refusedBlockerId, () => new Error("injected assignee write failure"));
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined as never);
+    try {
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => ({ id: randomUUID() }) as never) });
+      const result = await recovery.reconcileStrandedAssignedIssues();
+      expect(result.orphanBlockersAssigned).toBe(1);
+      expect(result.issueIds).toContain(ordinaryBlockerId);
+      expect(result.issueIds).not.toContain(refusedBlockerId);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          issueId: refusedBlockerId,
+          sweep: "recovery.reconcile_unassigned_blocking_issue",
+        }),
+        expect.stringContaining("skipped a card"),
+      );
+      const [refused, ordinary] = await Promise.all([
+        db.select().from(issues).where(eq(issues.id, refusedBlockerId)).then((rows) => rows[0]),
+        db.select().from(issues).where(eq(issues.id, ordinaryBlockerId)).then((rows) => rows[0]),
+      ]);
+      expect(refused?.assigneeAgentId).toBeNull();
+      expect(ordinary?.assigneeAgentId).toBe(seeded.coderId);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   async function seedExhaustedInReview(input: {

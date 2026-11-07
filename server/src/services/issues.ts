@@ -12153,18 +12153,38 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
-        // A status or blocker write that does not change the assignee, title,
-        // description, or execution policy/state is not an assignee write.
-        // Substituting the locked assignee made a recovery park of an already
-        // non-canonical Wiki handoff look like a new assignee write and refuse
-        // with wiki_handoff_non_canonical_assignee. Identity and assignee writes
-        // still present the resulting assignee to the guard.
-        const wikiHandoffIdentityWrite =
-          issueData.assigneeAgentId !== undefined ||
-          issueData.title !== undefined ||
-          issueData.description !== undefined ||
-          issueData.executionPolicy !== undefined ||
-          issueData.executionState !== undefined;
+        // Skip the Wiki handoff guard only when every present key is status or
+        // blocker bookkeeping. Any other key, including assigneeUserId, is an
+        // assignee or identity write and still runs the guard.
+        // status: blockIssueWithUnresolvedBlockers, blocked-without-blockers heal,
+        //   dispatch-suppression park, todo-stranded park, escalateDispositionRepair
+        // blockedByIssueIds: blockIssueWithUnresolvedBlockers,
+        //   resolveContinuationWaitingOnReview, reconcileActiveRecoveryActions
+        // statusVersion, lastStatusDecisionId: status-decision receipt bumps that
+        //   do not assign
+        // unblockDescriptor: repairNativeBlockedWait
+        // companyGuard: blockIssueWithUnresolvedBlockers company scope
+        // monitorNextCheckAt, monitorWakeRequestedAt, monitorNotes, monitorScheduledBy:
+        //   applyIssueMonitorPolicyTransition, used by scheduleProviderQuotaRecoveryMonitor
+        //   and armExhaustedBoardMonitor
+        const wikiHandoffUnguardedWriteKeys = new Set([
+          "status",
+          "blockedByIssueIds",
+          "statusVersion",
+          "lastStatusDecisionId",
+          "unblockDescriptor",
+          "companyGuard",
+          "monitorNextCheckAt",
+          "monitorWakeRequestedAt",
+          "monitorNotes",
+          "monitorScheduledBy",
+        ]);
+        const presentWriteKeys = Object.entries(data)
+          .filter(([, value]) => value !== undefined)
+          .map(([key]) => key);
+        const wikiHandoffIdentityWrite = presentWriteKeys.some(
+          (key) => !wikiHandoffUnguardedWriteKeys.has(key),
+        );
         if (wikiHandoffIdentityWrite) {
           await assertWikiHandoffWriteIntegrity({
             db: tx as Db,
