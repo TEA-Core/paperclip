@@ -2538,6 +2538,7 @@ export async function evaluateDoneTierDeclaration(
   // inside its status write passes the closer; without one the record_only
   // no-repository form refuses.
   noRepositoryLandingCloser: DoneTierClosingActor | null = null,
+  recordOnlyReviewDecision = false,
 ): Promise<DoneTierDeclarationResult> {
   // SUP-22801: a record_only card's primary accepted Tier 2 form is the
   // record-only live-evidence grammar (no merge head by design); the merge-head
@@ -2554,6 +2555,22 @@ export async function evaluateDoneTierDeclaration(
     skipped,
     skipReason,
   });
+  const missingDeclaration = (reason: string, specificReason: string | null): DoneTierDeclarationResult => {
+    if (specificReason === null && recordOnlyReviewDecision) {
+      return fallback(
+        "Record-only participant review decision carried the close without consumer probe evidence",
+        true,
+        "record_only_review_decision",
+      );
+    }
+    return {
+      allowed: false,
+      reason: specificReason ?? reason,
+      tier: null,
+      skipped: false,
+      skipReason: null,
+    };
+  };
   const tier1Forms = `${TIER1_FORM}${noRepositoryTier1FormSuffix(issue)}`;
 
   if (accompanyingComment && accompanyingComment.trim().length > 0) {
@@ -2578,19 +2595,14 @@ export async function evaluateDoneTierDeclaration(
       }
       return proveTier1Landing(db, issue, tier1.reason, false, accompanyingComment, noRepositoryLandingCloser);
     }
-    return {
-      allowed: false,
-      reason:
-        describeTierRejection(tier2, tier1, tier2Forms, tier1Forms) ??
-        ("Close comment is missing a done-tier declaration. Accepted forms: " +
-          `${tier2Forms}` +
-          ` or ` +
-          `${tier1Forms}` +
-          ` — per SUP-12693.`),
-      tier: null,
-      skipped: false,
-      skipReason: null,
-    };
+    return missingDeclaration(
+      "Close comment is missing a done-tier declaration. Accepted forms: " +
+        `${tier2Forms}` +
+        ` or ` +
+        `${tier1Forms}` +
+        ` — per SUP-12693.`,
+      describeTierRejection(tier2, tier1, tier2Forms, tier1Forms),
+    );
   }
 
   if (!runId) {
@@ -2667,19 +2679,14 @@ export async function evaluateDoneTierDeclaration(
     return proveTier1Landing(db, issue, tier1.reason, true, sameRunComment.body, noRepositoryLandingCloser);
   }
 
-  return {
-    allowed: false,
-    reason:
-      describeTierRejection(tier2, tier1, tier2Forms, tier1Forms) ??
-      ("Same-run comment does not contain a done-tier declaration. " +
-        `Accepted forms: ${tier2Forms}` +
-        ` or ` +
-        `${tier1Forms}` +
-        ` — per SUP-12693.`),
-    tier: null,
-    skipped: false,
-    skipReason: null,
-  };
+  return missingDeclaration(
+    "Same-run comment does not contain a done-tier declaration. " +
+      `Accepted forms: ${tier2Forms}` +
+      ` or ` +
+      `${tier1Forms}` +
+      ` — per SUP-12693.`,
+    describeTierRejection(tier2, tier1, tier2Forms, tier1Forms),
+  );
 }
 
 // ───────────────────────────────────────────────────────────────────────
