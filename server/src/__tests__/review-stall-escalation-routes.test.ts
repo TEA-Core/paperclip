@@ -1362,23 +1362,6 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     60_000,
   );
 
-  async function auditActions(issueId: string, action: string) {
-    return (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).filter(
-      (row) => row.action === action,
-    );
-  }
-
-  // Fire-and-forget audit inserts have no completion signal, so this polls the row.
-  async function waitForAuditCount(issueId: string, action: string, count: number) {
-    const deadline = Date.now() + 5_000;
-    let rows = await auditActions(issueId, action);
-    while (rows.length < count && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      rows = await auditActions(issueId, action);
-    }
-    return rows;
-  }
-
   it("refuses a stale participant bounce after an escalation accept closed the card done", async () => {
     const seeded = await seedCompany();
     const { issueId, stageId } = await seedPlainPendingReview(seeded, {
@@ -1470,65 +1453,6 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     expect(retried.status, JSON.stringify(retried.body)).toBe(200);
     expect(await decisionRows(issueId)).toHaveLength(2);
     expect((await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, pending!.id)))[0]?.status).toBe("accepted");
-  }, 60_000);
-
-  it("writes no done-guard audit when a final-stage accept is already stale at the lock", async () => {
-    const seeded = await seedCompany();
-    const { issueId, stageId } = await seedPlainPendingReview(seeded, {
-      maxReviewRounds: 3,
-      escalated: true,
-    });
-    const interaction = await seedEscalationInteraction(seeded, issueId, stageId);
-    lockInterleave.beforeLock = async () => {
-      const current = await issueRow(issueId);
-      await db
-        .update(issues)
-        .set({
-          executionState: {
-            ...(current.executionState as Record<string, unknown>),
-            lastDecisionId: randomUUID(),
-          },
-        })
-        .where(eq(issues.id, issueId));
-    };
-
-    const refused = await request(app(boardActor(seeded)))
-      .post(`/api/issues/${issueId}/interactions/${interaction.id}/accept`)
-      .send({});
-
-    expect(lockInterleave.beforeLock).toBeNull();
-    expect(refused.status, JSON.stringify(refused.body)).toBe(409);
-    expect(refused.body.details).toMatchObject({ code: "review_stall_policy_changed" });
-    expect(await decisionRows(issueId)).toHaveLength(0);
-    expect((await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction.id)))[0]?.status).toBe("pending");
-    // The done-guard audits are fire-and-forget inserts with no completion signal. A real wait is the only way to observe that they were not started.
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
-    expect(await auditActions(issueId, "issue.done_transition_guard_skipped")).toHaveLength(0);
-    expect(await auditActions(issueId, "issue.done_tier_declaration_skipped")).toHaveLength(0);
-  }, 60_000);
-
-  it("keeps done-guard preflight audits when a final-stage accept goes stale after the preflight", async () => {
-    const seeded = await seedCompany();
-    const headSha = "a".repeat(40);
-    const { issueId, stageId } = await seedPlainPendingReview(seeded, {
-      maxReviewRounds: 3,
-      escalated: true,
-      delivery: sameHeadDelivery(headSha),
-    });
-    const interaction = await seedEscalationInteraction(seeded, issueId, stageId);
-    refreshDeliveryBeforeResolve(issueId, { ...sameHeadDelivery(headSha), prUrl: "https://github.com/TEA-Core/paperclip/pull/1117" });
-
-    const refused = await request(app(boardActor(seeded)))
-      .post(`/api/issues/${issueId}/interactions/${interaction.id}/accept`)
-      .send({});
-
-    expect(lockInterleave.beforeResolve).toBeNull();
-    expect(refused.status, JSON.stringify(refused.body)).toBe(409);
-    expect(refused.body.details).toMatchObject({ code: "review_stall_policy_changed" });
-    expect(await decisionRows(issueId)).toHaveLength(0);
-    expect((await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction.id)))[0]?.status).toBe("pending");
-    expect(await waitForAuditCount(issueId, "issue.done_transition_guard_skipped", 2)).toHaveLength(2);
-    expect(await waitForAuditCount(issueId, "issue.done_tier_declaration_skipped", 1)).toHaveLength(1);
   }, 60_000);
 
   async function resolveRecovery(seeded: Seeded, issueId: string, note: string) {

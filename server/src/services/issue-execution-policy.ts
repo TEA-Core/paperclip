@@ -1190,14 +1190,14 @@ export function assertExecutionDecisionSnapshotCurrent(
   readPolicy: IssueExecutionPolicy | null,
   locked: { status?: string | null; executionState?: unknown; executionPolicy?: unknown } | null | undefined,
   issueId: string,
-  readStatus: string | null,
+  readStatus?: string | null,
 ): void {
   const lockedState = parseIssueExecutionState(locked?.executionState ?? null);
   if (
     (lockedState?.deliveredHeadSha ?? null) !== (readState?.deliveredHeadSha ?? null) ||
     (lockedState?.lastDecisionId ?? null) !== (readState?.lastDecisionId ?? null) ||
     (lockedState?.changesRequestedCount ?? 0) !== (readState?.changesRequestedCount ?? 0) ||
-    (locked?.status ?? null) !== readStatus ||
+    (readStatus !== undefined && (locked?.status ?? null) !== readStatus) ||
     stallHoldControlsDiffer(readPolicy, normalizeIssueExecutionPolicy(locked?.executionPolicy ?? null)) ||
     deliveryBindingDiffers(readState, lockedState)
   ) {

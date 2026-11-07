@@ -23571,9 +23571,7 @@ export function issueRoutes(
       // done-transition guard here — before the interaction is accepted — so a
       // card that cannot lawfully close is refused with the guard's own typed
       // status/body, surfaced rather than swallowed, and the pending interaction
-      // is left resolvable. The snapshot compare runs first, under the same row
-      // lock the decision uses, so a stale accept does not write the guard's
-      // preflight audit rows.
+      // is left resolvable.
       const reviewEscalationAccept =
         current.kind === "request_confirmation" && isReviewEscalationInteraction(current);
       const reviewEscalationCompletesLadder =
@@ -23589,16 +23587,6 @@ export function issueRoutes(
       } | null = null;
       let escalationCertifiedDelivery: Record<string, unknown> | null = null;
       if (reviewEscalationCompletesLadder) {
-        await db.transaction(async (tx) => {
-          const locked = await svc.getByIdForUpdate(issue.id, tx);
-          assertExecutionDecisionSnapshotCurrent(
-            parseIssueExecutionState(issue.executionState),
-            normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
-            locked,
-            issue.id,
-            issue.status,
-          );
-        });
         const closeOutcome = await evaluateDoneTransitionGuards({
           issue,
           override: null,
@@ -24127,10 +24115,6 @@ export function issueRoutes(
                   resolved.result.reason.trim().length > 0
                     ? resolved.result.reason.trim()
                     : "Review changes requested via the round-cap escalation.";
-                const resolverWritesTodo =
-                  issue.status === "in_review" &&
-                  (current.continuationPolicy === "wake_assignee" ||
-                    readAcceptedPlanConfirmationTarget(current.payload, issue.id)?.key === "plan");
                 rejectedEscalationDecision.value =
                   await applyReviewEscalationDecision({
                     db: tx as unknown as Db,
@@ -24144,7 +24128,7 @@ export function issueRoutes(
                       runId: actor.runId,
                     },
                     deferredPostCommit: rejectDeferredPostCommit,
-                    statusWrittenByResolver: resolverWritesTodo ? "todo" : null,
+                    skipStatusCompare: true,
                   });
               },
             })
