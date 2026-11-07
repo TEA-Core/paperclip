@@ -43,10 +43,15 @@ const activityFault = vi.hoisted(() => ({ action: null as string | null }));
 // Deterministic interleaving: `beforeLock` runs once, on the request's first
 // row-lock read, after the route computed its decision from the unlocked read
 // and before the locked re-check reads the row.
+// `beforeSecondLock` runs once, on the second row-lock read counted after the
+// test arms it: on the stop path that is the write transaction's read, after the
+// pre-stop compare passed and the runner stop ran.
 // `beforeResolve` runs once, right before an interaction accept or reject opens its
 // transaction: after the route read the card, before the resolution locks it.
 const lockInterleave = vi.hoisted(() => ({
   beforeLock: null as null | (() => Promise<void>),
+  beforeSecondLock: null as null | (() => Promise<void>),
+  lockReads: 0,
   beforeResolve: null as null | (() => Promise<void>),
 }));
 vi.mock("../services/index.js", async (importOriginal) => {
@@ -66,6 +71,14 @@ vi.mock("../services/index.js", async (importOriginal) => {
           const hook = lockInterleave.beforeLock;
           lockInterleave.beforeLock = null;
           if (hook) await hook();
+          if (lockInterleave.beforeSecondLock) {
+            lockInterleave.lockReads += 1;
+            if (lockInterleave.lockReads === 2) {
+              const second = lockInterleave.beforeSecondLock;
+              lockInterleave.beforeSecondLock = null;
+              await second();
+            }
+          }
           return svc.getByIdForUpdate(...lockArgs);
         },
       };
@@ -126,6 +139,8 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
   afterEach(async () => {
     activityFault.action = null;
     lockInterleave.beforeLock = null;
+    lockInterleave.beforeSecondLock = null;
+    lockInterleave.lockReads = 0;
     lockInterleave.beforeResolve = null;
     if (seededRunIds.length > 0) {
       await db.update(heartbeatRuns).set({ status: "cancelled" }).where(inArray(heartbeatRuns.id, seededRunIds));
@@ -1888,6 +1903,49 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(run?.status).toBe("running");
     expect(run?.errorCode ?? null).toBeNull();
+  }, 60_000);
+
+  it.each([
+    { arm: "bounce to the coder", body: plainFinding },
+    {
+      arm: "final approval",
+      body: {
+        status: "done",
+        comment: "Approve.",
+        doneTier: { tier: "tier2", probeEvidence: recordOnlyProbeEvidence },
+      },
+    },
+  ])("refuses a snapshot that moves during the runner stop on an agent-assigned $arm", async ({ body }) => {
+    const seeded = await seedCompany();
+    const { issueId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 50,
+      changesRequestedCount: 0,
+    });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    const before = await issueRow(issueId);
+    lockInterleave.beforeSecondLock = async () => {
+      const current = await issueRow(issueId);
+      await db.update(issues).set({
+        executionState: { ...(current.executionState as Record<string, unknown>), lastDecisionId: randomUUID() },
+      }).where(eq(issues.id, issueId));
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(body);
+
+    expect(lockInterleave.beforeSecondLock).toBeNull();
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    expect(await decisionRows(issueId)).toHaveLength(0);
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    expect(row.assigneeAgentId).toBe(before.assigneeAgentId);
+    expect(row.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: (before.executionState as { currentStageId: string }).currentStageId,
+    });
   }, 60_000);
 
   it("refuses a stale escalation accept after the card was parked blocked", async () => {
