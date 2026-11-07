@@ -622,9 +622,14 @@ The HTTP listener binds before startup recovery so surviving runners can
 reconnect. Inside the wrapped startup sweeps below, a per-card failure of any
 error class except a lost database connection is logged and that card is
 skipped. That includes assignee-review refusals and non-connection database
-failures (constraint, check, deadlock). A lost database connection
-(`CONNECTION_CLOSED`, `CONNECTION_ENDED`, `CONNECTION_DESTROYED`, anywhere on
-the error `cause` chain) is rethrown so startup fails visibly. The log carries
+failures (constraint, check, deadlock). The helper rethrows a lost database
+connection (`CONNECTION_CLOSED`, `CONNECTION_ENDED`, `CONNECTION_DESTROYED`,
+anywhere on the error `cause` chain). For the wrapped sweeps other than the
+host-restart strand sweep, that rethrow fails startup.
+`server/src/index.ts` catches every error from `sweepHostRestartStrandedIssues`,
+including a lost connection. It logs `startup host-restart strand sweep failed`
+and does not rethrow. Later startup steps still run. If those later steps
+succeed, startup can finish after that sweep fails. The log carries
 the issue identifier, the sweep name, and the error class and message. Writes
 made earlier in the same iteration (recovery action, comment, wake) may
 already have persisted. The sweep continues with the remaining cards so
@@ -643,15 +648,15 @@ monitor re-arm paths always send `executionPolicy` with the monitor columns, and
 the native status-decision commits send `statusVersion` with
 `actorAgentId` and `actorUserId` (null values still count as present keys), so
 those keys never form a write on their own and are not allow-listed. Known
-consequence: a non-canonical Wiki handoff card with an exhausted recovery action
-is skipped at every tick and does not get a monitor, because the guard refuses
-its `executionPolicy` write. The same holds for a non-canonical Wiki handoff
+consequence: an exhausted non-canonical Wiki handoff card gets no monitor, and
+the sweep logs one error per tick. The recovery-issue fallback runs when the
+monitor arm returns null. It does not run after a successful arm. A thrown
+guard error stops the card before that fallback, so the card also gets no
+recovery issue. The same monitor refusal holds for a non-canonical Wiki handoff
 card that is `in_progress`, or `in_review` with an invokable participant, whose
-latest run failed on provider quota: the monitor write is refused, so the card
-gets no monitor and no board item, and the sweep logs one error per tick. An
-exhausted card also loses its recovery-issue fallback, because that fallback runs
-only after the monitor arm succeeds. The base build crashed startup on the same
-cards. A follow-up change owns this gap. Latent gap, unchanged by this change:
+latest run failed on provider quota. That card gets no monitor and no board
+item. The base build crashed startup on the same cards. A follow-up change owns
+this gap. Latent gap, unchanged by this change:
 an explicit `executionPolicy: undefined` in the update data is dropped before the
 allow-list check, so it skips the guard, and the update then writes a null
 execution policy.
@@ -666,8 +671,12 @@ drizzle updates inside a per-run loop, stay fail-fast on purpose: those loops
 are not the guarded issue-service path. A failure there, including a database
 failure, still stops startup.
 
-Each card is processed inside the shared `runRecoverySweepIssue` helper in these
-startup sweeps. The helper accepts only the names in `RECOVERY_SWEEP_NAMES`
+Each card's repair is processed inside the shared `runRecoverySweepIssue` helper
+in these startup sweeps. For `sweepHostRestartStrandedIssues`, the sweep gathers
+facts for each candidate before it enters the helper. A non-connection error in
+that phase aborts the sweep, and later cards are not processed. That is the same
+as the base build. Per-card isolation applies only to the wrapped repair phase.
+The helper accepts only the names in `RECOVERY_SWEEP_NAMES`
 (`server/src/lib/recovery-sweep-isolation.ts`), so a call site with an
 unregistered name fails typecheck, and the sweep isolation table test runs an
 injected-failure case per registered name, with the failing card in both
@@ -695,7 +704,8 @@ reaches `issueService.update`, the guarded path:
   `armExhaustedBoardMonitor`.
 - `sweepHostRestartStrandedIssues`: the escalation calls it through
   `blockIssueWithUnresolvedBlockers`. The re-arm repair is a direct drizzle
-  update.
+  update. Fact gathering runs before the helper. A non-connection error there
+  aborts the sweep. Isolation covers only the wrapped repair.
 - `reconcileTaskWatchdogs`: `evaluateWatchdog` reaches
   `ensureReusableWatchdogIssue`, which reopens the watchdog issue with
   `issuesSvc.update`.
