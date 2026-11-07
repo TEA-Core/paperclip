@@ -32366,6 +32366,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   inArray(heartbeatRuns.status, [
                     ...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES,
                   ]),
+                  issue.assigneeAgentId
+                    ? or(
+                        ne(heartbeatRuns.status, "running"),
+                        eq(heartbeatRuns.agentId, issue.assigneeAgentId),
+                      )
+                    : undefined,
                   sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
                 ),
               )
