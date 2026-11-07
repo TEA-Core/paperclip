@@ -11,6 +11,7 @@ import {
   resolveWorkspaceReadinessState,
   resolveWorkspaceSeedMarkerDir,
 } from "../services/workspace-readiness.js";
+import { isVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
 import {
   buildManagedWorkspaceGuestEnv,
   listManagedWorkspaceHandoffSubjects,
@@ -151,6 +152,35 @@ describe("resolveWorkspaceReadiness", () => {
       seedMode: "minimal",
       executionWorkspaceId: "ews-1",
       companyId: "company-1",
+      failurePhase: null,
+    });
+  });
+
+  it("recognizes a verified minimal-no-secrets clone and reports its seed mode unchanged", async () => {
+    const manifest = {
+      version: 2,
+      state: "verified",
+      phase: "complete",
+      seedMode: "minimal-no-secrets",
+      source: { instanceId: "instance-a", configPath: "/etc/paperclip/config.json" },
+      snapshotAt: "2026-10-31T00:00:00.000Z",
+      migrationRevision: "rev-1",
+      targetInstanceId: "instance-b",
+      attemptId: "attempt-1",
+      startedAt: "2026-10-31T00:00:00.000Z",
+      finishedAt: "2026-10-31T00:01:00.000Z",
+      diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-10-31T00:01:00.000Z" }],
+    };
+    const { configPath } = createMarkerDir({ "seed-manifest.json": JSON.stringify(manifest) });
+    expect(isVerifiedWorktreeSeedManifest(manifest)).toBe(true);
+    const readiness = await resolveWorkspaceReadiness({
+      db: readyDb(),
+      env: readyGuestEnv(configPath),
+    });
+    expect(readiness).toMatchObject({
+      state: "ready",
+      seedState: "verified",
+      seedMode: "minimal-no-secrets",
       failurePhase: null,
     });
   });

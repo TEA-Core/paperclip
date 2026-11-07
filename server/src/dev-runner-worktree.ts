@@ -1,7 +1,8 @@
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { hasVerifiedWorktreeSeedManifest } from "./worktree-seed-manifest.js";
+import { hasVerifiedWorktreeSeedManifest, readVerifiedWorktreeSeedMode } from "./worktree-seed-manifest.js";
+import { resolveWorktreeRootFromRuntimeEnv } from "./worktree-config.js";
 
 function parseEnvFile(contents: string): Record<string, string> {
   const entries: Record<string, string> = {};
@@ -65,6 +66,49 @@ export function resolveWorktreeStateDir(rootDir: string, uid: number = process.g
 
 export function resolveWorktreeEnvFilePath(rootDir: string): string {
   return path.join(resolveWorktreeStateDir(rootDir), ".env");
+}
+
+const WORKTREE_SECRETS_MASTER_KEY_ENV_KEYS = [
+  "PAPERCLIP_SECRETS_MASTER_KEY",
+  "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
+] as const;
+
+export function applyWorktreeSecretsMasterKeyEnvOverrides(
+  rootDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  if (!isLinkedGitWorktreeCheckout(rootDir)) return env;
+
+  const envPath = resolveWorktreeEnvFilePath(rootDir);
+  if (!existsSync(envPath)) return env;
+
+  const entries = parseEnvFile(readFileSync(envPath, "utf8"));
+  // SUP-22348: in a minimal-no-secrets worktree the seeded .env owns the
+  // secrets master key, so values inherited from a parent process must be
+  // deleted when the worktree env does not carry them — overriding when
+  // present is not enough, the inherited value must never survive.
+  const seedMode = readVerifiedWorktreeSeedMode(
+    path.join(resolveWorktreeStateDir(rootDir), "seed-manifest.json"),
+  );
+  for (const key of WORKTREE_SECRETS_MASTER_KEY_ENV_KEYS) {
+    if (key in entries) env[key] = entries[key];
+    else if (seedMode === "minimal-no-secrets") delete env[key];
+  }
+  return env;
+}
+
+// SUP-22348: the managed runtime-service path (`pnpm --filter
+// @paperclipai/server dev` → `tsx src/index.ts`) runs with its working
+// directory inside the server package rather than at the worktree root, so
+// worktree detection cannot rely on cwd. Reuse the runtime context resolver,
+// which walks ancestors from the resolved Paperclip config and only adopts
+// genuine worktree layouts.
+export function applyWorktreeSecretsMasterKeyEnvOverridesFromRuntimeEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const rootDir = resolveWorktreeRootFromRuntimeEnv(env);
+  if (!rootDir) return env;
+  return applyWorktreeSecretsMasterKeyEnvOverrides(rootDir, env);
 }
 
 export function isWorktreeSeedPending(rootDir: string): boolean {
@@ -146,6 +190,7 @@ export function bootstrapDevRunnerWorktreeEnv(
     if (typeof env[key] === "string" && env[key]!.trim().length > 0) continue;
     env[key] = value;
   }
+  applyWorktreeSecretsMasterKeyEnvOverrides(rootDir, env);
 
   return {
     envPath,

@@ -91,6 +91,7 @@ function isPathInside(candidatePath: string, rootPath: string): boolean {
 }
 
 type WorktreeRuntimeContext = {
+  worktreeRoot: string;
   configPath: string;
   envPath: string;
   worktreeName: string;
@@ -156,6 +157,7 @@ function resolveWorktreeRuntimeContext(
   const instanceRoot = path.resolve(homeDir, "instances", instanceId);
 
   return {
+    worktreeRoot,
     configPath,
     envPath,
     worktreeName,
@@ -169,6 +171,16 @@ function resolveWorktreeRuntimeContext(
     storageDir: path.resolve(instanceRoot, "data", "storage"),
     secretsKeyFilePath: path.resolve("/etc/paperclip/worktrees", instanceId, "master.key"),
   };
+}
+
+// SUP-22348: runtime env override consumers (secrets master key deletion on
+// the managed runtime-service path) need the linked worktree's checkout root;
+// cwd-based detection is wrong there because pnpm runs package scripts inside
+// the server package directory.
+export function resolveWorktreeRootFromRuntimeEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  return resolveWorktreeRuntimeContext(env)?.worktreeRoot ?? null;
 }
 
 function atomicWriteFile(filePath: string, contents: string): void {

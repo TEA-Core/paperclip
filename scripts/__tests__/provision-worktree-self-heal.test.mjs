@@ -578,6 +578,35 @@ test("a failed CLI init fails provisioning instead of being masked as success", 
   assert.ok(!fs.existsSync(path.join(worktreeCwd, ".paperclip", "config.json")));
 });
 
+test("runtime provisioning accepts a verified minimal-no-secrets manifest", () => {
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const worktreeCwd = makeTempDir("paperclip-provision-runtime-minimal-no-secrets-");
+  fs.mkdirSync(path.join(worktreeCwd, ".paperclip"), { recursive: true });
+  fs.writeFileSync(path.join(worktreeCwd, ".paperclip", "config.json"), "{}\n");
+  fs.writeFileSync(
+    path.join(worktreeCwd, ".paperclip", "seed-manifest.json"),
+    JSON.stringify({
+      version: 2,
+      source: { instanceId: "base-source", configPath: path.join(baseCwd, ".paperclip", "config.json") },
+      snapshotAt: "2026-08-19T00:00:00.000Z",
+      seedMode: "minimal-no-secrets",
+      migrationRevision: "0142_test.sql",
+      targetInstanceId: "target-test",
+      phase: "complete",
+      state: "verified",
+      attemptId: "attempt-test",
+      startedAt: "2026-08-19T00:00:00.000Z",
+      finishedAt: "2026-08-19T00:01:00.000Z",
+      diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-08-19T00:01:00.000Z" }],
+    }) + "\n",
+  );
+
+  const result = runRuntimeProvision(baseCwd, worktreeCwd);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readCliInvocations(baseCwd).filter((args) => args[0] === "worktree" && args[1] === "ensure-seeded").length, 0);
+});
+
 test("runtime provisioning invokes ensure-seeded once and fast-exits after success", () => {
   const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
   const worktreeCwd = makeTempDir("paperclip-provision-runtime-worktree-");

@@ -43,7 +43,7 @@ try {
     && value?.phase === "complete"
     && typeof value?.source?.instanceId === "string" && value.source.instanceId.length > 0
     && typeof value?.source?.configPath === "string" && value.source.configPath.length > 0
-    && (value?.seedMode === "minimal" || value?.seedMode === "full")
+    && (value?.seedMode === "minimal" || value?.seedMode === "minimal-no-secrets" || value?.seedMode === "full")
     && typeof value?.snapshotAt === "string" && value.snapshotAt.length > 0
     && typeof value?.migrationRevision === "string" && value.migrationRevision.length > 0
     && typeof value?.targetInstanceId === "string" && value.targetInstanceId.length > 0

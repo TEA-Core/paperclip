@@ -51,7 +51,7 @@ export interface WorkspaceReadiness {
   seedState: WorkspaceSeedReadinessState;
   /** Last recorded seed phase, e.g. `restore` or `post_restore_validation`. */
   seedPhase: string | null;
-  seedMode: "minimal" | "full" | null;
+  seedMode: "minimal" | "minimal-no-secrets" | "full" | null;
   /** Resolved instance identity of the process that answered, never a branch heuristic. */
   instanceId: string | null;
   /** Execution workspace this instance was provisioned for, when known. */
