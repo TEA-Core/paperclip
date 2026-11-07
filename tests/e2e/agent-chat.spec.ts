@@ -578,6 +578,12 @@ test("sidebar discovery, stars, recent agents, configuration links, and drafts s
   request,
 }) => {
   const f = await setup(request);
+  // The connectors card is fixed over the lower sidebar and is not part of
+  // this contract. In merge_group 42314340481 it was covering the star while
+  // `toBeFocused` stayed "inactive" after `focus()` returned.
+  await page.route("**/api/announcements/current", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "null" }),
+  );
   try {
     await page.goto(`/${f.company.issuePrefix}/dashboard`);
     const nav = page.getByRole("navigation");
@@ -600,9 +606,14 @@ test("sidebar discovery, stars, recent agents, configuration links, and drafts s
     const star = page.getByRole("button", { name: "Star Zeta", exact: true });
     await page.getByTestId("task-chat-composer-input").click();
     await expect(star).toHaveCSS("opacity", "0");
-    await star.focus();
-    await expect(star).toBeFocused();
-    await expect(star).toHaveCSS("opacity", "1");
+    // `toBeFocused` also requires `document.hasFocus()`, which is not the
+    // reveal condition. The control fades in on `:focus-within`; focus it
+    // and wait for that opacity transition.
+    await star.evaluate((el) => el.scrollIntoView({ block: "center", inline: "nearest" }));
+    await expect.poll(async () => {
+      await star.focus();
+      return star.evaluate((el) => getComputedStyle(el).opacity);
+    }).toBe("1");
     await star.click();
     await page.goto(f.route);
     await page.getByRole("button", { name: "Star Alpha", exact: true }).click();
