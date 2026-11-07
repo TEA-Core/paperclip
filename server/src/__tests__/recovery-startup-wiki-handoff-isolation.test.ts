@@ -11,6 +11,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  issueRelations,
   issues,
   pluginManagedResources,
   plugins,
@@ -19,11 +20,12 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { unprocessable } from "../errors.js";
 import { issueService } from "../services/issues.js";
 import { recoveryService } from "../services/recovery/service.js";
 
 const issueUpdateHook = vi.hoisted(() => ({
-  failIssueIds: new Set<string>(),
+  failures: new Map<string, () => Error>(),
 }));
 
 vi.mock("../services/issues.js", async () => {
@@ -35,9 +37,8 @@ vi.mock("../services/issues.js", async () => {
       const update = service.update.bind(service);
       service.update = async (...updateArgs: Parameters<typeof update>) => {
         const issueId = updateArgs[0];
-        if (issueUpdateHook.failIssueIds.has(issueId)) {
-          throw new Error(`injected recovery write failure for ${issueId}`);
-        }
+        const failure = issueUpdateHook.failures.get(issueId);
+        if (failure) throw failure();
         return update(...updateArgs);
       };
       return service;
@@ -66,10 +67,11 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
   }, 30_000);
 
   afterEach(async () => {
-    issueUpdateHook.failIssueIds.clear();
+    issueUpdateHook.failures.clear();
     await db.delete(issueComments);
     await db.delete(issueRecoveryActions);
     await db.delete(agentWakeupRequests);
+    await db.delete(issueRelations);
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
@@ -259,7 +261,7 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
     const seeded = await seedCompany();
     const failingIssueId = await seedWikiHandoff({ ...seeded, issueNumber: 3 });
     const ordinaryIssueId = await seedOrdinaryStranded({ ...seeded, issueNumber: 4 });
-    issueUpdateHook.failIssueIds.add(failingIssueId);
+    issueUpdateHook.failures.set(failingIssueId, () => new Error(`injected recovery write failure for ${failingIssueId}`));
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
 
     const result = await recovery.reconcileStrandedAssignedIssues();
@@ -272,6 +274,147 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
     ]);
     expect(failing).toMatchObject({ status: "in_review", assigneeAgentId: seeded.intruderId });
     expect(ordinary?.status).toBe("blocked");
+  });
+
+  it("rethrows a lost database connection instead of skipping every card", async () => {
+    const seeded = await seedCompany();
+    const failingIssueId = await seedWikiHandoff({ ...seeded, issueNumber: 6 });
+    await seedOrdinaryStranded({ ...seeded, issueNumber: 7 });
+    issueUpdateHook.failures.set(failingIssueId, () =>
+      Object.assign(new Error("write CONNECTION_CLOSED db.example.internal:5432"), { code: "CONNECTION_CLOSED" }),
+    );
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    await expect(recovery.reconcileStrandedAssignedIssues()).rejects.toMatchObject({ code: "CONNECTION_CLOSED" });
+  });
+
+  async function seedOrphanBlocker(input: {
+    companyId: string;
+    prefix: string;
+    creatorId: string;
+    issueNumber: number;
+    downstreamId: string;
+  }) {
+    const blockerId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId: input.companyId,
+      title: `Orphan blocker ${input.issueNumber}`,
+      status: "todo",
+      priority: "medium",
+      createdByAgentId: input.creatorId,
+      issueNumber: input.issueNumber,
+      identifier: `${input.prefix}-${input.issueNumber}`,
+    });
+    await db.insert(issueRelations).values({
+      companyId: input.companyId,
+      issueId: blockerId,
+      relatedIssueId: input.downstreamId,
+      type: "blocks",
+    });
+    return blockerId;
+  }
+
+  it("continues the orphan-blocker sweep when one blocker's assignee write is refused as a non-canonical Wiki handoff", async () => {
+    const seeded = await seedCompany();
+    const downstreamId = randomUUID();
+    await db.insert(issues).values({
+      id: downstreamId,
+      companyId: seeded.companyId,
+      title: "Downstream card",
+      status: "blocked",
+      priority: "medium",
+      issueNumber: 8,
+      identifier: `${seeded.prefix}-8`,
+    });
+    const refusedBlockerId = await seedOrphanBlocker({ ...seeded, creatorId: seeded.coderId, issueNumber: 9, downstreamId });
+    const ordinaryBlockerId = await seedOrphanBlocker({ ...seeded, creatorId: seeded.coderId, issueNumber: 10, downstreamId });
+    issueUpdateHook.failures.set(refusedBlockerId, () =>
+      unprocessable("Refusing assigneeAgentId write on a Wiki handoff", {
+        guard: "assignee_review_gate",
+        subGuard: "wiki_handoff",
+        reason: "wiki_handoff_non_canonical_assignee",
+      }),
+    );
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => ({ id: randomUUID() }) as never) });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.orphanBlockersAssigned).toBe(1);
+    expect(result.issueIds).toContain(ordinaryBlockerId);
+    expect(result.issueIds).not.toContain(refusedBlockerId);
+    const [refused, ordinary] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, refusedBlockerId)).then((rows) => rows[0]),
+      db.select().from(issues).where(eq(issues.id, ordinaryBlockerId)).then((rows) => rows[0]),
+    ]);
+    expect(refused?.assigneeAgentId).toBeNull();
+    expect(ordinary?.assigneeAgentId).toBe(seeded.coderId);
+  });
+
+  async function seedExhaustedInReview(input: {
+    companyId: string;
+    prefix: string;
+    agentId: string;
+    issueNumber: number;
+    wikiHandoff: boolean;
+  }) {
+    const issueId = input.wikiHandoff
+      ? await seedWikiHandoff({
+          companyId: input.companyId,
+          prefix: input.prefix,
+          intruderId: input.agentId,
+          issueNumber: input.issueNumber,
+        })
+      : randomUUID();
+    if (!input.wikiHandoff) {
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: input.companyId,
+        title: "Ordinary in-review card",
+        status: "in_review",
+        priority: "medium",
+        assigneeAgentId: input.agentId,
+        issueNumber: input.issueNumber,
+        identifier: `${input.prefix}-${input.issueNumber}`,
+      });
+    }
+    await db.insert(issueRecoveryActions).values({
+      id: randomUUID(),
+      companyId: input.companyId,
+      sourceIssueId: issueId,
+      kind: "workspace_validation",
+      status: "escalated",
+      ownerType: "board",
+      previousOwnerAgentId: input.agentId,
+      cause: "workspace_validation_failed",
+      fingerprint: `workspace:provision:failure:${issueId}`,
+      attemptCount: 5,
+      maxAttempts: 5,
+      nextAction: "Repair the worktree provisioning failure.",
+      outcome: "exhausted",
+      evidence: { identifier: null },
+      lastAttemptAt: new Date("2026-11-07T09:00:00.000Z"),
+    });
+    return issueId;
+  }
+
+  it("continues the exhausted-recovery drain when the monitor re-arm on a non-canonical Wiki handoff is refused", async () => {
+    const seeded = await seedCompany();
+    const wikiIssueId = await seedExhaustedInReview({ ...seeded, agentId: seeded.intruderId, issueNumber: 11, wikiHandoff: true });
+    const ordinaryIssueId = await seedExhaustedInReview({ ...seeded, agentId: seeded.coderId, issueNumber: 12, wikiHandoff: false });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const result = await recovery.reconcileExhaustedRecoveryDrain();
+
+    expect(result.checked).toBe(2);
+    expect(result.issueIds).toContain(ordinaryIssueId);
+    expect(result.issueIds).not.toContain(wikiIssueId);
+    const [wiki, ordinary] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, wikiIssueId)).then((rows) => rows[0]),
+      db.select().from(issues).where(eq(issues.id, ordinaryIssueId)).then((rows) => rows[0]),
+    ]);
+    expect(wiki?.monitorNextCheckAt).toBeNull();
+    expect(ordinary?.monitorNextCheckAt).not.toBeNull();
   });
 
   it("still refuses an explicit non-canonical assignee write on a Wiki handoff", async () => {
