@@ -1188,17 +1188,21 @@ export function deliveryBindingDiffers(
 export function assertExecutionDecisionSnapshotCurrent(
   readState: IssueExecutionState | null,
   readPolicy: IssueExecutionPolicy | null,
-  locked: { executionState?: unknown; executionPolicy?: unknown } | null | undefined,
+  locked: { status?: string | null; executionState?: unknown; executionPolicy?: unknown } | null | undefined,
   issueId: string,
+  readStatus: string | null,
 ): void {
   const lockedState = parseIssueExecutionState(locked?.executionState ?? null);
   if (
     (lockedState?.deliveredHeadSha ?? null) !== (readState?.deliveredHeadSha ?? null) ||
+    (lockedState?.lastDecisionId ?? null) !== (readState?.lastDecisionId ?? null) ||
+    (lockedState?.changesRequestedCount ?? 0) !== (readState?.changesRequestedCount ?? 0) ||
+    (locked?.status ?? null) !== readStatus ||
     stallHoldControlsDiffer(readPolicy, normalizeIssueExecutionPolicy(locked?.executionPolicy ?? null)) ||
     deliveryBindingDiffers(readState, lockedState)
   ) {
     throw conflict(
-      "The delivered head, the delivery binding (pull request number, URL or head) or the execution policy (round ceiling, stall arbiter or stages) changed while this decision was in flight; this decision was not recorded and the stage was not handed off. Re-read the issue before deciding.",
+      "The delivered head, the delivery binding (pull request number, URL or head), the execution policy (round ceiling, stall arbiter or stages), the last decision, the review-round counter or the issue status changed while this decision was in flight; this decision was not recorded and the stage was not handed off. Re-read the issue before deciding.",
       {
         code: "review_stall_policy_changed",
         issueId,

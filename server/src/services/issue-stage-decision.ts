@@ -75,6 +75,10 @@ export async function applyReviewEscalationDecision(args: {
   // When the caller owns an enclosing transaction that is still open, it passes its
   // queues here and drains them itself after that transaction commits.
   deferredPostCommit?: { activityPublications: ActivityPublication[]; postCommitActions: IssuePostCommitAction[] };
+  // The reject resolver writes `todo` under the same row lock before this helper
+  // runs. That write is this request, not a concurrent decision. Pass it so the
+  // status compare does not treat it as a stale snapshot.
+  statusWrittenByResolver?: string | null;
 }): Promise<{
   id: string;
   status: string;
@@ -167,7 +171,8 @@ export async function applyReviewEscalationDecision(args: {
   const postCommitActions = args.deferredPostCommit?.postCommitActions ?? [];
   const updatedIssue = await db.transaction(async (tx) => {
     const lockedIssue = await issueService(db).getByIdForUpdate(issue.id, tx);
-    assertExecutionDecisionSnapshotCurrent(existingState, policy, lockedIssue, issue.id);
+    const readStatus = args.statusWrittenByResolver ?? issue.status;
+    assertExecutionDecisionSnapshotCurrent(existingState, policy, lockedIssue, issue.id, readStatus);
     await tx.insert(issueExecutionDecisions).values({
       id: decisionId,
       companyId: issue.companyId,
