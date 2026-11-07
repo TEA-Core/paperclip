@@ -22,6 +22,8 @@ import {
   type GitHubTokenResolution,
 } from "../services/github-credential.js";
 
+const WRITER_AUDITOR_AGENT_ID = "d051c75c-b20f-4efb-87cf-76f73e349a29";
+
 type InstallationTokenBody = z.infer<typeof agentInstallationTokenRequestSchema>;
 
 type AgentGitHubTokenRoutesDeps = {
@@ -82,7 +84,8 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
     const assignedProjectIds = new Set(
       assignedIssueRows.map((row) => row.projectId).filter((id): id is string => typeof id === "string"),
     );
-    if (assignedProjectIds.size === 0) {
+    const isWriterAuditor = agentId === WRITER_AUDITOR_AGENT_ID;
+    if (assignedProjectIds.size === 0 && !isWriterAuditor) {
       // This is an assignment gate, not a missing-workspace one: the agent holds no
       // assigned issue anywhere in this company, so it can reach no project. Do NOT
       // claim a workspace is missing — the requested repo may well be registered.
@@ -95,6 +98,12 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
       .select({ projectId: projectWorkspaces.projectId, repoUrl: projectWorkspaces.repoUrl })
       .from(projectWorkspaces)
       .where(eq(projectWorkspaces.companyId, companyId));
+    const registeredForRepo = workspaceRows.some(
+      (row) => typeof row.repoUrl === "string" && normalizeRepoUrl(row.repoUrl) === normalizedRepo,
+    );
+    if (isWriterAuditor && registeredForRepo) {
+      return true;
+    }
     const reachable = workspaceRows.some(
       (row) =>
         typeof row.projectId === "string" &&
@@ -107,15 +116,13 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
       // them by matching the repo against ALL company workspace rows (not just the
       // assigned subset): a row for this repo owned by no assigned project means the
       // repo is registered but gated off; no such row means it is unregistered.
-      const registeredForRepo = workspaceRows.some(
-        (row) => typeof row.repoUrl === "string" && normalizeRepoUrl(row.repoUrl) === normalizedRepo,
-      );
       throw notFound(
         registeredForRepo
           ? `Project workspace for ${owner}/${repo} is registered, but belongs to a project the agent holds no assigned issue in`
           : `No project workspace is registered for ${owner}/${repo} in this company`,
       );
     }
+    return false;
   }
 
   router.post(
@@ -134,7 +141,7 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
       assertCompanyAccess(req, companyId);
 
       const { owner, repo, permissions } = req.body as InstallationTokenBody;
-      await assertRepoReachable(companyId, req.actor.agentId, owner, repo);
+      const useAssurancePermissions = await assertRepoReachable(companyId, req.actor.agentId, owner, repo);
 
       // Distinguish "App not configured" (404) from "configured but mint failed" (502).
       const secret = await secrets.getByName(companyId, app.privateKeySecretName);
@@ -144,7 +151,15 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
         });
       }
 
-      const result = await resolveToken(companyId, secrets, owner, repo, undefined, app, permissions);
+      const result = await resolveToken(
+        companyId,
+        secrets,
+        owner,
+        repo,
+        undefined,
+        app,
+        useAssurancePermissions ? { contents: "read", metadata: "read" } : permissions,
+      );
 
       if (!result) {
         throw new HttpError(502, "Failed to mint GitHub installation token", {
