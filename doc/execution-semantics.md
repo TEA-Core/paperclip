@@ -629,6 +629,16 @@ database connection (`CONNECTION_CLOSED`, `CONNECTION_ENDED`,
 `CONNECTION_DESTROYED`, anywhere on the error `cause` chain) is not a per-card
 failure and is rethrown.
 
+The boundary is the write path. Per-card isolation is required for every
+startup sweep that writes issue rows through the guarded issue service
+(`issueService.update`), because the Wiki handoff guard and the other assignee
+and review gates can refuse that write. Steps that only write run, wake or
+session rows, or that clear raw lock columns (`executionRunId`,
+`executionAgentNameKey`, `executionLockedAt`, `checkoutRunId`) with direct
+drizzle updates inside a per-run loop, stay fail-fast on purpose: the only
+failures they can hit are database-level (constraint, connection), and a
+database failure must stop startup visibly.
+
 Each card is processed inside the shared `runRecoverySweepIssue` helper in these
 startup sweeps:
 
@@ -643,22 +653,62 @@ startup sweeps:
   resolution and escalation).
 - Cancelled-only-blocker dependents (action resolution and detection),
   unfinalizable workspace barriers, stale `in_review` child archive, stale issue
-  locks (the per-card lock clear), and completed-run strand escalation.
+  locks (the per-card lock clear only), and completed-run strand escalation.
 - Host-restart strand repairs (`sweepHostRestartStrandedIssues`).
 - Task watchdog reconciliation and the fired-never-rearmed monitor detector.
+
+Several of these loops write only recovery-action, wake, activity or lock
+columns rather than calling `issueService.update`; the helper is applied to them
+as well. It is not a requirement of the boundary above.
 
 Active recovery-action reconciliation (`reconcileActiveRecoveryActions`)
 isolates each action with its own `try`/`catch`; it logs and skips the action
 and does not rethrow a lost database connection.
 
-These startup steps are not issue-card write loops and are not wrapped: the
-native-runner restart recovery (fail closed by design, it rethrows), hot-restart
-adoption, orphaned-run reap, abandoned run scratch sweep (each caught as a whole
-by the caller), the run-, wake- and session-goal-level steps (scheduled-retry
-promotion, queued-run resume, session-goal recovery, the silent-active-run scan
-and hard-stop, and the run terminalization pre-pass of the stale-lock sweep),
-which act on run, wake and session rows rather than issue rows. A failure there
-still fails startup. A failure of a sweep itself, or any other fatal startup
+These startup steps are knowingly left fail-fast. A failure in one of them
+fails startup:
+
+- `scanTerminableSilentActiveRuns` (`terminateSilentActiveRun`), per run: in one
+  transaction marks the run `failed`, fails its wake request, clears the
+  execution lock columns on `issues` with a direct drizzle update, and inserts a
+  watchdog decision row; then appends a run event and an activity row. It does
+  not call `issueService.update`.
+- `scanSilentActiveRuns` (`foldSourceResolvedRun`), per run: in one transaction
+  finalizes the run and its wake request, clears the source issue's execution
+  lock columns with a direct drizzle update, resolves the watchdog recovery
+  action, and inserts a watchdog decision row. For an open evaluation issue it
+  also calls `issuesSvc.update(id, { status: "done" })` and adds a comment. That
+  patch carries only `status`, so neither the Wiki handoff guard (it runs only
+  on assignee, title, description or execution policy/state writes) nor the
+  assignee review-stage gate (it runs only when the patch has `assigneeAgentId`)
+  is reached. It is not wrapped, and it runs inside the fold's open transaction.
+- `promoteDueScheduledRetries`, per due retry run: promotes the run to `queued`
+  or cancels a suppressed retry, updates the wake request, and clears the
+  execution lock columns on `issues` with a direct drizzle update. No
+  `issueService.update`.
+- `resumeQueuedRuns`: touches `agent_wakeup_requests`, delivers saved queued
+  comments and releases execution through `releaseIssueExecutionAndPromote` (each
+  call carries its own `.catch` that logs), cancels stale queued runs
+  (`cancelStaleQueuedRun` also clears `executionRunId` and `checkoutRunId` on
+  `issues` with direct drizzle updates), and starts the next queued run per
+  agent. The step's own writes make no `issueService.update` call.
+- `recoverPendingSessionGoalActions`, per pending goal action:
+  `failRunnerGoalAction` on the session-goal action row (its error is swallowed)
+  and `enqueueWakeup` for wake and run rows.
+- `recoverActiveSessionGoals`, per active goal session: `enqueueWakeup` for wake
+  and run rows.
+- The run terminalization pre-pass of `sweepStaleIssueLocks`
+  (`terminalizeOrphanedRunningRun`), per referenced run: updates the
+  `heartbeat_runs` row and appends a run event.
+- `clearStaleRecoveryReplayHolds`, per resolved recovery action, at the tail of
+  `reconcileStrandedAssignedIssues`: rewrites `evidence` on the
+  `issue_recovery_actions` row with a direct drizzle update. It writes no issue
+  row.
+- Native-runner restart recovery fails closed by design and rethrows.
+  Hot-restart adoption, the orphaned-run reap and the abandoned run scratch sweep
+  are each caught as a whole by the caller, so startup continues after them.
+
+A failure that escapes a sweep, or any other fatal startup
 failure after binding, closes the HTTP listener before ending database
 clients: a rejected `startServer()` must not leave a port accepting requests
 against a closed pool. That failure is logged and rethrown. When the server runs
