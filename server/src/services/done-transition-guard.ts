@@ -279,12 +279,24 @@ export interface DoneTransitionOverride {
   reason?: string;
 }
 
+interface DoneTier2CloseAuditDetails {
+  probeEvidence: string;
+  probeCommand: string;
+  probeTarget: string | null;
+  observed: string | null;
+  observedRangeEnd: string | null;
+  tierForm: "live" | "record-only";
+  probeHead: string | null;
+  mergeCommit: string | null;
+}
+
 export interface DoneTierDeclarationResult {
   allowed: boolean;
   reason: string;
   tier: "tier1" | "tier2" | null;
   skipped: boolean;
   skipReason: string | null;
+  tier2Audit?: DoneTier2CloseAuditDetails;
   // SUP-22570: set when the accepted declaration is the record_only
   // no-repository form, with what it measured. The accepting door measures
   // again just before its status write (measureNoRepositoryLandingForClose)
@@ -1482,7 +1494,11 @@ function refuseTier2(reason: string): DoneTierDeclarationResult {
   };
 }
 
-function acceptTier2(evidence: string, sameRun: boolean): DoneTierDeclarationResult {
+function acceptTier2(
+  evidence: string,
+  sameRun: boolean,
+  audit: Omit<DoneTier2CloseAuditDetails, "probeEvidence">,
+): DoneTierDeclarationResult {
   const prefix = sameRun
     ? "Tier 2 declaration found in same-run comment: "
     : "Tier 2 declaration found: ";
@@ -1492,6 +1508,7 @@ function acceptTier2(evidence: string, sameRun: boolean): DoneTierDeclarationRes
     tier: "tier2",
     skipped: false,
     skipReason: null,
+    tier2Audit: { probeEvidence: evidence, ...audit },
   };
 }
 
@@ -1646,7 +1663,15 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
-  return acceptTier2(evidence.trim(), sameRun);
+  return acceptTier2(evidence.trim(), sameRun, {
+    probeCommand: probeCommand!.trim(),
+    probeTarget: observedTarget!.trim(),
+    observed: observedAt!,
+    observedRangeEnd: observedRangeEnd ?? null,
+    tierForm: "record-only",
+    probeHead: null,
+    mergeCommit: null,
+  });
 }
 
 async function proveTier2Live(
@@ -1774,7 +1799,17 @@ async function proveTier2Live(
         `Accepted form: ${tier2Forms}`,
     );
   }
-  return acceptTier2(evidence.trim(), sameRun);
+  const probeCommand = shape[1]!.trim();
+  const probeTarget = /https?:\/\/[^\s<>"']+/.exec(probeCommand)?.[0] ?? null;
+  return acceptTier2(evidence.trim(), sameRun, {
+    probeCommand,
+    probeTarget,
+    observed: null,
+    observedRangeEnd: null,
+    tierForm: "live",
+    probeHead,
+    mergeCommit: recordedMergeCommit,
+  });
 }
 
 // SUP-22570: the record_only no-repository close form. A record_only issue
@@ -2965,6 +3000,13 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
       void writeAuditLog(db, issue, "issue.done_transition_tier1_close", {
         reason: tierResult.reason,
         systemBackstopActor: actorId,
+      });
+    }
+    if (tierResult.tier === "tier2" && tierResult.tier2Audit) {
+      void writeAuditLog(db, issue, "issue.done_transition_tier2_close", {
+        reason: tierResult.reason,
+        systemBackstopActor: actorId,
+        ...tierResult.tier2Audit,
       });
     }
     return { allowed: true, closeComment: renderedComment, doneTierSkipAudit: null };

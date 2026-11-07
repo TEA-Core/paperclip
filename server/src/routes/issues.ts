@@ -5585,6 +5585,13 @@ export function issueRoutes(
           : {}),
       });
     }
+    if (tierResult.tier === "tier2" && tierResult.tier2Audit) {
+      void writeAuditLog(db, issue, "issue.done_transition_tier2_close", {
+        reason: tierResult.reason,
+        decisionCarried,
+        ...tierResult.tier2Audit,
+      });
+    }
     // SUP-20525 (SUP-18110 ask 1): resolve the close comment's cited commit
     // SHAs against the delivery repository. Only a SHA GitHub explicitly
     // reports not found — confirmed by a positive default-branch control
