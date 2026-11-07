@@ -1120,11 +1120,11 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
           unsubscribe();
         }
         expect(response.status, JSON.stringify(response.body)).toBe(409);
-        // A recorded PR number or issue status that moved since the read is a snapshot change: PATCH
-        // and comment lock the row and refuse it with the snapshot guard (SUP-23260, SUP-23283)
+        // A recorded PR number, issue status, or review stage that moved since the read is a
+        // snapshot change: PATCH and comment lock the row and refuse it with the snapshot guard
         // before the final delivery preflight runs. The escalation door runs that preflight first.
         expect(response.body.details).toMatchObject({
-          code: (change === "recorded PR identity" || change === "status") && door !== "escalation"
+          code: (change === "recorded PR identity" || change === "status" || change === "stage transition") && door !== "escalation"
             ? "review_stall_policy_changed"
             : "approval_final_delivery_preflight_stale",
         });

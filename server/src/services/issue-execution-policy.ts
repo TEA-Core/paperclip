@@ -1185,6 +1185,18 @@ export function deliveryBindingDiffers(
   );
 }
 
+function executionDecisionParticipantSignature(
+  participant: IssueExecutionStagePrincipal | null | undefined,
+): string | null {
+  if (!participant) return null;
+  if (participant.type === "agent") {
+    const agentId = participant.agentId?.trim().toLowerCase() ?? "";
+    return agentId.length > 0 ? `agent:${agentId}` : "agent:";
+  }
+  const userId = participant.userId?.trim() ?? "";
+  return userId.length > 0 ? `user:${userId}` : "user:";
+}
+
 export function assertExecutionDecisionSnapshotCurrent(
   readState: IssueExecutionState | null,
   readPolicy: IssueExecutionPolicy | null,
@@ -1195,6 +1207,9 @@ export function assertExecutionDecisionSnapshotCurrent(
   const lockedState = parseIssueExecutionState(locked?.executionState ?? null);
   if (
     (lockedState?.deliveredHeadSha ?? null) !== (readState?.deliveredHeadSha ?? null) ||
+    (lockedState?.currentStageId ?? null) !== (readState?.currentStageId ?? null) ||
+    executionDecisionParticipantSignature(lockedState?.currentParticipant) !==
+      executionDecisionParticipantSignature(readState?.currentParticipant) ||
     (lockedState?.lastDecisionId ?? null) !== (readState?.lastDecisionId ?? null) ||
     (lockedState?.changesRequestedCount ?? 0) !== (readState?.changesRequestedCount ?? 0) ||
     (readStatus !== undefined && (locked?.status ?? null) !== readStatus) ||
@@ -1202,7 +1217,7 @@ export function assertExecutionDecisionSnapshotCurrent(
     deliveryBindingDiffers(readState, lockedState)
   ) {
     throw conflict(
-      "The delivered head, the delivery binding (pull request number, URL or head), the execution policy (round ceiling, stall arbiter or stages), the last decision, the review-round counter or the issue status changed while this decision was in flight; this decision was not recorded and the stage was not handed off. Re-read the issue before deciding.",
+      "The delivered head, the delivery binding (pull request number, URL or head), the execution policy (round ceiling, stall arbiter or stages), the review stage, the seated participant, the last decision, the review-round counter or the issue status changed while this decision was in flight; this decision was not recorded and the stage was not handed off. Re-read the issue before deciding.",
       {
         code: "review_stall_policy_changed",
         issueId,

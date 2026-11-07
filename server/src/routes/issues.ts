@@ -20155,6 +20155,63 @@ export function issueRoutes(
       }
     }
 
+    // An execution decision was computed from the unlocked read. Compare it
+    // under the issue row lock before any runner stop, and again inside the
+    // write transaction below. The stop polls for up to 30 seconds, so it must
+    // not run while the row lock is held. A snapshot that is already stale at
+    // this first compare refuses the decision and does not stop the assignee's
+    // goal or cancel that assignee's run. A snapshot that moves after this
+    // compare passes, during the stop, is still refused by the write compare;
+    // that already-authorized stop is not rolled back.
+    const assertPatchExecutionDecisionLock = async (
+      tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+    ) => {
+      const readState = parseIssueExecutionState(existing.executionState);
+      const recordsDecision = Boolean(transition.decision);
+      const stallLockRequired =
+        Boolean(transition.stallEscalation) ||
+        (recordsDecision &&
+          Boolean(
+            previousExecutionPolicy?.stallEscalation ||
+            nextExecutionPolicy?.stallEscalation ||
+            readState?.stallHandoff,
+          ));
+      if (!stallLockRequired && !recordsDecision) return;
+      const locked = await svc.getByIdForUpdate(id, tx);
+      const lockedState = parseIssueExecutionState(locked?.executionState ?? null);
+      if (
+        stallLockRequired && (
+          (lockedState?.lastDecisionId ?? null) !== (readState?.lastDecisionId ?? null) ||
+          JSON.stringify(lockedState?.stallHandoff ?? null) !== JSON.stringify(readState?.stallHandoff ?? null)
+        )
+      ) {
+        throw conflict(
+          "A concurrent decision on this review stage was recorded first; this decision was not recorded and the stage was not handed off again. Re-read the issue before deciding.",
+          {
+            code: "review_stall_handoff_conflict",
+            issueId: existing.id,
+            stageId: readState?.currentStageId ?? null,
+          },
+        );
+      }
+      assertExecutionDecisionSnapshotCurrent(
+        readState,
+        previousExecutionPolicy,
+        locked,
+        existing.id,
+        existing.status,
+      );
+    };
+    if (
+      transition.decision &&
+      existing.assigneeAgentId &&
+      (assigneeWillChange || terminalizingIssue)
+    ) {
+      await db.transaction(async (tx) => {
+        await assertPatchExecutionDecisionLock(tx);
+      });
+    }
+
     if (assigneeWillChange && existing.assigneeAgentId) {
       rejectExpectedUpdatedAtBeforeSideEffect();
       await stopRunnerGoalForOwnershipChange({
@@ -20446,17 +20503,11 @@ export function issueRoutes(
       finalIssueStatus: () => issue?.status,
     });
     const decision = transition.decision && decisionId ? transition.decision : null;
-    // Snapshot this request's transition was computed from. Stall cards
-    // re-check the hand-off record under the row lock. Every execution
-    // decision also re-checks the ceiling and the delivery binding, so a
-    // board edit or a same-head PR refresh that landed after the read is not
-    // overwritten (SUP-23260).
-    const stallGuardReadState = parseIssueExecutionState(existing.executionState);
-    const stallLockGuardRequired =
-      Boolean(transition.stallEscalation) ||
-      (decision !== null &&
-        Boolean(previousExecutionPolicy?.stallEscalation || nextExecutionPolicy?.stallEscalation || stallGuardReadState?.stallHandoff));
-    const executionDecisionLostUpdateGuardRequired = decision !== null;
+    // Snapshot this request's transition was computed from. The lock compare
+    // is `assertPatchExecutionDecisionLock`: stall cards re-check the hand-off
+    // record, and every execution decision re-checks the stage, the seated
+    // participant, the ceiling, the delivery binding, the last decision, the
+    // review-round counter and the issue status.
     let attachmentComment: Awaited<ReturnType<typeof svc.addComment>> | null =
       null;
     let comment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
@@ -20638,43 +20689,13 @@ export function issueRoutes(
             reviewPolicySensitiveMutationRequested
             && !(await assertLockedReviewPolicyAllowsMutation(tx))
           ) return null;
-          // The hand-off must be atomic on a stall card, and every execution
-          // decision must use the snapshot it was computed from. Each was
-          // computed from the unlocked read, so lock the row on this
-          // transaction and re-check. A concurrent decision or a hand-off
-          // record that appeared since the read is a hand-off conflict (stall
-          // cards only). A moved delivered head, a changed ceiling or other
-          // stall-hold control, a changed delivery binding (prNumber, prUrl,
-          // headSha), a different last decision, a different review-round
-          // counter, or a different issue status refuses the decision. A
-          // refused request persists nothing. The lock read uses `tx`; do not
-          // call a service on the outer pool from inside this transaction.
-          if (stallLockGuardRequired || executionDecisionLostUpdateGuardRequired) {
-            const locked = await svc.getByIdForUpdate(id, tx);
-            const lockedState = parseIssueExecutionState(locked?.executionState ?? null);
-            if (
-              stallLockGuardRequired && (
-                (lockedState?.lastDecisionId ?? null) !== (stallGuardReadState?.lastDecisionId ?? null) ||
-                JSON.stringify(lockedState?.stallHandoff ?? null) !== JSON.stringify(stallGuardReadState?.stallHandoff ?? null)
-              )
-            ) {
-              throw conflict(
-                "A concurrent decision on this review stage was recorded first; this decision was not recorded and the stage was not handed off again. Re-read the issue before deciding.",
-                {
-                  code: "review_stall_handoff_conflict",
-                  issueId: existing.id,
-                  stageId: stallGuardReadState?.currentStageId ?? null,
-                },
-              );
-            }
-            assertExecutionDecisionSnapshotCurrent(
-              stallGuardReadState,
-              previousExecutionPolicy,
-              locked,
-              existing.id,
-              existing.status,
-            );
-          }
+          // Re-check the snapshot on this write transaction after any runner
+          // stop authorized by the earlier compare. A refused decision writes
+          // no decision row, comment, state change, activity row or wake. It
+          // does not cancel a run when the snapshot was already stale at the
+          // pre-stop compare. The lock read uses `tx`; do not call a service
+          // on the outer pool from inside this transaction.
+          await assertPatchExecutionDecisionLock(tx);
           // SUP-15878: refuse the close under the update lock (after the review
           // policy reauthorization above) with a typed diagnosis instead of
           // letting the transition silently coerce the card back to in_review.
