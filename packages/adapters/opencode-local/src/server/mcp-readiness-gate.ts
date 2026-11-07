@@ -149,6 +149,12 @@ export async function waitForOpenCodeMcpReady(input: OpenCodeMcpReadyInput): Pro
 
   const fail = (reason: OpenCodeMcpReadinessFailureReason, message: string) =>
     new OpenCodeMcpReadinessError(reason, message, lastStatuses);
+  const deadlineFailure = () => fail(
+    "deadline",
+    `OpenCode MCP server(s) did not reach connected and quiet within ${deadlineMs / 1000}s ` +
+      `(last status: ${describeStatuses(servers, lastStatuses)}${lastReadProblem ? `; last read failed: ${lastReadProblem}` : ""}); ` +
+      `do not create a session — it would begin without its Paperclip tools`,
+  );
 
   let stream: Awaited<ReturnType<typeof openEventStream>>;
   try {
@@ -168,8 +174,8 @@ export async function waitForOpenCodeMcpReady(input: OpenCodeMcpReadyInput): Pro
     throw fail("stream", `OpenCode event stream unavailable: HTTP ${stream.status}`);
   }
 
-  // The pump only maintains `lastMcpEventAt`; polls stay authoritative, so a
-  // dying pump never turns into a silent pass — the window just stops growing.
+  // The pump only maintains `lastMcpEventAt`; polls stay authoritative, and
+  // every poll or sleep races the pump so a dead stream fails closed.
   const pump = (async () => {
     try {
       for await (const envelope of readEventStream(stream.chunks)) {
@@ -180,34 +186,50 @@ export async function waitForOpenCodeMcpReady(input: OpenCodeMcpReadyInput): Pro
           input.onDiagnostic?.(`mcp event: ${type}`);
         }
       }
-    } catch {
-      // The poll loop owns the verdict; a closed stream surfaces there.
+    } catch (error) {
+      if (abort.signal.aborted) return;
+      throw fail(
+        "stream",
+        `OpenCode event stream failed before MCP readiness: ${error instanceof Error ? error.message : String(error)}; ` +
+          "do not create a session — it would begin without its Paperclip tools",
+      );
+    }
+    if (!abort.signal.aborted) {
+      throw fail(
+        "stream",
+        "OpenCode event stream closed before MCP readiness; do not create a session — it would begin without its Paperclip tools",
+      );
     }
   })();
 
   try {
     while (true) {
       const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        throw fail(
-          "deadline",
-          `OpenCode MCP server(s) did not reach connected and quiet within ${deadlineMs / 1000}s ` +
-            `(last status: ${describeStatuses(servers, lastStatuses)}${lastReadProblem ? `; last read failed: ${lastReadProblem}` : ""}); ` +
-            `do not create a session — it would begin without its Paperclip tools`,
-        );
-      }
+      if (remaining <= 0) throw deadlineFailure();
       if (input.signal?.aborted) throw fail("aborted", "OpenCode MCP readiness wait was aborted");
 
       let statuses: Map<string, string> | null = null;
+      let readTimer: ReturnType<typeof setTimeout> | undefined;
+      const readDeadline = new Promise<"deadline">((resolve) => {
+        readTimer = setTimeout(() => resolve("deadline"), remaining);
+      });
       try {
         // The only side effect this module can trigger: on 2.2.4 the first
         // `GET /api/mcp` is what starts the MCP servers. It stays a GET.
-        const response = await fetcher(`${input.baseUrl}/api/mcp`, {
-          headers: { authorization: input.authorization },
-          signal: abort.signal,
-        });
-        if (response.ok) {
-          const entries = asRecord(safeJson(await response.text())).data;
+        const response = await Promise.race([
+          fetcher(`${input.baseUrl}/api/mcp`, {
+            headers: { authorization: input.authorization },
+            signal: abort.signal,
+          }),
+          pump,
+          readDeadline,
+        ]);
+        if (response === "deadline") throw deadlineFailure();
+        const mcpResponse = response as Response;
+        if (mcpResponse.ok) {
+          const body = await Promise.race([mcpResponse.text(), pump, readDeadline]);
+          if (body === "deadline") throw deadlineFailure();
+          const entries = asRecord(safeJson(body as string)).data;
           const read = new Map<string, string>();
           if (Array.isArray(entries)) {
             for (const entry of entries) {
@@ -222,11 +244,14 @@ export async function waitForOpenCodeMcpReady(input: OpenCodeMcpReadyInput): Pro
           for (const [name, status] of read) lastStatuses.set(name, status);
           lastReadProblem = null;
         } else {
-          lastReadProblem = `HTTP ${response.status}`;
+          lastReadProblem = `HTTP ${mcpResponse.status}`;
         }
       } catch (error) {
+        if (error instanceof OpenCodeMcpReadinessError && (error.reason === "stream" || error.reason === "deadline")) throw error;
         if (abort.signal.aborted) throw fail("aborted", "OpenCode MCP readiness wait was aborted");
         lastReadProblem = error instanceof Error ? error.message : String(error);
+      } finally {
+        clearTimeout(readTimer);
       }
 
       const quietFor = Date.now() - lastMcpEventAt;
@@ -240,7 +265,10 @@ export async function waitForOpenCodeMcpReady(input: OpenCodeMcpReadyInput): Pro
         input.onDiagnostic?.(`connected but not quiet (${quietFor}ms < ${quiescenceMs}ms); waiting`);
       }
 
-      await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())));
+      await Promise.race([
+        sleep(Math.min(pollMs, Math.max(0, deadline - Date.now()))),
+        pump,
+      ]);
     }
   } finally {
     abort.abort();

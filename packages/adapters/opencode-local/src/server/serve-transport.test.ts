@@ -70,7 +70,7 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
     };
   }
 
-  it("starts the session only after the MCP event plus the settle, and returns run-format stdout", async () => {
+  it("starts the session only after MCP is connected and quiet, and returns run-format stdout", async () => {
     const result = await runOpenCodeServeProcess(input());
     expect(result.exitCode).toBe(0);
     expect(result.timedOut).toBe(false);
@@ -92,11 +92,20 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
   it("fails closed without creating a session when an MCP server never reports", async () => {
     const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_NO_MCP_EVENT: "1" }), mcpReadyTimeoutMs: 600 }));
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("did not report mcp.resources.changed for MCP server(s) Paperclip projects within 0.6s");
+    expect(result.stderr).toContain("did not reach connected and quiet within 0.6s");
     expect(result.stderr).toContain("without its Paperclip tools");
     expect(result.stderr).not.toContain("listening on");
     // The clear text is a stdout `error` event so it becomes the run's errorMessage.
-    expect(parseOpenCodeJsonl(result.stdout).errorMessage).toContain("did not report mcp.resources.changed for MCP server(s) Paperclip projects");
+    expect(parseOpenCodeJsonl(result.stdout).errorMessage).toContain("OpenCode MCP server(s) did not reach connected and quiet");
+    expect((await requests()).some((entry) => entry.path.startsWith("/api/session"))).toBe(false);
+    await expectServerStopped();
+  });
+
+  it("fails closed without creating a session when the MCP event stream closes", async () => {
+    const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_CLOSE_EVENT: "1" }), mcpReadyTimeoutMs: 2_000 }));
+
+    expect(result.exitCode).toBe(1);
+    expect(parseOpenCodeJsonl(result.stdout).errorMessage).toContain("event stream closed before MCP readiness");
     expect((await requests()).some((entry) => entry.path.startsWith("/api/session"))).toBe(false);
     await expectServerStopped();
   });
@@ -107,14 +116,14 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
 
     expect(result.exitCode).toBe(1);
     const message = parseOpenCodeJsonl(result.stdout).errorMessage;
-    expect(message).toContain("within 0.6s (reported status: Paperclip projects: needs_auth (requires a login));");
-    expect(result.stderr).toContain("Paperclip projects: needs_auth (requires a login)");
+    expect(message).toContain("within 0.6s (last status: Paperclip projects: needs_auth)");
+    expect(result.stderr).toContain("Paperclip projects: needs_auth");
   });
 
   it("says a server is not reported when the status read lists nothing for it", async () => {
     const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_NO_MCP_EVENT: "1" }), mcpReadyTimeoutMs: 600 }));
 
-    expect(parseOpenCodeJsonl(result.stdout).errorMessage).toContain("(reported status: Paperclip projects: not reported);");
+    expect(parseOpenCodeJsonl(result.stdout).errorMessage).toContain("(last status: Paperclip projects: not reported)");
   });
 
   it("bounds the MCP touch request by the same readiness deadline", async () => {
@@ -122,15 +131,16 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
     const result = await runOpenCodeServeProcess(input({ env: serverEnv({ FAKE_HANG_MCP: "1" }), mcpReadyTimeoutMs: 500 }));
     expect(Date.now() - startedAt).toBeLessThan(10_000);
     expect(result.exitCode).toBe(1);
-    expect(parseOpenCodeJsonl(result.stdout).errorMessage).toContain("did not answer its MCP status request within 0.5s");
+    expect(parseOpenCodeJsonl(result.stdout).errorMessage).toContain("did not reach connected and quiet within 0.5s");
     expect((await requests()).some((entry) => entry.path.startsWith("/api/session"))).toBe(false);
     await expectServerStopped();
   });
 
-  it("does not wait when no MCP server was injected", async () => {
+  it("does not touch or wait on the gate when no MCP server was injected", async () => {
     const result = await runOpenCodeServeProcess(input({ mcpServers: [] }));
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("fake reply");
+    expect((await requests()).some((entry) => entry.path === "/api/mcp")).toBe(false);
   });
 
   it("maps a failed turn to exit 1 with the error in the stream", async () => {
@@ -148,14 +158,29 @@ describe("OpenCode serve transport (fake server)", { timeout: 20_000 }, () => {
     expect((await requests()).some((entry) => entry.path.endsWith("/prompt"))).toBe(false);
   });
 
-  it("resumes a known session and switches its model", async () => {
-    const result = await runOpenCodeServeProcess(input({ resumeSessionId: "ses_known", variant: "high" }));
-    expect(result.exitCode).toBe(0);
+  it("preserves state and resumes a known session across two invocations", async () => {
+    const xdg = {
+      XDG_CONFIG_HOME: path.join(root, "xdg", "config"),
+      XDG_DATA_HOME: path.join(root, "xdg", "data"),
+      XDG_CACHE_HOME: path.join(root, "xdg", "cache"),
+      XDG_STATE_HOME: path.join(root, "xdg", "state"),
+    };
+    await Promise.all(Object.values(xdg).map((directory) => fs.mkdir(directory, { recursive: true })));
+    const env = serverEnv(xdg);
+    const first = await runOpenCodeServeProcess(input({ env, resumeSessionId: "ses_known", variant: "high" }));
+    expect(first.exitCode).toBe(0);
+    await Promise.all(Object.values(xdg).map((directory) => fs.access(directory)));
+
+    const second = await runOpenCodeServeProcess(input({ env, resumeSessionId: "ses_known", variant: "high" }));
+    expect(second.exitCode).toBe(0);
+    await Promise.all(Object.values(xdg).map((directory) => fs.access(directory)));
+
     const seen = await requests();
     const switched = seen.find((entry) => entry.path === "/api/session/ses_known/model")!;
     expect(JSON.parse(switched.body)).toEqual({ model: { providerID: "fx", id: "m1", variant: "high" } });
-    expect(seen.some((entry) => entry.path === "/api/session/ses_known/prompt")).toBe(true);
-    expect(seen.some((entry) => entry.path === "/api/session" && entry.method === "POST")).toBe(false);
+    expect(seen.filter((entry) => entry.method === "GET" && entry.path === "/api/session/ses_known")).toHaveLength(2);
+    expect(seen.filter((entry) => entry.method === "POST" && entry.path === "/api/session/ses_known/prompt")).toHaveLength(2);
+    expect(seen.some((entry) => entry.method === "POST" && entry.path === "/api/session")).toBe(false);
   });
 
   it("never leaks the server password, its Authorization header or the MCP bearer token", async () => {
