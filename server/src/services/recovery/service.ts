@@ -7815,9 +7815,8 @@ export function recoveryService(
       );
 
       for (const candidate of companyCandidates) {
-        await runRecoverySweepIssue(candidate, "recovery.reconcile_resolved_dependency_wake_backstop", async () => {
         const agentId = candidate.assigneeAgentId;
-        if (!agentId) return;
+        if (!agentId) continue;
 
         const readiness = readinessMap.get(candidate.id);
         const resolvedBlockerIssueId = readiness?.blockerIssueIds[0] ?? null;
@@ -7834,7 +7833,7 @@ export function recoveryService(
           !resolvedBlockerIssueId
         ) {
           result.notReadySkipped += 1;
-          return;
+          continue;
         }
 
         // Zero-blocker heal path: a live recovery action owns the issue, so
@@ -7844,7 +7843,7 @@ export function recoveryService(
         // still runs once the sweep has given up.
         if (zeroBlockerHeal && (await hasActiveOrEscalatedRecoveryAction(companyId, candidate.id))) {
           result.zeroBlockerActiveRecoverySkipped += 1;
-          return;
+          continue;
         }
 
         // Level-triggered dedup: key on the full blocker set (the current ready
@@ -7893,7 +7892,7 @@ export function recoveryService(
             });
         if (existingWake) {
           result.existingWakeSkipped += 1;
-          return;
+          continue;
         }
 
         // SUP-17092/A: withhold the dependent wake when the RESOLVED BLOCKER's
@@ -7955,7 +7954,7 @@ export function recoveryService(
               }
             }
             result.attributedWithheld += 1;
-            return;
+            continue;
           }
         }
 
@@ -8030,7 +8029,7 @@ export function recoveryService(
         if (consumedWakes >= maxCount) {
           if (await hasActiveOrEscalatedRecoveryAction(companyId, candidate.id)) {
             result.reArmCapSkipped += 1;
-            return;
+            continue;
           }
           const reArmSvc = issueRecoveryActionService(db);
           await reArmSvc.upsertSourceScoped({
@@ -8057,7 +8056,7 @@ export function recoveryService(
           });
           result.reArmCapEscalated++;
           result.reArmCapEscalatedIssueIds.push(candidate.id);
-          return;
+          continue;
         }
 
         if (
@@ -8065,12 +8064,12 @@ export function recoveryService(
           (await hasQueuedIssueWake(companyId, candidate.id, agentId))
         ) {
           result.livePathSkipped += 1;
-          return;
+          continue;
         }
 
         if (await hasPendingWakeInteraction(db, companyId, candidate.id)) {
           result.interactionSkipped += 1;
-          return;
+          continue;
         }
 
         if (
@@ -8082,7 +8081,7 @@ export function recoveryService(
           )
         ) {
           result.pauseHoldSkipped += 1;
-          return;
+          continue;
         }
 
         const rearmWindowMs = opts?.rearmWindowMs;
@@ -8134,7 +8133,7 @@ export function recoveryService(
                 },
               });
             }
-            return;
+            continue;
           }
         }
 
@@ -8168,7 +8167,7 @@ export function recoveryService(
             // such as disabled wake-on-demand or concurrency gating. That is
             // not an enqueue error, but the backstop still did not heal now.
             result.deferredOrFailed += 1;
-            return;
+            continue;
           }
 
           result.healed += 1;
@@ -8200,9 +8199,7 @@ export function recoveryService(
             { err, issueId: candidate.id, agentId, idempotencyKey, source },
             "failed to enqueue dependency wake from issue graph liveness backstop",
           );
-          throw err;
         }
-        });
       }
     }
 
@@ -8328,39 +8325,38 @@ export function recoveryService(
       );
 
       for (const candidate of companyCandidates) {
-        await runRecoverySweepIssue(candidate, "recovery.reconcile_pending_review_rearm", async () => {
         const readiness = readinessMap.get(candidate.id);
         if (!readiness?.isDependencyReady) {
           result.dependencyBlockedSkipped += 1;
-          return;
+          continue;
         }
 
         const state = parseIssueExecutionState(candidate.executionState);
         const participant = state?.currentParticipant;
         if (participant?.type !== "agent" || !participant.agentId) {
           result.notReadySkipped += 1;
-          return;
+          continue;
         }
         const agentId = participant.agentId;
 
         if (await hasActiveExecutionPath(companyId, candidate.id, agentId)) {
           result.livePathSkipped += 1;
-          return;
+          continue;
         }
 
         if (await hasQueuedIssueWake(companyId, candidate.id, agentId)) {
           result.queuedWakeSkipped += 1;
-          return;
+          continue;
         }
 
         if (await hasPendingWakeInteraction(db, companyId, candidate.id)) {
           result.interactionSkipped += 1;
-          return;
+          continue;
         }
 
         if (await isAutomaticRecoverySuppressedByPauseHold(db, companyId, candidate.id, treeControlSvc)) {
           result.pauseHoldSkipped += 1;
-          return;
+          continue;
         }
 
         const consumedCount = await db
@@ -8406,13 +8402,13 @@ export function recoveryService(
             result.reArmCapExhausted += 1;
             result.reArmCapExhaustedIssueIds.push(candidate.id);
           }
-          return;
+          continue;
         }
 
         const executionStage = buildExecutionStageWakeContextFromState(state);
         if (!executionStage) {
           result.notReadySkipped += 1;
-          return;
+          continue;
         }
 
         try {
@@ -8439,7 +8435,7 @@ export function recoveryService(
           });
           if (!wake) {
             result.deferredOrFailed += 1;
-            return;
+            continue;
           }
 
           result.reArmed += 1;
@@ -8468,9 +8464,7 @@ export function recoveryService(
             { err, issueId: candidate.id, agentId, source },
             "failed to enqueue pending review re-arm wake",
           );
-          throw err;
         }
-        });
       }
     }
 
@@ -10092,7 +10086,6 @@ export function recoveryService(
         eq(issueRecoveryActions.status, "active"),
         opts?.companyId ? eq(issueRecoveryActions.companyId, opts.companyId) : sql`true`));
     for (const park of activeParks) {
-      await runRecoverySweepIssue({ id: park.issueId, identifier: null }, "recovery.reconcile_dispatch_suppression_parks", async () => {
       let resolutionNote: string | null = null;
       if (park.issueStatus !== "blocked") {
         resolutionNote = "The issue left blocked status.";
@@ -10110,7 +10103,7 @@ export function recoveryService(
       )) {
         resolutionNote = "A live continuation path was restored.";
       }
-      if (!resolutionNote) return;
+      if (!resolutionNote) continue;
       const cancelled = await recoveryActionsSvc.resolveActiveForIssue({
         companyId: park.companyId,
         sourceIssueId: park.issueId,
@@ -10131,7 +10124,6 @@ export function recoveryService(
           details: { source, recoveryActionId: park.actionId, resolutionNote },
         });
       }
-      });
     }
     const windowStart = new Date(now.getTime() - DISPATCH_SUPPRESSED_PARK_SUSTAINED_MS);
 
@@ -10244,7 +10236,7 @@ export function recoveryService(
     );
 
     for (const candidate of issueRows) {
-      await runRecoverySweepIssue(candidate, "recovery.reconcile_dispatch_suppression_parks_write", async () => {
+      await runRecoverySweepIssue(candidate, "recovery.reconcile_dispatch_suppression_parks", async () => {
       const lastRealActivity = [
         candidate.updatedAt,
         commentLatestById.get(candidate.id) ?? null,
@@ -11056,18 +11048,8 @@ export function recoveryService(
       .orderBy(asc(issueRecoveryActions.lastAttemptAt));
 
     result.checked = candidates.length;
-    const identifierBySourceIssueId = new Map(
-      candidates.length === 0
-        ? []
-        : (
-            await db
-              .select({ id: issues.id, identifier: issues.identifier })
-              .from(issues)
-              .where(inArray(issues.id, candidates.map((candidate) => candidate.sourceIssueId)))
-          ).map((row) => [row.id, row.identifier] as const),
-    );
     for (const candidate of candidates) {
-      await runRecoverySweepIssue({ id: candidate.sourceIssueId, identifier: identifierBySourceIssueId.get(candidate.sourceIssueId) ?? null }, "recovery.reconcile_stale_recovery_action_wakes", async () => {
+      await runRecoverySweepIssue({ id: candidate.sourceIssueId, identifier: null }, "recovery.reconcile_stale_recovery_action_wakes", async () => {
       const effectiveMaxAttempts = candidate.maxAttempts ?? MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
 
       if (candidate.attemptCount >= effectiveMaxAttempts) {
@@ -11559,7 +11541,6 @@ export function recoveryService(
         ),
       );
     for (const candidate of candidates) {
-      await runRecoverySweepIssue(candidate, "recovery.ingest_stale_in_review_child_issues", async () => {
       const parent = await db
         .select({ status: issues.status })
         .from(issues)
@@ -11568,7 +11549,7 @@ export function recoveryService(
 
       if (!parent || parent.status !== "blocked") {
         result.skippedParentNotBlocked += 1;
-        return;
+        continue;
       }
 
       const state = parseIssueExecutionState(candidate.executionState);
@@ -11580,7 +11561,7 @@ export function recoveryService(
           body: "Manual intervention required: stale in_review child with no matching auto-archive rule. The child is in_review but not at a review stage, so it cannot be auto-archived by this sweep.",
         });
         result.manual += 1;
-        return;
+        continue;
       }
 
       // Staleness must be measured from the card's OWN current review-stage arm
@@ -11596,7 +11577,7 @@ export function recoveryService(
           : null;
       if (ageReferenceMs === null || Number.isNaN(ageReferenceMs) || ageReferenceMs > dayAgoMs) {
         result.skippedFresh += 1;
-        return;
+        continue;
       }
 
       // Never archive a load-bearing blocker. A live 'blocks' edge into a
@@ -11618,7 +11599,7 @@ export function recoveryService(
         .limit(1);
       if (liveBlockerRows.length > 0) {
         result.skippedLiveBlocker += 1;
-        return;
+        continue;
       }
 
       await db.transaction(async (tx) => {
@@ -11652,7 +11633,6 @@ export function recoveryService(
           policy: "stale_in_review_child",
           identifier: candidate.identifier,
         },
-      });
       });
     }
 
@@ -11769,7 +11749,6 @@ export function recoveryService(
         ),
       );
     for (const action of openCancelledBlockerActions) {
-      await runRecoverySweepIssue({ id: action.sourceIssueId, identifier: null }, "recovery.reconcile_cancelled_only_blocker_dependents_resolve", async () => {
       const [source] = await db.select().from(issues).where(eq(issues.id, action.sourceIssueId));
       let resolutionNote: string | null = null;
       if (!source) {
@@ -11786,7 +11765,7 @@ export function recoveryService(
             "Recovery action became stale because the source issue no longer has only cancelled unresolved blockers.";
         }
       }
-      if (!resolutionNote) return;
+      if (!resolutionNote) continue;
       await recoveryActionsSvc.resolveActiveForIssue({
         companyId: action.companyId,
         sourceIssueId: action.sourceIssueId,
@@ -11794,7 +11773,6 @@ export function recoveryService(
         status: "resolved",
         outcome: "restored",
         resolutionNote,
-      });
       });
     }
 
@@ -11823,8 +11801,7 @@ export function recoveryService(
       .limit(opts?.limit ?? CANCELLED_ONLY_BLOCKER_DEPENDENT_SWEEP_LIMIT);
 
     for (const candidate of candidates) {
-      await runRecoverySweepIssue(candidate, "recovery.reconcile_cancelled_only_blocker_dependents", async () => {
-      if (seen.has(candidate.id)) return;
+      if (seen.has(candidate.id)) continue;
       seen.add(candidate.id);
       const blockerIds = await db
         .select({ blockerId: issueRelations.issueId })
@@ -11840,7 +11817,7 @@ export function recoveryService(
 
       if (blockerIds.length === 0) {
         result.skipped += 1;
-        return;
+        continue;
       }
 
       const readiness = (await listIssueDependencyReadinessMap(db, candidate.companyId, [candidate.id])).get(
@@ -11848,37 +11825,37 @@ export function recoveryService(
       );
       if (!readiness) {
         result.skipped += 1;
-        return;
+        continue;
       }
 
       if (readiness.unresolvedBlockerCount === 0) {
         result.skipped += 1;
-        return;
+        continue;
       }
 
       if (readiness.pendingFinalizeBlockerIssueIds.length > 0) {
         result.skipped += 1;
-        return;
+        continue;
       }
 
       if (!(await unresolvedBlockersAllCancelled(candidate.companyId, readiness.unresolvedBlockerIssueIds))) {
         result.skipped += 1;
-        return;
+        continue;
       }
 
       if (await isAutomaticRecoverySuppressedByPauseHold(db, candidate.companyId, candidate.id, treeControlSvc)) {
         result.skipped += 1;
-        return;
+        continue;
       }
 
       if (await hasActiveExecutionPath(candidate.companyId, candidate.id, candidate.assigneeAgentId)) {
         result.skipped += 1;
-        return;
+        continue;
       }
 
       if (await hasPendingWakeInteraction(db, candidate.companyId, candidate.id)) {
         result.skipped += 1;
-        return;
+        continue;
       }
 
       result.reported += 1;
@@ -11916,7 +11893,6 @@ export function recoveryService(
           maxAttempts: null,
         });
       }
-      });
     }
 
     const shouldLog =
@@ -12058,7 +12034,6 @@ export function recoveryService(
         ),
       );
     for (const action of openUndispatchableActions) {
-      await runRecoverySweepIssue({ id: action.sourceIssueId, identifier: null }, "recovery.reconcile_undispatchable_assigned_resolve", async () => {
       const [source] = await db
         .select()
         .from(issues)
@@ -12079,7 +12054,7 @@ export function recoveryService(
           resolutionNote = "Recovery action became stale because the source issue assignee is no longer a pull-only adapter agent.";
         }
       }
-      if (!resolutionNote) return;
+      if (!resolutionNote) continue;
       const resolvedAction = await recoveryActionsSvc.resolveActiveForIssue({
         companyId: action.companyId,
         sourceIssueId: action.sourceIssueId,
@@ -12092,7 +12067,6 @@ export function recoveryService(
         result.resolved += 1;
         undispatchableAssignedSightCounts.delete(action.sourceIssueId);
       }
-      });
     }
 
     const queryCandidates = (afterIssueId: string | null) => {
@@ -12140,14 +12114,13 @@ export function recoveryService(
     result.scanned = candidates.length;
 
     for (const candidate of candidates) {
-      await runRecoverySweepIssue(candidate, "recovery.reconcile_undispatchable_assigned", async () => {
       // Every guard that clears the condition also resets the confirmation
       // counter, so a card that recovers between cycles counts first-sight
       // again from the next confirmed cycle.
       if (!isPullOnlyAdapterType(candidate.assigneeAdapterType)) {
         undispatchableAssignedSightCounts.delete(candidate.id);
         result.skipped += 1;
-        return;
+        continue;
       }
 
       // A declared `external_pull` agent is never invoked by design: it pulls
@@ -12163,7 +12136,7 @@ export function recoveryService(
       ) {
         undispatchableAssignedSightCounts.delete(candidate.id);
         result.skipped += 1;
-        return;
+        continue;
       }
 
       if (
@@ -12176,19 +12149,19 @@ export function recoveryService(
       ) {
         undispatchableAssignedSightCounts.delete(candidate.id);
         result.skipped += 1;
-        return;
+        continue;
       }
 
       if (await hasPendingWakeInteraction(db, candidate.companyId, candidate.id)) {
         undispatchableAssignedSightCounts.delete(candidate.id);
         result.skipped += 1;
-        return;
+        continue;
       }
 
       if (await isAutomaticRecoverySuppressedByPauseHold(db, candidate.companyId, candidate.id, treeControlSvc)) {
         undispatchableAssignedSightCounts.delete(candidate.id);
         result.skipped += 1;
-        return;
+        continue;
       }
 
       result.reported += 1;
@@ -12220,7 +12193,7 @@ export function recoveryService(
         undispatchableAssignedSightCounts.clear();
       }
       undispatchableAssignedSightCounts.set(candidate.id, confirmedCycles);
-      if (confirmedCycles < 2) return;
+      if (confirmedCycles < 2) continue;
 
       const openAction = await recoveryActionsSvc.getActiveForIssue(candidate.companyId, candidate.id);
       if (openAction) {
@@ -12228,12 +12201,12 @@ export function recoveryService(
           // Idempotent: this sweep already owns an open (or terminal
           // escalated) action for the same condition. Re-confirmation must
           // not mint a second one or bump its attempt budget.
-          return;
+          continue;
         }
         if (isTerminalRecoveryAction(openAction)) {
           // A terminal action for a different condition blocks a new mint on
           // the same source (platform invariant). Board must resolve it first.
-          return;
+          continue;
         }
       }
 
@@ -12257,7 +12230,7 @@ export function recoveryService(
         ruledInvalid?.outcome === "false_positive" &&
         (ruledInvalid.evidence?.assigneeAgentId as string | null | undefined) === candidate.assigneeAgentId
       ) {
-        return;
+        continue;
       }
 
       const escalatedAction = await recoveryActionsSvc.upsertSourceScoped({
@@ -12282,7 +12255,7 @@ export function recoveryService(
         monitorPolicy: null,
         maxAttempts: null,
       });
-      if (escalatedAction.kind !== UNDISPATCHABLE_ASSIGNEE_RECOVERY_KIND) return;
+      if (escalatedAction.kind !== UNDISPATCHABLE_ASSIGNEE_RECOVERY_KIND) continue;
       result.escalated += 1;
 
       await logActivity(db, {
@@ -12300,7 +12273,6 @@ export function recoveryService(
           assigneeAgentId: candidate.assigneeAgentId,
           recoveryActionId: escalatedAction.id,
         },
-      });
       });
     }
 

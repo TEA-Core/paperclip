@@ -658,27 +658,39 @@ are not the guarded issue-service path. A failure there, including a database
 failure, still stops startup.
 
 Each card is processed inside the shared `runRecoverySweepIssue` helper in these
-startup sweeps:
+startup sweeps. The helper accepts only the names in `RECOVERY_SWEEP_NAMES`
+(`server/src/lib/recovery-sweep-isolation.ts`), so a call site with an
+unregistered name fails typecheck, and the sweep isolation table test runs one
+injected-failure case per registered name. Each line says how the card body
+reaches `issueService.update`, the guarded path:
 
-- Stranded assigned issues, including the unassigned-blocking-issue pass
-  (`reconcileStrandedAssignedIssues`, `reconcileUnassignedBlockingIssues`).
-- Issue-graph liveness: resolved-dependency wake backstop, dispatch-suppression
-  parks (park resolution and park write), todo-stranded parks, and
-  blocked-without-blockers (`reconcileIssueGraphLiveness`, also run
-  directly for the last).
-- Stillborn assigned backlog, exhausted recovery drain, stale recovery-action
-  wakes, pending-review re-arm, and undispatchable assigned issues (action
-  resolution and escalation).
-- Cancelled-only-blocker dependents (action resolution and detection),
-  stale `in_review` child archive, stale issue
-  locks (the per-card lock clear only), and completed-run strand escalation.
-- Host-restart strand repairs (`sweepHostRestartStrandedIssues`).
-- Task watchdog reconciliation (`reconcileTaskWatchdogs`).
-
-A few of these loops (the stale issue lock clear and the stale recovery-action
-wake reconciliation) write only lock columns, recovery-action rows or wake rows
-rather than calling `issueService.update`; the helper is applied to them as
-well. It is not a requirement of the boundary above.
+- `reconcileStrandedAssignedIssues`: `blockIssueWithUnresolvedBlockers`,
+  `escalateStrandedAssignedIssue`, `repairNativeBlockedWait`,
+  `resolveContinuationWaitingOnReview` and
+  `scheduleProviderQuotaRecoveryMonitor` all call it.
+- Unassigned blocking issues (`reconcileUnassignedBlockingIssues`): the
+  reassignment calls `issueService(txDb).update` with `assigneeAgentId`.
+- `reconcileStillbornAssignedBacklog`: `escalateStrandedAssignedIssue` calls it.
+- `reconcileBlockedWithoutBlockers` (also run through
+  `reconcileIssueGraphLiveness`): the heal and `armExhaustedBoardMonitor` call it.
+- `reconcileDispatchSuppressionParks`, park write only: it calls
+  `issuesSvc.update(id, { status: "blocked" })`.
+- `reconcileTodoStrandedCards`: it calls `issuesSvc.update(id, { status: "blocked" })`.
+- `reconcileExhaustedRecoveryDrain`: `armExhaustedBoardMonitor` calls it with the
+  monitor columns and `executionPolicy`.
+- `reconcileStaleRecoveryActionWakes`: its wake path writes only recovery-action
+  and wake rows, but an action at its attempt ceiling goes through
+  `escalateExhaustedRecoveryAction`, which reaches it through
+  `armExhaustedBoardMonitor`.
+- `sweepHostRestartStrandedIssues`: the escalation calls it through
+  `blockIssueWithUnresolvedBlockers`. The re-arm repair is a direct drizzle
+  update.
+- `reconcileTaskWatchdogs`: `evaluateWatchdog` reaches
+  `ensureReusableWatchdogIssue`, which reopens the watchdog issue with
+  `issuesSvc.update`.
+- `sweepStaleIssueLocks`, the per-card lock clear only: it does not call it. It
+  clears raw lock columns with a direct drizzle update. It stays wrapped as a
+  recorded decision, not because of the boundary above.
 
 Active recovery-action reconciliation (`reconcileActiveRecoveryActions`)
 isolates each action with its own `try`/`catch`; it logs and skips the action
@@ -730,6 +742,22 @@ fails startup:
   one activity-log row. No `issueService.update`.
 - `detectStaleIssueMonitors`, per stale monitor: one select and one activity-log
   insert. No `issueService.update`.
+- `reconcileResolvedDependencyWakeBackstop`, per candidate: `enqueueWakeup` and
+  an activity-log row. Its enqueue throw is already caught per card and counted
+  as `enqueueFailed`. No `issueService.update`.
+- `reconcilePendingReviewRearm`, per candidate: a recovery-action upsert,
+  `enqueueWakeup` and an activity-log row. Its enqueue throw is already caught
+  per card. No `issueService.update`.
+- `reconcileDispatchSuppressionParks`, park resolution: resolves the recovery
+  action and writes an activity-log row. No `issueService.update`.
+- `ingestStaleInReviewChildIssues`, per stale child: a system comment, a direct
+  drizzle update of `hiddenAt` and an archive row. No `issueService.update`.
+- `reconcileCancelledOnlyBlockerDependents` (action resolution and detection):
+  recovery-action rows and detection activity rows. No `issueService.update`.
+- `reconcileUndispatchableAssignedIssues` (action resolution and escalation):
+  recovery-action rows and activity rows. No `issueService.update`.
+- `sweepCompletedRunStrandedIssues`, per escalation: a system comment through
+  `addComment`, which does not call `issueService.update`.
 - Native-runner restart recovery fails closed by design and rethrows.
   Hot-restart adoption, the orphaned-run reap and the abandoned run scratch sweep
   are each caught as a whole by the caller, so startup continues after them.

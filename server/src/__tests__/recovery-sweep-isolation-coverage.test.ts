@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -10,7 +9,6 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
-  issueComments,
   issueRecoveryActions,
   issueRelations,
   issues,
@@ -22,9 +20,9 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { RECOVERY_SWEEP_NAMES, type RecoverySweepName } from "../lib/recovery-sweep-isolation.js";
 import { logger } from "../middleware/logger.js";
 import { recoveryService } from "../services/recovery/service.js";
-import { sweepCompletedRunStrandedIssues } from "../services/recovery/completed-run-strand-sweep.js";
 import { sweepHostRestartStrandedIssues } from "../services/recovery/host-restart-strand-sweep.js";
 import { taskWatchdogService } from "../services/task-watchdogs.js";
 
@@ -35,52 +33,6 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 
 type Db = ReturnType<typeof createDb>;
 type Seed = { companyId: string; agentId: string; prefix: string };
-
-const RECOVERY_SWEEP_SITES = [
-  "task_watchdogs.reconcile_task_watchdogs",
-  "recovery.completed_run_strand_sweep",
-  "recovery.host_restart_strand_sweep",
-  "recovery.reconcile_unassigned_blocking_issue",
-  "recovery.reconcile_stranded_assigned_issues",
-  "recovery.reconcile_resolved_dependency_wake_backstop",
-  "recovery.reconcile_pending_review_rearm",
-  "recovery.sweep_stale_issue_locks",
-  "recovery.reconcile_exhausted_recovery_drain",
-  "recovery.reconcile_blocked_without_blockers",
-  "recovery.reconcile_dispatch_suppression_parks",
-  "recovery.reconcile_dispatch_suppression_parks_write",
-  "recovery.reconcile_todo_stranded_cards",
-  "recovery.reconcile_stale_recovery_action_wakes",
-  "recovery.ingest_stale_in_review_child_issues",
-  "recovery.reconcile_cancelled_only_blocker_dependents_resolve",
-  "recovery.reconcile_cancelled_only_blocker_dependents",
-  "recovery.reconcile_stillborn_assigned_backlog",
-  "recovery.reconcile_undispatchable_assigned_resolve",
-  "recovery.reconcile_undispatchable_assigned",
-] as const;
-
-function sweepCallSitesFromSource(): string[] {
-  const files = [
-    "server/src/services/recovery/service.ts",
-    "server/src/services/recovery/host-restart-strand-sweep.ts",
-    "server/src/services/recovery/completed-run-strand-sweep.ts",
-    "server/src/services/task-watchdogs.ts",
-  ];
-  const sites: string[] = [];
-  for (const file of files) {
-    const text = readFileSync(file, "utf8");
-    for (const match of text.matchAll(/runRecoverySweepIssue\([\s\S]*?,\s*"([^"]+)"/g)) {
-      sites.push(match[1]!);
-    }
-  }
-  return sites;
-}
-
-describe("recovery sweep isolation coverage", () => {
-  it("fails when a wrapped call site has no table entry", () => {
-    expect(sweepCallSitesFromSource().sort()).toEqual([...RECOVERY_SWEEP_SITES].sort());
-  });
-});
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -247,7 +199,7 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
     });
   }
 
-  async function assertSkipped(sweep: string, failingIssueId: string, run: () => Promise<unknown>) {
+  async function assertSkipped(sweep: RecoverySweepName, failingIssueId: string, run: () => Promise<unknown>) {
     const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined as never);
     try {
       await expect(run()).resolves.toBeDefined();
@@ -260,7 +212,7 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
     }
   }
 
-  it.each(RECOVERY_SWEEP_SITES)("skips one injected write failure in %s and still processes the later card", async (sweep) => {
+  it.each(RECOVERY_SWEEP_NAMES)("skips one injected write failure in %s and still processes the later card", async (sweep) => {
     const seeded = await seedCompany();
     const failing = await drive(sweep, seeded, "Failing card", 1);
     const later = await drive(sweep, seeded, "Ordinary card", 2);
@@ -276,7 +228,7 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
     }
   });
 
-  async function drive(sweep: string, seeded: Seed, title: string, issueNumber: number): Promise<string> {
+  async function drive(sweep: RecoverySweepName, seeded: Seed, title: string, issueNumber: number): Promise<string> {
     const old = new Date(Date.now() - 3 * 60 * 60 * 1000);
     const veryOld = new Date(Date.now() - 48 * 60 * 60 * 1000);
     if (sweep === "recovery.reconcile_stranded_assigned_issues") {
@@ -378,7 +330,7 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
         extra: { updatedAt: old },
       });
     }
-    if (sweep === "recovery.reconcile_dispatch_suppression_parks_write") {
+    if (sweep === "recovery.reconcile_dispatch_suppression_parks") {
       const id = await insertIssue({
         ...seeded,
         agentId: seeded.agentId,
@@ -398,102 +350,6 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
         createdAt: new Date(Date.now() - 30 * 60 * 1000),
       });
       return id;
-    }
-    if (sweep === "recovery.reconcile_dispatch_suppression_parks") {
-      const id = await insertIssue({
-        ...seeded,
-        agentId: seeded.agentId,
-        title,
-        status: "todo",
-        issueNumber,
-      });
-      await db.insert(issueRecoveryActions).values({
-        id: randomUUID(),
-        companyId: seeded.companyId,
-        sourceIssueId: id,
-        kind: "issue_graph_liveness",
-        status: "active",
-        ownerType: "agent",
-        ownerAgentId: seeded.agentId,
-        cause: "in_progress_without_live_continuation_path",
-        fingerprint: `timer-park:${seeded.companyId}:${id}`,
-        nextAction: "finish the issue",
-        evidence: {},
-      });
-      return id;
-    }
-    if (sweep === "recovery.reconcile_cancelled_only_blocker_dependents") {
-      const blockerId = await insertIssue({ ...seeded, title: `blocker-${issueNumber}`, status: "cancelled", issueNumber: 200 + issueNumber });
-      const id = await insertIssue({ ...seeded, agentId: seeded.agentId, title, status: "blocked", issueNumber });
-      await db.insert(issueRelations).values({
-        companyId: seeded.companyId,
-        issueId: blockerId,
-        relatedIssueId: id,
-        type: "blocks",
-      });
-      return id;
-    }
-    if (sweep === "recovery.reconcile_cancelled_only_blocker_dependents_resolve") {
-      const id = await insertIssue({ ...seeded, agentId: seeded.agentId, title, status: "todo", issueNumber });
-      await db.insert(issueRecoveryActions).values({
-        id: randomUUID(),
-        companyId: seeded.companyId,
-        sourceIssueId: id,
-        kind: "issue_graph_liveness",
-        status: "active",
-        ownerType: "board",
-        cause: "cancelled_blocker_dependent",
-        fingerprint: `cancelled-blocker:${id}`,
-        nextAction: "review the dependent",
-        evidence: {},
-      });
-      return id;
-    }
-    if (sweep === "recovery.reconcile_undispatchable_assigned") {
-      const pullOnly = randomUUID();
-      await db.insert(agents).values({
-        id: pullOnly,
-        companyId: seeded.companyId,
-        name: `pull-${issueNumber}`,
-        role: "engineer",
-        status: "active",
-        adapterType: "process",
-        adapterConfig: {},
-        runtimeConfig: {},
-        permissions: {},
-      });
-      return insertIssue({ ...seeded, agentId: pullOnly, title, status: "todo", issueNumber });
-    }
-    if (sweep === "recovery.reconcile_undispatchable_assigned_resolve") {
-      const id = await insertIssue({ ...seeded, agentId: seeded.agentId, title, status: "done", issueNumber });
-      await db.insert(issueRecoveryActions).values({
-        id: randomUUID(),
-        companyId: seeded.companyId,
-        sourceIssueId: id,
-        kind: "undispatchable_assignee",
-        status: "active",
-        ownerType: "board",
-        cause: "undispatchable_assignee",
-        fingerprint: `undispatchable:${id}`,
-        nextAction: "reassign",
-        evidence: {},
-      });
-      return id;
-    }
-    if (sweep === "recovery.ingest_stale_in_review_child_issues") {
-      const parentId = await insertIssue({ ...seeded, agentId: seeded.agentId, title: `parent-${issueNumber}`, status: "blocked", issueNumber: 300 + issueNumber });
-      return insertIssue({
-        ...seeded,
-        agentId: seeded.agentId,
-        title,
-        status: "in_review",
-        issueNumber,
-        extra: {
-          parentId,
-          updatedAt: veryOld,
-          executionState: { currentStageType: "review", pendingSince: veryOld.toISOString() },
-        },
-      });
     }
     if (sweep === "recovery.host_restart_strand_sweep") {
       const id = await insertIssue({
@@ -527,27 +383,6 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
       });
       return id;
     }
-    if (sweep === "recovery.completed_run_strand_sweep") {
-      const id = await insertIssue({
-        ...seeded,
-        agentId: seeded.agentId,
-        title,
-        status: "in_progress",
-        issueNumber,
-        extra: { monitorNextCheckAt: null, assigneeUserId: null },
-      });
-      await db.insert(heartbeatRuns).values({
-        id: randomUUID(),
-        companyId: seeded.companyId,
-        agentId: seeded.agentId,
-        invocationSource: "manual",
-        status: "succeeded",
-        startedAt: veryOld,
-        finishedAt: veryOld,
-        contextSnapshot: { issueId: id },
-      });
-      return id;
-    }
     if (sweep === "recovery.reconcile_stale_recovery_action_wakes") {
       const id = await insertIssue({ ...seeded, agentId: seeded.agentId, title, status: "in_progress", issueNumber });
       await db.insert(issueRecoveryActions).values({
@@ -565,41 +400,6 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
         lastAttemptAt: veryOld,
         attemptCount: 0,
         maxAttempts: 5,
-      });
-      return id;
-    }
-    if (sweep === "recovery.reconcile_pending_review_rearm") {
-      return insertIssue({
-        ...seeded,
-        agentId: seeded.agentId,
-        title,
-        status: "in_review",
-        issueNumber,
-        extra: {
-          updatedAt: old,
-          executionState: {
-            status: "pending",
-            currentStageId: randomUUID(),
-            currentStageIndex: 0,
-            currentStageType: "review",
-            currentParticipant: { type: "agent", agentId: seeded.agentId, userId: null },
-            returnAssignee: null,
-            reviewRequest: { instructions: "Please review" },
-            completedStageIds: [],
-            lastDecisionId: null,
-            lastDecisionOutcome: null,
-          },
-        },
-      });
-    }
-    if (sweep === "recovery.reconcile_resolved_dependency_wake_backstop") {
-      const blockerId = await insertIssue({ ...seeded, title: `done-blocker-${issueNumber}`, status: "done", issueNumber: 400 + issueNumber });
-      const id = await insertIssue({ ...seeded, agentId: seeded.agentId, title, status: "blocked", issueNumber });
-      await db.insert(issueRelations).values({
-        companyId: seeded.companyId,
-        issueId: blockerId,
-        relatedIssueId: id,
-        type: "blocks",
       });
       return id;
     }
@@ -626,7 +426,7 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
     throw new Error(`no driver for ${sweep}`);
   }
 
-  async function runSweep(sweep: string, seeded: Seed) {
+  async function runSweep(sweep: RecoverySweepName, seeded: Seed) {
     const svc = recovery();
     const now = new Date();
     if (sweep === "recovery.reconcile_stranded_assigned_issues" || sweep === "recovery.reconcile_unassigned_blocking_issue") {
@@ -637,32 +437,12 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
     if (sweep === "recovery.reconcile_exhausted_recovery_drain") return svc.reconcileExhaustedRecoveryDrain();
     if (sweep === "recovery.reconcile_blocked_without_blockers") return svc.reconcileBlockedWithoutBlockers({ now, companyId: seeded.companyId });
     if (sweep === "recovery.reconcile_todo_stranded_cards") return svc.reconcileTodoStrandedCards({ now, companyId: seeded.companyId });
-    if (sweep === "recovery.reconcile_dispatch_suppression_parks" || sweep === "recovery.reconcile_dispatch_suppression_parks_write") {
+    if (sweep === "recovery.reconcile_dispatch_suppression_parks") {
       return svc.reconcileDispatchSuppressionParks({ now, companyId: seeded.companyId });
     }
-    if (sweep === "recovery.reconcile_cancelled_only_blocker_dependents" || sweep === "recovery.reconcile_cancelled_only_blocker_dependents_resolve") {
-      return svc.reconcileCancelledOnlyBlockerDependents();
-    }
-    if (sweep === "recovery.reconcile_undispatchable_assigned") {
-      await svc.reconcileUndispatchableAssignedIssues();
-      return svc.reconcileUndispatchableAssignedIssues();
-    }
-    if (sweep === "recovery.reconcile_undispatchable_assigned_resolve") {
-      return svc.reconcileUndispatchableAssignedIssues();
-    }
-    if (sweep === "recovery.ingest_stale_in_review_child_issues") return svc.ingestStaleInReviewChildIssues();
     if (sweep === "recovery.reconcile_stale_recovery_action_wakes") return svc.reconcileStaleRecoveryActionWakes({ intervalMs: 0 });
-    if (sweep === "recovery.reconcile_pending_review_rearm") {
-      return svc.reconcilePendingReviewRearm({ now: new Date(Date.now() + 2 * 60 * 60 * 1000), companyId: seeded.companyId, rearmWindowMs: 60 * 60 * 1000, rearmMaxCount: 3 });
-    }
-    if (sweep === "recovery.reconcile_resolved_dependency_wake_backstop") {
-      return svc.reconcileResolvedDependencyWakeBackstop({ now, companyId: seeded.companyId });
-    }
     if (sweep === "recovery.host_restart_strand_sweep") {
       return sweepHostRestartStrandedIssues({ db, now, resolveBootId: async () => "boot-new", companyId: seeded.companyId });
-    }
-    if (sweep === "recovery.completed_run_strand_sweep") {
-      return sweepCompletedRunStrandedIssues({ db, now, idleThresholdMs: 0, companyId: seeded.companyId });
     }
     if (sweep === "task_watchdogs.reconcile_task_watchdogs") {
       return taskWatchdogService(db).reconcileTaskWatchdogs({ companyId: seeded.companyId });
