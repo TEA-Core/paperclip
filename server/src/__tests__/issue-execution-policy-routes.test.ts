@@ -392,6 +392,13 @@ describe("issue execution policy routes", () => {
       innerJoin: () => dbChainNode([]),
     }));
     mockDbSelectWhere.mockImplementation(() => dbChainNode(HANDOFF_AGENT_ROWS));
+    mockDb.transaction.mockImplementation(async (callback: (tx: Record<string, unknown>) => Promise<unknown>) =>
+      callback({
+        select: mockDbSelect,
+        insert: () => mockTxWriteChain([{}]),
+        update: () => mockTxWriteChain([]),
+        delete: () => mockTxWriteChain([]),
+      }));
     mockIssueService.createChild.mockResolvedValue({
       issue: {
         id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
@@ -4078,6 +4085,254 @@ describe("issue execution policy routes", () => {
       expect(res.body.error).toContain(PHANTOM_AGENT_ID);
       expect(res.body.details).toMatchObject({ stageIndex: 0, agentId: PHANTOM_AGENT_ID });
       expect(mockIssueService.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("reassignment run stop (SUP-22662)", () => {
+    const issueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const runId = "55555555-5555-4555-8555-555555555555";
+    const reviewerAgentId = "33333333-3333-4333-8333-333333333333";
+    const nextAgentId = "55555555-5555-4555-8555-555555555555";
+    const runningRun = {
+      id: runId,
+      companyId: "company-1",
+      agentId: reviewerAgentId,
+      status: "running",
+      contextSnapshot: { issueId },
+    };
+
+    beforeEach(() => {
+      mockHeartbeatService.getRun.mockResolvedValue(runningRun);
+      mockHeartbeatService.cancelRun.mockResolvedValue({
+        ...runningRun,
+        status: "cancelled",
+      });
+    });
+
+    function mockStageHandoff() {
+      const stage1Id = "11111111-1111-4111-8111-111111111111";
+      const stage2Id = "aaaaaaaa-0000-4000-8000-000000000002";
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [
+          {
+            id: stage1Id,
+            type: "review",
+            participants: [{ type: "agent", agentId: reviewerAgentId }],
+          },
+          {
+            id: stage2Id,
+            type: "review",
+            participants: [{ type: "agent", agentId: nextAgentId }],
+          },
+        ],
+      })!;
+      const issue = {
+        id: issueId,
+        companyId: "company-1",
+        status: "in_review",
+        assigneeAgentId: reviewerAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-1012",
+        title: "Stage hand-off",
+        deliveryRequirement: "record_only",
+        executionPolicy: policy,
+        executionRunId: runId,
+        executionState: {
+          status: "pending",
+          currentStageId: stage1Id,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: reviewerAgentId },
+          returnAssignee: { type: "agent", agentId: "44444444-4444-4444-8444-444444444444" },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const insertedRows: Record<string, unknown>[] = [];
+      mockDb.transaction.mockImplementation(async (callback: (tx: Record<string, unknown>) => Promise<unknown>) =>
+        callback({
+          select: mockDbSelect,
+          insert: () => ({
+            values: async (values: Record<string, unknown>) => {
+              insertedRows.push(values);
+              return [{ id: values.id }];
+            },
+          }),
+          update: () => mockTxWriteChain([]),
+          delete: () => mockTxWriteChain([]),
+        }));
+      return { stage1Id, stage2Id, insertedRows };
+    }
+
+    it("does not cancel the issuing run on a workflow-controlled non-final stage approval", async () => {
+      const { stage1Id, stage2Id, insertedRows } = mockStageHandoff();
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId,
+      }))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Stage approved; handing to the next reviewer." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          assigneeAgentId: nextAgentId,
+          executionState: expect.objectContaining({
+            status: "pending",
+            currentStageId: stage2Id,
+            currentParticipant: expect.objectContaining({
+              type: "agent",
+              agentId: nextAgentId,
+            }),
+          }),
+        }),
+        expect.anything(),
+      );
+      expect(insertedRows).toContainEqual(expect.objectContaining({
+        issueId,
+        stageId: stage1Id,
+        stageType: "review",
+        actorAgentId: reviewerAgentId,
+        outcome: "approved",
+      }));
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
+    it("cancels the outgoing run when a workflow hand-off comes from a different run", async () => {
+      mockStageHandoff();
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId: "66666666-6666-4666-8666-666666666666",
+      }))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Hand-off requested by another run." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ assigneeAgentId: nextAgentId }),
+        expect.anything(),
+      );
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+        runId,
+        "Cancelled before issue reassignment",
+        expect.objectContaining({ errorCode: "issue_reassigned" }),
+      );
+      expect(mockIssueService.update.mock.invocationCallOrder[0])
+        .toBeLessThan(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]);
+    });
+
+    it("still cancels the outgoing run after a plain reassignment commits", async () => {
+      const issue = {
+        id: issueId,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: reviewerAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-1013",
+        title: "Plain reassignment",
+        executionPolicy: null,
+        executionRunId: runId,
+        executionState: null,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: nextAgentId });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ assigneeAgentId: nextAgentId }),
+      );
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+        runId,
+        "Cancelled before issue reassignment",
+        expect.objectContaining({ errorCode: "issue_reassigned" }),
+      );
+      expect(mockIssueService.update.mock.invocationCallOrder[0])
+        .toBeLessThan(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]);
+    });
+
+    it("retries cancelled-status cleanup when deferred reassignment cancellation fails", async () => {
+      const issue = {
+        id: issueId,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: reviewerAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-1015",
+        title: "Cancelled reassignment",
+        executionPolicy: null,
+        executionRunId: runId,
+        executionState: null,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+      mockHeartbeatService.cancelRun
+        .mockRejectedValueOnce(new Error("simulated cancellation failure"))
+        .mockResolvedValue({ ...runningRun, status: "cancelled" });
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: nextAgentId, status: "cancelled" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(2);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenNthCalledWith(2, runId);
+    });
+
+    it("does not cancel the outgoing run when the reassignment update fails", async () => {
+      const issue = {
+        id: issueId,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: reviewerAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-1014",
+        title: "Failed reassignment",
+        executionPolicy: null,
+        executionRunId: runId,
+        executionState: null,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockRejectedValue(new Error("simulated update failure"));
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: nextAgentId });
+
+      expect(res.status).toBe(500);
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
     });
   });
 });
