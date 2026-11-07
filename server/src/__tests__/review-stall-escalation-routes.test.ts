@@ -591,6 +591,10 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
       .send({ status: "in_progress", comment: "Regenerate the stale fixture and redeliver." });
     expect(directive.status, JSON.stringify(directive.body)).toBe(200);
     expect((await issueRow(issueId)).assigneeAgentId).toBe(seeded.coderId);
+    // These runs are seeded, not owned by an adapter. End each issuer before
+    // the next participant acts; a handoff no longer hides a running owner.
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, arbiterRun));
 
     const coderRun = await liveRun(seeded, seeded.coderId, issueId);
     const redelivery = await request(app(agentActor(seeded, seeded.coderId, coderRun)))
@@ -598,6 +602,8 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
       .send({ status: "in_review", comment: "Redelivered with the regenerated fixture." });
     expect(redelivery.status, JSON.stringify(redelivery.body)).toBe(200);
     expect((await issueRow(issueId)).assigneeAgentId).toBe(seeded.reviewerId);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, coderRun));
 
     const reviewerRun = await liveRun(seeded, seeded.reviewerId, issueId);
     const approval = await request(app(agentActor(seeded, seeded.reviewerId, reviewerRun)))

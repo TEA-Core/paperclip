@@ -19068,7 +19068,6 @@ export function issueRoutes(
     }
     let interruptedRunId: string | null = null;
     let pendingReassignmentStopRunId: string | null = null;
-    let preservedStageHandoffRunId: string | null = null;
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(existing);
     const isAgentWorkUpdate =
       req.actor.type === "agent" &&
@@ -20246,9 +20245,9 @@ export function issueRoutes(
         !terminalApprovalNeedsClassificationCheck &&
         actor.runId !== null &&
         runToStopForReassignment?.id === actor.runId;
-      if (isIssuingRunStageHandoff) {
-        preservedStageHandoffRunId = runToStopForReassignment?.id ?? null;
-      } else if (runToStopForReassignment) {
+      // A stage issuer must finish its own PATCH. Its running execution still
+      // holds the issue lock, so the next stage waits for normal finalization.
+      if (!isIssuingRunStageHandoff && runToStopForReassignment) {
         if (terminalApprovalNeedsClassificationCheck) {
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,
@@ -20582,8 +20581,7 @@ export function issueRoutes(
       )
     );
     const shouldUseTransactionalIssueUpdate =
-      preservedStageHandoffRunId !== null
-      || plainCommentJoinsUpdate
+      plainCommentJoinsUpdate
       || Boolean(commentBody && isClosed && !effectiveMoveToTodoRequested)
       || Boolean(commentAttachmentIds?.length)
       || Boolean(decision)
@@ -20890,17 +20888,6 @@ export function issueRoutes(
           const updated = await updateIssue(tx);
 
           if (!updated) return null;
-          if (preservedStageHandoffRunId) {
-            await tx
-              .update(heartbeatRuns)
-              .set({
-                contextSnapshot: sql`jsonb_set(coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb), '{issueExecutionHandoffAt}', ${JSON.stringify(new Date().toISOString())}::jsonb, true)`,
-              })
-              .where(and(
-                eq(heartbeatRuns.id, preservedStageHandoffRunId),
-                eq(heartbeatRuns.companyId, updated.companyId),
-              ));
-          }
           if (commentAttachmentIds?.length) {
             // Reassignment, comment creation and upload binding commit together.
             // An invalid or already-bound receipt rolls back the issue update.
