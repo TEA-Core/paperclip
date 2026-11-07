@@ -264,7 +264,7 @@ export function prDeliveryService(
     const owners = await Promise.all(
       issueIds.map(async (issueId) => {
         const ownership = await resolveCardDeliveryBranchOwnership(db, companyId, issueId);
-        return ownership.legitimate && ownership.branch === headRef ? issueId : null;
+        return ownership.legitimate && ownership.branchIsOwn && ownership.branch === headRef ? issueId : null;
       }),
     );
     return owners.filter((issueId): issueId is string => issueId !== null);

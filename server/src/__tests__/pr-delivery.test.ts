@@ -164,7 +164,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
   afterEach(async () => {
     await db
       .update(issues)
-      .set({ executionWorkspaceId: sharedExecutionWorkspaceId })
+      .set({ executionWorkspaceId: sharedExecutionWorkspaceId, status: "done" })
       .where(eq(issues.companyId, companyId));
     await db
       .delete(executionWorkspaces)
@@ -259,6 +259,18 @@ describeEmbeddedPostgres("prDeliveryService", () => {
       expect((row.metadata as Record<string, unknown>).prNumber).toBe(PR_NUMBER);
       expect((row.metadata as Record<string, unknown>).repository).toBe(REPOSITORY);
     }
+  });
+
+  it("recordAtOpen excludes live descendants borrowing the carrier owner's branch", async () => {
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.companyId, companyId));
+    const service = prDeliveryService(db);
+
+    const result = await service.recordAtOpen(input());
+
+    expect(result.writtenIssueIds).toEqual([sourceIssueId]);
+    const rows = await readRows();
+    expect(rows.map((row) => row.issueId)).toEqual([sourceIssueId]);
+    expect(rows.some((row) => childIds.includes(row.issueId))).toBe(false);
   });
 
   it("is idempotent: re-recording does not create duplicate rows", async () => {
@@ -421,6 +433,25 @@ describeEmbeddedPostgres("prDeliveryService", () => {
 
   it("recordCarrierFanOut does not write onto descendants that do not own the head ref", async () => {
     const service = prDeliveryService(db);
+    const result = await service.recordCarrierFanOut({
+      companyId,
+      sourceIssueId,
+      externalId: EXTERNAL_ID,
+      url: PR_URL,
+      title: `PR #${PR_NUMBER} ${REPOSITORY}`,
+      status: "ready_for_review",
+      reviewState: "none",
+      metadata: { prNumber: PR_NUMBER, repository: REPOSITORY, headRef: "carrier-branch" },
+    });
+
+    expect(result.writtenIssueIds).toEqual([]);
+    expect(await readRows()).toHaveLength(0);
+  });
+
+  it("recordCarrierFanOut excludes live descendants borrowing the carrier owner's branch", async () => {
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.companyId, companyId));
+    const service = prDeliveryService(db);
+
     const result = await service.recordCarrierFanOut({
       companyId,
       sourceIssueId,
