@@ -578,9 +578,9 @@ test("sidebar discovery, stars, recent agents, configuration links, and drafts s
   request,
 }) => {
   const f = await setup(request);
-  // The connectors card is fixed over the lower sidebar and is not part of
-  // this contract. In merge_group 42314340481 it was covering the star while
-  // `toBeFocused` stayed "inactive" after `focus()` returned.
+  // Removes the network-dependent announcement card so the sidebar does not
+  // depend on a live feed. The card was present in the failing local run; it
+  // is not shown to be the cause of the focus failure.
   await page.route("**/api/announcements/current", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: "null" }),
   );
@@ -609,7 +609,6 @@ test("sidebar discovery, stars, recent agents, configuration links, and drafts s
     // `toBeFocused` also requires `document.hasFocus()`, which is not the
     // reveal condition. The control fades in on `:focus-within`; focus it
     // and wait for that opacity transition.
-    await star.evaluate((el) => el.scrollIntoView({ block: "center", inline: "nearest" }));
     await expect.poll(async () => {
       await star.focus();
       return star.evaluate((el) => getComputedStyle(el).opacity);
