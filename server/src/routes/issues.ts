@@ -5502,6 +5502,10 @@ export function issueRoutes(
       runId,
       (issueId) => svc.listComments(issueId, { order: "desc", limit: 100 }),
       input.noRepositoryLandingCloser ?? null,
+      issue.deliveryRequirement === "record_only" &&
+        decisionCarried &&
+        guardResult.skipped &&
+        guardResult.skipReason === "record_only_delivery_skipped",
     );
     if (tierResult.skipped) {
       void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
