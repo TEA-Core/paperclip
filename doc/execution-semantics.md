@@ -170,6 +170,14 @@ The active-lock lifecycle is part of the checkout contract:
 
 Stale-lock recovery is crash recovery, not a retry loop. Paperclip must not clear or adopt locks held by non-terminal runs. After stale cleanup, a checkout `409` should mean a real live owner, status/assignee mismatch, unresolved blocker, or active gate still prevents checkout. Agents must treat that `409` as an ownership conflict and stop rather than retrying the same checkout.
 
+A non-final workflow handoff may change the assignee while its issuing run is
+still running. That run must survive its own handoff PATCH and keep the issue's
+execution lock until it stops. If the assignment update clears `executionRunId`,
+admission recovers the live lock by company and issue, not by the new assignee.
+The next stage's wake stays `deferred_issue_execution`; normal run finalization
+releases the issuer's lock and promotes the waiting successor. A handoff marker
+from an older server does not exempt a live run from this lock.
+
 ### Known execution waits at admission
 
 A known execution hold is a waiting condition, not a new execution attempt. Every issue wake must read the current effective reconciliation hold under the issue admission lock before creating a run. Resolved recovery bookkeeping can still carry a no-replay hold; only clearing the effective hold makes admission eligible again. The final dispatch gate remains required for changes after admission.

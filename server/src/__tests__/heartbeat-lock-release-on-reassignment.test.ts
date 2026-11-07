@@ -1,13 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import express from "express";
+import request from "supertest";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
-  agentRuntimeState,
   agentWakeupRequests,
   companies,
   createDb,
-  heartbeatRunEvents,
   heartbeatRuns,
   issues,
 } from "@paperclipai/db";
@@ -16,6 +16,9 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { errorHandler } from "../middleware/index.js";
+import { issueRoutes } from "../routes/issues.js";
+import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentTaskRun = vi.hoisted(() => vi.fn());
@@ -58,13 +61,9 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
 
   afterEach(async () => {
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(issues);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(companies);
+    // The route also creates comments, decisions and audit rows. Clear the
+    // disposable company graph together, including their run foreign keys.
+    await db.execute(sql`TRUNCATE TABLE companies CASCADE`);
     vi.clearAllMocks();
   });
 
@@ -156,6 +155,98 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
       wakeupRequestId,
     };
   }
+
+  it("defers the next stage behind its issuing run after the handoff PATCH and promotes it on stop", async () => {
+    const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId } =
+      await seedCrossAgentScenario({ holderStatus: "running" });
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        { type: "review", participants: [{ type: "agent", agentId: coderAgentId }] },
+        { type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] },
+      ],
+    })!;
+    await db.update(issues).set({
+      assigneeAgentId: coderAgentId,
+      deliveryRequirement: "record_only",
+      executionPolicy: { ...policy },
+      executionState: {
+        status: "pending",
+        currentStageId: policy.stages[0]!.id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: policy.stages[0]!.participants[0],
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+    // Hold the successor's only slot on another issue. Promotion can create a
+    // real queued run without launching a provider in this disposable database.
+    await db.update(agents).set({
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+    }).where(eq(agents.id, reviewerAgentId));
+    const [busyRun] = await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: reviewerAgentId,
+      status: "running",
+      contextSnapshot: { issueId: randomUUID() },
+      startedAt: new Date(),
+    }).returning();
+
+    const client = express();
+    client.use(express.json());
+    client.use((req, _res, next) => {
+      req.actor = { type: "agent", companyId, agentId: coderAgentId, runId: holderRunId };
+      next();
+    });
+    // This PATCH does not access attachment storage.
+    const unusedStorage = {} as Parameters<typeof issueRoutes>[1];
+    client.use("/api", issueRoutes(db, unusedStorage, {}));
+    client.use(errorHandler);
+    const response = await request(client).patch(`/api/issues/${issueId}`).send({
+      status: "done", comment: "Review passed; the next reviewer can continue after this run stops.",
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: reviewerAgentId,
+      executionState: { currentStageId: policy.stages[1]!.id },
+    });
+    expect((await heartbeat.getRun(holderRunId))?.status).toBe("running");
+    // The assignee change clears the direct lock. Admission must rediscover
+    // the outgoing issuer by issue, not by the new assignee.
+    await heartbeat.wakeup(reviewerAgentId, {
+      source: "automation",
+      reason: "issue_assigned",
+      payload: { issueId },
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      requestedByActorType: "agent",
+      requestedByActorId: coderAgentId,
+    });
+    const deferred = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, reviewerAgentId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    ));
+    expect(deferred).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: "deferred_issue_execution", runId: null }),
+    ]));
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].executionRunId).toBe(holderRunId);
+    expect((await heartbeat.getRun(holderRunId))?.status).toBe("running");
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(2);
+
+    await heartbeat.cancelRun(holderRunId, "Stage issuer finished", { suppressImmediateRecovery: true });
+    expect((await heartbeat.getRun(holderRunId))?.status).toBe("cancelled");
+    await vi.waitFor(async () => {
+      const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, deferred[0]!.id));
+      expect(receipt).toMatchObject({ status: "queued", reason: "issue_execution_promoted" });
+      const successor = await heartbeat.getRun(receipt.runId!);
+      expect(successor).toMatchObject({ agentId: reviewerAgentId, status: "queued", contextSnapshot: { issueId } });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue.executionRunId).toBe(successor!.id);
+    });
+    expect((await heartbeat.getRun(busyRun.id))?.status).toBe("running");
+  });
 
   it("defers a cross-agent wake while the holder is still running and leaves the holder alone", async () => {
     const { coderAgentId, reviewerAgentId, issueId, holderRunId, wakeupRequestId } =

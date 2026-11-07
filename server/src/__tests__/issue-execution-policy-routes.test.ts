@@ -4325,6 +4325,55 @@ describe("issue execution policy routes", () => {
       expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
     });
 
+    it("refuses terminal approval when cancellation does not confirm the run stopped", async () => {
+      const { stage1Id } = mockStageHandoff();
+      const issue = await mockIssueService.getById();
+      mockIssueService.getById.mockResolvedValue({
+        ...issue,
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [{
+            id: stage1Id,
+            type: "approval",
+            participants: [{ type: "agent", agentId: reviewerAgentId }],
+          }],
+        }),
+        executionState: {
+          ...issue.executionState,
+          currentStageType: "approval",
+          returnAssignee: { type: "agent", agentId: nextAgentId },
+        },
+      });
+      mockHeartbeatService.cancelRun.mockResolvedValue(runningRun);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId,
+      }))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "done",
+          assigneeAgentId: nextAgentId,
+          comment: "Final approval passed.",
+          doneTier: {
+            tier: "tier2",
+            probeEvidence: "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records",
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+        runId,
+        "Cancelled before issue reassignment",
+        expect.objectContaining({ errorCode: "issue_reassigned" }),
+      );
+      expect(res.body).toMatchObject({
+        details: { code: "runner_goal_reassignment_stop_unconfirmed", runId },
+      });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
     it("cancels the outgoing run when a workflow hand-off comes from a different run", async () => {
       mockStageHandoff();
       const res = await request(await createApp({
