@@ -7918,6 +7918,18 @@ describe("resolveCitedCommits (SUP-20525)", () => {
   const CONTROL_REF = "fold/tea-patches-v2026.722.0";
   const CONTROL_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${encodeURIComponent(CONTROL_REF)}`;
   const shaUrl = (sha: string) => `https://api.github.com/repos/TEA-Core/paperclip/commits/${sha}`;
+  const projectRepo = { hostname: "github.com", owner: "TEA-Core", repo: "paperclip" };
+  const unverifiableProject = (sha: string, reason: string) => ({
+    sha,
+    status: "unverifiable" as const,
+    reason,
+    probedRepos: [projectRepo],
+  });
+  const nonexistentProject = (sha: string) => ({
+    sha,
+    status: "nonexistent" as const,
+    probedRepos: [projectRepo],
+  });
 
   const okResponse = (body: unknown = { sha: "head" }) => new Response(JSON.stringify(body), { status: 200 });
   const noCommitFound422 = () =>
@@ -7927,7 +7939,7 @@ describe("resolveCitedCommits (SUP-20525)", () => {
     return ghFetchMock.mock.calls.map(([url]) => String(url));
   }
 
-  function crossRepoLinkedPr(shas: { mergeCommitSha?: string | null; headSha?: string | null }) {
+  function crossRepoLinkedPr(shas: { mergeCommitSha?: string | null; headSha?: string | null; baseRefName?: string | null }) {
     return {
       id: "pr-cross-repo",
       owner: "Other-Org",
@@ -7963,13 +7975,35 @@ describe("resolveCitedCommits (SUP-20525)", () => {
     expect(probeUrls()).toEqual([shaUrl("674fef15d2000000000000000000000000000000")]);
   });
 
-  it("marks a SHA nonexistent on GitHub's 422 No-commit-found, proven by a resolving control ref", async () => {
+  it("marks an explicitly repository-scoped SHA nonexistent on absence with a resolving control in that repository", async () => {
+    ghFetchMock.mockImplementation(async (url: string) =>
+      url === CONTROL_URL ? okResponse({ ref: CONTROL_REF }) : noCommitFound422(),
+    );
+    const resolution = await resolveCitedCommits(mockDb, issue, "merge commit TEA-Core/paperclip@afc6278bea3c0000000000000000000000000000");
+    expect(resolution).toEqual({
+      results: [{
+        sha: "afc6278bea3c0000000000000000000000000000",
+        status: "nonexistent",
+        probedRepos: [{ hostname: "github.com", owner: "TEA-Core", repo: "paperclip" }],
+      }],
+    });
+    expect(probeUrls()).toEqual([shaUrl("afc6278bea3c0000000000000000000000000000"), CONTROL_URL]);
+  });
+
+  it("leaves a bare SHA unverifiable when every candidate repository reports absence", async () => {
     ghFetchMock.mockImplementation(async (url: string) =>
       url === CONTROL_URL ? okResponse({ ref: CONTROL_REF }) : noCommitFound422(),
     );
     const resolution = await resolveCitedCommits(mockDb, issue, "merge commit afc6278bea3c0000000000000000000000000000");
-    expect(resolution).toEqual({ results: [{ sha: "afc6278bea3c0000000000000000000000000000", status: "nonexistent" }] });
-    expect(probeUrls()).toEqual([shaUrl("afc6278bea3c0000000000000000000000000000"), CONTROL_URL]);
+    expect(resolution).toEqual({
+      results: [{
+        sha: "afc6278bea3c0000000000000000000000000000",
+        status: "unverifiable",
+        reason: "ambiguous_repository_scope",
+        probedRepos: [{ hostname: "github.com", owner: "TEA-Core", repo: "paperclip" }],
+      }],
+    });
+    expect(probeUrls()).toEqual([shaUrl("afc6278bea3c0000000000000000000000000000")]);
   });
 
   it("resolves a cited merge SHA from a linked PR in another repository", async () => {
@@ -7982,7 +8016,10 @@ describe("resolveCitedCommits (SUP-20525)", () => {
     const resolution = await resolveCitedCommits(mockDb, issue, `Landed in \`${mergeSha}\`.`);
 
     expect(resolution).toEqual({ results: [{ sha: mergeSha, status: "resolved" }] });
-    expect(probeUrls()).toEqual([shaUrl(mergeSha)]);
+    expect(probeUrls()).toEqual([
+      shaUrl(mergeSha),
+      `https://api.github.com/repos/Other-Org/other-repo/commits/${mergeSha}`,
+    ]);
   });
 
   it("resolves a cited head SHA from a linked PR in another repository", async () => {
@@ -7995,7 +8032,89 @@ describe("resolveCitedCommits (SUP-20525)", () => {
     const resolution = await resolveCitedCommits(mockDb, issue, `Head commit ${headSha}.`);
 
     expect(resolution).toEqual({ results: [{ sha: headSha, status: "resolved" }] });
-    expect(probeUrls()).toEqual([shaUrl(headSha)]);
+    expect(probeUrls()).toEqual([
+      shaUrl(headSha),
+      `https://api.github.com/repos/Other-Org/other-repo/commits/${headSha}`,
+    ]);
+  });
+
+  it("probes a linked pull-request work-product repository after the project repository reports absence", async () => {
+    const mergeSha = "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19";
+    const otherRepoUrl = `https://api.github.com/repos/Other-Org/other-repo/commits/${mergeSha}`;
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([crossRepoLinkedPr({ baseRefName: "main" })]);
+    ghFetchMock.mockImplementation(async (url: string) =>
+      url === otherRepoUrl ? okResponse({ sha: mergeSha }) : noCommitFound422(),
+    );
+
+    const resolution = await resolveCitedCommits(mockDb, issue, `Landed in \`${mergeSha}\`.`);
+
+    expect(resolution).toEqual({ results: [{ sha: mergeSha, status: "resolved" }] });
+    expect(probeUrls()).toEqual([shaUrl(mergeSha), otherRepoUrl]);
+  });
+
+  it("probes the repository named by an explicit commit URL", async () => {
+    const citedSha = "674fef15d2000000000000000000000000000000";
+    const otherRepoUrl = `https://api.github.com/repos/Other-Org/other-repo/commits/${citedSha}`;
+    ghFetchMock.mockImplementation(async (url: string) =>
+      url === otherRepoUrl ? okResponse({ sha: citedSha }) : noCommitFound422(),
+    );
+
+    const resolution = await resolveCitedCommits(
+      mockDb,
+      issue,
+      `Landed in https://github.com/Other-Org/other-repo/commit/${citedSha}.`,
+    );
+
+    expect(resolution).toEqual({ results: [{ sha: citedSha, status: "resolved" }] });
+    expect(probeUrls()).toEqual([otherRepoUrl]);
+  });
+
+  it("requires a resolving positive control in every explicitly scoped candidate repository", async () => {
+    const missingSha = "afc6278bea3c0000000000000000000000000000";
+    const otherShaUrl = `https://api.github.com/repos/Other-Org/other-repo/commits/${missingSha}`;
+    const otherControlUrl = "https://api.github.com/repos/Other-Org/other-repo/commits/main";
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([crossRepoLinkedPr({ baseRefName: "main" })]);
+    ghFetchMock.mockImplementation(async (url: string) =>
+      url === CONTROL_URL || url === otherControlUrl ? okResponse() : noCommitFound422(),
+    );
+
+    const resolution = await resolveCitedCommits(
+      mockDb,
+      issue,
+      `Other-Org/other-repo@${missingSha}`,
+    );
+
+    expect(resolution).toEqual({
+      results: [{
+        sha: missingSha,
+        status: "nonexistent",
+        probedRepos: [
+          { hostname: "github.com", owner: "Other-Org", repo: "other-repo" },
+          projectRepo,
+        ],
+      }],
+    });
+    expect(probeUrls()).toEqual([otherShaUrl, shaUrl(missingSha), otherControlUrl, CONTROL_URL]);
+  });
+
+  it("probes the served build repository for a cited commit from that repository", async () => {
+    const citedSha = "674fef15d2000000000000000000000000000000";
+    const buildSha = "0ea666699d3f0a7ef86f98cb21a574e95be61d22";
+    const servedRepoUrl = `https://api.github.com/repos/Served-Org/control-plane/commits/${citedSha}`;
+    vi.stubEnv("PAPERCLIP_BUILD_COMMIT", buildSha);
+    vi.stubEnv("PAPERCLIP_BUILD_REPO_URL", "https://github.com/Served-Org/control-plane");
+    try {
+      ghFetchMock.mockImplementation(async (url: string) =>
+        url === servedRepoUrl ? okResponse({ sha: citedSha }) : noCommitFound422(),
+      );
+
+      const resolution = await resolveCitedCommits(mockDb, issue, `Control plane fix at \`${citedSha}\`.`);
+
+      expect(resolution).toEqual({ results: [{ sha: citedSha, status: "resolved" }] });
+      expect(probeUrls()).toEqual([shaUrl(citedSha), servedRepoUrl]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("does not classify a SHA nonexistent when linked PR lookup fails", async () => {
@@ -8007,7 +8126,9 @@ describe("resolveCitedCommits (SUP-20525)", () => {
 
     const resolution = await resolveCitedCommits(mockDb, issue, `Commit ${missingSha}.`);
 
-    expect(resolution).toEqual({ results: [{ sha: missingSha, status: "unverifiable" }] });
+    expect(resolution).toEqual({
+      results: [unverifiableProject(missingSha, "linked_pull_request_lookup_failed")],
+    });
     expect(probeUrls()).toEqual([shaUrl(missingSha)]);
   });
 
@@ -8015,24 +8136,36 @@ describe("resolveCitedCommits (SUP-20525)", () => {
     ghFetchMock.mockImplementation(async (url: string) =>
       url === CONTROL_URL ? okResponse({ ref: CONTROL_REF }) : new Response("Not Found", { status: 404 }),
     );
-    const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c0000000000000000000000000000` and `0d1e2f3a4b5c6d70000000000000000000000000`");
+    const resolution = await resolveCitedCommits(
+      mockDb,
+      issue,
+      "TEA-Core/paperclip@afc6278bea3c0000000000000000000000000000 and TEA-Core/paperclip@0d1e2f3a4b5c6d70000000000000000000000000",
+    );
     expect(resolution.results).toEqual([
-      { sha: "afc6278bea3c0000000000000000000000000000", status: "nonexistent" },
-      { sha: "0d1e2f3a4b5c6d70000000000000000000000000", status: "nonexistent" },
+      nonexistentProject("afc6278bea3c0000000000000000000000000000"),
+      nonexistentProject("0d1e2f3a4b5c6d70000000000000000000000000"),
     ]);
     expect(probeUrls().filter((url) => url === CONTROL_URL)).toHaveLength(1);
   });
 
   it("downgrades absence to unverifiable when the control ref does not resolve", async () => {
     ghFetchMock.mockResolvedValue(new Response("Not Found", { status: 404 }));
-    const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c0000000000000000000000000000`");
-    expect(resolution).toEqual({ results: [{ sha: "afc6278bea3c0000000000000000000000000000", status: "unverifiable" }] });
+    const resolution = await resolveCitedCommits(
+      mockDb,
+      issue,
+      "TEA-Core/paperclip@afc6278bea3c0000000000000000000000000000",
+    );
+    expect(resolution).toEqual({
+      results: [unverifiableProject("afc6278bea3c0000000000000000000000000000", "positive_control_unavailable")],
+    });
   });
 
   it("treats a 422 with a different message as unverifiable, not absence (no control probe)", async () => {
     ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ message: "Validation Failed" }), { status: 422 }));
     const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c0000000000000000000000000000`");
-    expect(resolution).toEqual({ results: [{ sha: "afc6278bea3c0000000000000000000000000000", status: "unverifiable" }] });
+    expect(resolution).toEqual({
+      results: [unverifiableProject("afc6278bea3c0000000000000000000000000000", "commit_probe_error")],
+    });
     expect(probeUrls()).toEqual([shaUrl("afc6278bea3c0000000000000000000000000000")]);
   });
 
@@ -8040,7 +8173,9 @@ describe("resolveCitedCommits (SUP-20525)", () => {
     for (const status of [401, 403, 500]) {
       ghFetchMock.mockResolvedValue(new Response("no", { status }));
       const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c0000000000000000000000000000`");
-      expect(resolution).toEqual({ results: [{ sha: "afc6278bea3c0000000000000000000000000000", status: "unverifiable" }] });
+      expect(resolution).toEqual({
+        results: [unverifiableProject("afc6278bea3c0000000000000000000000000000", "commit_probe_error")],
+      });
       ghFetchMock.mockReset();
     }
   });
@@ -8048,7 +8183,9 @@ describe("resolveCitedCommits (SUP-20525)", () => {
   it("fails open when ghFetch throws (network failure)", async () => {
     ghFetchMock.mockRejectedValue(new Error("network down"));
     const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c0000000000000000000000000000`");
-    expect(resolution).toEqual({ results: [{ sha: "afc6278bea3c0000000000000000000000000000", status: "unverifiable" }] });
+    expect(resolution).toEqual({
+      results: [unverifiableProject("afc6278bea3c0000000000000000000000000000", "commit_probe_error")],
+    });
   });
 
   it("marks every SHA unverifiable without probing when no GitHub credential resolves", async () => {
@@ -8056,8 +8193,18 @@ describe("resolveCitedCommits (SUP-20525)", () => {
     const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c0000000000000000000000000000` and `0d1e2f3a4b5c6d70000000000000000000000000`");
     expect(resolution).toEqual({
       results: [
-        { sha: "afc6278bea3c0000000000000000000000000000", status: "unverifiable" },
-        { sha: "0d1e2f3a4b5c6d70000000000000000000000000", status: "unverifiable" },
+        {
+          sha: "afc6278bea3c0000000000000000000000000000",
+          status: "unverifiable",
+          reason: "github_credential_unavailable",
+          probedRepos: [],
+        },
+        {
+          sha: "0d1e2f3a4b5c6d70000000000000000000000000",
+          status: "unverifiable",
+          reason: "github_credential_unavailable",
+          probedRepos: [],
+        },
       ],
     });
     expect(ghFetchMock).not.toHaveBeenCalled();
@@ -8066,7 +8213,14 @@ describe("resolveCitedCommits (SUP-20525)", () => {
   it("marks every SHA unverifiable when the issue resolves no delivery repository", async () => {
     setupDbMock({});
     const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c0000000000000000000000000000`");
-    expect(resolution).toEqual({ results: [{ sha: "afc6278bea3c0000000000000000000000000000", status: "unverifiable" }] });
+    expect(resolution).toEqual({
+      results: [{
+        sha: "afc6278bea3c0000000000000000000000000000",
+        status: "unverifiable",
+        reason: "repository_scope_unavailable",
+        probedRepos: [],
+      }],
+    });
     expect(ghFetchMock).not.toHaveBeenCalled();
   });
 
@@ -8081,7 +8235,14 @@ describe("resolveCitedCommits (SUP-20525)", () => {
     });
     const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c0000000000000000000000000000`");
     expect(urls[0]).toBe("https://git.example.com/api/v3/repos/acme/widget/commits/afc6278bea3c0000000000000000000000000000");
-    expect(resolution).toEqual({ results: [{ sha: "afc6278bea3c0000000000000000000000000000", status: "unverifiable" }] });
+    expect(resolution).toEqual({
+      results: [{
+        sha: "afc6278bea3c0000000000000000000000000000",
+        status: "unverifiable",
+        reason: "ambiguous_repository_scope",
+        probedRepos: [{ hostname: "git.example.com", owner: "acme", repo: "widget" }],
+      }],
+    });
   });
 
   it("reports a mixed comment truthfully (resolved alongside nonexistent)", async () => {
@@ -8093,11 +8254,11 @@ describe("resolveCitedCommits (SUP-20525)", () => {
     const resolution = await resolveCitedCommits(
       mockDb,
       issue,
-      "Landed in `674fef15d2000000000000000000000000000000`; fix commit afc6278bea3c0000000000000000000000000000 followed.",
+      "Landed in `674fef15d2000000000000000000000000000000`; fix commit TEA-Core/paperclip@afc6278bea3c0000000000000000000000000000 followed.",
     );
     expect(resolution.results).toEqual([
       { sha: "674fef15d2000000000000000000000000000000", status: "resolved" },
-      { sha: "afc6278bea3c0000000000000000000000000000", status: "nonexistent" },
+      nonexistentProject("afc6278bea3c0000000000000000000000000000"),
     ]);
   });
 

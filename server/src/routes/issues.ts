@@ -5607,12 +5607,11 @@ export function issueRoutes(
       });
     }
     // SUP-20525 (SUP-18110 ask 1): resolve the close comment's cited commit
-    // SHAs against the delivery repository. Only a SHA GitHub explicitly
-    // reports not found — confirmed by a positive default-branch control
-    // probe — refuses the close (422); the refusal audit row is the
-    // cited-sha resolution row written above the branch. Unverifiable SHAs
-    // are audited and allowed, and the resolver itself never blocks: a throw
-    // fails open so this stays a liar-detector, not a new close gate.
+    // SHAs against their explicit and candidate repositories. Only an
+    // explicitly scoped SHA reported absent everywhere, with a resolving
+    // positive control in each candidate repository, refuses the close (422).
+    // Unverifiable SHAs are audited and allowed, and the resolver itself never
+    // blocks: a throw fails open so this stays a liar-detector, not a new close gate.
     try {
       const citedShaResolution = await resolveCitedCommits(db, issue, commentBody);
       if (citedShaResolution.results.length > 0) {
@@ -5628,9 +5627,9 @@ export function issueRoutes(
         const shaList = nonexistentShas.join(", ");
         const refusalError =
           nonexistentShas.length === 1
-            ? `Close comment cites commit SHA ${shaList}, which GitHub reports as not found in the delivery repository (the default-branch control probe resolved, so the repository and credential are live).`
-            : `Close comment cites commit SHAs ${shaList}, which GitHub reports as not found in the delivery repository (the default-branch control probe resolved, so the repository and credential are live).`;
-        const remedy = `Cite a commit that exists in the delivery repository (or drop the citation) and close again. Only provably nonexistent ${nonexistentShas.length === 1 ? "SHA" : "SHAs"} ${shaList} block this close; SHAs that could not be verified were allowed.`;
+            ? `Close comment cites commit SHA ${shaList}, which GitHub reports as not found in every candidate repository (a repository-scoped positive control resolved for each candidate).`
+            : `Close comment cites commit SHAs ${shaList}, which GitHub reports as not found in every candidate repository (repository-scoped positive controls resolved for each candidate).`;
+        const remedy = `Cite a commit that exists in a candidate repository (or drop the citation) and close again. Only provably nonexistent ${nonexistentShas.length === 1 ? "SHA" : "SHAs"} ${shaList} block this close; SHAs that could not be verified were allowed.`;
         if (persistRefusalComment) {
           await postTerminalStatusRefusalComment(svc, issue.id, {
             httpStatus: 422,
