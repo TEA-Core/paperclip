@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, ne } from "drizzle-orm";
 import {
   activityLog,
   companies,
   createDb,
+  executionWorkspaces,
   issueWorkProducts,
   issues,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -95,8 +97,10 @@ describeEmbeddedPostgres("prDeliveryService", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let companyId!: string;
+  let projectId!: string;
   let sourceIssueId!: string;
   let childIds!: string[];
+  let sharedExecutionWorkspaceId!: string;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-pr-delivery-");
@@ -108,12 +112,19 @@ describeEmbeddedPostgres("prDeliveryService", () => {
       issuePrefix: "SUP",
       requireBoardApprovalForNewAgents: false,
     });
+    projectId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: REPOSITORY,
+      status: "in_progress",
+    });
 
-    // Four-child single-carrier shape: one source issue with four descendants.
     sourceIssueId = randomUUID();
     await db.insert(issues).values({
       id: sourceIssueId,
       companyId,
+      projectId,
       title: "Carrier source",
       status: "done",
     });
@@ -122,14 +133,47 @@ describeEmbeddedPostgres("prDeliveryService", () => {
       await db.insert(issues).values({
         id: childId,
         companyId,
+        projectId,
         title: "Carrier child",
         status: "done",
         parentId: sourceIssueId,
       });
     }
+    const [sharedWorkspace] = await db
+      .insert(executionWorkspaces)
+      .values({
+        id: randomUUID(),
+        companyId,
+        projectId,
+        mode: "shared_workspace",
+        strategyType: "git_worktree",
+        name: "carrier-workspace",
+        status: "active",
+        branchName: "carrier-branch",
+        repoUrl: `https://github.com/${REPOSITORY}`,
+        sourceIssueId,
+      })
+      .returning();
+    sharedExecutionWorkspaceId = sharedWorkspace!.id;
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId: sharedExecutionWorkspaceId })
+      .where(eq(issues.companyId, companyId));
   }, 20_000);
 
   afterEach(async () => {
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId: sharedExecutionWorkspaceId })
+      .where(eq(issues.companyId, companyId));
+    await db
+      .delete(executionWorkspaces)
+      .where(
+        and(
+          eq(executionWorkspaces.companyId, companyId),
+          ne(executionWorkspaces.id, sharedExecutionWorkspaceId),
+        ),
+      );
     await db.delete(issueWorkProducts);
     await db.delete(activityLog);
   });
@@ -167,11 +211,33 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     return db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
   }
 
-  it("fans a ready_for_review row out to every issue in the carrier tree at PR-open", async () => {
+  async function assignOwnedWorkspace(issueId: string) {
+    const [workspace] = await db
+      .insert(executionWorkspaces)
+      .values({
+        id: randomUUID(),
+        companyId,
+        projectId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "child-workspace",
+        status: "active",
+        branchName: "carrier-branch",
+        repoUrl: `https://github.com/${REPOSITORY}`,
+        sourceIssueId: issueId,
+      })
+      .returning();
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId: workspace!.id })
+      .where(eq(issues.id, issueId));
+  }
+
+  it("records a ready_for_review row only on the issue owning the PR branch at PR-open", async () => {
     const service = prDeliveryService(db);
     const result = await service.recordAtOpen(input());
 
-    expect(result.writtenIssueIds.sort()).toEqual([sourceIssueId, ...childIds].sort());
+    expect(result.writtenIssueIds).toEqual([sourceIssueId]);
     expect(result.status).toBe("ready_for_review");
     expect(result.metadata).toMatchObject({
       prNumber: PR_NUMBER,
@@ -182,7 +248,9 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     });
 
     const rows = await readRows();
-    expect(rows).toHaveLength(5);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.issueId).toBe(sourceIssueId);
+    expect(rows.some((row) => childIds.includes(row.issueId))).toBe(false);
     for (const row of rows) {
       expect(row.status).toBe("ready_for_review");
       expect(row.provider).toBe("github");
@@ -199,8 +267,8 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     await service.recordAtOpen(input());
 
     const rows = await readRows();
-    expect(rows).toHaveLength(5);
-    expect(new Set(rows.map((row) => row.issueId)).size).toBe(5);
+    expect(rows).toHaveLength(1);
+    expect(new Set(rows.map((row) => row.issueId)).size).toBe(1);
   });
 
   it("refresh stamps every row merged with mergedAt + mergeCommitSha sourced from GitHub", async () => {
@@ -221,7 +289,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     expect(refreshed.mergeCommitSha).toBe("3fc37fe91c6190ab695a651224ad057db0a38aba");
 
     const rows = await readRows();
-    expect(rows).toHaveLength(5);
+    expect(rows).toHaveLength(1);
     for (const row of rows) {
       expect(row.status).toBe("merged");
       const metadata = row.metadata as Record<string, unknown>;
@@ -249,7 +317,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     await service.refreshMergeState(input());
 
     const rows = await readRows();
-    expect(rows).toHaveLength(5);
+    expect(rows).toHaveLength(1);
     for (const row of rows) {
       expect(row.status).toBe("merged");
       const metadata = row.metadata as Record<string, unknown>;
@@ -273,7 +341,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     await service.refreshMergeState(input());
 
     const rows = await readRows();
-    expect(rows).toHaveLength(5);
+    expect(rows).toHaveLength(1);
     for (const row of rows) {
       expect(row.status).toBe("merged");
       const metadata = row.metadata as Record<string, unknown>;
@@ -326,7 +394,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     expect(refreshed.mergedAt).toBeNull();
 
     const rows = await readRows();
-    expect(rows).toHaveLength(5);
+    expect(rows).toHaveLength(1);
     for (const row of rows) {
       expect(row.status).toBe("ready_for_review");
       expect((row.metadata as Record<string, unknown>).mergedAt).toBeUndefined();
@@ -351,7 +419,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     expect(await readRows()).toHaveLength(0);
   });
 
-  it("recordCarrierFanOut mirrors the source row onto every descendant, never the source", async () => {
+  it("recordCarrierFanOut does not write onto descendants that do not own the head ref", async () => {
     const service = prDeliveryService(db);
     const result = await service.recordCarrierFanOut({
       companyId,
@@ -361,23 +429,65 @@ describeEmbeddedPostgres("prDeliveryService", () => {
       title: `PR #${PR_NUMBER} ${REPOSITORY}`,
       status: "ready_for_review",
       reviewState: "none",
-      metadata: { prNumber: PR_NUMBER, repository: REPOSITORY },
+      metadata: { prNumber: PR_NUMBER, repository: REPOSITORY, headRef: "carrier-branch" },
     });
 
-    // Four children, not the source, written.
-    expect(result.writtenIssueIds.sort()).toEqual(childIds.sort());
-    const rows = await readRows();
-    expect(rows).toHaveLength(4);
-    for (const row of rows) {
-      expect(row.issueId).not.toBe(sourceIssueId);
-      expect(row.externalId).toBe(EXTERNAL_ID);
-      expect(row.status).toBe("ready_for_review");
-      expect(row.isPrimary).toBe(false);
-      expect(row.url).toBe(PR_URL);
-    }
+    expect(result.writtenIssueIds).toEqual([]);
+    expect(await readRows()).toHaveLength(0);
   });
 
-  it("recordCarrierFanOut is idempotent: re-fanning does not duplicate descendant rows", async () => {
+  it("does not write either fan-out path when the legitimate branch differs from the head ref", async () => {
+    const ownerIssueId = childIds[0]!;
+    await assignOwnedWorkspace(ownerIssueId);
+    const service = prDeliveryService(db);
+
+    const atOpen = await service.recordAtOpen({ ...input(), headRef: "different-branch" });
+    expect(atOpen.writtenIssueIds).toEqual([]);
+
+    const fanOut = await service.recordCarrierFanOut({
+      companyId,
+      sourceIssueId,
+      externalId: EXTERNAL_ID,
+      url: PR_URL,
+      title: `PR #${PR_NUMBER} ${REPOSITORY}`,
+      status: "ready_for_review",
+      reviewState: "none",
+      metadata: { prNumber: PR_NUMBER, repository: REPOSITORY, headRef: "different-branch" },
+    });
+    expect(fanOut.writtenIssueIds).toEqual([]);
+    expect(await readRows()).toHaveLength(0);
+  });
+
+  it("recordCarrierFanOut writes only a descendant that owns the recorded head ref", async () => {
+    const ownerIssueId = childIds[0]!;
+    await assignOwnedWorkspace(ownerIssueId);
+
+    const service = prDeliveryService(db);
+    const result = await service.recordCarrierFanOut({
+      companyId,
+      sourceIssueId,
+      externalId: EXTERNAL_ID,
+      url: PR_URL,
+      title: `PR #${PR_NUMBER} ${REPOSITORY}`,
+      status: "ready_for_review",
+      reviewState: "none",
+      metadata: { prNumber: PR_NUMBER, repository: REPOSITORY, headRef: "carrier-branch" },
+    });
+
+    expect(result.writtenIssueIds).toEqual([ownerIssueId]);
+    const rows = await readRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.issueId).toBe(ownerIssueId);
+    expect(rows[0]!.externalId).toBe(EXTERNAL_ID);
+    expect(rows[0]!.status).toBe("ready_for_review");
+    expect(rows[0]!.isPrimary).toBe(false);
+    expect(rows[0]!.url).toBe(PR_URL);
+  });
+
+  it("recordCarrierFanOut is idempotent on the owning descendant", async () => {
+    const ownerIssueId = childIds[0]!;
+    await assignOwnedWorkspace(ownerIssueId);
+
     const service = prDeliveryService(db);
     const fanIn = {
       companyId,
@@ -387,14 +497,14 @@ describeEmbeddedPostgres("prDeliveryService", () => {
       title: `PR #${PR_NUMBER} ${REPOSITORY}`,
       status: "ready_for_review",
       reviewState: "none",
-      metadata: { prNumber: PR_NUMBER, repository: REPOSITORY },
+      metadata: { prNumber: PR_NUMBER, repository: REPOSITORY, headRef: "carrier-branch" },
     };
     await service.recordCarrierFanOut(fanIn);
     await service.recordCarrierFanOut(fanIn);
 
     const rows = await readRows();
-    expect(rows).toHaveLength(4);
-    expect(new Set(rows.map((row) => row.issueId)).size).toBe(4);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.issueId).toBe(ownerIssueId);
   });
 
   it("sweepMergeState flips every delivery row to merged with mergedAt + mergeCommitSha", async () => {
@@ -411,11 +521,11 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     expect((await readRows()).every((row) => row.status === "ready_for_review")).toBe(true);
 
     const swept = await service.sweepMergeState();
-    expect(swept.checked).toBe(5);
-    expect(swept.flipped).toBe(5);
+    expect(swept.checked).toBe(1);
+    expect(swept.flipped).toBe(1);
 
     const rows = await readRows();
-    expect(rows).toHaveLength(5);
+    expect(rows).toHaveLength(1);
     for (const row of rows) {
       expect(row.status).toBe("merged");
       const metadata = row.metadata as Record<string, unknown>;
@@ -440,10 +550,10 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     });
     await service.recordAtOpen(input());
     const swept = await service.sweepMergeState();
-    expect(swept.flipped).toBe(5);
+    expect(swept.flipped).toBe(1);
 
     const rows = await readRows();
-    expect(rows).toHaveLength(5);
+    expect(rows).toHaveLength(1);
     for (const row of rows) {
       expect(row.status).toBe("merged");
       const metadata = row.metadata as Record<string, unknown>;
@@ -467,7 +577,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     expect(swept.flipped).toBe(0);
 
     const rows = await readRows();
-    expect(rows).toHaveLength(5);
+    expect(rows).toHaveLength(1);
     for (const row of rows) {
       expect(row.status).toBe("ready_for_review");
       expect((row.metadata as Record<string, unknown>).mergeStateCheckedAt).toBeTruthy();
@@ -484,14 +594,15 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     const service = prDeliveryService(db, { resolvePullRequestDetails: resolve });
     await service.recordAtOpen(input());
 
-    expect((await service.sweepMergeState()).checked).toBe(5);
+    expect((await service.sweepMergeState()).checked).toBe(1);
     // Within the 5-minute cooldown window the same rows are skipped; the live
     // resolver is not called again.
     expect((await service.sweepMergeState()).checked).toBe(0);
-    expect(resolve).toHaveBeenCalledTimes(5);
+    expect(resolve).toHaveBeenCalledTimes(1);
   });
 
   it("recordAtOpen + recordCarrierFanOut never downgrade a merged row on re-delivery", async () => {
+    await assignOwnedWorkspace(childIds[0]!);
     const service = prDeliveryService(db, {
       resolvePullRequestDetails: vi.fn(async () => ({
         state: "merged" as const,
@@ -505,7 +616,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     await service.refreshMergeState(input());
 
     // Simulate a re-delivery: the live route re-records the open row on the
-    // source and the fan-out re-mirrors it onto the descendants.
+    // source and the fan-out re-mirrors it onto the owning descendant.
     await service.recordAtOpen(input());
     await service.recordCarrierFanOut({
       companyId,
@@ -515,11 +626,11 @@ describeEmbeddedPostgres("prDeliveryService", () => {
       title: `PR #${PR_NUMBER} ${REPOSITORY}`,
       status: "ready_for_review",
       reviewState: "none",
-      metadata: { prNumber: PR_NUMBER, repository: REPOSITORY },
+      metadata: { prNumber: PR_NUMBER, repository: REPOSITORY, headRef: "carrier-branch" },
     });
 
     const rows = await readRows();
-    expect(rows).toHaveLength(5);
+    expect(rows).toHaveLength(2);
     for (const row of rows) {
       // A recorded merge must stay merged; the merge marker is not clobbered
       // by the open-time reset (the false-`unknown` this card prevents).
@@ -547,17 +658,18 @@ describeEmbeddedPostgres("prDeliveryService", () => {
         };
       }),
     });
+    await assignOwnedWorkspace(childIds[0]!);
     await service.recordAtOpen(input());
 
     const swept = await service.sweepMergeState();
-    // One row's resolution threw and was caught; the remaining four still
+    // One row's resolution threw and was caught; the remaining row still
     // flipped — the failure did not abort the sweep and strand later rows.
-    expect(swept.checked).toBe(5);
-    expect(swept.flipped).toBe(4);
+    expect(swept.checked).toBe(2);
+    expect(swept.flipped).toBe(1);
 
     const rows = await readRows();
-    expect(rows).toHaveLength(5);
-    expect(rows.filter((row) => row.status === "merged")).toHaveLength(4);
+    expect(rows).toHaveLength(2);
+    expect(rows.filter((row) => row.status === "merged")).toHaveLength(1);
     expect(rows.filter((row) => row.status === "ready_for_review")).toHaveLength(1);
     // pr-delivery-sweep-catch-no-cooldown-stamp: the row whose resolver threw
     // must still carry the cooldown marker, so it cools down instead of being
@@ -591,21 +703,21 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     expect(tree.sort()).toEqual([sourceIssueId, ...childIds].sort());
 
     await service.recordAtOpen(input());
-    // Exactly the five in-company issues carry the row; the outsider got none.
+    // Only the branch owner carries the row; the outsider got none.
     const all = await db
       .select()
       .from(issueWorkProducts)
       .where(eq(issueWorkProducts.externalId, EXTERNAL_ID));
-    expect(all).toHaveLength(5);
+    expect(all).toHaveLength(1);
     expect(all.every((row) => row.companyId === companyId)).toBe(true);
   });
 
-  it("logs a created activity entry on every carrier issue at PR-open", async () => {
+  it("logs a created activity entry only for the branch owner at PR-open", async () => {
     const service = prDeliveryService(db);
     await service.recordAtOpen(input());
 
     const activity = await readActivity();
-    expect(activity).toHaveLength(5);
+    expect(activity).toHaveLength(1);
     for (const entry of activity) {
       expect(entry.action).toBe("issue.work_product_created");
       expect(entry.entityType).toBe("issue");
@@ -616,10 +728,12 @@ describeEmbeddedPostgres("prDeliveryService", () => {
       expect(details.status).toBe("ready_for_review");
       expect(details.workProductId).toBeTruthy();
     }
-    expect(activity.map((entry) => entry.entityId).sort()).toEqual([sourceIssueId, ...childIds].sort());
+    expect(activity.map((entry) => entry.entityId)).toEqual([sourceIssueId]);
   });
 
-  it("logs a created activity entry on every descendant for the carrier fan-out", async () => {
+  it("logs a created activity entry only for the owning descendant in the carrier fan-out", async () => {
+    const ownerIssueId = childIds[0]!;
+    await assignOwnedWorkspace(ownerIssueId);
     const service = prDeliveryService(db);
     await service.recordCarrierFanOut({
       companyId,
@@ -629,19 +743,18 @@ describeEmbeddedPostgres("prDeliveryService", () => {
       title: `PR #${PR_NUMBER} ${REPOSITORY}`,
       status: "ready_for_review",
       reviewState: "none",
-      metadata: { prNumber: PR_NUMBER, repository: REPOSITORY },
+      metadata: { prNumber: PR_NUMBER, repository: REPOSITORY, headRef: "carrier-branch" },
     });
 
     const activity = await readActivity();
-    expect(activity).toHaveLength(4);
+    expect(activity).toHaveLength(1);
     for (const entry of activity) {
       expect(entry.action).toBe("issue.work_product_created");
-      expect(entry.entityId).not.toBe(sourceIssueId);
+      expect(entry.entityId).toBe(ownerIssueId);
       const details = entry.details as Record<string, unknown>;
       expect(details.externalId).toBe(EXTERNAL_ID);
       expect(details.carrierFanOut).toBe(true);
     }
-    expect(activity.map((entry) => entry.entityId).sort()).toEqual(childIds.sort());
   });
 
   it("logs an updated activity entry when refresh flips every row to merged", async () => {
@@ -659,7 +772,7 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     await service.refreshMergeState(input());
 
     const activity = await readActivity();
-    expect(activity).toHaveLength(5);
+    expect(activity).toHaveLength(1);
     for (const entry of activity) {
       expect(entry.action).toBe("issue.work_product_updated");
       const details = entry.details as Record<string, unknown>;
@@ -698,9 +811,9 @@ describeEmbeddedPostgres("prDeliveryService", () => {
     await db.delete(activityLog);
     const swept = await service.sweepMergeState();
 
-    expect(swept.flipped).toBe(5);
+    expect(swept.flipped).toBe(1);
     const activity = await readActivity();
-    expect(activity).toHaveLength(5);
+    expect(activity).toHaveLength(1);
     for (const entry of activity) {
       expect(entry.action).toBe("issue.work_product_updated");
       expect(entry.actorType).toBe("system");

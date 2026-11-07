@@ -8,6 +8,7 @@ import {
 } from "./github-pull-request-merge.js";
 import { logActivity, logActivityInTransaction } from "./activity-log.js";
 import type { LogActivityInput } from "./activity-log.js";
+import { resolveCardDeliveryBranchOwnership } from "./merge-arming.js";
 
 /**
  * Produce-side of the delivery-path PR work product (SUP-14645).
@@ -18,10 +19,8 @@ import type { LogActivityInput } from "./activity-log.js";
  *
  * - `recordAtOpen` writes one `pull_request` work product (status
  *   `ready_for_review`, metadata carrying prNumber/repository/headRef/baseRef/
- *   headSha) on EVERY issue whose work rides the shared carrier branch — the
- *   carrier source issue plus its descendant tree. The row on the carrier's
- *   `sourceIssueId` is load-bearing for the delivery-state predicate; the
- *   sibling rows satisfy the "one row per issue" fan-out requirement.
+ *   headSha) only on carrier-tree issues whose legitimate execution-workspace
+ *   branch equals the recorded head ref.
  * - `refreshMergeState` re-resolves the live GitHub PR and, once merged, flips
  *   each of those rows to `status: merged` and stamps `metadata.mergedAt` and
  *   `metadata.mergeCommitSha` sourced from GitHub. That pair is what the
@@ -68,10 +67,9 @@ export type PrRefreshResult = {
 
 /**
  * Live delivery-path fan-out (SUP-14645). When the delivery path records a
- * carrier PR on the source issue, the same row is written on every descendant
- * in the carrier tree so each issue owns its own `pull_request` work product.
- * The source row is written by the delivery path itself (createForIssue); this
- * mirrors it onto the descendants only.
+ * carrier PR on the source issue, the row is mirrored only onto descendants
+ * whose legitimate execution-workspace branch equals the recorded head ref.
+ * The source row is written by the delivery path itself (createForIssue).
  */
 export type PrCarrierFanOutInput = {
   companyId: string;
@@ -262,8 +260,21 @@ export function prDeliveryService(
     return rows[0] ?? null;
   }
 
+  async function listBranchOwnerIssueIds(companyId: string, issueIds: string[], headRef: string) {
+    const owners = await Promise.all(
+      issueIds.map(async (issueId) => {
+        const ownership = await resolveCardDeliveryBranchOwnership(db, companyId, issueId);
+        return ownership.legitimate && ownership.branch === headRef ? issueId : null;
+      }),
+    );
+    return owners.filter((issueId): issueId is string => issueId !== null);
+  }
+
   async function recordAtOpen(input: PrDeliveryInput): Promise<PrRecordResult> {
-    const issueIds = await listCarrierIssueIds(input.companyId, input.sourceIssueId);
+    const carrierIssueIds = await listCarrierIssueIds(input.companyId, input.sourceIssueId);
+    const issueIds = input.headRef
+      ? await listBranchOwnerIssueIds(input.companyId, carrierIssueIds, input.headRef)
+      : [];
     const metadata = openMetadata(input);
     const externalId = externalIdFor(input);
     const writtenIssueIds: string[] = [];
@@ -392,8 +403,9 @@ export function prDeliveryService(
 
   /**
    * Live delivery-path carrier fan-out. Mirrors the source issue's delivery
-   * `pull_request` row onto every descendant in the carrier tree (the source
-   * row is written by the delivery path via createForIssue, not here).
+   * `pull_request` row only onto descendants whose legitimate execution-workspace
+   * branch equals the recorded head ref (the source row is written by the
+   * delivery path via createForIssue, not here).
    *
    * Each descendant row is secondary (isPrimary false) so recording a carrier
    * delivery does not demote a descendant's existing primary of the same type.
@@ -402,8 +414,15 @@ export function prDeliveryService(
    */
   async function recordCarrierFanOut(input: PrCarrierFanOutInput): Promise<PrCarrierFanOutResult> {
     const tree = await listCarrierIssueIds(input.companyId, input.sourceIssueId);
-    const descendants = tree.filter((issueId) => issueId !== input.sourceIssueId);
     const metadata = input.metadata ?? {};
+    const headRef = typeof metadata.headRef === "string" ? metadata.headRef : null;
+    const descendants = headRef
+      ? await listBranchOwnerIssueIds(
+          input.companyId,
+          tree.filter((issueId) => issueId !== input.sourceIssueId),
+          headRef,
+        )
+      : [];
     const title = input.title ?? `PR ${input.externalId}`;
     const writtenIssueIds: string[] = [];
 
