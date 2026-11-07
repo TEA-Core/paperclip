@@ -31,9 +31,9 @@ const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
   triggerIssueMonitor: vi.fn(async () => ({ outcome: "triggered" as const })),
   reportRunActivity: vi.fn(async () => undefined),
-  getRun: vi.fn(async () => null),
-  getActiveRunForAgent: vi.fn(async () => null),
-  cancelRun: vi.fn(async () => null),
+  getRun: vi.fn(async () => null as unknown),
+  getActiveRunForAgent: vi.fn(async () => null as unknown),
+  cancelRun: vi.fn(async () => null as unknown),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -392,13 +392,6 @@ describe("issue execution policy routes", () => {
       innerJoin: () => dbChainNode([]),
     }));
     mockDbSelectWhere.mockImplementation(() => dbChainNode(HANDOFF_AGENT_ROWS));
-    mockDb.transaction.mockImplementation(async (callback: (tx: Record<string, unknown>) => Promise<unknown>) =>
-      callback({
-        select: mockDbSelect,
-        insert: () => mockTxWriteChain([{}]),
-        update: () => mockTxWriteChain([]),
-        delete: () => mockTxWriteChain([]),
-      }));
     mockIssueService.createChild.mockResolvedValue({
       issue: {
         id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
@@ -4158,7 +4151,7 @@ describe("issue execution policy routes", () => {
       }));
 
       const insertedRows: Record<string, unknown>[] = [];
-      mockDb.transaction.mockImplementation(async (callback: (tx: Record<string, unknown>) => Promise<unknown>) =>
+      mockDb.transaction.mockImplementation(async (callback: (tx: any) => Promise<unknown>) =>
         callback({
           select: mockDbSelect,
           insert: () => ({
