@@ -619,15 +619,26 @@ A `blocked` issue is stalled when the unresolved blocker leaf has no active run,
 Paperclip now treats crash/restart recovery as a stranded-assigned-work problem, not just a stranded-run problem.
 
 The HTTP listener binds before startup recovery so surviving runners can
-reconnect. A per-card failure of any error class inside the startup recovery
-sweeps listed below — including an assignee-review refusal — is logged with the
-issue identifier, the sweep name, and the error class and message, and the card
-is skipped for that sweep. Writes made earlier in the same iteration (recovery
-action, comment, wake) may already have persisted. The sweep continues with the
-remaining cards so startup can finish and the listener stays open. A lost
-database connection (`CONNECTION_CLOSED`, `CONNECTION_ENDED`,
-`CONNECTION_DESTROYED`, anywhere on the error `cause` chain) is not a per-card
-failure and is rethrown.
+reconnect. Inside the wrapped startup sweeps below, a per-card failure of any
+error class except a lost database connection is logged and that card is
+skipped. That includes assignee-review refusals and non-connection database
+failures (constraint, check, deadlock). A lost database connection
+(`CONNECTION_CLOSED`, `CONNECTION_ENDED`, `CONNECTION_DESTROYED`, anywhere on
+the error `cause` chain) is rethrown so startup fails visibly. The log carries
+the issue identifier, the sweep name, and the error class and message. Writes
+made earlier in the same iteration (recovery action, comment, wake) may
+already have persisted. The sweep continues with the remaining cards so
+startup can finish and the listener stays open.
+
+The Wiki handoff guard runs on any issue write that is not purely status and
+blocker bookkeeping. `assigneeUserId` is guarded, the same as
+`assigneeAgentId`. The guard is skipped only when every present key is in this
+allow-list: `status`, `blockedByIssueIds`, `statusVersion`,
+`lastStatusDecisionId`, `unblockDescriptor`, `companyGuard`,
+`monitorNextCheckAt`, `monitorWakeRequestedAt`, `monitorNotes`,
+`monitorScheduledBy`. A status-only or blocker-only park still passes. Any
+other key, including `priority`, `labelIds`, `hiddenAt`, `parentId`,
+`billingCode`, and `requestDepth`, runs the guard.
 
 The boundary is the write path. Per-card isolation is required for every
 startup sweep that writes issue rows through the guarded issue service
@@ -635,9 +646,9 @@ startup sweep that writes issue rows through the guarded issue service
 and review gates can refuse that write. Steps that only write run, wake or
 session rows, or that clear raw lock columns (`executionRunId`,
 `executionAgentNameKey`, `executionLockedAt`, `checkoutRunId`) with direct
-drizzle updates inside a per-run loop, stay fail-fast on purpose: the only
-failures they can hit are database-level (constraint, connection), and a
-database failure must stop startup visibly.
+drizzle updates inside a per-run loop, stay fail-fast on purpose: those loops
+are not the guarded issue-service path. A failure there, including a database
+failure, still stops startup.
 
 Each card is processed inside the shared `runRecoverySweepIssue` helper in these
 startup sweeps:
@@ -679,7 +690,7 @@ fails startup:
   action, and inserts a watchdog decision row. For an open evaluation issue it
   also calls `issuesSvc.update(id, { status: "done" })` and adds a comment. That
   patch carries only `status`, so neither the Wiki handoff guard (it runs only
-  on assignee, title, description or execution policy/state writes) nor the
+  on assignee agent, assignee user, title, description or execution policy/state writes) nor the
   assignee review-stage gate (it runs only when the patch has `assigneeAgentId`)
   is reached. It is not wrapped, and it runs inside the fold's open transaction.
 - `promoteDueScheduledRetries`, per due retry run: promotes the run to `queued`
