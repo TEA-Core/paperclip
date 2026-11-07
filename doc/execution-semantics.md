@@ -155,8 +155,10 @@ still running. That run must survive its own handoff PATCH and keep the issue's
 execution lock until it stops. If the assignment update clears `executionRunId`,
 admission recovers the live lock by company and issue, not by the new assignee.
 The next stage's wake stays `deferred_issue_execution`; normal run finalization
-releases the issuer's lock and promotes the waiting successor. A handoff marker
-from an older server does not exempt a live run from this lock.
+releases the issuer's lock and promotes the waiting successor. Only an issuer
+whose run context names this issue gets that exemption. An unscoped issuer, or
+one scoped to a different issue, cannot be rediscovered by admission, so the
+handoff is saved and then that run is cancelled as for any other reassignment.
 
 ### Known execution waits at admission
 
