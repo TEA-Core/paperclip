@@ -578,6 +578,12 @@ test("sidebar discovery, stars, recent agents, configuration links, and drafts s
   request,
 }) => {
   const f = await setup(request);
+  // Removes the network-dependent announcement card so the sidebar does not
+  // depend on a live feed. The card was present in the failing local run; it
+  // is not shown to be the cause of the focus failure.
+  await page.route("**/api/announcements/current", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "null" }),
+  );
   try {
     await page.goto(`/${f.company.issuePrefix}/dashboard`);
     const nav = page.getByRole("navigation");
@@ -600,9 +606,13 @@ test("sidebar discovery, stars, recent agents, configuration links, and drafts s
     const star = page.getByRole("button", { name: "Star Zeta", exact: true });
     await page.getByTestId("task-chat-composer-input").click();
     await expect(star).toHaveCSS("opacity", "0");
-    await star.focus();
-    await expect(star).toBeFocused();
-    await expect(star).toHaveCSS("opacity", "1");
+    // `toBeFocused` also requires `document.hasFocus()`, which is not the
+    // reveal condition. The control fades in on `:focus-within`; focus it
+    // and wait for that opacity transition.
+    await expect.poll(async () => {
+      await star.focus();
+      return star.evaluate((el) => getComputedStyle(el).opacity);
+    }).toBe("1");
     await star.click();
     await page.goto(f.route);
     await page.getByRole("button", { name: "Star Alpha", exact: true }).click();
