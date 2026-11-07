@@ -20,8 +20,9 @@ import {
   companies,
   documents,
   heartbeatRuns,
-  runIdentityContexts,
   issueComments,
+  issueExecutionDecisions,
+  runIdentityContexts,
   issueDocuments,
   issueQuestionResponseDeliveries,
   issueThreadInteractions,
@@ -97,6 +98,16 @@ import {
   USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS,
 } from "./issue-interaction-kinds.js";
 import { logActivityInTransaction, publishActivity, type ActivityPublication } from "./activity-log.js";
+import { resolveGatedPrincipal } from "./approval-status-reconciler.js";
+import {
+  countLadderedChildren,
+  evaluateDoneTransitionGuardForBackstopClose,
+} from "./done-transition-guard.js";
+import {
+  resolveCardDeliveryBranchOwnership,
+  resolveIssueRepoContext,
+  resolveLinkedPullRequestsWithState,
+} from "./merge-arming.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import {
   assertIssueReviewVerdictActorAllowed,
@@ -1934,6 +1945,226 @@ async function expireStaleRequestConfirmationTarget(
   return expired;
 }
 
+/**
+ * SUP-21908 (redo, SUP-22297): the authoritative snapshot of every DB-backed
+ * input the shared done-transition guard consumed when
+ * `acceptRequestConfirmation` preflighted a native completion close. The
+ * issue row alone (status/statusVersion/updatedAt) is NOT a revision for the
+ * guard's other inputs — linked delivery/PR mention rows, execution-decision
+ * rows, the comment window, laddered-child rows, and the workspace context
+ * can all mutate without touching the issue row. The acceptance transaction
+ * re-captures this snapshot after taking the issue lock and refuses the close
+ * on any drift, so a stale preflight verdict can no longer be committed.
+ *
+ * Deliberately excluded: GitHub live state (branch ahead-of-base, merged-PR
+ * lookups, hydration) and credential resolution — those are external to every
+ * database transaction and cannot be validated by the acceptance transaction
+ * itself; drift there is indistinguishable from ordinary external state
+ * change. Everything the guard reads from Postgres is captured.
+ *
+ * SUP-22307 (`stale-native-guard-agent-name`): the ADR-072 ladder-shape check
+ * resolves stage participants, the gated principal, and recorded decision
+ * actors through the mutable `agents` table (`normalizeAgentUrlKey(name)`), so
+ * an agent rename can invalidate the preflight verdict without moving any
+ * decision-row identifier or the issue row. The referenced agent identity rows
+ * are captured here and compared under the same lock.
+ */
+type NativeCompletionGuardInputSnapshot = {
+  issue: {
+    status: string;
+    statusVersion: number;
+    updatedAtMs: number;
+    identifier: string | null;
+    parentId: string | null;
+    createdByAgentId: string | null;
+    projectId: string | null;
+    projectWorkspaceId: string | null;
+    executionWorkspaceId: string | null;
+    deliveryRequirement: string | null;
+    executionPolicy: string | null;
+    executionState: string | null;
+  };
+  decisions: Array<{
+    id: string;
+    stageId: string;
+    outcome: string;
+    actorAgentId: string | null;
+    createdAtMs: number;
+  }>;
+  comments: Array<{ id: string; updatedAtMs: number }>;
+  linkedPullRequests: Array<Record<string, unknown>>;
+  ladderedChildren: {
+    count: number;
+    identifiers: string[];
+    excludedChildIdentifiers: string[];
+  };
+  repoContext: Record<string, unknown> | null;
+  deliveryBranchOwnership: Record<string, unknown>;
+  referencedAgents: Array<{ id: string; name: string }>;
+};
+
+async function captureNativeCompletionGuardInputs(
+  db: Db,
+  issue: typeof issues.$inferSelect,
+): Promise<NativeCompletionGuardInputSnapshot> {
+  const [
+    decisionRows,
+    commentRows,
+    linkedPullRequests,
+    ladderedChildren,
+    repoContext,
+    deliveryBranchOwnership,
+  ] = await Promise.all([
+    db
+      .select({
+        id: issueExecutionDecisions.id,
+        stageId: issueExecutionDecisions.stageId,
+        outcome: issueExecutionDecisions.outcome,
+        actorAgentId: issueExecutionDecisions.actorAgentId,
+        createdAt: issueExecutionDecisions.createdAt,
+      })
+      .from(issueExecutionDecisions)
+      .where(
+        and(
+          eq(issueExecutionDecisions.companyId, issue.companyId),
+          eq(issueExecutionDecisions.issueId, issue.id),
+        ),
+      )
+      .then((rows) =>
+        rows
+          .map((row) => ({
+            id: row.id,
+            stageId: row.stageId,
+            outcome: row.outcome,
+            actorAgentId: row.actorAgentId,
+            createdAtMs: row.createdAt.getTime(),
+          }))
+          .sort((a, b) => (a.id < b.id ? -1 : 1)),
+      ),
+    // The same latest-100 window the guard's `listComments` callback reads.
+    db
+      .select({
+        id: issueComments.id,
+        updatedAt: issueComments.updatedAt,
+      })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issue.id))
+      .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+      .limit(100)
+      .then((rows) =>
+        rows.map((row) => ({ id: row.id, updatedAtMs: row.updatedAt.getTime() })),
+      ),
+    // The guard's own cached linked-PR reader, so the snapshot can never drift
+    // from what `resolveLinkedPullRequestsWithState` feeds the guard.
+    resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, {
+      includeDrafts: true,
+    }).then((prs) =>
+      prs
+        .map((pr) => ({ ...pr }))
+        .sort((a, b) =>
+          a.displayName === b.displayName
+            ? a.id < b.id
+              ? -1
+              : 1
+            : a.displayName < b.displayName
+              ? -1
+              : 1,
+        ),
+    ),
+    countLadderedChildren(db, issue.companyId, issue.id).then((census) => ({
+      count: census.count,
+      identifiers: [...census.identifiers].sort(),
+      excludedChildIdentifiers: [...census.excludedChildIdentifiers].sort(),
+    })),
+    resolveIssueRepoContext(db, issue),
+    resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id),
+  ]);
+
+  // SUP-22307 (`stale-native-guard-agent-name`): the ADR-072 ladder-shape check
+  // resolves stage participants, the gated principal, and recorded decision
+  // actors through the mutable `agents` table (`normalizeAgentUrlKey(name)`),
+  // so an agent rename can invalidate the preflight verdict without moving any
+  // identifier captured above. Collect every agent id the guard can reach for
+  // this issue — policy stage participants, the guard's own gated-principal
+  // reader, and the decision actors (a deliberate superset of the check's
+  // latest-per-stage view; the underlying rows are already compared, so the
+  // superset can only surface as one safe retry, never a missed drift) — and
+  // snapshot the identity rows themselves. Missing rows stay absent, matching
+  // the guard's `Map.get` → undefined miss behavior.
+  const referencedAgentIds = new Set<string>();
+  const policyObject =
+    issue.executionPolicy != null && typeof issue.executionPolicy === "object"
+      ? (issue.executionPolicy as Record<string, unknown>)
+      : {};
+  const policyStages = Array.isArray(policyObject.stages) ? policyObject.stages : [];
+  for (const stage of policyStages) {
+    if (stage == null || typeof stage !== "object") continue;
+    const participants = (stage as { participants?: unknown }).participants;
+    if (!Array.isArray(participants)) continue;
+    for (const participant of participants) {
+      if (participant == null || typeof participant !== "object") continue;
+      if ((participant as { type?: unknown }).type !== "agent") continue;
+      const agentId = (participant as { agentId?: unknown }).agentId;
+      if (typeof agentId === "string") referencedAgentIds.add(agentId);
+    }
+  }
+  const stateObject =
+    issue.executionState != null && typeof issue.executionState === "object"
+      ? (issue.executionState as Record<string, unknown>)
+      : {};
+  for (const agentId of resolveGatedPrincipal(
+    policyObject,
+    stateObject,
+    issue.createdByAgentId,
+  ).agentIds) {
+    referencedAgentIds.add(agentId);
+  }
+  for (const decision of decisionRows) {
+    if (decision.actorAgentId) referencedAgentIds.add(decision.actorAgentId);
+  }
+  const referencedAgents =
+    referencedAgentIds.size > 0
+      ? (
+          await db
+            .select({ id: agents.id, name: agents.name })
+            .from(agents)
+            .where(
+              and(
+                inArray(agents.id, [...referencedAgentIds]),
+                eq(agents.companyId, issue.companyId),
+              ),
+            )
+            .for("share")
+        )
+          .map((row) => ({ id: row.id, name: row.name }))
+          .sort((a, b) => (a.id < b.id ? -1 : 1))
+      : [];
+
+  return {
+    issue: {
+      status: issue.status,
+      statusVersion: issue.statusVersion,
+      updatedAtMs: issue.updatedAt.getTime(),
+      identifier: issue.identifier,
+      parentId: issue.parentId,
+      createdByAgentId: issue.createdByAgentId,
+      projectId: issue.projectId,
+      projectWorkspaceId: issue.projectWorkspaceId,
+      executionWorkspaceId: issue.executionWorkspaceId,
+      deliveryRequirement: issue.deliveryRequirement,
+      executionPolicy: JSON.stringify(issue.executionPolicy ?? null),
+      executionState: JSON.stringify(issue.executionState ?? null),
+    },
+    decisions: decisionRows,
+    comments: commentRows,
+    linkedPullRequests,
+    ladderedChildren,
+    repoContext: repoContext === null ? null : { ...repoContext },
+    deliveryBranchOwnership: { ...deliveryBranchOwnership },
+    referencedAgents,
+  };
+}
+
 export function issueThreadInteractionService(
   db: Db,
   opts: IssueThreadInteractionServiceOptions = {},
@@ -2112,6 +2343,48 @@ export function issueThreadInteractionService(
         result: expired.result,
       });
 
+    let nativeCompletionCloseComment: string | null = null;
+    let nativeCompletionGuardInputs: NativeCompletionGuardInputSnapshot | null =
+      null;
+    if (isNativeCompletionReview(args.current)) {
+      const [guardIssue] = await db
+        .select()
+        .from(issues)
+        .where(
+          and(
+            eq(issues.id, args.issue.id),
+            eq(issues.companyId, args.issue.companyId),
+          ),
+        )
+        .limit(1);
+      if (!guardIssue) throw notFound("Issue not found");
+      const guardVerdict = await evaluateDoneTransitionGuardForBackstopClose({
+        db,
+        issue: guardIssue,
+        actorId: args.actor.agentId ?? args.actor.userId ?? "native-completion-review",
+        closeComment: null,
+        structuredDoneTier: args.input.doneTier ?? null,
+        listComments: (issueId) =>
+          issueService(db).listComments(issueId, { order: "desc", limit: 100 }),
+      });
+      if (!guardVerdict.allowed || guardVerdict.doneTierSkipAudit) {
+        throw unprocessable(
+          guardVerdict.allowed
+            ? "A native completion review requires a done-tier declaration"
+            : guardVerdict.reason,
+          {
+            code: guardVerdict.allowed
+              ? "done_transition_missing_tier_declaration"
+              : guardVerdict.code,
+          },
+        );
+      }
+      nativeCompletionCloseComment = guardVerdict.closeComment;
+      nativeCompletionGuardInputs = await captureNativeCompletionGuardInputs(
+        db,
+        guardIssue,
+      );
+    }
     const now = new Date();
     const postCommitActivityPublications: ActivityPublication[] = [];
     const result = await db.transaction(async (tx) => {
@@ -2122,22 +2395,11 @@ export function issueThreadInteractionService(
       // before expiring linked proposals, so keep issue -> proposal ->
       // interaction as the shared lifecycle order.
       const issueContext = await tx
-        .select({
-          id: issues.id,
-          companyId: issues.companyId,
-          status: issues.status,
-          workMode: issues.workMode,
-          assigneeAgentId: issues.assigneeAgentId,
-          assigneeUserId: issues.assigneeUserId,
-          reviewPolicy: issues.reviewPolicy,
-          createdByAgentId: issues.createdByAgentId,
-          createdByUserId: issues.createdByUserId,
-          executionState: issues.executionState,
-        })
+        .select()
         .from(issues)
         .where(eq(issues.id, args.issue.id))
         .for("update")
-        .then((rows: IssueResolutionContext[]) => rows[0] ?? null);
+        .then((rows) => rows[0] ?? null);
 
       if (!issueContext || issueContext.companyId !== args.issue.companyId) {
         throw notFound("Issue not found");
@@ -2171,6 +2433,27 @@ export function issueThreadInteractionService(
         lockedCurrent,
         args.actor,
       );
+
+      if (isNativeCompletionReview(lockedCurrent)) {
+        // SUP-21908 redo (SUP-22297): the preflight verdict is only
+        // authoritative for the exact DB state it was computed from. Re-read
+        // every DB-backed guard input under the issue lock and refuse the
+        // close if ANY of them drifted — an issue-row revision alone does not
+        // cover linked delivery/PR rows, decision rows, comments, laddered
+        // children, or the workspace context.
+        const lockedGuardInputs = await captureNativeCompletionGuardInputs(
+          tx as unknown as Db,
+          issueContext,
+        );
+        if (
+          nativeCompletionGuardInputs === null ||
+          !isDeepStrictEqual(lockedGuardInputs, nativeCompletionGuardInputs)
+        ) {
+          throw conflict(
+            "Issue changed while the native completion review was being checked; retry the acceptance",
+          );
+        }
+      }
 
       const interaction = hydrateInteraction(lockedCurrent);
       const selectedOptionIds =
@@ -2245,16 +2528,31 @@ export function issueThreadInteractionService(
           )).limit(1);
         // Each explicit reviewer must be able to answer independently. Completing
         // on the first answer would cancel the other pending decisions.
-        const completedIssue = otherPending.length > 0 || issueContext.status !== "in_review" ? null : await issueService(db).update(
-          args.issue.id,
-          {
-            status: "done",
-            actorAgentId: args.actor.agentId ?? null,
-            actorUserId: args.actor.userId ?? null,
-          },
-          tx,
-          postCommitActivityPublications,
-        );
+        const completedIssue = otherPending.length > 0 || issueContext.status !== "in_review" ? null : await (async () => {
+          if (nativeCompletionCloseComment) {
+            await issueService(db).addComment(
+              args.issue.id,
+              nativeCompletionCloseComment,
+              {
+                agentId: args.actor.agentId ?? undefined,
+                userId: args.actor.userId ?? undefined,
+                runId: args.actor.runId ?? null,
+              },
+              {},
+              tx,
+            );
+          }
+          return issueService(db).update(
+            args.issue.id,
+            {
+              status: "done",
+              actorAgentId: args.actor.agentId ?? null,
+              actorUserId: args.actor.userId ?? null,
+            },
+            tx,
+            postCommitActivityPublications,
+          );
+        })();
         if (completedIssue) {
           continuationIssue = {
             id: completedIssue.id,

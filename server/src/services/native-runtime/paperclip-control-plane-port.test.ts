@@ -1063,7 +1063,12 @@ describe("PaperclipControlPlanePort conformance", () => {
     await issueThreadInteractionService(db).acceptInteraction(
       { id: issueId, companyId: identity.companyId, projectId: null, goalId: null, status: "in_review" },
       reviewInteraction!.id,
-      {},
+      {
+        doneTier: {
+          tier: "tier2",
+          probeEvidence: "native review interaction verified by the reviewer",
+        },
+      },
       { userId: "reviewer-24" },
     );
     await expect(db.select().from(issues).where(eq(issues.id, issueId))).resolves.toEqual([
@@ -1074,7 +1079,14 @@ describe("PaperclipControlPlanePort conformance", () => {
     const secondReview = remaining.find((entry) => entry.status === "pending")!;
     await issueThreadInteractionService(db).acceptInteraction(
       { id: issueId, companyId: identity.companyId, projectId: null, goalId: null, status: "in_review" },
-      secondReview.id, {}, { userId: "reviewer-24" },
+      secondReview.id,
+      {
+        doneTier: {
+          tier: "tier2",
+          probeEvidence: "native review completion verified by the reviewer",
+        },
+      },
+      { userId: "reviewer-24" },
     );
     await expect(db.select().from(issues).where(eq(issues.id, issueId))).resolves.toEqual([
       expect.objectContaining({ status: "done" }),
@@ -1101,7 +1113,14 @@ describe("PaperclipControlPlanePort conformance", () => {
     await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, issueId));
     await issueThreadInteractionService(db).acceptInteraction(
       { id: issueId, companyId: identity.companyId, projectId: null, goalId: null, status: "in_review" },
-      reviews[1]!.id, {}, { userId: "reviewer-24" },
+      reviews[1]!.id,
+      {
+        doneTier: {
+          tier: "tier2",
+          probeEvidence: "native review round verified by the reviewer",
+        },
+      },
+      { userId: "reviewer-24" },
     );
     expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("in_review");
 

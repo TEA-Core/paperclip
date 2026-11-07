@@ -9,6 +9,8 @@ import {
   documentRevisions,
   documents,
   executionWorkspaces,
+  externalObjectMentions,
+  externalObjects,
   goals,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -5238,5 +5240,387 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       assigneeAgentId: creatorAgentId,
       assigneeUserId: null,
     });
+  });
+
+  async function seedNativeCompletionReview(title = "Native completion") {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const reviewerAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title,
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Reviewer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title,
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: reviewerAgentId,
+      deliveryRequirement: "record_only",
+    });
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "none",
+      payload: {
+        version: 1,
+        prompt: "Approve completion?",
+        acceptLabel: "Approve completion",
+        rejectLabel: "Continue work",
+        allowDeclineReason: true,
+        target: {
+          type: "custom",
+          key: "native_completion_review",
+          revisionId: randomUUID(),
+          label: "Completion decision",
+        },
+      },
+    }, {
+      agentId: reviewerAgentId,
+    });
+    return { companyId, goalId, issueId, reviewerAgentId, interactionId: created.id };
+  }
+
+  it("refuses a native completion accept that has no done-tier declaration", async () => {
+    const { companyId, goalId, issueId, reviewerAgentId, interactionId } =
+      await seedNativeCompletionReview();
+
+    await expect(interactionsSvc.acceptInteraction({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, interactionId, {}, {
+      userId: "local-board",
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "done_transition_missing_tier_declaration" },
+    });
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [interaction] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
+    expect(issue?.status).toBe("in_review");
+    expect(interaction?.status).toBe("pending");
+  });
+
+  it("persists structured done-tier evidence when a native completion accept closes the card", async () => {
+    const { companyId, goalId, issueId, reviewerAgentId, interactionId } =
+      await seedNativeCompletionReview();
+
+    const accepted = await interactionsSvc.acceptInteraction({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, interactionId, {
+      doneTier: {
+        tier: "tier2",
+        probeEvidence: "record-only native completion verified by the reviewer",
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    expect(accepted.continuationIssue?.status).toBe("done");
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((comment) =>
+      comment.body.includes("Closed at Tier 2 (live): record-only native completion verified by the reviewer"),
+    )).toBe(true);
+  });
+
+  it("rejects native completion when the issue changes after the guard preflight", async () => {
+    const { companyId, goalId, issueId, interactionId } =
+      await seedNativeCompletionReview();
+
+    await expect(interactionsSvc.acceptInteraction(
+      { id: issueId, companyId, goalId, projectId: null },
+      interactionId,
+      {
+        doneTier: {
+          tier: "tier2",
+          probeEvidence: "record-only native completion verified by the reviewer",
+        },
+      },
+      { userId: "local-board" },
+      {
+        beforeResolveInTransaction: async () => {
+          await db
+            .update(issues)
+            .set({ status: "in_progress", updatedAt: new Date() })
+            .where(eq(issues.id, issueId));
+        },
+      },
+    )).rejects.toMatchObject({ status: 409 });
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [interaction] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interactionId));
+    expect(issue?.status).toBe("in_progress");
+    expect(interaction?.status).toBe("pending");
+  });
+
+  it("rejects native completion when executionPolicy changes after the guard preflight", async () => {
+    const { companyId, goalId, issueId, interactionId } =
+      await seedNativeCompletionReview();
+
+    await expect(interactionsSvc.acceptInteraction(
+      { id: issueId, companyId, goalId, projectId: null },
+      interactionId,
+      {
+        doneTier: {
+          tier: "tier2",
+          probeEvidence: "record-only native completion verified by the reviewer",
+        },
+      },
+      { userId: "local-board" },
+      {
+        beforeResolveInTransaction: async () => {
+          await db
+            .update(issues)
+            .set({
+              executionPolicy: { mode: "normal", stages: [] },
+              updatedAt: new Date(),
+            })
+            .where(eq(issues.id, issueId));
+        },
+      },
+    )).rejects.toMatchObject({ status: 409 });
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [interaction] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interactionId));
+    expect(issue?.status).toBe("in_review");
+    expect(interaction?.status).toBe("pending");
+  });
+
+  it("rejects native completion when linked delivery state changes after the guard preflight", async () => {
+    const { companyId, goalId, issueId, interactionId } =
+      await seedNativeCompletionReview("Native completion delivery");
+
+    // repository_delivery runs the guard's linked-PR zone; the seeded card has
+    // no execution workspace, so the preflight guard still allows the close
+    // via its no-repo-context fallback.
+    await db
+      .update(issues)
+      .set({ deliveryRequirement: "repository_delivery" })
+      .where(eq(issues.id, issueId));
+
+    await expect(interactionsSvc.acceptInteraction(
+      { id: issueId, companyId, goalId, projectId: null },
+      interactionId,
+      {
+        doneTier: {
+          tier: "tier2",
+          probeEvidence: "repository delivery native completion verified by the reviewer",
+        },
+      },
+      { userId: "local-board" },
+      {
+        beforeResolveInTransaction: async () => {
+          // Pause-after-preflight mutation of a guard-relevant non-issue-row
+          // input: an open linked PR mention appears for the card. The issue
+          // row's status, statusVersion, and updatedAt are untouched, so the
+          // previous updatedAt-only staleness check could not see this — the
+          // guard's verdict is now stale (it would refuse on the open PR).
+          const [externalObject] = await db
+            .insert(externalObjects)
+            .values({
+              companyId,
+              providerKey: "github",
+              objectType: "pull_request",
+              externalId: "octo-org/repo#pull/55",
+              data: { state: "open", draft: false, title: "Deliver the card" },
+            })
+            .returning();
+          await db.insert(externalObjectMentions).values({
+            companyId,
+            sourceIssueId: issueId,
+            sourceKind: "description",
+            objectId: externalObject.id,
+            objectType: "pull_request",
+            providerKey: "github",
+          });
+        },
+      },
+    )).rejects.toMatchObject({ status: 409 });
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [interaction] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interactionId));
+    expect(issue?.status).toBe("in_review");
+    expect(interaction?.status).toBe("pending");
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(
+      comments.some((comment) => comment.body.includes("Closed at Tier")),
+    ).toBe(false);
+  });
+
+  it("rejects native completion when a guard-referenced agent identity changes after the guard preflight", async () => {
+    // SUP-22307 (`stale-native-guard-agent-name`): the ADR-072 close-ladder
+    // shape check resolves stage participants through the mutable `agents`
+    // table, so a rename can invalidate the preflight verdict without moving
+    // the issue row, any decision row, or the child census. Seed a laddered
+    // parent whose close ladder is genuinely satisfied by three named stage
+    // participants plus two laddered children, so the guard's ladder-shape
+    // zone actually consumes the agent identity rows.
+    const { companyId, goalId, issueId, interactionId } =
+      await seedNativeCompletionReview("Native completion agent identity");
+
+    const ladderAgents = [
+      { id: randomUUID(), name: "support-QAE" },
+      { id: randomUUID(), name: "coder-LE" },
+      { id: randomUUID(), name: "exec-CTO" },
+    ];
+    for (const ladderAgent of ladderAgents) {
+      await db.insert(agents).values({
+        id: ladderAgent.id,
+        companyId,
+        name: ladderAgent.name,
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+    }
+    const stageIds = [randomUUID(), randomUUID(), randomUUID()];
+    const completedExecutionState = (completedStageIds: string[]) => ({
+      status: "completed" as const,
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      deliveryAuthor: null,
+      reviewRequest: null,
+      completedStageIds,
+      skippedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      changesRequestedCount: 0,
+    });
+    await db
+      .update(issues)
+      .set({
+        executionPolicy: {
+          mode: "normal",
+          stages: [
+            {
+              id: stageIds[0],
+              type: "review",
+              participants: [{ type: "agent", agentId: ladderAgents[0].id }],
+            },
+            {
+              id: stageIds[1],
+              type: "review",
+              participants: [{ type: "agent", agentId: ladderAgents[1].id }],
+            },
+            {
+              id: stageIds[2],
+              type: "approval",
+              participants: [{ type: "agent", agentId: ladderAgents[2].id }],
+            },
+          ],
+        },
+        executionState: completedExecutionState(stageIds),
+      })
+      .where(eq(issues.id, issueId));
+    // Two decomposition children with a rung each arm the guard's
+    // `countLadderedChildren >= 2` ladder-shape zone (ADR-072 mechanism D).
+    for (const childIndex of [1, 2]) {
+      const childStageId = randomUUID();
+      await db.insert(issues).values({
+        id: randomUUID(),
+        companyId,
+        goalId,
+        title: `Native completion child ${childIndex}`,
+        status: "done",
+        priority: "medium",
+        parentId: issueId,
+        executionPolicy: {
+          mode: "normal",
+          stages: [{ id: childStageId, type: "review" }],
+        },
+        executionState: completedExecutionState([childStageId]),
+      });
+    }
+
+    await expect(interactionsSvc.acceptInteraction(
+      { id: issueId, companyId, goalId, projectId: null },
+      interactionId,
+      {
+        doneTier: {
+          tier: "tier2",
+          probeEvidence: "record-only native completion verified by the reviewer",
+        },
+      },
+      { userId: "local-board" },
+      {
+        beforeResolveInTransaction: async () => {
+          // Pause-after-preflight mutation of a guard-relevant input that no
+          // previously captured row records: rename the first ladder rung's
+          // agent. The issue row (status, statusVersion, updatedAt), the
+          // decision rows, comments, linked delivery state, and the child
+          // census are all untouched, so the pre-snapshot compared equal and
+          // committed a verdict that is now stale (the renamed rung no longer
+          // matches the required `review:support-QAE` agent key).
+          await db
+            .update(agents)
+            .set({ name: "renamed-away-from-support-qae" })
+            .where(eq(agents.id, ladderAgents[0].id));
+        },
+      },
+    )).rejects.toMatchObject({ status: 409 });
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [interaction] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interactionId));
+    expect(issue?.status).toBe("in_review");
+    expect(interaction?.status).toBe("pending");
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(
+      comments.some((comment) => comment.body.includes("Closed at Tier")),
+    ).toBe(false);
   });
 });
