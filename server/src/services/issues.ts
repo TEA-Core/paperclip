@@ -12160,11 +12160,14 @@ export function issueService(db: Db) {
         //   dispatch-suppression park, todo-stranded park, escalateDispositionRepair
         // blockedByIssueIds: blockIssueWithUnresolvedBlockers,
         //   resolveContinuationWaitingOnReview, reconcileActiveRecoveryActions
+        // lastStatusDecisionId: dismissObsoleteNativePolicyReviews (with status and
+        //   unblockDescriptor)
         // unblockDescriptor: repairNativeBlockedWait
         // companyGuard: blockIssueWithUnresolvedBlockers company scope
         const wikiHandoffUnguardedWriteKeys = new Set([
           "status",
           "blockedByIssueIds",
+          "lastStatusDecisionId",
           "unblockDescriptor",
           "companyGuard",
         ]);
