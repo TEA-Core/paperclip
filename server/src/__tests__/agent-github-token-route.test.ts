@@ -31,6 +31,7 @@ const { privateKey: FIXTURE_PRIVATE_KEY_PEM } = generateKeyPairSync("rsa", { mod
 const FIXTURE_PRIVATE_KEY = FIXTURE_PRIVATE_KEY_PEM.export({ type: "pkcs1", format: "pem" }) as string;
 const FIXTURE_TOKEN = "ghs_test_installation_token_for_agent_route_tests_only";
 const FIXTURE_INSTALLATION_ID = "12345678";
+const WRITER_AUDITOR_AGENT_ID = "d051c75c-b20f-4efb-87cf-76f73e349a29";
 
 type IssueRow = { projectId: string | null };
 type WorkspaceRow = { projectId: string; repoUrl: string | null };
@@ -179,6 +180,45 @@ describe("POST /api/agents/me/github/installation-tokens", () => {
     expect(res.body.error).toBe(
       "Project workspace for owner/repo is registered, but belongs to a project the agent holds no assigned issue in",
     );
+    expect(resolveToken).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: "omits permissions", body: { owner: "owner", repo: "repo" } },
+    {
+      name: "requests contents write",
+      body: { owner: "owner", repo: "repo", permissions: { contents: "write" } },
+    },
+  ])("mints contents-read for writer-Auditor on a registered but unassigned repo when it $name", async ({ body }) => {
+    const { deps, resolveToken } = fakeDeps();
+    const app = createApp(agentActor({ agentId: WRITER_AUDITOR_AGENT_ID }), deps, {
+      issues: [{ projectId: "project-x" }],
+      workspaces: [{ projectId: "project-y", repoUrl: "https://github.com/owner/repo" }],
+    });
+    const res = await request(app).post("/api/agents/me/github/installation-tokens").send(body);
+    expect(res.status).toBe(200);
+    expect(resolveToken).toHaveBeenCalledWith(
+      "company-1",
+      expect.anything(),
+      "owner",
+      "repo",
+      undefined,
+      DEFAULT_GITHUB_APP,
+      { contents: "read", metadata: "read" },
+    );
+  });
+
+  it("reports an unregistered repo for writer-Auditor without minting even with no assigned issues", async () => {
+    const { deps, resolveToken } = fakeDeps();
+    const app = createApp(agentActor({ agentId: WRITER_AUDITOR_AGENT_ID }), deps, {
+      issues: [],
+      workspaces: [],
+    });
+    const res = await request(app)
+      .post("/api/agents/me/github/installation-tokens")
+      .send({ owner: "owner", repo: "repo" });
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("No project workspace is registered for owner/repo in this company");
     expect(resolveToken).not.toHaveBeenCalled();
   });
 
