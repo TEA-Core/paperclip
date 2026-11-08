@@ -32129,6 +32129,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   inArray(heartbeatRuns.status, [
                     ...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES,
                   ]),
+                  sql`${heartbeatRuns.contextSnapshot} ->> 'issueExecutionHandoffAt' is null`,
                   sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
                 ),
               )
