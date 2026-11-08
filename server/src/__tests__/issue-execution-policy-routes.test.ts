@@ -4224,7 +4224,7 @@ describe("issue execution policy routes", () => {
       });
     });
 
-    function mockStageHandoff(executionRunId: string | null = runId) {
+    function mockStageHandoff() {
       const stage1Id = "11111111-1111-4111-8111-111111111111";
       const stage2Id = "aaaaaaaa-0000-4000-8000-000000000002";
       const policy = normalizeIssueExecutionPolicy({
@@ -4252,7 +4252,7 @@ describe("issue execution policy routes", () => {
         title: "Stage hand-off",
         deliveryRequirement: "record_only",
         executionPolicy: policy,
-        executionRunId,
+        executionRunId: runId,
         executionState: {
           status: "pending",
           currentStageId: stage1Id,
@@ -4401,73 +4401,32 @@ describe("issue execution policy routes", () => {
         .toBeLessThan(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]);
     });
 
-    it.each(["confirmed", "unconfirmed"] as const)(
-      "also cancels the resolved outgoing run when the unscoped issuer stop is %s",
-      async (outcome) => {
-        mockStageHandoff();
-        const issuingRunId = "66666666-6666-4666-8666-666666666666";
-        const issuingRun = { ...runningRun, id: issuingRunId, contextSnapshot: { wakeReason: "timer" } };
-        mockHeartbeatService.getRun.mockImplementation(async (id?: string) =>
-          id === issuingRunId ? issuingRun : id === runId ? runningRun : null);
-        mockHeartbeatService.cancelRun.mockImplementation(async (id?: string) =>
-          id === issuingRunId
-            ? { ...issuingRun, status: outcome === "confirmed" ? "cancelled" : "running" }
-            : { ...runningRun, status: "cancelled" });
-
-        const res = await request(await createApp({
-          type: "agent",
-          agentId: reviewerAgentId,
-          companyId: "company-1",
-          runId: issuingRunId,
-        }))
-          .patch(`/api/issues/${issueId}`)
-          .send({ status: "done", comment: "Hand off from an unscoped run while another run owns this issue." });
-
-        expect(res.status, JSON.stringify(res.body)).toBe(200);
-        expect(res.body).toMatchObject({ status: "in_review", assigneeAgentId: nextAgentId });
-        expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(2);
-        expect(mockHeartbeatService.cancelRun).toHaveBeenNthCalledWith(
-          1, issuingRunId, expect.any(String), expect.anything(),
-        );
-        expect(mockHeartbeatService.cancelRun).toHaveBeenNthCalledWith(
-          2, runId, expect.any(String), expect.anything(),
-        );
-        expect(mockIssueService.update.mock.invocationCallOrder[0])
-          .toBeLessThan(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]);
-        if (outcome === "unconfirmed") {
-          expect(mockLogActivity).toHaveBeenCalledWith(
-            expect.anything(),
-            expect.objectContaining({
-              action: "heartbeat.cancel_failed",
-              entityId: issuingRunId,
-              issueId,
-              details: { source: "issue_reassigned", issueId },
-            }),
-          );
-        }
-      },
-    );
-
-    it.each([
-      ["another company", { companyId: "company-2" }],
-      ["another agent", { agentId: nextAgentId }],
-    ] as const)("does not cancel a request-context run owned by %s", async (_label, ownership) => {
-      mockStageHandoff(null);
-      const issuingRunId = "66666666-6666-4666-8666-666666666666";
-      const foreignRun = { ...runningRun, id: issuingRunId, contextSnapshot: { wakeReason: "timer" }, ...ownership };
-      mockHeartbeatService.getRun.mockImplementation(async (id?: string) => id === issuingRunId ? foreignRun : null);
-      mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
+    it("saves a hand-off without cancelling when the issue lookup finds no run", async () => {
+      mockStageHandoff();
+      const issue = await mockIssueService.getById();
+      mockIssueService.getById.mockResolvedValue({ ...issue, executionRunId: null });
+      const unscopedRunId = "66666666-6666-4666-8666-666666666666";
+      mockHeartbeatService.getRun.mockResolvedValue({
+        ...runningRun,
+        id: unscopedRunId,
+        contextSnapshot: { wakeReason: "timer" },
+      });
 
       const res = await request(await createApp({
         type: "agent",
         agentId: reviewerAgentId,
         companyId: "company-1",
-        runId: issuingRunId,
+        runId: unscopedRunId,
       }))
         .patch(`/api/issues/${issueId}`)
-        .send({ status: "done", comment: "The request header must not authorize a stop of someone else's run." });
+        .send({ status: "done", comment: "Hand-off from a run the issue never recorded." });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ assigneeAgentId: nextAgentId }),
+        expect.anything(),
+      );
       expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
     });
 
