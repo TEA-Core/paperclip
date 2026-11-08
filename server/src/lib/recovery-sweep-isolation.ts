@@ -1,3 +1,4 @@
+import { HttpError } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { isTransientDbConnectionError } from "./db-connection-errors.js";
 
@@ -13,17 +14,30 @@ export const RECOVERY_SWEEP_NAMES = [
   "recovery.reconcile_todo_stranded_cards",
   "recovery.reconcile_stale_recovery_action_wakes",
   "recovery.reconcile_stillborn_assigned_backlog",
+  "recovery.reconcile_pending_review_rearm",
+  "recovery.ingest_stale_in_review_child_issues",
+  "recovery.reconcile_cancelled_only_blocker_dependents",
+  "recovery.reconcile_undispatchable_assigned",
+  "recovery.completed_run_strand_sweep",
 ] as const;
 
 export type RecoverySweepName = (typeof RECOVERY_SWEEP_NAMES)[number];
 
+function isCanonicalWikiHandoffRefusal(error: unknown): boolean {
+  if (!(error instanceof HttpError) || error.status !== 422) return false;
+  const details = error.details;
+  return (
+    details !== null &&
+    typeof details === "object" &&
+    (details as { subGuard?: unknown }).subGuard === "wiki_handoff" &&
+    (details as { reason?: unknown }).reason === "wiki_handoff_non_canonical_assignee"
+  );
+}
+
 /**
- * Per-card isolation for the startup recovery sweeps: one card whose recovery write is refused or
- * fails must not abort the sweep (and with it server startup) for every other card. Returns
- * `true` when `run` completed and `false` when the card was skipped for this sweep after an
- * error, so callers can count it. Writes made earlier in the same `run` (recovery action,
- * comment, wake) are not rolled back. A lost database connection is rethrown: that is not a
- * one-card problem, and startup should fail visibly instead of silently skipping every card.
+ * Per-card isolation for the startup recovery sweeps. Only the canonical Wiki handoff refusal is
+ * safe to skip; all other errors preserve the fail-fast recovery contract. Writes made earlier in
+ * the same `run` are not rolled back.
  */
 export async function runRecoverySweepIssue(
   issue: { id: string; identifier?: string | null },
@@ -34,12 +48,14 @@ export async function runRecoverySweepIssue(
     await run();
     return true;
   } catch (err) {
-    if (isTransientDbConnectionError(err)) throw err;
+    if (isTransientDbConnectionError(err) || !isCanonicalWikiHandoffRefusal(err)) throw err;
+    const details = (err as HttpError).details as { reason?: unknown } | null | undefined;
     logger.error(
       {
         err,
         errorClass: err instanceof Error ? err.constructor.name : typeof err,
         errorMessage: err instanceof Error ? err.message : String(err),
+        refusalReason: typeof details?.reason === "string" ? details.reason : null,
         issueId: issue.id,
         identifier: issue.identifier ?? null,
         sweep,

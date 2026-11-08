@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { readFileSync } from "node:fs";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -9,30 +10,57 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issueRecoveryActions,
   issueRelations,
   issues,
   issueWatchdogs,
   pluginManagedResources,
   plugins,
+  unWakeableArchives,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { RECOVERY_SWEEP_NAMES, type RecoverySweepName } from "../lib/recovery-sweep-isolation.js";
+import { HttpError } from "../errors.js";
+import {
+  RECOVERY_SWEEP_NAMES,
+  runRecoverySweepIssue,
+  type RecoverySweepName,
+} from "../lib/recovery-sweep-isolation.js";
 import { logger } from "../middleware/logger.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { sweepHostRestartStrandedIssues } from "../services/recovery/host-restart-strand-sweep.js";
+import { sweepCompletedRunStrandedIssues } from "../services/recovery/completed-run-strand-sweep.js";
 import { taskWatchdogService } from "../services/task-watchdogs.js";
 
 const REFUSE_TITLE = "REFUSE_WRITE";
+
+// The five sweeps the startup recovery pass runs that were folded into the
+// isolation contract in R2. Every per-card write they make must route through
+// runRecoverySweepIssue so only the canonical Wiki handoff refusal skips a card
+// and every other failure aborts the sweep (and startup) loudly.
+const FIVE_STARTUP_SWEEP_NAMES = [
+  "recovery.reconcile_pending_review_rearm",
+  "recovery.ingest_stale_in_review_child_issues",
+  "recovery.reconcile_cancelled_only_blocker_dependents",
+  "recovery.reconcile_undispatchable_assigned",
+  "recovery.completed_run_strand_sweep",
+] as const satisfies readonly RecoverySweepName[];
+
+function canonicalWikiHandoffRefusal(): HttpError {
+  return new HttpError(422, "Wiki handoff refused", {
+    subGuard: "wiki_handoff",
+    reason: "wiki_handoff_non_canonical_assignee",
+  });
+}
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 type Db = ReturnType<typeof createDb>;
-type Seed = { companyId: string; agentId: string; prefix: string };
+type Seed = { companyId: string; agentId: string; pullAgentId: string; prefix: string };
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -45,6 +73,23 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("recovery sweep isolation table", () => {
   let db!: Db;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  // reconcilePendingReviewRearm calls loadConfig(), whose ancestor config
+  // probe can hit an unreadable repo .paperclip/config.json in CI sandboxes,
+  // and whose local_trusted default rejects the sandbox's non-loopback bind.
+  // Point the config path at a nonexistent file and force a loopback bind.
+  const priorPaperclipConfig = process.env.PAPERCLIP_CONFIG;
+  const priorPaperclipBind = process.env.PAPERCLIP_BIND;
+  beforeAll(() => {
+    process.env.PAPERCLIP_CONFIG = `/nonexistent/paperclip-config-${process.pid}.json`;
+    process.env.PAPERCLIP_BIND = "loopback";
+  });
+  afterAll(() => {
+    if (priorPaperclipConfig === undefined) delete process.env.PAPERCLIP_CONFIG;
+    else process.env.PAPERCLIP_CONFIG = priorPaperclipConfig;
+    if (priorPaperclipBind === undefined) delete process.env.PAPERCLIP_BIND;
+    else process.env.PAPERCLIP_BIND = priorPaperclipBind;
+  });
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-sweep-isolation-");
@@ -109,35 +154,42 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
   });
 
   afterEach(async () => {
-    await db.execute(sql`alter table issues disable trigger fm_refuse_issues`);
-    await db.execute(sql`alter table issue_comments disable trigger fm_refuse_comments`);
-    await db.execute(sql`alter table issue_recovery_actions disable trigger fm_refuse_actions`);
-    await db.execute(sql`alter table issue_watchdogs disable trigger fm_refuse_watchdogs`);
-    await db.execute(sql`alter table agent_wakeup_requests disable trigger fm_refuse_wakeups`);
-    await db.execute(sql`alter table activity_log disable trigger fm_refuse_activity`);
-    await db.delete(issueWatchdogs);
-    await db.delete(issueRecoveryActions);
-    await db.delete(agentWakeupRequests);
-    await db.delete(issueRelations);
-    await db.delete(activityLog);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
-    await db.delete(issues);
-    await db.delete(pluginManagedResources);
-    await db.delete(agents);
-    await db.delete(plugins);
-    await db.delete(companies);
-    await db.execute(sql`alter table issues enable trigger fm_refuse_issues`);
-    await db.execute(sql`alter table issue_comments enable trigger fm_refuse_comments`);
-    await db.execute(sql`alter table issue_recovery_actions enable trigger fm_refuse_actions`);
-    await db.execute(sql`alter table issue_watchdogs enable trigger fm_refuse_watchdogs`);
-    await db.execute(sql`alter table agent_wakeup_requests enable trigger fm_refuse_wakeups`);
-    await db.execute(sql`alter table activity_log enable trigger fm_refuse_activity`);
+    // Deletes can fail (e.g. FK surprises); the triggers must be re-enabled
+    // regardless or every later test in this file silently loses its refusal.
+    try {
+      await db.execute(sql`alter table issues disable trigger fm_refuse_issues`);
+      await db.execute(sql`alter table issue_comments disable trigger fm_refuse_comments`);
+      await db.execute(sql`alter table issue_recovery_actions disable trigger fm_refuse_actions`);
+      await db.execute(sql`alter table issue_watchdogs disable trigger fm_refuse_watchdogs`);
+      await db.execute(sql`alter table agent_wakeup_requests disable trigger fm_refuse_wakeups`);
+      await db.execute(sql`alter table activity_log disable trigger fm_refuse_activity`);
+      await db.delete(unWakeableArchives);
+      await db.delete(issueWatchdogs);
+      await db.delete(issueRecoveryActions);
+      await db.delete(agentWakeupRequests);
+      await db.delete(issueRelations);
+      await db.delete(activityLog);
+      await db.delete(heartbeatRunEvents);
+      await db.delete(heartbeatRuns);
+      await db.delete(issues);
+      await db.delete(pluginManagedResources);
+      await db.delete(agents);
+      await db.delete(plugins);
+      await db.delete(companies);
+    } finally {
+      await db.execute(sql`alter table issues enable trigger fm_refuse_issues`);
+      await db.execute(sql`alter table issue_comments enable trigger fm_refuse_comments`);
+      await db.execute(sql`alter table issue_recovery_actions enable trigger fm_refuse_actions`);
+      await db.execute(sql`alter table issue_watchdogs enable trigger fm_refuse_watchdogs`);
+      await db.execute(sql`alter table agent_wakeup_requests enable trigger fm_refuse_wakeups`);
+      await db.execute(sql`alter table activity_log enable trigger fm_refuse_activity`);
+    }
   });
 
   async function seedCompany(): Promise<Seed> {
     const companyId = randomUUID();
     const agentId = randomUUID();
+    const pullAgentId = randomUUID();
     const prefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     await db.insert(companies).values({
       id: companyId,
@@ -156,7 +208,19 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
       runtimeConfig: {},
       permissions: {},
     });
-    return { companyId, agentId, prefix };
+    // Pull-only adapter agent for the undispatchable-assignee sweep.
+    await db.insert(agents).values({
+      id: pullAgentId,
+      companyId,
+      name: "Pull Worker",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return { companyId, agentId, pullAgentId, prefix };
   }
 
   async function insertIssue(input: {
@@ -199,16 +263,165 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
     });
   }
 
-  async function assertSkipped(sweep: RecoverySweepName, failingIssueId: string, run: () => Promise<unknown>) {
+  it("skips only the canonical Wiki handoff refusal", async () => {
     const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined as never);
     try {
-      const result = await run();
-      expect(result).toBeDefined();
+      await expect(
+        runRecoverySweepIssue(
+          { id: "wiki-issue", identifier: "SUP-WIKI" },
+          "recovery.reconcile_stranded_assigned_issues",
+          async () => {
+            throw new HttpError(422, "Wiki handoff refused", {
+              subGuard: "wiki_handoff",
+              reason: "wiki_handoff_non_canonical_assignee",
+            });
+          },
+        ),
+      ).resolves.toBe(false);
       expect(errorSpy).toHaveBeenCalledWith(
-        expect.objectContaining({ issueId: failingIssueId, sweep }),
+        expect.objectContaining({ issueId: "wiki-issue", sweep: "recovery.reconcile_stranded_assigned_issues" }),
         expect.stringContaining("skipped a card"),
       );
-      return result;
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("rethrows unrelated errors instead of skipping the card", async () => {
+    const error = new HttpError(500, "recovery write failed");
+    await expect(
+      runRecoverySweepIssue(
+        { id: "ordinary-issue", identifier: "SUP-ORDINARY" },
+        "recovery.reconcile_stranded_assigned_issues",
+        async () => {
+          throw error;
+        },
+      ),
+    ).rejects.toBe(error);
+  });
+
+  it.each(RECOVERY_SWEEP_NAMES)(
+    "keeps the same isolation contract for %s: a canonical Wiki handoff refusal skips the card with its refusal reason",
+    async (sweep) => {
+      const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined as never);
+      try {
+        await expect(
+          runRecoverySweepIssue({ id: "wiki-card", identifier: "SUP-WIKI" }, sweep, async () => {
+            throw canonicalWikiHandoffRefusal();
+          }),
+        ).resolves.toBe(false);
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            sweep,
+            issueId: "wiki-card",
+            refusalReason: "wiki_handoff_non_canonical_assignee",
+          }),
+          expect.stringContaining("skipped a card"),
+        );
+      } finally {
+        errorSpy.mockRestore();
+      }
+    },
+  );
+
+  it("reconcilePendingReviewRearm skips a canonical Wiki handoff refusal and still arms the ordinary card", async () => {
+    const seeded = await seedCompany();
+    const wikiCard = await drive("recovery.reconcile_pending_review_rearm", seeded, "Wiki card", 1);
+    const ordinary = await drive("recovery.reconcile_pending_review_rearm", seeded, "Ordinary card", 2);
+    const svc = recoveryService(db, {
+      enqueueWakeup: vi.fn(async (_agentId: string, wakeup?: { payload?: Record<string, unknown> | null }) => {
+        const issueId = typeof wakeup?.payload?.issueId === "string" ? wakeup.payload.issueId : undefined;
+        if (issueId === wikiCard) throw canonicalWikiHandoffRefusal();
+        return { id: randomUUID() };
+      }) as never,
+    });
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined as never);
+    try {
+      const result = await svc.reconcilePendingReviewRearm({ now: new Date() });
+      expect(result).toMatchObject({ checked: 2, reArmed: 1, skipped: 1 });
+      expect(result.skippedIssueIds).toEqual([wikiCard]);
+      expect(result.issueIds).toEqual([ordinary]);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sweep: "recovery.reconcile_pending_review_rearm",
+          issueId: wikiCard,
+          refusalReason: "wiki_handoff_non_canonical_assignee",
+        }),
+        expect.stringContaining("skipped a card"),
+      );
+      expect(await sweepEffectApplied("recovery.reconcile_pending_review_rearm", ordinary, seeded)).toBe(true);
+      expect(await sweepEffectApplied("recovery.reconcile_pending_review_rearm", wikiCard, seeded)).toBe(false);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("sweepCompletedRunStrandedIssues skips a canonical Wiki handoff refusal and still escalates the ordinary card", async () => {
+    const seeded = await seedCompany();
+    const wikiCard = await drive("recovery.completed_run_strand_sweep", seeded, "Wiki card", 1);
+    const ordinary = await drive("recovery.completed_run_strand_sweep", seeded, "Ordinary card", 2);
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined as never);
+    try {
+      const report = await sweepCompletedRunStrandedIssues({
+        db,
+        now: new Date(),
+        companyId: seeded.companyId,
+        escalateIssue: async (_db, candidate, { sourceRun }) => {
+          if (candidate.id === wikiCard) throw canonicalWikiHandoffRefusal();
+          await db.insert(issueComments).values({
+            companyId: candidate.companyId,
+            issueId: candidate.id,
+            authorType: "system",
+            body: "completed-run strand notice",
+            metadata: { sourceRunId: sourceRun.id },
+          });
+          return true;
+        },
+      });
+      expect(report.escalated).toEqual([ordinary]);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sweep: "recovery.completed_run_strand_sweep",
+          issueId: wikiCard,
+          refusalReason: "wiki_handoff_non_canonical_assignee",
+        }),
+        expect.stringContaining("skipped a card"),
+      );
+      expect(await sweepEffectApplied("recovery.completed_run_strand_sweep", ordinary, seeded)).toBe(true);
+      expect(await sweepEffectApplied("recovery.completed_run_strand_sweep", wikiCard, seeded)).toBe(false);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("routes every startup recovery sweep's per-card writes through runRecoverySweepIssue", () => {
+    const readSource = (relative: string) => readFileSync(new URL(relative, import.meta.url), "utf8");
+    const serviceSource = readSource("../services/recovery/service.ts");
+    const completedRunStrandSource = readSource("../services/recovery/completed-run-strand-sweep.ts");
+    for (const name of FIVE_STARTUP_SWEEP_NAMES) {
+      const pattern = new RegExp(`runRecoverySweepIssue\\([\\s\\S]{0,400}?"${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`);
+      const routed = pattern.test(serviceSource) || pattern.test(completedRunStrandSource);
+      expect(routed, `${name} per-card writes must route through runRecoverySweepIssue`).toBe(true);
+    }
+  });
+
+  async function assertFailsFast(sweep: RecoverySweepName, failingIssueId: string, run: () => Promise<unknown>) {
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined as never);
+    try {
+      // Drizzle wraps the trigger's pg error in a cause chain; walk it so the
+      // assertion proves the injected refusal itself propagated.
+      await expect(run()).rejects.toSatisfy((error: unknown) => {
+        let cursor: unknown = error;
+        while (cursor) {
+          if (cursor instanceof Error && /injected non-connection recovery write failure/.test(cursor.message)) return true;
+          cursor = (cursor as { cause?: unknown }).cause;
+        }
+        return false;
+      });
+      expect(errorSpy).not.toHaveBeenCalledWith(
+        expect.objectContaining({ sweep, issueId: failingIssueId }),
+        expect.stringContaining("skipped a card"),
+      );
     } finally {
       errorSpy.mockRestore();
     }
@@ -237,6 +450,41 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
         return (
           await db.select({ attemptCount: issueRecoveryActions.attemptCount }).from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))
         ).some((row) => row.attemptCount > 0);
+      case "recovery.reconcile_pending_review_rearm":
+        return (
+          await db
+            .select({ id: activityLog.id })
+            .from(activityLog)
+            .where(
+              sql`${activityLog.entityType} = 'issue' and ${activityLog.entityId} = ${issueId} and ${activityLog.action} = 'issue.pending_review_rearm_wake_emitted'`,
+            )
+        ).length > 0;
+      case "recovery.ingest_stale_in_review_child_issues":
+        return (
+          (await db.select({ hiddenAt: issues.hiddenAt }).from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]))?.hiddenAt != null ||
+          (await db.select({ id: unWakeableArchives.id }).from(unWakeableArchives).where(eq(unWakeableArchives.issueId, issueId))).length > 0
+        );
+      case "recovery.reconcile_cancelled_only_blocker_dependents":
+        return (
+          await db
+            .select({ id: issueRecoveryActions.id })
+            .from(issueRecoveryActions)
+            .where(and(eq(issueRecoveryActions.sourceIssueId, issueId), eq(issueRecoveryActions.cause, "cancelled_blocker_dependent")))
+        ).length > 0;
+      case "recovery.reconcile_undispatchable_assigned":
+        return (
+          await db
+            .select({ id: issueRecoveryActions.id })
+            .from(issueRecoveryActions)
+            .where(and(eq(issueRecoveryActions.sourceIssueId, issueId), eq(issueRecoveryActions.kind, "undispatchable_assignee")))
+        ).length > 0;
+      case "recovery.completed_run_strand_sweep":
+        return (
+          await db
+            .select({ id: issueComments.id })
+            .from(issueComments)
+            .where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")))
+        ).length > 0;
       case "task_watchdogs.reconcile_task_watchdogs":
         return (
           await db.select({ triggerCount: issueWatchdogs.triggerCount }).from(issueWatchdogs).where(eq(issueWatchdogs.issueId, issueId))
@@ -253,22 +501,17 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
     [sweep, false] as const,
   ]);
 
-  it.each(SWEEP_CASES)("skips one injected write failure in %s (failing card first: %s) and still processes the ordinary card", async (sweep, failingFirst) => {
+  it.each(SWEEP_CASES)("fails fast on an injected non-canonical write failure in %s (failing card first: %s) instead of skipping the card", async (sweep, failingFirst) => {
     const seeded = await seedCompany();
     const first = await drive(sweep, seeded, failingFirst ? "Failing card" : "Ordinary card", 1);
     const second = await drive(sweep, seeded, failingFirst ? "Ordinary card" : "Failing card", 2);
     const failing = failingFirst ? first : second;
-    const ordinary = failingFirst ? second : first;
     const before = await db.select({ updatedAt: issues.updatedAt }).from(issues).where(eq(issues.id, failing)).then((rows) => rows[0]);
     await db.execute(sql`alter table issues disable trigger fm_refuse_issues`);
     await db.update(issues).set({ title: REFUSE_TITLE, updatedAt: before?.updatedAt ?? new Date(Date.now() - 3 * 60 * 60 * 1000) }).where(eq(issues.id, failing));
     await db.execute(sql`alter table issues enable trigger fm_refuse_issues`);
-    const result = await assertSkipped(sweep, failing, () => runSweep(sweep, seeded));
+    await assertFailsFast(sweep, failing, () => runSweep(sweep, seeded));
     expect(await sweepEffectApplied(sweep, failing, seeded)).toBe(false);
-    expect(await sweepEffectApplied(sweep, ordinary, seeded)).toBe(true);
-    if (sweep === "task_watchdogs.reconcile_task_watchdogs") {
-      expect(result).toMatchObject({ checked: 2, triggered: 1, skipped: 1 });
-    }
   });
 
   async function drive(sweep: RecoverySweepName, seeded: Seed, title: string, issueNumber: number): Promise<string> {
@@ -466,6 +709,94 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
       });
       return id;
     }
+    if (sweep === "recovery.reconcile_pending_review_rearm") {
+      return insertIssue({
+        ...seeded,
+        agentId: seeded.agentId,
+        title,
+        status: "in_review",
+        issueNumber,
+        extra: {
+          updatedAt: old,
+          executionState: {
+            status: "pending",
+            currentStageId: randomUUID(),
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: seeded.agentId, userId: null },
+            returnAssignee: null,
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            completedStageIds: [],
+          },
+        },
+      });
+    }
+    if (sweep === "recovery.ingest_stale_in_review_child_issues") {
+      const parentId = await insertIssue({
+        ...seeded,
+        title: `parent-${issueNumber}`,
+        status: "blocked",
+        issueNumber: 300 + issueNumber,
+      });
+      return insertIssue({
+        ...seeded,
+        agentId: seeded.agentId,
+        title,
+        status: "in_review",
+        issueNumber,
+        extra: {
+          parentId,
+          updatedAt: old,
+          executionState: {
+            status: "pending",
+            currentStageId: randomUUID(),
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: seeded.agentId, userId: null },
+            returnAssignee: null,
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            completedStageIds: [],
+            pendingSince: veryOld.toISOString(),
+          },
+        },
+      });
+    }
+    if (sweep === "recovery.reconcile_cancelled_only_blocker_dependents") {
+      const blockerId = await insertIssue({
+        ...seeded,
+        title: `blocker-${issueNumber}`,
+        status: "cancelled",
+        issueNumber: 400 + issueNumber,
+      });
+      const id = await insertIssue({ ...seeded, agentId: seeded.agentId, title, status: "blocked", issueNumber });
+      await db.insert(issueRelations).values({
+        companyId: seeded.companyId,
+        issueId: blockerId,
+        relatedIssueId: id,
+        type: "blocks",
+      });
+      return id;
+    }
+    if (sweep === "recovery.reconcile_undispatchable_assigned") {
+      return insertIssue({ ...seeded, agentId: seeded.pullAgentId, title, status: "todo", issueNumber });
+    }
+    if (sweep === "recovery.completed_run_strand_sweep") {
+      const id = await insertIssue({ ...seeded, agentId: seeded.agentId, title, status: "in_progress", issueNumber });
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.agentId,
+        invocationSource: "manual",
+        status: "succeeded",
+        startedAt: old,
+        finishedAt: old,
+        updatedAt: old,
+        contextSnapshot: { issueId: id },
+      });
+      return id;
+    }
     throw new Error(`no driver for ${sweep}`);
   }
 
@@ -484,6 +815,20 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
       return svc.reconcileDispatchSuppressionParks({ now, companyId: seeded.companyId });
     }
     if (sweep === "recovery.reconcile_stale_recovery_action_wakes") return svc.reconcileStaleRecoveryActionWakes({ intervalMs: 0 });
+    if (sweep === "recovery.reconcile_pending_review_rearm") return svc.reconcilePendingReviewRearm({ now });
+    if (sweep === "recovery.ingest_stale_in_review_child_issues") return svc.ingestStaleInReviewChildIssues();
+    if (sweep === "recovery.reconcile_cancelled_only_blocker_dependents") {
+      return svc.reconcileCancelledOnlyBlockerDependents();
+    }
+    if (sweep === "recovery.reconcile_undispatchable_assigned") {
+      // Two-cycle confirmation: the first pass is report-only, the second mints
+      // the board recovery action, which is the write the trigger refuses.
+      await svc.reconcileUndispatchableAssignedIssues();
+      return svc.reconcileUndispatchableAssignedIssues();
+    }
+    if (sweep === "recovery.completed_run_strand_sweep") {
+      return sweepCompletedRunStrandedIssues({ db, now, companyId: seeded.companyId });
+    }
     if (sweep === "recovery.host_restart_strand_sweep") {
       return sweepHostRestartStrandedIssues({ db, now, resolveBootId: async () => "boot-new", companyId: seeded.companyId });
     }
