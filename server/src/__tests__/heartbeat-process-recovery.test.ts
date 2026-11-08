@@ -3,6 +3,7 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { randomUUID } from "node:crypto";
 import { legacyExecutionNeedsReconciliation, terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { issueService } from "../services/issues.js";
+import { logger } from "../middleware/logger.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { adapterExecutionControls, createAdapterExecutionControl } from "../services/adapter-execution-control.js";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -16612,20 +16613,28 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.execute(
       sql`create trigger test_native_blocked_wait_fault before insert on issue_comments for each row execute function test_native_blocked_wait_fault()`,
     );
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined as never);
     try {
-      // The faulted card is skipped (startup recovery must survive one refused card write) and the
-      // repair transaction rolls back whole, so no partial state is left behind.
-      const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
-      expect(result).toMatchObject({
-        skipped: 1,
-        continuationRequeued: 0,
-        escalated: 0,
+      await expect(
+        heartbeatService(db).reconcileStrandedAssignedIssues(),
+      ).rejects.toSatisfy((error: unknown) => {
+        let cursor: unknown = error;
+        while (cursor) {
+          if (cursor instanceof Error && cursor.message === "native_blocked_wait_fixture_fault") return true;
+          cursor = (cursor as { cause?: unknown }).cause;
+        }
+        return false;
       });
+      expect(errorSpy).not.toHaveBeenCalledWith(
+        expect.objectContaining({ issueId, sweep: "recovery.reconcile_stranded_assigned_issues" }),
+        expect.stringContaining("skipped a card"),
+      );
     } finally {
       await db.execute(
         sql`drop trigger test_native_blocked_wait_fault on issue_comments`,
       );
       await db.execute(sql`drop function test_native_blocked_wait_fault()`);
+      errorSpy.mockRestore();
     }
     expect(
       await db.select().from(issues).where(eq(issues.id, issueId)),
@@ -16703,15 +16712,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           }
         }, config),
       );
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined as never);
     try {
-      const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
-      expect(result).toMatchObject({
-        skipped: 1,
-        continuationRequeued: 0,
-        escalated: 0,
-      });
+      await expect(
+        heartbeatService(db).reconcileStrandedAssignedIssues(),
+      ).rejects.toBe(failure);
+      expect(errorSpy).not.toHaveBeenCalledWith(
+        expect.objectContaining({ issueId, sweep: "recovery.reconcile_stranded_assigned_issues" }),
+        expect.stringContaining("skipped a card"),
+      );
     } finally {
       transactionSpy.mockRestore();
+      errorSpy.mockRestore();
     }
     expect(sawAudit).toBe(true);
     expect(
