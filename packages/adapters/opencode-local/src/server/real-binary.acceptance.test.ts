@@ -672,7 +672,7 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
         },
       }));
       expect(result.exitCode).toBe(1);
-      expect(result.errorMessage).toContain("did not report mcp.resources.changed for MCP server(s) paperclip-denied");
+      expect(result.errorMessage).toContain("OpenCode MCP server(s) did not reach connected and quiet within 10s");
       expect(result.errorMessage).toContain("paperclip-denied: needs_auth");
       expect(mainRequests).toHaveLength(0);
       expect(JSON.stringify(result)).not.toContain("acceptance-denied-bearer");
