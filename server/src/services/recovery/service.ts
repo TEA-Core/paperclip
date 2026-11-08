@@ -9461,6 +9461,11 @@ export function recoveryService(
         priority: "high",
         parentId: input.issue.id,
         projectId: input.issue.projectId,
+        // A null projectWorkspaceId is refilled from the project default, and
+        // that binding is itself a git-workspace expectation. agent_default is
+        // the create-time normalization that drops it, so the board card is
+        // not dispatched against the source checkout (SUP-23493).
+        executionWorkspacePreference: "agent_default",
         goalId: input.issue.goalId,
         assigneeAgentId: ownerAgentId,
         originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
@@ -9469,6 +9474,12 @@ export function recoveryService(
         // The card records a board decision and never ships code, so its owner
         // must be able to close it without a repository delivery.
         deliveryRequirement: "record_only",
+        // A record-only board card has no adapter workspace of its own. Passing
+        // the source as parentId would otherwise copy that issue's
+        // executionWorkspaceId, including a workspace_validation failure the
+        // next dispatch cannot reuse (SUP-23493). Ordinary parent-child
+        // inheritance is unchanged: this flag is set only on this mint.
+        skipExecutionWorkspaceInheritance: true,
         billingCode: input.issue.billingCode,
       });
     } catch (error) {

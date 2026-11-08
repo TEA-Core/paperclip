@@ -3508,6 +3508,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     identifier: string | null;
     projectId: string | null;
     projectWorkspaceId: string | null;
+    deliveryRequirement?: "repository_delivery" | "record_only" | null;
   } | null;
   resolvedWorkspace: ResolvedWorkspaceForRun;
   executionWorkspace: RealizedExecutionWorkspace;
@@ -3526,6 +3527,11 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
 
   const issue = input.issue;
   if (!issue) return;
+  // A record_only card ships no code, so a project checkout resolved for its
+  // wake is not a workspace it is required to use. Failing that checkout as
+  // missing git metadata re-runs the validation that exhausted the source
+  // (SUP-23493). A repository_delivery card keeps the check.
+  if (issue.deliveryRequirement === "record_only") return;
 
   const environmentDriver =
     readNonEmptyString(input.environmentDriver) ?? "local";
@@ -11736,6 +11742,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         priority: issues.priority,
         projectId: issues.projectId,
         projectWorkspaceId: issues.projectWorkspaceId,
+        deliveryRequirement: issues.deliveryRequirement,
         executionWorkspaceId: issues.executionWorkspaceId,
         executionWorkspacePreference: issues.executionWorkspacePreference,
         assigneeAgentId: issues.assigneeAgentId,
@@ -23797,6 +23804,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             description: issueContext.description,
             projectId: issueContext.projectId,
             projectWorkspaceId: issueContext.projectWorkspaceId,
+            deliveryRequirement: issueContext.deliveryRequirement,
             executionWorkspaceId: issueContext.executionWorkspaceId,
             executionWorkspacePreference:
               issueContext.executionWorkspacePreference,
@@ -25748,6 +25756,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 identifier: issueRef.identifier,
                 projectId: issueRef.projectId,
                 projectWorkspaceId: issueRef.projectWorkspaceId,
+                deliveryRequirement: issueRef.deliveryRequirement,
               }
             : null,
           resolvedWorkspace,

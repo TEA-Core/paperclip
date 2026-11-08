@@ -70,6 +70,7 @@ vi.mock("../services/issue-execution-policy.ts", async () => {
 import { HttpError } from "../errors.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
+import { issueService } from "../services/issues.ts";
 import { hasUsableUnblockDescriptor, isBlockedWithoutBlockers } from "../services/recovery/service.ts";
 
 // loadConfig() in recovery/service.ts validates bind mode eagerly.
@@ -1313,8 +1314,8 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     await drainAgentRuns(agentId);
   });
 
-  async function seedCompanyAgentAndProject() {
-    const { companyId, agentId } = await seedCompanyAndAgent();
+  async function seedCompanyAgentAndProject(overrides?: { agentRole?: string }) {
+    const { companyId, agentId } = await seedCompanyAndAgent(overrides);
     const projectId = randomUUID();
     const projectWorkspaceId = randomUUID();
     await db.insert(projects).values({
@@ -2291,6 +2292,118 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(second.monitorArmed).toBe(0);
     expect(second.recoveryIssueMinted).toBe(0);
     expect(second.alreadyLive).toBe(1);
+    const recoveryIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(recoveryIssues).toHaveLength(1);
+  });
+
+  it("SUP-23493: an exhausted record-only recovery card does not inherit an unusable source workspace", async () => {
+    const { companyId, agentId, projectId, projectWorkspaceId } = await seedCompanyAgentAndProject({
+      agentRole: "cto",
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    const issueId = randomUUID();
+    const workspaceId = randomUUID();
+    const FAILED_SOURCE_WORKSPACE_CWD = "/tmp/not-a-real-worktree-path-exhausted-recovery-card";
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Todo behind an exhausted workspace validation, unassigned",
+      status: "todo",
+      priority: "high",
+      updatedAt: oldDate(),
+    });
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: `failed-source-${workspaceId}`,
+      status: "active",
+      cwd: FAILED_SOURCE_WORKSPACE_CWD,
+    });
+    await db.update(issues).set({
+      executionWorkspaceId: workspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: {
+        mode: "isolated_workspace",
+        workspaceRuntime: { profile: "agent" },
+      },
+    }).where(eq(issues.id, issueId));
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    mockAdapterExecute.mockClear();
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileExhaustedRecoveryDrain();
+    expect(result.recoveryIssueMinted).toBe(1);
+
+    const [action] = await db
+      .select({ recoveryIssueId: issueRecoveryActions.recoveryIssueId })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    const [recoveryIssue] = await db
+      .select({
+        executionWorkspaceId: issues.executionWorkspaceId,
+        executionWorkspacePreference: issues.executionWorkspacePreference,
+        executionWorkspaceSettings: issues.executionWorkspaceSettings,
+        projectWorkspaceId: issues.projectWorkspaceId,
+        deliveryRequirement: issues.deliveryRequirement,
+      })
+      .from(issues)
+      .where(eq(issues.id, action.recoveryIssueId!));
+    expect(recoveryIssue.deliveryRequirement).toBe("record_only");
+    expect(recoveryIssue.executionWorkspaceId).toBeNull();
+    expect(recoveryIssue.executionWorkspacePreference).toBe("agent_default");
+    expect(recoveryIssue.executionWorkspaceSettings).toBeNull();
+    expect(recoveryIssue.projectWorkspaceId).toBeNull();
+
+    await drainAgentRuns(agentId);
+    const recoveryWakes = await db
+      .select({ payload: agentWakeupRequests.payload, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(recoveryWakes.some((wake) => {
+      const payload = wake.payload as { issueId?: unknown } | null;
+      return payload?.issueId === action.recoveryIssueId;
+    })).toBe(true);
+    const recoveryRunIds = recoveryWakes
+      .map((wake) => wake.runId)
+      .filter((runId): runId is string => typeof runId === "string");
+    const recoveryRuns = recoveryRunIds.length === 0
+      ? []
+      : await db
+        .select({ errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, recoveryRunIds));
+    expect(recoveryRuns.some((run) => run.errorCode === "workspace_validation_failed")).toBe(false);
+    const workspaces = await db
+      .select({ cwd: executionWorkspaces.cwd })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.companyId, companyId));
+    expect(workspaces.filter((row) => row.cwd === FAILED_SOURCE_WORKSPACE_CWD)).toHaveLength(1);
+
+    const ordinaryChild = await issueService(db).create(companyId, {
+      parentId: issueId,
+      projectId,
+      title: "Ordinary child still inherits the live source workspace",
+    });
+    expect(ordinaryChild.executionWorkspaceId).toBe(workspaceId);
+    expect(ordinaryChild.executionWorkspacePreference).toBe("reuse_existing");
+
+    const second = await heartbeat.reconcileExhaustedRecoveryDrain();
+    expect(second.recoveryIssueMinted).toBe(0);
     const recoveryIssues = await db
       .select({ id: issues.id })
       .from(issues)

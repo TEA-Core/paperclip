@@ -449,6 +449,32 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
     );
   });
 
+  it("does not require git metadata for a record_only card", async () => {
+    const input = buildWorkspaceValidationInput();
+    const cwd = "/tmp/paperclip-record-only-without-git-metadata";
+
+    await expect(
+      assertGitSensitiveAdapterWorkspaceValid(
+        buildWorkspaceValidationInput({
+          issue: {
+            ...input.issue!,
+            deliveryRequirement: "record_only",
+          },
+          resolvedWorkspace: buildResolvedWorkspace({ cwd }),
+          executionWorkspace: {
+            ...input.executionWorkspace,
+            baseCwd: cwd,
+            cwd,
+          },
+          persistedExecutionWorkspace: {
+            ...input.persistedExecutionWorkspace!,
+            cwd,
+          },
+        }),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
   it("does not apply the git-sensitive workspace guard to non-local execution targets", async () => {
     const input = buildWorkspaceValidationInput();
 
