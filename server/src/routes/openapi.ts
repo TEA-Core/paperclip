@@ -5971,6 +5971,7 @@ const decisionQueueSeedRuleSchema = z
       "issue_has_pull_request_work_product",
       "plan_document_confirmation",
       "ask_user_questions",
+      "recovery_rate_alert",
     ]),
   })
   .strict();

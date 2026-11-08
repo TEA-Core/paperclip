@@ -202,7 +202,7 @@ describeEmbeddedPostgres("decision queue routes", () => {
     const seedRules = await request(app(board))
       .get(`/api/companies/${companyId}/decision-queue-seed-rules`)
       .expect(200);
-    expect(seedRules.body.map((seed: { key: string }) => seed.key)).toEqual(["prs", "plans", "questions"]);
+    expect(seedRules.body.map((seed: { key: string }) => seed.key)).toEqual(["prs", "plans", "questions", "alerts"]);
 
     const events = await db.select().from(decisionTriageEvents)
       .where(eq(decisionTriageEvents.queueId, first.body.id));
@@ -485,6 +485,50 @@ describeEmbeddedPostgres("decision queue routes", () => {
     expect((await service.listItems(companyId, "alerts", agentActor(companyId, agentId))).map((item) => item.sourceId))
       .toEqual([]);
     expect((await service.list(companyId, boardActor(companyId)))[0]?.itemCount).toBe(1);
+  });
+
+  it("materializes recovery-rate alerts into the board alerts queue", async () => {
+    const { companyId } = await seed();
+    const artifactKey = `recovery_rate_alert:${companyId}:2026-10-26`;
+    const alertItem: AttentionItem = {
+      id: `recovery_rate_alert:${artifactKey}`,
+      companyId,
+      sourceKind: "recovery_rate_alert",
+      subject: {
+        kind: "budget_incident",
+        id: artifactKey,
+        companyId,
+        title: "Recovery rate alert",
+        identifier: null,
+        status: "breached",
+        href: "/dashboard",
+      },
+      whyNow: "Recovery rate breached",
+      decisionVerbs: [],
+      inlineResolvable: false,
+      entryRule: "recovery rate exceeded threshold",
+      exitRule: "No breach",
+      dedupKey: artifactKey,
+      dismissalKey: artifactKey,
+      dismissal: null,
+      severity: "high",
+      rank: 1,
+      activityAt: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      relatedIssue: null,
+      project: null,
+      workspace: null,
+      detail: null,
+      trainingExampleId: null,
+    };
+
+    await decisionQueueService(db).materializeSeededQueues(companyId, [alertItem]);
+
+    const queues = await db.select().from(decisionQueues).where(eq(decisionQueues.companyId, companyId));
+    expect(queues.map((queue) => queue.key)).toEqual(["alerts"]);
+    const items = await db.select().from(decisionQueueItems).where(eq(decisionQueueItems.companyId, companyId));
+    expect(items).toMatchObject([{ sourceKind: "recovery_rate_alert", sourceId: artifactKey }]);
   });
 
   it("matches canonical source visibility when the issue points to a foreign project", async () => {
