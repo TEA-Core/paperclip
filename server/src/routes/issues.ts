@@ -9661,6 +9661,11 @@ export function issueRoutes(
     recoveryAction: NonNullable<
       Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>>
     >;
+    // SUP-23490: the run id the recovery door already validated (header, then
+    // the issue's own checkout/execution self-declared run). A header-less
+    // agent close must compare the lock against this resolved identity, not
+    // against null.
+    effectiveRunId?: string | null;
   }) {
     const returnOwnerAgentId = input.recoveryAction.returnOwnerAgentId;
     if (
@@ -9678,9 +9683,10 @@ export function issueRoutes(
       );
     }
     const actorRunId =
-      input.req.actor.type === "agent"
+      input.effectiveRunId?.trim() ||
+      (input.req.actor.type === "agent"
         ? input.req.actor.runId?.trim() || null
-        : null;
+        : null);
     const conflictingRunId = [
       input.issue.checkoutRunId,
       input.issue.executionRunId,
@@ -13905,7 +13911,8 @@ export function issueRoutes(
                 }
               : null,
           commentBody: doneTierResolutionNote,
-          runId: resolvedRecoveryRunId,          closingAgentId: actor.agentId ?? null,
+          runId: resolvedRecoveryRunId,
+          closingAgentId: actor.agentId ?? null,
           decisionCarried: !!doneCarryTransition.decision,
           boardActor: req.actor.type === "board",
         });
@@ -14134,6 +14141,7 @@ export function issueRoutes(
               req,
               issue: lockedIssue,
               recoveryAction: activeRecoveryAction,
+              effectiveRunId: resolvedRecoveryRunId,
             });
           } else {
             // The fork routes a stranded recovery action to an OWNER AGENT (the
@@ -25523,7 +25531,8 @@ export function issueRoutes(
               actor.agentId ?? undefined,
               currentIssue.checkoutRunId ?? currentIssue.executionRunId ?? null,
             )
-            || null,          closingAgentId: actor.agentId ?? null,
+            || null,
+          closingAgentId: actor.agentId ?? null,
           decisionCarried: !!transition.decision,
           boardActor: req.actor.type === "board",
           caller: {
