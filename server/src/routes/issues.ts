@@ -19507,8 +19507,9 @@ export function issueRoutes(
     Object.assign(updateFields, transition.patch);
     // SUP-13526 / SUP-21752: check the assignee and execution state the write
     // will persist. The gate is keyed on the request explicitly supplying an
-    // assignee; a workflow-owned assignment is exempt only when the request did
-    // not supply one. Otherwise a request could pair an explicit assignee with
+    // assignee; a workflow-owned assignment is exempt for an implicit handoff
+    // or the canonical Maintainer explicitly reasserting its seat during a
+    // human handoff. Otherwise a request could pair an explicit assignee with
     // a workflow re-assertion and land a self-satisfying review seat.
     const resultingAssigneeAgentId =
       updateFields.assigneeAgentId !== undefined
@@ -19546,9 +19547,17 @@ export function issueRoutes(
         executionState: resultingExecutionState,
       },
       incomingAssigneeAgentId: resultingAssigneeAgentId,
+      actorAgentId: actor.agentId ?? null,
+      currentAssigneeAgentId: existing.assigneeAgentId,
       checkReviewStage: false,
       workflowControlledAssignment:
-        transition.workflowControlledAssignment === true && normalizedAssigneeAgentId === undefined,
+        transition.workflowControlledAssignment === true &&
+        (normalizedAssigneeAgentId === undefined || (
+          resultingAssigneeAgentId === null &&
+          typeof normalizedAssigneeAgentId === "string" &&
+          normalizedAssigneeAgentId === actor.agentId &&
+          normalizedAssigneeAgentId === existing.assigneeAgentId
+        )),
       refusalContext:
         req.actor.type === "board"
           ? undefined

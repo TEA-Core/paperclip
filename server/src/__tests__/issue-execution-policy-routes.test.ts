@@ -3584,6 +3584,61 @@ describe("issue execution policy routes", () => {
       });
     });
 
+    it.each([
+      ["in_review", false],
+      ["done", false],
+      ["in_review", true],
+      ["done", true],
+    ])("lets the canonical Maintainer write %s after recovery (explicit assignee: %s) without removing human review", async (status, explicitAssignee) => {
+      const issue = {
+        ...issueWithParticipants([]),
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [{
+            id: stageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ type: "user", userId: "human-reviewer" }],
+          }],
+        }),
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+      vi.doMock("../services/cross-issue-influence-limit.js", async (importOriginal) => ({
+        ...await importOriginal<typeof import("../services/cross-issue-influence-limit.js")>(),
+        observeCrossIssueInfluence: vi.fn(async () => null),
+      }));
+      const app = await createApp({
+        type: "agent",
+        agentId: maintainerId,
+        companyId: "company-1",
+        runId: "55555555-5555-4555-8555-555555555555",
+      });
+
+      const res = await request(app).patch(`/api/issues/${issueId}`).send({
+        status,
+        ...(explicitAssignee ? { assigneeAgentId: maintainerId } : {}),
+      });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(patch).toMatchObject({
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: "human-reviewer",
+        workflowControlledAssignment: true,
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentParticipant: { type: "user", userId: "human-reviewer" },
+          returnAssignee: { type: "agent", agentId: maintainerId },
+        },
+      });
+    });
+
     it("refuses canonical-only review entry as wiki_handoff_self_satisfy", async () => {
       mockIssueService.getById.mockResolvedValue(issueWithParticipants([maintainerId], authorId));
 
