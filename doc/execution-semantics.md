@@ -94,6 +94,26 @@ be completed and the last recorded decision to be approved; a pending post-merge
 stage does not delay that stamp. Stage order and issue completion are unchanged:
 the review workflow still waits for post-merge stages before closing `done`.
 
+For a native completion review addressed to an agent, the server saves the review
+card and a durable reviewer wake in the same transaction. The reviewer can act
+on the child task even when its own parent task waits for that child. The child
+keeps its worker assignee and the parent keeps its dependency. The review run
+can read the submitted work and accept or reject its assigned card. It cannot
+use that role to change ordinary task assignments or dependencies.
+
+Accepting the last required native completion review marks the child Done and
+makes its dependents eligible to continue. Rejection returns the requested
+changes to the worker. A review run that ends without a decision cannot mark
+the child Done. It retains the review and records a bounded recovery action.
+See [native status arbitration](architecture/native-status-arbitration.md#agent-review-handoff)
+for the authorization checks and completion-report rules.
+
+The parent receives recent child review decisions in its continuation evidence
+and through `get_task_context`. Each record names the child, decision, reviewer,
+and review run. The server reads these records from saved review state; it does
+not depend on the parent session remembering a separate review session. These
+records are evidence and do not grant permission to resolve another review.
+
 ### `done`
 
 The work is complete and terminal.
@@ -1507,3 +1527,56 @@ permission again or copy Connect / Not now into a generic question. A generic
 question does not start setup. The real connection card keeps user identity,
 access grants, the decision, and continuation together. This guidance does not
 approve a connection or bypass its normal user decision.
+
+## Responses submitted during an active run
+
+A confirmation, checkbox confirmation, or question answer is new conversation
+input. Resolving the card records the decision immediately; it does not implicitly
+interrupt or steer an agent that is doing work. Its typed continuation wake waits
+behind the issue's active execution and appears in the message queue.
+
+The queue projects the original resolved interaction as an immutable response.
+It keeps the selected answers and accepted document revision; it does not create
+an editable comment that could silently change what was approved. Ordinary
+messages retain their existing edit, discard, and reorder behavior.
+
+- Normal run completion promotes the saved response once. The restart scan also
+  finds stranded interaction receipts after the issue execution lock is released.
+- **Steer** explicitly delivers the saved response to a compatible native turn.
+  The acknowledgement consumes the receipt, so a retry cannot create a second
+  delivery. It retains the existing run's execution identity.
+- **Interrupt** stops a legacy turn and starts a continuation with the typed
+  response. Native plan approvals that require a fresh session use Interrupt too;
+  steering cannot turn a planning session into an execution session. Existing
+  process-stop, environment-cleanup, ownership, and recovery gates still apply.
+- If the provider is blocked on the original native question request, answering
+  resolves that tool request directly. It must not wait behind the blocked turn.
+
+An agent may finish its review handoff after the user has already answered its
+card. A resolved card from that same source run, or its queued continuation, is a
+valid live path. A stale agent handback to a human cannot cancel the run and orphan
+a queued response. This does not make an old resolved card a review path for a
+later run, or prevent an explicit board reassignment.
+
+### Persistent sandbox cleanup
+
+A lost bridge cannot indefinitely prevent Daytona termination. Ordinary lease release
+and destruction wait briefly for bridge activity, then call the provider for the exact
+recorded sandbox. Drain timeout is not a stop receipt. Reusable sandboxes prefer
+stop; failed stop falls back to deletion. Stop/delete transport hangs are bounded
+and leave cleanup pending unless the provider confirms termination.
+
+The pending-cleanup sweep retains a durable attempt identity and a 15-minute
+in-flight deadline. It retries after restart, waits at least 30 seconds between
+failed attempts, and slows to 30 minutes after five failures. It reports that
+operator attention is needed at that threshold, while automatic cleanup continues.
+Provider outages never convert a live sandbox into an abandoned manual task.
+Explicit Retry can skip the cooldown after a failed cleanup, but cannot take over
+a live cleanup attempt. Active startup cancellation still stops the sandbox first.
+
+A live cleanup attempt renews its durable claim every 30 seconds. Another sweep in the same controller cannot overlap it, even if the deadline passes. Completion writes require the current attempt identity. After controller loss, cleanup can repeat destruction of the exact quarantined provider resource; providers must make that operation idempotent. A timeout or claim expiry does not prove termination.
+
+Renewal updates only the ownership deadline, never the retry cooldown. Cleanup
+does not await an outstanding renewal; a stalled database response cannot retain
+process-local cleanup ownership. Late responses still require the same active
+attempt, and completed attempts use only the persisted retry cooldown.

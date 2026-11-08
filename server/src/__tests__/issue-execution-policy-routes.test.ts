@@ -141,6 +141,9 @@ function registerModuleMocks() {
     return { ...actual, evaluateDoneTransitionGuard: mockEvaluateDoneTransitionGuard };
   });
 
+  vi.doMock("../services/queued-interaction-response.js", () => ({
+    hasQueuedInteractionResponse: vi.fn(async () => false),
+  }));
   vi.doMock("../services/runner-goals.js", () => ({
     runnerGoalService: () => mockRunnerGoalService,
     RunnerGoalActionError: class RunnerGoalActionError extends Error {},

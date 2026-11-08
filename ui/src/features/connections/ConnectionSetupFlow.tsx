@@ -66,7 +66,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { ToggleSwitch } from "@/components/ui/toggle-switch";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
-import { copyTextToClipboard } from "@/lib/clipboard";
+import { useCopyAction } from "@/lib/use-copy-action";
 import { resolveAuthorizationTarget } from "@/lib/authorizationUrl";
 import { navigateTopLevel } from "@/lib/browserNavigation";
 import { prepareOAuthNavigation, savePendingCloudHandoff } from "@/lib/oauthHandoff";
@@ -315,6 +315,11 @@ const SELECTED_APP_STEP_INDEX: Record<Exclude<Step, "gallery" | "success">, numb
   key: 1,
 };
 const ZAPIER_STEP_LABELS = ["Access", "Add MCP URL"];
+// Waiting for browser sign-in happens *inside* the flow's last step, so the
+// waiting screen reuses the step model of the flow that opened it. It must not
+// append a trailing step the flow never lands on: a stepper that grows from two
+// dots to three the moment you press Connect reads as a step you missed.
+const OAUTH_SIGN_IN_STEP_LABELS = ["Access", "Sign in"];
 
 /**
  * Which identity a fresh connection should default to (PAP-17835).
@@ -1690,7 +1695,7 @@ export function ConnectionSetupFlow({
   });
 
   if (!selectedCompanyId) {
-    return <div className="p-6 text-sm text-muted-foreground">Select a company to connect apps.</div>;
+    return <div className="p-6 text-sm text-muted-foreground">Select an organization to connect apps.</div>;
   }
 
   if (
@@ -1732,7 +1737,7 @@ export function ConnectionSetupFlow({
       <div className="mx-auto max-w-xl rounded-xl border border-border bg-card p-6">
         <h2 className="text-lg font-semibold text-foreground">This setup can’t be resumed</h2>
         <p className="mt-2 text-sm text-muted-foreground">
-          The saved connection no longer exists or is not available to this company.
+          The saved connection no longer exists or is not available to this organization.
         </p>
         <Button type="button" variant="outline" className="mt-5" onClick={() => navigate("/apps")}>
           Back to apps
@@ -1752,7 +1757,7 @@ export function ConnectionSetupFlow({
         <h2 className="text-lg font-semibold text-foreground">This connection can’t be reconnected</h2>
         <p className="mt-2 text-sm text-muted-foreground">
           {!reconnectConnection
-            ? "The retained connection no longer exists or is not available to this company."
+            ? "The retained connection no longer exists or is not available to this organization."
             : "This reconnect link does not match the retained connection's provider."}
         </p>
         <Button type="button" variant="outline" className="mt-5" onClick={() => navigate("/apps")}>
@@ -1987,6 +1992,9 @@ export function ConnectionSetupFlow({
           name: linkName.trim() || endpointHost(linkUrl) || "this server",
           unverifiedHost: endpointHost(linkUrl),
         }}
+        // A pasted endpoint walks the generic three-step wizard, so keep that
+        // model rather than dropping to the curated two-step one.
+        steps={{ labels: STEP_LABELS, activeIndex: STEP_INDEX.key }}
         phase={oauthPhase}
         error={oauthError}
         authorizationHost={authorizationHost}
@@ -2358,6 +2366,15 @@ export function ConnectionSetupFlow({
       )}
 
       {step === "access" && (
+        <>
+        {entry?.slug === "railway" && (
+          <div className="mb-6 space-y-3 text-sm text-muted-foreground">
+            <p>{accessStepMethod?.guidanceMd}</p>
+            <ul className="list-disc space-y-2 pl-5">
+              {accessStepMethod?.warnings?.map((warning) => <li key={warning}>{warning}</li>)}
+            </ul>
+          </div>
+        )}
         <AccessStep
           companyId={selectedCompanyId}
           authKind={accessStepAuthKind}
@@ -2391,6 +2408,7 @@ export function ConnectionSetupFlow({
             else setStep("key");
           }}
         />
+        </>
       )}
 
       {step === "success" && (
@@ -2454,17 +2472,25 @@ function StepHeader({
         </Button>
       </div>
       {step !== "gallery" && (
-        <div className="mt-4">
-          <div className="flex gap-2">
+        // A landmark with stable hooks, so the step model can be read without
+        // guessing at Tailwind classes. The dots are decoration — the label
+        // line below already says the same thing, so announcing both would
+        // read every step name twice.
+        <nav className="mt-4" aria-label="Setup progress" data-testid="wizard-stepper">
+          <ol className="flex gap-2" aria-hidden="true">
             {labels.map((label, i) => (
-              <div
+              <li
                 key={label}
+                data-testid="wizard-step-dot"
+                data-step-active={i === activeIndex ? "true" : undefined}
                 className={cn("h-1 w-20 rounded-full", i <= activeIndex ? "bg-foreground" : "bg-border")}
               />
             ))}
+          </ol>
+          <div className="mt-2 text-xs text-muted-foreground" data-testid="wizard-step-labels">
+            {labels.join("   ·   ")}
           </div>
-          <div className="mt-2 text-xs text-muted-foreground">{labels.join("   ·   ")}</div>
-        </div>
+        </nav>
       )}
     </div>
   );
@@ -2479,6 +2505,7 @@ export function OAuthConnectStateScreen({
   recoveryActions,
   authorizationHost,
   authorizationUrl,
+  steps = { labels: OAUTH_SIGN_IN_STEP_LABELS, activeIndex: 1 },
   onRetry,
   onOpenAuthorization,
   onBack,
@@ -2501,6 +2528,12 @@ export function OAuthConnectStateScreen({
   authorizationHost?: string | null;
   /** Already validated by prepareOAuthNavigation; used for a native browser link. */
   authorizationUrl?: string | null;
+  /**
+   * Step model of the flow that opened this screen, so the stepper keeps the
+   * shape it had on the previous screen. Defaults to the two-step curated
+   * sign-in model for hosts that have no wizard of their own.
+   */
+  steps?: { labels: string[]; activeIndex: number };
   onOpenAuthorization?: () => void;
   onRetry: () => void;
   onBack: () => void;
@@ -2539,8 +2572,8 @@ export function OAuthConnectStateScreen({
       <StepHeader
         subtitle="Secure MCP sign-in"
         step="key"
-        activeIndex={1}
-        labels={["Access", "Sign in", "Ready"]}
+        activeIndex={steps.activeIndex}
+        labels={steps.labels}
         appIdentity={entry ? { name: entry.name, logoUrl: entry.branding.logoUrl, darkLogoUrl: entry.branding.darkLogoUrl } : undefined}
         unverifiedHost={unverifiedHost}
         onCancel={onCancel}
@@ -3476,15 +3509,7 @@ function KeyStep({
                 >
                   {robotEmail}
                 </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  className="shrink-0"
-                  onClick={() => void copyTextToClipboard(robotEmail).catch(() => {})}
-                >
-                  <Copy className="mr-2 h-4 w-4" />
-                  Copy
-                </Button>
+                <CopyValueButton value={robotEmail} ariaLabel="Copy sharing email" />
               </div>
               <p className="mt-2 text-xs text-muted-foreground">
                 In Google Sheets, click Share and add this email as an Editor. Then paste the sheet links below.
@@ -3694,6 +3719,27 @@ function KeyStep({
   );
 }
 
+/**
+ * The Copy button beside a value the operator has to paste into another
+ * product's console. Both of those values are long and opaque, so the button
+ * has to say whether the clipboard actually took it.
+ */
+function CopyValueButton({ value, ariaLabel }: { value: string; ariaLabel: string }) {
+  const { copied, failed, copy } = useCopyAction();
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      className="shrink-0"
+      aria-label={ariaLabel}
+      onClick={() => void copy(value)}
+    >
+      {copied ? <Check className="mr-2 h-4 w-4" /> : <Copy className="mr-2 h-4 w-4" />}
+      {copied ? "Copied" : failed ? "Copy failed" : "Copy"}
+    </Button>
+  );
+}
+
 function OAuthClientFields({
   entry,
   method,
@@ -3744,15 +3790,7 @@ function OAuthClientFields({
             >
               {callbackUrl}
             </div>
-            <Button
-              type="button"
-              variant="outline"
-              className="shrink-0"
-              onClick={() => void copyTextToClipboard(callbackUrl).catch(() => {})}
-            >
-              <Copy className="mr-2 h-4 w-4" />
-              Copy
-            </Button>
+            <CopyValueButton value={callbackUrl} ariaLabel="Copy callback URL" />
           </div>
           <p className="mt-2 text-xs text-muted-foreground">
             Add this exact URL to {entry.name} before continuing. It must match the authorization request.
@@ -3972,7 +4010,7 @@ export function AccessStep({
                       ? githubIdentity ? "My GitHub account" : "Just me"
                       : allowedGrantKinds[0] === "agent"
                         ? "A dedicated account for an agent"
-                        : githubIdentity ? "Shared company GitHub account (advanced)" : "Any human in the company"}
+                        : githubIdentity ? "Shared organization GitHub account (advanced)" : "Any human in the organization"}
                   </div>
                   {githubIdentity ? (
                     <p className="mt-1 text-xs text-muted-foreground">
@@ -4017,14 +4055,14 @@ export function AccessStep({
                   },
                   {
                     value: "organization",
-                    title: githubIdentity ? "Shared company GitHub account (advanced)" : "Any human in the company",
+                    title: githubIdentity ? "Shared organization GitHub account (advanced)" : "Any human in the organization",
                     description: githubIdentity
                       ? "Eligible agents use one shared credential, regardless of who starts the run."
                       : undefined,
                     icon: <UsersRound className="h-4 w-4" aria-hidden="true" />,
                     accessibleLabel: canCreateOrganizationGrant
-                      ? githubIdentity ? "Shared company GitHub account (advanced)" : "Any human in the company"
-                      : `${githubIdentity ? "Shared company GitHub account (advanced)" : "Any human in the company"}. Unavailable: ${capabilities?.organizationGrantReason ??
+                      ? githubIdentity ? "Shared organization GitHub account (advanced)" : "Any human in the organization"
+                      : `${githubIdentity ? "Shared organization GitHub account (advanced)" : "Any human in the organization"}. Unavailable: ${capabilities?.organizationGrantReason ??
                         "Only a connection manager can share this credential with the organization."}`,
                     tooltip: canCreateOrganizationGrant
                       ? undefined

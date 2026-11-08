@@ -1,3 +1,4 @@
+import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
@@ -3423,7 +3424,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
       publication.idempotencyKey ===
       `interaction:${input.interaction.id}:${publication.endpointId}`,
   );
-  void input.heartbeat
+  await input.heartbeat
     .wakeup(wakeTargetAgentId, {
       source: "automation",
       triggerDetail: "system",
@@ -7181,6 +7182,7 @@ export function issueRoutes(
       companyId: string;
       status: string;
       assigneeUserId?: string | null;
+      assigneeAgentId?: string | null;
       executionState?: unknown;
       monitorNextCheckAt?: Date | null;
     };
@@ -7232,6 +7234,21 @@ export function issueRoutes(
     const pendingInteractions = interactions.filter(
       (interaction) => interaction.status === "pending",
     );
+    // Acceptance can commit just before its continuation wake is persisted.
+    // The source run may still be finishing its original review handoff. The
+    // resolved card from that exact run is evidence of the in-flight response;
+    // an old card from an earlier run is not a new review path.
+    const resolvedSourceResponse = input.actorType === "agent" && input.actorRunId
+      ? interactions.find(interaction =>
+          interaction.sourceRunId === input.actorRunId &&
+          interaction.createdByAgentId === input.actorAgentId &&
+          (!input.reviewInteractionId || interaction.id === input.reviewInteractionId) &&
+          ["accepted", "answered", "rejected"].includes(interaction.status) &&
+          (interaction.continuationPolicy === "wake_assignee" ||
+            (interaction.continuationPolicy === "wake_assignee_on_accept" &&
+              ["accepted", "answered"].includes(interaction.status))))
+      : undefined;
+    if (resolvedSourceResponse) return null;
     if (input.reviewInteractionId) {
       const designatedReviewConfirmation = pendingInteractions.find(
         (interaction) =>
@@ -7272,6 +7289,7 @@ export function issueRoutes(
     if (localReviewPathSatisfied()) return null;
 
     if (pendingInteractions.length > 0) return null;
+    if (await hasQueuedInteractionResponse(db, input.existing.companyId, input.existing.id, input.existing.assigneeAgentId)) return null;
 
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(
       input.existing.id,
@@ -9909,7 +9927,7 @@ export function issueRoutes(
     for (const wake of rows) {
       if (
         readObject(wake.payload).issueId !== issue.id ||
-        queuedCommentIdsFromWakePayload(wake.payload).length === 0
+        (queuedCommentIdsFromWakePayload(wake.payload).length === 0 && !queuedInteractionId(wake.payload))
       )
         continue;
       if (wake.status === "deferred_issue_execution") {
@@ -9940,6 +9958,10 @@ export function issueRoutes(
     issueId: string,
     wake: IssueQueueWake | null,
   ) {
+    if (wake && queuedInteractionId(wake.payload)) {
+      const response = await readQueuedInteractionResponse(executor as Db, wake.companyId, issueId, wake.payload);
+      return response ? [response.comment] : [];
+    }
     const ids = queuedCommentIdsFromWakePayload(wake?.payload);
     if (ids.length === 0) return [];
     const rows = await executor
@@ -9951,7 +9973,7 @@ export function issueRoutes(
     const byId = new Map(rows.map((row) => [row.id, row]));
     return ids.flatMap((id) => {
       const row = byId.get(id);
-      return row && !row.deletedAt ? [row] : [];
+      return row && !row.deletedAt ? [{ ...row, authorType: row.authorType ?? (row.authorAgentId ? "agent" as const : "user" as const) }] : [];
     });
   }
 
@@ -10001,7 +10023,7 @@ export function issueRoutes(
             .then((state) => state.disposition)
             .catch(() => "temporarily_unavailable" as const));
     const wait = queueState?.state === "deferred" ? readObject(readObject(wake?.payload).executionWait) : {};
-    return buildQueuedCommentQueueSnapshot({
+    const queue = buildQueuedCommentQueueSnapshot({
       issueId: input.issue.id,
       executionWait: typeof wait.reason === "string" && typeof wait.message === "string"
         ? { reason: wait.reason, message: wait.message } : null,
@@ -10014,6 +10036,12 @@ export function issueRoutes(
       actorType: input.actor.actorType,
       actorId: input.actor.actorId,
     });
+    if (wake && queuedInteractionId(wake.payload)) {
+      const response = await readQueuedInteractionResponse(input.executor as Db, input.issue.companyId, input.issue.id, wake.payload);
+      if (response?.source.requiresFreshSession) queue.steeringDisposition = "unsupported";
+      queue.entries = response ? [{ comment: response.comment, source: response.source, position: 0, canEdit: false, canDiscard: false }] : [];
+    }
+    return queue;
   }
 
   function assertQueueMutationTarget(input: {
@@ -10076,7 +10104,7 @@ export function issueRoutes(
     if (
       !wake ||
       readObject(wake.payload).issueId !== input.issue.id ||
-      queuedCommentIdsFromWakePayload(wake.payload).length === 0
+      (queuedCommentIdsFromWakePayload(wake.payload).length === 0 && !queuedInteractionId(wake.payload))
     ) {
       throw conflict("The queued message is no longer pending", {
         code: "queued_comment_not_pending",
@@ -16832,7 +16860,7 @@ export function issueRoutes(
         !runWorkspaceInheritanceSourceIssueId &&
         rawCreateBody.executionWorkspacePreference === "reuse_existing";
       // When this is genuinely the onboarding first task, the server owns the task
-      // description: assemble it from brief.md plus the proposal file the
+      // description: invoke the first-task skill and save the proposal mode the
       // enableFirstTaskPlanProposal toggle selects, read once here at creation
       // time, and ignore any client-supplied description. Flipping the toggle
       // later does not change an existing first task. Best-effort: a read failure
@@ -20002,6 +20030,14 @@ export function issueRoutes(
       !!existing.createdByUserId &&
       nextAssigneeUserId === existing.createdByUserId;
 
+    if (assigneeWillChange && actor.actorType === "agent" &&
+        existing.assigneeAgentId === actor.agentId && updateFields.status === "in_review" &&
+        await hasQueuedInteractionResponse(db, existing.companyId, existing.id, existing.assigneeAgentId)) {
+      throw conflict("The user already responded. Keep the current assignee so the queued response can continue after this run.", {
+        code: "interaction_response_queued",
+      });
+    }
+
     if (assigneeWillChange && !transition.workflowControlledAssignment) {
       if (!isAgentReturningIssueToCreator) {
         await assertCanAssignTasks(req, existing.companyId, {
@@ -23011,10 +23047,11 @@ export function issueRoutes(
           allowStoppedTarget: true,
         });
         assertQueueMutationTarget({ queue: locked.queue, queueId: req.body.queueId, revision: req.body.revision });
-        if (locked.queue.protocol !== "legacy" || locked.state !== "deferred" ||
+        const freshResponse = locked.queue.entries.some(entry => entry.source?.requiresFreshSession);
+        if ((locked.queue.protocol !== "legacy" && !freshResponse) || locked.state !== "deferred" ||
             !locked.queue.entries.length ||
             (locked.activeRun && locked.activeRun.agentId !== locked.wake.agentId)) {
-          throw conflict("This queue does not support legacy interruption");
+          throw conflict("This queue does not support interruption");
         }
         if (locked.activeRun && locked.activeRun.status !== "running" &&
             !["succeeded", "failed", "timed_out", "interrupted", "cancelled"].includes(locked.activeRun.status)) {
@@ -23074,12 +23111,19 @@ export function issueRoutes(
       );
       if (!issue) return;
       if (issue.conversationAgentId) throw conflict("Conversation messages are processed in order at turn boundaries");
+      const decision = await decideIssueAccess(req, issue, "issue:comment");
+      if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
       const actor = getActorInfo(req);
+      const responseWake = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.id, req.body.queueId), eq(agentWakeupRequests.companyId, issue.companyId),
+      )).then(rows => rows[0]);
+      const response = responseWake ? await readQueuedInteractionResponse(db, issue.companyId, issue.id, responseWake.payload) : null;
       const steeringIdentity = await reserveSteeredIdentity(db, {
         companyId: issue.companyId,
         runId: req.body.targetRunId,
         issueId: issue.id,
         messageId: commentId,
+        source: response?.comment.id === commentId ? "interaction" : "comment",
       });
       let steeringDeliveryAttempted = false;
       let acknowledgedTurnId: string | null = null;
@@ -23213,11 +23257,16 @@ export function issueRoutes(
             });
           }
 
+          if (entry.source?.requiresFreshSession) {
+            throw conflict("This approval needs a fresh turn. Interrupt or wait for the current turn to finish.", {
+              code: "queued_response_requires_fresh_session",
+            });
+          }
           steeringDeliveryAttempted = true;
           const acknowledgement =
-            (steeringIdentity
-              ? await storedSteeringAcknowledgement(tx, steeringIdentity)
-              : null) ??
+            (await storedSteeringAcknowledgement(tx, steeringIdentity ?? {
+              companyId: issue.companyId, runId: locked.activeRun.id, messageId: commentId,
+            })) ??
             (await steerNativeSession({
               runId: locked.activeRun.id,
               message: entry.comment.body,

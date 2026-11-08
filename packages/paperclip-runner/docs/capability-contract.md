@@ -179,23 +179,23 @@ The skill/reference inventory and eval cases are the only normative behavior sou
 | skill:skills/paperclip/references/api-reference.md:requesting-a-hire-management-only:874 | optional_agent_tool | skills/paperclip/references/api-reference.md:874 |
 | skill:skills/paperclip/references/api-reference.md:ceo-strategy-approval:906 | optional_agent_tool | skills/paperclip/references/api-reference.md:906 |
 | skill:skills/paperclip/references/api-reference.md:questions-and-waiting-for-human-input:915 | always_agent_tool | skills/paperclip/references/api-reference.md:915 |
-| skill:skills/paperclip/references/api-reference.md:issue-thread-confirmations:997 | always_agent_tool | skills/paperclip/references/api-reference.md:997 |
-| skill:skills/paperclip/references/api-reference.md:checkbox-confirmations:1055 | always_agent_tool | skills/paperclip/references/api-reference.md:1055 |
-| skill:skills/paperclip/references/api-reference.md:item-verdict-requests:1170 | optional_agent_tool | skills/paperclip/references/api-reference.md:1170 |
-| skill:skills/paperclip/references/api-reference.md:checking-approval-status:1280 | optional_agent_tool | skills/paperclip/references/api-reference.md:1280 |
-| skill:skills/paperclip/references/api-reference.md:approval-follow-up-requesting-agent:1286 | always_agent_tool | skills/paperclip/references/api-reference.md:1286 |
-| skill:skills/paperclip/references/api-reference.md:issue-lifecycle:1304 | always_agent_tool | skills/paperclip/references/api-reference.md:1304 |
-| skill:skills/paperclip/references/api-reference.md:error-handling:1334 | control_plane_owned | skills/paperclip/references/api-reference.md:1334 |
-| skill:skills/paperclip/references/api-reference.md:full-api-reference:1348 | optional_agent_tool | skills/paperclip/references/api-reference.md:1348 |
-| skill:skills/paperclip/references/api-reference.md:agents:1350 | optional_agent_tool | skills/paperclip/references/api-reference.md:1350 |
-| skill:skills/paperclip/references/api-reference.md:issues-tasks:1371 | optional_agent_tool | skills/paperclip/references/api-reference.md:1371 |
-| skill:skills/paperclip/references/api-reference.md:companies-projects-goals:1413 | optional_agent_tool | skills/paperclip/references/api-reference.md:1413 |
-| skill:skills/paperclip/references/api-reference.md:routines:1437 | optional_agent_tool | skills/paperclip/references/api-reference.md:1437 |
-| skill:skills/paperclip/references/api-reference.md:approvals-costs-activity-dashboard:1453 | optional_agent_tool | skills/paperclip/references/api-reference.md:1453 |
-| skill:skills/paperclip/references/api-reference.md:secrets:1475 | optional_agent_tool | skills/paperclip/references/api-reference.md:1475 |
-| skill:skills/paperclip/references/api-reference.md:agent-secret-proposals:1488 | optional_agent_tool | skills/paperclip/references/api-reference.md:1488 |
-| skill:skills/paperclip/references/api-reference.md:agent-secret-access:1588 | optional_agent_tool | skills/paperclip/references/api-reference.md:1588 |
-| skill:skills/paperclip/references/api-reference.md:common-mistakes:1628 | optional_agent_tool | skills/paperclip/references/api-reference.md:1628 |
+| skill:skills/paperclip/references/api-reference.md:issue-thread-confirmations:1006 | always_agent_tool | skills/paperclip/references/api-reference.md:1006 |
+| skill:skills/paperclip/references/api-reference.md:checkbox-confirmations:1064 | always_agent_tool | skills/paperclip/references/api-reference.md:1064 |
+| skill:skills/paperclip/references/api-reference.md:item-verdict-requests:1179 | optional_agent_tool | skills/paperclip/references/api-reference.md:1179 |
+| skill:skills/paperclip/references/api-reference.md:checking-approval-status:1289 | optional_agent_tool | skills/paperclip/references/api-reference.md:1289 |
+| skill:skills/paperclip/references/api-reference.md:approval-follow-up-requesting-agent:1295 | always_agent_tool | skills/paperclip/references/api-reference.md:1295 |
+| skill:skills/paperclip/references/api-reference.md:issue-lifecycle:1313 | always_agent_tool | skills/paperclip/references/api-reference.md:1313 |
+| skill:skills/paperclip/references/api-reference.md:error-handling:1343 | control_plane_owned | skills/paperclip/references/api-reference.md:1343 |
+| skill:skills/paperclip/references/api-reference.md:full-api-reference:1357 | optional_agent_tool | skills/paperclip/references/api-reference.md:1357 |
+| skill:skills/paperclip/references/api-reference.md:agents:1359 | optional_agent_tool | skills/paperclip/references/api-reference.md:1359 |
+| skill:skills/paperclip/references/api-reference.md:issues-tasks:1380 | optional_agent_tool | skills/paperclip/references/api-reference.md:1380 |
+| skill:skills/paperclip/references/api-reference.md:companies-projects-goals:1422 | optional_agent_tool | skills/paperclip/references/api-reference.md:1422 |
+| skill:skills/paperclip/references/api-reference.md:routines:1446 | optional_agent_tool | skills/paperclip/references/api-reference.md:1446 |
+| skill:skills/paperclip/references/api-reference.md:approvals-costs-activity-dashboard:1462 | optional_agent_tool | skills/paperclip/references/api-reference.md:1462 |
+| skill:skills/paperclip/references/api-reference.md:secrets:1484 | optional_agent_tool | skills/paperclip/references/api-reference.md:1484 |
+| skill:skills/paperclip/references/api-reference.md:agent-secret-proposals:1497 | optional_agent_tool | skills/paperclip/references/api-reference.md:1497 |
+| skill:skills/paperclip/references/api-reference.md:agent-secret-access:1597 | optional_agent_tool | skills/paperclip/references/api-reference.md:1597 |
+| skill:skills/paperclip/references/api-reference.md:common-mistakes:1637 | optional_agent_tool | skills/paperclip/references/api-reference.md:1637 |
 
 ## Legacy MCP Alias Index
 
