@@ -11,6 +11,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   applyWorktreeSecretsMasterKeyEnvOverrides,
+  applyWorktreeSecretsMasterKeyEnvOverridesFromRuntimeEnv,
   bootstrapDevRunnerWorktreeEnv,
   isWorktreeSeedPending,
   isLinkedGitWorktreeCheckout,
@@ -19,8 +20,13 @@ import {
 } from "../dev-runner-worktree.ts";
 
 const tempRoots = new Set<string>();
+const originalCwd = process.cwd();
+const originalPaperclipConfig = process.env.PAPERCLIP_CONFIG;
 
 afterEach(() => {
+  process.chdir(originalCwd);
+  if (originalPaperclipConfig === undefined) delete process.env.PAPERCLIP_CONFIG;
+  else process.env.PAPERCLIP_CONFIG = originalPaperclipConfig;
   for (const root of tempRoots) {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -31,6 +37,48 @@ function createTempRoot(prefix: string): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   tempRoots.add(root);
   return root;
+}
+
+function createRuntimeMasterKeyWorktree(seedMode: "minimal" | "minimal-no-secrets") {
+  const root = createTempRoot("paperclip-dev-runner-runtime-master-key-");
+  const stateDir = path.join(root, ".paperclip");
+  const serverDir = path.join(root, "server");
+  const configPath = path.join(stateDir, "config.json");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(serverDir, { recursive: true });
+  fs.writeFileSync(path.join(root, ".git"), "gitdir: /tmp/paperclip/.git/worktrees/feature\n", "utf8");
+  fs.writeFileSync(configPath, "{}\n", "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, ".env"),
+    [
+      "PAPERCLIP_IN_WORKTREE=true",
+      `PAPERCLIP_CONFIG=${configPath}`,
+      "UNRELATED=local-value",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(stateDir, "seed-manifest.json"),
+    JSON.stringify({
+      version: 2,
+      source: { instanceId: "source", configPath: "/source/config.json" },
+      snapshotAt: "2026-08-18T00:00:00.000Z",
+      seedMode,
+      migrationRevision: "0001",
+      targetInstanceId: "target",
+      phase: "complete",
+      state: "verified",
+      attemptId: "attempt",
+      startedAt: "2026-08-18T00:00:00.000Z",
+      finishedAt: "2026-08-18T00:01:00.000Z",
+      diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-08-18T00:01:00.000Z" }],
+    }),
+    "utf8",
+  );
+  process.chdir(serverDir);
+  process.env.PAPERCLIP_CONFIG = configPath;
+  return { configPath };
 }
 
 describe("dev-runner worktree env bootstrap", () => {
@@ -244,6 +292,38 @@ describe("dev-runner worktree env bootstrap", () => {
       "utf8",
     );
     expect(applyWorktreeSecretsMasterKeyEnvOverrides(root, { ...inheritedEnv })).toEqual(inheritedEnv);
+  });
+
+  it("deletes inherited master-key settings through managed runtime config resolution", () => {
+    const { configPath } = createRuntimeMasterKeyWorktree("minimal-no-secrets");
+    const result = applyWorktreeSecretsMasterKeyEnvOverridesFromRuntimeEnv({
+      PAPERCLIP_CONFIG: configPath,
+      PAPERCLIP_IN_WORKTREE: "true",
+      PAPERCLIP_SECRETS_MASTER_KEY: "inherited-master-key",
+      PAPERCLIP_SECRETS_MASTER_KEY_FILE: "/tmp/inherited-master.key",
+      UNRELATED: "inherited-value",
+    });
+
+    expect(result).toEqual({
+      PAPERCLIP_CONFIG: configPath,
+      PAPERCLIP_IN_WORKTREE: "true",
+      UNRELATED: "inherited-value",
+    });
+    expect("PAPERCLIP_SECRETS_MASTER_KEY" in result).toBe(false);
+    expect("PAPERCLIP_SECRETS_MASTER_KEY_FILE" in result).toBe(false);
+  });
+
+  it("keeps inherited master-key settings through managed runtime config resolution outside minimal-no-secrets", () => {
+    const { configPath } = createRuntimeMasterKeyWorktree("minimal");
+    const inheritedEnv = {
+      PAPERCLIP_CONFIG: configPath,
+      PAPERCLIP_IN_WORKTREE: "true",
+      PAPERCLIP_SECRETS_MASTER_KEY: "inherited-master-key",
+      PAPERCLIP_SECRETS_MASTER_KEY_FILE: "/tmp/inherited-master.key",
+      UNRELATED: "inherited-value",
+    };
+
+    expect(applyWorktreeSecretsMasterKeyEnvOverridesFromRuntimeEnv({ ...inheritedEnv })).toEqual(inheritedEnv);
   });
 
   it("loads repo-local Paperclip env for initialized worktrees without overriding explicit env", () => {
