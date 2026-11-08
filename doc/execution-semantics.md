@@ -182,7 +182,9 @@ first and cancellation is then attempted only for a run the route's existing
 lookup finds: the execution-lock holder or the assignee's issue-scoped active
 run. An issuer that lookup cannot find is not cancelled, as before this change.
 A cancellation attempt can throw or leave the run running. The handoff stays
-saved; the route logs a warning and a `heartbeat.cancel_failed` activity.
+saved; the route logs a warning and a `heartbeat.cancel_failed` activity. A
+terminal approval keeps the confirmed stop before the write: an unconfirmed stop
+returns `409 runner_goal_reassignment_stop_unconfirmed` and saves nothing.
 
 Under the issue row lock, a non-terminal assignee change retains a running
 holder identified by the issue's existing execution or checkout binding. It
