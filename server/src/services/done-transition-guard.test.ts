@@ -610,6 +610,27 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
+    it("attributes a backstop refusal to the calling reaper and run", async () => {
+      const result = await evaluateDoneTransitionGuardForBackstopClose({
+        db: mockDb,
+        issue: { ...issue, executionPolicy: ladderPolicy, executionState: {} },
+        actorId: "system:execution-control-reconciliation",
+        runId: "reaper-run-1",
+        closeComment: null,
+      });
+
+      expect(result.allowed).toBe(false);
+      expect(logActivity).toHaveBeenCalledWith(
+        mockDb,
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_refused",
+          actorType: "system",
+          actorId: "system:execution-control-reconciliation",
+          runId: "reaper-run-1",
+        }),
+      );
+    });
+
     it("refuses done for the literal SUP-8098 shape: parked pending on stage 1 with zero decisions (AC2)", async () => {
       // The state as it landed on SUP-8098: pending at stage index 0, no
       // completedStageIds. It does not round-trip the state schema (the

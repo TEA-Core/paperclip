@@ -496,7 +496,7 @@ describeEmbeddedPostgres(
       );
     });
 
-    it("SUP-21910: a guard refusal defers the card instead of closing around the ladder", async () => {
+    it("SUP-21910: an unchanged guard refusal is deferred without another attempt or audit row", async () => {
       // Mechanism C: the card carries a review ladder with no recorded
       // decision for its current stage. The reaper must NOT terminalize it —
       // the silent bypass was the defect — and the refusal surfaces as the
@@ -541,14 +541,20 @@ describeEmbeddedPostgres(
         .select()
         .from(activityLog)
         .where(eq(activityLog.entityId, issueId));
-      expect(refusalAudits).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            action: "issue.done_transition_ladder_refused",
-            actorId: "done-transition-guard",
-          }),
-        ]),
-      );
+      const ladderRefusals = refusalAudits.filter((row) => row.action === "issue.done_transition_ladder_refused");
+      expect(ladderRefusals).toEqual([
+        expect.objectContaining({
+          actorId: "system:execution-control-reconciliation",
+          runId: null,
+        }),
+      ]);
+
+      expect(await reapStrandedSummaryGenerationIssues(db)).toEqual({ scanned: 0, terminalized: 0 });
+      const auditsAfterRerun = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.entityId, issueId));
+      expect(auditsAfterRerun.filter((row) => row.action === "issue.done_transition_ladder_refused")).toHaveLength(1);
 
       // This describe shares one database and isolates with fresh rows, so a
       // card this test deliberately leaves non-terminal would inflate every
@@ -572,7 +578,7 @@ describeEmbeddedPostgres(
       expect((await getIssue(issueId))?.status).toBe("done");
     });
 
-    it("terminalizes a blocked summary task and releases a still-armed slot binding", async () => {
+    it("excludes a blocked summary task from stranded-generation candidates", async () => {
 
       const issueId = await seedStrandedGenerationTask({ companyId, reviewerAgentId, status: "blocked" });
       const slotId = randomUUID();
@@ -588,18 +594,17 @@ describeEmbeddedPostgres(
 
       const result = await reapStrandedSummaryGenerationIssues(db);
 
-      expect(result).toEqual({ scanned: 1, terminalized: 1 });
-      expect((await getIssue(issueId))?.status).toBe("done");
-      // The terminal transition runs the same slot finalizer SUP-17609 relies on:
-      // the binding is cleared. This generation wrote no surviving revision, so
-      // the slot fails closed to "failed" for the refresh sweep to regenerate.
+      expect(result).toEqual({ scanned: 0, terminalized: 0 });
+      expect((await getIssue(issueId))?.status).toBe("blocked");
       const [slot] = await db
         .select()
         .from(summarySlots)
         .where(eq(summarySlots.id, slotId))
         .limit(1);
-      expect(slot?.generatingIssueId).toBeNull();
-      expect(slot?.status).toBe("failed");
+      expect(slot?.generatingIssueId).toBe(issueId);
+      expect(slot?.status).toBe("generating");
+      await db.delete(summarySlots).where(eq(summarySlots.id, slotId));
+      await db.delete(issues).where(eq(issues.id, issueId));
     });
 
     it("terminalizes a todo summary task with a null execution state", async () => {

@@ -624,7 +624,12 @@ export async function githubBranchHasMergedPr(
 
 async function writeAuditLog(
   db: Db,
-  issue: { id: string; companyId: string; identifier: string | null },
+  issue: {
+    id: string;
+    companyId: string;
+    identifier: string | null;
+    doneTransitionAuditProvenance?: { actorId: string; runId: string | null };
+  },
   action: string,
   details: Record<string, unknown>,
 ) {
@@ -632,9 +637,9 @@ async function writeAuditLog(
     await logActivity(db, {
       companyId: issue.companyId,
       actorType: "system",
-      actorId: "done-transition-guard",
+      actorId: issue.doneTransitionAuditProvenance?.actorId ?? "done-transition-guard",
       agentId: null,
-      runId: null,
+      runId: issue.doneTransitionAuditProvenance?.runId ?? null,
       agentApiKeyId: null,
       action,
       entityType: "issue",
@@ -3347,6 +3352,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
   db: Db;
   issue: Parameters<typeof evaluateDoneTransitionGuard>[1] & { id: string };
   actorId: string;
+  runId?: string | null;
   closeComment: string | null;
   structuredDoneTier?: DoneTierDeclaration | null;
   listComments?: (issueId: string) => Promise<IssueComment[]>;
@@ -3363,8 +3369,12 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
       reason: string;
     }
 > {
-  const { db, issue, actorId, closeComment, structuredDoneTier, listComments } = input;
-  const guardResult = await evaluateDoneTransitionGuard(db, issue, null, false);
+  const { db, issue, actorId, runId = null, closeComment, structuredDoneTier, listComments } = input;
+  const guardIssue = {
+    ...issue,
+    doneTransitionAuditProvenance: { actorId, runId },
+  };
+  const guardResult = await evaluateDoneTransitionGuard(db, guardIssue, null, false);
   if (!guardResult.allowed) {
     return {
       allowed: false,
@@ -3389,13 +3399,13 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
       };
     }
     if (tierResult.tier === "tier1") {
-      void writeAuditLog(db, issue, "issue.done_transition_tier1_close", {
+      void writeAuditLog(db, guardIssue, "issue.done_transition_tier1_close", {
         reason: tierResult.reason,
         systemBackstopActor: actorId,
       });
     }
     if (tierResult.tier === "tier2" && tierResult.tier2Audit) {
-      void writeAuditLog(db, issue, "issue.done_transition_tier2_close", {
+      void writeAuditLog(db, guardIssue, "issue.done_transition_tier2_close", {
         reason: tierResult.reason,
         systemBackstopActor: actorId,
         ...tierResult.tier2Audit,
@@ -4338,6 +4348,7 @@ async function evaluateDoneTransitionGuardCore(
     executionPolicy?: unknown;
     executionState?: unknown;
     deliveryRequirement?: IssueDeliveryRequirement | null;
+    doneTransitionAuditProvenance?: { actorId: string; runId: string | null };
   },
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
