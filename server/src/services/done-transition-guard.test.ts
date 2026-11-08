@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   agents as agentsTable,
+  heartbeatRuns as heartbeatRunsTable,
   issueExecutionDecisions as issueExecutionDecisionsTable,
   issueLabels as issueLabelsTable,
   issueRelations as issueRelationsTable,
@@ -154,7 +155,7 @@ function filterLabelRowsByName(
  * `select().from().where()` resolves to the `executionWorkspaces` rows exactly
  * as the legacy positional chain did, so pre-existing tests are untouched.
  */
-function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[]; issueWorkProducts?: Record<string, unknown>[] }) {
+function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[]; issueWorkProducts?: Record<string, unknown>[]; heartbeatRuns?: Record<string, unknown>[] }) {
   // SUP-15233: the guard reads the issues table twice inside
   // countLadderedChildren: read 1 is the parent_id edge (decomposition
   // children), read 2 is the inArray re-read (blockedBy edge, only present in
@@ -215,6 +216,16 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     where: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
     then: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
   };
+  // SUP-23490: the tier evaluator reads the closing run's heartbeat row
+  // (startedAt/createdAt) to place a record-only observation inside the
+  // closing run's lifetime. Dispatch by table identity; unseeded tests
+  // return [] so a run id that no test seeds resolves to no row (the
+  // lifetime gate then refuses record-only evidence that carries one).
+  const heartbeatRunsChain = {
+    from: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue(rows.heartbeatRuns ?? []),
+    then: vi.fn().mockResolvedValue(rows.heartbeatRuns ?? []),
+  };
   const selectChain = {
     from: vi.fn().mockReturnThis(),
     where: vi.fn().mockResolvedValue(rows.executionWorkspaces ?? []),
@@ -251,6 +262,7 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
         if (table === labelsTable) return labelsChain;
         if (table === issueLabelsTable) return issueLabelsChain;
         if (table === issueWorkProductsTable) return workProductsChain;
+        if (table === heartbeatRunsTable) return heartbeatRunsChain;
         const chain = chains[callCount] ?? selectChain;
         callCount++;
         return chain;
@@ -6130,6 +6142,15 @@ describe("evaluateDoneTierDeclaration", () => {
     });
 
     it("accepts the same record-only declaration from the same-run comment path", async () => {
+      // SUP-23490: the same-run path faces the closing-run lifetime gate too, so
+      // the seeded run must have started before the cited observation — the
+      // ordinary shape of a run that probed mid-execution — and the accepted
+      // audit stamps the closing run identity beside the observation.
+      setupDbMock({
+        heartbeatRuns: [
+          { id: "run-1", companyId: "company-1", startedAt: new Date("2026-11-04T09:00:00Z"), createdAt: new Date("2026-11-04T08:58:00Z") },
+        ],
+      });
       const result = await evaluateDoneTierDeclaration(
         mockDb,
         recordOnlyTierIssue(),
@@ -6140,6 +6161,7 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.allowed).toBe(true);
       expect(result.tier).toBe("tier2");
       expect(result.reason).toContain("same-run comment");
+      expect(result.tier2Audit).toMatchObject({ closingRunId: "run-1", closingRunStartedAt: "2026-11-04T09:00:00.000Z" });
       expect(ghFetchMock).not.toHaveBeenCalled();
     });
 
@@ -6267,6 +6289,167 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(ghFetchMock).not.toHaveBeenCalled();
     });
 
+    // SUP-23490: the record-only `observed` instant must fall inside the
+    // CLOSING run's lifetime. SUP-22817 restated SUP-22444's close line
+    // byte-for-byte — a different run citing the first run's observation five
+    // minutes later — and the guard accepted it because nothing compared the
+    // cited instant against the run that was closing.
+    describe("observation must fall inside the closing run's lifetime (SUP-23490)", () => {
+      function seededRun(startedAt: string) {
+        return { id: "run-1", companyId: "company-1", startedAt: new Date(startedAt), createdAt: new Date("2026-11-04T08:00:00Z") };
+      }
+
+      function evidenceObservedAt(observation: string) {
+        return `record-only probe \`curl -fsS https://ops.example.com/api/sweep/healthz\` target https://ops.example.com observed ${observation} result: pass active recovery action null`;
+      }
+
+      it("refuses an observation predating the closing run's start, naming the run and its start", async () => {
+        setupDbMock({ heartbeatRuns: [seededRun("2026-11-08T07:15:00Z")] });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-08T07:12:36Z")),
+          "run-1",
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("predates the closing run");
+        expect(result.reason).toContain("run run-1, started 2026-11-08T07:15:00.000Z");
+        expect(result.reason).toContain("restated");
+        expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+        expect(ghFetchMock).not.toHaveBeenCalled();
+      });
+
+      it("negative control: the same probe text reused by a second run that started after the observation is refused", async () => {
+        // The SUP-22817 shape: run A observes 07:12:36 and closes; run B starts
+        // 07:14, copies run A's declaration, closes 07:18 — accepted before this
+        // gate, refused now.
+        setupDbMock({ heartbeatRuns: [seededRun("2026-11-08T07:14:00Z")] });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-08T07:12:36Z")),
+          "run-1",
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toContain("predates the closing run");
+      });
+
+      it("accepts an observation inside the run's lifetime and stamps the closing run into the audit", async () => {
+        setupDbMock({ heartbeatRuns: [seededRun("2026-11-08T07:10:00Z")] });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-08T07:12:36Z")),
+          "run-1",
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier2");
+        expect(result.tier2Audit).toMatchObject({
+          observed: "2026-11-08T07:12:36Z",
+          closingRunId: "run-1",
+          closingRunStartedAt: "2026-11-08T07:10:00.000Z",
+        });
+      });
+
+      it("falls back to createdAt when the closing run has no startedAt", async () => {
+        setupDbMock({
+          heartbeatRuns: [{ id: "run-1", companyId: "company-1", startedAt: null, createdAt: new Date("2026-11-08T07:10:00Z") }],
+        });
+        const accepted = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-08T07:12:36Z")),
+          "run-1",
+          () => Promise.resolve([]),
+        );
+        expect(accepted.allowed).toBe(true);
+        expect(accepted.tier2Audit).toMatchObject({ closingRunStartedAt: "2026-11-08T07:10:00.000Z" });
+        const refused = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-08T07:09:00Z")),
+          "run-1",
+          () => Promise.resolve([]),
+        );
+        expect(refused.allowed).toBe(false);
+        expect(refused.reason).toContain("predates the closing run");
+      });
+
+      it("refuses a closing run whose heartbeat row cannot be resolved (fail-closed)", async () => {
+        setupDbMock({});
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-08T07:12:36Z")),
+          "run-1",
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("no heartbeat run row");
+        expect(result.reason).toContain("run run-1");
+      });
+
+      it("refuses an observation postdating the evaluation beyond the clock-skew allowance", async () => {
+        setupDbMock({ heartbeatRuns: [seededRun("2026-11-04T08:00:00Z")] });
+        const future = new Date(Date.now() + 30 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt(future)),
+          "run-1",
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toContain("postdates this evaluation");
+        expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+      });
+
+      it("keeps doors without a run id on the grammar checks alone and records the absent closing run", async () => {
+        // No heartbeatRuns seeded, runId null (human close / system backstop):
+        // there is no lifetime to compare against, so the pre-existing grammar
+        // verdict stands and the audit's closingRunId is null.
+        setupDbMock({});
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-04T09:15:00Z")),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier2");
+        expect(result.tier2Audit).toMatchObject({ closingRunId: null, closingRunStartedAt: null });
+      });
+
+      it("does not lifetime-gate the merge-head grammar but still stamps the closing run", async () => {
+        setupTier2OriginMocks();
+        mockRefHeadResolutions([
+          { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+          { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+        ]);
+        // The merge-head grammar names no `observed` instant — its origin
+        // predicate binds the evidence to the delivery merge head — so the
+        // closing-run lifetime gate must not fire on it; the closing run id is
+        // still recorded on the audit. The closing run row is deliberately NOT
+        // seeded: a live-form close never reads heartbeat_runs.
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          { ...repoBackedTierIssue(), deliveryRequirement: "record_only" as const },
+          tier2Line(validTier2Evidence()),
+          "run-1",
+          () => Promise.resolve([mockComment(tier2Line(validTier2Evidence()), "run-1")]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier2");
+        expect(result.tier2Audit).toMatchObject({ tierForm: "live", closingRunId: "run-1", closingRunStartedAt: null });
+      });
+    });
+
     it("names the record-only form in the missing-declaration refusal on a record_only card", async () => {
       const result = await evaluateDoneTierDeclaration(
         mockDb,
@@ -6311,6 +6494,10 @@ describe("evaluateDoneTierDeclaration", () => {
             tierForm: "record-only",
             probeHead: null,
             mergeCommit: null,
+            // SUP-23490: the backstop door carries no run id, so the machine
+            // record says so instead of inventing a closing run.
+            closingRunId: null,
+            closingRunStartedAt: null,
           },
         }),
       );

@@ -5,6 +5,7 @@ import {
   documentRevisions,
   documents,
   executionWorkspaces,
+  heartbeatRuns,
   issueDocuments,
   issueExecutionDecisions,
   issueLabels,
@@ -290,6 +291,16 @@ interface DoneTier2CloseAuditDetails {
   tierForm: "live" | "record-only";
   probeHead: string | null;
   mergeCommit: string | null;
+  /**
+   * SUP-23490: the run that performed the close, as the closing door carried it
+   * (null on doors without a run — human closes and the system backstop). With
+   * `closingRunStartedAt` and `observed` in the same record, a restated
+   * observation (an `observed` instant predating the closing run) is detectable
+   * after the fact from the audit row alone.
+   */
+  closingRunId?: string | null;
+  /** SUP-23490: the closing run's resolved start (`startedAt ?? createdAt`), when resolvable. */
+  closingRunStartedAt?: string | null;
 }
 
 export interface DoneTierDeclarationResult {
@@ -1765,6 +1776,110 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
   });
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// SUP-23490: a record-only Tier 2 observation must belong to the CLOSING run.
+// The record-only grammar's `observed` instant is the whole liveness claim, and
+// nothing used to compare it against the closing run's lifetime, so a run could
+// restate another run's close line byte-for-byte (SUP-22444 → SUP-22817, a
+// 290-character verbatim copy whose cited state was already false) and be
+// accepted as fresh proof. The guard now loads the closing run's
+// `heartbeat_runs` row and refuses an observation that predates the run's
+// start (`startedAt ?? createdAt` — both precede any probe the run itself can
+// make) or that postdates the evaluation by more than a clock-skew allowance,
+// with the reason naming the run and its start. Fail-closed: a closing run
+// whose row cannot be resolved has no verifiable lifetime, so the observation
+// cannot be attributed to it. The merge-head grammar has no `observed`
+// component and its origin predicate (probe head == delivery merge head) is
+// unchanged: it is stamped with the closing run id but never lifetime-gated.
+// Doors without a run id (human closes, the system backstop) have no lifetime
+// to compare against; they keep the pre-existing grammar checks only, and the
+// audit row's null `closingRunId` says so. Every accepted result — both forms —
+// is stamped with `closingRunId`/`closingRunStartedAt` so the
+// `issue.done_transition_tier2_close` activity row carries the closing run
+// identity beside the cited observation (SUP-23366's machine record).
+// ───────────────────────────────────────────────────────────────────────
+const TIER2_OBSERVED_CLOCK_SKEW_MS = 5 * 60 * 1000;
+
+async function loadClosingRunStart(
+  db: Db,
+  companyId: string,
+  runId: string,
+): Promise<Date | null> {
+  const rows = await db
+    .select({ startedAt: heartbeatRuns.startedAt, createdAt: heartbeatRuns.createdAt })
+    .from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
+  const row = rows[0];
+  if (!row) {
+    return null;
+  }
+  return row.startedAt ?? row.createdAt;
+}
+
+async function attributeTier2EvidenceToClosingRun(
+  db: Db,
+  issue: { companyId: string },
+  result: DoneTierDeclarationResult,
+  runId: string | null,
+): Promise<DoneTierDeclarationResult> {
+  if (!result.allowed || !result.tier2Audit) {
+    return result;
+  }
+  const audit: DoneTier2CloseAuditDetails = {
+    ...result.tier2Audit,
+    closingRunId: runId,
+    closingRunStartedAt: null,
+  };
+  // The merge-head form's origin predicate (probe head resolves to the recorded
+  // delivery merge head) already binds the evidence to the delivery; there is
+  // no observation instant to place inside the run's lifetime.
+  if (audit.tierForm !== "record-only" || !runId) {
+    return { ...result, tier2Audit: audit };
+  }
+  let runStart: Date | null = null;
+  try {
+    runStart = await loadClosingRunStart(db, issue.companyId, runId);
+  } catch (err) {
+    return refuseTier2(
+      `record-only close Tier 2 probe evidence could not be checked against the closing run's lifetime ` +
+        `(heartbeat run lookup for ${runId} failed: ${err instanceof Error ? err.message : "unknown"}); a closing ` +
+        "run whose lifetime cannot be resolved cannot prove the cited observation is its own. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
+  }
+  if (runStart === null) {
+    return refuseTier2(
+      `record-only close Tier 2 probe evidence cannot be attributed to the closing run: run ${runId} has no ` +
+        "heartbeat run row, so the closing run's lifetime is unresolvable and the cited observation cannot be " +
+        "proven to be this run's. Re-probe from this run and close with the fresh observed timestamp. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
+  }
+  const runStartMs = runStart.getTime();
+  const observedStartMs = Date.parse(audit.observed ?? "");
+  if (!Number.isNaN(observedStartMs) && observedStartMs < runStartMs) {
+    return refuseTier2(
+      `record-only close Tier 2 probe evidence names observed instant ${audit.observed}, which predates the ` +
+        `closing run (run ${runId}, started ${runStart.toISOString()}); an observation made before this run began ` +
+        "is another run's observation restated, not this run's live proof. Re-probe from this run and close " +
+        "with the fresh observed timestamp. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
+  }
+  const latestObserved = audit.observedRangeEnd ?? audit.observed;
+  const latestObservedMs = latestObserved ? Date.parse(latestObserved) : Number.NaN;
+  if (!Number.isNaN(latestObservedMs) && latestObservedMs > Date.now() + TIER2_OBSERVED_CLOCK_SKEW_MS) {
+    return refuseTier2(
+      `record-only close Tier 2 probe evidence names observed instant ${latestObserved}, which postdates this ` +
+        "evaluation by more than the allowed clock skew; an observation cannot be made after the close that " +
+        "cites it. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
+  }
+  audit.closingRunStartedAt = runStart.toISOString();
+  return { ...result, tier2Audit: audit };
+}
+
 async function proveTier2Live(
   db: Db,
   issue: {
@@ -2680,7 +2795,15 @@ export async function evaluateDoneTierDeclaration(
       // the origin predicate resolves the named probe head and compares it with
       // the delivery merge head before the close is allowed. SUP-22801: on a
       // record_only card the record-only grammar is proven locally instead.
-      return proveTier2Live(db, issue, tier2.evidence, false, issue.deliveryRequirement);
+      // SUP-23490: the accepted evidence is then attributed to the closing run —
+      // a record-only `observed` instant outside the closing run's lifetime is
+      // refused as a restated observation.
+      return attributeTier2EvidenceToClosingRun(
+        db,
+        issue,
+        await proveTier2Live(db, issue, tier2.evidence, false, issue.deliveryRequirement),
+        runId,
+      );
     }
     const tier1 = parseTier1Declaration(accompanyingComment);
     if (tier1.kind === "matched") {
@@ -2764,8 +2887,14 @@ export async function evaluateDoneTierDeclaration(
   if (tier2.kind === "matched") {
     // SUP-21902: same-run Tier 2 declarations face the same origin predicate as
     // accompanying-comment ones — a pre-merge or unresolvable head is refused
-    // identically on both doors.
-    return proveTier2Live(db, issue, tier2.evidence, true, issue.deliveryRequirement);
+    // identically on both doors. SUP-23490: the same closing-run lifetime gate
+    // applies — a same-run comment can still restate another run's observation.
+    return attributeTier2EvidenceToClosingRun(
+      db,
+      issue,
+      await proveTier2Live(db, issue, tier2.evidence, true, issue.deliveryRequirement),
+      runId,
+    );
   }
 
   const tier1 = parseTier1Declaration(sameRunComment.body);
