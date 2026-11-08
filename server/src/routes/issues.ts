@@ -9563,6 +9563,7 @@ export function issueRoutes(
     // same row lock. It waives the ownership check below and nothing else --
     // the active-run lock that follows still applies.
     recoveryOwnerAuthorized = false,
+    effectiveRunId?: string | null,
   ) {
     if (req.actor.type !== "agent") return;
     const actorAgentId = req.actor.agentId;
@@ -13702,6 +13703,7 @@ export function issueRoutes(
         )
       )
         return;
+      let resolvedRecoveryRunId: string | null = null;
       if (req.actor.type === "agent") {
         const boundaryDecision = await decideIssueAccess(
           req,
@@ -13738,7 +13740,10 @@ export function issueRoutes(
           );
           return;
         }
-        if (!requireAgentRunId(req, res)) return;
+        resolvedRecoveryRunId = await requireAgentRunId(req, res, {
+          checkoutRunId: existing.checkoutRunId ?? existing.executionRunId ?? null,
+        });
+        if (!resolvedRecoveryRunId) return;
         if (
           !(await assertCrossIssueInfluenceWithinRunCap(
             req,
@@ -13900,7 +13905,7 @@ export function issueRoutes(
                 }
               : null,
           commentBody: doneTierResolutionNote,
-          runId: actor.runId ?? null,
+          runId: resolvedRecoveryRunId,
           closingAgentId: actor.agentId ?? null,
           decisionCarried: !!doneCarryTransition.decision,
           boardActor: req.actor.type === "board",
@@ -14147,6 +14152,7 @@ export function issueRoutes(
               lockedIssue,
               activeRecoveryAction,
               recoveryOwnerAuthorizedThisResolution,
+              resolvedRecoveryRunId,
             );
           }
 
@@ -20151,11 +20157,6 @@ export function issueRoutes(
         issue: finalDeliveryIssue,
         override,
         commentBody: commentBody ?? null,
-        // The run id header is optional on agent requests, so an agent close
-        // that omits it falls back to the issue's own checkout/execution run
-        // when that resolves to a running self-declared run of this agent;
-        // otherwise null reaches the tier guard, which refuses an agent
-        // record-only Tier 2 close with no resolvable closing run.
         runId: actor.runId?.trim()
           || await resolveSelfDeclaredRunIdForIssue(
             actor.agentId ?? undefined,
@@ -25518,7 +25519,12 @@ export function issueRoutes(
           issue: currentIssue,
           override: null,
           commentBody: commentBody ?? null,
-          runId: actor.runId ?? null,
+          runId: actor.runId?.trim()
+            || await resolveSelfDeclaredRunIdForIssue(
+              actor.agentId ?? undefined,
+              currentIssue.checkoutRunId ?? currentIssue.executionRunId ?? null,
+            )
+            || null,
           closingAgentId: actor.agentId ?? null,
           decisionCarried: !!transition.decision,
           boardActor: req.actor.type === "board",
