@@ -619,15 +619,178 @@ A `blocked` issue is stalled when the unresolved blocker leaf has no active run,
 Paperclip now treats crash/restart recovery as a stranded-assigned-work problem, not just a stranded-run problem.
 
 The HTTP listener binds before startup recovery so surviving runners can
-reconnect. Recovery-action reconciliation logs and skips an individual failed
-action, allowing the other actions and startup to continue. A fatal startup
-failure after binding instead closes the HTTP listener before ending database
+reconnect. Inside the wrapped startup sweeps below, a per-card failure of any
+error class except a lost database connection is logged and that card is
+skipped. That includes assignee-review refusals and non-connection database
+failures (constraint, check, deadlock). The helper rethrows a lost database
+connection (`CONNECTION_CLOSED`, `CONNECTION_ENDED`, `CONNECTION_DESTROYED`,
+anywhere on the error `cause` chain). For the wrapped sweeps other than the
+host-restart strand sweep, that rethrow fails startup.
+`server/src/index.ts` catches every error from `sweepHostRestartStrandedIssues`,
+including a lost connection. It logs `startup host-restart strand sweep failed`
+and does not rethrow. Later startup steps still run. If those later steps
+succeed, startup can finish after that sweep fails. The log carries
+the issue identifier, the sweep name, and the error class and message. Writes
+made earlier in the same iteration (recovery action, comment, wake) may
+already have persisted. The sweep continues with the remaining cards so
+startup can finish and the listener stays open.
+
+The Wiki handoff guard runs on any issue write that is not purely status and
+blocker bookkeeping. `assigneeUserId` is guarded, the same as
+`assigneeAgentId`. The guard is skipped only when every present key is in this
+allow-list: `status`, `blockedByIssueIds`, `lastStatusDecisionId`,
+`unblockDescriptor`, `companyGuard`. A status-only or blocker-only park still
+passes, and so does the native policy-review cleanup, which writes `status`,
+`lastStatusDecisionId` and `unblockDescriptor` together. Any other key,
+including `priority`, `labelIds`, `hiddenAt`, `parentId`, `billingCode`,
+`requestDepth`, `statusVersion`, and the monitor columns, runs the guard. The
+monitor re-arm paths always send `executionPolicy` with the monitor columns, and
+the native status-decision commits send `statusVersion` with
+`actorAgentId` and `actorUserId` (null values still count as present keys), so
+those keys never form a write on their own and are not allow-listed. Known
+consequence: an exhausted non-canonical Wiki handoff card gets no monitor, and
+the sweep logs one error per tick. The recovery-issue fallback runs when the
+monitor arm returns null. It does not run after a successful arm. A thrown
+guard error stops the card before that fallback, so the card also gets no
+recovery issue. The same monitor refusal holds for a non-canonical Wiki handoff
+card that is `in_progress`, or `in_review` with an invokable participant, whose
+latest run failed on provider quota. That card gets no monitor and no board
+item. The base build crashed startup on the same cards. A follow-up change owns
+this gap. Latent gap, unchanged by this change:
+an explicit `executionPolicy: undefined` in the update data is dropped before the
+allow-list check, so it skips the guard, and the update then writes a null
+execution policy.
+
+The boundary is the write path. Per-card isolation is required for every
+startup sweep that writes issue rows through the guarded issue service
+(`issueService.update`), because the Wiki handoff guard and the other assignee
+and review gates can refuse that write. Steps that only write run, wake or
+session rows, or that clear raw lock columns (`executionRunId`,
+`executionAgentNameKey`, `executionLockedAt`, `checkoutRunId`) with direct
+drizzle updates inside a per-run loop, stay fail-fast on purpose: those loops
+are not the guarded issue-service path. A failure there, including a database
+failure, still stops startup.
+
+Each card's repair is processed inside the shared `runRecoverySweepIssue` helper
+in these startup sweeps. For `sweepHostRestartStrandedIssues`, the sweep gathers
+facts for each candidate before it enters the helper. A non-connection error in
+that phase aborts the sweep, and later cards are not processed. That is the same
+as the base build. Per-card isolation applies only to the wrapped repair phase.
+The helper accepts only the names in `RECOVERY_SWEEP_NAMES`
+(`server/src/lib/recovery-sweep-isolation.ts`), so a call site with an
+unregistered name fails typecheck, and the sweep isolation table test runs an
+injected-failure case per registered name, with the failing card in both
+iteration positions, and checks that the sweep's effect landed on the other
+card and not on the refused one. Each line says how the card body
+reaches `issueService.update`, the guarded path:
+
+- `reconcileStrandedAssignedIssues`: `blockIssueWithUnresolvedBlockers`,
+  `escalateStrandedAssignedIssue`, `repairNativeBlockedWait`,
+  `resolveContinuationWaitingOnReview` and
+  `scheduleProviderQuotaRecoveryMonitor` all call it.
+- Unassigned blocking issues (`reconcileUnassignedBlockingIssues`): the
+  reassignment calls `issueService(txDb).update` with `assigneeAgentId`.
+- `reconcileStillbornAssignedBacklog`: `escalateStrandedAssignedIssue` calls it.
+- `reconcileBlockedWithoutBlockers` (also run through
+  `reconcileIssueGraphLiveness`): the heal and `armExhaustedBoardMonitor` call it.
+- `reconcileDispatchSuppressionParks`, park write only: it calls
+  `issuesSvc.update(id, { status: "blocked" })`.
+- `reconcileTodoStrandedCards`: it calls `issuesSvc.update(id, { status: "blocked" })`.
+- `reconcileExhaustedRecoveryDrain`: `armExhaustedBoardMonitor` calls it with the
+  monitor columns and `executionPolicy`.
+- `reconcileStaleRecoveryActionWakes`: its wake path writes only recovery-action
+  and wake rows, but an action at its attempt ceiling goes through
+  `escalateExhaustedRecoveryAction`, which reaches it through
+  `armExhaustedBoardMonitor`.
+- `sweepHostRestartStrandedIssues`: the escalation calls it through
+  `blockIssueWithUnresolvedBlockers`. The re-arm repair is a direct drizzle
+  update. Fact gathering runs before the helper. A non-connection error there
+  aborts the sweep. Isolation covers only the wrapped repair.
+- `reconcileTaskWatchdogs`: `evaluateWatchdog` reaches
+  `ensureReusableWatchdogIssue`, which reopens the watchdog issue with
+  `issuesSvc.update`.
+- `sweepStaleIssueLocks`, the per-card lock clear only: it does not call it. It
+  clears raw lock columns with a direct drizzle update. It stays wrapped as a
+  recorded decision, not because of the boundary above.
+
+Active recovery-action reconciliation (`reconcileActiveRecoveryActions`)
+isolates each action with its own `try`/`catch`; it logs and skips the action
+and does not rethrow a lost database connection.
+
+These startup steps are knowingly left fail-fast. A failure in one of them
+fails startup:
+
+- `scanTerminableSilentActiveRuns` (`terminateSilentActiveRun`), per run: in one
+  transaction marks the run `failed`, fails its wake request, clears the
+  execution lock columns on `issues` with a direct drizzle update, and inserts a
+  watchdog decision row; then appends a run event and an activity row. It does
+  not call `issueService.update`.
+- `scanSilentActiveRuns` (`foldSourceResolvedRun`), per run: in one transaction
+  finalizes the run and its wake request, clears the source issue's execution
+  lock columns with a direct drizzle update, resolves the watchdog recovery
+  action, and inserts a watchdog decision row. For an open evaluation issue it
+  also calls `issuesSvc.update(id, { status: "done" })` and adds a comment. That
+  patch carries only `status`, an allow-listed key, so the Wiki handoff guard
+  does not run, and the assignee review-stage gate (it runs only when the patch
+  has `assigneeAgentId`) is not reached. It is not wrapped, and it runs inside
+  the fold's open transaction.
+- `promoteDueScheduledRetries`, per due retry run: promotes the run to `queued`
+  or cancels a suppressed retry, updates the wake request, and clears the
+  execution lock columns on `issues` with a direct drizzle update. No
+  `issueService.update`.
+- `resumeQueuedRuns`: touches `agent_wakeup_requests`, delivers saved queued
+  comments and releases execution through `releaseIssueExecutionAndPromote` (each
+  call carries its own `.catch` that logs), cancels stale queued runs
+  (`cancelStaleQueuedRun` also clears `executionRunId` and `checkoutRunId` on
+  `issues` with direct drizzle updates), and starts the next queued run per
+  agent. The step's own writes make no `issueService.update` call.
+- `recoverPendingSessionGoalActions`, per pending goal action:
+  `failRunnerGoalAction` on the session-goal action row (its error is swallowed)
+  and `enqueueWakeup` for wake and run rows.
+- `recoverActiveSessionGoals`, per active goal session: `enqueueWakeup` for wake
+  and run rows.
+- The run terminalization pre-pass of `sweepStaleIssueLocks`
+  (`terminalizeOrphanedRunningRun`), per referenced run: updates the
+  `heartbeat_runs` row and appends a run event.
+- `clearStaleRecoveryReplayHolds`, per resolved recovery action, at the tail of
+  `reconcileStrandedAssignedIssues`: rewrites `evidence` on the
+  `issue_recovery_actions` row with a direct drizzle update. It writes no issue
+  row.
+- `reconcileDeferredWakeupReplay`, per deferred wake: a compare-and-swap on the
+  `agent_wakeup_requests` row, then `enqueueWakeup`, whose throw is already caught
+  per wake and counted as `reDriveFailed`. No `issueService.update`.
+- `reconcileUnfinalizableWorkspaceBarriers`, per blocker: report-only; writes
+  one activity-log row. No `issueService.update`.
+- `detectStaleIssueMonitors`, per stale monitor: one select and one activity-log
+  insert. No `issueService.update`.
+- `reconcileResolvedDependencyWakeBackstop`, per candidate: `enqueueWakeup` and
+  an activity-log row. Its enqueue throw is already caught per card and counted
+  as `enqueueFailed`. No `issueService.update`.
+- `reconcilePendingReviewRearm`, per candidate: a recovery-action upsert,
+  `enqueueWakeup` and an activity-log row. Its enqueue throw is already caught
+  per card. No `issueService.update`.
+- `reconcileDispatchSuppressionParks`, park resolution: resolves the recovery
+  action and writes an activity-log row. No `issueService.update`.
+- `ingestStaleInReviewChildIssues`, per stale child: a system comment, a direct
+  drizzle update of `hiddenAt` and an archive row. No `issueService.update`.
+- `reconcileCancelledOnlyBlockerDependents` (action resolution and detection):
+  recovery-action rows and detection activity rows. No `issueService.update`.
+- `reconcileUndispatchableAssignedIssues` (action resolution and escalation):
+  recovery-action rows and activity rows. No `issueService.update`.
+- `sweepCompletedRunStrandedIssues`, per escalation: a system comment through
+  `addComment`, which does not call `issueService.update`.
+- Native-runner restart recovery fails closed by design and rethrows.
+  Hot-restart adoption, the orphaned-run reap and the abandoned run scratch sweep
+  are each caught as a whole by the caller, so startup continues after them.
+
+A failure that escapes a sweep, or any other fatal startup
+failure after binding, closes the HTTP listener before ending database
 clients: a rejected `startServer()` must not leave a port accepting requests
-against a closed pool. The failure is logged and rethrown. When the server runs
+against a closed pool. That failure is logged and rethrown. When the server runs
 as the main module, the entrypoint reports eligible failures to Sentry and exits
-nonzero so the supervisor restarts it. Embedding callers such as the CLI receive
-the rejection with no leaked listener and decide how to recover; the server does
-not hard-kill them.
+nonzero so the supervisor restarts it. Embedding callers such as the CLI
+receive the rejection with no leaked listener and decide how to recover; the
+server does not hard-kill them.
 
 There are two distinct failure modes.
 

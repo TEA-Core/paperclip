@@ -12153,32 +12153,58 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
-        await assertWikiHandoffWriteIntegrity({
-          db: tx as Db,
-          companyId: receiptExisting.companyId,
-          issue: {
-            title:
-              issueData.title !== undefined ? issueData.title : receiptExisting.title,
-            description:
-              issueData.description !== undefined
-                ? issueData.description
-                : receiptExisting.description,
-            executionPolicy:
-              issueData.executionPolicy !== undefined
-                ? issueData.executionPolicy
-                : receiptExisting.executionPolicy,
-            executionState:
-              issueData.executionState !== undefined
-                ? issueData.executionState
-                : receiptExisting.executionState,
-          },
-          incomingAssigneeAgentId:
-            issueData.assigneeAgentId !== undefined
-              ? issueData.assigneeAgentId
-              : receiptExisting.assigneeAgentId,
-          checkReviewStage: false,
-          workflowControlledAssignment,
-        });
+        // Skip the Wiki handoff guard only when every present key is status or
+        // blocker bookkeeping. Any other key, including assigneeUserId, is an
+        // assignee or identity write and still runs the guard.
+        // status: blockIssueWithUnresolvedBlockers, blocked-without-blockers heal,
+        //   dispatch-suppression park, todo-stranded park, escalateDispositionRepair
+        // blockedByIssueIds: blockIssueWithUnresolvedBlockers,
+        //   resolveContinuationWaitingOnReview, reconcileActiveRecoveryActions
+        // lastStatusDecisionId: dismissObsoleteNativePolicyReviews (with status and
+        //   unblockDescriptor)
+        // unblockDescriptor: repairNativeBlockedWait
+        // companyGuard: blockIssueWithUnresolvedBlockers company scope
+        const wikiHandoffUnguardedWriteKeys = new Set([
+          "status",
+          "blockedByIssueIds",
+          "lastStatusDecisionId",
+          "unblockDescriptor",
+          "companyGuard",
+        ]);
+        const presentWriteKeys = Object.entries(data)
+          .filter(([, value]) => value !== undefined)
+          .map(([key]) => key);
+        const wikiHandoffIdentityWrite = presentWriteKeys.some(
+          (key) => !wikiHandoffUnguardedWriteKeys.has(key),
+        );
+        if (wikiHandoffIdentityWrite) {
+          await assertWikiHandoffWriteIntegrity({
+            db: tx as Db,
+            companyId: receiptExisting.companyId,
+            issue: {
+              title:
+                issueData.title !== undefined ? issueData.title : receiptExisting.title,
+              description:
+                issueData.description !== undefined
+                  ? issueData.description
+                  : receiptExisting.description,
+              executionPolicy:
+                issueData.executionPolicy !== undefined
+                  ? issueData.executionPolicy
+                  : receiptExisting.executionPolicy,
+              executionState:
+                issueData.executionState !== undefined
+                  ? issueData.executionState
+                  : receiptExisting.executionState,
+            },
+            incomingAssigneeAgentId:
+              issueData.assigneeAgentId !== undefined
+                ? issueData.assigneeAgentId
+                : receiptExisting.assigneeAgentId,
+            checkReviewStage: false,
+            workflowControlledAssignment,
+          });
+        }
         if (
           issueData.assigneeAgentId !== undefined &&
           !workflowControlledAssignment

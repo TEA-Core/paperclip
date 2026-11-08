@@ -80,6 +80,7 @@ import {
 import { visibleIssueCondition } from "../issue-visibility.js";
 import { HttpError, forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
+import { runRecoverySweepIssue } from "../../lib/recovery-sweep-isolation.js";
 import {
   isPidAlive,
   isProcessGroupAlive,
@@ -2896,13 +2897,14 @@ export function recoveryService(
     const issueIds: string[] = [];
     const seen = new Set<string>();
     for (const candidate of candidates) {
-      if (seen.has(candidate.id)) continue;
+      const completed = await runRecoverySweepIssue(candidate, "recovery.reconcile_unassigned_blocking_issue", async () => {
+      if (seen.has(candidate.id)) return;
       seen.add(candidate.id);
 
       const creatorAgentId = candidate.createdByAgentId;
       if (!creatorAgentId) {
         skipped += 1;
-        continue;
+        return;
       }
 
       // SUP-14225: consider the recorded return assignee and creator together.
@@ -2942,14 +2944,14 @@ export function recoveryService(
       );
       if (!selected) {
         skipped += 1;
-        continue;
+        return;
       }
       const selectedCandidate = bounceCandidates.find(({ agent, source }) =>
         agent.id === selected.agentId && source === selected.source,
       );
       if (!selectedCandidate) {
         skipped += 1;
-        continue;
+        return;
       }
       const nextAgent = selectedCandidate.agent;
       const reassignSource = selectedCandidate.source;
@@ -2978,12 +2980,12 @@ export function recoveryService(
       });
       if (!updated) {
         skipped += 1;
-        continue;
+        return;
       }
       const nextAssigneeAgentId = updated.assigneeAgentId;
       if (!nextAssigneeAgentId) {
         skipped += 1;
-        continue;
+        return;
       }
 
       await issuesSvc.addComment(
@@ -3048,6 +3050,8 @@ export function recoveryService(
       } else {
         skipped += 1;
       }
+      });
+      if (!completed) skipped += 1;
     }
 
     return { assigned, skipped, issueIds };
@@ -6047,6 +6051,7 @@ export function recoveryService(
     }
 
     for (const issue of candidates) {
+      const completed = await runRecoverySweepIssue(issue, "recovery.reconcile_stranded_assigned_issues", async () => {
       if (issue.conversationAgentId) {
         const lastRun = await getLatestIssueRun(issue.companyId, issue.id);
         if (lastRun?.status === "succeeded") {
@@ -6055,12 +6060,12 @@ export function recoveryService(
             if (current) Object.assign(issue, current);
           }
         }
-        if (!(await instanceSettingsService(db).getExperimental()).enableAgentChat) { result.skipped += 1; continue; }
+        if (!(await instanceSettingsService(db).getExperimental()).enableAgentChat) { result.skipped += 1; return; }
         {
           await deliverConversationComments(db, issue, deps.enqueueWakeup);
         }
       }
-      if (isWaitingConversation(issue)) { result.skipped += 1; continue; }
+      if (isWaitingConversation(issue)) { result.skipped += 1; return; }
       const now = new Date();
       // Parse the persisted execution state once. `executionState`/`pendingExecutionState`
       // stay gated on `in_review` so every pre-existing status-keyed path below keeps its
@@ -6118,7 +6123,7 @@ export function recoveryService(
         const armed = nonReviewArmedExecutionState;
         if (armed === null) {
           result.skipped += 1;
-          continue;
+          return;
         }
         const armedParticipant = armed.currentParticipant;
         const participantOwnerAgentId =
@@ -6134,7 +6139,7 @@ export function recoveryService(
         // once the lease is released/cleared, detects the genuine wedge.
         if (issue.checkoutRunId || issue.executionRunId) {
           result.skipped += 1;
-          continue;
+          return;
         }
         // Grace is measured from the IMMUTABLE arm anchor — `pendingSince`, the
         // moment the review stage entered its pending state — not the mutable
@@ -6147,7 +6152,7 @@ export function recoveryService(
           now.getTime() - (pendingSinceMs ?? issue.updatedAt.getTime());
         if (msSinceArm < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
           result.skipped += 1;
-          continue;
+          return;
         }
         // An operator-cancelled latest run stands down ALL automatic recovery:
         // the board deliberately stopped the agent, so re-waking the participant
@@ -6163,7 +6168,7 @@ export function recoveryService(
           )
         ) {
           result.skipped += 1;
-          continue;
+          return;
         }
         // The wedged-review wedge is only actionable when NO other live path already
         // owns this card. An in-flight run, a future monitor, a queued/deferred/
@@ -6177,26 +6182,26 @@ export function recoveryService(
         // paths while honouring the guards those paths themselves apply.
         if (hasFutureMonitorCheck(issue.monitorNextCheckAt)) {
           result.skipped += 1;
-          continue;
+          return;
         }
         if (await hasActiveExecutionPath(issue.companyId, issue.id, null)) {
           result.skipped += 1;
-          continue;
+          return;
         }
         if (await hasLiveIssueWake(issue.companyId, issue.id)) {
           result.skipped += 1;
-          continue;
+          return;
         }
         if (await hasPendingWakeInteraction(db, issue.companyId, issue.id)) {
           result.skipped += 1;
-          continue;
+          return;
         }
         const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
         // A board-owned recovery action is already the durable, human-owned path;
         // do not race that authority by minting a participant action on top of it.
         if (existingAction?.ownerType === "board") {
           result.skipped += 1;
-          continue;
+          return;
         }
         // A subtree pause hold suppresses ALL automatic recovery. The participant is
         // deliberately parked, so minting a participant-owned action here would let the
@@ -6212,7 +6217,7 @@ export function recoveryService(
           )
         ) {
           result.skipped += 1;
-          continue;
+          return;
         }
         // SUP-22272: the guards above key on THIS card's live paths, but the
         // parent incident (SUP-21921) had the review participant heartbeating
@@ -6233,7 +6238,7 @@ export function recoveryService(
           ))
         ) {
           result.skipped += 1;
-          continue;
+          return;
         }
         // Idempotency is scoped to the exact wedge identity (stage + participant).
         // The fingerprint is globally unique among active actions, so equality
@@ -6245,7 +6250,7 @@ export function recoveryService(
         const fingerprint = `review_stage_armed_stranded:${issue.companyId}:${issue.id}:${armed.currentStageId ?? "none"}:${participantOwnerAgentId ?? "none"}`;
         if (existingAction?.fingerprint === fingerprint) {
           result.skipped += 1;
-          continue;
+          return;
         }
         await recoveryActionsSvc.upsertSourceScoped({
           companyId: issue.companyId,
@@ -6295,7 +6300,7 @@ export function recoveryService(
             fingerprint,
           },
         });
-        continue;
+        return;
       }
 
       const agentId =
@@ -6305,12 +6310,12 @@ export function recoveryService(
       if (!agentId) {
         if (issue.status === "in_review") {
           result.skipped += 1;
-          continue;
+          return;
         }
         const msSinceUpdate = now.getTime() - issue.updatedAt.getTime();
         if (msSinceUpdate < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
           result.skipped += 1;
-          continue;
+          return;
         }
         const exemptLabel = await db
           .select({ id: labels.id })
@@ -6338,12 +6343,12 @@ export function recoveryService(
             });
           }
           result.skipped += 1;
-          continue;
+          return;
         }
         const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
         if (existingAction?.kind === "no_live_path_unowned") {
           result.skipped += 1;
-          continue;
+          return;
         }
         const upserted = await recoveryActionsSvc.upsertSourceScoped({
           companyId: issue.companyId,
@@ -6369,7 +6374,7 @@ export function recoveryService(
         // scheduler tick for the same card (SUP-22165: 1,568 rows in 14h).
         if (upserted.kind !== "no_live_path_unowned") {
           result.skipped += 1;
-          continue;
+          return;
         }
         result.noLivePathUnowned += 1;
         result.issueIds.push(issue.id);
@@ -6385,7 +6390,7 @@ export function recoveryService(
             fingerprint: `no_live_path_unowned:${issue.companyId}:${issue.id}`,
           },
         });
-        continue;
+        return;
       }
 
       // An unfinished durable session goal owns its continuation lifecycle.
@@ -6396,7 +6401,7 @@ export function recoveryService(
         unfinishedGoalBindings.has(`${issue.companyId}:${issue.id}:${agentId}`)
       ) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
@@ -6410,7 +6415,7 @@ export function recoveryService(
         parseObject(latestRun.resultJson).finalizationReasonCode === "conversation_turn_finished"
       ) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       const agent = await getAgent(agentId);
@@ -6431,7 +6436,7 @@ export function recoveryService(
         (await hasCurrentNativePassiveWait(issue, latestRun))
       ) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       const recoveryNow = new Date();
@@ -6443,7 +6448,7 @@ export function recoveryService(
         : latestRun;
       if (hasPendingRecoveryMonitor(issue, monitorRun, recoveryNow)) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       // FOLD 2c: compose upstream's non-invokable-owner arm with SUP-11085's.
@@ -6503,19 +6508,19 @@ export function recoveryService(
             result.skipped += 1;
           }
         }
-        continue;
+        return;
       }
 
       if (issue.status !== "in_review" && !agentInvokable) {
         const msSinceUpdate = now.getTime() - issue.updatedAt.getTime();
         if (msSinceUpdate < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
           result.skipped += 1;
-          continue;
+          return;
         }
         const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
         if (existingAction?.kind === "no_live_path_owner_unavailable") {
           result.skipped += 1;
-          continue;
+          return;
         }
         const upserted = await recoveryActionsSvc.upsertSourceScoped({
           companyId: issue.companyId,
@@ -6543,7 +6548,7 @@ export function recoveryService(
         // Same guard as no_live_path_unowned above: another kind still owns it.
         if (upserted.kind !== "no_live_path_owner_unavailable") {
           result.skipped += 1;
-          continue;
+          return;
         }
         result.noLivePathOwnerUnavailable += 1;
         result.issueIds.push(issue.id);
@@ -6559,7 +6564,7 @@ export function recoveryService(
             fingerprint: `no_live_path_owner_unavailable:${issue.companyId}:${issue.id}`,
           },
         });
-        continue;
+        return;
       }
 
       if (
@@ -6570,12 +6575,12 @@ export function recoveryService(
         )
       ) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       if (await hasPendingWakeInteraction(db, issue.companyId, issue.id)) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       // SUP-16697: a `resolved` execution-reconciliation action carrying
@@ -6621,7 +6626,7 @@ export function recoveryService(
           .limit(1);
         if (alreadySurfaced.length > 0) {
           result.skipped += 1;
-          continue;
+          return;
         }
         await recoveryActionsSvc.upsertSourceScoped({
           companyId: issue.companyId,
@@ -6670,7 +6675,7 @@ export function recoveryService(
             fingerprint: holdFingerprint,
           },
         });
-        continue;
+        return;
       }
 
       // A board-owned recovery action is already the durable, human-owned
@@ -6683,7 +6688,7 @@ export function recoveryService(
       );
       if (activeRecoveryAction?.ownerType === "board") {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       if (
@@ -6695,7 +6700,7 @@ export function recoveryService(
         )
       ) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       latestRun = await getLatestIssueRun(issue.companyId, issue.id);
@@ -6715,11 +6720,11 @@ export function recoveryService(
         ).kind !== "clear"
       ) {
         result.skipped += 1;
-        continue;
+        return;
       }
       if (isOperatorCancelledRun(executionRecoverySource, agentId)) {
         result.operatorCancelExempted += 1;
-        continue;
+        return;
       }
       if (
         executionRecoverySource &&
@@ -6746,7 +6751,7 @@ export function recoveryService(
           });
           result.escalated += 1;
           result.issueIds.push(issue.id);
-          continue;
+          return;
         }
       }
       if (await isInvocationBudgetBlocked(issue, agentId)) {
@@ -6782,7 +6787,7 @@ export function recoveryService(
             result.skipped += 1;
           }
         }
-        continue;
+        return;
       }
       const nativeUnblockAction = await nativeBlockedUnblockAction(
         issue,
@@ -6805,14 +6810,14 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
       if (
         latestRun?.status === "succeeded" &&
         (await hasPersistedDurableWaitPath(issue, latestRun))
       ) {
         result.skipped += 1;
-        continue;
+        return;
       }
       if (isStrandedIssueRecoveryIssue(issue) && isUnsuccessfulTerminalIssueRun(latestRun)) {
         const updated = await escalateStrandedRecoveryIssueInPlace({
@@ -6826,7 +6831,7 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
 
       const adapterFailureClassification =
@@ -6839,7 +6844,7 @@ export function recoveryService(
         const targetAgentId = getAdapterFailureRecoveryTargetAgentId(issue);
         if (!targetAgentId || latestRun.agentId !== targetAgentId) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         if (adapterFailureClassification.kind === "provider_quota") {
@@ -6855,10 +6860,10 @@ export function recoveryService(
             );
             result.providerQuotaMonitored += 1;
             result.issueIds.push(issue.id);
-            continue;
+            return;
           }
           result.skipped += 1;
-          continue;
+          return;
         } else {
           const updated = await escalateStrandedAssignedIssue({
             issue,
@@ -6880,7 +6885,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
       }
 
@@ -6917,17 +6922,17 @@ export function recoveryService(
         if (!successfulRunSinceResolution) {
           if (!agentInvokable) {
             result.skipped += 1;
-            continue;
+            return;
           }
 
           if (await hasQueuedIssueWake(issue.companyId, issue.id, agentId)) {
             result.skipped += 1;
-            continue;
+            return;
           }
 
           if (await isInvocationBudgetBlocked(issue, agentId)) {
             result.skipped += 1;
-            continue;
+            return;
           }
 
           const latestPostResolutionRun = await getLatestIssueRunSince(
@@ -6944,7 +6949,7 @@ export function recoveryService(
             if (resolved) {
               result.waitingOnReviewResolved += 1;
               result.issueIds.push(issue.id);
-              continue;
+              return;
             }
             const outcome = await reconcileDispositionRepair(
               issue,
@@ -6963,7 +6968,7 @@ export function recoveryService(
             } else {
               result.skipped += 1;
             }
-            continue;
+            return;
           }
           const { consecutive } = legacyReviewParkAttempts;
           if (
@@ -6974,7 +6979,7 @@ export function recoveryService(
             if (resolved) {
               result.waitingOnReviewResolved += 1;
               result.issueIds.push(issue.id);
-              continue;
+              return;
             }
 
             const updated = await escalateStrandedAssignedIssue({
@@ -6993,7 +6998,7 @@ export function recoveryService(
             } else {
               result.skipped += 1;
             }
-            continue;
+            return;
           }
 
           const queued = await enqueueStrandedIssueRecovery({
@@ -7024,7 +7029,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
       }
 
@@ -7033,7 +7038,7 @@ export function recoveryService(
           const msSinceUpdate = now.getTime() - issue.updatedAt.getTime();
           if (msSinceUpdate < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
             result.skipped += 1;
-            continue;
+            return;
           }
           // SUP-22272: this branch fires when no pending participant pointer
           // exists, so the recovery target is the assignee (delivery makes the
@@ -7052,7 +7057,7 @@ export function recoveryService(
             ))
           ) {
             result.skipped += 1;
-            continue;
+            return;
           }
           const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
           // Key on this detector's own fingerprint, not just the shared kind:
@@ -7064,7 +7069,7 @@ export function recoveryService(
             existingAction.fingerprint === `review_stage_unarmed:${issue.companyId}:${issue.id}`
           ) {
             result.skipped += 1;
-            continue;
+            return;
           }
           await recoveryActionsSvc.upsertSourceScoped({
             companyId: issue.companyId,
@@ -7099,7 +7104,7 @@ export function recoveryService(
               fingerprint: `review_stage_unarmed:${issue.companyId}:${issue.id}`,
             },
           });
-          continue;
+          return;
         }
         const participantLatestRun = participantLatestRunForRecovery;
 
@@ -7126,7 +7131,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         const participantAdapterFailureClassification =
@@ -7154,7 +7159,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
         if (
           participantAdapterFailureClassification?.kind ===
@@ -7181,7 +7186,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (!agentInvokable) {
@@ -7200,7 +7205,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (
@@ -7224,7 +7229,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (
@@ -7235,12 +7240,12 @@ export function recoveryService(
           )
         ) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         if (await isInvocationBudgetBlocked(issue, participantAgentId)) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         const queued = await enqueueStrandedIssueRecovery({
@@ -7263,7 +7268,7 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
 
       if (issue.status === "todo") {
@@ -7276,17 +7281,17 @@ export function recoveryService(
           // as stranded).
           if (await isOnboardingFirstTaskAwaitingUser(issue)) {
             result.onboardingFirstTaskExempted += 1;
-            continue;
+            return;
           }
 
           if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
             result.skipped += 1;
-            continue;
+            return;
           }
 
           if (await isInvocationBudgetBlocked(issue, agentId)) {
             result.skipped += 1;
-            continue;
+            return;
           }
 
           const queued = await enqueueInitialAssignedTodoDispatch(
@@ -7299,7 +7304,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (
@@ -7307,7 +7312,7 @@ export function recoveryService(
           !(await wasTodoHandedBackDuringOrAfterLatestRun(issue, latestRun))
         ) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         if (didAutomaticRecoveryFail(latestRun, "assignment_recovery")) {
@@ -7331,12 +7336,12 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (await isInvocationBudgetBlocked(issue, agentId)) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         const queued = await enqueueStrandedIssueRecovery({
@@ -7353,12 +7358,12 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
 
       if (!latestRun && !issue.checkoutRunId && !issue.executionRunId) {
         result.skipped += 1;
-        continue;
+        return;
       }
       if (readDispositionRepairAttempt(latestRun)) {
         const outcome = await reconcileDispositionRepair(issue, latestRun);
@@ -7372,17 +7377,17 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
       const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
       if (handoffEvidence) {
         if (isPluginManagedIssueLifecycle(issue)) {
           result.skipped += 1;
-          continue;
+          return;
         }
         if (!handoffEvidence.exhausted) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         const updated = await escalateStrandedAssignedIssue({
@@ -7399,7 +7404,7 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
       if (isSuccessfulInProgressContinuationRun(latestRun)) {
         const successfulRun = latestRun;
@@ -7412,13 +7417,13 @@ export function recoveryService(
         if (workspace.mode === "shared_workspace" && (await healthyOpenChildIssues(issue, true)).length > 0) {
           result.productiveContinuationObserved += 1;
           result.skipped += 1;
-          continue;
+          return;
         }
 
         if (!isProductiveContinuationRun(successfulRun)) {
           result.successfulContinuationObserved += 1;
           result.skipped += 1;
-          continue;
+          return;
         }
 
         if (isRepeatedProductiveContinuationRecovery(successfulRun)) {
@@ -7432,7 +7437,7 @@ export function recoveryService(
           // mirroring the queued-wake guard the `todo` lane applies.
           if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
             result.skipped += 1;
-            continue;
+            return;
           }
           // GGU-809: skip escalation if the assignee has shown visible progress
           // (comment or attachment) within the exemption window. Falling
@@ -7460,14 +7465,14 @@ export function recoveryService(
             } else {
               result.skipped += 1;
             }
-            continue;
+            return;
           }
           result.recentProgressExempted += 1;
         }
 
         if (await isInvocationBudgetBlocked(issue, agentId)) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         const queued = await enqueueStrandedIssueRecovery({
@@ -7484,7 +7489,7 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
       if (isUnsuccessfulTerminalIssueRun(latestRun)) {
         const classification = classifyContinuationFailure(latestRun);
@@ -7496,7 +7501,7 @@ export function recoveryService(
           if (resolved) {
             result.waitingOnReviewResolved += 1;
             result.issueIds.push(issue.id);
-            continue;
+            return;
           }
 
           const outcome = await reconcileDispositionRepair(issue, latestRun);
@@ -7510,7 +7515,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (classification.kind === "non_retryable") {
@@ -7552,7 +7557,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         const { consecutive, latestFinishedAt } = await summarizeRecentContinuationRetries(
@@ -7591,7 +7596,7 @@ export function recoveryService(
             } else {
               result.skipped += 1;
             }
-            continue;
+            return;
           }
 
           if (classification.baseBackoffMs > 0 && latestFinishedAt) {
@@ -7601,7 +7606,7 @@ export function recoveryService(
               Math.pow(2, Math.max(0, consecutive - 1));
             if (elapsed < requiredDelay) {
               result.skipped += 1;
-              continue;
+              return;
             }
           }
         }
@@ -7609,7 +7614,7 @@ export function recoveryService(
 
       if (await isInvocationBudgetBlocked(issue, agentId)) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       const queued = await enqueueStrandedIssueRecovery({
@@ -7626,6 +7631,8 @@ export function recoveryService(
       } else {
         result.skipped += 1;
       }
+      });
+      if (!completed) result.skipped += 1;
     }
 
     const orphanBlockerRecovery = await reconcileUnassignedBlockingIssues();
@@ -8987,11 +8994,12 @@ export function recoveryService(
     };
 
     for (const issue of candidates) {
+      await runRecoverySweepIssue(issue, "recovery.sweep_stale_issue_locks", async () => {
       if (
         !isCleanable(issue.checkoutRunId) ||
         !isCleanable(issue.executionRunId)
       ) {
-        continue;
+        return;
       }
 
       const updated = await db
@@ -9017,7 +9025,7 @@ export function recoveryService(
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
 
-      if (!updated) continue;
+      if (!updated) return;
 
       result.cleared += 1;
       result.issueIds.push(updated.id);
@@ -9037,6 +9045,7 @@ export function recoveryService(
           clearedExecutionRunId: issue.executionRunId,
           referencedRunStatuses: Object.fromEntries(runStatusById),
         },
+      });
       });
     }
 
@@ -9248,7 +9257,8 @@ export function recoveryService(
     result.candidateLimitSkipped = Math.max(0, (rows[0]?.totalCount ?? 0) - rows.length);
 
     for (const { action, issue } of rows) {
-      if (isStrandedIssueRecoveryIssue(issue)) continue;
+      await runRecoverySweepIssue(issue, "recovery.reconcile_exhausted_recovery_drain", async () => {
+      if (isStrandedIssueRecoveryIssue(issue)) return;
 
       const monitorable = isMonitorableIssueShape({
         status: issue.status,
@@ -9259,7 +9269,7 @@ export function recoveryService(
       if (monitorable) {
         if (hasFutureMonitorCheck(issue.monitorNextCheckAt)) {
           result.alreadyLive++;
-          continue;
+          return;
         }
         // SUP-21344 (post-merge review): a due/claimed board monitor armed by
         // this drain belongs to tickDueIssueMonitors. Re-arming here — the
@@ -9270,7 +9280,7 @@ export function recoveryService(
         if (isDueSelfArmedBoardMonitor(issue, now)) {
           result.monitorDueAwaitingClaim++;
           result.alreadyLive++;
-          continue;
+          return;
         }
         const armedAt = await armExhaustedBoardMonitor({
           issue,
@@ -9282,7 +9292,7 @@ export function recoveryService(
           result.monitorArmed++;
           result.issueIds.push(issue.id);
           result.actionIds.push(action.id);
-          continue;
+          return;
         }
         // The policy transition scheduled no check despite a monitorable
         // shape; fall through to the recovery-issue path rather than leave
@@ -9305,6 +9315,7 @@ export function recoveryService(
       } else {
         result.noInvokableOwner++;
       }
+      });
     }
 
     if (result.monitorArmed > 0 || result.recoveryIssueMinted > 0 || result.noInvokableOwner > 0) {
@@ -9561,8 +9572,9 @@ export function recoveryService(
       );
 
       for (const candidate of companyCandidates) {
+        await runRecoverySweepIssue(candidate, "recovery.reconcile_blocked_without_blockers", async () => {
         const readiness = readinessMap.get(candidate.id);
-        if (!readiness || readiness.unresolvedBlockerCount !== 0) continue;
+        if (!readiness || readiness.unresolvedBlockerCount !== 0) return;
 
         // SUP-16951 — deliberate-park exemption. A zero-blocker card that
         // carries a self-owned unblockDescriptor with a non-empty action is a
@@ -9574,34 +9586,34 @@ export function recoveryService(
         // branches alike. Cards with no descriptor fall through unchanged.
         if (hasUsableUnblockDescriptor(candidate.unblockDescriptor)) {
           result.unblockDescriptorExemptSkipped++;
-          continue;
+          return;
         }
 
         const blockedAt = candidate.updatedAt ?? new Date();
         const msInViolation = now.getTime() - blockedAt.getTime();
         if (msInViolation < BLOCKED_WITHOUT_BLOCKERS_GRACE_THRESHOLD_MS) {
           result.graceThresholdSkipped++;
-          continue;
+          return;
         }
 
         if (await hasActiveExecutionPath(companyId, candidate.id, null, candidate.monitorNextCheckAt)) {
           result.livePathSkipped++;
-          continue;
+          return;
         }
 
         if (await hasQueuedIssueWake(companyId, candidate.id, candidate.assigneeAgentId)) {
           result.queuedWakeSkipped++;
-          continue;
+          return;
         }
 
         if (await hasPendingWakeInteraction(db, companyId, candidate.id)) {
           result.interactionSkipped++;
-          continue;
+          return;
         }
 
         if (await isAutomaticRecoverySuppressedByPauseHold(db, companyId, candidate.id, treeControlSvc)) {
           result.pauseHoldSkipped++;
-          continue;
+          return;
         }
 
         const existingAction = await recoveryActionsSvc.getActiveForIssue(companyId, candidate.id);
@@ -9610,7 +9622,7 @@ export function recoveryService(
         if (existingAction?.kind === TIMER_DISPATCH_PARK_RECOVERY_KIND &&
             existingAction.cause === TIMER_DISPATCH_PARK_RECOVERY_CAUSE) {
           result.alreadyActionedSkipped++;
-          continue;
+          return;
         }
 
         // SUP-14151 — cross-fingerprint exhaustion suppression: when the
@@ -9734,7 +9746,7 @@ export function recoveryService(
               },
             });
           }
-          continue;
+          return;
         }
 
         // Guard 2 — rearm-cap-exhausted: a candidate holding an active
@@ -9752,7 +9764,7 @@ export function recoveryService(
           existingAction?.cause === "dependency_wake_rearm_cap_exhausted"
         ) {
           result.rearmCapExhaustedSkipped++;
-          continue;
+          return;
         }
 
         // Auto-heal path — setting-gated, default OFF.
@@ -9806,12 +9818,12 @@ export function recoveryService(
                   );
                 } else {
                   result.deadWorkspaceBindingSkipped++;
-                  continue;
+                  return;
                 }
               }
             } else {
               result.deadWorkspaceBindingSkipped++;
-              continue;
+              return;
             }
           }
           const existingActionIsBwob = existingAction?.kind === "blocked_without_blockers";
@@ -9885,13 +9897,13 @@ export function recoveryService(
               entityId: candidate.id,
               details: { source, fingerprint: `bwob:${companyId}:${candidate.id}` },
             });
-            continue;
+            return;
           }
         }
 
         if (existingAction?.kind === "blocked_without_blockers") {
           result.alreadyActionedSkipped++;
-          continue;
+          return;
         }
 
         const resolvedAction = await recoveryActionsSvc.getLatestResolvedForIssue(
@@ -9929,7 +9941,7 @@ export function recoveryService(
         // untouched, so there is no escalation to count or log on this tick.
         if (upserted.kind !== "blocked_without_blockers") {
           result.alreadyActionedSkipped++;
-          continue;
+          return;
         }
 
         result.escalated++;
@@ -9947,6 +9959,7 @@ export function recoveryService(
             source,
             fingerprint: `bwob:${companyId}:${candidate.id}`,
           },
+        });
         });
       }
     }
@@ -10223,6 +10236,7 @@ export function recoveryService(
     );
 
     for (const candidate of issueRows) {
+      await runRecoverySweepIssue(candidate, "recovery.reconcile_dispatch_suppression_parks", async () => {
       const lastRealActivity = [
         candidate.updatedAt,
         commentLatestById.get(candidate.id) ?? null,
@@ -10236,7 +10250,7 @@ export function recoveryService(
       // (C) sustained window not yet elapsed — the card is not persistently stuck.
       if (!lastRealActivity || now.getTime() - lastRealActivity.getTime() < DISPATCH_SUPPRESSED_PARK_SUSTAINED_MS) {
         result.sustainedWindowSkipped++;
-        continue;
+        return;
       }
 
       // (D) any §2a live path reappeared — never park a live card.
@@ -10249,21 +10263,21 @@ export function recoveryService(
         now,
       )) {
         result.livePathSkipped++;
-        continue;
+        return;
       }
 
       // An active action for another cause already owns this issue's recovery.
       const existingAction = await recoveryActionsSvc.getActiveForIssue(candidate.companyId, candidate.id);
       if (existingAction) {
         result.alreadyActionedSkipped++;
-        continue;
+        return;
       }
 
       // (B) confirm D1 suppression and read the failing §2a disjuncts.
       const suppressionDetails = latestSuppressionById.get(candidate.id);
       if (suppressionDetails === undefined) {
         result.notSuppressedSkipped++;
-        continue;
+        return;
       }
       const rawDisjuncts = parseObject(suppressionDetails).disjuncts;
       const disjuncts: ContinuationPathDisjuncts = {
@@ -10328,6 +10342,7 @@ export function recoveryService(
 
       result.parked++;
       result.issueIds.push(candidate.id);
+      });
     }
 
     if (result.parked > 0) {
@@ -10836,12 +10851,13 @@ export function recoveryService(
     );
 
     for (const candidate of issueRows) {
+      await runRecoverySweepIssue(candidate, "recovery.reconcile_todo_stranded_cards", async () => {
       const assignee = candidate.assigneeAgentId
         ? assigneeById.get(candidate.assigneeAgentId)
         : null;
       if (assignee && isExternalPullAgent(assignee)) {
         result.externalPullSkipped += 1;
-        continue;
+        return;
       }
 
       const leased = Boolean(leasesByCompany.get(candidate.companyId)?.has(candidate.id));
@@ -10890,16 +10906,16 @@ export function recoveryService(
 
       if (leased) {
         result.leasedSkipped += 1;
-        continue;
+        return;
       }
       if (activeRecoveryAction !== null) {
         result.alreadyActionedSkipped += 1;
-        continue;
+        return;
       }
       if (!verdict.stranded) {
         if (activePath || monitorFuture || liveWake) result.livePathSkipped += 1;
         else result.thresholdSkipped += 1;
-        continue;
+        return;
       }
 
       const seatKey = `${candidate.id}:${candidate.assigneeAgentId ?? ""}`;
@@ -10915,7 +10931,7 @@ export function recoveryService(
         );
       if (latestParkedAt && (!latestDischargeAt || latestDischargeAt.getTime() <= latestParkedAt.getTime())) {
         result.alreadyParkedDischargedSkipped += 1;
-        continue;
+        return;
       }
 
       await issuesSvc.update(candidate.id, { status: "blocked" });
@@ -10954,6 +10970,7 @@ export function recoveryService(
 
       result.parked += 1;
       result.issueIds.push(candidate.id);
+      });
     }
 
     if (result.parked > 0) {
@@ -11032,12 +11049,13 @@ export function recoveryService(
 
     result.checked = candidates.length;
     for (const candidate of candidates) {
+      await runRecoverySweepIssue({ id: candidate.sourceIssueId, identifier: null }, "recovery.reconcile_stale_recovery_action_wakes", async () => {
       const effectiveMaxAttempts = candidate.maxAttempts ?? MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
 
       if (candidate.attemptCount >= effectiveMaxAttempts) {
         result.maxAttemptsReached += 1;
         await escalateExhaustedRecoveryAction(candidate, effectiveMaxAttempts, now);
-        continue;
+        return;
       }
 
       const sourceIssue = await db
@@ -11049,7 +11067,7 @@ export function recoveryService(
       // Nothing left to recover: the source issue is gone or already terminal.
       if (!sourceIssue || sourceIssue.status === "done" || sourceIssue.status === "cancelled") {
         result.skippedTerminalSource += 1;
-        continue;
+        return;
       }
 
       // A subtree pause hold suppresses ALL automatic recovery, including this
@@ -11067,7 +11085,7 @@ export function recoveryService(
         )
       ) {
         result.skippedPauseHold += 1;
-        continue;
+        return;
       }
 
       // Mirror the early-return guards in enqueueSourceScopedStrandedRecoveryWake
@@ -11075,19 +11093,19 @@ export function recoveryService(
       const wakePolicyType = readRecoveryWakePolicyType(candidate);
       if (wakePolicyType === "monitor_only" || wakePolicyType === "manual_repair_required") {
         result.nonWakeableSkipped += 1;
-        continue;
+        return;
       }
       if (candidate.cause === "configuration_incomplete") {
         result.nonWakeableSkipped += 1;
-        continue;
+        return;
       }
       if (candidate.cause === "provider_quota" && !candidate.ownerAgentId) {
         result.nonWakeableSkipped += 1;
-        continue;
+        return;
       }
       if (!candidate.ownerAgentId && wakePolicyType !== "board_escalation") {
         result.nonWakeableSkipped += 1;
-        continue;
+        return;
       }
 
       // This action was deliberately sent to the board because its pending
@@ -11100,7 +11118,7 @@ export function recoveryService(
         readNonEmptyString(parseObject(candidate.wakePolicy).reason) === "pending_participant_unavailable"
       ) {
         result.nonWakeableSkipped += 1;
-        continue;
+        return;
       }
 
       // Per-action backoff: an action that has already been re-fired several
@@ -11113,7 +11131,7 @@ export function recoveryService(
         const backoffBefore = new Date(now.getTime() - intervalMs * multiplier);
         if (candidate.lastAttemptAt >= backoffBefore) {
           result.skippedBackoff += 1;
-          continue;
+          return;
         }
       }
 
@@ -11145,7 +11163,7 @@ export function recoveryService(
               ),
             );
           result.nonWakeableSkipped += 1;
-          continue;
+          return;
         }
       }
 
@@ -11179,7 +11197,7 @@ export function recoveryService(
         )
         .returning();
 
-      if (!updated) continue;
+      if (!updated) return;
 
       const action = updated as unknown as IssueRecoveryAction;
       const latestRun = await getLatestIssueRun(candidate.companyId, candidate.sourceIssueId);
@@ -11191,7 +11209,7 @@ export function recoveryService(
           latestRun,
           recoveryCause: candidate.cause as StrandedRecoveryCause,
         });
-        if (!enqueued) continue;
+        if (!enqueued) return;
         if (rerouteOwnerAgentId) result.rerouted += 1;
         else result.reFired += 1;
         result.issueIds.push(candidate.sourceIssueId);
@@ -11203,6 +11221,7 @@ export function recoveryService(
           "failed to re-fire stale recovery action wake",
         );
       }
+      });
     }
 
     if (result.reFired > 0 || result.rerouted > 0 || result.maxAttemptsReached > 0) {
@@ -11914,19 +11933,20 @@ export function recoveryService(
       .limit(STILLBORN_ASSIGNED_BACKLOG_CANDIDATE_LIMIT);
 
     for (const candidate of candidates) {
+      const completed = await runRecoverySweepIssue(candidate, "recovery.reconcile_stillborn_assigned_backlog", async () => {
       if (await hasActiveExecutionPath(candidate.companyId, candidate.id, candidate.assigneeAgentId)) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       if (await hasPendingWakeInteraction(db, candidate.companyId, candidate.id)) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       if (await isAutomaticRecoverySuppressedByPauseHold(db, candidate.companyId, candidate.id, treeControlSvc)) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       const updated = await escalateStrandedAssignedIssue({
@@ -11941,7 +11961,7 @@ export function recoveryService(
       });
       if (!updated) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       result.reported += 1;
@@ -11966,6 +11986,8 @@ export function recoveryService(
           recoveryActionId: action?.id ?? null,
         },
       });
+      });
+      if (!completed) result.skipped += 1;
     }
 
     const shouldLog =

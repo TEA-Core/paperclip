@@ -16613,12 +16613,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       sql`create trigger test_native_blocked_wait_fault before insert on issue_comments for each row execute function test_native_blocked_wait_fault()`,
     );
     try {
-      await expect(
-        heartbeatService(db).reconcileStrandedAssignedIssues(),
-      ).rejects.toMatchObject({
-        cause: expect.objectContaining({
-          message: "native_blocked_wait_fixture_fault",
-        }),
+      // The faulted card is skipped (startup recovery must survive one refused card write) and the
+      // repair transaction rolls back whole, so no partial state is left behind.
+      const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+      expect(result).toMatchObject({
+        skipped: 1,
+        continuationRequeued: 0,
+        escalated: 0,
       });
     } finally {
       await db.execute(
@@ -16703,9 +16704,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         }, config),
       );
     try {
-      await expect(
-        heartbeatService(db).reconcileStrandedAssignedIssues(),
-      ).rejects.toBe(failure);
+      const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+      expect(result).toMatchObject({
+        skipped: 1,
+        continuationRequeued: 0,
+        escalated: 0,
+      });
     } finally {
       transactionSpy.mockRestore();
     }
