@@ -12870,6 +12870,33 @@ export function issueService(db: Db) {
         }
       }
 
+      // A stage handoff can clear the direct lock before its issuer stops.
+      // Use wake admission's live-run states and issue scope, not the assignee.
+      const liveExecutionRun = await db
+        .select({ id: heartbeatRuns.id })
+        .from(issues)
+        .innerJoin(heartbeatRuns, eq(heartbeatRuns.companyId, issues.companyId))
+        .where(
+          and(
+            eq(issues.id, id),
+            isNull(issues.executionRunId),
+            inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${id}`,
+          ),
+        )
+        .orderBy(
+          sql`case when ${heartbeatRuns.status} = 'running' then 0 else 1 end`,
+          asc(heartbeatRuns.createdAt),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (liveExecutionRun && liveExecutionRun.id !== checkoutRunId) {
+        throw conflict("Issue checkout conflict", {
+          issueId: id,
+          executionRunId: liveExecutionRun.id,
+        });
+      }
+
       const dependencyReadiness = await listIssueDependencyReadinessMap(
         db,
         issueCompany.companyId,

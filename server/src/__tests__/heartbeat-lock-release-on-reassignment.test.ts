@@ -19,6 +19,7 @@ import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.j
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
+import { issueService } from "../services/issues.ts";
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentTaskRun = vi.hoisted(() => vi.fn());
@@ -279,6 +280,143 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
       expect(issue.executionRunId).toBe(successor!.id);
     });
     expect((await heartbeat.getRun(busyRun.id))?.status).toBe("running");
+  });
+
+  describe("checkout with a cleared execution lock", () => {
+    it("refuses successor checkout while the stage-handoff issuer still runs", async () => {
+      const { companyId, reviewerAgentId, issueId, holderRunId } =
+        await seedCrossAgentScenario({ holderStatus: "running" });
+      // Seed the committed handoff shape without a wake repairing its missing
+      // execution pointer before checkout can exercise the null-lock path.
+      await db.update(issues).set({
+        executionRunId: null, executionAgentNameKey: null, executionLockedAt: null,
+      }).where(eq(issues.id, issueId));
+      const [busyRun] = await db.insert(heartbeatRuns).values({
+        companyId, agentId: reviewerAgentId, status: "running",
+        contextSnapshot: { wakeReason: "timer" },
+      }).returning();
+      const [before] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(before).toMatchObject({
+        assigneeAgentId: reviewerAgentId,
+        checkoutRunId: null,
+        executionRunId: null,
+      });
+      expect((await heartbeat.getRun(holderRunId))?.status).toBe("running");
+
+      await expect(issueService(db).checkout(
+        issueId, reviewerAgentId, ["in_review"], busyRun.id,
+      )).rejects.toMatchObject({ status: 409, message: "Issue checkout conflict" });
+
+      const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(after).toMatchObject({
+        status: before.status,
+        assigneeAgentId: reviewerAgentId,
+        checkoutRunId: null,
+      });
+      expect(after.executionRunId).not.toBe(busyRun.id);
+      expect((await heartbeat.getRun(holderRunId))?.status).toBe("running");
+    });
+
+    it("allows the issuing run's own checkout ahead of an older queued successor", async () => {
+      const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId } =
+        await seedCrossAgentScenario({ holderStatus: "running" });
+      await db.update(issues).set({
+        assigneeAgentId: coderAgentId,
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+      }).where(eq(issues.id, issueId));
+      await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId: reviewerAgentId,
+        status: "queued",
+        contextSnapshot: { issueId },
+        createdAt: new Date(0),
+      });
+
+      const checkedOut = await issueService(db).checkout(
+        issueId, coderAgentId, ["in_review"], holderRunId,
+      );
+      expect(checkedOut).toMatchObject({
+        id: issueId,
+        assigneeAgentId: coderAgentId,
+        checkoutRunId: holderRunId,
+        executionRunId: holderRunId,
+      });
+    });
+
+    it("allows successor checkout after the issuer has finished", async () => {
+      const { companyId, reviewerAgentId, issueId, holderRunId } =
+        await seedCrossAgentScenario({ holderStatus: "running" });
+      await db.update(issues).set({
+        executionRunId: null, executionAgentNameKey: null, executionLockedAt: null,
+      }).where(eq(issues.id, issueId));
+      await db.update(heartbeatRuns).set({
+        status: "succeeded", finishedAt: new Date(),
+      }).where(eq(heartbeatRuns.id, holderRunId));
+      const [successor] = await db.insert(heartbeatRuns).values({
+        companyId, agentId: reviewerAgentId, status: "running", contextSnapshot: {},
+      }).returning();
+
+      const checkedOut = await issueService(db).checkout(
+        issueId, reviewerAgentId, ["in_review"], successor.id,
+      );
+      expect(checkedOut).toMatchObject({
+        id: issueId,
+        assigneeAgentId: reviewerAgentId,
+        checkoutRunId: successor.id,
+        executionRunId: successor.id,
+      });
+    });
+
+    it("allows checkout on another issue while the issuer runs", async () => {
+      const { companyId, reviewerAgentId, issueId, holderRunId } =
+        await seedCrossAgentScenario({ holderStatus: "running" });
+      const svc = issueService(db);
+      const otherIssue = await svc.create(companyId, {
+        title: "Unrelated checkout", status: "todo", priority: "medium",
+        assigneeAgentId: reviewerAgentId,
+      });
+      const [otherRun] = await db.insert(heartbeatRuns).values({
+        companyId, agentId: reviewerAgentId, status: "running", contextSnapshot: {},
+      }).returning();
+
+      const checkedOut = await svc.checkout(otherIssue.id, reviewerAgentId, ["todo"], otherRun.id);
+      expect(checkedOut).toMatchObject({
+        id: otherIssue.id,
+        checkoutRunId: otherRun.id,
+        executionRunId: otherRun.id,
+      });
+      const [original] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(original.executionRunId).toBe(holderRunId);
+      expect((await heartbeat.getRun(holderRunId))?.status).toBe("running");
+    });
+
+    it("ignores a live run from another company whose context names this issue", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedCrossAgentScenario({
+        holderStatus: "running", holderContext: () => ({}),
+      });
+      await db.update(issues).set({
+        executionRunId: null, executionAgentNameKey: null, executionLockedAt: null,
+      }).where(eq(issues.id, issueId));
+      const foreign = await seedCrossAgentScenario({
+        holderStatus: "running", holderContext: () => ({ issueId }),
+      });
+      const [successor] = await db.insert(heartbeatRuns).values({
+        companyId, agentId: reviewerAgentId, status: "running", contextSnapshot: {},
+      }).returning();
+
+      const checkedOut = await issueService(db).checkout(
+        issueId, reviewerAgentId, ["in_review"], successor.id,
+      );
+      expect(checkedOut).toMatchObject({
+        id: issueId,
+        companyId,
+        checkoutRunId: successor.id,
+        executionRunId: successor.id,
+      });
+      expect((await heartbeat.getRun(foreign.holderRunId))?.status).toBe("running");
+    });
   });
 
   it("defers a cross-agent wake while the holder is still running and leaves the holder alone", async () => {
