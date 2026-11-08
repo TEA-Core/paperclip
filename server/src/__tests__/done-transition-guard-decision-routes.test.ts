@@ -1117,6 +1117,72 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(await statusOf(issueId)).toBe("in_review");
   });
 
+  it("POST comment: without a run id header the issue's checkout run attributes the approval close and its lifetime gate fires (SUP-23490)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23490E", { deliveryRequirement: "record_only" });
+    const checkoutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId: reviewerAgentId,
+      status: "running",
+      invocationSource: "self_declared",
+      startedAt: new Date("2026-11-04T09:20:00Z"),
+      contextSnapshot: { issueId },
+    });
+    await db.update(issues).set({ checkoutRunId }).where(eq(issues.id, issueId));
+    currentActor = { type: "agent", agentId: reviewerAgentId, companyId, source: "agent_key", runId: undefined };
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({ body: `## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): ${RECORD_ONLY_EVIDENCE}` });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(String(res.body.error)).toContain("predates the closing run");
+    expect(String(res.body.error)).toContain(checkoutRunId);
+    expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("POST comment: an accepted header-less approval stamps the checkout run into the tier2 audit record (SUP-23490)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23490F", { deliveryRequirement: "record_only" });
+    const checkoutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId: reviewerAgentId,
+      status: "running",
+      invocationSource: "self_declared",
+      startedAt: new Date("2026-11-04T09:00:00Z"),
+      contextSnapshot: { issueId },
+    });
+    await db.update(issues).set({ checkoutRunId }).where(eq(issues.id, issueId));
+    currentActor = { type: "agent", agentId: reviewerAgentId, companyId, source: "agent_key", runId: undefined };
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({ body: `## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): ${RECORD_ONLY_EVIDENCE}` });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await statusOf(issueId)).toBe("done");
+    const tier2Rows = await vi.waitFor(
+      async () => {
+        const found = await auditRows(companyId, issueId, "issue.done_transition_tier2_close");
+        if (found.length === 0) throw new Error("waiting for tier2 close audit row");
+        return found;
+      },
+      { timeout: 5000 },
+    );
+    expect(tier2Rows).toHaveLength(1);
+    expect(tier2Rows[0]?.details).toMatchObject({
+      observed: "2026-11-04T09:15:00Z",
+      tierForm: "record-only",
+      closingRunId: checkoutRunId,
+      closingRunStartedAt: "2026-11-04T09:00:00.000Z",
+    });
+  });
+
   it("PATCH: record_only close with prose-only Tier 2 evidence is refused naming the record-only form (SUP-22801)", async () => {
     const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D22801B", { deliveryRequirement: "record_only" });
     await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
@@ -1975,6 +2041,80 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(await statusOf(issueId)).toBe("done");
+    });
+
+    it("recovery-action close: the resolved closing run binds the observation lifetime on this door too (SUP-23490)", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("D23490R", { deliveryRequirement: "record_only" });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId: reviewerAgentId,
+        status: "running",
+        invocationSource: "self_declared",
+        startedAt: new Date("2026-11-04T09:20:00Z"),
+        contextSnapshot: { issueId },
+      });
+      await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, issueId));
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      currentActor = { type: "agent", agentId: reviewerAgentId, companyId, source: "agent_key", runId: undefined };
+      mockNoOpenPulls();
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          ...closeBody,
+          doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+      expect(String(res.body.error)).toContain("predates the closing run");
+      expect(String(res.body.error)).toContain(runId);
+      expect(await statusOf(issueId)).toBe("in_review");
+    });
+
+    it("recovery-action close: an accepted close stamps the closing run into the tier2 audit record (SUP-23490)", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("D23490S", { deliveryRequirement: "record_only" });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId: reviewerAgentId,
+        status: "running",
+        invocationSource: "self_declared",
+        startedAt: new Date("2026-11-04T09:00:00Z"),
+        contextSnapshot: { issueId },
+      });
+      await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, issueId));
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockNoOpenPulls();
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          ...closeBody,
+          doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+      const tier2Rows = await vi.waitFor(
+        async () => {
+          const found = await auditRows(companyId, issueId, "issue.done_transition_tier2_close");
+          if (found.length === 0) throw new Error("waiting for tier2 close audit row");
+          return found;
+        },
+        { timeout: 5000 },
+      );
+      expect(tier2Rows).toHaveLength(1);
+      expect(tier2Rows[0]?.details).toMatchObject({
+        observed: "2026-11-04T09:15:00Z",
+        tierForm: "record-only",
+        closingRunId: runId,
+        closingRunStartedAt: "2026-11-04T09:00:00.000Z",
+      });
     });
   });
 
