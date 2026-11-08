@@ -6,8 +6,19 @@ import { fileURLToPath } from "node:url";
 import { createServer } from "node:http";
 import type { Server } from "node:http";
 import { createDb, getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "@paperclipai/db";
-import { sql } from "drizzle-orm";
+import {
+  agents as agentsTable,
+  companies as companiesTable,
+  issueRecoveryActions,
+  issues as issuesTable,
+  pluginManagedResources,
+  plugins as pluginsTable,
+} from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
 import { bootstrapExecutionPolicyFromEnv } from "../services/index.js";
+import { recoveryService } from "../services/recovery/service.js";
+import { logger } from "../middleware/logger.js";
 
 const ORIGINAL_PAPERCLIP_API_URL = process.env.PAPERCLIP_API_URL;
 const ORIGINAL_PAPERCLIP_RUNTIME_API_URL = process.env.PAPERCLIP_RUNTIME_API_URL;
@@ -852,6 +863,202 @@ describe("startServer feedback export wiring", () => {
     expect(heartbeatServiceMock.reconcileHotRestartAdoption).toHaveBeenCalledTimes(1);
     expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(2);
   });
+
+  it.skipIf(!embeddedPostgresSupported)(
+    "keeps listening and skips only the canonical Wiki handoff card when a startup recovery write is refused",
+    async () => {
+      // CR finding 3: the startup recovery pass must not abort (nor restart-loop)
+      // when the exhausted-recovery drain's write on a non-canonical Wiki
+      // handoff card is refused; the refusal is isolated to that card, the
+      // refusal reason and card identity are logged, and the later ordinary
+      // card is still processed.
+      const { createDb: realCreateDb } =
+        await vi.importActual<{ createDb: typeof createDb }>("@paperclipai/db");
+      const tempDb = await startEmbeddedPostgresTestDatabase("paperclip-startup-wiki-skip-");
+      const database = realCreateDb(tempDb.connectionString);
+
+      const companyId = randomUUID();
+      const prefix = `SK${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+      const maintainerId = randomUUID();
+      const intruderId = randomUUID();
+      const coderId = randomUUID();
+      const pluginId = randomUUID();
+      const stageId = randomUUID();
+      const wikiIssueId = randomUUID();
+      const ordinaryIssueId = randomUUID();
+
+      await database.insert(companiesTable).values({
+        id: companyId,
+        name: "Startup Wiki Skip",
+        issuePrefix: prefix,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await database.insert(pluginsTable).values({
+        id: pluginId,
+        pluginKey: "paperclipai.plugin-llm-wiki",
+        packageName: "@paperclipai/plugin-llm-wiki",
+        version: "0.1.0",
+        apiVersion: 1,
+        categories: [],
+        manifestJson: {} as never,
+        status: "ready",
+        installOrder: 1,
+      });
+      await database.insert(agentsTable).values([
+        {
+          id: maintainerId,
+          companyId,
+          name: "Wiki Maintainer",
+          role: "knowledge-maintainer",
+          status: "paused",
+          adapterType: "process",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        },
+        {
+          id: intruderId,
+          companyId,
+          name: "coder-LE",
+          role: "engineer",
+          status: "paused",
+          adapterType: "codex_local",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        },
+        {
+          id: coderId,
+          companyId,
+          name: "Coder",
+          role: "engineer",
+          status: "idle",
+          adapterType: "codex_local",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        },
+      ] as never);
+      await database.insert(pluginManagedResources).values({
+        companyId,
+        pluginId,
+        pluginKey: "paperclipai.plugin-llm-wiki",
+        resourceKind: "agent",
+        resourceKey: "wiki-maintainer",
+        resourceId: maintainerId,
+        defaultsJson: {},
+      });
+      // The non-canonical Wiki handoff card: plugin-managed maintainer is the
+      // rightful reviewer, a foreign agent holds the assignment, and an
+      // exhausted recovery action leaves the drain to re-arm it.
+      await database.insert(issuesTable).values({
+        id: wikiIssueId,
+        companyId,
+        title: "[PPC ER] Weekly Report — handoff to Wiki Maintainer",
+        description: null,
+        status: "in_review",
+        priority: "medium",
+        assigneeAgentId: intruderId,
+        issueNumber: 1,
+        identifier: `${prefix}-1`,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [
+            {
+              id: stageId,
+              type: "review",
+              approvalsNeeded: 1,
+              participants: [{ id: randomUUID(), type: "agent", agentId: intruderId, userId: null }],
+            },
+          ],
+        },
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: intruderId, userId: null },
+          returnAssignee: { type: "agent", agentId: intruderId, userId: null },
+          reviewRequest: null,
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      });
+      await database.insert(issuesTable).values({
+        id: ordinaryIssueId,
+        companyId,
+        title: "Ordinary in-review card",
+        status: "in_review",
+        priority: "medium",
+        assigneeAgentId: coderId,
+        issueNumber: 2,
+        identifier: `${prefix}-2`,
+      });
+      await database.insert(issueRecoveryActions).values(
+        [wikiIssueId, ordinaryIssueId].map((sourceIssueId) => ({
+          id: randomUUID(),
+          companyId,
+          sourceIssueId,
+          kind: "workspace_validation",
+          status: "escalated",
+          ownerType: "board",
+          previousOwnerAgentId: sourceIssueId === wikiIssueId ? intruderId : coderId,
+          cause: "workspace_validation_failed",
+          fingerprint: `workspace:provision:failure:${sourceIssueId}`,
+          attemptCount: 5,
+          maxAttempts: 5,
+          nextAction: "Repair the worktree provisioning failure.",
+          outcome: "exhausted",
+          evidence: { identifier: null },
+          lastAttemptAt: new Date("2026-11-07T09:00:00.000Z"),
+        })),
+      );
+
+      const recovery = recoveryService(database, { enqueueWakeup: vi.fn(async () => null) });
+      createDbMock.mockReturnValueOnce(database as never);
+      heartbeatServiceFactoryMock.mockImplementationOnce(() => ({
+        ...heartbeatServiceMock,
+        reconcileExhaustedRecoveryDrain: () => recovery.reconcileExhaustedRecoveryDrain(),
+      }));
+      loadConfigMock.mockReturnValue(buildTestConfig({
+        heartbeatSchedulerEnabled: true,
+        heartbeatSchedulerIntervalMs: HEARTBEAT_SCHEDULER_INTERVAL_MS,
+        databaseUrl: tempDb.connectionString,
+      }));
+
+      try {
+        const started = await startServer();
+
+        // The refusal must not reject startup: the listener stays up.
+        expect(started.server).toBe(fakeServer);
+        expect(fakeServer.listen).toHaveBeenCalledOnce();
+        // The skip is logged with the card identity and refusal reason.
+        await vi.waitFor(() => {
+          expect(logger.error).toHaveBeenCalledWith(
+            expect.objectContaining({
+              sweep: "recovery.reconcile_exhausted_recovery_drain",
+              refusalReason: "wiki_handoff_non_canonical_assignee",
+              issueId: wikiIssueId,
+            }),
+            expect.stringContaining("skipped a card"),
+          );
+        });
+        // The ordinary card still gets its monitor armed; the refused card does not.
+        const [wiki, ordinary] = await Promise.all([
+          database.select().from(issuesTable).where(eq(issuesTable.id, wikiIssueId)).then((rows) => rows[0]),
+          database.select().from(issuesTable).where(eq(issuesTable.id, ordinaryIssueId)).then((rows) => rows[0]),
+        ]);
+        expect(ordinary?.monitorNextCheckAt).not.toBeNull();
+        expect(wiki?.monitorNextCheckAt).toBeNull();
+      } finally {
+        await tempDb.cleanup();
+      }
+    },
+    30_000,
+  );
 
   it.skipIf(!embeddedPostgresSupported)("closes the real listener before ending the real database pool on a fatal post-bind bootstrap failure", async () => {
     // The suite mocks HTTP and DB; these two actual factories expose the leaked-listener regression.

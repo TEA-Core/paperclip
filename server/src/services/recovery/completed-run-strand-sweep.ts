@@ -2,6 +2,7 @@ import { and, desc, eq, isNotNull, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issueComments, issues } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
+import { runRecoverySweepIssue } from "../../lib/recovery-sweep-isolation.js";
 import { issueService } from "../issues.js";
 import { isChatDrivenWake } from "./successful-run-handoff.js";
 import {
@@ -641,12 +642,16 @@ export async function sweepCompletedRunStrandedIssues(
     const sourceRun = facts.get(candidate.id)?.latestRun ?? null;
     if (!sourceRun) continue;
 
-    const escalated = await (input.escalateIssue ?? defaultEscalateCompletedRunStrand)(
-      db,
-      candidate,
-      { sourceRun },
-    );
+    let noticePosted = false;
+    const escalated = await runRecoverySweepIssue(candidate, "recovery.completed_run_strand_sweep", async () => {
+      noticePosted = await (input.escalateIssue ?? defaultEscalateCompletedRunStrand)(
+        db,
+        candidate,
+        { sourceRun },
+      );
+    });
     if (!escalated) continue;
+    if (!noticePosted) continue;
     report.escalated.push(candidate.id);
     logger.info(
       { issueId: candidate.id, identifier: candidate.identifier, sourceRunId: sourceRun.id },

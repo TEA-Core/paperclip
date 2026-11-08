@@ -8256,6 +8256,8 @@ export function recoveryService(
       reArmCapExhaustedIssueIds: [] as string[],
       deferredOrFailed: 0,
       enqueueFailed: 0,
+      skipped: 0,
+      skippedIssueIds: [] as string[],
       issueIds: [] as string[],
     };
 
@@ -8378,27 +8380,38 @@ export function recoveryService(
         if (consumedCount >= maxCount) {
           result.reArmCapSkipped += 1;
           if (!(await hasActiveOrEscalatedRecoveryAction(companyId, candidate.id))) {
-            await recoveryActionsSvc.upsertSourceScoped({
-              companyId,
-              sourceIssueId: candidate.id,
-              kind: "pending_review_rearm_cap_exhausted",
-              ownerType: "board",
-              previousOwnerAgentId: agentId,
-              cause: "pending_review_rearm_cap_exhausted",
-              fingerprint: `prr:${companyId}:${candidate.id}`,
-              evidence: {
-                identifier: candidate.identifier,
-                reArmCount: consumedCount,
-                reArmMax: maxCount,
-                reArmWindowMs: windowMs,
+            const capActionRecorded = await runRecoverySweepIssue(
+              candidate,
+              "recovery.reconcile_pending_review_rearm",
+              async () => {
+                await recoveryActionsSvc.upsertSourceScoped({
+                  companyId,
+                  sourceIssueId: candidate.id,
+                  kind: "pending_review_rearm_cap_exhausted",
+                  ownerType: "board",
+                  previousOwnerAgentId: agentId,
+                  cause: "pending_review_rearm_cap_exhausted",
+                  fingerprint: `prr:${companyId}:${candidate.id}`,
+                  evidence: {
+                    identifier: candidate.identifier,
+                    reArmCount: consumedCount,
+                    reArmMax: maxCount,
+                    reArmWindowMs: windowMs,
+                  },
+                  nextAction:
+                    "This issue's pending review was re-armed repeatedly without a decision. Review and take action.",
+                  wakePolicy: null,
+                  monitorPolicy: null,
+                  maxAttempts: null,
+                  lastAttemptAt: now,
+                });
               },
-              nextAction:
-                "This issue's pending review was re-armed repeatedly without a decision. Review and take action.",
-              wakePolicy: null,
-              monitorPolicy: null,
-              maxAttempts: null,
-              lastAttemptAt: now,
-            });
+            );
+            if (!capActionRecorded) {
+              result.skipped += 1;
+              result.skippedIssueIds.push(candidate.id);
+              continue;
+            }
             result.reArmCapExhausted += 1;
             result.reArmCapExhaustedIssueIds.push(candidate.id);
           }
@@ -8411,59 +8424,63 @@ export function recoveryService(
           continue;
         }
 
-        try {
-          const wake = await deps.enqueueWakeup(agentId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: PENDING_REVIEW_REARM_REASON,
-            payload: {
-              issueId: candidate.id,
-              mutation: "update",
-              executionStage,
-              rearm: true,
-            },
-            requestedByActorType: "system",
-            requestedByActorId,
-            contextSnapshot: {
-              issueId: candidate.id,
-              taskId: candidate.id,
-              wakeReason: PENDING_REVIEW_REARM_REASON,
-              source,
-              executionStage,
-              rearm: true,
-            },
-          });
-          if (!wake) {
-            result.deferredOrFailed += 1;
-            continue;
-          }
+        let wakeDeferred = false;
+        const reArmedCard = await runRecoverySweepIssue(
+          candidate,
+          "recovery.reconcile_pending_review_rearm",
+          async () => {
+            const wake = await deps.enqueueWakeup(agentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: PENDING_REVIEW_REARM_REASON,
+              payload: {
+                issueId: candidate.id,
+                mutation: "update",
+                executionStage,
+                rearm: true,
+              },
+              requestedByActorType: "system",
+              requestedByActorId,
+              contextSnapshot: {
+                issueId: candidate.id,
+                taskId: candidate.id,
+                wakeReason: PENDING_REVIEW_REARM_REASON,
+                source,
+                executionStage,
+                rearm: true,
+              },
+            });
+            if (!wake) {
+              wakeDeferred = true;
+              return;
+            }
 
-          result.reArmed += 1;
-          result.issueIds.push(candidate.id);
+            result.reArmed += 1;
+            result.issueIds.push(candidate.id);
 
-          await logActivity(db, {
-            companyId,
-            actorType: "system",
-            actorId: requestedByActorId,
-            agentId,
-            runId: opts?.runId ?? null,
-            action: "issue.pending_review_rearm_wake_emitted",
-            entityType: "issue",
-            entityId: candidate.id,
-            details: {
-              source,
-              wakeupRunId: wake.id,
-              reArmCount: consumedCount + 1,
-              reArmMax: maxCount,
-            },
-          });
-        } catch (err) {
+            await logActivity(db, {
+              companyId,
+              actorType: "system",
+              actorId: requestedByActorId,
+              agentId,
+              runId: opts?.runId ?? null,
+              action: "issue.pending_review_rearm_wake_emitted",
+              entityType: "issue",
+              entityId: candidate.id,
+              details: {
+                source,
+                wakeupRunId: wake.id,
+                reArmCount: consumedCount + 1,
+                reArmMax: maxCount,
+              },
+            });
+          },
+        );
+        if (!reArmedCard) {
+          result.skipped += 1;
+          result.skippedIssueIds.push(candidate.id);
+        } else if (wakeDeferred) {
           result.deferredOrFailed += 1;
-          result.enqueueFailed += 1;
-          logger.warn(
-            { err, issueId: candidate.id, agentId, source },
-            "failed to enqueue pending review re-arm wake",
-          );
         }
       }
     }
@@ -11517,6 +11534,8 @@ export function recoveryService(
       skippedFresh: 0,
       skippedLiveBlocker: 0,
       manual: 0,
+      isolationSkipped: 0,
+      isolationSkippedIssueIds: [] as string[],
       issueIds: [] as string[],
     };
 
@@ -11554,12 +11573,23 @@ export function recoveryService(
 
       const state = parseIssueExecutionState(candidate.executionState);
       if (!state || state.currentStageType !== "review") {
-        await db.insert(issueComments).values({
-          companyId: candidate.companyId,
-          issueId: candidate.id,
-          authorType: "system",
-          body: "Manual intervention required: stale in_review child with no matching auto-archive rule. The child is in_review but not at a review stage, so it cannot be auto-archived by this sweep.",
-        });
+        const manualNoted = await runRecoverySweepIssue(
+          candidate,
+          "recovery.ingest_stale_in_review_child_issues",
+          async () => {
+            await db.insert(issueComments).values({
+              companyId: candidate.companyId,
+              issueId: candidate.id,
+              authorType: "system",
+              body: "Manual intervention required: stale in_review child with no matching auto-archive rule. The child is in_review but not at a review stage, so it cannot be auto-archived by this sweep.",
+            });
+          },
+        );
+        if (!manualNoted) {
+          result.isolationSkipped += 1;
+          result.isolationSkippedIssueIds.push(candidate.id);
+          continue;
+        }
         result.manual += 1;
         continue;
       }
@@ -11602,38 +11632,48 @@ export function recoveryService(
         continue;
       }
 
-      await db.transaction(async (tx) => {
-        await tx
-          .update(issues)
-          .set({ hiddenAt: new Date() })
-          .where(eq(issues.id, candidate.id));
+      const archivedCard = await runRecoverySweepIssue(
+        candidate,
+        "recovery.ingest_stale_in_review_child_issues",
+        async () => {
+          await db.transaction(async (tx) => {
+            await tx
+              .update(issues)
+              .set({ hiddenAt: new Date() })
+              .where(eq(issues.id, candidate.id));
 
-        await tx.insert(unWakeableArchives).values({
-          companyId: candidate.companyId,
-          issueId: candidate.id,
-          policy: "stale_in_review_child",
-        });
-      });
+            await tx.insert(unWakeableArchives).values({
+              companyId: candidate.companyId,
+              issueId: candidate.id,
+              policy: "stale_in_review_child",
+            });
+          });
 
-      result.archived += 1;
-      result.issueIds.push(candidate.id);
+          result.archived += 1;
+          result.issueIds.push(candidate.id);
 
-      await logActivity(db, {
-        companyId: candidate.companyId,
-        actorType: "system",
-        actorId: "system",
-        agentId: null,
-        runId: null,
-        action: "issue.auto_archived",
-        entityType: "issue",
-        entityId: candidate.id,
-        details: {
-          source: "recovery.ingest_stale_in_review_child_issues",
-          parentId: candidate.parentId,
-          policy: "stale_in_review_child",
-          identifier: candidate.identifier,
+          await logActivity(db, {
+            companyId: candidate.companyId,
+            actorType: "system",
+            actorId: "system",
+            agentId: null,
+            runId: null,
+            action: "issue.auto_archived",
+            entityType: "issue",
+            entityId: candidate.id,
+            details: {
+              source: "recovery.ingest_stale_in_review_child_issues",
+              parentId: candidate.parentId,
+              policy: "stale_in_review_child",
+              identifier: candidate.identifier,
+            },
+          });
         },
-      });
+      );
+      if (!archivedCard) {
+        result.isolationSkipped += 1;
+        result.isolationSkippedIssueIds.push(candidate.id);
+      }
     }
 
     if (result.archived > 0) {
@@ -11766,14 +11806,20 @@ export function recoveryService(
         }
       }
       if (!resolutionNote) continue;
-      await recoveryActionsSvc.resolveActiveForIssue({
-        companyId: action.companyId,
-        sourceIssueId: action.sourceIssueId,
-        actionId: action.id,
-        status: "resolved",
-        outcome: "restored",
-        resolutionNote,
-      });
+      await runRecoverySweepIssue(
+        { id: action.sourceIssueId, identifier: source?.identifier ?? null },
+        "recovery.reconcile_cancelled_only_blocker_dependents",
+        async () => {
+          await recoveryActionsSvc.resolveActiveForIssue({
+            companyId: action.companyId,
+            sourceIssueId: action.sourceIssueId,
+            actionId: action.id,
+            status: "resolved",
+            outcome: "restored",
+            resolutionNote,
+          });
+        },
+      );
     }
 
     const candidates = await db
@@ -11858,41 +11904,47 @@ export function recoveryService(
         continue;
       }
 
-      result.reported += 1;
-      result.issueIds.push(candidate.id);
+      const reportedCard = await runRecoverySweepIssue(
+        candidate,
+        "recovery.reconcile_cancelled_only_blocker_dependents",
+        async () => {
+          await emitSweepDetectionRowIfChanged({
+            companyId: candidate.companyId,
+            entityId: candidate.id,
+            action: "issue.cancelled_blocker_dependent_detected",
+            details: {
+              identifier: candidate.identifier,
+              source: "recovery.reconcile_cancelled_only_blocker_dependents",
+            },
+          });
 
-      await emitSweepDetectionRowIfChanged({
-        companyId: candidate.companyId,
-        entityId: candidate.id,
-        action: "issue.cancelled_blocker_dependent_detected",
-        details: {
-          identifier: candidate.identifier,
-          source: "recovery.reconcile_cancelled_only_blocker_dependents",
+          // A cancelled blocker is terminal but does not satisfy its edge. Do not
+          // silently treat it as done: the board owns deciding whether to replace
+          // the cancelled work or remove the edge.
+          const recoveryActions = issueRecoveryActionService(db);
+          if (!(await recoveryActions.getActiveForIssue(candidate.companyId, candidate.id))) {
+            await recoveryActions.upsertSourceScoped({
+              companyId: candidate.companyId,
+              sourceIssueId: candidate.id,
+              kind: "issue_graph_liveness",
+              ownerType: "board",
+              previousOwnerAgentId: candidate.assigneeAgentId,
+              cause: "cancelled_blocker_dependent",
+              fingerprint: `cancelled_blocker_dependent:${candidate.companyId}:${candidate.id}`,
+              evidence: { identifier: candidate.identifier, cancelledBlockerIssueIds: readiness.unresolvedBlockerIssueIds },
+              nextAction:
+                "All remaining unresolved blocker edges point to cancelled issues. Board: replace the cancelled work " +
+                "or remove the stale blocker edges, then resume the dependent's assignee.",
+              wakePolicy: null,
+              monitorPolicy: null,
+              maxAttempts: null,
+            });
+          }
+          result.reported += 1;
+          result.issueIds.push(candidate.id);
         },
-      });
-
-      // A cancelled blocker is terminal but does not satisfy its edge. Do not
-      // silently treat it as done: the board owns deciding whether to replace
-      // the cancelled work or remove the edge.
-      const recoveryActions = issueRecoveryActionService(db);
-      if (!(await recoveryActions.getActiveForIssue(candidate.companyId, candidate.id))) {
-        await recoveryActions.upsertSourceScoped({
-          companyId: candidate.companyId,
-          sourceIssueId: candidate.id,
-          kind: "issue_graph_liveness",
-          ownerType: "board",
-          previousOwnerAgentId: candidate.assigneeAgentId,
-          cause: "cancelled_blocker_dependent",
-          fingerprint: `cancelled_blocker_dependent:${candidate.companyId}:${candidate.id}`,
-          evidence: { identifier: candidate.identifier, cancelledBlockerIssueIds: readiness.unresolvedBlockerIssueIds },
-          nextAction:
-            "All remaining unresolved blocker edges point to cancelled issues. Board: replace the cancelled work " +
-            "or remove the stale blocker edges, then resume the dependent's assignee.",
-          wakePolicy: null,
-          monitorPolicy: null,
-          maxAttempts: null,
-        });
-      }
+      );
+      if (!reportedCard) result.skipped += 1;
     }
 
     const shouldLog =
@@ -12055,18 +12107,24 @@ export function recoveryService(
         }
       }
       if (!resolutionNote) continue;
-      const resolvedAction = await recoveryActionsSvc.resolveActiveForIssue({
-        companyId: action.companyId,
-        sourceIssueId: action.sourceIssueId,
-        actionId: action.id,
-        status: "resolved",
-        outcome: "restored",
-        resolutionNote,
-      });
-      if (resolvedAction) {
-        result.resolved += 1;
-        undispatchableAssignedSightCounts.delete(action.sourceIssueId);
-      }
+      await runRecoverySweepIssue(
+        { id: action.sourceIssueId, identifier: source?.identifier ?? null },
+        "recovery.reconcile_undispatchable_assigned",
+        async () => {
+          const resolvedAction = await recoveryActionsSvc.resolveActiveForIssue({
+            companyId: action.companyId,
+            sourceIssueId: action.sourceIssueId,
+            actionId: action.id,
+            status: "resolved",
+            outcome: "restored",
+            resolutionNote,
+          });
+          if (resolvedAction) {
+            result.resolved += 1;
+            undispatchableAssignedSightCounts.delete(action.sourceIssueId);
+          }
+        },
+      );
     }
 
     const queryCandidates = (afterIssueId: string | null) => {
@@ -12164,116 +12222,122 @@ export function recoveryService(
         continue;
       }
 
-      result.reported += 1;
-      result.issueIds.push(candidate.id);
+      const reportedCard = await runRecoverySweepIssue(
+        candidate,
+        "recovery.reconcile_undispatchable_assigned",
+        async () => {
+          await emitSweepDetectionRowIfChanged({
+            companyId: candidate.companyId,
+            entityId: candidate.id,
+            action: "issue.undispatchable_assignee_detected",
+            details: {
+              source: "recovery.reconcile_undispatchable_assigned",
+              identifier: candidate.identifier,
+              assigneeAgentId: candidate.assigneeAgentId,
+              status: candidate.status,
+            },
+          });
+          result.reported += 1;
+          result.issueIds.push(candidate.id);
 
-      await emitSweepDetectionRowIfChanged({
-        companyId: candidate.companyId,
-        entityId: candidate.id,
-        action: "issue.undispatchable_assignee_detected",
-        details: {
-          source: "recovery.reconcile_undispatchable_assigned",
-          identifier: candidate.identifier,
-          assigneeAgentId: candidate.assigneeAgentId,
-          status: candidate.status,
+          // Two-cycle confirmation: the condition must hold on this sweep AND on
+          // a prior one before the sweep escalates. First sight stays report-only
+          // so a card mid-reassignment (assignee just set, dispatch state not yet
+          // settled) cannot trip the escalation. From the second confirmed
+          // cycle on, the card owns a first-class board recovery action instead
+          // of being re-reported forever with activeRecoveryAction null.
+          let confirmedCycles = (undispatchableAssignedSightCounts.get(candidate.id) ?? 0) + 1;
+          if (confirmedCycles === 1 && undispatchableAssignedSightCounts.size >= UNDISPATCHABLE_ASSIGNED_SIGHT_COUNTS_LIMIT) {
+            // Bounded-memory reset: only un-escalated cards are affected, and it
+            // just delays their escalation one cycle (open actions are persisted
+            // in the DB and re-confirmed idempotently, not via this counter).
+            undispatchableAssignedSightCounts.clear();
+          }
+          undispatchableAssignedSightCounts.set(candidate.id, confirmedCycles);
+          if (confirmedCycles < 2) return;
+
+          const openAction = await recoveryActionsSvc.getActiveForIssue(candidate.companyId, candidate.id);
+          if (openAction) {
+            if (openAction.kind === UNDISPATCHABLE_ASSIGNEE_RECOVERY_KIND) {
+              // Idempotent: this sweep already owns an open (or terminal
+              // escalated) action for the same condition. Re-confirmation must
+              // not mint a second one or bump its attempt budget.
+              return;
+            }
+            if (isTerminalRecoveryAction(openAction)) {
+              // A terminal action for a different condition blocks a new mint on
+              // the same source (platform invariant). Board must resolve it first.
+              return;
+            }
+          }
+
+          // Durable suppressor (SUP-14699): when the board has ruled this alarm
+          // structurally invalid for the current assignee, it is recorded as a
+          // resolved `false_positive` of this kind. The mint path above reads only
+          // the currently-open action, so without this check the next tick re-mints
+          // the alarm ~12s after the board resolved it — a ratified ruling surviving
+          // exactly one sweep interval. Keying on `false_positive` (not any
+          // resolution) preserves the sweep's real purpose: `restored` means the
+          // condition cleared and must keep re-detecting; only a ruling-invalid
+          // alarm goes quiet. Reading the persisted row — not the in-memory sight
+          // counter — means the ruling survives a control-plane restart. A change of
+          // assignee re-arms, because a different agent is a different claim.
+          const ruledInvalid = await recoveryActionsSvc.getLatestResolvedForIssue(
+            candidate.companyId,
+            candidate.id,
+            UNDISPATCHABLE_ASSIGNEE_RECOVERY_KIND,
+          );
+          if (
+            ruledInvalid?.outcome === "false_positive" &&
+            (ruledInvalid.evidence?.assigneeAgentId as string | null | undefined) === candidate.assigneeAgentId
+          ) {
+            return;
+          }
+
+          const escalatedAction = await recoveryActionsSvc.upsertSourceScoped({
+            companyId: candidate.companyId,
+            sourceIssueId: candidate.id,
+            kind: UNDISPATCHABLE_ASSIGNEE_RECOVERY_KIND,
+            ownerType: "board",
+            ownerAgentId: null,
+            previousOwnerAgentId: candidate.assigneeAgentId,
+            cause: UNDISPATCHABLE_ASSIGNEE_RECOVERY_CAUSE,
+            fingerprint: `undispatchable_assignee:${candidate.companyId}:${candidate.id}`,
+            evidence: {
+              source: "recovery.reconcile_undispatchable_assigned",
+              identifier: candidate.identifier,
+              assigneeAgentId: candidate.assigneeAgentId,
+              assigneeAdapterType: candidate.assigneeAdapterType,
+              status: candidate.status,
+            },
+            nextAction:
+              "Reassign the card to a dispatchable agent or a human owner: the current assignee is a pull-only (process) adapter agent that can never be woken, so the card has no wake path.",
+            wakePolicy: null,
+            monitorPolicy: null,
+            maxAttempts: null,
+          });
+          if (escalatedAction.kind !== UNDISPATCHABLE_ASSIGNEE_RECOVERY_KIND) return;
+          result.escalated += 1;
+
+          await logActivity(db, {
+            companyId: candidate.companyId,
+            actorType: "system",
+            actorId: "recovery.reconcile_undispatchable_assigned",
+            agentId: null,
+            runId: null,
+            action: "issue.undispatchable_assignee_escalated",
+            entityType: "issue",
+            entityId: candidate.id,
+            details: {
+              source: "recovery.reconcile_undispatchable_assigned",
+              identifier: candidate.identifier,
+              assigneeAgentId: candidate.assigneeAgentId,
+              recoveryActionId: escalatedAction.id,
+            },
+          });
         },
-      });
-
-      // Two-cycle confirmation: the condition must hold on this sweep AND on
-      // a prior one before the sweep escalates. First sight stays report-only
-      // so a card mid-reassignment (assignee just set, dispatch state not yet
-      // settled) cannot trip the escalation. From the second confirmed
-      // cycle on, the card owns a first-class board recovery action instead
-      // of being re-reported forever with activeRecoveryAction null.
-      let confirmedCycles = (undispatchableAssignedSightCounts.get(candidate.id) ?? 0) + 1;
-      if (confirmedCycles === 1 && undispatchableAssignedSightCounts.size >= UNDISPATCHABLE_ASSIGNED_SIGHT_COUNTS_LIMIT) {
-        // Bounded-memory reset: only un-escalated cards are affected, and it
-        // just delays their escalation one cycle (open actions are persisted
-        // in the DB and re-confirmed idempotently, not via this counter).
-        undispatchableAssignedSightCounts.clear();
-      }
-      undispatchableAssignedSightCounts.set(candidate.id, confirmedCycles);
-      if (confirmedCycles < 2) continue;
-
-      const openAction = await recoveryActionsSvc.getActiveForIssue(candidate.companyId, candidate.id);
-      if (openAction) {
-        if (openAction.kind === UNDISPATCHABLE_ASSIGNEE_RECOVERY_KIND) {
-          // Idempotent: this sweep already owns an open (or terminal
-          // escalated) action for the same condition. Re-confirmation must
-          // not mint a second one or bump its attempt budget.
-          continue;
-        }
-        if (isTerminalRecoveryAction(openAction)) {
-          // A terminal action for a different condition blocks a new mint on
-          // the same source (platform invariant). Board must resolve it first.
-          continue;
-        }
-      }
-
-      // Durable suppressor (SUP-14699): when the board has ruled this alarm
-      // structurally invalid for the current assignee, it is recorded as a
-      // resolved `false_positive` of this kind. The mint path above reads only
-      // the currently-open action, so without this check the next tick re-mints
-      // the alarm ~12s after the board resolved it — a ratified ruling surviving
-      // exactly one sweep interval. Keying on `false_positive` (not any
-      // resolution) preserves the sweep's real purpose: `restored` means the
-      // condition cleared and must keep re-detecting; only a ruling-invalid
-      // alarm goes quiet. Reading the persisted row — not the in-memory sight
-      // counter — means the ruling survives a control-plane restart. A change of
-      // assignee re-arms, because a different agent is a different claim.
-      const ruledInvalid = await recoveryActionsSvc.getLatestResolvedForIssue(
-        candidate.companyId,
-        candidate.id,
-        UNDISPATCHABLE_ASSIGNEE_RECOVERY_KIND,
       );
-      if (
-        ruledInvalid?.outcome === "false_positive" &&
-        (ruledInvalid.evidence?.assigneeAgentId as string | null | undefined) === candidate.assigneeAgentId
-      ) {
-        continue;
-      }
-
-      const escalatedAction = await recoveryActionsSvc.upsertSourceScoped({
-        companyId: candidate.companyId,
-        sourceIssueId: candidate.id,
-        kind: UNDISPATCHABLE_ASSIGNEE_RECOVERY_KIND,
-        ownerType: "board",
-        ownerAgentId: null,
-        previousOwnerAgentId: candidate.assigneeAgentId,
-        cause: UNDISPATCHABLE_ASSIGNEE_RECOVERY_CAUSE,
-        fingerprint: `undispatchable_assignee:${candidate.companyId}:${candidate.id}`,
-        evidence: {
-          source: "recovery.reconcile_undispatchable_assigned",
-          identifier: candidate.identifier,
-          assigneeAgentId: candidate.assigneeAgentId,
-          assigneeAdapterType: candidate.assigneeAdapterType,
-          status: candidate.status,
-        },
-        nextAction:
-          "Reassign the card to a dispatchable agent or a human owner: the current assignee is a pull-only (process) adapter agent that can never be woken, so the card has no wake path.",
-        wakePolicy: null,
-        monitorPolicy: null,
-        maxAttempts: null,
-      });
-      if (escalatedAction.kind !== UNDISPATCHABLE_ASSIGNEE_RECOVERY_KIND) continue;
-      result.escalated += 1;
-
-      await logActivity(db, {
-        companyId: candidate.companyId,
-        actorType: "system",
-        actorId: "recovery.reconcile_undispatchable_assigned",
-        agentId: null,
-        runId: null,
-        action: "issue.undispatchable_assignee_escalated",
-        entityType: "issue",
-        entityId: candidate.id,
-        details: {
-          source: "recovery.reconcile_undispatchable_assigned",
-          identifier: candidate.identifier,
-          assigneeAgentId: candidate.assigneeAgentId,
-          recoveryActionId: escalatedAction.id,
-        },
-      });
+      if (!reportedCard) result.skipped += 1;
     }
 
     const shouldLog =
