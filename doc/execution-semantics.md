@@ -178,7 +178,23 @@ The next stage's wake stays `deferred_issue_execution`; normal run finalization
 releases the issuer's lock and promotes the waiting successor. Only an issuer
 whose run context names this issue gets that exemption. An unscoped issuer, or
 one scoped to a different issue, cannot be rediscovered by admission, so the
-handoff is saved and then that run is cancelled as for any other reassignment.
+handoff is saved and then cancellation is attempted as for any other reassignment.
+That attempt can throw or leave the run running. The handoff stays saved and the
+issuer may keep running; the route logs a warning and a `heartbeat.cancel_failed`
+activity.
+
+While a live issuer remains associated with this issue, its successor waits at
+`deferred_issue_execution`. Normal finalization calls
+`releaseIssueExecutionAndPromote` after the issuer stops. The existing
+`reapOrphanedRuns` sweep can also finalize a lost run after its process-liveness
+and controller-ownership checks allow recovery. It marks that orphan failed and
+uses the same release/promotion path unless a process-loss retry takes over.
+The sweep skips tracked live executions, live child processes, and native runs
+whose ownership is unverified. It is not a forced-stop timeout for an issuer
+that stays active forever. A cancellation attempt alone never authorizes lock
+release: execution must have stopped. If an unscoped or differently scoped run's
+`executionRunId` was cleared, issue-context lookup cannot restore its association
+with this issue; a failed cancellation does not repair that missing association.
 
 ### Known execution waits at admission
 
