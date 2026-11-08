@@ -9620,7 +9620,7 @@ export function issueRoutes(
       );
     }
 
-    const actorRunId = req.actor.runId?.trim() || null;
+    const actorRunId = effectiveRunId?.trim() || req.actor.runId?.trim() || null;
     const conflictingRunId = [issue.checkoutRunId, issue.executionRunId].find(
       (runId) => runId && runId !== actorRunId,
     );
@@ -13905,8 +13905,7 @@ export function issueRoutes(
                 }
               : null,
           commentBody: doneTierResolutionNote,
-          runId: resolvedRecoveryRunId,
-          closingAgentId: actor.agentId ?? null,
+          runId: resolvedRecoveryRunId,          closingAgentId: actor.agentId ?? null,
           decisionCarried: !!doneCarryTransition.decision,
           boardActor: req.actor.type === "board",
         });
@@ -25524,8 +25523,7 @@ export function issueRoutes(
               actor.agentId ?? undefined,
               currentIssue.checkoutRunId ?? currentIssue.executionRunId ?? null,
             )
-            || null,
-          closingAgentId: actor.agentId ?? null,
+            || null,          closingAgentId: actor.agentId ?? null,
           decisionCarried: !!transition.decision,
           boardActor: req.actor.type === "board",
           caller: {
