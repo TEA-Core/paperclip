@@ -7,7 +7,7 @@ import { chatChannelRoutes } from "../routes/chat-channels.js";
 import { emailRoutes } from "../routes/email.js";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import type { EmailChannelService } from "../services/email-channels.js";
-
+import { makeRouteDbStub } from "./helpers/route-db-stub.js";
 const companyId = "11111111-1111-4111-8111-111111111111";
 const issueId = "22222222-2222-4222-8222-222222222222";
 const boardActor: Express.Request["actor"] = {
@@ -25,11 +25,11 @@ function app(actor = boardActor) {
     req.actor = actor;
     next();
   });
-  instance.use("/api", chatChannelRoutes({} as Db, {
+  instance.use("/api", chatChannelRoutes(makeRouteDbStub() as unknown as Db, {
     service: chat as unknown as ChatChannelService,
     heartbeat: { wakeup: vi.fn() },
   }));
-  instance.use("/api", emailRoutes({} as Db, email as unknown as EmailChannelService));
+  instance.use("/api", emailRoutes(makeRouteDbStub() as unknown as Db, email as unknown as EmailChannelService));
   instance.use(errorHandler);
   return instance;
 }
@@ -63,6 +63,7 @@ describe("task connector read routes", () => {
     expect(email.authorizeRead).toHaveBeenCalledWith(companyId, issueId, {
       userId: boardActor.userId,
       localImplicit: false,
+      boardApiKeyId: null,
     });
     expect(email.thread).toHaveBeenCalledWith(companyId, issueId);
   });

@@ -324,7 +324,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Explicit empty overrides clear inherited API keys in the child process.
     // Use the same precedence here when selecting its credential home.
     const isGrokSubscriptionMode = !hasNonEmptyEnvValue(
-      config.managedAiConnection ? env : { ...process.env, ...env },
+      config.managedAiConnection ? env : { ...sanitizeInheritedPaperclipEnv(process.env), ...env },
       "XAI_API_KEY",
     );
     if (isGrokSubscriptionMode) {

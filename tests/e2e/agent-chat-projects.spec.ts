@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 import { idle, json, send, setup } from "./agent-chat.shared";
+import { seedTier2Credential } from "./fixtures/tier2-delivery";
 
 test.use({ trace: "retain-on-failure" });
 test.setTimeout(120_000);
@@ -85,6 +86,7 @@ test("split handoff commits relevant plans before execution and never creates ch
 }) => {
   const f = await setup(request);
   try {
+    await seedTier2Credential(request, f.company.id);
     await page.goto(f.route);
     await send(page, {
       action: "handoff",
@@ -386,6 +388,7 @@ test("plan approval hands the preserved revision to an assigned project task", a
 }) => {
   const f = await setup(request);
   try {
+    await seedTier2Credential(request, f.company.id);
     await page.goto(f.route);
     await page.getByTestId("task-chat-composer-mode").click();
     await page

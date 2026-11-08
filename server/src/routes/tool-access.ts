@@ -1706,7 +1706,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
       if (error instanceof RailwayError) throw new HttpError(error.status, error.message);
       throw error;
     });
-    await logActivity(db, { companyId: connection.companyId, actorType: "user", actorId: req.actor.userId ?? "board", action: "tool_connection.railway_ssh_updated", entityType: "tool_connection", entityId: connection.id, details: { action: req.body.action, grantId: req.body.grantId, enabled: setup?.enabled ?? false } });
+    await logActivity(db, { companyId: connection.companyId, actorType: "user", actorId: req.actor.userId ?? "board", boardApiKeyId: getActorInfo(req).boardApiKeyId, action: "tool_connection.railway_ssh_updated", entityType: "tool_connection", entityId: connection.id, details: { action: req.body.action, grantId: req.body.grantId, enabled: setup?.enabled ?? false } });
     res.json(setup);
   });
 

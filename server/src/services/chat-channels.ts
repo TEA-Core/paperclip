@@ -9978,7 +9978,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     return { messageReceivedAt: at?.toISOString() ?? null };
   }
 
-  async function test(endpointId: string, finishOptions?: { optionalSlackTestForUser: string }) {
+  async function test(endpointId: string, finishOptions?: string | { optionalSlackTestForUser: string }) {
     const initial = await endpointRecord(endpointId);
     if (!initial) throw notFound("Chat endpoint not found");
     return withCredentialMutationLease(
@@ -10000,12 +10000,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         const testStartedAt = testStartedAtValue
           ? new Date(testStartedAtValue)
           : null;
-        const optionalSlackTest = Boolean(finishOptions?.optionalSlackTestForUser);
+        const optionalSlackTestUserId = typeof finishOptions === "string" ? finishOptions : finishOptions?.optionalSlackTestForUser;
+        const optionalSlackTest = Boolean(optionalSlackTestUserId);
         if (optionalSlackTest) {
           if (endpoint.provider !== "slack" || !endpoint.setup.webhookVerifiedAt || !endpoint.providerAccountId) {
             throw conflict("Verify the Slack connection before finishing setup");
           }
-          const linked = await findAuthorizedIdentityLink(endpoint, finishOptions!.optionalSlackTestForUser);
+          const linked = await findAuthorizedIdentityLink(endpoint, optionalSlackTestUserId!);
           if (!linked) throw forbidden("Connect your Slack account before finishing setup");
         }
         if (!optionalSlackTest) {
@@ -10141,7 +10142,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           await credentialLease.assertOwned(tx);
           if (optionalSlackTest) {
             const linked = await tx.select({ principalId: chatIdentityLinks.principalId }).from(chatIdentityLinks).where(and(
-              eq(chatIdentityLinks.endpointId, endpoint.id), eq(chatIdentityLinks.paperclipUserId, finishOptions!.optionalSlackTestForUser), eq(chatIdentityLinks.status, "linked"),
+              eq(chatIdentityLinks.endpointId, endpoint.id), eq(chatIdentityLinks.paperclipUserId, optionalSlackTestUserId!), eq(chatIdentityLinks.status, "linked"),
             )).limit(1).then((rows) => rows[0]);
             if (!linked || !(await lockCurrentPrincipalAuthorization(tx, endpoint, linked.principalId)).allowed) throw forbidden("Your Slack account is no longer authorized");
           }
@@ -10186,8 +10187,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               updatedAt: new Date(),
             })
             .where(eq(toolConnections.id, endpoint.connectionId));
-          if (optionalSlackTest) await logActivity(tx as unknown as Db, {
-            companyId: endpoint.companyId, actorType: "user", actorId: finishOptions!.optionalSlackTestForUser,
+          if (optionalSlackTest) await logActivityInTransaction(tx as unknown as Db, {
+            companyId: endpoint.companyId, actorType: "user", actorId: optionalSlackTestUserId!,
+            boardApiKeyId: null,
             action: "chat.setup_completed", entityType: "chat_endpoint", entityId: endpointId,
             details: { conversationTestOptional: true },
           });
@@ -23348,7 +23350,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             ? `[Connect your Paperclip account](${url}) — sign in and confirm this Slack identity. This private link expires in 15 minutes and works once. You can also confirm in the setup wizard. No agent work has started.`
             : "Return to the Paperclip setup wizard to confirm your Slack account. No agent work has started.";
         }
-        await logActivity(tx as unknown as Db, {
+        await logActivityInTransaction(tx as unknown as Db, {
           companyId: record.endpoint.companyId, actorType: "system", actorId: `chat:${principal.principal.id}`,
           action: "chat.slack_identity_discovered", entityType: "chat_endpoint", entityId: event.endpointId,
           details: { principalId: principal.principal.id },
@@ -28108,8 +28110,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         inviteId: invite.id, companyId: preview.companyId, requestType: "human", status: "pending_approval",
         requestIp, requestingUserId: userId, requestEmailSnapshot: user.email,
       }).returning({ id: joinRequests.id });
-      await logActivity(tx as unknown as Db, {
-        companyId: preview.companyId, actorType: "user", actorId: userId, action: "join.requested",
+      await logActivityInTransaction(tx as unknown as Db, {
+        companyId: preview.companyId, actorType: "user", actorId: userId, boardApiKeyId: null, action: "join.requested",
         entityType: "join_request", entityId: request.id, details: { requestType: "human", source: "slack_identity_link", endpointId: preview.endpointId },
       });
       return { status: "pending_approval" as const };
