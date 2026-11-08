@@ -12276,6 +12276,28 @@ export function issueService(db: Db) {
                 (blockedByIssueIds !== undefined || issueData.unblockDescriptor !== undefined)))) {
           patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
         }
+        if (
+          patch.executionRunId === null &&
+          (patch.status ?? receiptExisting.status) !== "done" &&
+          (patch.status ?? receiptExisting.status) !== "cancelled" &&
+          ((patch.assigneeAgentId !== undefined && patch.assigneeAgentId !== receiptExisting.assigneeAgentId) ||
+            (patch.assigneeUserId !== undefined && patch.assigneeUserId !== receiptExisting.assigneeUserId)) &&
+          (receiptExisting.executionRunId || receiptExisting.checkoutRunId)
+        ) {
+          const holder = await findLiveIssueExecutionHolder(tx as Db, receiptExisting.companyId, id);
+          if (
+            holder?.status === "running" &&
+            (holder.runId === receiptExisting.executionRunId || holder.runId === receiptExisting.checkoutRunId)
+          ) {
+            // Assignment permission changes now; execution admission waits for
+            // this resolved holder's actual stop, including a failed cancel.
+            const sameExecution = holder.runId === receiptExisting.executionRunId;
+            patch.executionRunId = holder.runId;
+            patch.executionAgentNameKey = sameExecution ? receiptExisting.executionAgentNameKey : null;
+            patch.executionLockedAt =
+              (sameExecution ? receiptExisting.executionLockedAt : null) ?? holder.startedAt ?? patch.updatedAt;
+          }
+        }
         // The version predicate is part of this UPDATE, not a check before it.
         // A concurrent writer that commits first changes updated_at, this
         // statement matches zero rows, and the transaction rolls back. The

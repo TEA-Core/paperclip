@@ -29458,18 +29458,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
     options: { suppressImmediateRecovery?: boolean } = {},
+    promotionIssueId?: string,
   ) {
+    const promotionOnly = promotionIssueId !== undefined;
     const runContext = parseObject(run.contextSnapshot);
-    const contextIssueId = readNonEmptyString(runContext.issueId);
-    const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
-    const recoveryAgent = await getAgent(run.agentId);
+    const contextIssueId = promotionIssueId ?? readNonEmptyString(runContext.issueId);
+    const recoveryAgent = promotionOnly ? null : await getAgent(run.agentId);
     const recoveryAgentInvokable =
       recoveryAgent &&
       recoveryAgent.status !== "paused" &&
       recoveryAgent.status !== "terminated" &&
       recoveryAgent.status !== "pending_approval";
     const recoverySessionBefore = recoveryAgentInvokable
-      ? await resolveSessionBeforeForWakeup(recoveryAgent, taskKey)
+      ? await resolveSessionBeforeForWakeup(recoveryAgent, deriveTaskKeyWithHeartbeatFallback(runContext, null))
       : null;
     const recoveryAgentNameKey = normalizeAgentNameKey(recoveryAgent?.name);
 
@@ -29482,6 +29483,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // the cycle repeats. Count the issue's consecutive pre-adapter setup failures and
     // block this retry once the bound is reached instead of queueing another.
     const preAdapterSetupFailureStreak =
+      !promotionOnly &&
       contextIssueId != null &&
       run.errorCode != null &&
       PRE_ADAPTER_SETUP_FAILURE_CODES.has(run.errorCode)
@@ -29492,6 +29494,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // Fold 2c / D12: upstream first-strike for non-retryable preflight refusals. Computed
     // before the tx so the post-commit event gate below can read it.
     const nonRetryablePreflightFailure = isNonRetryablePreflightFailedRun(run);
+    let siblingIssueIds: string[] | undefined;
 
     const promotionResult = await db.transaction(async (tx) => {
       // SUP-17978: this transaction holds the issue rows FOR UPDATE. Every read
@@ -29512,7 +29515,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // finalizations, which keeps deadlock risk independent of PostgreSQL's plan
       // choice when multiple issues match.
       await tx.execute(
-        contextIssueId
+        promotionIssueId !== undefined
+          ? sql`select id from issues
+              where company_id = ${run.companyId} and id = ${promotionIssueId}
+              for update`
+          : contextIssueId
           ? sql`
               select id from issues
               where company_id = ${run.companyId}
@@ -29539,7 +29546,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(
           and(
             eq(issues.companyId, run.companyId),
-            contextIssueId
+            promotionIssueId !== undefined
+              ? eq(issues.id, promotionIssueId)
+              : contextIssueId
               ? or(
                   eq(issues.id, contextIssueId),
                   eq(issues.executionRunId, run.id),
@@ -29565,44 +29574,55 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Only the checkout column should be released in that case; the execution
       // column now belongs to the retry.
       const promotionUpdateTimestamp = new Date();
-      await tx
-        .update(issues)
-        .set({
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: promotionUpdateTimestamp,
-        })
-        .where(
-          and(
-            eq(issues.companyId, run.companyId),
-            eq(issues.executionRunId, run.id),
-          ),
-        );
-      // `checkoutRunId` clear is symmetric to #6008's per-issue self-heal,
-      // extended to all siblings: covers paths where the issue's assignee or
-      // status changed between checkout and termination, which
-      // adoptStaleCheckoutRun's narrow WHERE clause cannot reach.
-      await tx
-        .update(issues)
-        .set({
-          checkoutRunId: null,
-          updatedAt: promotionUpdateTimestamp,
-        })
-        .where(
-          and(
-            eq(issues.companyId, run.companyId),
-            eq(issues.checkoutRunId, run.id),
-          ),
-        );
+      if (!promotionOnly) {
+        await tx
+          .update(issues)
+          .set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: promotionUpdateTimestamp,
+          })
+          .where(
+            and(
+              eq(issues.companyId, run.companyId),
+              eq(issues.executionRunId, run.id),
+            ),
+          );
+        // `checkoutRunId` clear is symmetric to #6008's per-issue self-heal,
+        // extended to all siblings: covers paths where the issue's assignee or
+        // status changed between checkout and termination, which
+        // adoptStaleCheckoutRun's narrow WHERE clause cannot reach.
+        await tx
+          .update(issues)
+          .set({
+            checkoutRunId: null,
+            updatedAt: promotionUpdateTimestamp,
+          })
+          .where(
+            and(
+              eq(issues.companyId, run.companyId),
+              eq(issues.checkoutRunId, run.id),
+            ),
+          );
+      }
 
-      // Deferred-wake promotion is bound to a single primary issue: the run's context
-      // issue when present, otherwise the first candidate we found (preserves the
-      // legacy rows[0] selection for runs that were not tied to a specific issue).
+      // Keep the original primary recovery surface. Other actual bindings
+      // release their own deferred intents without inheriting its recovery.
       let issue =
         (contextIssueId
           ? candidateIssues.find((candidate) => candidate.id === contextIssueId)
           : candidateIssues[0]) ?? null;
+      if (!promotionOnly) {
+        for (const candidate of candidateIssues) {
+          if (
+            candidate.id !== issue?.id &&
+            (candidate.executionRunId === run.id || candidate.checkoutRunId === run.id)
+          ) {
+            (siblingIssueIds ??= []).push(candidate.id);
+          }
+        }
+      }
 
       if (!issue) return null;
       if (issue.executionRunId && issue.executionRunId !== run.id) return null;
@@ -29612,6 +29632,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Sibling lock cleanup is already done above; only the primary issue carries
       // the recovery surface because the comment is attached to a single issue.
       if (
+        !promotionOnly &&
         (isWorkspaceValidationFailedRun(run) ||
           isConfigurationIncompleteFailedRun(run)) &&
         (issue.status === "todo" || issue.status === "in_progress") &&
@@ -29696,7 +29717,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ) {
         return { kind: "released" as const };
       }
-      if (await recordNativeTerminalRecoveryIfNeeded(txDb, run, issue, new Date())) {
+      if (!promotionOnly && await recordNativeTerminalRecoveryIfNeeded(txDb, run, issue, new Date())) {
         return { kind: "released" as const };
       }
 
@@ -30444,6 +30465,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       }
 
+      if (promotionOnly) return { kind: "released" as const };
+
       const findExistingExecutionPath = (agentId?: string | null) =>
         tx
           .select({ id: heartbeatRuns.id })
@@ -30616,7 +30639,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           reviewDeferralRetriesExhausted,
           reviewPreLaunchRetriesExhausted,
         });
-        if (shouldBlockReviewRecovery) {
+        if (!recoveryAgent || shouldBlockReviewRecovery) {
           return {
             kind: "blocked" as const,
             issue,
@@ -30957,6 +30980,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         run: queuedRun,
       };
     });
+    if (siblingIssueIds) {
+      const siblingOptions = { suppressImmediateRecovery: true };
+      for (const issueId of siblingIssueIds) {
+        await releaseIssueExecutionAndPromote(run, siblingOptions, issueId);
+      }
+    }
 
     if (promotionResult?.kind === "blocked") {
       // Fold 2c / D12: a block produced by the first-strike disjunct is a refusal, not a

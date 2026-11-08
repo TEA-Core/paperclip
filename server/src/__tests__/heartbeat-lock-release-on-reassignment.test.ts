@@ -229,9 +229,217 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
     return { ...seeded, policy, busyRun, client };
   }
 
-  // Admission only rediscovers a cleared execution lock through the holder's
-  // contextSnapshot.issueId, so a holder that lookup cannot see must not be
-  // exempted from the post-commit cancel or the successor would overlap it.
+  it("retains the resolved unscoped issuer while real post-commit cancellation is blocked", async () => {
+    const { coderAgentId, reviewerAgentId, issueId, holderRunId, policy, client } =
+      await seedStageHandoff(() => ({ wakeReason: "timer" }));
+    await db.execute(sql.raw(`CREATE FUNCTION test_stage_cancel_delay() RETURNS trigger
+      LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(739405); RETURN NEW; END $$`));
+    await db.execute(sql.raw(`CREATE TRIGGER test_stage_cancel_delay BEFORE UPDATE OF status ON heartbeat_runs
+      FOR EACH ROW WHEN (OLD.status = 'running' AND NEW.status = 'cancelled')
+      EXECUTE FUNCTION test_stage_cancel_delay()`));
+    const barrier = new EventEmitter();
+    const entered = once(barrier, "entered");
+    const gate = db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(739405)`);
+      const released = once(barrier, "release");
+      barrier.emit("entered");
+      await released;
+    });
+    await entered;
+    const patch = request(client).patch(`/api/issues/${issueId}`).send({
+      status: "done", comment: "Review passed; save the next stage before stopping this issuer.",
+    }).then((response) => response);
+    let deferredId: string | undefined;
+    try {
+      await vi.waitFor(async () => {
+        const waiting = await db.execute(sql`SELECT pid FROM pg_stat_activity
+          WHERE datname = current_database() AND wait_event = 'advisory'
+            AND query LIKE '%heartbeat_runs%'`);
+        expect(waiting).toHaveLength(1);
+      }, { timeout: 10_000 });
+      const [saved] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(saved).toMatchObject({
+        assigneeAgentId: reviewerAgentId,
+        executionState: { currentStageId: policy.stages[1]!.id },
+      });
+      expect((await heartbeat.getRun(holderRunId))?.status).toBe("running");
+      await heartbeat.wakeup(reviewerAgentId, {
+        source: "automation", reason: "issue_assigned", payload: { issueId },
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+        requestedByActorType: "agent", requestedByActorId: coderAgentId,
+      });
+      const [deferred] = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.agentId, reviewerAgentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ));
+      expect(deferred).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      deferredId = deferred!.id;
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].executionRunId).toBe(holderRunId);
+    } finally {
+      barrier.emit("release");
+      await gate;
+      await patch;
+      await db.execute(sql.raw("DROP TRIGGER test_stage_cancel_delay ON heartbeat_runs"));
+      await db.execute(sql.raw("DROP FUNCTION test_stage_cancel_delay()"));
+    }
+    const response = await patch;
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect((await heartbeat.getRun(holderRunId))?.status).toBe("cancelled");
+    const [promoted] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, deferredId!));
+    expect(promoted).toMatchObject({ status: "queued", reason: "issue_execution_promoted" });
+    expect(await heartbeat.getRun(promoted.runId!)).toMatchObject({ agentId: reviewerAgentId, status: "queued" });
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].executionRunId).toBe(promoted.runId);
+  });
+
+  it.each([
+    "unscoped", "unscoped multiple bindings", "missing context issue", "existing context issue",
+  ])("retains a resolved issuer after an actual cancel failure with %s until a real stop promotes every held successor", async (scope) => {
+    const contextIssueId = scope.startsWith("unscoped") ? null : randomUUID();
+    const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId, client } =
+      await seedStageHandoff(() => contextIssueId ? { issueId: contextIssueId } : { wakeReason: "timer" });
+    if (scope === "existing context issue") {
+      await db.insert(issues).values({
+        id: contextIssueId!, companyId, title: "Issuer's original task",
+        status: "in_review", assigneeAgentId: coderAgentId, executionRunId: holderRunId,
+      });
+    }
+    const siblingIssueId = scope === "unscoped" ? null : randomUUID();
+    if (siblingIssueId) {
+      await db.insert(issues).values({
+        id: siblingIssueId, companyId, title: "Other legacy held task",
+        status: "in_review", assigneeAgentId: reviewerAgentId, executionRunId: holderRunId,
+      });
+    }
+    await db.execute(sql.raw(`CREATE FUNCTION test_stage_cancel_failure() RETURNS trigger
+      LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test cancellation rejected'; END $$`));
+    await db.execute(sql.raw(`CREATE TRIGGER test_stage_cancel_failure BEFORE UPDATE OF status ON heartbeat_runs
+      FOR EACH ROW WHEN (OLD.status = 'running' AND NEW.status = 'cancelled')
+      EXECUTE FUNCTION test_stage_cancel_failure()`));
+    let deferredId: string | undefined;
+    let siblingDeferredId: string | undefined;
+    try {
+      const response = await request(client).patch(`/api/issues/${issueId}`).send({
+        status: "done", comment: "Review passed; cancellation failure must not admit overlapping execution.",
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body).toMatchObject({ status: "in_review", assigneeAgentId: reviewerAgentId });
+      expect((await heartbeat.getRun(holderRunId))?.status).toBe("running");
+      await heartbeat.wakeup(reviewerAgentId, {
+        source: "automation", reason: "issue_assigned", payload: { issueId },
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+        requestedByActorType: "agent", requestedByActorId: coderAgentId,
+      });
+      const [deferred] = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.agentId, reviewerAgentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ));
+      expect(deferred).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      deferredId = deferred!.id;
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].executionRunId).toBe(holderRunId);
+      if (siblingIssueId) {
+        await heartbeat.wakeup(reviewerAgentId, {
+          source: "automation", reason: "issue_assigned", payload: { issueId: siblingIssueId },
+          contextSnapshot: { issueId: siblingIssueId, taskId: siblingIssueId, wakeReason: "issue_assigned" },
+          requestedByActorType: "agent", requestedByActorId: coderAgentId,
+        });
+        const [siblingDeferred] = await db.select().from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.agentId, reviewerAgentId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${siblingIssueId}`,
+        ));
+        expect(siblingDeferred).toMatchObject({ status: "deferred_issue_execution", runId: null });
+        siblingDeferredId = siblingDeferred!.id;
+      }
+    } finally {
+      await db.execute(sql.raw("DROP TRIGGER test_stage_cancel_failure ON heartbeat_runs"));
+      await db.execute(sql.raw("DROP FUNCTION test_stage_cancel_failure()"));
+    }
+    await heartbeat.cancelRun(holderRunId, "The issuer actually stopped", { suppressImmediateRecovery: true });
+    expect((await heartbeat.getRun(holderRunId))?.status).toBe("cancelled");
+    const [promoted] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, deferredId!));
+    expect(promoted).toMatchObject({ status: "queued", reason: "issue_execution_promoted" });
+    expect(await heartbeat.getRun(promoted.runId!)).toMatchObject({ agentId: reviewerAgentId, status: "queued" });
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].executionRunId).toBe(promoted.runId);
+    if (siblingDeferredId) {
+      const [siblingPromoted] = await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, siblingDeferredId));
+      expect(siblingPromoted).toMatchObject({ status: "queued", reason: "issue_execution_promoted" });
+      expect(await heartbeat.getRun(siblingPromoted.runId!)).toMatchObject({
+        agentId: reviewerAgentId, status: "queued", contextSnapshot: { issueId: siblingIssueId },
+      });
+      expect((await db.select().from(issues).where(eq(issues.id, siblingIssueId!)))[0].executionRunId)
+        .toBe(siblingPromoted.runId);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, coderAgentId)))
+        .toEqual([expect.objectContaining({ id: holderRunId, status: "cancelled" })]);
+    }
+  });
+
+  it.each([
+    ["unscoped", () => ({ wakeReason: "timer" })],
+    ["other-issue", () => ({ issueId: randomUUID(), wakeReason: "issue_assigned" })],
+  ])("does not use an unresolved %s request header as cancellation or hold authority", async (_label, holderContext) => {
+    const { coderAgentId, reviewerAgentId, issueId, holderRunId, client } = await seedStageHandoff(holderContext);
+    await db.update(issues).set({
+      checkoutRunId: null, executionRunId: null, executionAgentNameKey: null, executionLockedAt: null,
+    }).where(eq(issues.id, issueId));
+    const response = await request(client).patch(`/api/issues/${issueId}`).send({
+      status: "done", comment: "Review passed without a resolved execution binding.",
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body).toMatchObject({ status: "in_review", assigneeAgentId: reviewerAgentId });
+    expect((await heartbeat.getRun(holderRunId))?.status).toBe("running");
+    await heartbeat.wakeup(reviewerAgentId, {
+      source: "automation", reason: "issue_assigned", payload: { issueId },
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      requestedByActorType: "agent", requestedByActorId: coderAgentId,
+    });
+    const successors = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.agentId, reviewerAgentId), eq(heartbeatRuns.status, "queued"),
+      sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+    ));
+    expect(successors).toEqual([expect.objectContaining({ agentId: reviewerAgentId, status: "queued" })]);
+    expect(await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, reviewerAgentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    ))).toEqual([]);
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].executionRunId).not.toBe(holderRunId);
+  });
+
+  it("retains a checkout-only saved handoff without borrowing header cancellation authority", async () => {
+    const { coderAgentId, reviewerAgentId, issueId, holderRunId, client } =
+      await seedStageHandoff(() => ({ issueId: randomUUID(), wakeReason: "issue_assigned" }));
+    await db.update(issues).set({
+      checkoutRunId: holderRunId, executionRunId: null,
+      executionAgentNameKey: null, executionLockedAt: null,
+    }).where(eq(issues.id, issueId));
+    const response = await request(client).patch(`/api/issues/${issueId}`).send({
+      status: "done", comment: "Review passed with a durable legacy checkout binding.",
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect((await heartbeat.getRun(holderRunId))?.status).toBe("running");
+    const [saved] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(saved).toMatchObject({
+      status: "in_review", assigneeAgentId: reviewerAgentId,
+      checkoutRunId: null, executionRunId: holderRunId,
+    });
+    await heartbeat.wakeup(reviewerAgentId, {
+      source: "automation", reason: "issue_assigned", payload: { issueId },
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      requestedByActorType: "agent", requestedByActorId: coderAgentId,
+    });
+    const [deferred] = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, reviewerAgentId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    ));
+    expect(deferred).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    await heartbeat.cancelRun(holderRunId, "The legacy issuer stopped", { suppressImmediateRecovery: true });
+    const [promoted] = await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferred!.id));
+    expect(promoted).toMatchObject({ status: "queued", reason: "issue_execution_promoted" });
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].executionRunId).toBe(promoted.runId);
+  });
+
+  // A resolved issuer without matching issue context still gets the normal
+  // post-commit cancellation attempt, even though its admission hold survives.
   it.each([
     ["has no issueId in its context", () => ({ wakeReason: "timer" })],
     ["is scoped to a different issue", () => ({ issueId: randomUUID(), wakeReason: "issue_assigned" })],
@@ -255,6 +463,9 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
   it("defers the next stage behind its issuing run after the handoff PATCH and promotes it on stop", async () => {
     const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId, policy, busyRun, client } =
       await seedStageHandoff();
+    await db.update(issues).set({
+      executionRunId: null, executionAgentNameKey: null, executionLockedAt: null,
+    }).where(eq(issues.id, issueId));
     const response = await request(client).patch(`/api/issues/${issueId}`).send({
       status: "done", comment: "Review passed; the next reviewer can continue after this run stops.",
     });
@@ -265,8 +476,8 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
       executionState: { currentStageId: policy.stages[1]!.id },
     });
     expect((await heartbeat.getRun(holderRunId))?.status).toBe("running");
-    // The assignee change clears the direct lock. Admission must rediscover
-    // the outgoing issuer by issue, not by the new assignee.
+    // This legacy binding was already cleared before PATCH. Admission must
+    // rediscover its scoped issuer independently of the new assignee.
     await heartbeat.wakeup(reviewerAgentId, {
       source: "automation",
       reason: "issue_assigned",
