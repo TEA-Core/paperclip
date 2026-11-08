@@ -866,6 +866,124 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(rows).toHaveLength(0);
   });
 
+  it("PATCH: record_only participant close without probe evidence records its decision and audited skip (SUP-23347)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23347A", { deliveryRequirement: "record_only" });
+    await db.delete(issueWorkProducts).where(eq(issueWorkProducts.issueId, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: "Reviewed the host repair and its verification record; no consumer probe exists.\n\nkind: review\ndecision: approved",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(issueId)).toBe("done");
+    const stateRows = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+    const state = stateRows[0]?.executionState as { completedStageIds?: string[]; lastDecisionOutcome?: string } | null;
+    expect(state?.lastDecisionOutcome).toBe("approved");
+    expect(state?.completedStageIds).toHaveLength(1);
+    const decisions = await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]?.stageId).toBe(state?.completedStageIds?.[0]);
+    expect(decisions[0]?.actorAgentId).toBe(reviewerAgentId);
+    expect(decisions[0]?.outcome).toBe("approved");
+    expect(await db.select().from(issueWorkProducts).where(eq(issueWorkProducts.issueId, issueId))).toHaveLength(0);
+    const rows = await vi.waitFor(async () => {
+      const found = await auditRows(companyId, issueId, "issue.done_tier_declaration_skipped");
+      if (found.length === 0) throw new Error("waiting for audit row");
+      return found;
+    });
+    expect(rows).toHaveLength(1);
+    expect((rows[0]?.details as Record<string, unknown>).skipReason).toBe("record_only_review_decision");
+    expect((rows[0]?.details as Record<string, unknown>).decisionCarried).toBe(true);
+  });
+
+  it("POST comment: record_only auto-approval without probe evidence records its decision and audited skip (SUP-23347)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23347C", { deliveryRequirement: "record_only" });
+    await db.delete(issueWorkProducts).where(eq(issueWorkProducts.issueId, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({ body: "## Review: APPROVED\n\nReviewed the host repair and its verification record; no consumer probe exists." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await statusOf(issueId)).toBe("done");
+    const decisions = await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]?.actorAgentId).toBe(reviewerAgentId);
+    expect(decisions[0]?.outcome).toBe("approved");
+    const rows = await vi.waitFor(async () => {
+      const found = await auditRows(companyId, issueId, "issue.done_tier_declaration_skipped");
+      if (found.length === 0) throw new Error("waiting for audit row");
+      return found;
+    });
+    expect(rows).toHaveLength(1);
+    expect((rows[0]?.details as Record<string, unknown>).skipReason).toBe("record_only_review_decision");
+    expect((rows[0]?.details as Record<string, unknown>).decisionCarried).toBe(true);
+  });
+
+  it("PATCH: record_only participant close without any comment still refuses (SUP-23347)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23347D", { deliveryRequirement: "record_only" });
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+
+    const res = await request(app).patch(`/api/issues/${identifier}`).send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(await statusOf(issueId)).toBe("in_review");
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId))).toHaveLength(0);
+    expect(await auditRows(companyId, issueId, "issue.done_tier_declaration_skipped")).toHaveLength(0);
+  });
+
+  it("PATCH: record_only participant close does not convert an unrelated landed-at-tip sha into a skip (SUP-23347)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23347E", { deliveryRequirement: "record_only" });
+    await db.delete(issueWorkProducts).where(eq(issueWorkProducts.issueId, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockMergedBranch();
+    const unrelatedSha = "deadbeef".repeat(5);
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: `Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 1 (landed, not liveness-probed): landed-at-tip merge commit ${unrelatedSha}. Liveness unverified.`,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(res.body.error).toContain("does not belong to this issue");
+    expect(await statusOf(issueId)).toBe("in_review");
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId))).toHaveLength(0);
+    expect(await auditRows(companyId, issueId, "issue.done_tier_declaration_skipped")).toHaveLength(0);
+  });
+
+  it("PATCH: record_only board close without a participant decision still refuses mechanism C (SUP-23347)", async () => {
+    const { companyId, issueId, identifier } = await seedIssueAwaitingReview("D23347B", { deliveryRequirement: "record_only" });
+    currentActor = {
+      type: "board",
+      userId: "cloud-user-1",
+      companyIds: [companyId],
+      memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+      source: "cloud_tenant",
+      isInstanceAdmin: false,
+      runId: randomUUID(),
+    };
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "Board close without participant concurrence." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.code).toBe("done_transition_missing_delivery");
+    expect(res.body.details.mechanism).toBe("C");
+    expect(res.body.details.decisionCarried).toBe(false);
+    expect(await statusOf(issueId)).toBe("in_review");
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId))).toHaveLength(0);
+    expect(await auditRows(companyId, issueId, "issue.done_tier_declaration_skipped")).toHaveLength(0);
+  });
+
   it("PATCH: a decision-carrying close carrying a verbatim tier line goes through (SUP-14367)", async () => {
     for (const [suffix, tierLine] of [
       [
