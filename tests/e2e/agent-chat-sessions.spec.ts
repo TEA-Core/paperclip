@@ -248,10 +248,13 @@ test("sidebar discovery, stars, recent agents, configuration links, and drafts s
     const star = page.getByRole("button", { name: "Star Zeta", exact: true });
     await page.getByTestId("task-chat-composer-input").click();
     await expect(star).toHaveCSS("opacity", "0");
-    await star.focus();
-    await page.keyboard.press("Tab");
-    await page.keyboard.press("Shift+Tab");
-    await expect(star).toHaveCSS("opacity", "1");
+    // `toBeFocused` also requires `document.hasFocus()`, which is not the
+    // reveal condition. The control fades in on `:focus-within`; focus it
+    // and wait for that opacity transition. Tab/Shift+Tab does not focus it.
+    await expect.poll(async () => {
+      await star.focus();
+      return star.evaluate((el) => getComputedStyle(el).opacity);
+    }).toBe("1");
     await star.click();
     await page.goto(f.route);
     await page.getByRole("button", { name: "Star Alpha", exact: true }).click();

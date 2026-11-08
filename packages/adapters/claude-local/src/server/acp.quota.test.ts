@@ -40,6 +40,11 @@ async function executeFailure(
       cwd: repoRoot,
       stateDir: path.join(root, "state"),
       env: {
+        // Fork managed-home gate: a local ACP run with no stored OAuth
+        // credentials throws before typed-failure classification. A placeholder
+        // subscription token is the gate's own fileless-auth bypass. The fixture
+        // never reads it, and the quota assertions below are unchanged.
+        CLAUDE_CODE_OAUTH_TOKEN: "claude-subscription-token",
         PAPERCLIP_ACPX_TYPED_FAILURE_CANARY: title,
         PAPERCLIP_ACPX_TYPED_FAILURE_CATEGORY: category,
       },

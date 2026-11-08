@@ -5517,10 +5517,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           summary: channelLost ? "duplex_channel_lost" : terminal.status,
           stopReason: terminalStopReason,
           message: errorMessage,
-          ...(forkTurnFailure
-            ? { errorCode: forkTurnFailure.errorCode }
-            : terminalFailureClassification
-              ? { errorCode: terminalFailureClassification.errorCode }
+          ...(classifiedFailure
+            ? { errorCode: classifiedFailure.errorCode }
+            : forkTurnFailure
+              ? { errorCode: forkTurnFailure.errorCode }
               : {}),
           ...(terminalErrorDetails ? { acpErrorDetails: terminalErrorDetails } : {}),
         });
@@ -5544,11 +5544,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             ? "acpx_timeout"
             : channelLost
               ? DUPLEX_CHANNEL_LOST_ERROR_CODE
-              : forkTurnFailure
-                ? forkTurnFailure.errorCode
-                : terminal.status === "failed"
-                  ? classifiedFailure?.errorCode ?? "acpx_turn_failed"
-                  : null,
+              : classifiedFailure?.errorCode
+                ?? forkTurnFailure?.errorCode
+                ?? (terminal.status === "failed" ? "acpx_turn_failed" : null),
           ...(orphanedProcess ? { errorMeta: { orphanedProcess } } : {}),
           ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
           ...(classifiedFailure?.retryNotBefore ? { retryNotBefore: classifiedFailure.retryNotBefore } : {}),

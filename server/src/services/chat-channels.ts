@@ -10000,7 +10000,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         const testStartedAt = testStartedAtValue
           ? new Date(testStartedAtValue)
           : null;
-        const optionalSlackTestUserId = typeof finishOptions === "string" ? finishOptions : finishOptions?.optionalSlackTestForUser;
+        const optionalSlackTestUserId = finishOptions && typeof finishOptions === "object"
+          ? finishOptions.optionalSlackTestForUser
+          : undefined;
         const optionalSlackTest = Boolean(optionalSlackTestUserId);
         if (optionalSlackTest) {
           if (endpoint.provider !== "slack" || !endpoint.setup.webhookVerifiedAt || !endpoint.providerAccountId) {
