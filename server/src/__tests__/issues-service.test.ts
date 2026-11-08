@@ -7405,15 +7405,12 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
   });
 
   it("returns the distinct terminal refusal (not a generic conflict) when a close lands in the checkout write window (SUP-15888)", async () => {
-    // Finding 3: the conditional write is gated by
-    // `inArray(status, expectedStatuses)`. A close that commits AFTER the
-    // terminal guard read at the top of `checkout` but BEFORE the write
-    // re-evaluates makes the write miss; the pre-fix code then fell through to
-    // a generic `Issue checkout conflict` instead of the distinct terminal
-    // refusal. This test forces exactly that interleaving deterministically:
-    // the row is live when the guard reads it, and a close is committed during
-    // the write via a db proxy. `checkout` must re-read, see the terminal
-    // status, and raise the distinct code — never the generic conflict.
+    // Checkout reads the card unlocked for the terminal guard, then takes the
+    // issue row lock for the write. A close that commits between the two must
+    // not be re-opened: the locked re-read sees the terminal status and raises
+    // the distinct refusal, never the generic conflict. The close holds the row
+    // lock uncommitted until checkout is observably blocked behind it, so the
+    // interleaving is deterministic.
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -7437,9 +7434,14 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       runtimeConfig: {},
       permissions: {},
     });
-    // Live at the guard read. Null run pointers keep the clear*IfTerminal
-    // helpers (which run before the write) as no-ops, so the only issues-table
-    // write in this path is the checkout's own conditional update.
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date("2026-09-12T04:00:00.000Z"),
+    });
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -7451,48 +7453,46 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       executionRunId: null,
     });
 
-    let closed = false;
-    const closingDb = new Proxy(db, {
-      get(target, prop, receiver) {
-        if (prop === "update") {
-          return function update(table: unknown) {
-            const builder = (target.update as (t: unknown) => any)(table);
-            if (table !== issues) return builder;
-            return {
-              set(values: unknown) {
-                const afterSet = builder.set(values);
-                return {
-                  where(condition: unknown) {
-                    const afterWhere = afterSet.where(condition);
-                    return {
-                      async returning() {
-                        if (!closed) {
-                          closed = true;
-                          // Commit the close precisely in the window between the
-                          // guard read and this conditional write.
-                          await db
-                            .update(issues)
-                            .set({ status: "done", completedAt, updatedAt: new Date() })
-                            .where(eq(issues.id, issueId));
-                        }
-                        // The real conditional write now misses: the row is no
-                        // longer in the expected (live) status.
-                        return afterWhere.returning();
-                      },
-                    };
-                  },
-                };
-              },
-            };
-          };
-        }
-        return Reflect.get(target, prop, receiver);
-      },
+    let releaseClose!: () => void;
+    const closeMayCommit = new Promise<void>((resolve) => {
+      releaseClose = resolve;
     });
+    let closerPid!: number;
+    let closeLocked!: () => void;
+    const closeHoldsLock = new Promise<void>((resolve) => {
+      closeLocked = resolve;
+    });
+    const closing = db.transaction(async (tx) => {
+      await tx
+        .update(issues)
+        .set({ status: "done", completedAt, updatedAt: new Date() })
+        .where(eq(issues.id, issueId));
+      const pidRows = (await tx.execute(sql`select pg_backend_pid() as pid`)) as unknown as Array<{ pid: number }>;
+      closerPid = pidRows[0]!.pid;
+      closeLocked();
+      await closeMayCommit;
+    });
+    await closeHoldsLock;
 
-    const closingSvc = issueService(closingDb as unknown as ReturnType<typeof createDb>);
+    const checkout = svc.checkout(issueId, agentId, ["in_review"], runId);
+    const refusal = checkout.then(
+      () => null,
+      (error: unknown) => error,
+    );
 
-    await expect(closingSvc.checkout(issueId, agentId, ["in_review"], runId)).rejects.toMatchObject({
+    let checkoutBlocked = false;
+    for (let attempt = 0; attempt < 200 && !checkoutBlocked; attempt++) {
+      const rows = (await db.execute(
+        sql`select 1 from pg_stat_activity where ${closerPid} = any(pg_blocking_pids(pid))`,
+      )) as unknown as Array<unknown>;
+      if (rows[0]) checkoutBlocked = true;
+      else await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    releaseClose();
+    await closing;
+    expect(checkoutBlocked).toBe(true);
+
+    expect(await refusal).toMatchObject({
       status: 409,
       details: { code: "checkout_refused_terminal_status", status: "done" },
     });
@@ -7557,13 +7557,13 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     // checkout/execution run is terminal) must not strip the row's
     // assigneeUserId. We exercise this via the adoptStaleCheckoutRun path,
     // which fires when checkoutRunId points at a terminal run while
-    // executionRunId still points at a different, non-terminal run.
+    // executionRunId already names the live acting run (a queued reservation
+    // for any other run would hold the lock and refuse the adoption).
     const companyId = randomUUID();
     const agentId = randomUUID();
     const userId = randomUUID();
     const issueId = randomUUID();
     const failedCheckoutRunId = randomUUID();
-    const queuedExecutionRunId = randomUUID();
     const successorRunId = randomUUID();
 
     await db.insert(companies).values({
@@ -7593,19 +7593,15 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
         finishedAt: new Date("2026-06-10T10:05:00.000Z"),
       },
       {
-        id: queuedExecutionRunId,
-        companyId,
-        agentId,
-        status: "queued",
-        invocationSource: "manual",
-      },
-      {
         id: successorRunId,
         companyId,
         agentId,
         status: "running",
         invocationSource: "manual",
         startedAt: new Date("2026-06-10T10:07:00.000Z"),
+        // Output keeps the acting run from reading as stillborn, so its
+        // execution pointer survives the pre-checkout self-heal.
+        lastOutputAt: new Date("2026-06-10T10:07:30.000Z"),
       },
     ]);
     await db.insert(issues).values({
@@ -7617,7 +7613,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       assigneeAgentId: agentId,
       assigneeUserId: userId,
       checkoutRunId: failedCheckoutRunId,
-      executionRunId: queuedExecutionRunId,
+      executionRunId: successorRunId,
       executionAgentNameKey: "codexcoder",
       executionLockedAt: new Date("2026-06-10T10:00:00.000Z"),
     });

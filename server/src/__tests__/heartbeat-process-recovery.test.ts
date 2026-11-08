@@ -9953,7 +9953,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).toBe(true);
   });
 
-  it("retries a pending execution-review participant when another agent has an active issue run", async () => {
+  it("defers a pending execution-review participant behind another agent's active issue run, then retries it", async () => {
     const { companyId, agentId, issueId, runId } =
       await seedInReviewParticipantRunFixture();
     const otherAgentId = randomUUID();
@@ -9986,6 +9986,36 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
 
     const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+
+    // The other agent's running run holds the issue, so the participant's run
+    // defers behind it instead of executing alongside it.
+    const deferral = await waitForValue(async () => {
+      const rows = await db
+        .select({ details: activityLog.details })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.action, "issue.concurrent_run_deferred"),
+            eq(activityLog.entityId, runId),
+          ),
+        );
+      return rows[0] ?? null;
+    }, 8_000);
+    expect(deferral?.details).toMatchObject({ holderRunId: otherRunId });
+    const deferredRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(deferredRun?.status).toBe("queued");
+
+    // Once the holder stops, the participant runs and is recovered.
+    const holderFinishedAt = new Date("2026-03-19T00:05:00.000Z");
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: holderFinishedAt, updatedAt: holderFinishedAt })
+      .where(eq(heartbeatRuns.id, otherRunId));
     await heartbeat.resumeQueuedRuns();
     const reviewRecoveryRun = await waitForValue(async () => {
       const runs = await db
