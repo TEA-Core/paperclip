@@ -20258,30 +20258,7 @@ export function issueRoutes(
       if (isIssuingRunStageHandoff) {
         preservedStageHandoffRunId = runToStopForReassignment?.id ?? null;
       } else if (runToStopForReassignment) {
-        if (terminalApprovalNeedsClassificationCheck) {
-          const cancelled = await heartbeat.cancelRun(
-            runToStopForReassignment.id,
-            "Cancelled before issue reassignment",
-            {
-              errorCode: "issue_reassigned",
-              resultJson: { reassignmentStopConfirmed: true },
-              eventMessage: "run cancelled before issue reassignment",
-              eventPayload: { issueId: existing.id },
-            },
-          );
-          if (!cancelled || cancelled.status !== "cancelled") {
-            throw conflict(
-              "The active agent run could not be stopped before reassignment",
-              {
-                code: "runner_goal_reassignment_stop_unconfirmed",
-                runId: runToStopForReassignment.id,
-              },
-            );
-          }
-          interruptedRunId = cancelled.id;
-        } else {
-          pendingReassignmentStopRunId = runToStopForReassignment.id;
-        }
+        pendingReassignmentStopRunId = runToStopForReassignment.id;
       }
     }
 

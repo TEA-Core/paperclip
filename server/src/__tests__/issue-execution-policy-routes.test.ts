@@ -4164,7 +4164,7 @@ describe("issue execution policy routes", () => {
       });
     });
 
-    function mockStageHandoff() {
+    function mockStageHandoff({ terminal = false }: { terminal?: boolean } = {}) {
       const stage1Id = "11111111-1111-4111-8111-111111111111";
       const stage2Id = "aaaaaaaa-0000-4000-8000-000000000002";
       const policy = normalizeIssueExecutionPolicy({
@@ -4174,11 +4174,11 @@ describe("issue execution policy routes", () => {
             type: "review",
             participants: [{ type: "agent", agentId: reviewerAgentId }],
           },
-          {
+          ...(terminal ? [] : [{
             id: stage2Id,
-            type: "review",
-            participants: [{ type: "agent", agentId: nextAgentId }],
-          },
+            type: "review" as const,
+            participants: [{ type: "agent" as const, agentId: nextAgentId }],
+          }]),
         ],
       })!;
       const issue = {
@@ -4262,6 +4262,59 @@ describe("issue execution policy routes", () => {
         actorAgentId: reviewerAgentId,
         outcome: "approved",
       }));
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
+    it("cancels a terminal-approval reassignment only after its update commits", async () => {
+      mockStageHandoff({ terminal: true });
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId,
+      }))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "done",
+          comment: "Terminal stage approved; reassigning the completed card.",
+          doneTier: {
+            tier: "tier2",
+            probeEvidence: "record-only probe `true` target local test observed 2026-11-08T00:00:00Z result: pass the command exited zero",
+          },
+          assigneeAgentId: nextAgentId,
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update.mock.calls[0]?.[1]).toEqual(
+        expect.objectContaining({ status: "done", assigneeAgentId: nextAgentId }),
+      );
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+      expect(mockIssueService.update.mock.invocationCallOrder[0])
+        .toBeLessThan(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]);
+    });
+
+    it("does not cancel when a terminal-approval reassignment update fails", async () => {
+      mockStageHandoff({ terminal: true });
+      mockEvaluateDoneTransitionGuard.mockResolvedValue({ ok: true });
+      mockIssueService.update.mockRejectedValue(new Error("simulated terminal update failure"));
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId,
+      }))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "done",
+          comment: "Terminal stage approved; reassigning the completed card.",
+          doneTier: {
+            tier: "tier2",
+            probeEvidence: "record-only probe `true` target local test observed 2026-11-08T00:00:00Z result: pass the command exited zero",
+          },
+          assigneeAgentId: nextAgentId,
+        });
+
+      expect(res.status).toBe(500);
       expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
     });
 

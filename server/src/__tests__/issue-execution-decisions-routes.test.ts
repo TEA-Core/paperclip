@@ -1551,30 +1551,45 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(fixture.writes).toEqual([]);
   });
 
-  it.each([
-    ["title", "NEW.title := 'Renamed while the run was cancelled';"],
-    ["execution policy", `NEW.execution_policy := NEW.execution_policy || '{"commentRequired": true}'::jsonb;`],
-    ["execution state", `NEW.execution_state := NEW.execution_state || '{"lastDecisionOutcome": "changes_requested"}'::jsonb;`],
-  ])("refuses a final PATCH when a concurrent %s change lands during its own run cancellation", async (_label, mutation) => {
-    const fixture = await pendingDelivery({ mergeArmingEnabled: true });
-    await holdAgentRun(fixture);
-    let response!: request.Response;
-    await withIssueTrigger(
-      "sup20467_concurrent_change",
-      "OLD.execution_run_id is not null and NEW.execution_run_id is null",
-      `${mutation} return NEW;`,
-      async () => { response = await fixture.approve(reassignToBoardUser); },
-    );
-    expect(response.status).toBe(409);
-    expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
-    const stored = await fixture.read();
-    expect(stored.status).toBe("in_review");
-    expect(stored.executionState?.completedStageIds).toEqual([]);
-    expect(stored.executionState?.approvalStatus).toBeUndefined();
-    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
-    expect(fixture.writes).toEqual([]);
-    expect(fixture.armCalls).toEqual([]);
-  });
+  it.each(["title", "execution policy", "execution state"] as const)(
+    "refuses a final PATCH when a concurrent %s change lands before deferred reassignment cancellation",
+    async (change) => {
+      const fixture = await pendingDelivery({ holdPull: true, mergeArmingEnabled: true });
+      const run = await holdAgentRun(fixture);
+      const initial = await fixture.read();
+      const approval = fixture.approve(reassignToBoardUser).then((response) => response);
+      const response = await raceAtDecisionTransaction(fixture, approval, async () => {
+        if (change === "title") {
+          await db.update(issues).set({ title: "Renamed before deferred reassignment cancellation" })
+            .where(eq(issues.id, fixture.issue.id));
+        } else if (change === "execution policy") {
+          await db.update(issues).set({
+            executionPolicy: {
+              ...(initial.executionPolicy as Record<string, unknown>),
+              commentRequired: true,
+            },
+          }).where(eq(issues.id, fixture.issue.id));
+        } else {
+          await db.update(issues).set({
+            executionState: {
+              ...initial.executionState,
+              lastDecisionOutcome: "changes_requested",
+            },
+          }).where(eq(issues.id, fixture.issue.id));
+        }
+      });
+      expect(response.status).toBe(409);
+      expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+      const stored = await fixture.read();
+      expect(stored.status).toBe("in_review");
+      expect(stored.executionState?.completedStageIds).toEqual([]);
+      expect(stored.executionState?.approvalStatus).toBeUndefined();
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0]?.status).toBe("running");
+      expect(fixture.writes).toEqual([]);
+      expect(fixture.armCalls).toEqual([]);
+    },
+  );
 
   it("publishes nothing and keeps the escalation pending when the accept transaction fails after the decision", async () => {
     const fixture = await pendingDelivery({ mergeArmingEnabled: true });
