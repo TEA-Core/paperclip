@@ -543,6 +543,24 @@ describe("wiki handoff write integrity (SUP-21752, pure helpers)", () => {
     });
   }
 
+  function humanReviewWorkflow() {
+    return {
+      executionPolicy: policyWithStages([
+        {
+          id: STAGE_ID,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "user", userId: USER_ID }],
+        },
+      ]),
+      executionState: incompleteState({
+        currentStageId: STAGE_ID,
+        currentParticipant: { type: "user", userId: USER_ID },
+      }),
+      workflowControlledAssignment: true,
+    };
+  }
+
   it("rejects the recurrence shape: a non-canonical write on a Wiki handoff", () => {
     expect(
       wikiHandoffWriteWouldViolate({
@@ -588,6 +606,34 @@ describe("wiki handoff write integrity (SUP-21752, pure helpers)", () => {
         executionState: state(CANONICAL),
       }),
     ).toBeNull();
+  });
+
+  it("allows the canonical actor to hand off from the canonical stored assignee to a human reviewer", () => {
+    expect(
+      wikiHandoffWriteWouldViolate({
+        ...humanReviewWorkflow(),
+        canonicalMaintainerAgentId: CANONICAL,
+        incomingAssigneeAgentId: null,
+        actorAgentId: CANONICAL,
+        currentAssigneeAgentId: CANONICAL,
+      }),
+    ).toBeNull();
+  });
+
+  it.each([
+    ["a different actor", INTRUDER_AGENT, CANONICAL],
+    ["a stale stored assignee", CANONICAL, INTRUDER_AGENT],
+    ["a missing actor", null, CANONICAL],
+  ])("rejects the human handoff with %s as wiki_handoff_non_canonical_assignee", (_name, actorAgentId, currentAssigneeAgentId) => {
+    expect(
+      wikiHandoffWriteWouldViolate({
+        ...humanReviewWorkflow(),
+        canonicalMaintainerAgentId: CANONICAL,
+        incomingAssigneeAgentId: null,
+        actorAgentId,
+        currentAssigneeAgentId,
+      }),
+    ).toEqual({ reason: "wiki_handoff_non_canonical_assignee" });
   });
 
   it("is a no-op when there is no canonical binding", () => {

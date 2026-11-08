@@ -3589,9 +3589,16 @@ describe("issue execution policy routes", () => {
       ["done", false],
       ["in_review", true],
       ["done", true],
-    ])("lets the canonical Maintainer write %s after recovery (explicit assignee: %s) without removing human review", async (status, explicitAssignee) => {
+    ])("lets the canonical Maintainer write %s from a recovery-restored todo handoff (explicit assignee: %s) without removing human review", async (status, explicitAssignee) => {
       const issue = {
         ...issueWithParticipants([]),
+        status: "todo",
+        statusVersion: 2,
+        checkoutRunId: null,
+        executionRunId: null,
+        executionLockedAt: null,
+        executionAgentNameKey: null,
+        executionState: null,
         executionPolicy: normalizeIssueExecutionPolicy({
           stages: [{
             id: stageId,
