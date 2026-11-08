@@ -21236,24 +21236,6 @@ export function issueRoutes(
         );
         if (cancelled?.status === "cancelled") {
           interruptedRunId = cancelled.id;
-          await logActivity(db, {
-            companyId: cancelled.companyId,
-            actorType: actor.actorType,
-            boardApiKeyId: actor.boardApiKeyId,
-            actorId: actor.actorId,
-            agentId: actor.agentId,
-            runId: actor.runId,
-            agentApiKeyId: actor.agentApiKeyId,
-            action: "heartbeat.cancelled",
-            entityType: "heartbeat_run",
-            entityId: cancelled.id,
-            issueId: existing.id,
-            details: {
-              agentId: cancelled.agentId,
-              source: "issue_reassigned",
-              issueId: existing.id,
-            },
-          });
         } else if (cancelled?.status === "running") {
           cancellationFailed = true;
         }
