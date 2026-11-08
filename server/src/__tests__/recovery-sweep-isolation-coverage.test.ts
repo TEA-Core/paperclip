@@ -373,8 +373,12 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
             issueId: candidate.id,
             authorType: "system",
             body: "completed-run strand notice",
-            metadata: { sourceRunId: sourceRun.id },
-          } as never);
+            metadata: {
+              version: 1,
+              sourceRunId: sourceRun.id,
+              sections: [{ rows: [{ type: "run_link", runId: sourceRun.id }] }],
+            },
+          });
           return true;
         },
       });
