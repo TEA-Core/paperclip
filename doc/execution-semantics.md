@@ -159,9 +159,12 @@ releases the issuer's lock and promotes the waiting successor. Only an issuer
 whose run context names this issue gets that exemption. An unscoped issuer, or
 one scoped to a different issue, cannot be rediscovered by admission, so the
 handoff is saved and then cancellation is attempted as for any other reassignment.
-That attempt can throw or leave the run running. The handoff stays saved and the
-issuer may keep running; the route logs a warning and a `heartbeat.cancel_failed`
-activity.
+The route finds that issuer by the request's run ID even when the issue has no
+`executionRunId`. It only selects a running run of the calling agent in the same
+company. The issuer need not be the current assignee. A separately resolved
+outgoing run still gets its own cancellation attempt.
+Either attempt can throw or leave its run running. The handoff stays saved and
+the route logs a warning and a `heartbeat.cancel_failed` activity.
 
 While a live issuer remains associated with this issue, its successor waits at
 `deferred_issue_execution`. Normal finalization calls

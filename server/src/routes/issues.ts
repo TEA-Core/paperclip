@@ -201,6 +201,7 @@ import {
   projectService,
   routineService,
   workProductService,
+  LogActivityInput,
 } from "../services/index.js";
 import { redactIssueCommentBody } from "../services/issues.js";
 import { isValidGitBranchName } from "../services/execution-workspace-branch-ownership.js";
@@ -9798,6 +9799,78 @@ export function issueRoutes(
     return runToInterrupt?.status === "running" ? runToInterrupt : null;
   }
 
+  async function cancelRunAfterIssueReassignment(
+    runId: string,
+    issue: { id: string; companyId: string },
+    actor: Pick<
+      LogActivityInput,
+      "actorType" | "actorId" | "agentId" | "runId" | "agentApiKeyId" | "boardApiKeyId"
+    >,
+  ) {
+    let cancelledRunId: string | null = null;
+    let cancellationFailed = false;
+    let cancellationError: unknown;
+    try {
+      const cancelled = await heartbeat.cancelRun(
+        runId,
+        "Cancelled before issue reassignment",
+        {
+          errorCode: "issue_reassigned",
+          resultJson: { reassignmentStopConfirmed: true },
+          eventMessage: "run cancelled before issue reassignment",
+          eventPayload: { issueId: issue.id },
+        },
+      );
+      if (cancelled?.status === "cancelled") {
+        cancelledRunId = cancelled.id;
+        await logActivity(db, {
+          companyId: cancelled.companyId,
+          actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "heartbeat.cancelled",
+          entityType: "heartbeat_run",
+          entityId: cancelled.id,
+          issueId: issue.id,
+          details: {
+            agentId: cancelled.agentId,
+            source: "issue_reassigned",
+            issueId: issue.id,
+          },
+        });
+      } else if (cancelled?.status === "running") {
+        cancellationFailed = true;
+      }
+    } catch (err) {
+      cancellationFailed = true;
+      cancellationError = err;
+    }
+    if (cancellationFailed) {
+      logger.warn(
+        { err: cancellationError, issueId: issue.id, runId },
+        "failed to cancel run for issue reassignment",
+      );
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        boardApiKeyId: actor.boardApiKeyId,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "heartbeat.cancel_failed",
+        entityType: "heartbeat_run",
+        entityId: runId,
+        issueId: issue.id,
+        details: { source: "issue_reassigned", issueId: issue.id },
+      });
+    }
+    return cancelledRunId;
+  }
+
   // SUP-14030 (ghost-pass-reporting.md §2a): gather the issue's live
   // continuation-path evidence — the four §2a disjuncts plus lastActivityAt
   // (the settle-window input) — then evaluate it with the exported pure
@@ -19068,6 +19141,7 @@ export function issueRoutes(
     }
     let interruptedRunId: string | null = null;
     let pendingReassignmentStopRunId: string | null = null;
+    let pendingIssuingStageHandoffStopRunId: string | null = null;
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(existing);
     const isAgentWorkUpdate =
       req.actor.type === "agent" &&
@@ -20233,6 +20307,10 @@ export function issueRoutes(
       });
     }
 
+    const isNonFinalStageHandoff = assigneeWillChange &&
+      transition.workflowControlledAssignment === true &&
+      !terminalApprovalNeedsClassificationCheck;
+    let isIssuingRunStageHandoff = false;
     if (assigneeWillChange && existing.assigneeAgentId) {
       rejectExpectedUpdatedAtBeforeSideEffect();
       await stopRunnerGoalForOwnershipChange({
@@ -20241,8 +20319,7 @@ export function issueRoutes(
         agentId: existing.assigneeAgentId,
       });
       const runToStopForReassignment = await resolveActiveIssueRun(existing);
-      const isIssuingRunStageHandoff = transition.workflowControlledAssignment &&
-        !terminalApprovalNeedsClassificationCheck &&
+      isIssuingRunStageHandoff = isNonFinalStageHandoff &&
         actor.runId !== null &&
         runToStopForReassignment?.id === actor.runId &&
         runToStopForReassignment.contextSnapshot?.issueId === existing.id;
@@ -20275,6 +20352,25 @@ export function issueRoutes(
         } else {
           pendingReassignmentStopRunId = runToStopForReassignment.id;
         }
+      }
+    }
+    // A stage participant need not be the issue's current assignee.
+    if (
+      isNonFinalStageHandoff &&
+      !isIssuingRunStageHandoff &&
+      actor.agentId &&
+      actor.runId &&
+      actor.runId !== pendingReassignmentStopRunId
+    ) {
+      const issuingRun = await heartbeat.getRun(actor.runId);
+      if (
+        issuingRun?.status === "running" &&
+        issuingRun.id !== pendingReassignmentStopRunId &&
+        issuingRun.companyId === existing.companyId &&
+        issuingRun.agentId === actor.agentId &&
+        issuingRun.contextSnapshot?.issueId !== existing.id
+      ) {
+        pendingIssuingStageHandoffStopRunId = issuingRun.id;
       }
     }
 
@@ -21148,67 +21244,17 @@ export function issueRoutes(
       res.status(404).json({ error: "Issue not found" });
       return;
     }
+    // Stop an unscoped issuer before a separate outgoing run can release the
+    // issue lock and promote the successor. Both attempts follow the commit.
+    if (pendingIssuingStageHandoffStopRunId) {
+      interruptedRunId = (await cancelRunAfterIssueReassignment(
+        pendingIssuingStageHandoffStopRunId, existing, actor,
+      )) ?? interruptedRunId;
+    }
     if (pendingReassignmentStopRunId) {
-      let cancellationFailed = false;
-      let cancellationError: unknown;
-      try {
-        const cancelled = await heartbeat.cancelRun(
-          pendingReassignmentStopRunId,
-          "Cancelled before issue reassignment",
-          {
-            errorCode: "issue_reassigned",
-            resultJson: { reassignmentStopConfirmed: true },
-            eventMessage: "run cancelled before issue reassignment",
-            eventPayload: { issueId: existing.id },
-          },
-        );
-        if (cancelled?.status === "cancelled") {
-          interruptedRunId = cancelled.id;
-          await logActivity(db, {
-            companyId: cancelled.companyId,
-            actorType: actor.actorType,
-            boardApiKeyId: actor.boardApiKeyId,
-            actorId: actor.actorId,
-            agentId: actor.agentId,
-            runId: actor.runId,
-            agentApiKeyId: actor.agentApiKeyId,
-            action: "heartbeat.cancelled",
-            entityType: "heartbeat_run",
-            entityId: cancelled.id,
-            issueId: existing.id,
-            details: {
-              agentId: cancelled.agentId,
-              source: "issue_reassigned",
-              issueId: existing.id,
-            },
-          });
-        } else if (cancelled?.status === "running") {
-          cancellationFailed = true;
-        }
-      } catch (err) {
-        cancellationFailed = true;
-        cancellationError = err;
-      }
-      if (cancellationFailed) {
-        logger.warn(
-          { err: cancellationError, issueId: existing.id, runId: pendingReassignmentStopRunId },
-          "failed to cancel run for issue reassignment",
-        );
-        await logActivity(db, {
-          companyId: existing.companyId,
-          actorType: actor.actorType,
-          boardApiKeyId: actor.boardApiKeyId,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          agentApiKeyId: actor.agentApiKeyId,
-          action: "heartbeat.cancel_failed",
-          entityType: "heartbeat_run",
-          entityId: pendingReassignmentStopRunId,
-          issueId: existing.id,
-          details: { source: "issue_reassigned", issueId: existing.id },
-        });
-      }
+      interruptedRunId = (await cancelRunAfterIssueReassignment(
+        pendingReassignmentStopRunId, existing, actor,
+      )) ?? interruptedRunId;
     }
     // SUP-15257: this issue mutation just committed; if it came from a
     // task-watchdog run, re-derive and advance that run's stop fingerprint so
