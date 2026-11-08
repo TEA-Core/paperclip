@@ -130,8 +130,19 @@ export function selfDeclaredRunService(
       // The successful UPDATE holds the issue lock through admission and stamp.
 
       if (!updated) {
+        // The miss re-evaluated against committed state, so classify from a fresh
+        // read: a concurrent reassignment is a 403, not "already being executed".
+        const current = await tx.select().from(issues)
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (!current) throw notFound("Issue not found");
+        if (current.assigneeAgentId !== agentId) {
+          throw forbidden("Agent is not assigned to this issue", {
+            code: "not_issue_assignee",
+          });
+        }
         throw conflict("Issue is already being executed", {
-          issueId, status: issue.status, executionRunId: issue.executionRunId,
+          issueId, status: current.status, executionRunId: current.executionRunId,
         });
       }
       const liveHolder = await findLiveIssueExecutionHolder(tx, issue.companyId, issueId);
