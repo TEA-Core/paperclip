@@ -156,15 +156,13 @@ execution lock until it stops. If the assignment update clears `executionRunId`,
 admission recovers the live lock by company and issue, not by the new assignee.
 The next stage's wake stays `deferred_issue_execution`; normal run finalization
 releases the issuer's lock and promotes the waiting successor. Only an issuer
-whose run context names this issue gets that exemption. An unscoped issuer, or
-one scoped to a different issue, cannot be rediscovered by admission, so the
-handoff is saved and then cancellation is attempted as for any other reassignment.
-The route finds that issuer by the request's run ID even when the issue has no
-`executionRunId`. It only selects a running run of the calling agent in the same
-company. The issuer need not be the current assignee. A separately resolved
-outgoing run still gets its own cancellation attempt.
-Either attempt can throw or leave its run running. The handoff stays saved and
-the route logs a warning and a `heartbeat.cancel_failed` activity.
+whose run context names this issue gets that exemption. For any other issuer,
+the handoff is saved first and cancellation is then attempted only for a run the
+route's existing lookup finds: the issue's execution-lock holder or the
+assignee's issue-scoped active run. An unscoped issuer that lookup cannot find is
+not cancelled, as before this change. A cancellation attempt can throw or leave
+the run running. The handoff stays saved and the run may keep running; the route
+logs a warning and a `heartbeat.cancel_failed` activity.
 
 While a live issuer remains associated with this issue, its successor waits at
 `deferred_issue_execution`. Normal finalization calls

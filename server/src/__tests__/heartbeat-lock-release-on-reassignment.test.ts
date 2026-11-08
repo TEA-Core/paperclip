@@ -234,38 +234,6 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
     expect(issue.executionRunId).not.toBe(holderRunId);
   });
 
-  it.each(["agent", "user"] as const)(
-    "saves a handoff with a null execution lock, then cancels its unscoped issuing run (%s owner)",
-    async (owner) => {
-      const { coderAgentId, reviewerAgentId, issueId, holderRunId, policy, client } =
-        await seedStageHandoff(() => ({ wakeReason: "timer" }));
-      await db.update(issues).set({
-        assigneeAgentId: owner === "agent" ? coderAgentId : null,
-        assigneeUserId: owner === "user" ? "local-board" : null,
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-      }).where(eq(issues.id, issueId));
-
-      const response = await request(client).patch(`/api/issues/${issueId}`).send({
-        status: "done", comment: "Review passed from an unscoped run with no execution lock.",
-      });
-      expect(response.status, JSON.stringify(response.body)).toBe(200);
-      expect(response.body).toMatchObject({
-        status: "in_review",
-        assigneeAgentId: reviewerAgentId,
-        executionState: { currentStageId: policy.stages[1]!.id },
-      });
-      expect((await heartbeat.getRun(holderRunId))?.status).toBe("cancelled");
-      const [saved] = await db.select().from(issues).where(eq(issues.id, issueId));
-      expect(saved).toMatchObject({
-        status: "in_review",
-        assigneeAgentId: reviewerAgentId,
-        executionState: { currentStageId: policy.stages[1]!.id },
-      });
-    },
-  );
-
   it("defers the next stage behind its issuing run after the handoff PATCH and promotes it on stop", async () => {
     const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId, policy, busyRun, client } =
       await seedStageHandoff();
