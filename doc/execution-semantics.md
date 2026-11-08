@@ -166,37 +166,49 @@ The active-lock lifecycle is part of the checkout contract:
 - finalization must not clear a lock already reacquired by a successor run
 - process-loss retry handoff must not leave `checkoutRunId` pinned to the failed run when `executionRunId` moves to the retry run
 - checkout and checkout-owner checks may self-heal lock columns that point at terminal or missing runs before evaluating conflicts
-- when `executionRunId` is clear, checkout returns `409` to a different run while a live run in the same company names the issue in `contextSnapshot.issueId`; the live run's own checkout keeps the existing status and assignment checks
+- checkout and checkout-owner adoption check the same-company execution, checkout and legacy `contextSnapshot.issueId` bindings; another queued, running or scheduled-retry run returns `409`, even when the caller has no run ID or issue context
+- the own-run exemption uses the exact run ID, not the agent ID; status and assignment checks still apply, a running owner takes precedence over an older queued reservation, and an acting run must belong to the issue company
+- the holder check, ownership change and execution stamp use one transaction and keep the issue row locked until commit
+- queued issue-ownership claims fence a different running holder under that same row lock and commit their execution stamp with the transition to `running`; a queued reservation is not already executing, and non-assignee visitor or mention runs do not acquire issue ownership
+- external self-declared run creation also checks and stamps under one issue lock; a live checkout or legacy-context holder refuses creation even when `executionRunId` is clear
 - the recovery sweeper may clear rows whose checkout and execution locks all point at terminal or missing runs
 
 Stale-lock recovery is crash recovery, not a retry loop. Paperclip must not clear or adopt locks held by non-terminal runs. After stale cleanup, a checkout `409` should mean a real live owner, status/assignee mismatch, unresolved blocker, or active gate still prevents checkout. Agents must treat that `409` as an ownership conflict and stop rather than retrying the same checkout.
 
 A non-final workflow handoff may change the assignee while its issuing run is
-still running. That run must survive its own handoff PATCH and keep the issue's
-execution lock until it stops. If the assignment update clears `executionRunId`,
-admission recovers the live lock by company and issue, not by the new assignee.
-The next stage's wake stays `deferred_issue_execution`; normal run finalization
-releases the issuer's lock and promotes the waiting successor. Only an issuer
-whose run context names this issue gets that exemption. For any other issuer,
-the handoff is saved first and cancellation is then attempted only for a run the
-route's existing lookup finds: the issue's execution-lock holder or the
-assignee's issue-scoped active run. An unscoped issuer that lookup cannot find is
-not cancelled, as before this change. A cancellation attempt can throw or leave
-the run running. The handoff stays saved and the run may keep running; the route
-logs a warning and a `heartbeat.cancel_failed` activity.
+still running. Only an issuer whose run context names this issue is exempt from
+its own handoff PATCH's cancellation. For any other issuer, the handoff is saved
+first and cancellation is then attempted only for a run the route's existing
+lookup finds: the execution-lock holder or the assignee's issue-scoped active
+run. An issuer that lookup cannot find is not cancelled, as before this change.
+A cancellation attempt can throw or leave the run running. The handoff stays
+saved; the route logs a warning and a `heartbeat.cancel_failed` activity.
 
-While a live issuer remains associated with this issue, its successor waits at
-`deferred_issue_execution`. Normal finalization calls
-`releaseIssueExecutionAndPromote` after the issuer stops. The existing
-`reapOrphanedRuns` sweep can also finalize a lost run after its process-liveness
-and controller-ownership checks allow recovery. It marks that orphan failed and
-uses the same release/promotion path unless a process-loss retry takes over.
-The sweep skips tracked live executions, live child processes, and native runs
-whose ownership is unverified. It is not a forced-stop timeout for an issuer
-that stays active forever. A cancellation attempt alone never authorizes lock
-release: execution must have stopped. If an unscoped or differently scoped run's
-`executionRunId` was cleared, issue-context lookup cannot restore its association
-with this issue; a failed cancellation does not repair that missing association.
+Under the issue row lock, a non-terminal assignee change retains a running
+holder identified by the issue's existing execution or checkout binding. It
+clears checkout permission but preserves execution admission across the saved
+update, a delayed cancellation and a failed cancellation. A request header alone
+grants neither cancellation nor a hold. If only a legacy issue-context binding
+remains, admission recovers it by company and issue, not by the new assignee.
+
+While that issuer runs, the successor stays `deferred_issue_execution`. After
+the issuer stops, `releaseIssueExecutionAndPromote` compare-and-clears only this
+run's actual bindings and promotes their existing deferred intents, including
+bindings outside the run's context issue. It does not clear a different run's
+lock or create automatic recovery for a sibling issue. Existing task, chat,
+comment-disposal and no-replay gates still apply. Recovery and missing-comment
+retry producers retain valid queued intent behind a different running holder;
+a former assignee cannot use a comment retry or a sibling binding to reclaim
+the next stage.
+
+The existing `reapOrphanedRuns` sweep can also finalize a lost run after its
+process-liveness and controller-ownership checks allow recovery. It marks that
+orphan failed and uses the same release/promotion path unless a process-loss
+retry takes over. It skips tracked live executions, live child processes and
+native runs whose ownership is unverified. It is not a forced-stop timeout for
+an issuer that stays active forever. A cancellation attempt alone never
+authorizes release: execution must have stopped. Without a saved binding or
+matching issue context, this change does not infer an issuer hold from a header.
 
 ### Known execution waits at admission
 
