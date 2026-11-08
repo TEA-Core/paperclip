@@ -374,7 +374,7 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
             authorType: "system",
             body: "completed-run strand notice",
             metadata: { sourceRunId: sourceRun.id },
-          });
+          } as never);
           return true;
         },
       });
