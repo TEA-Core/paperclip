@@ -76,6 +76,10 @@ const FORCE_LENGTH_MARKER = "paperclip-acceptance-force-length";
 // A prompt carrying one of these markers makes the model call that tool once.
 const SHELL_CALL_MARKER = "paperclip-acceptance-shell-call";
 const QUESTION_CALL_MARKER = "paperclip-acceptance-question-call";
+const PAPERCLIP_SEARCH_MARKER = "paperclip-acceptance-connections-search";
+const DESIRED_SKILL_MARKER = "paperclip-acceptance-desired-skill";
+const UNDESIRED_SKILL_MARKER = "paperclip-acceptance-undesired-skill";
+const taskBoundRequested = process.env.PAPERCLIP_OPENCODE_V2_TASK_BOUND_ACCEPTANCE === "1";
 const QUESTION_ARGS = {
   questions: [{ question: "Which option?", header: "Pick one", options: [{ label: "A", description: "first" }, { label: "B", description: "second" }] }],
 };
@@ -94,7 +98,12 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
   let cliVersion: string;
   let savedAllowAllModels: string | undefined;
   // Every request that carried tools, i.e. a main-agent request (title requests carry none).
-  const mainRequests: Array<{ tools: string[]; messageCount: number }> = [];
+  const mainRequests: Array<{
+    tools: string[];
+    messageCount: number;
+    hasDesiredSkill: boolean;
+    hasUndesiredSkill: boolean;
+  }> = [];
   let mcpServer: Server;
 
   function privateEnv(name: string): Record<string, string> {
@@ -164,10 +173,16 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
           mainRequests.push({
             tools: (parsed.tools ?? []).map((tool) => tool.function?.name ?? ""),
             messageCount: (parsed.messages ?? []).length,
+            hasDesiredSkill: body.includes(DESIRED_SKILL_MARKER),
+            hasUndesiredSkill: body.includes(UNDESIRED_SKILL_MARKER),
           });
           const answered = (parsed.messages ?? []).some((message) => message.role === "tool");
           if (!answered && lowered.includes(SHELL_CALL_MARKER)) toolCall = { name: "shell", args: { command: "echo hi" } };
           if (!answered && lowered.includes(QUESTION_CALL_MARKER)) toolCall = { name: "question", args: QUESTION_ARGS };
+          if (!answered && lowered.includes(PAPERCLIP_SEARCH_MARKER)) {
+            const name = (parsed.tools ?? []).map((tool) => tool.function?.name ?? "").find((tool) => /connections_search$/i.test(tool));
+            if (name) toolCall = { name, args: { query: "github" } };
+          }
         }
       } catch {
         // not a JSON chat request
@@ -649,6 +664,95 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     expect(mainRequests[0]!.tools.some((name) => /paperclip-fixture_echo$/i.test(name))).toBe(true);
     expect(JSON.stringify(result)).not.toContain("acceptance-mcp-bearer");
   }, 90_000);
+
+  it.skipIf(!taskBoundRequested)("calls the task-bound Paperclip MCP tool directly in the first main-agent step", async () => {
+    const mcpUrl = process.env.PAPERCLIP_RUNTIME_TOOLS_MCP_URL;
+    const token = process.env.PAPERCLIP_RUNTIME_TOOLS_TOKEN;
+    if (!mcpUrl || !token) throw new Error("Task-bound acceptance needs the live runtime MCP URL and token.");
+
+    const env = privateEnv("task-bound-paperclip");
+    await writeOpenCodeConfig(env, fixtureConfig);
+    const desiredSkill = path.join(rootDir, "desired-skill-source");
+    const undesiredSkill = path.join(rootDir, "undesired-skill-source");
+    await mkdir(desiredSkill, { recursive: true });
+    await mkdir(undesiredSkill, { recursive: true });
+    await writeFile(path.join(desiredSkill, "SKILL.md"), `---\nname: acceptance-desired\ndescription: ${DESIRED_SKILL_MARKER}\n---\n`);
+    await writeFile(path.join(undesiredSkill, "SKILL.md"), `---\nname: acceptance-undesired\ndescription: ${UNDESIRED_SKILL_MARKER}\n---\n`);
+
+    mainRequests.length = 0;
+    const logs: string[] = [];
+    const result = await execute(context({
+      runId: "acceptance-task-bound-paperclip",
+      config: {
+        command: binary,
+        cliVersion,
+        cwd: workspace,
+        model,
+        dangerouslySkipPermissions: true,
+        promptTemplate: `${PAPERCLIP_SEARCH_MARKER}: search connections once, then stop`,
+        env,
+        skillIsolation: "desired-only",
+        paperclipRuntimeSkills: [
+          { key: "acceptance/desired", runtimeName: "acceptance-desired", source: desiredSkill },
+          { key: "acceptance/undesired", runtimeName: "acceptance-undesired", source: undesiredSkill },
+        ],
+        paperclipSkillSync: { desiredSkills: ["acceptance/desired"] },
+      },
+      runtimeMcp: {
+        getServers: () => [{
+          name: "Paperclip connections",
+          url: mcpUrl,
+          token,
+          connectionId: "paperclip-runtime-tools",
+        }],
+      },
+      onLog: async (_stream, chunk) => {
+        logs.push(chunk);
+      },
+    }));
+
+    expect(result.errorMessage).toBeNull();
+    expect(result.exitCode).toBe(0);
+    expect(mainRequests.length).toBeGreaterThan(0);
+    const first = mainRequests[0]!;
+    const directTool = first.tools.find((name) => /^paperclip.*connections_search$/i.test(name));
+    expect(directTool, `first main-agent tools: ${first.tools.join(", ")}`).toBe("Paperclip_connections_connections_search");
+    expect(first.hasDesiredSkill).toBe(true);
+    expect(first.hasUndesiredSkill).toBe(false);
+
+    const toolUses = String(result.resultJson?.stdout ?? "")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { type?: string; part?: { tool?: string; state?: { status?: string; error?: string } } })
+      .filter((event) => event.type === "tool_use");
+    const directCalls = toolUses.filter((event) => event.part?.tool === directTool);
+    expect(directCalls).toHaveLength(1);
+    expect(directCalls[0]?.part?.state?.status).toBe("completed");
+    expect(directCalls[0]?.part?.state?.error).toBeUndefined();
+    expect(logs.join("")).toContain("skillIsolation=desired-only: run exposes 1 skill(s) via per-run HOME");
+    expect(logs.join("")).toContain("names=acceptance-desired");
+    expect(JSON.stringify(result)).not.toContain(token);
+  }, 90_000);
+
+  it.skipIf(!taskBoundRequested)("surfaces a real Paperclip MCP authorization failure in the run result", async () => {
+    const mcpUrl = process.env.PAPERCLIP_RUNTIME_TOOLS_MCP_URL;
+    if (!mcpUrl) throw new Error("Task-bound acceptance needs the live runtime MCP URL.");
+    mainRequests.length = 0;
+    const result = await execute(context({
+      runId: "acceptance-task-bound-paperclip-denied",
+      runtimeMcp: {
+        getServers: () => [{
+          name: "Paperclip connections",
+          url: mcpUrl,
+          token: "acceptance-invalid-runtime-token",
+          connectionId: "paperclip-runtime-tools",
+        }],
+      },
+    }));
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toMatch(/needs_auth|unauthorized|invalid|401/i);
+    expect(mainRequests).toHaveLength(0);
+  }, 60_000);
 
   it("fails the readiness gate with the MCP server's reported status when it cannot connect", async () => {
     const denied = createServer((_req, res) => {
