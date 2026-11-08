@@ -9620,7 +9620,7 @@ export function issueRoutes(
       );
     }
 
-    const actorRunId = req.actor.runId?.trim() || null;
+    const actorRunId = effectiveRunId?.trim() || req.actor.runId?.trim() || null;
     const conflictingRunId = [issue.checkoutRunId, issue.executionRunId].find(
       (runId) => runId && runId !== actorRunId,
     );
