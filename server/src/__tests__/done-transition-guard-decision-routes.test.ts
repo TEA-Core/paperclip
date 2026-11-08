@@ -699,6 +699,11 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       companyId,
       agentId,
       status: "running",
+      // SUP-23490: the done-tier gate places a record-only observation inside
+      // the closing run's lifetime (startedAt ?? createdAt); a run that closes
+      // its own card has always started, so seed the start before the suites'
+      // fixed probe instants (2026-11-04T09:15:00Z).
+      startedAt: new Date("2026-11-04T09:00:00Z"),
       contextSnapshot: { issueId },
     });
     return runId;
@@ -999,7 +1004,8 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
   it("PATCH: record_only close with structured record-only Tier 2 evidence needs no merge head (SUP-22801)", async () => {
     const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D22801A", { deliveryRequirement: "record_only" });
     await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
-    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    const runId = await seedRun(companyId, reviewerAgentId, issueId);
+    currentActor = agentActor(companyId, reviewerAgentId, runId);
     mockNoOpenPulls();
 
     const res = await request(app)
@@ -1019,6 +1025,58 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       expect(String((init as RequestInit | undefined)?.method ?? "GET")).toBe("GET");
       expect(String(url)).not.toContain("/commits/");
     }
+    // SUP-23490: the accepted close emits the machine record (SUP-23366) with
+    // the cited observation AND the closing run identity beside it, so a
+    // restated observation is detectable after the fact from the row alone.
+    const tier2Rows = await vi.waitFor(
+      async () => {
+        const found = await auditRows(companyId, issueId, "issue.done_transition_tier2_close");
+        if (found.length === 0) throw new Error("waiting for tier2 close audit row");
+        return found;
+      },
+      { timeout: 5000 },
+    );
+    expect(tier2Rows).toHaveLength(1);
+    expect(tier2Rows[0]?.details).toMatchObject({
+      observed: "2026-11-04T09:15:00Z",
+      tierForm: "record-only",
+      closingRunId: runId,
+      closingRunStartedAt: "2026-11-04T09:00:00.000Z",
+    });
+  });
+
+  it("PATCH: record_only close citing an observation predating the closing run is refused as a restatement (SUP-23490)", async () => {
+    // The SUP-22817 shape: the closing run started AFTER the cited observation
+    // (here 5 minutes after, matching the real restatement), so the cited
+    // liveness cannot belong to the run that is closing. Negative control for
+    // the lifetime gate: the guard refuses with the restatement reason.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23490A", { deliveryRequirement: "record_only" });
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: reviewerAgentId,
+      status: "running",
+      startedAt: new Date("2026-11-04T09:20:00Z"),
+      contextSnapshot: { issueId },
+    });
+    currentActor = agentActor(companyId, reviewerAgentId, runId);
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: "Closing.",
+        doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(String(res.body.error)).toContain("predates the closing run");
+    expect(String(res.body.error)).toContain(runId);
+    expect(await statusOf(issueId)).toBe("in_review");
   });
 
   it("PATCH: record_only close with prose-only Tier 2 evidence is refused naming the record-only form (SUP-22801)", async () => {
