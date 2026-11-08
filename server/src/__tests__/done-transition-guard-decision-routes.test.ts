@@ -1180,8 +1180,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       tierForm: "record-only",
       closingRunId: checkoutRunId,
       closingRunStartedAt: "2026-11-04T09:00:00.000Z",
-    });
-  });
+    });  });
 
   it("PATCH: record_only close with prose-only Tier 2 evidence is refused naming the record-only form (SUP-22801)", async () => {
     const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D22801B", { deliveryRequirement: "record_only" });
