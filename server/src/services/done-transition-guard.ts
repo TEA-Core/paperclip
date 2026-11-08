@@ -1821,6 +1821,7 @@ async function attributeTier2EvidenceToClosingRun(
   issue: { companyId: string },
   result: DoneTierDeclarationResult,
   runId: string | null,
+  closingAgentId: string | null = null,
 ): Promise<DoneTierDeclarationResult> {
   if (!result.allowed || !result.tier2Audit) {
     return result;
@@ -1833,7 +1834,25 @@ async function attributeTier2EvidenceToClosingRun(
   // The merge-head form's origin predicate (probe head resolves to the recorded
   // delivery merge head) already binds the evidence to the delivery; there is
   // no observation instant to place inside the run's lifetime.
-  if (audit.tierForm !== "record-only" || !runId) {
+  if (audit.tierForm !== "record-only") {
+    return { ...result, tier2Audit: audit };
+  }
+  if (!runId) {
+    // An agent closer has no excuse: every agent request can carry the run id
+    // header (or close from the issue's own checkout run), so an agent
+    // record-only close with no resolvable closing run is exactly the
+    // header-omission bypass — the cited observation cannot be proven to be
+    // this run's, and omitting the identity must not skip the lifetime gate.
+    // Human and system closers have no run to name; they keep the grammar-only
+    // behavior and the audit row's null closingRunId says so.
+    if (closingAgentId) {
+      return refuseTier2(
+        `record-only close Tier 2 probe evidence cannot be attributed to a closing run: agent ${closingAgentId} closed ` +
+          "without a resolvable closing run, so the cited observation cannot be proven to be this run's. Close from a " +
+          "live run (run id header set, or from the issue's own checkout run) and cite a fresh observed timestamp. " +
+          `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+      );
+    }
     return { ...result, tier2Audit: audit };
   }
   let runStart: Date | null = null;
@@ -2770,6 +2789,11 @@ export async function evaluateDoneTierDeclaration(
   // inside its status write passes the closer; without one the record_only
   // no-repository form refuses.
   noRepositoryLandingCloser: DoneTierClosingActor | null = null,
+  // The closing agent's id, when the closer is an agent (null for human and
+  // system closers). A record-only Tier 2 close by an agent must resolve to a
+  // closing run or it refuses — an agent can otherwise drop the run id header
+  // and skip the closing-run lifetime gate entirely.
+  closingAgentId: string | null = null,
 ): Promise<DoneTierDeclarationResult> {
   // SUP-22801: a record_only card's primary accepted Tier 2 form is the
   // record-only live-evidence grammar (no merge head by design); the merge-head
@@ -2803,6 +2827,7 @@ export async function evaluateDoneTierDeclaration(
         issue,
         await proveTier2Live(db, issue, tier2.evidence, false, issue.deliveryRequirement),
         runId,
+        closingAgentId,
       );
     }
     const tier1 = parseTier1Declaration(accompanyingComment);
@@ -2894,6 +2919,7 @@ export async function evaluateDoneTierDeclaration(
       issue,
       await proveTier2Live(db, issue, tier2.evidence, true, issue.deliveryRequirement),
       runId,
+      closingAgentId,
     );
   }
 
