@@ -6337,6 +6337,48 @@ describe("evaluateDoneTierDeclaration", () => {
         expect(result.reason).toContain("predates the closing run");
       });
 
+      it("an agent close with no resolvable closing run refuses — dropping the run id must not skip the lifetime gate", async () => {
+        // The run id header is optional on agent requests, so an agent closer
+        // can reach the guard with no run id at all. An agent has no excuse:
+        // without a resolvable closing run the cited observation cannot be
+        // proven to be this run's, so the record-only close refuses. Human and
+        // system closers (no closingAgentId) keep the grammar-only behavior.
+        setupDbMock({ heartbeatRuns: [] });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-08T07:12:36Z")),
+          null,
+          () => Promise.resolve([]),
+          null,
+          "agent-1",
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("cannot be attributed to a closing run");
+        expect(result.reason).toContain("agent agent-1");
+        expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+        expect(ghFetchMock).not.toHaveBeenCalled();
+      });
+
+      it("a closer with no agent identity and no run keeps the grammar-only behavior and records a null closing run", async () => {
+        setupDbMock({ heartbeatRuns: [] });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-08T07:12:36Z")),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier2");
+        expect(result.tier2Audit).toMatchObject({
+          observed: "2026-11-08T07:12:36Z",
+          closingRunId: null,
+          closingRunStartedAt: null,
+        });
+      });
+
       it("accepts an observation inside the run's lifetime and stamps the closing run into the audit", async () => {
         setupDbMock({ heartbeatRuns: [seededRun("2026-11-08T07:10:00Z")] });
         const result = await evaluateDoneTierDeclaration(

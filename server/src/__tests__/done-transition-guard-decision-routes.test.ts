@@ -1079,6 +1079,44 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(await statusOf(issueId)).toBe("in_review");
   });
 
+  it("PATCH: without a run id header the issue's own checkout run attributes the close and its lifetime gate fires (SUP-23490)", async () => {
+    // The run id header is optional on agent requests. The cross-issue run
+    // context gate resolves the same fallback (header, else the issue's
+    // checkout run) and would let the write through, while the tier guard used
+    // to receive only the header value — so a header-less close escaped the
+    // lifetime gate entirely. The door now passes the resolved closing run, and
+    // here that checkout run started AFTER the cited observation: refused as a
+    // restatement.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23490C", { deliveryRequirement: "record_only" });
+    const checkoutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId: reviewerAgentId,
+      status: "running",
+      invocationSource: "self_declared",
+      startedAt: new Date("2026-11-04T09:20:00Z"),
+      contextSnapshot: { issueId },
+    });
+    await db.update(issues).set({ executionPolicy: null, executionState: null, checkoutRunId }).where(eq(issues.id, issueId));
+    currentActor = { type: "agent", agentId: reviewerAgentId, companyId, source: "agent_key", runId: undefined };
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: "Closing.",
+        doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(String(res.body.error)).toContain("predates the closing run");
+    expect(String(res.body.error)).toContain(checkoutRunId);
+    expect(await statusOf(issueId)).toBe("in_review");
+  });
+
   it("PATCH: record_only close with prose-only Tier 2 evidence is refused naming the record-only form (SUP-22801)", async () => {
     const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D22801B", { deliveryRequirement: "record_only" });
     await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));

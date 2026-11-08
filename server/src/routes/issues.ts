@@ -5374,6 +5374,11 @@ export function issueRoutes(
     // inside its status write passes the closing actor; every other door leaves
     // it unset, and the record_only no-repository form then refuses.
     noRepositoryLandingCloser?: DoneTierClosingActor;
+    // The closing agent's id, when the closer is an agent (null/absent for
+    // human, board and system closers). The tier guard refuses an agent
+    // record-only Tier 2 close whose closing run cannot be resolved, so an
+    // agent cannot skip the lifetime gate by dropping the run id header.
+    closingAgentId?: string | null;
   }): Promise<DoneTransitionGuardOutcome> {
     const {
       issue,
@@ -5516,6 +5521,7 @@ export function issueRoutes(
       runId,
       (issueId) => svc.listComments(issueId, { order: "desc", limit: 100 }),
       input.noRepositoryLandingCloser ?? null,
+      input.closingAgentId ?? null,
     );
     if (tierResult.skipped) {
       void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
@@ -13895,6 +13901,7 @@ export function issueRoutes(
               : null,
           commentBody: doneTierResolutionNote,
           runId: actor.runId ?? null,
+          closingAgentId: actor.agentId ?? null,
           decisionCarried: !!doneCarryTransition.decision,
           boardActor: req.actor.type === "board",
         });
@@ -17017,6 +17024,7 @@ export function issueRoutes(
           override: null,
           commentBody: null,
           runId: actor.runId ?? null,
+          closingAgentId: actor.agentId ?? null,
           decisionCarried: false,
           createDoor: true,
           boardActor: req.actor.type === "board",
@@ -20143,10 +20151,21 @@ export function issueRoutes(
         issue: finalDeliveryIssue,
         override,
         commentBody: commentBody ?? null,
-        runId: actor.runId ?? null,
+        // The run id header is optional on agent requests, so an agent close
+        // that omits it falls back to the issue's own checkout/execution run
+        // when that resolves to a running self-declared run of this agent;
+        // otherwise null reaches the tier guard, which refuses an agent
+        // record-only Tier 2 close with no resolvable closing run.
+        runId: actor.runId?.trim()
+          || await resolveSelfDeclaredRunIdForIssue(
+            actor.agentId ?? undefined,
+            finalDeliveryIssue.checkoutRunId ?? finalDeliveryIssue.executionRunId ?? null,
+          )
+          || null,
         decisionCarried: !!transition.decision,
         boardActor: req.actor.type === "board",
         caller: refusalCaller,
+        closingAgentId: actor.agentId ?? null,
         noRepositoryLandingCloser: closingActor,
       });
       if (!outcome.ok) {
@@ -23644,6 +23663,7 @@ export function issueRoutes(
           override: null,
           commentBody: REVIEW_ESCALATION_APPROVED_DECISION_BODY,
           runId: actor.runId ?? null,
+          closingAgentId: actor.agentId ?? null,
           decisionCarried: true,
           boardActor: req.actor.type === "board",
           caller: {
@@ -25499,6 +25519,7 @@ export function issueRoutes(
           override: null,
           commentBody: commentBody ?? null,
           runId: actor.runId ?? null,
+          closingAgentId: actor.agentId ?? null,
           decisionCarried: !!transition.decision,
           boardActor: req.actor.type === "board",
           caller: {
