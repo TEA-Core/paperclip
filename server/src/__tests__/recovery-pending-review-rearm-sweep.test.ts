@@ -33,8 +33,11 @@ type RecoveryWakeup = (
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
 
-// loadConfig() in recovery/service.ts validates bind mode eagerly.
+// loadConfig() in recovery/service.ts validates bind mode eagerly, and its
+// ancestor config probe must not trip over an unreadable worktree
+// .paperclip/config.json in sandboxed runs.
 process.env.PAPERCLIP_BIND = "loopback";
+process.env.PAPERCLIP_CONFIG = `/nonexistent/paperclip-config-${process.pid}.json`;
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
