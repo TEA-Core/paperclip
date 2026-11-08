@@ -324,6 +324,13 @@ describeDb("POST /api/issues/:id/restore-participant", () => {
     const before = await snapshot();
     const result = await post();
     expect(result.status, JSON.stringify(result.body)).toBe(422);
+    expect(result.body.details).toMatchObject({
+      guard: "assignee_review_gate",
+      subGuard: "wiki_handoff",
+      reason: "wiki_handoff_non_canonical_assignee",
+      canonicalMaintainerAgentId: INDEPENDENT,
+      assigneeAgentId: PARTICIPANT,
+    });
     expect(await snapshot()).toEqual(before);
     expect(await audit()).toHaveLength(0);
   });

@@ -175,7 +175,7 @@ export async function resolveCanonicalWikiMaintainerAgentId(
 function isWorkflowControlledPendingReviewParticipant(input: {
   executionPolicy: unknown;
   executionState: unknown;
-  incomingAssigneeAgentId: string;
+  incomingAssigneeAgentId: string | null;
   workflowControlledAssignment?: boolean;
 }): boolean {
   if (input.workflowControlledAssignment !== true) return false;
@@ -183,10 +183,16 @@ function isWorkflowControlledPendingReviewParticipant(input: {
   if (
     state?.status !== "pending" ||
     typeof state.currentStageIndex !== "number" ||
-    state.currentStageType !== "review" ||
-    state.currentParticipant?.type !== "agent" ||
-    state.currentParticipant.agentId !== input.incomingAssigneeAgentId
+    state.currentStageType !== "review"
   ) return false;
+  const currentParticipant = state.currentParticipant;
+  if (currentParticipant?.type === "agent") {
+    if (currentParticipant.agentId !== input.incomingAssigneeAgentId) return false;
+  } else if (currentParticipant?.type === "user") {
+    if (input.incomingAssigneeAgentId !== null) return false;
+  } else {
+    return false;
+  }
   const policy = input.executionPolicy as { stages?: unknown } | null | undefined;
   if (!policy || typeof policy !== "object" || !Array.isArray(policy.stages)) return false;
   const rawStage = policy.stages[state.currentStageIndex];
@@ -198,13 +204,13 @@ function isWorkflowControlledPendingReviewParticipant(input: {
     state.completedStageIds.includes(stage.id) ||
     state.skippedStageIds?.includes(stage.id)
   ) return false;
-  return Array.isArray(stage.participants) && stage.participants.some(
-    (participant) =>
-      participant &&
-      typeof participant === "object" &&
-      participant.type === "agent" &&
-      participant.agentId === input.incomingAssigneeAgentId,
-  );
+  return Array.isArray(stage.participants) && stage.participants.some((participant) => {
+    if (!participant || typeof participant !== "object") return false;
+    if (currentParticipant.type === "agent") {
+      return participant.type === "agent" && participant.agentId === currentParticipant.agentId;
+    }
+    return participant.type === "user" && participant.userId === currentParticipant.userId;
+  });
 }
 
 export async function assertWikiHandoffWriteIntegrity(input: {
@@ -217,6 +223,8 @@ export async function assertWikiHandoffWriteIntegrity(input: {
     executionState?: unknown;
   };
   incomingAssigneeAgentId: string | null | undefined;
+  actorAgentId?: string | null;
+  currentAssigneeAgentId?: string | null;
   checkReviewStage?: boolean;
   workflowControlledAssignment?: boolean;
   refusalContext?: { caller: RefusalCaller; issue: RefusalIssue | null };
@@ -233,6 +241,8 @@ export async function assertWikiHandoffWriteIntegrity(input: {
   const violation = wikiHandoffWriteWouldViolate({
     canonicalMaintainerAgentId,
     incomingAssigneeAgentId: incoming,
+    actorAgentId: input.actorAgentId,
+    currentAssigneeAgentId: input.currentAssigneeAgentId,
     executionPolicy: input.issue.executionPolicy,
     executionState: input.issue.executionState,
     checkReviewStage: input.checkReviewStage,
@@ -271,6 +281,8 @@ export async function assertWikiHandoffWriteIntegrity(input: {
 export function wikiHandoffWriteWouldViolate(input: {
   canonicalMaintainerAgentId: string | null | undefined;
   incomingAssigneeAgentId: string | null | undefined;
+  actorAgentId?: string | null;
+  currentAssigneeAgentId?: string | null;
   executionPolicy: unknown;
   executionState: unknown;
   checkReviewStage?: boolean;
@@ -285,7 +297,10 @@ export function wikiHandoffWriteWouldViolate(input: {
     : null;
   if (incoming !== canonical) {
     if (
-      incoming !== null &&
+      (incoming !== null || (
+        input.actorAgentId === canonical &&
+        input.currentAssigneeAgentId === canonical
+      )) &&
       isWorkflowControlledPendingReviewParticipant({
         executionPolicy: input.executionPolicy,
         executionState: input.executionState,
