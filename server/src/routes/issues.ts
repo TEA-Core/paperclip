@@ -21149,6 +21149,8 @@ export function issueRoutes(
       return;
     }
     if (pendingReassignmentStopRunId) {
+      let cancellationFailed = false;
+      let cancellationError: unknown;
       try {
         const cancelled = await heartbeat.cancelRun(
           pendingReassignmentStopRunId,
@@ -21180,10 +21182,16 @@ export function issueRoutes(
               issueId: existing.id,
             },
           });
+        } else if (cancelled?.status === "running") {
+          cancellationFailed = true;
         }
       } catch (err) {
+        cancellationFailed = true;
+        cancellationError = err;
+      }
+      if (cancellationFailed) {
         logger.warn(
-          { err, issueId: existing.id, runId: pendingReassignmentStopRunId },
+          { err: cancellationError, issueId: existing.id, runId: pendingReassignmentStopRunId },
           "failed to cancel run for issue reassignment",
         );
         await logActivity(db, {

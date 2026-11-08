@@ -4319,6 +4319,57 @@ describe("issue execution policy routes", () => {
         .toBeLessThan(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]);
     });
 
+    it.each(["throws", "returns a running run"] as const)(
+      "reports an unconfirmed post-commit reassignment cancellation when it %s",
+      async (outcome) => {
+        mockStageHandoff();
+        if (outcome === "throws") {
+          mockHeartbeatService.cancelRun.mockRejectedValue(new Error("cancellation ownership is unverified"));
+        } else {
+          mockHeartbeatService.cancelRun.mockResolvedValue(runningRun);
+        }
+        // Import after resetModules so the spy observes the route's fresh logger instance.
+        const { logger } = await import("../middleware/logger.js");
+        const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+        try {
+          const res = await request(await createApp({
+            type: "agent",
+            agentId: reviewerAgentId,
+            companyId: "company-1",
+            runId: "66666666-6666-4666-8666-666666666666",
+          }))
+            .patch(`/api/issues/${issueId}`)
+            .send({ status: "done", comment: "Review passed; hand off before trying to stop the outgoing run." });
+
+          expect(res.status, JSON.stringify(res.body)).toBe(200);
+          expect(res.body).toMatchObject({ status: "in_review", assigneeAgentId: nextAgentId });
+          expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+          expect(mockIssueService.update.mock.invocationCallOrder[0])
+            .toBeLessThan(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]);
+          const warnings = warn.mock.calls.filter(([fields]) =>
+            fields !== null && typeof fields === "object"
+            && "issueId" in fields && fields.issueId === issueId
+            && "runId" in fields && fields.runId === runId);
+          expect(warnings).toHaveLength(1);
+          expect(mockLogActivity).toHaveBeenCalledWith(
+            expect.anything(),
+            expect.objectContaining({
+              action: "heartbeat.cancel_failed",
+              entityType: "heartbeat_run",
+              entityId: runId,
+              issueId,
+              details: { source: "issue_reassigned", issueId },
+            }),
+          );
+          // The activity mock records variadic service calls at runtime.
+          const activityCalls = mockLogActivity.mock.calls as unknown as Array<[unknown, { action: string }]>;
+          expect(activityCalls.filter(([, entry]) => entry.action === "heartbeat.cancel_failed")).toHaveLength(1);
+        } finally {
+          warn.mockRestore();
+        }
+      },
+    );
+
     it("retries cancelled-status cleanup when deferred reassignment cancellation fails", async () => {
       const issue = {
         id: issueId,
