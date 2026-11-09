@@ -448,7 +448,7 @@ export async function reapStrandedSummaryGenerationIssues(
             // went terminal, changed assignee, or gained a continuation path
             // since the scan belongs to its own owner.
             if (!issue) return false;
-            if (issue.status === "done" || issue.status === "cancelled") return false;
+            if (issue.status === "done" || issue.status === "cancelled" || issue.status === "blocked") return false;
             if (issue.assigneeAgentId !== SUMMARIZER_AGENT_ID) return false;
             // Amended-contract continuation path: an armed monitor.
             if (issue.monitorNextCheckAt) return false;

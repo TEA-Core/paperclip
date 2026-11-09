@@ -611,6 +611,68 @@ describeEmbeddedPostgres(
       await db.delete(issues).where(eq(issues.id, issueId));
     });
 
+    it("re-checks blocked status under the close row lock after selecting a candidate", async () => {
+      const issueId = await seedStrandedGenerationTask({ companyId, reviewerAgentId });
+      const slotId = randomUUID();
+      await db.insert(summarySlots).values({
+        id: slotId,
+        companyId,
+        scopeKind: "project",
+        scopeId: "86aa3f31-ce0d-42f8-98e9-02154f9be6a9",
+        slotKey: "header",
+        status: "generating",
+        generatingIssueId: issueId,
+      });
+
+      let signalLocked!: () => void;
+      const locked = new Promise<void>((resolve) => {
+        signalLocked = resolve;
+      });
+      let releaseLock!: () => void;
+      const lockReleased = new Promise<void>((resolve) => {
+        releaseLock = resolve;
+      });
+      const competingBlock = db.transaction(async (tx) => {
+        await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+        signalLocked();
+        await lockReleased;
+        await tx.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+      });
+      await locked;
+
+      const transaction = db.transaction.bind(db);
+      let closeTransactionStarted = false;
+      const transactionSpy = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) =>
+        transaction(async (tx) => {
+          closeTransactionStarted = true;
+          return callback(tx);
+        }, config),
+      );
+      const reaping = reapStrandedSummaryGenerationIssues(db);
+      try {
+        await vi.waitFor(() => {
+          expect(closeTransactionStarted).toBe(true);
+        }, { timeout: 5_000, interval: 10 });
+        releaseLock();
+        await competingBlock;
+        transactionSpy.mockRestore();
+        const result = await reaping;
+
+        expect(result).toEqual({ scanned: 1, terminalized: 0 });
+        expect((await getIssue(issueId))?.status).toBe("blocked");
+        const [slot] = await db.select().from(summarySlots).where(eq(summarySlots.id, slotId)).limit(1);
+        expect(slot).toMatchObject({ status: "generating", generatingIssueId: issueId });
+      } finally {
+        releaseLock();
+        transactionSpy.mockRestore();
+        await competingBlock.catch(() => undefined);
+        await reaping.catch(() => undefined);
+        await db.delete(activityLog).where(eq(activityLog.entityId, issueId));
+        await db.delete(summarySlots).where(eq(summarySlots.id, slotId));
+        await db.delete(issues).where(eq(issues.id, issueId));
+      }
+    });
+
     it("terminalizes a todo summary task with a null execution state", async () => {
 
       const issueId = await seedStrandedGenerationTask({
