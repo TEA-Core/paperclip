@@ -15,6 +15,7 @@ import {
   issues,
   pluginManagedResources,
   plugins,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -77,6 +78,7 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(pluginManagedResources);
+    await db.delete(projects);
     await db.delete(agents);
     await db.delete(plugins);
     await db.delete(companies);
@@ -329,6 +331,9 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
     issueNumber: number;
     downstreamId: string;
     title?: string;
+    projectId?: string;
+    deliveryRequirement?: "record_only" | "repository_delivery";
+    returnAssigneeAgentId?: string;
   }) {
     const blockerId = randomUUID();
     await db.insert(issues).values({
@@ -340,6 +345,11 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
       createdByAgentId: input.creatorId,
       issueNumber: input.issueNumber,
       identifier: `${input.prefix}-${input.issueNumber}`,
+      projectId: input.projectId,
+      deliveryRequirement: input.deliveryRequirement,
+      executionState: input.returnAssigneeAgentId
+        ? { returnAssignee: { type: "agent", agentId: input.returnAssigneeAgentId, userId: null } }
+        : null,
     });
     await db.insert(issueRelations).values({
       companyId: input.companyId,
@@ -349,6 +359,87 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
     });
     return blockerId;
   }
+
+  it("routes repository-delivery orphan blockers to execution-capable recovery owners", async () => {
+    const seeded = await seedCompany();
+    const leadId = randomUUID();
+    const projectId = randomUUID();
+    await db.update(agents).set({
+      capabilities: "Read-only. NOT: implement, never reviewer.",
+    }).where(eq(agents.id, seeded.coderId));
+    await db.update(agents).set({
+      status: "error",
+      capabilities: "Implement and verify repository changes.",
+    }).where(eq(agents.id, seeded.maintainerId));
+    await db.insert(agents).values({
+      id: leadId,
+      companyId: seeded.companyId,
+      name: "coder-LE",
+      role: "engineer",
+      status: "idle",
+      capabilities: "NOT: feature implementation. Code allowed: surgical unblock fix.",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId: seeded.companyId,
+      name: "Repository delivery recovery",
+      leadAgentId: leadId,
+    });
+    const downstreamId = randomUUID();
+    await db.insert(issues).values({
+      id: downstreamId,
+      companyId: seeded.companyId,
+      title: "Downstream card",
+      status: "blocked",
+      priority: "medium",
+      issueNumber: 21,
+      identifier: `${seeded.prefix}-21`,
+    });
+    const returnBlockerId = await seedOrphanBlocker({
+      ...seeded,
+      creatorId: seeded.coderId,
+      issueNumber: 22,
+      downstreamId,
+      projectId,
+      deliveryRequirement: "repository_delivery",
+      returnAssigneeAgentId: seeded.maintainerId,
+    });
+    const leadBlockerId = await seedOrphanBlocker({
+      ...seeded,
+      creatorId: seeded.coderId,
+      issueNumber: 23,
+      downstreamId,
+      projectId,
+      deliveryRequirement: "repository_delivery",
+      returnAssigneeAgentId: seeded.intruderId,
+    });
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }) as never);
+
+    const result = await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+
+    expect(result.orphanBlockersAssigned).toBe(2);
+    expect(enqueueWakeup.mock.calls.map(([agentId]) => agentId).sort()).toEqual(
+      [seeded.maintainerId, leadId].sort(),
+    );
+    const recoveredIssues = await db.select().from(issues).where(eq(issues.companyId, seeded.companyId));
+    expect(recoveredIssues.find((issue) => issue.id === returnBlockerId)?.assigneeAgentId).toBe(seeded.maintainerId);
+    expect(recoveredIssues.find((issue) => issue.id === leadBlockerId)?.assigneeAgentId).toBe(leadId);
+    expect(recoveredIssues.find((issue) => issue.id === downstreamId)).toMatchObject({
+      status: "blocked",
+      assigneeAgentId: null,
+    });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.companyId, seeded.companyId));
+    const returnComment = comments.find((comment) => comment.issueId === returnBlockerId);
+    expect(returnComment?.body).toContain("Recovery route: return_assignee");
+    expect(returnComment?.body).toContain("creator cannot execute repository_delivery");
+    const leadComment = comments.find((comment) => comment.issueId === leadBlockerId);
+    expect(leadComment?.body).toContain("Recovery route: project_lead");
+    expect(leadComment?.body).toContain("project lead engineer");
+  });
 
   it("continues the orphan-blocker sweep when one blocker's assignee write throws", async () => {
     const seeded = await seedCompany();
