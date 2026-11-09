@@ -7,6 +7,7 @@ import {
   agents,
   companies,
   createDb,
+  executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -77,6 +78,7 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
+    await db.delete(executionWorkspaces);
     await db.delete(pluginManagedResources);
     await db.delete(projects);
     await db.delete(agents);
@@ -140,6 +142,7 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
         name: "Coder",
         role: "engineer",
         status: "idle",
+        capabilities: "Implement and verify repository changes.",
         adapterType: "codex_local",
         adapterConfig: {},
         runtimeConfig: {},
@@ -334,6 +337,8 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
     projectId?: string;
     deliveryRequirement?: "record_only" | "repository_delivery";
     returnAssigneeAgentId?: string;
+    parentId?: string;
+    executionWorkspaceId?: string;
   }) {
     const blockerId = randomUUID();
     await db.insert(issues).values({
@@ -346,6 +351,8 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
       issueNumber: input.issueNumber,
       identifier: `${input.prefix}-${input.issueNumber}`,
       projectId: input.projectId,
+      parentId: input.parentId,
+      executionWorkspaceId: input.executionWorkspaceId,
       deliveryRequirement: input.deliveryRequirement,
       executionState: input.returnAssigneeAgentId
         ? { returnAssignee: { type: "agent", agentId: input.returnAssigneeAgentId, userId: null } }
@@ -377,7 +384,7 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
       name: "coder-LE",
       role: "engineer",
       status: "idle",
-      capabilities: "NOT: feature implementation. Code allowed: surgical unblock fix.",
+      capabilities: "Implement surgical unblock fixes and verify repository changes.",
       adapterType: "codex_local",
       adapterConfig: {},
       runtimeConfig: {},
@@ -417,7 +424,7 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
       deliveryRequirement: "repository_delivery",
       returnAssigneeAgentId: seeded.intruderId,
     });
-    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }) as never);
+    const enqueueWakeup = vi.fn(async (_agentId: string) => ({ id: randomUUID() }) as never);
 
     const result = await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
 
@@ -435,10 +442,132 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
     const comments = await db.select().from(issueComments).where(eq(issueComments.companyId, seeded.companyId));
     const returnComment = comments.find((comment) => comment.issueId === returnBlockerId);
     expect(returnComment?.body).toContain("Recovery route: return_assignee");
-    expect(returnComment?.body).toContain("creator cannot execute repository_delivery");
+    expect(returnComment?.body).toContain("creator rejected: cannot execute repository_delivery");
     const leadComment = comments.find((comment) => comment.issueId === leadBlockerId);
     expect(leadComment?.body).toContain("Recovery route: project_lead");
     expect(leadComment?.body).toContain("project lead engineer");
+    expect(leadComment?.body).toContain("recorded return assignee rejected: cannot execute repository_delivery");
+    expect(leadComment?.body).toContain("creator rejected: cannot execute repository_delivery");
+  });
+
+  it("reports an eligible return assignee losing status rank instead of claiming none was recorded", async () => {
+    const seeded = await seedCompany();
+    await db.update(agents).set({ status: "error" }).where(eq(agents.id, seeded.maintainerId));
+    const downstreamId = randomUUID();
+    await db.insert(issues).values({
+      id: downstreamId,
+      companyId: seeded.companyId,
+      title: "Downstream card",
+      status: "blocked",
+      priority: "medium",
+      issueNumber: 24,
+      identifier: `${seeded.prefix}-24`,
+    });
+    const blockerId = await seedOrphanBlocker({
+      ...seeded,
+      creatorId: seeded.coderId,
+      issueNumber: 25,
+      downstreamId,
+      deliveryRequirement: "record_only",
+      returnAssigneeAgentId: seeded.maintainerId,
+    });
+    const enqueueWakeup = vi.fn(async (_agentId: string) => ({ id: randomUUID() }) as never);
+
+    const result = await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+
+    expect(result.orphanBlockersAssigned).toBe(1);
+    expect(enqueueWakeup).toHaveBeenCalledWith(seeded.coderId, expect.anything());
+    const comment = await db.select().from(issueComments).where(eq(issueComments.issueId, blockerId)).then((rows) => rows[0]);
+    expect(comment?.body).toContain("Recovery route: creator");
+    expect(comment?.body).toContain("creator status idle outranked recorded return assignee status error");
+    expect(comment?.body).not.toContain("no usable return assignee was recorded");
+    const activities = await db.select().from(activityLog).where(eq(activityLog.entityId, blockerId));
+    const recoveryActivity = activities.find((entry) =>
+      (entry.details as { reassignSource?: string } | null)?.reassignSource === "creator"
+    );
+    expect(recoveryActivity?.details).toMatchObject({
+      reassignSource: "creator",
+      reassignReason: "creator status idle outranked recorded return assignee status error",
+    });
+  });
+
+  it.each([
+    { runStatus: "running", retryReason: null, workspaceReference: "context" },
+    { runStatus: "running", retryReason: null, workspaceReference: "issue_binding" },
+    { runStatus: "scheduled_retry", retryReason: "execution_workspace_occupied", workspaceReference: "context" },
+    { runStatus: "scheduled_retry", retryReason: "execution_workspace_occupied", workspaceReference: "issue_binding" },
+  ])("leaves a workspace-inheriting orphan blocker parked for its parent's $runStatus execution path via $workspaceReference", async ({ runStatus, retryReason, workspaceReference }) => {
+    const seeded = await seedCompany();
+    const projectId = randomUUID();
+    const parentId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId: seeded.companyId,
+      name: "Inherited workspace recovery",
+    });
+    await db.insert(issues).values({
+      id: parentId,
+      companyId: seeded.companyId,
+      projectId,
+      title: "Parent occupying inherited workspace",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: seeded.maintainerId,
+      issueNumber: 26,
+      identifier: `${seeded.prefix}-26`,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId: seeded.companyId,
+      projectId,
+      sourceIssueId: parentId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Inherited worktree",
+    });
+    await db.update(issues).set({ executionWorkspaceId }).where(eq(issues.id, parentId));
+    const blockerId = await seedOrphanBlocker({
+      ...seeded,
+      creatorId: seeded.coderId,
+      issueNumber: 27,
+      downstreamId: parentId,
+      projectId,
+      parentId,
+      executionWorkspaceId,
+      deliveryRequirement: "record_only",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: seeded.companyId,
+      agentId: seeded.maintainerId,
+      invocationSource: "automation",
+      status: runStatus,
+      startedAt: runStatus === "running" ? new Date() : null,
+      scheduledRetryAt: retryReason ? new Date(Date.now() + 60_000) : null,
+      scheduledRetryAttempt: retryReason ? 1 : 0,
+      scheduledRetryReason: retryReason,
+      contextSnapshot: {
+        issueId: parentId,
+        ...(workspaceReference === "context" ? { executionWorkspaceId } : {}),
+      },
+    });
+    if (workspaceReference === "issue_binding") {
+      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, parentId));
+    }
+    const enqueueWakeup = vi.fn(async (_agentId: string) => ({ id: randomUUID() }) as never);
+
+    const result = await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+
+    expect(result.orphanBlockersAssigned).toBe(0);
+    expect(result.issueIds).not.toContain(blockerId);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    await expect(db.select().from(issues).where(eq(issues.id, blockerId)).then((rows) => rows[0])).resolves.toMatchObject({
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      executionWorkspaceId,
+    });
   });
 
   it("continues the orphan-blocker sweep when one blocker's assignee write throws", async () => {
