@@ -1,5 +1,6 @@
 import type { ActivityEvent } from "@paperclipai/shared";
 import { useProjectCreatedItems } from "@/hooks/useProjectCreatedItems";
+import { skillCreatedItems } from "@/components/task-chat/skill-created-items";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import { TaskChatExpansionState } from "@/components/task-chat/expansion-state";
 import { TaskChatScrollReady } from "@/components/task-chat/scroll-navigation";
@@ -402,6 +403,7 @@ export type TaskChatThreadProps = ComponentProps<typeof IssueChatThread> & {
   initialHistoryPending?: boolean;
   initialHistoryError?: boolean;
   onRetryInitialHistory?: () => void;
+  onOpenSkill?: (skillId: string, name: string) => void;
 };
 
 type PendingComposerInput =
@@ -543,6 +545,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     liveIssueIds,
     onResumeAssignee,
     resumeAssigneePending = false,
+    onOpenSkill,
   } = props;
   const retryFailedRunHandler =
     isTerminalIssueStatus(issueStatus) ||
@@ -578,6 +581,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const canRetryFailedRun = Boolean(retryFailedRunHandler);
   const queryClient = useQueryClient();
   const createdProjectItems = useProjectCreatedItems(props.creationActivity ?? [], companyId);
+  const createdSkillItems = useMemo(() => skillCreatedItems(props.creationActivity ?? []), [props.creationActivity]);
   const [pendingComposerAssignee, setPendingComposerAssignee] = useState<
     string | null
   >(null);
@@ -1312,11 +1316,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     for (const item of createdProjectItems) {
       entries.push({ id: item.id, item, ms: toMs(item.timestamp), order: 2 });
     }
+    for (const item of createdSkillItems) {
+      entries.push({ id: item.id, item, ms: toMs(item.timestamp), order: 2 });
+    }
     return entries.sort(
       (a, b) => a.ms - b.ms || a.order - b.order || a.id.localeCompare(b.id),
     );
   }, [
     createdProjectItems,
+    createdSkillItems,
     comments,
     projectedComments,
     commentItems,
@@ -2680,6 +2688,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     initialHistoryPending ||
     planLoading ||
     initialRuns.some((run) => {
+      // A scheduled retry has not started and has no log to hydrate yet.
+      if (run.status === "scheduled_retry") return false;
       if (
         run.runtimeMode === "native" &&
         (hydratedNativeRunIds
@@ -2836,6 +2846,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                     }
                     onRetryFailedRun={retryFailedRunHandler}
                     retryFailedRunId={retryFailedRunId}
+                    onOpenSkill={onOpenSkill}
                     tail={
                       tailRunId ||
                       optimisticRunnerStartup ||

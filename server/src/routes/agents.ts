@@ -81,7 +81,7 @@ import {
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { resolveLiveExecutionLeases } from "../services/issue-execution-lease.js";
-import { PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
+import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
@@ -2921,7 +2921,10 @@ export function agentRoutes(
     if (role !== "ceo" && !boardOnboardingFirstAgent) return undefined;
     const adapter = findActiveServerAdapter(adapterType);
     if (!adapter?.listSkills && !adapter?.syncSkills) return undefined;
-    return PAPERCLIP_CORE_SKILL_KEYS
+    const keys = boardOnboardingFirstAgent
+      ? [...PAPERCLIP_CORE_SKILL_KEYS, ONBOARDING_FIRST_TASK_SKILL_KEY]
+      : PAPERCLIP_CORE_SKILL_KEYS;
+    return keys
       .filter((key) => adapterType !== "paperclip_runner" || key !== PAPERCLIP_OPERATIONAL_SKILL_KEY)
       .map((key) => ({ key, versionId: null }));
   }
@@ -6732,8 +6735,17 @@ export function agentRoutes(
     })))));
   });
 
-  router.get("/heartbeat-runs/:runId", async (req, res) => {
+  function readHeartbeatRunId(req: Request): string {
     const runId = req.params.runId as string;
+    // isUuidLike accepts surrounding whitespace, but PostgreSQL UUID inputs do not.
+    if (runId !== runId.trim() || !isUuidLike(runId)) {
+      throw badRequest("Invalid heartbeat run ID");
+    }
+    return runId;
+  }
+
+  router.get("/heartbeat-runs/:runId", async (req, res) => {
+    const runId = readHeartbeatRunId(req);
     const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!run) return;
     if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
@@ -6751,7 +6763,7 @@ export function agentRoutes(
 
   router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
     assertBoard(req);
-    const runId = req.params.runId as string;
+    const runId = readHeartbeatRunId(req);
     const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!existing) return;
     // Stamp the cancellation as operator-initiated (this route is board-only).
@@ -6785,7 +6797,7 @@ export function agentRoutes(
     "/heartbeat-runs/:runId/runtime-requests/:requestId/resolve",
     async (req, res) => {
       assertBoard(req);
-      const runId = req.params.runId as string;
+      const runId = readHeartbeatRunId(req);
       const requestId = req.params.requestId as string;
       const existing = await getAccessibleResource(
         req,
@@ -6991,7 +7003,7 @@ export function agentRoutes(
   );
 
   router.post("/heartbeat-runs/:runId/watchdog-decisions", async (req, res) => {
-    const runId = req.params.runId as string;
+    const runId = readHeartbeatRunId(req);
     const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!existing) return;
     const decision = typeof req.body?.decision === "string" ? req.body.decision : "";
@@ -7024,7 +7036,7 @@ export function agentRoutes(
 
   router.get("/heartbeat-runs/:runId/provider-trace", async (req, res) => {
     assertInstanceAdmin(req);
-    const runId = req.params.runId as string;
+    const runId = readHeartbeatRunId(req);
     const run = await getAccessibleResource(
       req,
       res,
@@ -7054,7 +7066,7 @@ export function agentRoutes(
     "/heartbeat-runs/:runId/provider-trace/reproject-workspace-diffs",
     async (req, res) => {
       assertBoard(req);
-      const runId = req.params.runId as string;
+      const runId = readHeartbeatRunId(req);
       const run = await getAccessibleResource(
         req,
         res,
@@ -7114,7 +7126,7 @@ export function agentRoutes(
     "/heartbeat-runs/:runId/provider-trace/frames/:frameId/reveal",
     async (req, res) => {
       assertInstanceAdmin(req);
-      const runId = req.params.runId as string;
+      const runId = readHeartbeatRunId(req);
       const frameId = Number(req.params.frameId);
       if (!Number.isSafeInteger(frameId) || frameId < 1) {
         throw badRequest("Invalid provider trace frame id");
@@ -7155,7 +7167,7 @@ export function agentRoutes(
     "/heartbeat-runs/:runId/provider-trace/download",
     async (req, res) => {
       assertInstanceAdmin(req);
-      const runId = req.params.runId as string;
+      const runId = readHeartbeatRunId(req);
       const run = await getAccessibleResource(
         req,
         res,
@@ -7191,7 +7203,7 @@ export function agentRoutes(
 
   router.delete("/heartbeat-runs/:runId/provider-trace", async (req, res) => {
     assertInstanceAdmin(req);
-    const runId = req.params.runId as string;
+    const runId = readHeartbeatRunId(req);
     const run = await getAccessibleResource(
       req,
       res,
@@ -7215,7 +7227,7 @@ export function agentRoutes(
   });
 
   router.get("/heartbeat-runs/:runId/events", async (req, res) => {
-    const runId = req.params.runId as string;
+    const runId = readHeartbeatRunId(req);
     const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!run) return;
     if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
@@ -7234,7 +7246,7 @@ export function agentRoutes(
   });
 
   router.get("/heartbeat-runs/:runId/log", async (req, res) => {
-    const runId = req.params.runId as string;
+    const runId = readHeartbeatRunId(req);
     const run = await getAccessibleResource(req, res, heartbeat.getRunLogAccess(runId), "Heartbeat run not found");
     if (!run) return;
     if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
@@ -7251,7 +7263,7 @@ export function agentRoutes(
   });
 
   router.get("/heartbeat-runs/:runId/workspace-operations", async (req, res) => {
-    const runId = req.params.runId as string;
+    const runId = readHeartbeatRunId(req);
     const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!run) return;
     if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;

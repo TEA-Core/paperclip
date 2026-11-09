@@ -1103,6 +1103,13 @@ export type IssueQueuedCommentSteeringDisposition =
   | "temporarily_unavailable";
 
 export interface IssueQueuedCommentEntry {
+  /** Immutable response projected from its durable interaction receipt. */
+  source?: {
+    kind: "interaction";
+    interactionId: string;
+    interactionKind: string;
+    requiresFreshSession?: boolean;
+  };
   comment: IssueComment;
   position: number;
   canEdit: boolean;

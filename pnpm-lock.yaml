@@ -45,10 +45,10 @@ patchedDependencies:
     hash: vbylpnnxt5av2zdnuqmf6hjyjy
     path: patches/@discordjs__ws@1.2.3.patch
   acpx@0.12.0:
-    hash: oelvlvtsc7rrwl4kzluvrmavam
+    hash: fq7kxxsppupxoadm5u5oonpwza
     path: patches/acpx@0.12.0.patch
   acpx@0.13.1:
-    hash: zmi2maauog4djnfd2acdrgmyhe
+    hash: ikfco27aeue26z63kex2z5d5ce
     path: patches/acpx@0.13.1.patch
   embedded-postgres@18.1.0-beta.16:
     hash: 55uhvnotpqyiy37rn3pqpukhei
@@ -163,7 +163,7 @@ importers:
         version: link:../shared
       acpx:
         specifier: 0.12.0
-        version: 0.12.0(patch_hash=oelvlvtsc7rrwl4kzluvrmavam)
+        version: 0.12.0(patch_hash=fq7kxxsppupxoadm5u5oonpwza)
       picocolors:
         specifier: ^1.1.1
         version: 1.1.1
@@ -513,7 +513,7 @@ importers:
         version: 0.153.4
       acpx:
         specifier: 0.13.1
-        version: 0.13.1(patch_hash=zmi2maauog4djnfd2acdrgmyhe)
+        version: 0.13.1(patch_hash=ikfco27aeue26z63kex2z5d5ce)
       ajv:
         specifier: ^8.20.0
         version: 8.20.0
@@ -959,7 +959,7 @@ importers:
         version: 8.18.0
       acpx:
         specifier: 0.13.1
-        version: 0.13.1(patch_hash=zmi2maauog4djnfd2acdrgmyhe)
+        version: 0.13.1(patch_hash=ikfco27aeue26z63kex2z5d5ce)
       ajv:
         specifier: ^8.20.0
         version: 8.20.0
@@ -13266,7 +13266,7 @@ snapshots:
 
   acorn@8.18.0: {}
 
-  acpx@0.12.0(patch_hash=oelvlvtsc7rrwl4kzluvrmavam):
+  acpx@0.12.0(patch_hash=fq7kxxsppupxoadm5u5oonpwza):
     dependencies:
       '@agentclientprotocol/sdk': 1.2.1(zod@4.4.3)
       commander: 15.0.0
@@ -13278,7 +13278,7 @@ snapshots:
       - bare-buffer
       - react-native-b4a
 
-  acpx@0.13.1(patch_hash=zmi2maauog4djnfd2acdrgmyhe):
+  acpx@0.13.1(patch_hash=ikfco27aeue26z63kex2z5d5ce):
     dependencies:
       '@agentclientprotocol/sdk': 1.4.0(zod@4.4.3)
       commander: 15.0.0
