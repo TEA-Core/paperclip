@@ -5,6 +5,7 @@ import {
   createEvaluateScheduledRetryGate,
   createPromoteDueScheduledRetries,
   createPromoteScheduledRetry,
+  createSweepStaleQueuedRuns,
 } from "./use-cases.js";
 import type { DueRetryRun, RunDispatchWriter, ScheduledRetryReader } from "./ports.js";
 
@@ -18,6 +19,9 @@ function fakeReader(dueRuns: DueRetryRun[] = []): ScheduledRetryReader & { evalu
     },
     async listDueRetries() {
       return dueRuns;
+    },
+    async listStaleQueuedRuns() {
+      return [];
     },
   };
 }
@@ -121,6 +125,36 @@ describe("createPromoteDueScheduledRetries", () => {
 
     expect(result.promoted).toBe(50);
     expect(result.runIds).toEqual(dueRuns.slice(0, 50).map(({ runId }) => runId));
+  });
+});
+
+describe("createSweepStaleQueuedRuns", () => {
+  it("cancels at most 50 age-expired queued runs in reader order", async () => {
+    const queuedRuns = Array.from({ length: 75 }, (_, i) => ({
+      runId: `run-${i}`,
+      companyId: "company-1",
+    }));
+    const reader = fakeReader();
+    reader.listStaleQueuedRuns = vi.fn(async ({ cutoff, limit }) => {
+      expect(cutoff).toEqual(new Date("2026-01-01T00:00:00.000Z"));
+      expect(limit).toBe(50);
+      return queuedRuns;
+    });
+    const cancelStaleQueuedRun = vi.fn<RunDispatchWriter["cancelStaleQueuedRun"]>(async () => ({
+      outcome: "cancelled" as const,
+      reason: "expired",
+      errorCode: "queued_run_expired" as const,
+      postCommitEffects: [],
+    }));
+    const writer = fakeWriter({ cancelStaleQueuedRun });
+
+    const result = await createSweepStaleQueuedRuns({ reader, cancelStaleQueuedRun: createCancelStaleQueuedRun({ writer }) })({
+      now: new Date("2026-01-02T00:00:00.000Z"),
+    });
+
+    expect(result.cancelled).toBe(50);
+    expect(cancelStaleQueuedRun).toHaveBeenCalledTimes(50);
+    expect(cancelStaleQueuedRun.mock.calls[0]?.[0]).toMatchObject({ runId: "run-0", companyId: "company-1", expectedStatus: "queued" });
   });
 });
 

@@ -1507,8 +1507,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         taskId: issueId,
         wakeReason: "issue_assigned",
       },
-      updatedAt: now,
-      createdAt: now,
+      // SUP-21903: the real-clock stale sweep cancels queued runs older than
+      // MAX_QUEUED_ISSUE_RUN_AGE_MS, so the seeded run must stay inside that
+      // window while the rest of the fixture keeps its fixed 2026-03-19 clock.
+      updatedAt: new Date(),
+      createdAt: new Date(),
     });
 
     await db.insert(issues).values({
