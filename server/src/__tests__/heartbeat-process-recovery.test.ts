@@ -11577,7 +11577,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         id: creatorAgentId,
         companyId,
         name: "SecurityEngineer",
-        role: "engineer",
+        role: "engineer", capabilities: "Implement and verify repository changes.",
         status: "idle",
         adapterType: "codex_local",
         adapterConfig: {},
@@ -11690,7 +11690,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         id: creatorAgentId,
         companyId,
         name: "SecurityEngineer",
-        role: "engineer",
+        role: "engineer", capabilities: "Implement and verify repository changes.",
         status: "idle",
         adapterType: "codex_local",
         adapterConfig: {},
@@ -11701,7 +11701,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         id: returnAssigneeAgentId,
         companyId,
         name: "CoderDBE",
-        role: "engineer",
+        role: "engineer", capabilities: "Implement and verify repository changes.",
         status: "idle",
         adapterType: "codex_local",
         adapterConfig: {},
@@ -11833,7 +11833,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         id: creatorAgentId,
         companyId,
         name: "SecurityEngineer",
-        role: "engineer",
+        role: "engineer", capabilities: "Implement and verify repository changes.",
         status: "idle",
         adapterType: "codex_local",
         adapterConfig: {},
@@ -11844,7 +11844,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         id: returnAssigneeAgentId,
         companyId,
         name: "CoderDBE",
-        role: "engineer",
+        role: "engineer", capabilities: "Implement and verify repository changes.",
         status: "paused",
         adapterType: "codex_local",
         adapterConfig: {},
@@ -11923,7 +11923,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, blockerIssueId));
     expect(comments[0]?.body).toContain("Assigned Orphan Blocker");
     expect(comments[0]?.body).toContain("created the blocker");
-    expect(comments[0]?.body).not.toContain("recorded return assignee");
+    expect(comments[0]?.body).toContain("Recovery route: creator; reason: recorded return assignee rejected: not invokable (status paused)");
 
     const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, creatorAgentId));
     expect(wakeups).toEqual([
@@ -11977,7 +11977,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         id: creatorAgentId,
         companyId,
         name: "SecurityEngineer",
-        role: "engineer",
+        role: "engineer", capabilities: "Implement and verify repository changes.",
         status: "idle",
         adapterType: "codex_local",
         adapterConfig: {},
@@ -11988,7 +11988,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         id: returnAssigneeAgentId,
         companyId,
         name: "CoderDBE",
-        role: "engineer",
+        role: "engineer", capabilities: "Implement and verify repository changes.",
         status: "idle",
         adapterType: "codex_local",
         adapterConfig: {},

@@ -1182,7 +1182,28 @@ export function recoveryBounceStatusRank(status: string | null | undefined): num
   return 2;
 }
 
-export type RecoveryBounceCandidateSource = "return_assignee" | "creator";
+export type RecoveryBounceCandidateSource = "return_assignee" | "creator" | "project_lead";
+
+export function canExecuteRecoveryDelivery(
+  deliveryRequirement: string | null | undefined,
+  capabilities: string | null | undefined,
+): boolean {
+  if (deliveryRequirement !== "repository_delivery") return true;
+  const summary = capabilities?.trim() ?? "";
+  if (!summary) return false;
+  if (
+    /\bread[\s-]*only\b/i.test(summary)
+    || /\bdocumentation[\s-]*only\b/i.test(summary)
+    || /\badvisory[\s-]*only\b/i.test(summary)
+    || /\bno[\s-]*code\b/i.test(summary)
+    || /\bno\s+repository\s+changes\b/i.test(summary)
+    || /\bnot\s*:[^.;!\n]*\bimplement(?:ation)?\b/i.test(summary)
+    || /\b(?:not|never)\s+(?:\w+\s+){0,2}implement(?:ation)?\b/i.test(summary)
+  ) {
+    return false;
+  }
+  return /\bimplement(?:s|ing|ation)?\b/i.test(summary) || /\bwrites?\s+code\b/i.test(summary);
+}
 
 export function selectRecoveryBounceCandidate(
   candidates: ReadonlyArray<{
@@ -1705,6 +1726,51 @@ export function recoveryService(
   function hasFutureMonitorCheck(monitorNextCheckAt: string | Date | null | undefined) {
     if (!monitorNextCheckAt) return false;
     return new Date(monitorNextCheckAt).getTime() > Date.now();
+  }
+
+  async function hasOccupiedExecutionWorkspace(
+    companyId: string,
+    executionWorkspaceId: string,
+    excludingIssueId: string,
+    runner: Db = db,
+  ) {
+    const boundIssues = await runner
+      .select({
+        executionRunId: issues.executionRunId,
+        checkoutRunId: issues.checkoutRunId,
+      })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, companyId),
+        eq(issues.executionWorkspaceId, executionWorkspaceId),
+        isNull(issues.hiddenAt),
+        ne(issues.id, excludingIssueId),
+      ))
+      .limit(50);
+    const boundRunIds = [...new Set(boundIssues.flatMap((issue) =>
+      [issue.executionRunId, issue.checkoutRunId].filter((runId): runId is string => Boolean(runId)),
+    ))];
+    const workspaceRunCondition = or(
+      boundRunIds.length > 0 ? inArray(heartbeatRuns.id, boundRunIds) : sql`false`,
+      sql`${heartbeatRuns.contextSnapshot} ->> 'executionWorkspaceId' = ${executionWorkspaceId}`,
+    );
+    return runner
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        or(
+          inArray(heartbeatRuns.status, ["queued", "running"]),
+          and(
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            eq(heartbeatRuns.scheduledRetryReason, "execution_workspace_occupied"),
+          ),
+        ),
+        workspaceRunCondition,
+        sql`(${heartbeatRuns.contextSnapshot} ->> 'issueId') is distinct from ${excludingIssueId}`,
+      ))
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
   }
 
   async function hasActiveExecutionPath(
@@ -2870,8 +2936,11 @@ export function recoveryService(
         status: issues.status,
         createdByAgentId: issues.createdByAgentId,
         assigneeAgentId: issues.assigneeAgentId,
+        projectId: issues.projectId,
+        deliveryRequirement: issues.deliveryRequirement,
         executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
+        executionWorkspaceId: issues.executionWorkspaceId,
       })
       .from(issueRelations)
       .innerJoin(issues, eq(issueRelations.issueId, issues.id))
@@ -2906,6 +2975,13 @@ export function recoveryService(
         skipped += 1;
         return;
       }
+      if (
+        candidate.executionWorkspaceId
+        && await hasOccupiedExecutionWorkspace(candidate.companyId, candidate.executionWorkspaceId, candidate.id)
+      ) {
+        skipped += 1;
+        return;
+      }
 
       // SUP-14225: consider the recorded return assignee and creator together.
       // SUP-17884 C3: prefer a live idle/active/running candidate over a live
@@ -2914,34 +2990,63 @@ export function recoveryService(
         agent: typeof agents.$inferSelect;
         source: RecoveryBounceCandidateSource;
       }> = [];
+      const bounceCandidateRejections: Array<{
+        source: RecoveryBounceCandidateSource;
+        reason: string;
+      }> = [];
+      const addBounceCandidate = async (
+        agent: typeof agents.$inferSelect | null | undefined,
+        source: RecoveryBounceCandidateSource,
+      ) => {
+        if (!agent || agent.companyId !== candidate.companyId) {
+          bounceCandidateRejections.push({ source, reason: "not available in this company" });
+          return;
+        }
+        if (!canExecuteRecoveryDelivery(candidate.deliveryRequirement, agent.capabilities)) {
+          bounceCandidateRejections.push({ source, reason: "cannot execute repository_delivery" });
+          return;
+        }
+        if (!(await isAgentInvokable(agent))) {
+          bounceCandidateRejections.push({ source, reason: `not invokable (status ${agent.status})` });
+          return;
+        }
+        if (await hasConsecutiveWakeFailuresForAgent(agent.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES)) {
+          bounceCandidateRejections.push({ source, reason: "recent consecutive wake failures" });
+          return;
+        }
+        bounceCandidates.push({ agent, source });
+      };
       const returnAssigneeAgentId = readReturnAssigneeAgentId(candidate.executionState);
       if (returnAssigneeAgentId) {
-        const returnAgent = await getAgent(returnAssigneeAgentId);
-        if (
-          returnAgent &&
-          returnAgent.companyId === candidate.companyId &&
-          (await isAgentInvokable(returnAgent)) &&
-          !(await hasConsecutiveWakeFailuresForAgent(returnAgent.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES))
-        ) {
-          bounceCandidates.push({ agent: returnAgent, source: "return_assignee" });
-        }
+        await addBounceCandidate(await getAgent(returnAssigneeAgentId), "return_assignee");
       }
       const creatorAgent = await getAgent(creatorAgentId);
-      if (
-        creatorAgent &&
-        creatorAgent.companyId === candidate.companyId &&
-        (await isAgentInvokable(creatorAgent)) &&
-        !(await hasConsecutiveWakeFailuresForAgent(creatorAgent.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES))
-      ) {
-        bounceCandidates.push({ agent: creatorAgent, source: "creator" });
-      }
-      const selected = selectRecoveryBounceCandidate(
+      await addBounceCandidate(creatorAgent, "creator");
+      let selected = selectRecoveryBounceCandidate(
         bounceCandidates.map(({ agent, source }) => ({
           agentId: agent.id,
           status: agent.status,
           source,
         })),
       );
+      if (!selected && candidate.deliveryRequirement === "repository_delivery" && candidate.projectId) {
+        const project = await db
+          .select({ leadAgentId: projects.leadAgentId })
+          .from(projects)
+          .where(and(eq(projects.id, candidate.projectId), eq(projects.companyId, candidate.companyId)))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (project?.leadAgentId) {
+          await addBounceCandidate(await getAgent(project.leadAgentId), "project_lead");
+        }
+        selected = selectRecoveryBounceCandidate(
+          bounceCandidates.map(({ agent, source }) => ({
+            agentId: agent.id,
+            status: agent.status,
+            source,
+          })),
+        );
+      }
       if (!selected) {
         skipped += 1;
         return;
@@ -2955,6 +3060,26 @@ export function recoveryService(
       }
       const nextAgent = selectedCandidate.agent;
       const reassignSource = selectedCandidate.source;
+      const bounceCandidateLabel = (source: RecoveryBounceCandidateSource) =>
+        source === "return_assignee"
+          ? "recorded return assignee"
+          : source === "project_lead"
+            ? "project lead engineer"
+            : "creator";
+      const outrankedCandidate = bounceCandidates.find(({ agent, source }) =>
+        source !== reassignSource
+        && recoveryBounceStatusRank(agent.status) > recoveryBounceStatusRank(nextAgent.status),
+      );
+      const rejectionReason = bounceCandidateRejections
+        .map(({ source, reason }) => `${bounceCandidateLabel(source)} rejected: ${reason}`)
+        .join("; ");
+      const reassignReason = outrankedCandidate
+        ? `${bounceCandidateLabel(reassignSource)} status ${nextAgent.status} outranked ${bounceCandidateLabel(outrankedCandidate.source)} status ${outrankedCandidate.agent.status}`
+        : rejectionReason || (reassignSource === "return_assignee"
+          ? "recorded return assignee owed the next action"
+          : reassignSource === "project_lead"
+            ? "no execution-capable, invokable creator or recorded return assignee was available"
+            : "no usable return assignee was recorded");
 
       const relations = await issuesSvc.getRelationSummaries(candidate.id);
       const blockingLinks = formatIssueLinksForComment(relations.blocks);
@@ -2970,6 +3095,10 @@ export function recoveryService(
           .for("update").limit(1);
         if (!current) return null;
         if (current.assigneeAgentId || current.assigneeUserId) return null;
+        if (
+          current.executionWorkspaceId
+          && await hasOccupiedExecutionWorkspace(current.companyId, current.executionWorkspaceId, current.id, txDb)
+        ) return null;
         const nextAssigneeAgentId = await resolveRecoveryReassignedAssignee(current, nextAgent.id, txDb);
         if (!nextAssigneeAgentId) return null;
         return issueService(txDb).update(candidate.id, {
@@ -2997,7 +3126,10 @@ export function recoveryService(
           "",
           reassignSource === "return_assignee"
             ? "- Assigned it to the recorded return assignee (the executor that owed the next action), not to the creator."
-            : "- Assigned it back to the agent that created the blocker (no usable return assignee was recorded).",
+            : reassignSource === "project_lead"
+              ? "- Assigned it to the project lead engineer."
+              : "- Assigned it back to the agent that created the blocker.",
+          `- Recovery route: ${reassignSource}; reason: ${reassignReason}.`,
           "- Next action: resolve this blocker or reassign it to the right owner.",
         ].join("\n"),
         {},
@@ -3016,6 +3148,7 @@ export function recoveryService(
           identifier: candidate.identifier,
           assigneeAgentId: nextAssigneeAgentId,
           reassignSource,
+          reassignReason,
           source: "recovery.reconcile_unassigned_blocking_issue",
         },
       });
