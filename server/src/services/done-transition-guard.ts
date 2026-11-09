@@ -53,6 +53,7 @@ import {
   LADDERED_CHILD_CARVE_OUT_LABEL_NAMES,
 } from "./laddered-child-eligibility.js";
 import { resolveGatedPrincipal } from "./approval-status-reconciler.js";
+import { isStrandedIssueRecoveryOriginKind } from "./recovery/origins.js";
 
 export class GitHubAuthError extends Error {
   readonly status: number;
@@ -2078,6 +2079,8 @@ export interface NoRepositoryLandingSubject {
   projectWorkspaceId?: string | null;
   executionWorkspaceId?: string | null;
   deliveryRequirement?: IssueDeliveryRequirement | null;
+  originKind?: string | null;
+  originId?: string | null;
 }
 
 /**
@@ -2094,6 +2097,8 @@ export interface NoRepositoryLandingMeasurement {
   baseBranch: string;
   /** The project workspace's reference branch, reduced to a branch name; board-only like the base. */
   repoRef: string | null;
+  recoverySourceIssueId: string | null;
+  permittedSourceCard: { id: string; identifier: string } | null;
   ruling: { documentId: string; revisionNumber: number; revisionCount: number; updatedAt: string };
   probe: {
     branch: string;
@@ -2172,7 +2177,10 @@ function noRepositoryRefusal(reason: string, remedy?: string): NoRepositoryLandi
 }
 
 /** Everything the close rests on that the database holds; `probe` aside, the measurement. */
-type NoRepositoryLandingRecord = Omit<NoRepositoryLandingMeasurement, "probe"> & {
+type NoRepositoryLandingRecord = Omit<
+  NoRepositoryLandingMeasurement,
+  "probe" | "recoverySourceIssueId" | "permittedSourceCard"
+> & {
   identifier: string;
   projectId: string;
   repositoryLocation: NonNullable<ReturnType<typeof parseRepoUrl>>;
@@ -2447,12 +2455,25 @@ async function verifyNoRepositoryLanding(
   }
   const projectBranches = new Set([record.baseBranch, githubDefaultBranch]);
   if (record.repoRef) projectBranches.add(record.repoRef);
+  const recoverySourceIssueId = isStrandedIssueRecoveryOriginKind(issue.originKind) ? issue.originId ?? null : null;
+  let permittedSourceCard: NoRepositoryLandingMeasurement["permittedSourceCard"] = null;
+  if (recoverySourceIssueId) {
+    permittedSourceCard = await db
+      .select({ id: issues.id, identifier: issues.identifier })
+      .from(issues)
+      .where(and(eq(issues.id, recoverySourceIssueId), eq(issues.companyId, issue.companyId)))
+      .then((rows) => {
+        const source = rows[0];
+        return source?.identifier ? { id: source.id, identifier: source.identifier } : null;
+      });
+  }
   const probe = await probeNoRepositoryWorktree({
     recordedWorktreePath: record.recordedWorktreePath,
     managedProjectRoot: path.dirname(
       resolveManagedProjectWorkspaceDir({ companyId: issue.companyId, projectId: record.projectId }),
     ),
     issueIdentifier: record.identifier,
+    permittedOtherCardIdentifiers: permittedSourceCard ? new Set([permittedSourceCard.identifier]) : undefined,
     projectBranches,
     attributedBranches: new Set(record.attributedBranches),
     existingOtherCardIdentifiers: async (candidates) =>
@@ -2496,6 +2517,8 @@ async function verifyNoRepositoryLanding(
       repository: record.repository,
       baseBranch: record.baseBranch,
       repoRef: record.repoRef,
+      recoverySourceIssueId,
+      permittedSourceCard,
       ruling: record.ruling,
       probe: {
         branch: probe.branch,
@@ -2623,6 +2646,26 @@ export async function verifyNoRepositoryLandingAtTransition(
     (lockedIssue.projectWorkspaceId ?? null) !== measurement.issueProjectWorkspaceId
   ) {
     return noRepositoryRefusal("refused: the issue's workspace binding changed after the close was measured.");
+  }
+  const recoverySourceIssueId = isStrandedIssueRecoveryOriginKind(lockedIssue.originKind)
+    ? lockedIssue.originId ?? null
+    : null;
+  if (recoverySourceIssueId !== measurement.recoverySourceIssueId) {
+    return noRepositoryRefusal("refused: the recovery source changed after the close was measured.");
+  }
+  if (measurement.permittedSourceCard) {
+    const sourceIdentifier = await tx
+      .select({ identifier: issues.identifier })
+      .from(issues)
+      .where(and(
+        eq(issues.id, measurement.permittedSourceCard.id),
+        eq(issues.companyId, lockedIssue.companyId),
+      ))
+      .for("update")
+      .then((rows) => rows[0]?.identifier ?? null);
+    if (sourceIdentifier !== measurement.permittedSourceCard.identifier) {
+      return noRepositoryRefusal("refused: the recovery source identifier changed after the close was measured.");
+    }
   }
   let read: Awaited<ReturnType<typeof readNoRepositoryLandingRecord>>;
   try {
