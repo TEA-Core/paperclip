@@ -315,7 +315,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       deliveryRequirement?: "record_only" | "repository_delivery";
       workspace?: Partial<typeof executionWorkspaces.$inferInsert>;
       /** The issue-title slug after the identifier in the worktree's branch (the default template). */
-      branchSlug?: string;
+      branchSlug?: string | ((identifier: string) => string);
       projectWorkspace?: Partial<typeof projectWorkspaces.$inferInsert>;
     } = {},
   ): Promise<SeededIssue> {
@@ -329,7 +329,8 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     const executionWorkspaceId = randomUUID();
     const issueId = randomUUID();
     const identifier = `${prefix}-1`;
-    const branch = `${identifier}-${options.branchSlug ?? "entry-ruling"}`;
+    const branchSlug = typeof options.branchSlug === "function" ? options.branchSlug(identifier) : options.branchSlug;
+    const branch = `${identifier}-${branchSlug ?? "entry-ruling"}`;
 
     const repoRoot = resolveManagedProjectWorkspaceDir({ companyId, projectId, repoName: "paperclip" });
     const origin = path.join(home, "origins", `${prefix}.git`);
@@ -1423,6 +1424,57 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(await statusOf(fixture.issueId)).toBe("done");
+  });
+
+  async function seedStrandedRecovery() {
+    const fixture = await seed({
+      branchSlug: (identifier) => `recover-exhausted-recovery-for-${identifier.replace(/-1$/, "-2")}`,
+    });
+    const sourceIssueId = randomUUID();
+    const sourceIdentifier = fixture.identifier.replace(/-1$/, "-2");
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId: fixture.companyId,
+      projectId: fixture.projectId,
+      identifier: sourceIdentifier,
+      title: "Source card",
+      status: "done",
+      priority: "medium",
+      createdByUserId: "cloud-user-1",
+    });
+    await db.update(issues).set({
+      originKind: "stranded_issue_recovery",
+      originId: sourceIssueId,
+      title: `Recover exhausted recovery for ${sourceIdentifier}`,
+    }).where(eq(issues.id, fixture.issueId));
+    expect(fixture.branch).toBe(`${fixture.identifier}-recover-exhausted-recovery-for-${sourceIdentifier}`);
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    return { fixture, sourceIssueId, sourceIdentifier };
+  }
+
+  it("closes a stranded recovery card whose platform-minted title slug names its source card", async () => {
+    const { fixture } = await seedStrandedRecovery();
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(fixture.issueId)).toBe("done");
+  });
+
+  it("refuses when a stranded recovery source identifier changes after measurement", async () => {
+    const { fixture, sourceIssueId, sourceIdentifier } = await seedStrandedRecovery();
+    mockMeasureNoRepositoryLanding.mockImplementation(async (...args: Parameters<typeof measureNoRepositoryLandingForClose>) => {
+      const verdict = await realMeasureNoRepositoryLandingRef.current!(...args);
+      expect(verdict.ok, JSON.stringify(verdict)).toBe(true);
+      await db.update(issues).set({ identifier: `${sourceIdentifier}0` }).where(eq(issues.id, sourceIssueId));
+      return verdict;
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("the recovery source identifier changed after the close was measured");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 
   it("still refuses a declaration that carries a word-number token, whatever its case", async () => {
