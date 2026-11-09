@@ -179,8 +179,17 @@ test("Stop then queued /new resets unpause the conversation without losing histo
     expect(
       await json(await request.get(`/api/companies/${f.company.id}/projects`)),
     ).toHaveLength(0);
+    // Fork divergence (merge_group flake hardening, slice 2d): a /new comment
+    // that lands while an earlier /new's reset run is still reading its window
+    // is coalesced into that reset, so back-to-back sends can advance the
+    // generation once instead of twice. Await each reset before the next send;
+    // nothing the test asserts changes, only the interleave is removed.
+    const generation = async () =>
+      (await json(await request.get(f.chatPath))).conversationSessionGeneration;
     await send(page, "/new");
+    await expect.poll(generation, { timeout: 30_000 }).toBe(1);
     await send(page, "/new");
+    await expect.poll(generation, { timeout: 30_000 }).toBe(2);
     await send(page, "Fresh followup");
     await idle(request, f.chatPath, 2);
     const fresh = await json(await request.get(f.chatPath));
@@ -197,19 +206,25 @@ test("Stop then queued /new resets unpause the conversation without losing histo
     const runs = await json(
       await request.get(`/api/companies/${f.company.id}/heartbeat-runs`),
     );
+    const resetCommentIds = (
+      await json(await request.get(`/api/issues/${issue.id}/comments`))
+    )
+      .filter((comment: any) => comment.body === "/new")
+      .map((comment: any) => comment.id);
+    expect(resetCommentIds).toHaveLength(2);
     const detailed = await Promise.all(
       runs.map((run: any) =>
         request.get(`/api/heartbeat-runs/${run.id}`).then(json),
       ),
     );
+    const resetRuns = detailed.filter(
+      (run) => run.contextSnapshot?.conversationReset,
+    );
+    expect(resetRuns).toHaveLength(2);
     expect(
-      detailed.filter((run) => run.contextSnapshot?.conversationReset),
-    ).toHaveLength(2);
-    expect(
-      detailed
-        .filter((run) => run.contextSnapshot?.conversationReset)
-        .every((run) => !run.sessionIdAfter),
-    ).toBe(true);
+      new Set(resetRuns.map((run) => run.contextSnapshot?.wakeCommentId)),
+    ).toEqual(new Set(resetCommentIds));
+    expect(resetRuns.every((run) => !run.sessionIdAfter)).toBe(true);
   } finally {
     await f.restore();
   }

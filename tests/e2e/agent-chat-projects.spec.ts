@@ -1,7 +1,10 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { expect, test } from "@playwright/test";
 
 import { idle, json, send, setup } from "./agent-chat.shared";
-import { seedTier2Credential } from "./fixtures/tier2-delivery";
+import { seedTier2Credential, seedTier2Project } from "./fixtures/tier2-delivery";
 
 test.use({ trace: "retain-on-failure" });
 test.setTimeout(120_000);
@@ -456,11 +459,13 @@ test("shared questions resume and existing project reuse creates no project card
   request,
 }) => {
   const f = await setup(request);
+  const projectCwd = await mkdtemp(path.join(os.tmpdir(), "paperclip-chat-project-"));
   try {
-    const project = await json(
-      await request.post(`/api/companies/${f.company.id}/projects`, {
-        data: { name: "Garden club" },
-      }),
+    const project = await seedTier2Project(
+      request,
+      f.company.id,
+      "Garden club",
+      projectCwd,
     );
     await page.goto(f.route);
     await send(page, { action: "question" });
@@ -515,6 +520,7 @@ test("shared questions resume and existing project reuse creates no project card
     ).toBe("in_review");
   } finally {
     await f.restore();
+    await rm(projectCwd, { recursive: true, force: true });
   }
 });
 

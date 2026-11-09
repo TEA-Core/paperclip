@@ -499,6 +499,37 @@ describe("grok_local execute", () => {
     expect(seenArgs[flagIndex + 1]).toBe("bypassPermissions");
   });
 
+  it("does not hand server-only PAPERCLIP_ and GitHub credentials to the Grok child", async () => {
+    const previous = {
+      secret: process.env.PAPERCLIP_TEST_SERVER_ONLY,
+      ghToken: process.env.GH_TOKEN,
+      xai: process.env.XAI_API_KEY,
+    };
+    process.env.PAPERCLIP_TEST_SERVER_ONLY = "server-secret";
+    process.env.GH_TOKEN = "gh-server-token";
+    process.env.XAI_API_KEY = "test-key";
+    ensureCommandMock.mockClear();
+    runProcessMock.mockImplementation(async () => makeSuccessfulRunResult());
+    try {
+      await execute(await makeCtx("run-env-sanitize", await makeTempRoot()));
+    } finally {
+      for (const [key, value] of [
+        ["PAPERCLIP_TEST_SERVER_ONLY", previous.secret],
+        ["GH_TOKEN", previous.ghToken],
+        ["XAI_API_KEY", previous.xai],
+      ] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+    // The spawn env is sanitised again by the runner; this site builds the env
+    // used to resolve the command and to pick the billing mode.
+    const resolutionEnv = (ensureCommandMock.mock.calls[0] as unknown[] | undefined)?.[3] as Record<string, string> | undefined;
+    expect(resolutionEnv).toBeDefined();
+    expect(resolutionEnv?.PAPERCLIP_TEST_SERVER_ONLY).toBeUndefined();
+    expect(resolutionEnv?.GH_TOKEN).toBeUndefined();
+  });
+
   it("cleans up staged assets when setup fails before the Grok process starts", async () => {
     const root = await makeTempRoot();
     const instructionsPath = path.join(root, "managed", "AGENTS.md");

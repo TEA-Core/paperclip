@@ -68,6 +68,16 @@ describe("task connector read routes", () => {
     expect(email.thread).toHaveBeenCalledWith(companyId, issueId);
   });
 
+  it("threads the board API key id into the email read authorization audit actor", async () => {
+    const server = app({ ...boardActor, source: "board_key", keyId: "board-key-1" });
+    await request(server).get(`/api/companies/${companyId}/email/tasks/${issueId}`).expect(200, "null");
+    expect(email.authorizeRead).toHaveBeenCalledWith(companyId, issueId, {
+      userId: boardActor.userId,
+      localImplicit: false,
+      boardApiKeyId: "board-key-1",
+    });
+  });
+
   it.each([issueId, `chat:${issueId}`])("retains authentication checks for %s", async (id) => {
     const server = app({ type: "none", source: "none" });
     await request(server).get(`/api/issues/${id}/chat-binding`).expect(403);
