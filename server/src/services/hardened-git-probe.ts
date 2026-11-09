@@ -682,6 +682,7 @@ export interface NoRepositoryWorktreeProbeInput {
   /** `<instanceRoot>/projects/<companyId>/<projectId>`, derived from server env and immutable ids. */
   managedProjectRoot: string;
   issueIdentifier: string;
+  permittedOtherCardIdentifiers?: ReadonlySet<string>;
   /**
    * The project's own branches (its default and reference branches and the
    * repository's default branch on the remote): their local branches carry no
@@ -910,7 +911,8 @@ export async function probeNoRepositoryWorktree(
   if (!branchNamesIssue(own.branch, input.issueIdentifier)) {
     return refuse(`the recorded worktree's branch does not name ${input.issueIdentifier}`);
   }
-  const otherCards = otherCardIdentifiersInBranch(own.branch, input.issueIdentifier);
+  const otherCards = otherCardIdentifiersInBranch(own.branch, input.issueIdentifier)
+    .filter((identifier) => !input.permittedOtherCardIdentifiers?.has(identifier));
   if (otherCards.length > 0) {
     return refuse(`the recorded worktree's branch ${own.branch} also names another card (${otherCards.join(", ")})`);
   }

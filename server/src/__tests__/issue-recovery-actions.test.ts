@@ -242,7 +242,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         id: coderId,
         companyId,
         name: "Coder",
-        role: "engineer",
+        role: "engineer", capabilities: "Implement and verify repository changes.",
         status: "idle",
         reportsTo: managerId,
         adapterType: "codex_local",
