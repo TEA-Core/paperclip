@@ -87,6 +87,16 @@ export const DECISION_QUEUE_SEEDS: readonly SeedDefinition[] = [
       description: "Pending ask_user_questions interactions.",
     }],
   },
+  {
+    key: "alerts",
+    title: "Alerts",
+    description: "Board-visible alerts requiring attention.",
+    rules: [{
+      key: "recovery-rate-alert",
+      signal: "recovery_rate_alert",
+      description: "Recovery-rate alerts whose complete-week breach remains live.",
+    }],
+  },
 ] as const;
 
 const SYSTEM_ACTOR: DecisionMutationActor = {
@@ -867,6 +877,9 @@ export function decisionQueueService(db: Db) {
         }
         if (item.sourceKind === "issue_thread_interaction" && item.subject.metadata?.kind === "ask_user_questions") {
           matches.set("questions", [...(matches.get("questions") ?? []), item]);
+        }
+        if (item.sourceKind === "recovery_rate_alert") {
+          matches.set("alerts", [...(matches.get("alerts") ?? []), item]);
         }
       }
 
