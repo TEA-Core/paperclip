@@ -633,13 +633,16 @@ async function writeAuditLog(
   action: string,
   details: Record<string, unknown>,
 ) {
+  const isLadderRefusal = action === "issue.done_transition_ladder_refused";
   try {
     await logActivity(db, {
       companyId: issue.companyId,
       actorType: "system",
-      actorId: issue.doneTransitionAuditProvenance?.actorId ?? "done-transition-guard",
+      actorId: isLadderRefusal
+        ? "done-transition-guard"
+        : issue.doneTransitionAuditProvenance?.actorId ?? "done-transition-guard",
       agentId: null,
-      runId: issue.doneTransitionAuditProvenance?.runId ?? null,
+      runId: isLadderRefusal ? null : issue.doneTransitionAuditProvenance?.runId ?? null,
       agentApiKeyId: null,
       action,
       entityType: "issue",
@@ -4470,6 +4473,12 @@ async function evaluateDoneTransitionGuardCore(
   if (reviewLadder !== null && !reviewLadder.satisfied) {
     const first = reviewLadder.firstUnsatisfiedStage;
     void writeAuditLog(db, issue, "issue.done_transition_ladder_refused", {
+      ...(issue.doneTransitionAuditProvenance
+        ? {
+            callingActor: issue.doneTransitionAuditProvenance.actorId,
+            callingRunId: issue.doneTransitionAuditProvenance.runId,
+          }
+        : {}),
       reason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
       skipReason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
       stageIndex: reviewLadder.firstUnsatisfiedIndex,

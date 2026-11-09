@@ -544,8 +544,12 @@ describeEmbeddedPostgres(
       const ladderRefusals = refusalAudits.filter((row) => row.action === "issue.done_transition_ladder_refused");
       expect(ladderRefusals).toEqual([
         expect.objectContaining({
-          actorId: "system:execution-control-reconciliation",
+          actorId: "done-transition-guard",
           runId: null,
+          details: expect.objectContaining({
+            callingActor: "system:execution-control-reconciliation",
+            callingRunId: null,
+          }),
         }),
       ]);
 
