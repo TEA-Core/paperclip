@@ -5375,6 +5375,11 @@ export function issueRoutes(
     // inside its status write passes the closing actor; every other door leaves
     // it unset, and the record_only no-repository form then refuses.
     noRepositoryLandingCloser?: DoneTierClosingActor;
+    // The closing agent's id, when the closer is an agent (null/absent for
+    // human, board and system closers). The tier guard refuses an agent
+    // record-only Tier 2 close whose closing run cannot be resolved, so an
+    // agent cannot skip the lifetime gate by dropping the run id header.
+    closingAgentId?: string | null;
   }): Promise<DoneTransitionGuardOutcome> {
     const {
       issue,
@@ -5517,6 +5522,7 @@ export function issueRoutes(
       runId,
       (issueId) => svc.listComments(issueId, { order: "desc", limit: 100 }),
       input.noRepositoryLandingCloser ?? null,
+      input.closingAgentId ?? null,
     );
     if (tierResult.skipped) {
       void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
@@ -9575,6 +9581,7 @@ export function issueRoutes(
     // same row lock. It waives the ownership check below and nothing else --
     // the active-run lock that follows still applies.
     recoveryOwnerAuthorized = false,
+    effectiveRunId?: string | null,
   ) {
     if (req.actor.type !== "agent") return;
     const actorAgentId = req.actor.agentId;
@@ -9631,7 +9638,7 @@ export function issueRoutes(
       );
     }
 
-    const actorRunId = req.actor.runId?.trim() || null;
+    const actorRunId = effectiveRunId?.trim() || req.actor.runId?.trim() || null;
     const conflictingRunId = [issue.checkoutRunId, issue.executionRunId].find(
       (runId) => runId && runId !== actorRunId,
     );
@@ -9672,6 +9679,11 @@ export function issueRoutes(
     recoveryAction: NonNullable<
       Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>>
     >;
+    // SUP-23490: the run id the recovery door already validated (header, then
+    // the issue's own checkout/execution self-declared run). A header-less
+    // agent close must compare the lock against this resolved identity, not
+    // against null.
+    effectiveRunId?: string | null;
   }) {
     const returnOwnerAgentId = input.recoveryAction.returnOwnerAgentId;
     if (
@@ -9689,9 +9701,10 @@ export function issueRoutes(
       );
     }
     const actorRunId =
-      input.req.actor.type === "agent"
+      input.effectiveRunId?.trim() ||
+      (input.req.actor.type === "agent"
         ? input.req.actor.runId?.trim() || null
-        : null;
+        : null);
     const conflictingRunId = [
       input.issue.checkoutRunId,
       input.issue.executionRunId,
@@ -13724,6 +13737,7 @@ export function issueRoutes(
         )
       )
         return;
+      let resolvedRecoveryRunId: string | null = null;
       if (req.actor.type === "agent") {
         const boundaryDecision = await decideIssueAccess(
           req,
@@ -13760,7 +13774,10 @@ export function issueRoutes(
           );
           return;
         }
-        if (!requireAgentRunId(req, res)) return;
+        resolvedRecoveryRunId = await requireAgentRunId(req, res, {
+          checkoutRunId: existing.checkoutRunId ?? existing.executionRunId ?? null,
+        });
+        if (!resolvedRecoveryRunId) return;
         if (
           !(await assertCrossIssueInfluenceWithinRunCap(
             req,
@@ -13922,7 +13939,8 @@ export function issueRoutes(
                 }
               : null,
           commentBody: doneTierResolutionNote,
-          runId: actor.runId ?? null,
+          runId: resolvedRecoveryRunId,
+          closingAgentId: actor.agentId ?? null,
           decisionCarried: !!doneCarryTransition.decision,
           boardActor: req.actor.type === "board",
         });
@@ -14151,6 +14169,7 @@ export function issueRoutes(
               req,
               issue: lockedIssue,
               recoveryAction: activeRecoveryAction,
+              effectiveRunId: resolvedRecoveryRunId,
             });
           } else {
             // The fork routes a stranded recovery action to an OWNER AGENT (the
@@ -14168,6 +14187,7 @@ export function issueRoutes(
               lockedIssue,
               activeRecoveryAction,
               recoveryOwnerAuthorizedThisResolution,
+              resolvedRecoveryRunId,
             );
           }
 
@@ -17045,6 +17065,7 @@ export function issueRoutes(
           override: null,
           commentBody: null,
           runId: actor.runId ?? null,
+          closingAgentId: actor.agentId ?? null,
           decisionCarried: false,
           createDoor: true,
           boardActor: req.actor.type === "board",
@@ -20179,10 +20200,16 @@ export function issueRoutes(
         issue: finalDeliveryIssue,
         override,
         commentBody: commentBody ?? null,
-        runId: actor.runId ?? null,
+        runId: actor.runId?.trim()
+          || await resolveSelfDeclaredRunIdForIssue(
+            actor.agentId ?? undefined,
+            finalDeliveryIssue.checkoutRunId ?? finalDeliveryIssue.executionRunId ?? null,
+          )
+          || null,
         decisionCarried: !!transition.decision,
         boardActor: req.actor.type === "board",
         caller: refusalCaller,
+        closingAgentId: actor.agentId ?? null,
         noRepositoryLandingCloser: closingActor,
       });
       if (!outcome.ok) {
@@ -23693,6 +23720,7 @@ export function issueRoutes(
           override: null,
           commentBody: REVIEW_ESCALATION_APPROVED_DECISION_BODY,
           runId: actor.runId ?? null,
+          closingAgentId: actor.agentId ?? null,
           decisionCarried: true,
           boardActor: req.actor.type === "board",
           caller: {
@@ -25547,7 +25575,13 @@ export function issueRoutes(
           issue: currentIssue,
           override: null,
           commentBody: commentBody ?? null,
-          runId: actor.runId ?? null,
+          runId: actor.runId?.trim()
+            || await resolveSelfDeclaredRunIdForIssue(
+              actor.agentId ?? undefined,
+              currentIssue.checkoutRunId ?? currentIssue.executionRunId ?? null,
+            )
+            || null,
+          closingAgentId: actor.agentId ?? null,
           decisionCarried: !!transition.decision,
           boardActor: req.actor.type === "board",
           caller: {

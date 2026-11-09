@@ -4289,6 +4289,52 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  it("resolves the safe hand-back run lock from the issue's checkout run when the header is absent", async () => {
+    // SUP-23490: the recovery door validates the run id header, then the
+    // issue's own checkout/execution self-declared run. The safe hand-back
+    // gate must compare its run lock against that resolved identity, not
+    // against null — a header-less agent resolving its own card's recovery
+    // used to be refused as a conflicting run even though it owned the
+    // checkout run.
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "blocked",
+      assigneeAgentId: ownerAgentId,
+      checkoutRunId: ownerRunId,
+    }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId, checkoutRunId: ownerRunId }),
+      ...patch,
+    }));
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+      id: recoveryActionId,
+      ownerAgentId: ownerAgentId,
+      returnOwnerAgentId: ownerAgentId,
+    } as never);
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: ownerRunId,
+      companyId,
+      agentId: ownerAgentId,
+      status: "running",
+      invocationSource: "self_declared",
+      contextSnapshot: { issueId, wakeReason: "self_declared" },
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId: ownerAgentId,
+      companyId,
+      source: "agent_key",
+      // intentionally no runId — the issue's checkout run supplies it
+    });
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+      .send({ actionId: recoveryActionId, outcome: "restored", sourceIssueStatus: "todo" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
   it("blocks safe hand-back while the original owner's budget is paused", async () => {
     mockIssueService.getById.mockResolvedValue(
       makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }),

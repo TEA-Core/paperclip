@@ -267,6 +267,14 @@ describe("openapi routes", () => {
     expect(wake.responses["409"]).toBeDefined();
     expect(wake.description).toContain("durable queued/deferred receipt");
   });
+  it("documents recovery-rate alert decision queue seed signals", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/companies/{companyId}/decision-queue-seed-rules"].get;
+    const schema = operation.responses["200"].content["application/json"].schema;
+
+    expect(schema.items.properties.signal.enum).toContain("recovery_rate_alert");
+  });
+
   it("documents the recovery observability incident-based response contract", () => {
     const { spec } = loadSpecRoutes();
     const operation =

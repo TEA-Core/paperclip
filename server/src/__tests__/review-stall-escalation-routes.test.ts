@@ -257,7 +257,13 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
   async function liveRun(seeded: Seeded, agentId: string, issueId: string) {
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({
-      id: runId, companyId: seeded.companyId, agentId, status: "running", contextSnapshot: { issueId },
+      id: runId, companyId: seeded.companyId, agentId, status: "running",
+      // SUP-23490: the done-tier gate places a record-only observation inside
+      // the closing run's lifetime (startedAt ?? createdAt); a run that closes
+      // its own card has always started, so seed the start before the suite's
+      // fixed probe instant (2026-11-04T09:15:00Z).
+      startedAt: new Date("2026-11-04T09:00:00Z"),
+      contextSnapshot: { issueId },
     });
     seededRunIds.push(runId);
     return runId;
