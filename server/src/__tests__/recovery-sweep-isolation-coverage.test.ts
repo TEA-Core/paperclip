@@ -149,7 +149,7 @@ describeEmbeddedPostgres("recovery sweep isolation table", () => {
       id: agentId,
       companyId,
       name: "Coder",
-      role: "engineer",
+      role: "engineer", capabilities: "Implement and verify repository changes.",
       status: "active",
       adapterType: "codex_local",
       adapterConfig: {},
