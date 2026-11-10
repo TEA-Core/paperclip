@@ -9,6 +9,7 @@ import {
   agentWakeupRequests,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issues,
@@ -1369,6 +1370,11 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
           });
           expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake!.id)))[0])
             .toMatchObject({ status: "cancelled", error: "Cancelled during ordinary claim" });
+          // The cancel event bumps the run row's event sequence just before the
+          // issue cleanup blocks; snapshot only once it has landed.
+          expect(await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents)
+            .where(and(eq(heartbeatRunEvents.runId, queued!.id), eq(heartbeatRunEvents.message, "run cancelled"))))
+            .toHaveLength(1);
         }, { timeout: 5_000, interval: 20 });
         const [cancelledRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id));
         const [cancelledWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake!.id));
