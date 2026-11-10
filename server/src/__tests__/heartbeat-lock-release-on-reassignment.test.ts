@@ -9,6 +9,7 @@ import {
   agentWakeupRequests,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issues,
@@ -1277,6 +1278,133 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
         await db.execute(sql`DROP TRIGGER test_capture_composed_stamp ON issues`);
         await db.execute(sql`DROP FUNCTION test_capture_composed_stamp()`);
         await db.execute(sql`DROP TABLE test_composed_claims, test_composed_stamps`);
+      }
+    }, 30_000);
+
+    it("does not resurrect an ordinary queued run cancelled before its claim commits", async () => {
+      const { companyId, reviewerAgentId, issueId, holderRunId } =
+        await seedCrossAgentScenario({ holderStatus: "running" });
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, holderRunId));
+      const executionDir = await mkdtemp(join(tmpdir(), "claim-cancel-"));
+      const dispatchedPath = join(executionDir, "dispatched");
+      await db.update(agents).set({
+        adapterConfig: {
+          command: process.execPath,
+          args: ["-e", "require('node:fs').writeFileSync(process.argv[1], 'dispatched')", dispatchedPath],
+          cwd: executionDir,
+        },
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      }).where(eq(agents.id, reviewerAgentId));
+      const [wake] = await db.insert(agentWakeupRequests).values({
+        companyId, agentId: reviewerAgentId, source: "assignment", status: "queued",
+        reason: "issue_assigned", payload: { issueId },
+      }).returning();
+      const [queued] = await db.insert(heartbeatRuns).values({
+        companyId, agentId: reviewerAgentId, status: "queued", invocationSource: "assignment",
+        wakeupRequestId: wake!.id, responsibleUserId: "responsible-user",
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      }).returning();
+      await db.update(agentWakeupRequests).set({ runId: queued!.id })
+        .where(eq(agentWakeupRequests.id, wake!.id));
+      await db.update(issues).set({
+        status: "in_progress", checkoutRunId: queued!.id, executionRunId: queued!.id,
+        executionAgentNameKey: "reviewer", executionLockedAt: new Date(),
+      }).where(eq(issues.id, issueId));
+      await db.execute(sql`CREATE TABLE test_cancelled_claims (kind text, run_id uuid)`);
+      await db.execute(sql`CREATE FUNCTION test_capture_cancelled_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          INSERT INTO test_cancelled_claims VALUES ('running', NEW.id);
+          RETURN NEW;
+        END;
+      $$`);
+      await db.execute(sql`CREATE TRIGGER test_capture_cancelled_claim
+        AFTER UPDATE OF status ON heartbeat_runs FOR EACH ROW
+        WHEN (NEW.status = 'running' AND OLD.status IS DISTINCT FROM NEW.status)
+        EXECUTE FUNCTION test_capture_cancelled_claim()`);
+      await db.execute(sql`CREATE FUNCTION test_capture_cancelled_stamp() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          INSERT INTO test_cancelled_claims VALUES ('stamp', NEW.execution_run_id);
+          RETURN NEW;
+        END;
+      $$`);
+      await db.execute(sql`CREATE TRIGGER test_capture_cancelled_stamp
+        AFTER UPDATE OF execution_run_id ON issues FOR EACH ROW
+        WHEN (NEW.execution_run_id IS NOT NULL)
+        EXECUTE FUNCTION test_capture_cancelled_stamp()`);
+      // A separate application identifies only this claim's backend, without
+      // depending on SQL text or interfering with the real cancellation client.
+      const applicationName = `claim-cancel-${queued!.id}`;
+      const claimDb = createDb(tempDb!.connectionString, { applicationName, maxConnections: 1 });
+      const claimingHeartbeat = heartbeatService(claimDb);
+      const barrier = new EventEmitter();
+      const locked = once(barrier, "locked");
+      const release = once(barrier, "release");
+      let barrierPid = 0;
+      const holder = db.transaction(async (tx) => {
+        await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+        const [backend] = await tx.execute(sql`SELECT pg_backend_pid() AS pid`);
+        barrierPid = Number(backend!.pid);
+        barrier.emit("locked");
+        await release;
+      });
+      let resume: Promise<void> | undefined;
+      let cancel: Promise<unknown> | undefined;
+      try {
+        await locked;
+        resume = claimingHeartbeat.resumeQueuedRuns();
+        await vi.waitFor(async () => {
+          const waiters = await db.execute(sql`
+            SELECT pid FROM pg_stat_activity
+            WHERE datname = current_database() AND application_name = ${applicationName}
+              AND wait_event_type = 'Lock' AND ${barrierPid} = ANY(pg_blocking_pids(pid))
+          `);
+          expect(Array.from(waiters), "ordinary claim reached its issue lock after reading the queued run").toHaveLength(1);
+        }, { timeout: 5_000, interval: 20 });
+        // Cancel commits the run and wake status before its issue cleanup waits
+        // on the same barrier. The claim now holds a stale queued snapshot.
+        cancel = heartbeat.cancelRun(queued!.id, "Cancelled during ordinary claim", { suppressImmediateRecovery: true });
+        await vi.waitFor(async () => {
+          expect(await heartbeat.getRun(queued!.id)).toMatchObject({
+            status: "cancelled", startedAt: null, error: "Cancelled during ordinary claim", errorCode: "cancelled",
+          });
+          expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake!.id)))[0])
+            .toMatchObject({ status: "cancelled", error: "Cancelled during ordinary claim" });
+          // The cancel event bumps the run row's event sequence just before the
+          // issue cleanup blocks; snapshot only once it has landed.
+          expect(await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents)
+            .where(and(eq(heartbeatRunEvents.runId, queued!.id), eq(heartbeatRunEvents.message, "run cancelled"))))
+            .toHaveLength(1);
+        }, { timeout: 5_000, interval: 20 });
+        const [cancelledRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id));
+        const [cancelledWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake!.id));
+        barrier.emit("release");
+        await holder;
+        await Promise.all([resume, cancel]);
+        await claimingHeartbeat.drainActiveRunExecutions();
+        // Capture committed transitions, not just the final status: later
+        // cancellation cleanup must not hide a claim or stamp that escaped.
+        expect(Array.from(await db.execute(sql`
+          SELECT kind, run_id FROM test_cancelled_claims WHERE run_id = ${queued!.id}
+        `)), "cancelled run must not be claimed as running or take an execution stamp").toEqual([]);
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id)))[0]).toEqual(cancelledRun);
+        expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake!.id)))[0]).toEqual(cancelledWake);
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toMatchObject({
+          checkoutRunId: null, executionRunId: null, executionAgentNameKey: null, executionLockedAt: null,
+        });
+        expect(cancelledRun!.runnerProfileJson?.adapterDispatch).toBeUndefined();
+        await expect(readFile(dispatchedPath)).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        barrier.emit("release");
+        await Promise.allSettled([holder, resume, cancel]);
+        await drainHeartbeatRunsToQuiescence(db, claimingHeartbeat).catch(() => undefined);
+        await claimDb.$client.end({ timeout: 5 }).catch(() => undefined);
+        await db.execute(sql`DROP TRIGGER IF EXISTS test_capture_cancelled_claim ON heartbeat_runs`);
+        await db.execute(sql`DROP FUNCTION IF EXISTS test_capture_cancelled_claim()`);
+        await db.execute(sql`DROP TRIGGER IF EXISTS test_capture_cancelled_stamp ON issues`);
+        await db.execute(sql`DROP FUNCTION IF EXISTS test_capture_cancelled_stamp()`);
+        await db.execute(sql`DROP TABLE IF EXISTS test_cancelled_claims`);
+        await rm(executionDir, { recursive: true, force: true });
       }
     }, 30_000);
 
