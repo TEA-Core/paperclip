@@ -18833,6 +18833,26 @@ export function issueRoutes(
     }
     let interruptedRunId: string | null = null;
     let pendingReassignmentStopRunId: string | null = null;
+    const hasUnexpectedRunLink = (
+      candidate: {
+        checkoutRunId?: string | null;
+        executionRunId?: string | null;
+      },
+      allowActorRunAdoption = false,
+    ) => {
+      const checkoutRunId = candidate.checkoutRunId ?? null;
+      const executionRunId = candidate.executionRunId ?? null;
+      if (
+        checkoutRunId === (existing.checkoutRunId ?? null) &&
+        executionRunId === (existing.executionRunId ?? null)
+      ) return false;
+      return !(
+        allowActorRunAdoption &&
+        actor.runId !== null &&
+        checkoutRunId === actor.runId &&
+        executionRunId === actor.runId
+      );
+    };
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(existing);
     const isAgentWorkUpdate =
       req.actor.type === "agent" &&
@@ -19821,11 +19841,23 @@ export function issueRoutes(
         issueId: existing.id,
         agentId: existing.assigneeAgentId,
       });
-      if (!transition.workflowControlledAssignment || terminalApprovalNeedsClassificationCheck) {
-        const runToStopForReassignment = await resolveActiveIssueRun(existing);
-        if (runToStopForReassignment) {
-          pendingReassignmentStopRunId = runToStopForReassignment.id;
-          interruptedRunId = runToStopForReassignment.id;
+      const linkedRunIds = [existing.executionRunId, existing.checkoutRunId].filter(
+        (runId, index, runIds): runId is string =>
+          typeof runId === "string" && runId.length > 0 && runIds.indexOf(runId) === index,
+      );
+      for (const linkedRunId of linkedRunIds) {
+        const linkedRun = await heartbeat.getRun(linkedRunId);
+        const linkedIssueId =
+          linkedRun?.contextSnapshot && typeof linkedRun.contextSnapshot === "object"
+            ? (linkedRun.contextSnapshot as Record<string, unknown>).issueId
+            : null;
+        if (
+          linkedRun?.status === "running" &&
+          linkedRun.agentId === existing.assigneeAgentId &&
+          linkedIssueId === existing.id
+        ) {
+          pendingReassignmentStopRunId = linkedRun.id;
+          break;
         }
       }
     }
@@ -19893,7 +19925,8 @@ export function issueRoutes(
       if (
         !afterStop ||
         !isDeepStrictEqual(withoutRunRelease(afterStop), withoutRunRelease(existing)) ||
-        (interruptedRunId === null && !adoptedOwnCheckout && !isDeepStrictEqual(afterStop, existing)) ||
+        (!adoptedOwnCheckout && !isDeepStrictEqual(afterStop, existing)) ||
+        hasUnexpectedRunLink(afterStop, adoptedOwnCheckout) ||
         (await readFinalDeliveryBinding(db, afterStop)) !== originalDeliveryBinding
       ) {
         throw conflict("Card or delivery binding changed before the final delivery preflight; retry the final verdict", {
@@ -20140,6 +20173,7 @@ export function issueRoutes(
       || reviewPolicySensitiveMutationRequested
       || workspaceReprovisionCloseId !== null
       || deliveryIdentityWorkspaceBranchWrite
+      || assigneeWillChange
       || terminalApprovalNeedsClassificationCheck
       // ADR-103 M4: a re-parent must commit atomically with its close-ladder
       // check, so force every parent-edge mutation through the transactional
@@ -20333,17 +20367,29 @@ export function issueRoutes(
               ));
           }
 
+          if (assigneeWillChange) {
+            const lockedIssue = await svc.getByIdForUpdate(id, tx);
+            if (!lockedIssue) return null;
+            if (hasUnexpectedRunLink(lockedIssue)) {
+              throw conflict("Card run ownership changed before reassignment persistence; retry the reassignment", {
+                code: "issue_reassignment_run_stale",
+                runId: pendingReassignmentStopRunId,
+              });
+            }
+          }
+
           // Revalidate the external certification against the locked row and
           // delivery binding before persisting the final decision or its receipt.
           if (terminalApprovalNeedsClassificationCheck) {
             const lockedIssue = await svc.getByIdForUpdate(id, tx);
             if (!lockedIssue) return null;
             if (
-              lockedIssue.deliveryRequirement !== existing.deliveryRequirement
+              lockedIssue.deliveryRequirement !== existing.deliveryRequirement ||
+              hasUnexpectedRunLink(lockedIssue)
             ) {
-              throw conflict("Card delivery classification changed before the final delivery preflight; retry the final verdict", {
+              throw conflict("Card delivery classification or run ownership changed before the final delivery preflight; retry the final verdict", {
                 code: "approval_final_delivery_preflight_stale",
-                reason: "head_moved: delivery classification changed before final delivery preflight",
+                reason: "head_moved: delivery classification or run ownership changed before final delivery preflight",
               });
             }
             const effectiveLockedIssue =
@@ -20594,6 +20640,7 @@ export function issueRoutes(
           },
         );
         if (cancelled) {
+          interruptedRunId = cancelled.id;
           await logActivity(db, {
             companyId: cancelled.companyId,
             actorType: actor.actorType,
