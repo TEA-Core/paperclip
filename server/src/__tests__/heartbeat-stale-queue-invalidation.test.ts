@@ -6,6 +6,7 @@ import {
   agents,
   agentWakeupRequests,
   companies,
+  completionContracts,
   costEvents,
   createDb,
   documentRevisions,
@@ -15,6 +16,9 @@ import {
   issueDocuments,
   issueThreadInteractions,
   issues,
+  nativeRunResults,
+  statusDecisions,
+  workAssessments,
 } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import {
@@ -534,6 +538,110 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(wakeup).toMatchObject({ status: "skipped", error: expect.stringContaining("no longer in_progress") });
     expect(issue?.status).toBe("backlog");
     expect(countExecuteCallsForRun(runId)).toBe(0);
+  });
+
+  it("claims a bare native-review queued run for the reviewer instead of cancelling it as assignee-changed", async () => {
+    const { companyId, agentId: workerId } = await seedCompanyAndAgent();
+    const reviewerId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerId,
+      companyId,
+      name: "ReviewLead",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const contractId = randomUUID();
+    const resultId = randomUUID();
+    const assessmentId = randomUUID();
+    const decisionId = randomUUID();
+    const interactionId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Native review of completed work",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: workerId,
+      statusVersion: 1,
+      lastStatusDecisionId: decisionId,
+    });
+    await db.insert(completionContracts).values({
+      id: contractId, companyId, issueId, revision: 1, schemaVersion: "1",
+      policyVersion: "test", risk: "low", completionAuthority: "agent_claim_policy",
+      incompleteCriteriaPolicy: "block", contractJson: {}, canonicalSha256: randomUUID(),
+      createdByActorType: "agent", createdByActorId: workerId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId, companyId, agentId: workerId, status: "succeeded",
+      runtimeMode: "native", nativeIssueId: issueId, completionContractId: contractId,
+      contextSnapshot: { issueId }, startedAt: new Date(), finishedAt: new Date(),
+    });
+    await db.insert(nativeRunResults).values({
+      id: resultId, companyId, issueId, runId: sourceRunId, completionContractId: contractId,
+      serverFingerprint: randomUUID(), schemaStatus: "valid", resultJson: {},
+      canonicalSha256: randomUUID(),
+    });
+    await db.insert(workAssessments).values({
+      id: assessmentId, companyId, issueId, runId: sourceRunId, contractId, resultId,
+      triggerKind: "test", triggerActorCompanyId: companyId, priorIssueStatus: "in_progress",
+      priorStatusVersion: 0, policyVersion: "test", assessmentJson: {}, inputDigest: randomUUID(),
+    });
+    await db.insert(statusDecisions).values({
+      id: decisionId, companyId, issueId, runId: sourceRunId, assessmentId,
+      decisionVersion: 1, policyVersion: "test", fromStatus: "in_progress",
+      toStatus: "in_review", reasonCode: "completion_review",
+      decisionJson: { projectedStatusVersion: 1 }, decisionDigest: randomUUID(),
+      applicationState: "applied",
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId, companyId, issueId, kind: "request_confirmation", status: "pending",
+      continuationPolicy: "wake_assignee", requestedResolverPolicy: "anyone",
+      effectiveResolverPolicy: "anyone", resolverPolicyProvenance: "inherited",
+      sourceRunId, addresseeAgentId: reviewerId,
+      payload: {
+        version: 1, prompt: "Review",
+        target: { type: "custom", key: "native_completion_review", revisionId: decisionId },
+      },
+    });
+    const { runId, wakeupRequestId } = await seedQueuedRun({
+      companyId,
+      agentId: reviewerId,
+      issueId,
+      wakeReason: "native_completion_review",
+      contextExtras: {
+        nativeReviewInteractionId: interactionId,
+        nativeReviewDecisionId: decisionId,
+      },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForCondition(async () => {
+      const [run] = await db.select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+      return run?.status !== "queued" && run?.status !== "running";
+    });
+
+    const [run, wakeup] = await Promise.all([
+      db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null),
+      db.select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+    expect(run?.errorCode).not.toBe("issue_assignee_changed");
+    expect(run?.status).toBe("succeeded");
+    expect(wakeup?.status).not.toBe("skipped");
+    expect(countExecuteCallsForRun(runId)).toBe(1);
   });
 
   it("does not re-open a resolved connection-intent issue parked after claim", async () => {

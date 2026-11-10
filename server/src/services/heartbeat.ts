@@ -20550,6 +20550,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const isCurrentReviewParticipant =
       reviewParticipant?.type === "agent" &&
       reviewParticipant.agentId === run.agentId;
+    // A native reviewer is not the issue assignee by design. The bare context
+    // only exempts the run from this gate; claimQueuedNativeReviewRun still
+    // validates the assignment before claiming.
+    const isNativeReviewRun = readNativeReviewAssignmentContext(context) !== null;
 
     const recoveryActionId = readNonEmptyString(context.recoveryActionId);
     const authorizedSourceScopedRecovery =
@@ -20574,6 +20578,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issue.assigneeAgentId !== run.agentId &&
       !isInteractionWake &&
       !isCurrentReviewParticipant &&
+      !isNativeReviewRun &&
       !isNonAssigneeWorkspaceBusyRetry(retryReason, context) &&
       !authorizedSourceScopedRecovery
     ) {
