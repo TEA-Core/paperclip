@@ -8161,6 +8161,11 @@ export function recoveryService(
             ),
           )
           .then((rows) => rows[0]?.count ?? 0) : 0;
+        if (hasFutureMonitorCheck(candidate.monitorNextCheckAt)) {
+          result.livePathSkipped += 1;
+          continue;
+        }
+
         if (consumedWakes >= maxCount) {
           if (await hasActiveOrEscalatedRecoveryAction(companyId, candidate.id)) {
             result.reArmCapSkipped += 1;
