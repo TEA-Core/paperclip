@@ -8161,7 +8161,7 @@ export function recoveryService(
             ),
           )
           .then((rows) => rows[0]?.count ?? 0) : 0;
-        if (hasFutureMonitorCheck(candidate.monitorNextCheckAt)) {
+        if (candidate.monitorNextCheckAt) {
           result.livePathSkipped += 1;
           continue;
         }

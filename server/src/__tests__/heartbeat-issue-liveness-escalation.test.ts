@@ -1101,6 +1101,55 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(wakes).toHaveLength(0);
   });
 
+  it("skips a zero-blocker heal while a due monitor owns the next execution check", async () => {
+    const { companyId, agentId, blockedIssueId } = await seedZeroBlockerBackstopFixture();
+    const now = new Date();
+    const monitorNextCheckAt = new Date(now.getTime() - 1);
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt,
+        unblockDescriptor: {
+          owner: { agentId },
+          action: "Resume execution when the armed monitor fires",
+        },
+      })
+      .where(eq(issues.id, blockedIssueId));
+
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const result = await recoveryServiceWithMocks({ enqueueWakeup }).reconcileResolvedDependencyWakeBackstop({
+      companyId,
+      now,
+    });
+
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(result.zeroBlockerObserved).toBe(1);
+    expect(result.livePathSkipped).toBe(1);
+    expect(result.zeroBlockerHealed).toBe(0);
+    expect(result.healed).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const issue = await db
+      .select({ status: issues.status, monitorNextCheckAt: issues.monitorNextCheckAt })
+      .from(issues)
+      .where(eq(issues.id, blockedIssueId))
+      .then((rows) => rows[0]);
+    expect(issue?.status).toBe("blocked");
+    expect(issue?.monitorNextCheckAt).toEqual(monitorNextCheckAt);
+
+    const wakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes).toHaveLength(0);
+
+    const healEvents = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "issue.blockers_resolved_wake_emitted")));
+    expect(healEvents).toHaveLength(0);
+  });
+
   it("skips re-arm cap escalation while a future monitor owns the next execution check", async () => {
     const { companyId, agentId, blockedIssueId } = await seedZeroBlockerBackstopFixture();
     const now = new Date();
