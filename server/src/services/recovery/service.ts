@@ -7862,6 +7862,7 @@ export function recoveryService(
             identifier: issues.identifier,
             assigneeAgentId: issues.assigneeAgentId,
             blockedTransitionAt: issues.blockedTransitionAt,
+            monitorNextCheckAt: issues.monitorNextCheckAt,
             totalCount: sql<number>`count(*) over()::int`,
           })
           .from(issueRelations)
@@ -7878,6 +7879,7 @@ export function recoveryService(
           identifier: issues.identifier,
           assigneeAgentId: issues.assigneeAgentId,
           blockedTransitionAt: issues.blockedTransitionAt,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
           totalCount: sql<number>`count(*) over()::int`,
         })
         .from(issues)
@@ -8159,6 +8161,11 @@ export function recoveryService(
             ),
           )
           .then((rows) => rows[0]?.count ?? 0) : 0;
+        if (hasFutureMonitorCheck(candidate.monitorNextCheckAt)) {
+          result.livePathSkipped += 1;
+          continue;
+        }
+
         if (consumedWakes >= maxCount) {
           if (await hasActiveOrEscalatedRecoveryAction(companyId, candidate.id)) {
             result.reArmCapSkipped += 1;
@@ -8193,7 +8200,7 @@ export function recoveryService(
         }
 
         if (
-          (await hasActiveExecutionPath(companyId, candidate.id, agentId)) ||
+          (await hasActiveExecutionPath(companyId, candidate.id, agentId, candidate.monitorNextCheckAt)) ||
           (await hasQueuedIssueWake(companyId, candidate.id, agentId))
         ) {
           result.livePathSkipped += 1;
