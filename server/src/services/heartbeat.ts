@@ -258,7 +258,7 @@ import {
 } from "../vendor/paperclip-runner/index.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
-import { resolveLiveExecutionLeases, type LiveExecutionLease } from "./issue-execution-lease.js";
+import { findLiveIssueExecutionHolder, resolveLiveExecutionLeases, type LiveExecutionLease } from "./issue-execution-lease.js";
 import {
   buildTimerDispatchSuppressionDetails,
   evaluateIssueContinuationPath,
@@ -15306,7 +15306,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const retryRun = await db.transaction(async (tx) => {
       await tx.execute(
-        sql`select id from issues where company_id = ${run.companyId} and execution_run_id = ${run.id} for update`,
+        sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} and execution_run_id = ${run.id} for update`,
       );
 
       const issue = await tx
@@ -15315,6 +15315,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(
           and(
             eq(issues.companyId, run.companyId),
+            eq(issues.id, issueId),
+            eq(issues.assigneeAgentId, run.agentId),
             eq(issues.executionRunId, run.id),
           ),
         )
@@ -15372,12 +15374,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
+      const executionHolder = await findLiveIssueExecutionHolder(tx as unknown as Db, run.companyId, issue.id);
+      const runningHolder = executionHolder?.status === "running" ? executionHolder : null;
+
       await tx
         .update(issues)
         .set({
-          executionRunId: queuedRun.id,
-          executionAgentNameKey: normalizeAgentNameKey(agent.name),
-          executionLockedAt: now,
+          executionRunId: runningHolder?.runId ?? queuedRun.id,
+          executionAgentNameKey: runningHolder ? null : normalizeAgentNameKey(agent.name),
+          executionLockedAt: runningHolder?.startedAt ?? now,
           updatedAt: now,
         })
         .where(eq(issues.id, issue.id));
@@ -19282,6 +19287,46 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     const nativeReviewContext = readNativeReviewAssignmentContext(context);
     const queuedCommentIds = queuedCommentIdsFromRunContext(context);
+
+    type ClaimIssue = Pick<typeof issues.$inferSelect, "id" | "companyId" | "assigneeAgentId" | "executionRunId">;
+    const bindsExecution = (issue: ClaimIssue | null): issue is ClaimIssue =>
+      !nativeReviewContext && issue !== null && issue.assigneeAgentId === run.agentId &&
+      readNonEmptyString(context.wakeReason) !== "source_scoped_recovery_action";
+    const deferForLiveIssueHolder = async (txDb: Db, issue: ClaimIssue | null) => {
+      if (!bindsExecution(issue)) return null;
+      const holder = await findLiveIssueExecutionHolder(txDb, issue.companyId, issue.id);
+      if (!holder || holder.status !== "running" || holder.runId === run.id) return null;
+      if (issue.executionRunId !== holder.runId) {
+        await txDb.update(issues).set({
+          executionRunId: holder.runId,
+          executionAgentNameKey: null,
+          executionLockedAt: holder.startedAt ?? claimedAt,
+          updatedAt: claimedAt,
+        }).where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId)));
+      }
+      return { id: holder.runId, status: holder.status, startedAt: holder.startedAt };
+    };
+    const stampClaimedExecution = async (
+      txDb: Db, issue: ClaimIssue | null, claimedRun: typeof heartbeatRuns.$inferSelect,
+    ) => {
+      if (!bindsExecution(issue)) return;
+      await txDb.update(issues).set({
+        executionRunId: claimedRun.id,
+        executionAgentNameKey: normalizeAgentNameKey(agent.name),
+        executionLockedAt: claimedAt,
+        updatedAt: claimedAt,
+      }).where(and(
+        eq(issues.id, issue.id),
+        eq(issues.companyId, issue.companyId),
+        eq(issues.assigneeAgentId, claimedRun.agentId),
+        claimedRun.scheduledRetryReason === "native_safe_replacement"
+          ? and(
+              or(isNull(issues.executionRunId), eq(issues.executionRunId, claimedRun.id)),
+              or(isNull(issues.checkoutRunId), eq(issues.checkoutRunId, claimedRun.id)),
+            )
+          : undefined,
+      ));
+    };
     if (
       issueId &&
       run.invocationSource === "automation" &&
@@ -19293,7 +19338,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         stage: "claim",
       });
     const atomicClaim =
-      (issueId || retryTaskKey) && run.scheduledRetryReason
+      !nativeReviewContext && (issueId || retryTaskKey) && run.scheduledRetryReason
         ? await db.transaction(async (tx) => {
             if (retryTaskKey && !issueId) {
               await tx.execute(
@@ -19339,6 +19384,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               lockedRun.status !== "queued" ||
               (run.wakeupRequestId &&
                 (!lockedWake || lockedWake.status !== "queued" || lockedWake.runId !== run.id))
+            ) {
+              return { kind: "stale" as const, run: null };
+            }
+            if (
+              lockedRun.scheduledRetryReason === "native_safe_replacement" && lockedIssue &&
+              ((lockedIssue.executionRunId !== null && lockedIssue.executionRunId !== lockedRun.id) ||
+                (lockedIssue.checkoutRunId !== null && lockedIssue.checkoutRunId !== lockedRun.id))
             ) {
               return { kind: "stale" as const, run: null };
             }
@@ -19555,6 +19607,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 );
               }
             }
+            const issueHolder = await deferForLiveIssueHolder(tx as unknown as Db, lockedIssue);
+            if (issueHolder) return { kind: "deferred" as const, run: null, holder: issueHolder };
 
             const [claimedRun] = await tx
               .update(heartbeatRuns)
@@ -19586,7 +19640,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
 
             const bindsIssueExecution =
-              issueId != null &&
+              !nativeReviewContext && issueId != null &&
               readNonEmptyString(context.wakeReason) !== "source_scoped_recovery_action" &&
               lockedIssue?.assigneeAgentId === run.agentId;
             if (bindsIssueExecution) {
@@ -19602,6 +19656,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   eq(issues.id, issueId),
                   eq(issues.companyId, run.companyId),
                   eq(issues.assigneeAgentId, run.agentId),
+                  claimedRun.scheduledRetryReason === "native_safe_replacement"
+                    ? and(
+                        or(isNull(issues.executionRunId), eq(issues.executionRunId, claimedRun.id)),
+                        or(isNull(issues.checkoutRunId), eq(issues.checkoutRunId, claimedRun.id)),
+                      )
+                    : undefined,
                 ))
                 .returning({ id: issues.id });
               if (!boundIssue) throw new Error("Queued run issue ownership binding failed");
@@ -19719,8 +19779,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               // run becomes running, a concurrent discard must observe the
               // claimed wake and return an explicit conflict; if discard wins,
               // this claim observes the cancelled queue and does no work.
-              await tx
-                .select({ id: issues.id })
+              const lockedIssue = await tx
+                .select({
+                  id: issues.id, companyId: issues.companyId,
+                  assigneeAgentId: issues.assigneeAgentId, executionRunId: issues.executionRunId,
+                })
                 .from(issues)
                 .where(
                   and(
@@ -19728,7 +19791,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     eq(issues.companyId, run.companyId),
                   ),
                 )
-                .for("update");
+                .for("update").then((rows) => rows[0] ?? null);
               const wake = await tx
                 .select()
                 .from(agentWakeupRequests)
@@ -19862,6 +19925,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 // envelope. Preserve their established claim path; only an
                 // explicitly bound queued-message envelope is subject to the
                 // live-comment discard gate below.
+                const issueHolder = await deferForLiveIssueHolder(tx as unknown as Db, lockedIssue);
+                if (issueHolder) return { kind: "deferred" as const, run: null, holder: issueHolder };
                 const [claimedRun] = await tx
                   .update(heartbeatRuns)
                   .set({
@@ -19886,6 +19951,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     ),
                   )
                   .returning();
+                if (claimedRun) await stampClaimedExecution(tx as unknown as Db, lockedIssue, claimedRun);
                 return claimedRun
                   ? { kind: "claimed" as const, run: claimedRun }
                   : { kind: "stale" as const, run: null };
@@ -19954,6 +20020,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   run: cancelled ?? lockedRun,
                 };
               }
+              const issueHolder = await deferForLiveIssueHolder(tx as unknown as Db, lockedIssue);
+              if (issueHolder) return { kind: "deferred" as const, run: null, holder: issueHolder };
 
               await tx
                 .update(agentWakeupRequests)
@@ -19991,6 +20059,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   ),
                 )
                 .returning();
+              if (claimedRun) await stampClaimedExecution(tx as unknown as Db, lockedIssue, claimedRun);
               return claimedRun
                 ? { kind: "claimed" as const, run: claimedRun }
                 : { kind: "stale" as const, run: null };
@@ -19998,9 +20067,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .catch((error) => {
               if (isExternalChatWaitAuthorizationContention(error))
                 return { kind: "stale" as const, run: null };
+              if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
+                logger.error({ runId: run.id, issueId, err: error },
+                  "claimQueuedRun: routine-execution open-slot collision; leaving run queued");
+                return { kind: "stale" as const, run: null };
+              }
               throw error;
             })
         : null;
+    if (queuedCommentClaim?.kind === "deferred") {
+      await recordConcurrentRunDeferral(run, issueId!, queuedCommentClaim.holder);
+      return null;
+    }
     if (queuedCommentClaim?.kind === "cancelled") {
       await appendRunEvent(queuedCommentClaim.run, {
         eventType: "lifecycle",
@@ -20035,6 +20113,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       void emitAgentTaskRun(db, queuedCommentClaim.run);
       return null;
     }
+    let ordinaryDeferredHolder: Awaited<ReturnType<typeof deferForLiveIssueHolder>> | undefined;
     const claimed = atomicClaim?.kind === "claimed"
       ? atomicClaim.run
       : queuedCommentClaim
@@ -20058,11 +20137,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               agentNameKey: normalizeAgentNameKey(agent.name),
             });
           }
-          return tx.update(heartbeatRuns).set(claimValues).where(and(
-            eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued"),
-          )).returning().then((rows) => rows[0] ?? null);
+          const claimRow = (executor: Db) => executor.update(heartbeatRuns)
+            .set(claimValues)
+            .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+            .returning().then((rows) => rows[0] ?? null);
+          if (!issueId) return claimRow(tx);
+          return tx.transaction(async (tx) => {
+            const lockedIssue = await tx.select({
+              id: issues.id, companyId: issues.companyId,
+              assigneeAgentId: issues.assigneeAgentId, executionRunId: issues.executionRunId,
+            }).from(issues)
+              .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+              .for("update").then((rows) => rows[0] ?? null);
+            if (!lockedIssue) return null;
+            const txDb = tx as unknown as Db;
+            const holder = await deferForLiveIssueHolder(txDb, lockedIssue);
+            if (holder) {
+              ordinaryDeferredHolder = holder;
+              return null;
+            }
+            const claimedRun = await claimRow(txDb);
+            if (claimedRun) await stampClaimedExecution(txDb, lockedIssue, claimedRun);
+            return claimedRun;
+          }).catch((error) => {
+            if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
+              logger.error({ runId: run.id, issueId, err: error },
+                "claimQueuedRun: routine-execution open-slot collision; leaving run queued");
+              return null;
+            }
+            throw error;
+          });
         });
-    if (!claimed) return null;
+    if (!claimed) {
+      if (issueId && ordinaryDeferredHolder) {
+        await recordConcurrentRunDeferral(run, issueId, ordinaryDeferredHolder);
+      }
+      return null;
+    }
 
     publishLiveEvent({
       companyId: claimed.companyId,
@@ -20091,59 +20202,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
     }
 
-    // Fix A (lazy locking): stamp executionRunId now that the run is actually running,
-    // not at queue time. Guard is idempotent — safe if called more than once.
-    const claimedContext = parseObject(claimed.contextSnapshot);
-    const claimedIssueId = readNonEmptyString(claimedContext.issueId);
-    const claimedWakeReason = readNonEmptyString(claimedContext.wakeReason);
-    if (
-      !nativeReviewContext && claimedIssueId &&
-      claimedWakeReason !== "source_scoped_recovery_action"
-    ) {
-      const claimedAgent = await getAgent(claimed.agentId);
-      try {
-        await db
-          .update(issues)
-          .set({
-            executionRunId: claimed.id,
-            executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
-            executionLockedAt: claimedAt,
-            updatedAt: claimedAt,
-          })
-          .where(
-            and(
-              eq(issues.id, claimedIssueId),
-              eq(issues.companyId, claimed.companyId),
-              eq(issues.assigneeAgentId, claimed.agentId),
-              claimed.scheduledRetryReason === "native_safe_replacement"
-                ? or(
-                    isNull(issues.checkoutRunId),
-                    eq(issues.checkoutRunId, claimed.id),
-                  )
-                : undefined,
-              or(
-                isNull(issues.executionRunId),
-                eq(issues.executionRunId, claimed.id),
-              ),
-            ),
-          );
-      } catch (error) {
-        if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
-          logger.error(
-            {
-              runId: claimed.id,
-              issueId: claimedIssueId,
-              companyId: claimed.companyId,
-              err: error,
-            },
-            "claimQueuedRun: routine-execution open-slot collision on lazy execution-lock stamp; releasing run and skipping candidate",
-          );
-          await releaseRunClaimedJustBeforeSuppression(claimed.id);
-          return null;
-        }
-        throw error;
-      }
-    }
     return claimed;
   }
 
@@ -29400,18 +29458,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
     options: { suppressImmediateRecovery?: boolean } = {},
+    promotionIssueId?: string,
   ) {
+    const promotionOnly = promotionIssueId !== undefined;
     const runContext = parseObject(run.contextSnapshot);
-    const contextIssueId = readNonEmptyString(runContext.issueId);
-    const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
-    const recoveryAgent = await getAgent(run.agentId);
+    const contextIssueId = promotionIssueId ?? readNonEmptyString(runContext.issueId);
+    const recoveryAgent = promotionOnly ? null : await getAgent(run.agentId);
     const recoveryAgentInvokable =
       recoveryAgent &&
       recoveryAgent.status !== "paused" &&
       recoveryAgent.status !== "terminated" &&
       recoveryAgent.status !== "pending_approval";
     const recoverySessionBefore = recoveryAgentInvokable
-      ? await resolveSessionBeforeForWakeup(recoveryAgent, taskKey)
+      ? await resolveSessionBeforeForWakeup(recoveryAgent, deriveTaskKeyWithHeartbeatFallback(runContext, null))
       : null;
     const recoveryAgentNameKey = normalizeAgentNameKey(recoveryAgent?.name);
 
@@ -29424,6 +29483,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // the cycle repeats. Count the issue's consecutive pre-adapter setup failures and
     // block this retry once the bound is reached instead of queueing another.
     const preAdapterSetupFailureStreak =
+      !promotionOnly &&
       contextIssueId != null &&
       run.errorCode != null &&
       PRE_ADAPTER_SETUP_FAILURE_CODES.has(run.errorCode)
@@ -29434,6 +29494,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // Fold 2c / D12: upstream first-strike for non-retryable preflight refusals. Computed
     // before the tx so the post-commit event gate below can read it.
     const nonRetryablePreflightFailure = isNonRetryablePreflightFailedRun(run);
+    let siblingIssueIds: string[] | undefined;
 
     const promotionResult = await db.transaction(async (tx) => {
       // SUP-17978: this transaction holds the issue rows FOR UPDATE. Every read
@@ -29454,7 +29515,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // finalizations, which keeps deadlock risk independent of PostgreSQL's plan
       // choice when multiple issues match.
       await tx.execute(
-        contextIssueId
+        promotionIssueId !== undefined
+          ? sql`select id from issues
+              where company_id = ${run.companyId} and id = ${promotionIssueId}
+              for update`
+          : contextIssueId
           ? sql`
               select id from issues
               where company_id = ${run.companyId}
@@ -29481,7 +29546,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(
           and(
             eq(issues.companyId, run.companyId),
-            contextIssueId
+            promotionIssueId !== undefined
+              ? eq(issues.id, promotionIssueId)
+              : contextIssueId
               ? or(
                   eq(issues.id, contextIssueId),
                   eq(issues.executionRunId, run.id),
@@ -29507,44 +29574,55 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Only the checkout column should be released in that case; the execution
       // column now belongs to the retry.
       const promotionUpdateTimestamp = new Date();
-      await tx
-        .update(issues)
-        .set({
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: promotionUpdateTimestamp,
-        })
-        .where(
-          and(
-            eq(issues.companyId, run.companyId),
-            eq(issues.executionRunId, run.id),
-          ),
-        );
-      // `checkoutRunId` clear is symmetric to #6008's per-issue self-heal,
-      // extended to all siblings: covers paths where the issue's assignee or
-      // status changed between checkout and termination, which
-      // adoptStaleCheckoutRun's narrow WHERE clause cannot reach.
-      await tx
-        .update(issues)
-        .set({
-          checkoutRunId: null,
-          updatedAt: promotionUpdateTimestamp,
-        })
-        .where(
-          and(
-            eq(issues.companyId, run.companyId),
-            eq(issues.checkoutRunId, run.id),
-          ),
-        );
+      if (!promotionOnly) {
+        await tx
+          .update(issues)
+          .set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: promotionUpdateTimestamp,
+          })
+          .where(
+            and(
+              eq(issues.companyId, run.companyId),
+              eq(issues.executionRunId, run.id),
+            ),
+          );
+        // `checkoutRunId` clear is symmetric to #6008's per-issue self-heal,
+        // extended to all siblings: covers paths where the issue's assignee or
+        // status changed between checkout and termination, which
+        // adoptStaleCheckoutRun's narrow WHERE clause cannot reach.
+        await tx
+          .update(issues)
+          .set({
+            checkoutRunId: null,
+            updatedAt: promotionUpdateTimestamp,
+          })
+          .where(
+            and(
+              eq(issues.companyId, run.companyId),
+              eq(issues.checkoutRunId, run.id),
+            ),
+          );
+      }
 
-      // Deferred-wake promotion is bound to a single primary issue: the run's context
-      // issue when present, otherwise the first candidate we found (preserves the
-      // legacy rows[0] selection for runs that were not tied to a specific issue).
+      // Keep the original primary recovery surface. Other actual bindings
+      // release their own deferred intents without inheriting its recovery.
       let issue =
         (contextIssueId
           ? candidateIssues.find((candidate) => candidate.id === contextIssueId)
           : candidateIssues[0]) ?? null;
+      if (!promotionOnly) {
+        for (const candidate of candidateIssues) {
+          if (
+            candidate.id !== issue?.id &&
+            (candidate.executionRunId === run.id || candidate.checkoutRunId === run.id)
+          ) {
+            (siblingIssueIds ??= []).push(candidate.id);
+          }
+        }
+      }
 
       if (!issue) return null;
       if (issue.executionRunId && issue.executionRunId !== run.id) return null;
@@ -29554,6 +29632,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Sibling lock cleanup is already done above; only the primary issue carries
       // the recovery surface because the comment is attached to a single issue.
       if (
+        !promotionOnly &&
         (isWorkspaceValidationFailedRun(run) ||
           isConfigurationIncompleteFailedRun(run)) &&
         (issue.status === "todo" || issue.status === "in_progress") &&
@@ -29638,7 +29717,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ) {
         return { kind: "released" as const };
       }
-      if (await recordNativeTerminalRecoveryIfNeeded(txDb, run, issue, new Date())) {
+      if (!promotionOnly && await recordNativeTerminalRecoveryIfNeeded(txDb, run, issue, new Date())) {
         return { kind: "released" as const };
       }
 
@@ -30105,6 +30184,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // The D9 port replaces this with the module's rule; delete it in that change.
         if (noReplayDisposition) break;
 
+        if (deferred.agentId === issue.assigneeAgentId) {
+          const holder = await findLiveIssueExecutionHolder(txDb, issue.companyId, issue.id);
+          if (holder?.status === "running") {
+            await tx.update(issues).set({
+              executionRunId: holder.runId,
+              executionAgentNameKey: null,
+              executionLockedAt: holder.startedAt ?? promotionUpdateTimestamp,
+              updatedAt: promotionUpdateTimestamp,
+            }).where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId)));
+            // Keep the existing receipt, not a second recovery intent. A holder's
+            // own finalization will promote it after execution actually stops.
+            return { kind: "released" as const };
+          }
+        }
+
         const promotedContextSeed: Record<string, unknown> = { ...deferredContextSeed };
         if (activePauseHold) {
           promotedContextSeed.treeHoldInteraction = true;
@@ -30371,6 +30465,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       }
 
+      if (promotionOnly) return { kind: "released" as const };
+
       const findExistingExecutionPath = (agentId?: string | null) =>
         tx
           .select({ id: heartbeatRuns.id })
@@ -30543,7 +30639,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           reviewDeferralRetriesExhausted,
           reviewPreLaunchRetriesExhausted,
         });
-        if (shouldBlockReviewRecovery) {
+        if (!recoveryAgent || shouldBlockReviewRecovery) {
           return {
             kind: "blocked" as const,
             issue,
@@ -30623,12 +30719,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
           .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
+        const executionHolder = await findLiveIssueExecutionHolder(txDb, issue.companyId, issue.id);
+        const runningHolder = executionHolder?.status === "running" ? executionHolder : null;
+
         await tx
           .update(issues)
           .set({
-            executionRunId: queuedRun.id,
-            executionAgentNameKey: recoveryAgentNameKey,
-            executionLockedAt: now,
+            executionRunId: runningHolder?.runId ?? queuedRun.id,
+            executionAgentNameKey: runningHolder ? null : recoveryAgentNameKey,
+            executionLockedAt: runningHolder?.startedAt ?? now,
             updatedAt: now,
           })
           .where(eq(issues.id, issue.id));
@@ -30863,12 +30962,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
+      const executionHolder = await findLiveIssueExecutionHolder(txDb, issue.companyId, issue.id);
+      const runningHolder = executionHolder?.status === "running" ? executionHolder : null;
+
       await tx
         .update(issues)
         .set({
-          executionRunId: queuedRun.id,
-          executionAgentNameKey: recoveryAgentNameKey,
-          executionLockedAt: now,
+          executionRunId: runningHolder?.runId ?? queuedRun.id,
+          executionAgentNameKey: runningHolder ? null : recoveryAgentNameKey,
+          executionLockedAt: runningHolder?.startedAt ?? now,
           updatedAt: now,
         })
         .where(eq(issues.id, issue.id));
@@ -30878,6 +30980,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         run: queuedRun,
       };
     });
+    if (siblingIssueIds) {
+      const siblingOptions = { suppressImmediateRecovery: true };
+      for (const issueId of siblingIssueIds) {
+        try {
+          await releaseIssueExecutionAndPromote(run, siblingOptions, issueId);
+        } catch (err) {
+          logger.error({ err, runId: run.id, issueId }, "failed to promote released sibling issue execution");
+        }
+      }
+    }
 
     if (promotionResult?.kind === "blocked") {
       // Fold 2c / D12: a block produced by the first-strike disjunct is a refusal, not a

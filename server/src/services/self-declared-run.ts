@@ -35,6 +35,7 @@ export interface SelfDeclaredRunCloseResult {
 }
 
 import { DEFAULT_SELF_DECLARED_RUN_TTL_MS } from "./run-stillborn.js";
+import { findLiveIssueExecutionHolder } from "./issue-execution-lease.js";
 
 export function selfDeclaredRunService(
   db: Db,
@@ -49,14 +50,6 @@ export function selfDeclaredRunService(
       .select()
       .from(agents)
       .where(eq(agents.id, agentId))
-      .then((rows) => rows[0] ?? null);
-  }
-
-  async function getIssueById(issueId: string) {
-    return db
-      .select()
-      .from(issues)
-      .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
   }
 
@@ -76,112 +69,125 @@ export function selfDeclaredRunService(
         code: "not_external_pull_agent",
       });
     }
-
-    const issue = await getIssueById(issueId);
-    if (!issue) throw notFound("Issue not found");
-    if (issue.assigneeAgentId !== agentId) {
-      throw forbidden("Agent is not assigned to this issue", {
-        code: "not_issue_assignee",
-      });
-    }
-
     const now = new Date();
-    const latestSelfDeclaredRun = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(
-        and(
-          eq(heartbeatRuns.companyId, issue.companyId),
-          eq(heartbeatRuns.agentId, agentId),
-          eq(heartbeatRuns.invocationSource, "self_declared"),
-          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-        ),
-      )
-      .orderBy(desc(heartbeatRuns.createdAt))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    const canRecoverExpiredSession =
-      issue.status === "blocked" &&
-      issue.executionRunId === null &&
-      latestSelfDeclaredRun?.status === "failed" &&
-      latestSelfDeclaredRun.errorCode === "self_declared_run_expired" &&
-      latestSelfDeclaredRun.agentId === agentId;
-    const allowedStatuses = canRecoverExpiredSession
-      ? (["todo", "in_progress", "blocked"] as const)
-      : (["todo", "in_progress"] as const);
-
-    const updated = await db
-      .update(issues)
-      .set({
-        assigneeAgentId: agentId,
-        assigneeUserId: null,
-        status: "in_progress",
-        startedAt: now,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(issues.id, issueId),
-          inArray(issues.status, allowedStatuses),
-          or(
-            isNull(issues.assigneeAgentId),
-            eq(issues.assigneeAgentId, agentId),
-          ),
-          isNull(issues.executionRunId),
-        ),
-      )
-      .returning()
-      .then((rows) => rows[0] ?? null);
-
-    if (!updated) {
-      const current = await getIssueById(issueId);
-      if (!current) throw notFound("Issue not found");
-      if (current.assigneeAgentId !== agentId) {
+    const { run, contextSnapshot } = await db.transaction(async (tx) => {
+      const db = tx as unknown as Db;
+      const issue = await tx.select().from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (!issue) throw notFound("Issue not found");
+      if (issue.assigneeAgentId !== agentId) {
         throw forbidden("Agent is not assigned to this issue", {
           code: "not_issue_assignee",
         });
       }
-      throw conflict("Issue is already being executed", {
+      const latestSelfDeclaredRun = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, issue.companyId),
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.invocationSource, "self_declared"),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.createdAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      const canRecoverExpiredSession =
+        issue.status === "blocked" &&
+        issue.executionRunId === null &&
+        latestSelfDeclaredRun?.status === "failed" &&
+        latestSelfDeclaredRun.errorCode === "self_declared_run_expired" &&
+        latestSelfDeclaredRun.agentId === agentId;
+      const allowedStatuses = canRecoverExpiredSession
+        ? (["todo", "in_progress", "blocked"] as const)
+        : (["todo", "in_progress"] as const);
+
+      const updated = await db
+        .update(issues)
+        .set({
+          assigneeAgentId: agentId,
+          assigneeUserId: null,
+          status: "in_progress",
+          startedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(issues.id, issueId),
+            inArray(issues.status, allowedStatuses),
+            or(
+              isNull(issues.assigneeAgentId),
+              eq(issues.assigneeAgentId, agentId),
+            ),
+            isNull(issues.executionRunId),
+          ),
+        )
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      // The successful UPDATE holds the issue lock through admission and stamp.
+
+      if (!updated) {
+        // The miss re-evaluated against committed state, so classify from a fresh
+        // read: a concurrent reassignment is a 403, not "already being executed".
+        const current = await tx.select().from(issues)
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (!current) throw notFound("Issue not found");
+        if (current.assigneeAgentId !== agentId) {
+          throw forbidden("Agent is not assigned to this issue", {
+            code: "not_issue_assignee",
+          });
+        }
+        throw conflict("Issue is already being executed", {
+          issueId, status: current.status, executionRunId: current.executionRunId,
+        });
+      }
+      const liveHolder = await findLiveIssueExecutionHolder(tx, issue.companyId, issueId);
+      if (liveHolder) {
+        throw conflict("Issue is already being executed", {
+          issueId, status: issue.status, executionRunId: liveHolder.runId,
+        });
+      }
+
+      const contextSnapshot = {
         issueId,
-        status: current.status,
-        executionRunId: current.executionRunId,
-      });
-    }
+        projectId: issue.projectId,
+        wakeReason: "self_declared",
+      };
 
-    const contextSnapshot = {
-      issueId,
-      projectId: issue.projectId,
-      wakeReason: "self_declared",
-    };
+      const run = await db
+        .insert(heartbeatRuns)
+        .values({
+          companyId: agent.companyId,
+          agentId: agentId,
+          invocationSource: "self_declared",
+          triggerDetail: "self_declared",
+          status: "running",
+          startedAt: now,
+          contextSnapshot,
+          responsibleUserId: issue.responsibleUserId ?? null,
+          issueCommentStatus: "not_applicable",
+        })
+        .returning()
+        .then((rows) => rows[0] ?? null);
 
-    const run = await db
-      .insert(heartbeatRuns)
-      .values({
-        companyId: agent.companyId,
-        agentId: agentId,
-        invocationSource: "self_declared",
-        triggerDetail: "self_declared",
-        status: "running",
-        startedAt: now,
-        contextSnapshot,
-        responsibleUserId: issue.responsibleUserId ?? null,
-        issueCommentStatus: "not_applicable",
-      })
-      .returning()
-      .then((rows) => rows[0] ?? null);
+      if (!run) throw conflict("Failed to create self-declared run");
 
-    if (!run) throw conflict("Failed to create self-declared run");
-
-    await db
-      .update(issues)
-      .set({
-        checkoutRunId: run.id,
-        executionRunId: run.id,
-        executionAgentNameKey: normalizeAgentNameKey(agent.name),
-        executionLockedAt: now,
-        updatedAt: now,
-      })
-      .where(eq(issues.id, issueId));
+      await db
+        .update(issues)
+        .set({
+          checkoutRunId: run.id,
+          executionRunId: run.id,
+          executionAgentNameKey: normalizeAgentNameKey(agent.name),
+          executionLockedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(issues.id, issueId));
+      return { run, contextSnapshot };
+    });
 
     const workspace = await heartbeat.prepareWorkspaceForSelfDeclaredRun(run.id);
     if (!workspace) throw conflict("Failed to provision self-declared workspace");
