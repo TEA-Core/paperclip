@@ -20136,10 +20136,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             updatedAt: claimedAt,
           };
           if (nativeReviewContext) {
-            return claimQueuedNativeReviewRun(tx, {
-              run, claimedAt, claimValues,
-              agentNameKey: normalizeAgentNameKey(agent.name),
-            });
+            try {
+              return await claimQueuedNativeReviewRun(tx, {
+                run, claimedAt, claimValues,
+                agentNameKey: normalizeAgentNameKey(agent.name),
+              });
+            } catch (error) {
+              logger.warn(
+                { err: error, runId: run.id },
+                "claimQueuedRun: native-review claim failed; leaving run queued",
+              );
+              return null;
+            }
           }
           const claimRow = (executor: Db) => executor.update(heartbeatRuns)
             .set(claimValues)
@@ -20344,7 +20352,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           | "issue_not_in_progress"
           | "issue_execution_lock_changed"
           | "issue_review_participant_changed"
-          | "issue_continuation_waiting_on_review";
+          | "issue_continuation_waiting_on_review"
+          | "native_review_assignment_already_claimed";
         details: Record<string, unknown>;
         // Agent that owns the issue now and must be woken in the cancelled run's
         // place. null means this is a deliberate no-enqueue case (the issue is
@@ -20551,14 +20560,86 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       reviewParticipant?.type === "agent" &&
       reviewParticipant.agentId === run.agentId;
     // A native reviewer is not the issue assignee by design; exempt only while
-    // the assignment still validates, so stale ones fall to the assignee gate.
+    // the assignment still validates and the run's creating wake carries the
+    // server-set native-review provenance, so stale or forged-marker runs fall
+    // to the assignee gate. A lookup error must not abort the whole sweep: log
+    // it and let the claim revalidate (its own failure leaves this run queued).
     const nativeReviewContext = readNativeReviewAssignmentContext(context);
-    const isNativeReviewRun = nativeReviewContext
-      ? Boolean(await getNativeReviewAssignment(dbOrTx, {
+    let isNativeReviewRun = false;
+    let duplicateNativeReviewRun = false;
+    if (nativeReviewContext) {
+      try {
+        const assignment = await getNativeReviewAssignment(dbOrTx, {
           companyId: run.companyId, issueId, agentId: run.agentId,
           contextSnapshot: nativeReviewContext,
-        }))
-      : false;
+        });
+        if (assignment) {
+          const wake = run.wakeupRequestId
+            ? await dbOrTx
+                .select({
+                  reason: agentWakeupRequests.reason,
+                  idempotencyKey: agentWakeupRequests.idempotencyKey,
+                  payload: agentWakeupRequests.payload,
+                })
+                .from(agentWakeupRequests)
+                .where(
+                  and(
+                    eq(agentWakeupRequests.id, run.wakeupRequestId),
+                    eq(agentWakeupRequests.companyId, run.companyId),
+                    eq(agentWakeupRequests.agentId, run.agentId),
+                    eq(agentWakeupRequests.runId, run.id),
+                  ),
+                )
+                .then((rows) => rows[0] ?? null)
+            : null;
+          const wakePayload = parseObject(wake?.payload);
+          const wakeContext = parseObject(wakePayload._paperclipWakeContext);
+          const wakeCarriesAssignment =
+            wakePayload.nativeReviewInteractionId === nativeReviewContext.nativeReviewInteractionId ||
+            wakeContext.nativeReviewInteractionId === nativeReviewContext.nativeReviewInteractionId;
+          const hasWakeProvenance =
+            wake?.reason === "native_completion_review" &&
+            wake.idempotencyKey === `native-review:${nativeReviewContext.nativeReviewInteractionId}` &&
+            wakeCarriesAssignment;
+          if (hasWakeProvenance) {
+            const sibling = await dbOrTx
+              .select({ id: heartbeatRuns.id })
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.companyId, run.companyId),
+                  ne(heartbeatRuns.id, run.id),
+                  inArray(heartbeatRuns.status, ["running", "succeeded"]),
+                  sql`${heartbeatRuns.contextSnapshot} ->> 'nativeReviewInteractionId' = ${nativeReviewContext.nativeReviewInteractionId}`,
+                ),
+              )
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
+            if (sibling) duplicateNativeReviewRun = true;
+            else isNativeReviewRun = true;
+          }
+        }
+      } catch (error) {
+        logger.warn(
+          { err: error, runId: run.id, issueId },
+          "evaluateQueuedRunStaleness: native-review assignment lookup failed; deferring to claim revalidation",
+        );
+        isNativeReviewRun = true;
+      }
+    }
+    if (duplicateNativeReviewRun && nativeReviewContext) {
+      return {
+        stale: true,
+        errorCode: "native_review_assignment_already_claimed",
+        reason:
+          "Cancelled because another run already claimed this native-review assignment before the queued run could start",
+        details: {
+          issueId,
+          nativeReviewInteractionId: nativeReviewContext.nativeReviewInteractionId,
+        },
+        handoffAgentId: null,
+      };
+    }
 
     const recoveryActionId = readNonEmptyString(context.recoveryActionId);
     const authorizedSourceScopedRecovery =
