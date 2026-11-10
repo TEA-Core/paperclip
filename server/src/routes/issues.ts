@@ -18832,6 +18832,7 @@ export function issueRoutes(
       return;
     }
     let interruptedRunId: string | null = null;
+    let pendingReassignmentStopRunId: string | null = null;
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(existing);
     const isAgentWorkUpdate =
       req.actor.type === "agent" &&
@@ -19820,28 +19821,12 @@ export function issueRoutes(
         issueId: existing.id,
         agentId: existing.assigneeAgentId,
       });
-      const runToStopForReassignment = await resolveActiveIssueRun(existing);
-      if (runToStopForReassignment) {
-        const cancelled = await heartbeat.cancelRun(
-          runToStopForReassignment.id,
-          "Cancelled before issue reassignment",
-          {
-            errorCode: "issue_reassigned",
-            resultJson: { reassignmentStopConfirmed: true },
-            eventMessage: "run cancelled before issue reassignment",
-            eventPayload: { issueId: existing.id },
-          },
-        );
-        if (!cancelled || cancelled.status !== "cancelled") {
-          throw conflict(
-            "The active agent run could not be stopped before reassignment",
-            {
-              code: "runner_goal_reassignment_stop_unconfirmed",
-              runId: runToStopForReassignment.id,
-            },
-          );
+      if (!transition.workflowControlledAssignment || terminalApprovalNeedsClassificationCheck) {
+        const runToStopForReassignment = await resolveActiveIssueRun(existing);
+        if (runToStopForReassignment) {
+          pendingReassignmentStopRunId = runToStopForReassignment.id;
+          interruptedRunId = runToStopForReassignment.id;
         }
-        interruptedRunId = cancelled.id;
       }
     }
 
@@ -20595,6 +20580,59 @@ export function issueRoutes(
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;
+    }
+    if (pendingReassignmentStopRunId) {
+      try {
+        const cancelled = await heartbeat.cancelRun(
+          pendingReassignmentStopRunId,
+          "Cancelled before issue reassignment",
+          {
+            errorCode: "issue_reassigned",
+            resultJson: { reassignmentStopConfirmed: true },
+            eventMessage: "run cancelled before issue reassignment",
+            eventPayload: { issueId: existing.id },
+          },
+        );
+        if (cancelled) {
+          await logActivity(db, {
+            companyId: cancelled.companyId,
+            actorType: actor.actorType,
+            boardApiKeyId: actor.boardApiKeyId,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "heartbeat.cancelled",
+            entityType: "heartbeat_run",
+            entityId: cancelled.id,
+            issueId: existing.id,
+            details: {
+              agentId: cancelled.agentId,
+              source: "issue_reassigned",
+              issueId: existing.id,
+            },
+          });
+        }
+      } catch (err) {
+        logger.warn(
+          { err, issueId: existing.id, runId: pendingReassignmentStopRunId },
+          "failed to cancel run for issue reassignment",
+        );
+        await logActivity(db, {
+          companyId: existing.companyId,
+          actorType: actor.actorType,
+          boardApiKeyId: actor.boardApiKeyId,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "heartbeat.cancel_failed",
+          entityType: "heartbeat_run",
+          entityId: pendingReassignmentStopRunId,
+          issueId: existing.id,
+          details: { source: "issue_reassigned", issueId: existing.id },
+        });
+      }
     }
     // SUP-15257: this issue mutation just committed; if it came from a
     // task-watchdog run, re-derive and advance that run's stop fingerprint so
