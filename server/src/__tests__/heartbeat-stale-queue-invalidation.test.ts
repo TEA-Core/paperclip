@@ -540,7 +540,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(countExecuteCallsForRun(runId)).toBe(0);
   });
 
-  it("claims a bare native-review queued run for the reviewer instead of cancelling it as assignee-changed", async () => {
+  async function seedNativeReviewQueuedRun(interactionStatus: "pending" | "rejected") {
     const { companyId, agentId: workerId } = await seedCompanyAndAgent();
     const reviewerId = randomUUID();
     await db.insert(agents).values({
@@ -600,7 +600,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       applicationState: "applied",
     });
     await db.insert(issueThreadInteractions).values({
-      id: interactionId, companyId, issueId, kind: "request_confirmation", status: "pending",
+      id: interactionId, companyId, issueId, kind: "request_confirmation", status: interactionStatus,
       continuationPolicy: "wake_assignee", requestedResolverPolicy: "anyone",
       effectiveResolverPolicy: "anyone", resolverPolicyProvenance: "inherited",
       sourceRunId, addresseeAgentId: reviewerId,
@@ -638,10 +638,22 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         .where(eq(agentWakeupRequests.id, wakeupRequestId))
         .then((rows) => rows[0] ?? null),
     ]);
+    return { run, wakeup, executeCalls: countExecuteCallsForRun(runId) };
+  }
+
+  it("claims a bare native-review queued run for the reviewer instead of cancelling it as assignee-changed", async () => {
+    const { run, wakeup, executeCalls } = await seedNativeReviewQueuedRun("pending");
     expect(run?.errorCode).not.toBe("issue_assignee_changed");
     expect(run?.status).toBe("succeeded");
     expect(wakeup?.status).not.toBe("skipped");
-    expect(countExecuteCallsForRun(runId)).toBe(1);
+    expect(executeCalls).toBe(1);
+  });
+
+  it("still cancels a native-review queued run whose interaction is no longer pending", async () => {
+    const { run, executeCalls } = await seedNativeReviewQueuedRun("rejected");
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_assignee_changed");
+    expect(executeCalls).toBe(0);
   });
 
   it("does not re-open a resolved connection-intent issue parked after claim", async () => {
