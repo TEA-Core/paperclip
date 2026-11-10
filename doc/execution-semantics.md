@@ -91,8 +91,8 @@ An external review service can also be a valid review path when the issue keeps 
 Each `executionPolicy.stages` entry may set `phase` to `pre_merge` (the default)
 or `post_merge`. The `paperclip/approved` stamp requires all pre-merge stages to
 be completed and the last recorded decision to be approved; a pending post-merge
-stage does not delay that stamp. Stage order and issue completion are unchanged:
-the review workflow still waits for post-merge stages before closing `done`.
+stage does not delay that stamp. The review workflow follows stage order and
+waits for post-merge stages before closing `done`.
 
 For a native completion review addressed to an agent, the server saves the review
 card and a durable reviewer wake in the same transaction. The reviewer can act
@@ -157,7 +157,7 @@ These are related but not identical:
 - `checkoutRunId` answers who currently owns execution rights for the issue
 - `executionRunId` answers which run is actually live right now
 
-Paperclip already clears stale execution locks and can adopt some stale checkout locks when the original run is gone.
+Paperclip clears stale execution locks and can adopt some stale checkout locks when the original run is gone.
 
 The active-lock lifecycle is part of the checkout contract:
 
@@ -180,7 +180,7 @@ still running. Only an issuer whose run context names this issue is exempt from
 its own handoff PATCH's cancellation. For any other issuer, the handoff is saved
 first and cancellation is then attempted only for a run the route's existing
 lookup finds: the execution-lock holder or the assignee's issue-scoped active
-run. An issuer that lookup cannot find is not cancelled, as before this change.
+run. The route does not cancel an issuer that this lookup cannot find.
 A cancellation attempt can throw or leave the run running. The handoff stays
 saved; the route logs a warning and a `heartbeat.cancel_failed` activity. A
 terminal approval keeps the confirmed stop before the write: an unconfirmed stop
@@ -210,7 +210,7 @@ retry takes over. It skips tracked live executions, live child processes and
 native runs whose ownership is unverified. It is not a forced-stop timeout for
 an issuer that stays active forever. A cancellation attempt alone never
 authorizes release: execution must have stopped. Without a saved binding or
-matching issue context, this change does not infer an issuer hold from a header.
+matching issue context, Paperclip does not infer an issuer hold from a request header.
 
 ### Known execution waits at admission
 
@@ -678,7 +678,7 @@ A `blocked` issue is stalled when the unresolved blocker leaf has no active run,
 
 ## 9. Crash and Restart Recovery
 
-Paperclip now treats crash/restart recovery as a stranded-assigned-work problem, not just a stranded-run problem.
+Paperclip treats crash/restart recovery as a stranded-assigned-work problem, not just a stranded-run problem.
 
 The HTTP listener binds before startup recovery so surviving runners can
 reconnect. Inside the wrapped startup sweeps below, a per-card failure of any
@@ -717,11 +717,9 @@ guard error stops the card before that fallback, so the card also gets no
 recovery issue. The same monitor refusal holds for a non-canonical Wiki handoff
 card that is `in_progress`, or `in_review` with an invokable participant, whose
 latest run failed on provider quota. That card gets no monitor and no board
-item. The base build crashed startup on the same cards. A follow-up change owns
-this gap. Latent gap, unchanged by this change:
-an explicit `executionPolicy: undefined` in the update data is dropped before the
-allow-list check, so it skips the guard, and the update then writes a null
-execution policy.
+item. If every other present key is allowed bookkeeping, an explicit
+`executionPolicy: undefined` is dropped from the present-key check. The guard
+is skipped, while policy normalization writes `null`.
 
 The boundary is the write path. Per-card isolation is required for every
 startup sweep that writes issue rows through the guarded issue service
@@ -736,8 +734,8 @@ failure, still stops startup.
 Each card's repair is processed inside the shared `runRecoverySweepIssue` helper
 in these startup sweeps. For `sweepHostRestartStrandedIssues`, the sweep gathers
 facts for each candidate before it enters the helper. A non-connection error in
-that phase aborts the sweep, and later cards are not processed. That is the same
-as the base build. Per-card isolation applies only to the wrapped repair phase.
+that phase aborts the sweep, and later cards are not processed. Per-card
+isolation applies only to the wrapped repair phase.
 The helper accepts only the names in `RECOVERY_SWEEP_NAMES`
 (`server/src/lib/recovery-sweep-isolation.ts`), so a call site with an
 unregistered name fails typecheck, and the sweep isolation table test runs an
@@ -1058,7 +1056,7 @@ Verification and escalation semantics:
 - attempt lineage is durable watchdog state: attempt number, the fingerprint each attempt claimed to fix, and the restoration actions taken
 - after N attempts (N = 2–3) on the same fingerprint lineage, the platform stops re-firing and escalates to a human — the watchdog owner or a board notification — carrying the attempt history
 
-This bounds both failure modes: a failed restoration retries instead of going silent (liveness), and the attempt bound plus human escalation prevents an infinite fire loop (no runaway watchdog). Legitimate stops still suppress exactly as before.
+This bounds both failure modes: a failed restoration retries instead of going silent (liveness), and the attempt bound plus human escalation prevents an infinite fire loop (no runaway watchdog). A reviewed legitimate stop suppresses re-firing for its recorded fingerprint.
 
 Task watchdogs must not silently mark source work done from prose comments, must not duplicate child trees for the same accepted plan revision, and must not create another task-watchdog issue for the same source issue.
 
@@ -1275,7 +1273,6 @@ runners. A stop receipt retires only the settled cleanup owner for that exact co
 Missing receipts and failed cleanup retain the hold. Older providers that return
 no receipt remain supported but cannot authorize remote continuation. A terminal
 database status or a PID check on the wrong host is insufficient.
-No historical task is automatically awakened by this change.
 
 Startup waits for provider plugin initialization before remote recovery and
 lease cleanup. The task's blocked notice offers Retry, and a refused retry
