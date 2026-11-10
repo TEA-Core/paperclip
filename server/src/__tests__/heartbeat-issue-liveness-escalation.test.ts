@@ -1064,6 +1064,43 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     });
   });
 
+  it("skips a zero-blocker heal while a future monitor owns the next execution check", async () => {
+    const { companyId, agentId, blockedIssueId } = await seedZeroBlockerBackstopFixture();
+    const monitorNextCheckAt = new Date(Date.now() + 60 * 60 * 1000);
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt,
+        unblockDescriptor: {
+          owner: { agentId },
+          action: "Resume execution when the armed monitor fires",
+        },
+      })
+      .where(eq(issues.id, blockedIssueId));
+
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes({ companyId });
+
+    expect(result.zeroBlockerObserved).toBe(1);
+    expect(result.livePathSkipped).toBe(1);
+    expect(result.zeroBlockerHealed).toBe(0);
+    expect(result.healed).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const issue = await db
+      .select({ status: issues.status, monitorNextCheckAt: issues.monitorNextCheckAt })
+      .from(issues)
+      .where(eq(issues.id, blockedIssueId))
+      .then((rows) => rows[0]);
+    expect(issue?.status).toBe("blocked");
+    expect(issue?.monitorNextCheckAt).toEqual(monitorNextCheckAt);
+
+    const wakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes).toHaveLength(0);
+  });
+
   it("does not re-wake a zero-blocker issue whose heal wake already exists", async () => {
     const { companyId, agentId, blockedIssueId } = await seedZeroBlockerBackstopFixture();
     const idempotencyKey = `issue_blockers_resolved:${blockedIssueId}:zero_blocker`;
