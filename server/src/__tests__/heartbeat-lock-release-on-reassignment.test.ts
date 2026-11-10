@@ -374,6 +374,69 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
     }
   });
 
+  it("promotes a healthy sibling when another sibling promotion fails", async () => {
+    const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId } = await seedStageHandoff();
+    const failedIssueId = "00000000-0000-4000-8000-000000000001";
+    const healthyIssueId = "00000000-0000-4000-8000-000000000002";
+    await db.update(issues).set({
+      status: "in_progress", assigneeAgentId: reviewerAgentId, executionPolicy: null, executionState: null,
+      checkoutRunId: holderRunId,
+    }).where(eq(issues.id, issueId));
+    await db.update(agents).set({
+      adapterConfig: { command: process.execPath, args: ["-e", "process.exit(0)"] },
+    }).where(eq(agents.id, reviewerAgentId));
+    await db.insert(issues).values([failedIssueId, healthyIssueId].map((id) => ({
+      id, companyId, title: "Held sibling", status: "in_progress", assigneeAgentId: reviewerAgentId,
+      executionRunId: holderRunId, checkoutRunId: holderRunId,
+    })));
+    for (const id of [issueId, failedIssueId, healthyIssueId]) {
+      await heartbeat.wakeup(reviewerAgentId, {
+        source: "automation", reason: "issue_assigned", payload: { issueId: id },
+        contextSnapshot: { issueId: id, taskId: id, wakeReason: "issue_assigned" },
+        requestedByActorType: "agent", requestedByActorId: coderAgentId,
+      });
+    }
+    const [healthyWake] = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${healthyIssueId}`,
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    ));
+    expect(healthyWake).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    await db.execute(sql.raw("CREATE SEQUENCE test_sibling_promotion_faults"));
+    await db.execute(sql.raw(`CREATE FUNCTION test_sibling_promotion_failure() RETURNS trigger
+      LANGUAGE plpgsql AS $$ BEGIN
+        IF NEW.context_snapshot->>'issueId' = '${failedIssueId}' THEN
+          PERFORM nextval('test_sibling_promotion_faults');
+          RAISE EXCEPTION 'test sibling promotion rejected';
+        END IF;
+        RETURN NEW;
+      END $$`));
+    await db.execute(sql.raw(`CREATE TRIGGER test_sibling_promotion_failure BEFORE INSERT ON heartbeat_runs
+      FOR EACH ROW EXECUTE FUNCTION test_sibling_promotion_failure()`));
+    try {
+      await heartbeat.cancelRun(holderRunId, "Issuer stopped", { suppressImmediateRecovery: true }).catch(() => undefined);
+      expect((await heartbeat.getRun(holderRunId))?.status).toBe("cancelled");
+      const [fault] = await db.execute(sql`SELECT is_called FROM test_sibling_promotion_faults`);
+      expect(fault?.is_called).toBe(true);
+      const [promoted] = await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, healthyWake!.id));
+      expect(promoted).toMatchObject({ status: "queued" });
+      expect(await heartbeat.getRun(promoted!.runId!)).toMatchObject({
+        status: "queued", agentId: reviewerAgentId, contextSnapshot: { issueId: healthyIssueId },
+      });
+      expect((await db.select().from(issues).where(eq(issues.id, healthyIssueId)))[0])
+        .toMatchObject({ executionRunId: promoted!.runId, checkoutRunId: null });
+      expect((await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${failedIssueId}`,
+      )))[0]).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    } finally {
+      await db.execute(sql.raw("DROP TRIGGER test_sibling_promotion_failure ON heartbeat_runs"));
+      await db.execute(sql.raw("DROP FUNCTION test_sibling_promotion_failure()"));
+      await db.execute(sql.raw("DROP SEQUENCE test_sibling_promotion_faults"));
+    }
+  });
+
   it.each([
     ["unscoped", () => ({ wakeReason: "timer" })],
     ["other-issue", () => ({ issueId: randomUUID(), wakeReason: "issue_assigned" })],

@@ -30983,7 +30983,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (siblingIssueIds) {
       const siblingOptions = { suppressImmediateRecovery: true };
       for (const issueId of siblingIssueIds) {
-        await releaseIssueExecutionAndPromote(run, siblingOptions, issueId);
+        try {
+          await releaseIssueExecutionAndPromote(run, siblingOptions, issueId);
+        } catch (err) {
+          logger.error({ err, runId: run.id, issueId }, "failed to promote released sibling issue execution");
+        }
       }
     }
 
