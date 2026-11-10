@@ -1396,16 +1396,14 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
         await expect(readFile(dispatchedPath)).rejects.toMatchObject({ code: "ENOENT" });
       } finally {
         barrier.emit("release");
-        await holder;
-        await resume;
-        await cancel;
-        await drainHeartbeatRunsToQuiescence(db, claimingHeartbeat);
-        await claimDb.$client.end({ timeout: 5 });
-        await db.execute(sql`DROP TRIGGER test_capture_cancelled_claim ON heartbeat_runs`);
-        await db.execute(sql`DROP FUNCTION test_capture_cancelled_claim()`);
-        await db.execute(sql`DROP TRIGGER test_capture_cancelled_stamp ON issues`);
-        await db.execute(sql`DROP FUNCTION test_capture_cancelled_stamp()`);
-        await db.execute(sql`DROP TABLE test_cancelled_claims`);
+        await Promise.allSettled([holder, resume, cancel]);
+        await drainHeartbeatRunsToQuiescence(db, claimingHeartbeat).catch(() => undefined);
+        await claimDb.$client.end({ timeout: 5 }).catch(() => undefined);
+        await db.execute(sql`DROP TRIGGER IF EXISTS test_capture_cancelled_claim ON heartbeat_runs`);
+        await db.execute(sql`DROP FUNCTION IF EXISTS test_capture_cancelled_claim()`);
+        await db.execute(sql`DROP TRIGGER IF EXISTS test_capture_cancelled_stamp ON issues`);
+        await db.execute(sql`DROP FUNCTION IF EXISTS test_capture_cancelled_stamp()`);
+        await db.execute(sql`DROP TABLE IF EXISTS test_cancelled_claims`);
         await rm(executionDir, { recursive: true, force: true });
       }
     }, 30_000);
