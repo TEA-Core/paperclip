@@ -96,7 +96,7 @@ import {
   TARGET_BOUND_INTERACTION_KINDS,
   USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS,
 } from "./issue-interaction-kinds.js";
-import { logActivityInTransaction, publishActivity, type ActivityPublication } from "./activity-log.js";
+import { logActivity, logActivityInTransaction, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { getNativeReviewAssignment } from "./native-runtime/native-review-participant.js";
 import {
@@ -3422,6 +3422,35 @@ export function issueThreadInteractionService(
             },
           );
         }
+      }
+
+      if (
+        normalizedData.kind === "request_confirmation" &&
+        !normalizedData.addresseeAgentId &&
+        !normalizedData.addresseeUserId
+      ) {
+        const details = {
+          code: "interaction_unaddressable",
+          reason: "missing_addressee",
+          kind: normalizedData.kind,
+          idempotencyKey: normalizedData.idempotencyKey ?? null,
+        };
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.systemId ? "system" : actor.agentId ? "agent" : actor.userId ? "user" : "system",
+          actorId: actor.systemId ?? actor.agentId ?? actor.userId ?? "issue-thread-interactions",
+          agentId: actor.agentId ?? null,
+          runId: actor.runId ?? null,
+          action: "issue.thread_interaction_create_refused",
+          entityType: "issue",
+          entityId: issue.id,
+          issueId: issue.id,
+          details,
+        });
+        throw unprocessable(
+          "A request_confirmation requires a concrete user or agent addressee",
+          details,
+        );
       }
 
       if (normalizedData.idempotencyKey) {

@@ -45,7 +45,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-thread-interactions-");
     db = createDb(tempDb.connectionString);
     issuesSvc = issueService(db);
-    interactionsSvc = issueThreadInteractionService(db);
+    interactionsSvc = legacyAddressedInteractionService(db);
   }, 20_000);
 
   afterEach(async () => {
@@ -2107,7 +2107,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       startedAt: new Date(),
     });
     const created = await interactionsSvc.create({ id: issueId, companyId }, {
-      kind: "request_confirmation",
+      kind: "request_confirmation", addresseeAgentId: resolverAgentId,
       payload: { version: 1, prompt: "Approve this review?" },
       resolverPolicy: "anyone",
     }, {
@@ -2160,7 +2160,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         startedAt: new Date(),
       });
       const created = await interactionsSvc.create({ id: issueId, companyId }, {
-        kind: "request_confirmation",
+        kind: "request_confirmation", addresseeAgentId: resolverAgentId,
         payload: { version: 1, prompt: "Approve this review?" },
       }, {
         userId: "local-board",
@@ -2262,7 +2262,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
 
     const createdByResolver = await interactionsSvc.create({ id: issueId, companyId }, {
-      kind: "request_confirmation",
+      kind: "request_confirmation", addresseeAgentId: resolverAgentId,
       payload: { version: 1, prompt: "Approve your own request?" },
       resolverPolicy: "anyone",
     }, {
@@ -5239,4 +5239,169 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       assigneeUserId: null,
     });
   });
+
+  type CreateInteractionInput = Parameters<ReturnType<typeof issueThreadInteractionService>["create"]>[1];
+  type RequestConfirmationInput = Extract<CreateInteractionInput, { kind: "request_confirmation" }>;
+
+  const governedConfirmationPayloads = {
+    toolAction: {
+      version: 1 as const,
+      actionRequestId: randomUUID(),
+      invocationId: randomUUID(),
+      toolName: "forged_tool",
+      toolDisplayName: "Forged tool",
+      connectionId: null,
+      applicationId: null,
+      appDisplayName: null,
+      risk: "write" as const,
+      previewMarkdown: "Perform the governed action",
+      argumentsSummaryJson: "{}",
+      argumentsHash: "a".repeat(64),
+      expiresAt: "2026-12-30T12:00:00.000Z",
+    },
+    secretProposal: {
+      version: 1 as const,
+      proposalId: randomUUID(),
+      sourceSecretLabel: "forged/source",
+      configPath: "access.FORGED_ALIAS",
+      targetAgentId: randomUUID(),
+      targetAgentName: "Target agent",
+      justification: "Trust me",
+      expiresAt: "2026-12-30T12:00:00.000Z",
+    },
+  };
+
+  function confirmationPayload(
+    governedField?: keyof typeof governedConfirmationPayloads,
+  ): RequestConfirmationInput["payload"] {
+    return {
+      version: 1,
+      prompt: "Approve this action?",
+      allowDeclineReason: true,
+      ...(governedField === "toolAction"
+        ? { toolAction: governedConfirmationPayloads.toolAction }
+        : governedField === "secretProposal"
+          ? { secretProposal: governedConfirmationPayloads.secretProposal }
+          : {}),
+    };
+  }
+
+  it.each(["ordinary", "review-escalation"])(
+    "refuses an unaddressed %s confirmation and records one activity per refused attempt",
+    async (context) => {
+      const { companyId, issueId } = await seedConfirmationIssue("Unaddressable confirmation");
+      const agentId = await seedAgent(companyId);
+      const input: RequestConfirmationInput = {
+        kind: "request_confirmation",
+        continuationPolicy: "none",
+        payload: confirmationPayload(),
+        addresseeUserId: null,
+        addresseeAgentId: null,
+        idempotencyKey: `${context}:${issueId}`,
+      };
+      const create = () => interactionsSvc.create({ id: issueId, companyId }, input, { agentId });
+
+      await expect(create()).rejects.toMatchObject({
+        status: 422,
+        details: {
+          code: "interaction_unaddressable",
+          reason: "missing_addressee",
+          kind: "request_confirmation",
+        },
+      });
+      await expect(create()).rejects.toMatchObject({ status: 422 });
+      expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId))).toHaveLength(0);
+      const refusals = await db.select().from(activityLog).where(and(
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.action, "issue.thread_interaction_create_refused"),
+      ));
+      expect(refusals).toHaveLength(2);
+      expect(refusals[0]?.details).toMatchObject({
+        code: "interaction_unaddressable",
+        reason: "missing_addressee",
+        kind: "request_confirmation",
+        idempotencyKey: input.idempotencyKey,
+      });
+      expect(await db.select().from(activityLog).where(and(
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.action, "issue.thread_interaction_created"),
+      ))).toHaveLength(0);
+    },
+  );
+
+  it.each(["toolAction", "secretProposal"] as const)(
+    "refuses an unaddressed governed confirmation containing %s",
+    async (governedField) => {
+      const { companyId, issueId } = await seedConfirmationIssue("Unaddressable governed confirmation");
+      const agentId = await seedAgent(companyId);
+
+      await expect(interactionsSvc.create(
+        { id: issueId, companyId },
+        {
+          kind: "request_confirmation",
+          continuationPolicy: "none",
+          payload: confirmationPayload(governedField),
+          addresseeUserId: null,
+          addresseeAgentId: null,
+        },
+        { agentId },
+      )).rejects.toMatchObject({
+        status: 422,
+        details: { code: "interaction_unaddressable", reason: "missing_addressee" },
+      });
+      expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId))).toHaveLength(0);
+      expect(await db.select().from(activityLog).where(and(
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.action, "issue.thread_interaction_create_refused"),
+      ))).toHaveLength(1);
+    },
+  );
+
+  it("mints a governed confirmation with a concrete user addressee", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Addressed governed confirmation");
+    const agentId = await seedAgent(companyId);
+
+    const created = await interactionsSvc.create(
+      { id: issueId, companyId },
+      {
+        kind: "request_confirmation",
+        continuationPolicy: "none",
+        payload: confirmationPayload("toolAction"),
+        addresseeUserId: "user-board",
+      },
+      { agentId },
+    );
+
+    expect(created).toMatchObject({
+      kind: "request_confirmation",
+      status: "pending",
+      addresseeUserId: "user-board",
+      addresseeAgentId: null,
+      effectiveResolverPolicy: "human_only",
+    });
+    expect(await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, issueId),
+      eq(activityLog.action, "issue.thread_interaction_create_refused"),
+    ))).toHaveLength(0);
+  });
+
+  function legacyAddressedInteractionService(db: Parameters<typeof issueThreadInteractionService>[0]) {
+    const service = issueThreadInteractionService(db);
+    const create = ((
+      issue: Parameters<typeof service.create>[0],
+      input: CreateInteractionInput,
+      actor: Parameters<typeof service.create>[2],
+      options: Parameters<typeof service.create>[3],
+    ) => service.create(
+      issue,
+      input.kind === "request_confirmation" &&
+        !input.addresseeAgentId &&
+        input.addresseeUserId === undefined
+        ? { ...input, addresseeUserId: "local-board" }
+        : input,
+      actor,
+      options,
+    )) as typeof service.create;
+    return { ...service, create };
+  }
 });

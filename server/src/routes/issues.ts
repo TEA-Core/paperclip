@@ -1095,6 +1095,7 @@ async function mintReviewEscalationInteraction(args: {
       title: "Review round cap reached — your decision is needed",
       summary: `Review stage ${escalation.stageId} hit the ${escalation.maxRounds}-round change cap and was escalated to you.`,
       addresseeAgentId: null,
+      addresseeUserId: escalation.escalatedToUserId,
       resolverPolicy: "human_only",
       continuationPolicy: "wake_assignee",
       sourceRunId,
