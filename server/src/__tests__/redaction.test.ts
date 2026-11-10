@@ -193,6 +193,20 @@ describe("redaction", () => {
     expect(result.normal).toBe("plain");
   });
 
+  it("preserves known wake skip reasons only in wake diagnostic payloads", () => {
+    const details = {
+      agentId: "agent-1",
+      wakeupReason: "issue_reopened_via_comment",
+      outcome: "not_dispatched",
+      reason: "heartbeat.wakeOnDemand.disabled",
+    };
+
+    expect(sanitizeRecord(details)).toEqual(details);
+    expect(sanitizeRecord({ reason: details.reason }).reason).toBe(REDACTED_EVENT_VALUE);
+    expect(sanitizeRecord({ ...details, reason: "aaa.bbb.ccc" }).reason).toBe(REDACTED_EVENT_VALUE);
+    expect(sanitizeRecord({ ...details, outcome: "error" }).reason).toBe(REDACTED_EVENT_VALUE);
+  });
+
   it("preserves Paperclip protocol schema identifiers", () => {
     expect(
       sanitizeRecord({

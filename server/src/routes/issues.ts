@@ -5808,6 +5808,7 @@ export function issueRoutes(
     actor: ReturnType<typeof getActorInfo>;
     wakeupReason: string;
     outcome: "not_dispatched" | "error";
+    reason?: string;
     error?: unknown;
   }) =>
     logActivity(db, {
@@ -5826,6 +5827,7 @@ export function issueRoutes(
         agentId: input.agentId,
         wakeupReason: input.wakeupReason,
         outcome: input.outcome,
+        ...(input.reason ? { reason: input.reason } : {}),
         ...(input.outcome === "error"
           ? {
               error:
@@ -25256,6 +25258,48 @@ export function issueRoutes(
     });
   }
 
+  type AssigneeCommentWakeReceipt =
+    | { outcome: "dispatched" }
+    | { outcome: "coalesced"; reason?: string }
+    | { outcome: "not_dispatched"; reason: string };
+
+  const readAssigneeCommentWakeReceipt = async (input: {
+    companyId: string;
+    agentId: string;
+    commentId: string;
+    wakeRun: Awaited<ReturnType<typeof heartbeat.wakeup>>;
+  }): Promise<AssigneeCommentWakeReceipt> => {
+    const [request] = await db
+      .select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.agentId, input.agentId),
+        sql`${agentWakeupRequests.payload}->>'commentId' = ${input.commentId}`,
+      ))
+      .orderBy(desc(agentWakeupRequests.requestedAt), desc(agentWakeupRequests.id))
+      .limit(1);
+    if (request?.status === "coalesced") {
+      return {
+        outcome: "coalesced",
+        ...(request.reason ? { reason: request.reason } : {}),
+      };
+    }
+    if (request?.status === "skipped" || request?.status === "deferred_issue_execution") {
+      return {
+        outcome: "not_dispatched",
+        reason: request.reason?.trim()
+          ? request.reason
+          : "heartbeat wakeup recorded no reason",
+      };
+    }
+    if (input.wakeRun) return { outcome: "dispatched" };
+    return {
+      outcome: "not_dispatched",
+      reason: "heartbeat wakeup returned no run without recording a request",
+    };
+  };
+
   router.post("/issues/:id/comments", validate(addIssueCommentSchema), async (req, res) => {
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
@@ -26046,6 +26090,11 @@ export function issueRoutes(
       blockedToTodoRecovery: reopened && reopenFromStatus === "blocked" && currentIssue.status === "todo",
     });
 
+    let assigneeWakeStarted = false;
+    let resolveAssigneeWakeReceipt: ((receipt: AssigneeCommentWakeReceipt | null) => void) | undefined;
+    const assigneeWakeReceipt = new Promise<AssigneeCommentWakeReceipt | null>((resolve) => {
+      resolveAssigneeWakeReceipt = resolve;
+    });
     // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.
     void (async () => {
       type WakeupRequest = NonNullable<Parameters<typeof heartbeat.wakeup>[1]>;
@@ -26348,9 +26397,56 @@ export function issueRoutes(
 
       for (const { agentId, wakeup } of wakeups.values()) {
         const assigneeCommentReason =
-          wakeup.reason === "issue_reopened_via_comment" || wakeup.reason === "issue_commented"
+          agentId === assigneeId &&
+          wakeup.payload?.issueId === currentIssue.id &&
+          (wakeup.reason === "issue_reopened_via_comment" || wakeup.reason === "issue_commented")
             ? wakeup.reason
             : null;
+        if (assigneeCommentReason) {
+          assigneeWakeStarted = true;
+          void (async () => {
+            try {
+              const wakeRun = await heartbeat.wakeup(agentId, wakeup);
+              const receipt = await readAssigneeCommentWakeReceipt({
+                companyId: currentIssue.companyId,
+                agentId,
+                commentId: comment.id,
+                wakeRun,
+              });
+              if (receipt.outcome === "not_dispatched") {
+                await logUndispatchedAssigneeCommentWake({
+                  companyId: currentIssue.companyId,
+                  issueId: currentIssue.id,
+                  agentId,
+                  actor,
+                  wakeupReason: assigneeCommentReason,
+                  outcome: "not_dispatched",
+                  reason: receipt.reason,
+                }).catch((err) => {
+                  logger.warn({ err, issueId: currentIssue.id, agentId }, "failed to record undispatched comment wake");
+                });
+              }
+              resolveAssigneeWakeReceipt?.(receipt);
+            } catch (err) {
+              logger.warn({ err, issueId: currentIssue.id, agentId }, "failed to wake agent on issue comment");
+              const reason = err instanceof Error ? err.message || err.name : String(err);
+              await logUndispatchedAssigneeCommentWake({
+                companyId: currentIssue.companyId,
+                issueId: currentIssue.id,
+                agentId,
+                actor,
+                wakeupReason: assigneeCommentReason,
+                outcome: "error",
+                reason,
+                error: err,
+              }).catch((activityErr) => {
+                logger.warn({ err: activityErr, issueId: currentIssue.id, agentId }, "failed to record failed comment wake");
+              });
+              resolveAssigneeWakeReceipt?.({ outcome: "not_dispatched", reason });
+            }
+          })();
+          continue;
+        }
         heartbeat
           .wakeup(agentId, wakeup)
           .then((wakeRun) => {
@@ -26366,36 +26462,20 @@ export function issueRoutes(
                 defaultSource: "issue.comment",
               });
             }
-            if (assigneeCommentReason && !wakeRun) {
-              return logUndispatchedAssigneeCommentWake({
-                companyId: currentIssue.companyId,
-                issueId: currentIssue.id,
-                agentId,
-                actor,
-                wakeupReason: assigneeCommentReason,
-                outcome: "not_dispatched",
-              });
-            }
           })
           .catch((err) => {
             logger.warn({ err, issueId: currentIssue.id, agentId }, "failed to wake agent on issue comment");
-            if (assigneeCommentReason) {
-              return logUndispatchedAssigneeCommentWake({
-                companyId: currentIssue.companyId,
-                issueId: currentIssue.id,
-                agentId,
-                actor,
-                wakeupReason: assigneeCommentReason,
-                outcome: "error",
-                error: err,
-              });
-            }
           });
       }
-    })();
+      if (!assigneeWakeStarted) resolveAssigneeWakeReceipt?.(null);
+    })().catch((err) => {
+      logger.warn({ err, issueId: currentIssue.id }, "failed to prepare issue comment wakeups");
+      if (!assigneeWakeStarted) resolveAssigneeWakeReceipt?.(null);
+    });
 
     await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
-    res.status(201).json(comment);
+    const wakeReceipt = await assigneeWakeReceipt;
+    res.status(201).json(wakeReceipt ? { ...comment, wakeReceipt } : comment);
   });
 
   router.post(

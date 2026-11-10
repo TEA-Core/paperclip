@@ -1,4 +1,5 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
+import { wakeSkipClassForReason } from "./services/wake-skip-classification.js";
 
 const SECRET_FIELD_NAME_PATTERN = String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)[A-Za-z0-9_-]*`;
 
@@ -881,6 +882,22 @@ function isPaperclipSchemaDiscriminator(
   );
 }
 
+function isIssueCommentWakeSkipReason(
+  container: Record<string, unknown>,
+  key: string,
+  value: unknown,
+): value is string {
+  return (
+    key === "reason" &&
+    container.outcome === "not_dispatched" &&
+    (container.wakeupReason === "issue_commented" ||
+      container.wakeupReason === "issue_reopened_via_comment") &&
+    typeof container.agentId === "string" &&
+    typeof value === "string" &&
+    wakeSkipClassForReason(value) !== null
+  );
+}
+
 export function sanitizeRecord(
   record: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -927,6 +944,10 @@ export function sanitizeRecord(
     }
     if (AUDIT_SURFACE_PAYLOAD_KEY_RE.test(key) && typeof value === "string") {
       redacted[key] = redactSensitiveText(value);
+      continue;
+    }
+    if (isIssueCommentWakeSkipReason(record, key, value)) {
+      redacted[key] = value;
       continue;
     }
     if (
