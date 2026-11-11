@@ -1952,4 +1952,30 @@ describe("parseRepoUrlRef / canonicalGitHubRepoRef — host-aware repo identity 
     expect(parseRepoUrlRef("")).toBeNull();
     expect(parseRepoUrlRef("just-a-name")).toBeNull();
   });
+
+  // SUP-23892: only HTTP(S) URLs and the scp-like form are supported transports
+  // for repo identity. Any other URI scheme fails closed in the parser, before
+  // host comparison, so a URL that merely places github.com after an
+  // unsupported scheme cannot lend GitHub's host identity to that transport.
+  it("parseRepoUrlRef accepts only https/http URL transports — other schemes fail closed", () => {
+    expect(parseRepoUrlRef("file://github.com/TEA-Core/paperclip")).toBeNull();
+    expect(parseRepoUrlRef("ftp://github.com/TEA-Core/paperclip")).toBeNull();
+    expect(parseRepoUrlRef("ssh://git@github.com/TEA-Core/paperclip")).toBeNull();
+    expect(parseRepoUrlRef("git://github.com/TEA-Core/paperclip")).toBeNull();
+    // Supported URL transports keep parsing, HTTP included.
+    expect(parseRepoUrlRef("http://github.com/TEA-Core/paperclip")).toEqual({
+      host: "github.com",
+      owner: "TEA-Core",
+      repo: "paperclip",
+    });
+  });
+
+  it("canonicalGitHubRepoRef refuses an unsupported transport that impersonates github.com (SUP-23892)", () => {
+    expect(canonicalGitHubRepoRef("file://github.com/TEA-Core/paperclip")).toBeNull();
+    expect(canonicalGitHubRepoRef("git://github.com/TEA-Core/paperclip")).toBeNull();
+    // Supported transports keep authorizing: HTTPS, HTTP, and scp-like.
+    expect(canonicalGitHubRepoRef("https://github.com/TEA-Core/paperclip")).not.toBeNull();
+    expect(canonicalGitHubRepoRef("http://github.com/TEA-Core/paperclip")).not.toBeNull();
+    expect(canonicalGitHubRepoRef("git@github.com:TEA-Core/paperclip.git")).not.toBeNull();
+  });
 });

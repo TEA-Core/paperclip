@@ -471,13 +471,21 @@ export interface RepoUrlRef {
  * that is not exactly one host (or none) followed by exactly `owner/repo` —
  * deeper paths, empty segments — so authorization comparisons fail closed
  * instead of half-matching.
+ *
+ * Only HTTP(S) URLs and the scp-like `user@host:owner/repo` form are supported
+ * transports (SUP-23892): any other URI scheme (`file://github.com/…`,
+ * `ssh://…`, `ftp://…`) returns null BEFORE the host is considered, so an
+ * unsupported transport cannot lend a well-known host's identity — notably
+ * GitHub's — to a URL that is not a GitHub workspace URL.
  */
 export function parseRepoUrlRef(repoUrl: string): RepoUrlRef | null {
   const trimmed = repoUrl.trim();
   if (!trimmed) return null;
-  // URL form: scheme://[userinfo@]host/owner/repo — .git suffix and trailing slash optional.
+  // URL form: http(s)://[userinfo@]host/owner/repo — .git suffix and trailing slash optional.
+  // The scheme is pinned to https/http: any other scheme fails closed here rather
+  // than parsing into a host that could impersonate a supported one.
   const urlForm =
-    /^[a-z][a-z0-9+.-]*:\/\/(?:[^/@]+@)?([^/?#]+)\/([^/?#]+)\/([^/?#]+?)(?:\.git)?\/?$/i.exec(trimmed);
+    /^https?:\/\/(?:[^/@]+@)?([^/?#]+)\/([^/?#]+)\/([^/?#]+?)(?:\.git)?\/?$/i.exec(trimmed);
   if (urlForm) {
     return { host: urlForm[1]!.toLowerCase(), owner: urlForm[2]!, repo: urlForm[3]! };
   }
@@ -497,11 +505,13 @@ export function parseRepoUrlRef(repoUrl: string): RepoUrlRef | null {
 /**
  * The canonical GitHub owner/repo of a workspace registration, or null when the
  * URL is not GitHub-hosted — any host other than exactly `github.com`,
- * including a hostless bare `owner/repo` form. The writer-Auditor assurance
- * mint authorizes only against this ref: the request's owner/repo must equal
- * the returned strings exactly, so aliases (different casing, trailing `.git`,
- * URL-form owner, trailing whitespace) refuse instead of normalizing into an
- * authorization match.
+ * including a hostless bare `owner/repo` form, and any URI that places
+ * `github.com` after an unsupported transport such as `file://` (the parser
+ * refuses unsupported schemes before the host is compared, SUP-23892). The
+ * writer-Auditor assurance mint authorizes only against this ref: the
+ * request's owner/repo must equal the returned strings exactly, so aliases
+ * (different casing, trailing `.git`, URL-form owner, trailing whitespace)
+ * refuse instead of normalizing into an authorization match.
  */
 export function canonicalGitHubRepoRef(repoUrl: string): RepoUrlRef | null {
   const ref = parseRepoUrlRef(repoUrl);

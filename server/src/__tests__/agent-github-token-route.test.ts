@@ -270,6 +270,26 @@ describe("POST /api/agents/me/github/installation-tokens", () => {
       expect(resolveToken).not.toHaveBeenCalled();
     });
 
+    it("refuses a file:// registration impersonating github.com with 404 and without minting (SUP-23892)", async () => {
+      const { deps, resolveToken } = fakeDeps();
+      const app = createApp(agentActor({ agentId: WRITER_AUDITOR_AGENT_ID }), deps, {
+        issues: [{ projectId: "project-x" }],
+        workspaces: [{ projectId: "project-y", repoUrl: "file://github.com/TEA-Core/paperclip" }],
+      });
+      const res = await request(app)
+        .post("/api/agents/me/github/installation-tokens")
+        .send({ owner: "TEA-Core", repo: "paperclip" });
+      expect(res.status).toBe(404);
+      // normalizeRepoUrl still matches the repo name (it erases the transport and
+      // host), so the refusal is the non-GitHub-registration gate: file:// is not
+      // a GitHub transport and must fail closed before resolveToken.
+      expect(res.body.error).toBe(
+        "Assurance GitHub mint requires a workspace registered on github.com " +
+          "(requested TEA-Core/paperclip matches only a non-GitHub registration)",
+      );
+      expect(resolveToken).not.toHaveBeenCalled();
+    });
+
     it("mints with the canonical registered owner/repo and exactly contents+metadata read on an exact match", async () => {
       const { deps, resolveToken } = fakeDeps();
       const app = createApp(agentActor({ agentId: WRITER_AUDITOR_AGENT_ID }), deps, assuranceRows);
