@@ -3258,7 +3258,7 @@ export function routineService(
         const recordDelivery = async (status: "received" | "rejected") => {
           const receivedAt = new Date().toISOString();
           await txDb.update(routineTriggers).set({ lastWebhookDelivery: { status, receivedAt, test: trigger.setupPending } }).where(eq(routineTriggers.id, trigger.id));
-          await logActivity(txDb, {
+          await logActivityInTransaction(txDb, {
             companyId: routine.companyId, actorType: "system", actorId: "routine-webhook",
             action: trigger.setupPending ? `routine.webhook_test_${status}` : `routine.webhook_${status}`,
             entityType: "routine", entityId: routine.id,
@@ -3350,7 +3350,7 @@ export function routineService(
           return { routine, trigger, hmacReplayKey, testReceived: false, error };
         }
         if (appDelivery?.ignored) {
-          await logActivity(txDb, {
+          await logActivityInTransaction(txDb, {
             companyId: routine.companyId, actorType: "system", actorId: "routine-webhook",
             action: "routine.webhook_ignored", entityType: "routine", entityId: routine.id,
             details: { triggerId: trigger.id, reason: "event_not_subscribed" },

@@ -22,7 +22,7 @@ import {
 } from "../../errors.js";
 import { secretService } from "../secrets.js";
 import { toolAccessService } from "../tool-access.js";
-import { logActivity } from "../activity-log.js";
+import { logActivity, logActivityInTransaction } from "../activity-log.js";
 import { object, slackClient } from "./slack-client.js";
 
 export const SLACK_SEARCH_USER_SCOPES = [
@@ -377,6 +377,7 @@ export function slackSearchOAuthService(
       endpointId: string,
       userId: string,
       input: unknown,
+      boardApiKeyId?: string | null,
     ) {
       const values = slackSearchConfigSchema.parse(input);
       const row = await endpoint(companyId, endpointId);
@@ -441,10 +442,11 @@ export function slackSearchOAuthService(
           )
           .returning();
         await syncConnectionCredentialBindings(tx, updated);
-        await logActivity(tx as unknown as Db, {
+        await logActivityInTransaction(tx as unknown as Db, {
           companyId,
           actorType: "user",
           actorId: userId,
+          boardApiKeyId: boardApiKeyId ?? null,
           action: "chat.slack_search.configured",
           entityType: "chat_endpoint",
           entityId: endpointId,
@@ -486,7 +488,7 @@ export function slackSearchOAuthService(
       }).toString();
       return { url: url.toString() };
     },
-    async complete(state: string, code: string, userId: string) {
+    async complete(state: string, code: string, userId: string, boardApiKeyId?: string | null) {
       if (!state.startsWith("slack-search."))
         throw forbidden("Invalid Slack search state");
       const claimState = `slack-search-claim.${randomBytes(32).toString("base64url")}`;
@@ -686,10 +688,11 @@ export function slackSearchOAuthService(
             set: grantValues,
           });
         await syncConnectionCredentialBindings(tx, liveConnection);
-        await logActivity(tx as unknown as Db, {
+        await logActivityInTransaction(tx as unknown as Db, {
           companyId: pending.companyId,
           actorType: "user",
           actorId: userId,
+          boardApiKeyId: boardApiKeyId ?? null,
           action: "chat.slack_search.connected",
           entityType: "chat_endpoint",
           entityId: row.endpoint.id,
@@ -697,7 +700,7 @@ export function slackSearchOAuthService(
         return { endpointId: row.endpoint.id, companyId: pending.companyId };
       });
     },
-    async disconnect(companyId: string, endpointId: string, userId: string) {
+    async disconnect(companyId: string, endpointId: string, userId: string, boardApiKeyId?: string | null) {
       const row = await endpoint(companyId, endpointId);
       await db.transaction(async (tx) => {
         await tx
@@ -741,6 +744,7 @@ export function slackSearchOAuthService(
         companyId,
         actorType: "user",
         actorId: userId,
+        boardApiKeyId: boardApiKeyId ?? null,
         action: "chat.slack_search.disconnected",
         entityType: "chat_endpoint",
         entityId: endpointId,

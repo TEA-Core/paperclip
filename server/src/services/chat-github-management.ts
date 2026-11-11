@@ -22,7 +22,7 @@ import {
 } from "@paperclipai/shared";
 import { badRequest, conflict, forbidden, notFound } from "../errors.js";
 import { toolAccessService } from "./tool-access.js";
-import { logActivity } from "./activity-log.js";
+import { logActivityInTransaction } from "./activity-log.js";
 import { githubBotRequest } from "./chat-github-client.js";
 import { environmentService } from "./environments.js";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -90,6 +90,7 @@ export function githubChatManagementService(db: Db, fetchImpl = fetch) {
     endpointId: string,
     input: unknown,
     userId: string,
+    boardApiKeyId?: string | null,
   ) {
     const bot = await endpoint(endpointId);
     await member(bot.companyId, userId);
@@ -183,10 +184,11 @@ export function githubChatManagementService(db: Db, fetchImpl = fetch) {
         })
         .where(eq(chatEndpoints.id, endpointId));
       await syncGitHubBotTools(tx, bot, userId, config.toolsEnabled);
-      await logActivity(tx as unknown as Db, {
+      await logActivityInTransaction(tx as unknown as Db, {
         companyId: bot.companyId,
         actorType: "user",
         actorId: userId,
+        boardApiKeyId: boardApiKeyId ?? null,
         action: "chat_github.configuration_updated",
         entityType: "tool_connection",
         entityId: bot.connectionId,
@@ -234,6 +236,7 @@ export function githubChatManagementService(db: Db, fetchImpl = fetch) {
     connectionId: string,
     userId: string,
     confirmedGithubUserId?: string,
+    boardApiKeyId?: string | null,
   ) {
     const bot = await endpoint(endpointId);
     await member(bot.companyId, userId);
@@ -321,10 +324,11 @@ export function githubChatManagementService(db: Db, fetchImpl = fetch) {
           target: [chatIdentityLinks.endpointId, chatIdentityLinks.principalId],
           set: values,
         });
-      await logActivity(tx as unknown as Db, {
+      await logActivityInTransaction(tx as unknown as Db, {
         companyId: bot.companyId,
         actorType: "user",
         actorId: userId,
+        boardApiKeyId: boardApiKeyId ?? null,
         action: "chat_github.identity_confirmed",
         entityType: "tool_connection",
         entityId: bot.connectionId,

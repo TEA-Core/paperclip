@@ -630,7 +630,7 @@ const support = await getEmbeddedPostgresTestSupport();
         service.request(claims, "executor", { targetService: "hubspot" }),
       ).rejects.toThrow("cannot connect");
       await expect(
-        service.request(claims, "github", { targetService: "hubspot" }),
+        service.request(claims, "slack", { targetService: "hubspot" }),
       ).rejects.toThrow("direct external-provider");
     });
 

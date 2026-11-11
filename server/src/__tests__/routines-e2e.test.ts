@@ -259,10 +259,10 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       const detail = await request(board).get(`/api/routines/${routineId}`);
       expect(detail.body.triggers[0].webhookUrl).toBe(secretMaterial.webhookUrl);
       const path = new URL(secretMaterial.webhookUrl).pathname;
-      const [{ actorMiddleware }, { boardMutationGuard }, { routineRoutes }, { errorHandler }] = await Promise.all([
-        import("../middleware/auth.js"), import("../middleware/board-mutation-guard.js"),
-        import("../routes/routines.js"), import("../middleware/error-handler.js"),
-      ]);
+      const { actorMiddleware } = await import("../middleware/auth.js");
+      const { boardMutationGuard } = await import("../middleware/board-mutation-guard.js");
+      const { routineRoutes } = await import("../routes/routines.js");
+      const { errorHandler } = await import("../middleware/error-handler.js");
       const ingress = express();
       ingress.use(express.json({ verify: (req, _res, buf) => { (req as any).rawBody = buf; } }));
       ingress.use(actorMiddleware(db, {

@@ -93,6 +93,7 @@ vi.mock("./prompt-cache.js", () => ({
 
 vi.mock("./permissions.js", () => ({
   buildClaudeExecutionPermissionArgs: () => [],
+  claudeSandboxPermissionEnv: () => ({}),
 }));
 
 // Spread the real module: upstream #12730 made execute.ts import more than the effort

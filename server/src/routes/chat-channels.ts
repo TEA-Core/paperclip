@@ -175,7 +175,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
   });
   router.put("/chat-endpoints/:endpointId/github/configuration", validate(updateGitHubChatConfigurationSchema), async (req, res) => {
     if (!(await assertEndpointManagementAccess(req, res))) return;
-    res.json(await github.saveConfiguration(endpointId(req), req.body, githubUser(req)));
+    res.json(await github.saveConfiguration(endpointId(req), req.body, githubUser(req), actorBoardApiKeyId(req)));
   });
   router.post("/chat-endpoints/:endpointId/github/verify", async (req, res) => {
     if (!(await assertEndpointManagementAccess(req, res))) return;
@@ -195,7 +195,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
   });
   router.post("/chat-endpoints/:endpointId/github/identity", validate(z.object({ connectionId: z.string().uuid(), confirmedGithubUserId: z.string().regex(/^[1-9][0-9]*$/).optional() }).strict()), async (req, res) => {
     if (!(await assertEndpointAccess(req, res, service))) return;
-    res.json(await github.identity(endpointId(req), req.body.connectionId, githubUser(req), req.body.confirmedGithubUserId));
+    res.json(await github.identity(endpointId(req), req.body.connectionId, githubUser(req), req.body.confirmedGithubUserId, actorBoardApiKeyId(req)));
   });
   router.post("/chat-endpoints/:endpointId/github/people/lookup", validate(z.object({ login: z.string().min(1).max(44) }).strict()), async (req, res) => {
     if (!(await assertEndpointManagementAccess(req, res))) return;
@@ -204,11 +204,11 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
   router.post("/chat-endpoints/:endpointId/github/registration", validate(z.object({ name: z.string().trim().min(1).max(34) }).strict()), async (req, res) => {
     if (!(await assertEndpointManagementAccess(req, res))) return;
     res.set("Cache-Control", "no-store");
-    res.json(await service.startGitHubRegistration(endpointId(req), githubUser(req), req.body.name));
+    res.json(await service.startGitHubRegistration(endpointId(req), githubUser(req), req.body.name, actorBoardApiKeyId(req)));
   });
   router.post("/chat-endpoints/:endpointId/github/app", validate(z.object({ appId: z.string().regex(/^[1-9][0-9]*$/), privateKey: z.string().min(1).max(32000), webhookSecret: z.string().min(16).max(1024) }).strict()), async (req, res) => {
     if (!(await assertEndpointManagementAccess(req, res))) return;
-    res.json(await service.storeGitHubApp(endpointId(req), githubUser(req), req.body));
+    res.json(await service.storeGitHubApp(endpointId(req), githubUser(req), req.body, actorBoardApiKeyId(req)));
   });
   router.post("/chat-endpoints/:endpointId/github/repositories/refresh", async (req, res) => {
     if (!(await assertEndpointManagementAccess(req, res))) return;

@@ -1,7 +1,7 @@
 import { slackCapabilities } from "../services/connectors/slack-capabilities.js";
 import { slackSearchOAuthService } from "../services/connectors/slack-search-oauth.js";
 import { accessService } from "../services/access.js";
-import { assertBoard } from "./authz.js";
+import { assertBoard, getActorInfo } from "./authz.js";
 import type { Request } from "express";
 import { Router } from "express";
 import { companies, type Db } from "@paperclipai/db";
@@ -26,6 +26,9 @@ export function slackToolRoutes(db: Db, publicBaseUrl?: string) {
       next();
     },
   );
+  function boardApiKeyId(req: Request) {
+    return getActorInfo(req).boardApiKeyId;
+  }
   function user(req: Request) {
     assertBoard(req);
     if (!req.actor.userId)
@@ -51,6 +54,7 @@ export function slackToolRoutes(db: Db, publicBaseUrl?: string) {
       req.query.state,
       req.query.code,
       userId,
+      boardApiKeyId(req),
     );
     const [company] = await db
       .select({ prefix: companies.issuePrefix })
@@ -115,6 +119,7 @@ export function slackToolRoutes(db: Db, publicBaseUrl?: string) {
         String(req.params.endpointId),
         userId,
         req.body,
+        boardApiKeyId(req),
       ),
     );
   });
@@ -133,7 +138,7 @@ export function slackToolRoutes(db: Db, publicBaseUrl?: string) {
     const companyId = String(req.params.companyId);
     assertCompanyAccess(req, companyId);
     res.json(
-      await oauth.disconnect(companyId, String(req.params.endpointId), userId),
+      await oauth.disconnect(companyId, String(req.params.endpointId), userId, boardApiKeyId(req)),
     );
   });
   router.post(

@@ -9,7 +9,7 @@ import {
 } from "@paperclipai/db";
 import { badRequest, conflict, forbidden, notFound } from "../errors.js";
 import { githubBotRequest } from "./chat-github-client.js";
-import { logActivity } from "./activity-log.js";
+import { logActivityInTransaction } from "./activity-log.js";
 
 const digest = (state: string) =>
   createHash("sha256").update(state).digest("hex");
@@ -51,7 +51,7 @@ export function githubChatRegistrationService(
     ) => Promise<void>;
   },
 ) {
-  async function start(endpointId: string, userId: string, name: string) {
+  async function start(endpointId: string, userId: string, name: string, boardApiKeyId?: string | null) {
     const origin = httpsOrigin(options.publicOrigin());
     const ingress = httpsOrigin(options.webhookOrigin());
     if (!name.trim() || name.length > 34)
@@ -113,10 +113,11 @@ export function githubChatRegistrationService(
         trustedOrigin: origin,
         expiresAt,
       });
-      await logActivity(tx as unknown as Db, {
+      await logActivityInTransaction(tx as unknown as Db, {
         companyId: endpoint.companyId,
         actorType: "user",
         actorId: userId,
+        boardApiKeyId: boardApiKeyId ?? null,
         action: "chat_github.registration_started",
         entityType: "tool_connection",
         entityId: endpoint.connectionId,

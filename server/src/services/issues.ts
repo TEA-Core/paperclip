@@ -13929,7 +13929,7 @@ export function issueService(db: Db) {
           : append();
       }
       // Callers supplying a transaction still share the settlement fence.
-      if (actor.userId && dbOrTx !== db) {
+      if (actor.userId && isTransactionHandle(dbOrTx)) {
         await dbOrTx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
       }
       const issue = await dbOrTx

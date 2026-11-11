@@ -1,4 +1,5 @@
 import { withSlackBoardLease } from "./slack-board-lease.js";
+import { isTransactionHandle } from "./db-handle.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { authorizeSlackBoardPublication } from "./slack-board-authority.js";
 import { assertSlackBoardWorkAllowed } from "./slack-board-resume.js";
@@ -6731,7 +6732,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const values: Record<string, string> = {};
     for (const ref of refs) {
       const key = ref.configPath.replace(/^credentials\./, "");
-      values[key] = await (database === db ? secrets : secretService(database as Db)).resolveSecretValue(
+      values[key] = await (!isTransactionHandle(database) ? secrets : secretService(database as Db)).resolveSecretValue(
         endpoint.companyId,
         ref.secretId,
         ref.versionSelector ?? "latest",
@@ -27804,7 +27805,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             if (action.result?.resumeApplied !== true) {
               if (["done", "blocked"].includes(current.status)) {
                 await issueService(tx as unknown as Db).update(current.id, { status: "todo", actorUserId: userId });
-                await logActivity(tx as unknown as Db, { companyId: current.companyId, actorType: "user", actorId: userId, action: "issue.updated", entityType: "issue", entityId: current.id, details: { status: "todo", source: "slack_board_message" } });
+                await logActivityInTransaction(tx as unknown as Db, { companyId: current.companyId, actorType: "user", actorId: userId, boardApiKeyId: null, action: "issue.updated", entityType: "issue", entityId: current.id, details: { status: "todo", source: "slack_board_message" } });
               }
               await tx.update(chatActions).set({ result: { resumeApplied: true }, updatedAt: new Date() }).where(eq(chatActions.id, action.id));
             }
@@ -38281,7 +38282,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       : null;
   }
 
-  async function storeGitHubApp(endpointId: string, userId: string, credentials: Record<string, string>) {
+  async function storeGitHubApp(endpointId: string, userId: string, credentials: Record<string, string>, boardApiKeyId?: string | null) {
     const initial = await endpointRecord(endpointId);
     if (!initial || initial.endpoint.provider !== "github") throw notFound("GitHub bot not found");
     await withCredentialMutationLease(initial.endpoint, async credentialLease => {
@@ -38316,7 +38317,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           setup: { ...record.endpoint.setup, github: { stage: "install", appSlug: slug, installationUrl: `https://github.com/apps/${slug}/installations/new`, registrationStatus: "completed" } },
           healthMessage: "Install the App on GitHub to continue", updatedAt: new Date(),
         }).where(eq(chatEndpoints.id, endpointId));
-        await logActivity(tx as unknown as Db, { companyId: record.endpoint.companyId, actorType: "user", actorId: userId, action: "chat_github.app_connected", entityType: "tool_connection", entityId: record.endpoint.connectionId, details: { endpointId, appId: identity.botExternalId } });
+        await logActivityInTransaction(tx as unknown as Db, { companyId: record.endpoint.companyId, actorType: "user", actorId: userId, boardApiKeyId: boardApiKeyId ?? null, action: "chat_github.app_connected", entityType: "tool_connection", entityId: record.endpoint.connectionId, details: { endpointId, appId: identity.botExternalId } });
       });
     });
     // Manifest registration can send its ping before the credential exchange

@@ -53,7 +53,7 @@ import {
   githubAutomaticAdmission,
   githubPreviousAssessment,
 } from "./chat-github-events.js";
-import { logActivity } from "./activity-log.js";
+import { logActivityInTransaction } from "./activity-log.js";
 
 type Session = {
   companyId: string;
@@ -1333,7 +1333,7 @@ export function githubChatReviewService(db: Db, fetchImpl = fetch) {
                 updatedAt: new Date(),
               })
               .where(eq(chatActions.id, action.id));
-            await logActivity(tx as unknown as Db, {
+            await logActivityInTransaction(tx as unknown as Db, {
               companyId: action.companyId,
               actorType: "agent",
               actorId: source.agent.id,
