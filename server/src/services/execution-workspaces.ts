@@ -3203,13 +3203,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           keep(workspace, "cwd could not be read", "skippedUndelivered", "skippedGitUnverified");
           continue;
         }
-        // A missing or non-git cwd used to stay skipped forever. Archive the
-        // record without spawning git. A missing git worktree is still inspected
-        // (no git runs for a missing path) so a merged row keeps its existing
-        // cleanup, which prunes the leftover admin entry.
-        const archiveWithoutGit = isOpenRow && (
-          cwdKind === "not_git" || (cwdKind === "missing" && workspace.providerType !== "git_worktree")
-        );
+        // A missing or non-git cwd has no repository state to protect. Archive
+        // the record without Git readiness or cleanup.
+        const archiveWithoutGit = isOpenRow && (cwdKind === "not_git" || cwdKind === "missing");
         let git: ExecutionWorkspaceCloseGitReadiness | null = null;
         // The live sweep's inspection can fetch the default branch; the dry run's never does.
         let defaultBranchCheckSkipped = false;
@@ -3262,7 +3258,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         let recordOnlyReason: string | null = null;
         const mergedDelivery = assessment.deliveryState === "merged_via_pr"
           || assessment.deliveryState === "merged_by_ancestry";
-        if (archiveWithoutGit || (isOpenRow && !mergedDelivery && cwdKind === "missing")) {
+        if (archiveWithoutGit) {
           recordOnlyReason = cwdKind === "missing" ? "cwd does not exist" : "cwd is not a git repository";
         } else if (sharedSession) {
           // A shared session is a record of a reused workspace, so it archives
