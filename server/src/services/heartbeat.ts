@@ -31917,13 +31917,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             const nativeStatusWakeIntentId = readNonEmptyString(
               enrichedContextSnapshot.nativeStatusWakeIntentId,
             );
+            const snapshotBlockedTransitionAt = readNonEmptyString(
+              enrichedContextSnapshot.blockedTransitionAt,
+            );
+            // Producers do not always stamp blockedTransitionAt into the
+            // context snapshot (the liveness backstop is one). Without the
+            // cycle timestamp an old-key COMPLETED wake from any earlier
+            // blocked cycle would suppress the enqueue, so fall back to the
+            // dependent issue's live cycle timestamp — the same information
+            // the producer's own pre-check used.
+            const dependencyBlockedTransitionAt = snapshotBlockedTransitionAt ??
+              (await tx
+                .select({ blockedTransitionAt: issues.blockedTransitionAt })
+                .from(issues)
+                .where(and(
+                  eq(issues.companyId, agent.companyId),
+                  eq(issues.id, issueId),
+                ))
+                .limit(1)
+                .then((rows) => rows[0]?.blockedTransitionAt ?? null));
             const existingDependencyWake = await findExistingIssueBlockersResolvedWakeForReadyState(
               tx as unknown as Db,
               {
                 companyId: agent.companyId,
                 dependentIssueId: issueId,
                 blockerIssueIds: dependencyBlockerIds,
-                blockedTransitionAt: readNonEmptyString(enrichedContextSnapshot.blockedTransitionAt),
+                blockedTransitionAt: dependencyBlockedTransitionAt,
                 completedRearmCutoff: opts.completedRearmCutoff,
                 excludeWakeupRequestIds: [nativeStatusWakeIntentId, executionWaitRequestId]
                   .filter((id): id is string => Boolean(id)),

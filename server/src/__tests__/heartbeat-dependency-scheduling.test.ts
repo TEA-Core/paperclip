@@ -29,7 +29,10 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
-import { buildIssueBlockersResolvedWakeStateKey } from "../services/issue-dependency-wakeups.ts";
+import {
+  buildIssueBlockersResolvedWakeStateKey,
+  buildIssueBlockersResolvedWakeStateKeyWithoutCycle,
+} from "../services/issue-dependency-wakeups.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -447,6 +450,124 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       runId: agentWakeupRequests.runId,
     }).from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent!.id));
     expect(persistedIntent).toEqual({ status: "coalesced", runId: dependencyRuns[0]!.id });
+  });
+
+  it("falls back to the dependent issue's live blocked cycle when the wake snapshot omits blockedTransitionAt", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const blockedTransitionAt = new Date();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `F${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CycleFallbackWakeProducer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: { env: { OPENAI_API_KEY: "test" } },
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: blockerId,
+        companyId,
+        title: "Completed prerequisite",
+        status: "done",
+        priority: "medium",
+      },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Ready dependent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+        blockedTransitionAt,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+
+    // A completed OLD-KEY wake from a previous blocked cycle: requested before
+    // the current blockedTransitionAt, so it must not cover the ready state.
+    // The producer (e.g. the liveness backstop) does not stamp
+    // blockedTransitionAt into the wake context snapshot.
+    const oldStateKey = buildIssueBlockersResolvedWakeStateKeyWithoutCycle({
+      dependentIssueId: blockedIssueId,
+      blockerIssueIds: [blockerId],
+    });
+    const previousCycleAt = new Date(blockedTransitionAt.getTime() - 30 * 24 * 60 * 60 * 1000);
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: {
+        issueId: blockedIssueId,
+        taskId: blockedIssueId,
+        resolvedBlockerIssueId: blockerId,
+        blockerIssueIds: [blockerId],
+      },
+      status: "completed",
+      runId: null,
+      requestedAt: previousCycleAt,
+      finishedAt: previousCycleAt,
+      requestedByActorType: "system",
+      requestedByActorId: "previous-cycle-producer",
+      idempotencyKey: oldStateKey,
+    });
+
+    const canonicalKey = buildIssueBlockersResolvedWakeStateKey({
+      dependentIssueId: blockedIssueId,
+      blockerIssueIds: [blockerId],
+    });
+    const run = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: {
+        issueId: blockedIssueId,
+        resolvedBlockerIssueId: blockerId,
+        blockerIssueIds: [blockerId],
+      },
+      idempotencyKey: canonicalKey,
+      requestedByActorType: "system",
+      requestedByActorId: "backstop-producer",
+      contextSnapshot: {
+        issueId: blockedIssueId,
+        taskId: blockedIssueId,
+        wakeReason: "issue_blockers_resolved",
+        blockerIssueIds: [blockerId],
+      },
+    });
+    expect(run).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    expect((await heartbeat.getRun(run!.id))?.status).toBe("succeeded");
+
+    const canonicalRequests = await db.select({
+      status: agentWakeupRequests.status,
+    }).from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, canonicalKey));
+    expect(canonicalRequests).toHaveLength(1);
+    expect(canonicalRequests[0]).toEqual({ status: "completed" });
+    const oldKeyRequests = await db.select({
+      status: agentWakeupRequests.status,
+    }).from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, oldStateKey));
+    expect(oldKeyRequests).toEqual([{ status: "completed" }]);
   });
 
   it("coalesces the native intent when dispatch admission defers behind an active issue run", async () => {

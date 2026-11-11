@@ -8301,6 +8301,7 @@ export function recoveryService(
               source,
               resolvedBlockerIssueId,
               blockerIssueIds: readiness?.blockerIssueIds ?? [],
+              blockedTransitionAt: candidate.blockedTransitionAt,
               ...(zeroBlockerHeal ? { zeroBlockerHeal: true } : {}),
             },
           });
