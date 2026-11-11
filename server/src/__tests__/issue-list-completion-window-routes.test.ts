@@ -250,4 +250,53 @@ describeEmbeddedPostgres("issue list completion window", () => {
       .expect(400);
     expect(res.body.error).toContain("sortField");
   });
+
+  it("rejects completion window filters combined with attention=blocked instead of silently ignoring them", async () => {
+    const f = await seedCensusFixtures();
+    const res = await request(f.app())
+      .get(
+        `/api/companies/${f.companyId}/issues?attention=blocked&completedAfter=2026-07-01T00:00:00.000Z&completedBefore=2026-07-02T00:00:00.000Z`,
+      )
+      .expect(400);
+    expect(res.body.error).toContain("attention=blocked");
+    expect(res.body.error).toContain("completion window");
+  });
+
+  it("rejects sortField=completed combined with attention=blocked", async () => {
+    const f = await seedCensusFixtures();
+    const res = await request(f.app())
+      .get(`/api/companies/${f.companyId}/issues?attention=blocked&sortField=completed`)
+      .expect(400);
+    expect(res.body.error).toContain("attention=blocked");
+  });
+
+  it("rejects a non-ISO completedAfter that Date parsing would accept", async () => {
+    const f = await seedCensusFixtures();
+    const res = await request(f.app())
+      .get(`/api/companies/${f.companyId}/issues?completedAfter=July 1, 2026`)
+      .expect(400);
+    expect(res.body.error).toContain("completedAfter");
+  });
+
+  it("rejects a normalized calendar date such as February 30", async () => {
+    const f = await seedCensusFixtures();
+    const res = await request(f.app())
+      .get(
+        `/api/companies/${f.companyId}/issues?completedBefore=2026-02-30T00:00:00.000Z`,
+      )
+      .expect(400);
+    expect(res.body.error).toContain("completedBefore");
+  });
+
+  it("accepts a strict ISO timestamp with a numeric UTC offset", async () => {
+    const f = await seedCensusFixtures();
+    const res = await request(f.app())
+      .get(
+        `/api/companies/${f.companyId}/issues?completedAfter=2026-07-02T05:30:00%2B05:30&completedBefore=2026-07-02T15:30:00%2B05:30`,
+      )
+      .expect(200);
+    expect((res.body as { id: string }[]).map((issue) => issue.id).sort()).toEqual(
+      [f.tieAId, f.tieBId].sort(),
+    );
+  });
 });

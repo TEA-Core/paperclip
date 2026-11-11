@@ -4351,6 +4351,24 @@ function logIssueListRequest(input: {
   });
 }
 
+const STRICT_ISO_TIMESTAMP_RE =
+  /^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,7})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/;
+
+function parseStrictIsoTimestampMs(value: unknown): number | null {
+  if (typeof value !== "string" || !STRICT_ISO_TIMESTAMP_RE.test(value))
+    return null;
+  // Date.parse otherwise normalizes nonexistent dates such as February 30.
+  const day = value.slice(0, 10);
+  const calendar = new Date(`${day}T00:00:00.000Z`);
+  if (
+    !Number.isFinite(calendar.getTime()) ||
+    calendar.toISOString().slice(0, 10) !== day
+  )
+    return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 export function issueRoutes(
   db: Db,
   storage: StorageService,
@@ -11134,12 +11152,14 @@ export function issueRoutes(
     const rawUpdatedSince = req.query.updatedSince as string | undefined;
     const rawCompletedAfter = req.query.completedAfter as string | undefined;
     const rawCompletedBefore = req.query.completedBefore as string | undefined;
-    const completedAfterMs = rawCompletedAfter
-      ? new Date(rawCompletedAfter).getTime()
-      : null;
-    const completedBeforeMs = rawCompletedBefore
-      ? new Date(rawCompletedBefore).getTime()
-      : null;
+    const completedAfterMs =
+      rawCompletedAfter !== undefined
+        ? parseStrictIsoTimestampMs(rawCompletedAfter)
+        : null;
+    const completedBeforeMs =
+      rawCompletedBefore !== undefined
+        ? parseStrictIsoTimestampMs(rawCompletedBefore)
+        : null;
 
     if (
       assigneeUserFilterRaw === "me" &&
@@ -11309,9 +11329,7 @@ export function issueRoutes(
     }
     if (
       rawCompletedAfter !== undefined &&
-      (typeof rawCompletedAfter !== "string" ||
-        completedAfterMs === null ||
-        !Number.isFinite(completedAfterMs))
+      completedAfterMs === null
     ) {
       res.status(400).json({
         error: "completedAfter must be a valid ISO 8601 timestamp when provided",
@@ -11320,9 +11338,7 @@ export function issueRoutes(
     }
     if (
       rawCompletedBefore !== undefined &&
-      (typeof rawCompletedBefore !== "string" ||
-        completedBeforeMs === null ||
-        !Number.isFinite(completedBeforeMs))
+      completedBeforeMs === null
     ) {
       res.status(400).json({
         error:
@@ -11337,6 +11353,17 @@ export function issueRoutes(
     ) {
       res.status(400).json({
         error: "completedAfter must not be later than completedBefore",
+      });
+      return;
+    }
+    const completionWindowRequested =
+      rawCompletedAfter !== undefined ||
+      rawCompletedBefore !== undefined ||
+      sortField === "completed";
+    if (attention === "blocked" && completionWindowRequested) {
+      res.status(400).json({
+        error:
+          "completion window filters are not supported with attention=blocked",
       });
       return;
     }
@@ -11491,9 +11518,6 @@ export function issueRoutes(
     // read (including the blocked-inbox attention view) keeps the default
     // plugin-operation drop — disclose it so a consumer counting rows knows
     // the page is not a census.
-    const completionWindowQuery =
-      Boolean(rawCompletedAfter || rawCompletedBefore) ||
-      sortField === "completed";
     const pluginOperationsExplicitlyIncluded = Boolean(
       listFilters.includePluginOperations ||
         listFilters.originKind ||
@@ -11503,7 +11527,7 @@ export function issueRoutes(
     );
     if (
       !pluginOperationsExplicitlyIncluded &&
-      (attention === "blocked" || !completionWindowQuery)
+      (attention === "blocked" || !completionWindowRequested)
     ) {
       res.setHeader("X-Paperclip-Plugin-Operations-Excluded", "true");
     }
