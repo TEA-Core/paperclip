@@ -3749,6 +3749,67 @@ describe("issue execution policy routes", () => {
       });
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
+
+    // SUP-23890 / SUP-23886: canonical in_progress handoff with an ACTIVE
+    // issuing run entering a user-only review stage. The route must project
+    // the workflow-controlled user seating into the update patch (so the
+    // service guard can exempt it) and must not cancel the issuing run.
+    it("lands the canonical Maintainer's issuing-run stage handoff into a user-only review without cancelling the run (SUP-23890)", async () => {
+      const issuingRunId = "55555555-5555-4555-8555-555555555555";
+      const issue = {
+        ...issueWithParticipants([maintainerId]),
+        executionRunId: issuingRunId,
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [{
+            id: stageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ type: "user", userId: "human-reviewer" }],
+          }],
+        }),
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+      mockHeartbeatService.getRun.mockResolvedValue({
+        id: issuingRunId,
+        companyId: "company-1",
+        agentId: maintainerId,
+        status: "running",
+        contextSnapshot: { issueId },
+      });
+      vi.doMock("../services/cross-issue-influence-limit.js", async (importOriginal) => ({
+        ...await importOriginal<typeof import("../services/cross-issue-influence-limit.js")>(),
+        observeCrossIssueInfluence: vi.fn(async () => null),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: maintainerId,
+        companyId: "company-1",
+        runId: issuingRunId,
+      })).patch(`/api/issues/${issueId}`).send({ status: "in_review" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(patch).toMatchObject({
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: "human-reviewer",
+        workflowControlledAssignment: true,
+        actorAgentId: maintainerId,
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentParticipant: { type: "user", userId: "human-reviewer" },
+          returnAssignee: { type: "agent", agentId: maintainerId },
+        },
+      });
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
   });
 
   it.each([

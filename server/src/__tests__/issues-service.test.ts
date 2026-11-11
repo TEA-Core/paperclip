@@ -9700,6 +9700,8 @@ describeEmbeddedPostgres("issueService.update Wiki handoff workflow-controlled r
 
   afterEach(async () => {
     await db.delete(pluginManagedResources);
+    await db.delete(heartbeatRuns);
+    await db.delete(companyMemberships);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(plugins);
@@ -9763,6 +9765,77 @@ describeEmbeddedPostgres("issueService.update Wiki handoff workflow-controlled r
     })).rejects.toMatchObject({
       status: 422,
       details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
+    });
+  });
+
+  // SUP-23890 / SUP-23886: the combined state no prior test spans — canonical
+  // actor AND canonical stored assignee AND workflow-projected null assignee
+  // AND a user-only pending review stage AND an active issuing run. The route
+  // passes actor + current assignee into this update; the service guard must
+  // forward them so the canonical null-assignee exemption (issue-assignee-
+  // review-gate wikiHandoffWriteWouldViolate) can apply instead of rejecting
+  // wiki_handoff_unassigned.
+  it("admits the canonical Maintainer's issuing-run handoff into a user-only review (SUP-23890)", async () => {
+    const reviewerUserId = `board-${randomUUID()}`;
+    const issuingRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: issuingRunId,
+      companyId,
+      agentId: canonicalAgentId,
+      status: "running",
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: reviewerUserId,
+      status: "active",
+      membershipRole: "member",
+    });
+    await db.update(issues).set({
+      executionPolicy: {
+        mode: "normal",
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ type: "user", agentId: null, userId: reviewerUserId }],
+        }],
+      },
+      executionRunId: issuingRunId,
+    }).where(eq(issues.id, issueId));
+
+    await expect(svc.update(issueId, {
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: reviewerUserId,
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "user", agentId: null, userId: reviewerUserId },
+        returnAssignee: { type: "agent", agentId: canonicalAgentId, userId: null },
+        deliveryAuthor: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+      workflowControlledAssignment: true,
+      actorAgentId: canonicalAgentId,
+    })).resolves.toMatchObject({
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: reviewerUserId,
+      // The issuing run keeps the execution lock until it actually stops
+      // (SUP-23227 re-assert); only the assignment permission moves to the
+      // user now. The route separately declines to cancel it.
+      executionRunId: issuingRunId,
+      executionState: expect.objectContaining({
+        status: "pending",
+        currentParticipant: { type: "user", agentId: null, userId: reviewerUserId },
+      }),
     });
   });
 });

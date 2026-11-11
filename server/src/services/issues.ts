@@ -12280,6 +12280,8 @@ export function issueService(db: Db) {
               issueData.assigneeAgentId !== undefined
                 ? issueData.assigneeAgentId
                 : receiptExisting.assigneeAgentId,
+            actorAgentId,
+            currentAssigneeAgentId: receiptExisting.assigneeAgentId,
             checkReviewStage: false,
             workflowControlledAssignment,
           });
