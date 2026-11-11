@@ -12,6 +12,12 @@ const mockIssueService = vi.hoisted(() => ({
   update: vi.fn(),
   addComment: vi.fn(),
   getDependencyReadiness: vi.fn(),
+  // Default: every wired blocker counts as unresolved, matching this suite's
+  // pre-SUP-23854 semantics. Tests that exercise the all-done refusal
+  // override this per-test.
+  listUnresolvedBlockerIssueIds: vi.fn(
+    async (_companyId: string, blockerIssueIds: string[]) => blockerIssueIds,
+  ),
   getCurrentScheduledRetry: vi.fn(),
   findMentionedAgents: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),

@@ -391,7 +391,6 @@ import {
   ORPHANED_DUPLICATE_RUN_CONFLICT_CODE,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   isTerminalOrMissingHeartbeatRun,
-  listUnresolvedBlockerIssueIds,
   expectedUpdatedAtUnsupportedWithSideEffects,
   issueVersionConflict,
   workspaceReopenRequired,
@@ -20003,8 +20002,7 @@ export function issueRoutes(
         ? [...new Set(req.body.blockedByIssueIds as string[])]
         : null;
       const hasUnresolvedBlocker = requestedBlockerIds
-        ? requestedBlockerIds.length > 0 && (await listUnresolvedBlockerIssueIds(
-          db,
+        ? requestedBlockerIds.length > 0 && (await svc.listUnresolvedBlockerIssueIds(
           existing.companyId,
           requestedBlockerIds,
         )).length > 0
@@ -20028,8 +20026,7 @@ export function issueRoutes(
         : null;
       let setEntirelyResolved: boolean;
       if (requestedBlockerIds) {
-        const unresolvedBlockerIssueIds = await listUnresolvedBlockerIssueIds(
-          db,
+        const unresolvedBlockerIssueIds = await svc.listUnresolvedBlockerIssueIds(
           existing.companyId,
           requestedBlockerIds,
         );

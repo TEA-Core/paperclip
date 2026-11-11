@@ -2,6 +2,7 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { buildIssueBlockersResolvedWakeStateKey } from "../services/issue-dependency-wakeups.ts";
+import { listUnresolvedBlockerIssueIds as realListUnresolvedBlockerIssueIds } from "../services/issues.js";
 import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 // The first test in this suite imports the large `routes/issues.ts` module
@@ -33,6 +34,10 @@ const mockIssueService = vi.hoisted(() => ({
   checkout: vi.fn(),
   update: vi.fn(),
   getDependencyReadiness: vi.fn(),
+  // SUP-23854: the route resolves wired blocker sets through the service
+  // object; createApp() re-points this at the real function over the stub
+  // routeDb so the finalization-aware filtering stays under test.
+  listUnresolvedBlockerIssueIds: vi.fn(async (_companyId: string, _blockerIssueIds: string[]) => [] as string[]),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
   findMentionedAgents: vi.fn(async () => []),
@@ -202,6 +207,14 @@ async function createApp(
     // cross-issue attribution guard can resolve its `for update` run lookup.
     transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(routeDb),
   };
+  mockIssueService.listUnresolvedBlockerIssueIds.mockImplementation(
+    async (companyId: string, blockerIssueIds: string[]) =>
+      realListUnresolvedBlockerIssueIds(
+        routeDb as unknown as Parameters<typeof realListUnresolvedBlockerIssueIds>[0],
+        companyId,
+        blockerIssueIds,
+      ),
+  );
   const { issueRoutes } = await vi.importActual<typeof import("../routes/issues.js")>(
     "../routes/issues.js",
   );

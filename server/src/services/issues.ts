@@ -9784,6 +9784,15 @@ export function issueService(db: Db) {
       };
     },
 
+    // Route-level block-intent validation resolves the requested blocker set
+    // through the service object so fully-mocking route tests can stub it
+    // alongside getDependencyReadiness instead of a module-level import.
+    listUnresolvedBlockerIssueIds: async (
+      companyId: string,
+      blockerIssueIds: string[],
+      dbOrTx: any = db,
+    ) => listUnresolvedBlockerIssueIds(dbOrTx, companyId, blockerIssueIds),
+
     getDependencyReadiness: async (issueId: string, dbOrTx: any = db) => {
       const issue = await dbOrTx
         .select({ id: issues.id, companyId: issues.companyId })
