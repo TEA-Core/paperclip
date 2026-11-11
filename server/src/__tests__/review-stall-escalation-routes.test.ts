@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -48,11 +48,16 @@ const activityFault = vi.hoisted(() => ({ action: null as string | null }));
 // pre-stop compare passed and the runner stop ran.
 // `beforeResolve` runs once, right before an interaction accept or reject opens its
 // transaction: after the route read the card, before the resolution locks it.
+// `afterUpdate` runs after each route-driven issueService.update resolves — i.e.
+// after that update's transaction committed — and stays armed until its gate
+// (the hook's return value) matches the update it was armed for: the window
+// between a committed transition and the post-commit work keyed off it.
 const lockInterleave = vi.hoisted(() => ({
   beforeLock: null as null | (() => Promise<void>),
   beforeSecondLock: null as null | (() => Promise<void>),
   lockReads: 0,
   beforeResolve: null as null | (() => Promise<void>),
+  afterUpdate: null as null | ((patch: Record<string, unknown>) => Promise<boolean>),
 }));
 vi.mock("../services/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/index.js")>();
@@ -67,6 +72,16 @@ vi.mock("../services/index.js", async (importOriginal) => {
       const svc = actual.issueService(...args);
       return {
         ...svc,
+        update: async (...updateArgs: Parameters<typeof svc.update>) => {
+          const result = await svc.update(...updateArgs);
+          if (lockInterleave.afterUpdate) {
+            const consumed = await lockInterleave.afterUpdate(
+              (updateArgs[1] ?? {}) as Record<string, unknown>,
+            );
+            if (consumed) lockInterleave.afterUpdate = null;
+          }
+          return result;
+        },
         getByIdForUpdate: async (...lockArgs: Parameters<typeof svc.getByIdForUpdate>) => {
           const hook = lockInterleave.beforeLock;
           lockInterleave.beforeLock = null;
@@ -142,6 +157,7 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     lockInterleave.beforeSecondLock = null;
     lockInterleave.lockReads = 0;
     lockInterleave.beforeResolve = null;
+    lockInterleave.afterUpdate = null;
     if (seededRunIds.length > 0) {
       await db.update(heartbeatRuns).set({ status: "cancelled" }).where(inArray(heartbeatRuns.id, seededRunIds));
       seededRunIds.length = 0;
@@ -940,6 +956,116 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     expect(row.assigneeAgentId).toBe(seeded.coderId);
     expect(row.executionPolicy).not.toHaveProperty("stallEscalation");
     expect(await decisionRows(issueId)).toHaveLength(1);
+  }, 60_000);
+
+  async function interactionRefusalRows(issueId: string) {
+    return db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.filter((entry) => entry.action === "issue.thread_interaction_create_refused"));
+  }
+
+  it("refuses to mint a round-cap escalation card whose human lost an active membership after the commit (SUP-23807)", async () => {
+    const seeded = await seedCompany();
+    const { issueId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 2,
+      changesRequestedCount: 1,
+    });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+    // The escalation target was a valid assignee when the decision committed.
+    // Her membership is archived right after the escalation-hold update commits
+    // and before the post-commit mint runs, so the mint itself — not the
+    // pre-commit validation — must refuse the human_only card nobody could
+    // resolve any more.
+    lockInterleave.afterUpdate = async (patch) => {
+      if (patch.assigneeUserId !== seeded.userId) return false;
+      await db
+        .update(companyMemberships)
+        .set({ status: "archived" })
+        .where(
+          and(
+            eq(companyMemberships.companyId, seeded.companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, seeded.userId),
+          ),
+        );
+      return true;
+    };
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(plainFinding);
+
+    // The membership really was archived after the hold committed.
+    expect(lockInterleave.afterUpdate).toBeNull();
+    const membership = await db
+      .select()
+      .from(companyMemberships)
+      .where(
+        and(
+          eq(companyMemberships.companyId, seeded.companyId),
+          eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.principalId, seeded.userId),
+        ),
+      );
+    expect(membership[0]?.status).toBe("archived");
+
+    // The decision and the escalation hold commit; the mint is post-commit, so
+    // its typed refusal must not fail the request.
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const decisions = await decisionRows(issueId);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]?.outcome).toBe("changes_requested");
+    const row = await issueRow(issueId);
+    expect(row.status).toBe("in_review");
+    expect(row.assigneeAgentId).toBeNull();
+    expect(row.assigneeUserId).toBe(seeded.userId);
+    expect(row.executionState).toMatchObject({
+      currentParticipant: { type: "user", userId: seeded.userId },
+      changesRequestedCount: 2,
+    });
+    // No permanently unanswerable card exists...
+    expect(
+      await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId)),
+    ).toHaveLength(0);
+    // ...and exactly one typed, countable refusal activity records why.
+    const refusals = await interactionRefusalRows(issueId);
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]?.details).toMatchObject({
+      code: "interaction_unaddressable",
+      reason: "missing_addressee",
+    });
+  }, 60_000);
+
+  it("mints the round-cap escalation card for an active member through the real service (SUP-23807)", async () => {
+    const seeded = await seedCompany();
+    const { issueId } = await seedPlainPendingReview(seeded, {
+      maxReviewRounds: 2,
+      changesRequestedCount: 1,
+    });
+    const runId = await liveRun(seeded, seeded.reviewerId, issueId);
+
+    const res = await request(app(agentActor(seeded, seeded.reviewerId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send(plainFinding);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect((await issueRow(issueId)).assigneeUserId).toBe(seeded.userId);
+    const interactions = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.issueId, issueId));
+    expect(interactions).toHaveLength(1);
+    expect(interactions[0]).toMatchObject({
+      kind: "request_confirmation",
+      status: "pending",
+      addresseeAgentId: null,
+      addresseeUserId: seeded.userId,
+      requestedResolverPolicy: "human_only",
+      continuationPolicy: "wake_assignee",
+    });
+    expect(await interactionRefusalRows(issueId)).toHaveLength(0);
   }, 60_000);
 
   it("refuses a plain-card bounce that would erase a same-head PR binding refreshed after the read (SUP-23260)", async () => {
