@@ -2394,6 +2394,24 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       .where(eq(executionWorkspaces.companyId, companyId));
     expect(workspaces.filter((row) => row.cwd === FAILED_SOURCE_WORKSPACE_CWD)).toHaveLength(1);
 
+    // The owner wake must not write a workspace expectation back onto the
+    // minted card: the mint refused the failed source workspace, so the card
+    // must still hold the no-binding board-only shape after its wake drained
+    // (SUP-23493; pc1145a-adv recovery-card regression).
+    const [recoveryIssueAfterWake] = await db
+      .select({
+        executionWorkspaceId: issues.executionWorkspaceId,
+        projectWorkspaceId: issues.projectWorkspaceId,
+        executionWorkspacePreference: issues.executionWorkspacePreference,
+        deliveryRequirement: issues.deliveryRequirement,
+      })
+      .from(issues)
+      .where(eq(issues.id, action.recoveryIssueId!));
+    expect(recoveryIssueAfterWake.executionWorkspaceId).toBeNull();
+    expect(recoveryIssueAfterWake.projectWorkspaceId).toBeNull();
+    expect(recoveryIssueAfterWake.executionWorkspacePreference).toBe("agent_default");
+    expect(recoveryIssueAfterWake.deliveryRequirement).toBe("record_only");
+
     const ordinaryChild = await issueService(db).create(companyId, {
       parentId: issueId,
       projectId,

@@ -449,7 +449,7 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
     );
   });
 
-  it("does not require git metadata for a record_only card", async () => {
+  it("does not require git metadata for the exhausted record-only recovery card minted off a failed source workspace", async () => {
     const input = buildWorkspaceValidationInput();
     const cwd = "/tmp/paperclip-record-only-without-git-metadata";
 
@@ -459,6 +459,10 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
           issue: {
             ...input.issue!,
             deliveryRequirement: "record_only",
+            executionWorkspaceId: null,
+            projectWorkspaceId: null,
+            executionWorkspacePreference: "agent_default",
+            originKind: "stranded_issue_recovery",
           },
           resolvedWorkspace: buildResolvedWorkspace({ cwd }),
           executionWorkspace: {
@@ -473,6 +477,64 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
         }),
       ),
     ).resolves.toBeUndefined();
+  });
+
+  it("still requires git metadata for a record_only card with a bound execution workspace", async () => {
+    const input = buildWorkspaceValidationInput();
+    const cwd = "/tmp/paperclip-record-only-bound-workspace-without-git-metadata";
+
+    await expectWorkspaceValidationFailure(
+      buildWorkspaceValidationInput({
+        issue: {
+          ...input.issue!,
+          deliveryRequirement: "record_only",
+          executionWorkspaceId: "bound-execution-workspace-1",
+          executionWorkspacePreference: "reuse_existing",
+          originKind: "manual",
+        },
+        resolvedWorkspace: buildResolvedWorkspace({ cwd }),
+        executionWorkspace: {
+          ...input.executionWorkspace,
+          baseCwd: cwd,
+          cwd,
+        },
+        persistedExecutionWorkspace: {
+          ...input.persistedExecutionWorkspace!,
+          cwd,
+        },
+      }),
+      "missing_git_metadata",
+      "has no .git metadata",
+    );
+  });
+
+  it("still requires git metadata for an ordinary record_only card outside the exhausted-recovery mint", async () => {
+    const input = buildWorkspaceValidationInput();
+    const cwd = "/tmp/paperclip-record-only-non-recovery-without-git-metadata";
+
+    await expectWorkspaceValidationFailure(
+      buildWorkspaceValidationInput({
+        issue: {
+          ...input.issue!,
+          deliveryRequirement: "record_only",
+          executionWorkspaceId: null,
+          executionWorkspacePreference: "agent_default",
+          originKind: "manual",
+        },
+        resolvedWorkspace: buildResolvedWorkspace({ cwd }),
+        executionWorkspace: {
+          ...input.executionWorkspace,
+          baseCwd: cwd,
+          cwd,
+        },
+        persistedExecutionWorkspace: {
+          ...input.persistedExecutionWorkspace!,
+          cwd,
+        },
+      }),
+      "missing_git_metadata",
+      "has no .git metadata",
+    );
   });
 
   it("does not apply the git-sensitive workspace guard to non-local execution targets", async () => {
