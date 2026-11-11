@@ -172,6 +172,7 @@ export function createSecretProposalsService(db: Db) {
     txDb: Db,
     proposal: Proposal,
     sourceSecretLabel: string,
+    addresseeUserId: string | null,
   ) {
     if (!proposal.originIssueId || !proposal.targetId || !proposal.configPath) return proposal;
     const target = await txDb
@@ -199,6 +200,7 @@ export function createSecretProposalsService(db: Db) {
         summary: `Bind ${sourceSecretLabel} to ${target.name} as ${proposal.configPath}`,
         createdByAgentId: proposal.proposedByAgentId,
         addresseeAgentId: null,
+        addresseeUserId,
         payload: {
           version: 1,
           prompt: `Bind secret ${sourceSecretLabel} to ${target.name} as ${proposal.configPath}?`,
@@ -243,6 +245,7 @@ export function createSecretProposalsService(db: Db) {
         interactionStatus: "pending",
         continuationPolicy: "wake_assignee",
         addresseeAgentId: null,
+        addresseeUserId,
         requestedResolverPolicy: "board_only",
         effectiveResolverPolicy: "board_only",
         serverOwnedPayload: "secretProposal",
@@ -378,6 +381,30 @@ export function createSecretProposalsService(db: Db) {
     if (!input.justification.trim()) throw unprocessable("Justification is required");
     if (input.justification.trim().length > 20_000) throw unprocessable("Justification must be at most 20000 characters");
     const { run, originIssueId } = await loadRunContext(db, context);
+    if (originIssueId && !run.responsibleUserId) {
+      const details = {
+        code: "interaction_unaddressable",
+        reason: "missing_addressee",
+        kind: "request_confirmation",
+        idempotencyKey: null,
+      };
+      await logActivity(db, {
+        companyId: context.companyId,
+        actorType: "agent",
+        actorId: run.agentId,
+        agentId: run.agentId,
+        runId: run.id,
+        action: "issue.thread_interaction_create_refused",
+        entityType: "issue",
+        entityId: originIssueId,
+        issueId: originIssueId,
+        details,
+      });
+      throw unprocessable(
+        "A request_confirmation requires a concrete user or agent addressee",
+        details,
+      );
+    }
     const targetAgentId = input.targetAgentId ?? run.agentId;
     const [proposerAncestors, targetAncestors] = await Promise.all([
       ancestorIds(db, context.companyId, run.agentId),
@@ -472,7 +499,7 @@ export function createSecretProposalsService(db: Db) {
         }).returning().then((rows) => rows[0]);
         await recordCreated(proposal, txDb);
         if (!sourceSecretLabel) throw conflict("Binding proposal source secret label is unavailable");
-        return createBindingInteraction(txDb, proposal, sourceSecretLabel);
+        return createBindingInteraction(txDb, proposal, sourceSecretLabel, run.responsibleUserId);
       },
     );
   }

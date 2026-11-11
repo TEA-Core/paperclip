@@ -659,6 +659,12 @@ describe("PaperclipRunnerToolAuthority", () => {
   });
 
   it("returns the exact accepted plan revision in task context", async () => {
+    await db.update(heartbeatRuns)
+      .set({ responsibleUserId: "run-owner" })
+      .where(eq(heartbeatRuns.id, runId));
+    await db.update(issues)
+      .set({ responsibleUserId: "issue-owner" })
+      .where(eq(issues.id, issueId));
     const plan = await documentService(db).getIssueDocumentByKey(
       issueId,
       "plan",
@@ -696,6 +702,8 @@ describe("PaperclipRunnerToolAuthority", () => {
       interaction: {
         kind: "request_confirmation",
         status: "pending",
+        addresseeAgentId: null,
+        addresseeUserId: "run-owner",
         payload: {
           target: {
             type: "issue_document",
@@ -1089,6 +1097,70 @@ describe("PaperclipRunnerToolAuthority", () => {
     ).toHaveLength(0);
   });
 
+  it("refuses an unaddressable runner confirmation without creating an interaction", async () => {
+    const unaddressableIssueId = "00000000-0000-4000-8000-000000000122";
+    const unaddressableRunId = "00000000-0000-4000-8000-000000000123";
+    await db.insert(issues).values({
+      id: unaddressableIssueId,
+      companyId,
+      issueNumber: 122,
+      identifier: "RNT-122",
+      title: "Unaddressable confirmation",
+      status: "in_progress",
+      workMode: "standard",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: unaddressableRunId,
+      companyId,
+      agentId,
+      status: "running",
+      runtimeMode: "native",
+      nativeIssueId: unaddressableIssueId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      contextSnapshot: { issueId: unaddressableIssueId },
+    });
+    await db.update(issues)
+      .set({ executionRunId: unaddressableRunId })
+      .where(eq(issues.id, unaddressableIssueId));
+    const authority = new PaperclipRunnerToolAuthority(db, {
+      companyId,
+      agentId,
+      issueId: unaddressableIssueId,
+      runId: unaddressableRunId,
+    });
+    const before = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.issueId, unaddressableIssueId));
+    await expect(authority.execute({
+      tool: "request_human_input",
+      callId: "missing-confirmation-owner",
+      arguments: {
+        idempotencyKey: "missing-confirmation-owner",
+        interactionKind: "confirmation",
+        title: "Unaddressable confirmation",
+        prompt: "Cannot be answered.",
+        continuationPolicy: "wake_assignee",
+        payload: {},
+      },
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "interaction_unaddressable", reason: "missing_addressee" },
+    });
+    const after = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.issueId, unaddressableIssueId));
+    expect(after).toHaveLength(before.length);
+    const refusals = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, unaddressableIssueId));
+    expect(refusals.filter((entry) => entry.action === "issue.thread_interaction_create_refused")).toHaveLength(1);
+  });
+
   it("captures delegation and approval origins before steering and preserves replay identity", async () => {
     const issueId = "00000000-0000-4000-8000-000000000120";
     const runId = "00000000-0000-4000-8000-000000000121";
@@ -1126,7 +1198,11 @@ describe("PaperclipRunnerToolAuthority", () => {
       prompt: "Continue?", continuationPolicy: "wake_assignee", payload: {},
     } });
     const interactions = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId));
-    expect(interactions.find((row) => row.title === "Approve continuation")?.sourceIdentityContextId).toBe(pending!.id);
+    expect(interactions.find((row) => row.title === "Approve continuation")).toMatchObject({
+      sourceIdentityContextId: pending!.id,
+      addresseeAgentId: null,
+      addresseeUserId: "person-b",
+    });
   });
 
   it("fails closed once the run is no longer active", async () => {

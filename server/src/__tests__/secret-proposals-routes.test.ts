@@ -10,6 +10,7 @@ import {
   activityLog,
   agents,
   companies,
+  companyMemberships,
   companySecretBindings,
   companySecretProposals,
   companySecretProviderConfigs,
@@ -72,6 +73,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(companies);
   });
 
@@ -475,6 +477,112 @@ describeEmbeddedPostgres("secret proposal routes", () => {
         body: expect.stringContaining("GET /api/agents/me/secrets"),
       }),
     ]);
+  });
+
+  it("addresses binding confirmations to the run owner instead of the issue owner", async () => {
+    const fixture = await seedRun();
+    await db.update(heartbeatRuns)
+      .set({ responsibleUserId: "run-owner" })
+      .where(eq(heartbeatRuns.id, fixture.heartbeatRunId));
+    await db.update(issues)
+      .set({ responsibleUserId: "issue-owner" })
+      .where(eq(issues.id, fixture.issueId));
+    await db.insert(companyMemberships).values({
+      companyId: fixture.companyId,
+      principalType: "user",
+      principalId: "run-owner",
+      status: "active",
+      membershipRole: "member",
+    });
+    const liveSecret = await secretService(db).create(fixture.companyId, {
+      name: "dev/run-owner/source",
+      key: "RUN_OWNER_SOURCE",
+      provider: "local_encrypted",
+      value: "run-owner-secret",
+    });
+
+    const proposed = await request(createAgentApp(fixture))
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "binding",
+        secretId: liveSecret.id,
+        configPath: "access.RUN_OWNER_ALIAS",
+        justification: "Verify run-owned confirmation addressing",
+      });
+
+    expect(proposed.status).toBe(201);
+    const [confirmation] = await db.select().from(issueThreadInteractions);
+    expect(confirmation).toMatchObject({
+      id: proposed.body.interactionId,
+      addresseeUserId: "run-owner",
+      addresseeAgentId: null,
+      status: "pending",
+    });
+    const [creationActivity] = await db.select().from(activityLog).where(and(
+      eq(activityLog.action, "issue.thread_interaction_created"),
+      eq(activityLog.entityId, fixture.issueId),
+    ));
+    expect(creationActivity.details).toMatchObject({
+      interactionId: confirmation.id,
+      addresseeUserId: "run-owner",
+      addresseeAgentId: null,
+    });
+
+    const accepted = await issueThreadInteractionService(db).acceptInteraction(
+      { id: fixture.issueId, companyId: fixture.companyId },
+      confirmation.id,
+      {},
+      { userId: "run-owner" },
+    );
+    expect(accepted.interaction).toMatchObject({
+      id: confirmation.id,
+      status: "accepted",
+      resolvedByUserId: "run-owner",
+    });
+  });
+
+  it("refuses a binding confirmation when the run has no responsible user", async () => {
+    const fixture = await seedRun();
+    await db.update(heartbeatRuns)
+      .set({ responsibleUserId: null })
+      .where(eq(heartbeatRuns.id, fixture.heartbeatRunId));
+    const liveSecret = await secretService(db).create(fixture.companyId, {
+      name: "dev/missing-run-owner/source",
+      key: "MISSING_RUN_OWNER_SOURCE",
+      provider: "local_encrypted",
+      value: "missing-run-owner-secret",
+    });
+
+    const proposed = await request(createAgentApp(fixture))
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "binding",
+        secretId: liveSecret.id,
+        configPath: "access.MISSING_RUN_OWNER_ALIAS",
+        justification: "Verify unaddressed confirmations are refused",
+      });
+
+    expect(proposed.status).toBe(422);
+    expect(proposed.body).toMatchObject({
+      error: "A request_confirmation requires a concrete user or agent addressee",
+      details: {
+        code: "interaction_unaddressable",
+        reason: "missing_addressee",
+        kind: "request_confirmation",
+      },
+    });
+    expect(await db.select().from(issueThreadInteractions)).toEqual([]);
+    expect(await db.select().from(companySecretProposals)).toEqual([]);
+    const refusals = await db.select().from(activityLog).where(eq(
+      activityLog.action,
+      "issue.thread_interaction_create_refused",
+    ));
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0].details).toMatchObject({
+      code: "interaction_unaddressable",
+      reason: "missing_addressee",
+      kind: "request_confirmation",
+    });
   });
 
   it("approves a binding without cascade after its secret proposal was approved separately", async () => {
@@ -979,7 +1087,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       { id: fixture.issueId, companyId: fixture.companyId, status: "in_progress" },
       card!.id,
       { reason: "Use the canonical binding name" },
-      { userId: "board-user" },
+      { userId: "user-1" },
     );
 
     expect(await db.select().from(companySecretProposals)
@@ -1063,7 +1171,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       { id: fixture.issueId, companyId: fixture.companyId, status: "in_progress" },
       proposed.body.interactionId,
       { reason: "Reject after the lock-order check" },
-      { userId: "board-user" },
+      { userId: "user-1" },
     );
 
     try {

@@ -96,7 +96,7 @@ async function createAgent(db: Db, companyId: string, permissions: Record<string
     .then((rows) => rows[0]!);
 }
 
-async function createIssueAndRun(db: Db, companyId: string, agentId: string) {
+async function createIssueAndRun(db: Db, companyId: string, agentId: string, responsibleUserId?: string) {
   const project = await db
     .insert(projects)
     .values({ companyId, name: `Project ${randomUUID()}` })
@@ -113,6 +113,7 @@ async function createIssueAndRun(db: Db, companyId: string, agentId: string) {
     })
     .returning()
     .then((rows) => rows[0]!);
+  if (responsibleUserId) await createActiveMember(db, companyId, responsibleUserId);
   const run = await db
     .insert(heartbeatRuns)
     .values({
@@ -120,6 +121,7 @@ async function createIssueAndRun(db: Db, companyId: string, agentId: string) {
       agentId,
       invocationSource: "assignment",
       status: "running",
+      responsibleUserId,
       contextSnapshot: { issueId: issue.id, projectId: project.id },
     })
     .returning()
@@ -2948,7 +2950,7 @@ rl.on("line", (line) => {
   it("expires legacy managed-connector approvals before provider dispatch", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
-    const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    const { issue, run } = await createIssueAndRun(db, company.id, agent.id, "board-user");
     const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
       body: {
         jsonrpc: "2.0",
@@ -3061,7 +3063,7 @@ rl.on("line", (line) => {
   it("does not expire a managed-connector provider execution already in flight", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
-    const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    const { issue, run } = await createIssueAndRun(db, company.id, agent.id, "board-user");
     const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
       body: {
         jsonrpc: "2.0",
@@ -3249,7 +3251,7 @@ rl.on("line", (line) => {
   it("enforces policy, approvals, retries, rate limits, and company boundaries for connected remote MCP calls", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
-    const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    const { issue, run } = await createIssueAndRun(db, company.id, agent.id, "board-user");
     const otherCompany = await createCompany(db);
     const otherAgent = await createAgent(db, otherCompany.id);
     const { run: otherRun } = await createIssueAndRun(db, otherCompany.id, otherAgent.id);
@@ -3677,7 +3679,7 @@ rl.on("line", (line) => {
   it("requires re-review when an approved connected MCP replay target changed", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
-    const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    const { issue, run } = await createIssueAndRun(db, company.id, agent.id, "board-user");
     const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
       body: {
         jsonrpc: "2.0",
@@ -3777,7 +3779,7 @@ rl.on("line", (line) => {
     // create a fresh, signable request.
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
-    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id, "board-user");
     const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
       body: {
         jsonrpc: "2.0",
@@ -3882,7 +3884,7 @@ rl.on("line", (line) => {
     // request. It must not expire the row and must not create a duplicate.
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
-    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id, "board-user");
     const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
       body: {
         jsonrpc: "2.0",
@@ -3972,7 +3974,7 @@ rl.on("line", (line) => {
   it("requires re-review when an approved connected MCP replay credential latest version changed", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
-    const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    const { issue, run } = await createIssueAndRun(db, company.id, agent.id, "board-user");
     const originalCredential = `approved-replay-token-${randomUUID()}`;
     const rotatedCredential = `rotated-replay-token-${randomUUID()}`;
     const secret = await secretService(db).create(company.id, {
@@ -5338,7 +5340,7 @@ rl.on("line", (line) => {
   it("defers write-risk tool calls into issue-thread approval requests", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
-    const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    const { issue, run } = await createIssueAndRun(db, company.id, agent.id, "board-user");
     await allowToolsForAgent(db, company.id, agent.id, [
       "mcp-remote-fixture:echo",
       "mcp-remote-fixture:update_note",

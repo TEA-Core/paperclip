@@ -2455,6 +2455,19 @@ export function createToolGatewayService(
         .onConflictDoNothing();
     }
 
+    let addresseeUserId = input.session.responsibleUserId ?? null;
+    if (input.session.runId) {
+      const [run] = await db
+        .select({ responsibleUserId: heartbeatRuns.responsibleUserId })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, input.session.runId),
+          eq(heartbeatRuns.companyId, input.session.companyId),
+        ))
+        .limit(1);
+      addresseeUserId = run?.responsibleUserId ?? input.session.responsibleUserId ?? null;
+    }
+
     const interaction = await interactions.create(
       { id: input.session.issueId, companyId: input.session.companyId },
       {
@@ -2462,6 +2475,7 @@ export function createToolGatewayService(
         idempotencyKey: `tool-action:${actionRequest.id}`,
         title: "Approve tool action",
         resolverPolicy: "human_only",
+        addresseeUserId,
         sourceRunId: input.session.runId ?? undefined,
         summary: "This action needs your approval before it runs.",
         continuationPolicy: "wake_assignee",

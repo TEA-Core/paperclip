@@ -53,6 +53,7 @@ import { nativeToolContractFingerprintForTarget } from "./native-session-resume.
 import { buildNativeHeartbeatPreparationSpans } from "./native-run-trace.js";
 import { NativeRunnerOwnershipUnverifiedError } from "./native-runner-ownership.js";
 import type { AdapterRuntimeEvent } from "../../adapters/index.js";
+import { unprocessable } from "../../errors.js";
 
 type BackendFactoryOptions = {
   runnerInstanceId?: string;
@@ -289,6 +290,7 @@ import {
   resolveNativeHarnessPersistenceProfile,
   runnerdStateProvesIncompleteBootstrap,
   semanticProviderPlanMarkdown,
+  synchronizeCompletedProviderPlan,
   sha256DirectoryTree,
   stageRemoteRunnerDirectory,
   steerNativeSession,
@@ -3835,6 +3837,142 @@ describe("explicit failed native retry physical evidence", () => {
 });
 
 describe("provider plan synchronization", () => {
+  it("addresses a synchronized plan approval to the bound run owner", async () => {
+    const owner = "run-owner";
+    const created: Record<string, unknown>[] = [];
+    const run = { responsibleUserId: owner };
+    const document = {
+      id: "plan-document",
+      latestRevisionId: "plan-revision",
+      latestRevisionNumber: 3,
+      body: "# Approved plan",
+    };
+    let selectCount = 0;
+    const db = {
+      select: () => {
+        selectCount += 1;
+        return {
+          from: () => ({
+            innerJoin: () => ({
+              where: () => ({ orderBy: () => ({ limit: async () => [] }) }),
+            }),
+            where: () => ({
+              limit: async () => (selectCount === 3 ? [run] : []),
+            }),
+          }),
+        };
+      },
+    } as unknown as Db;
+    const interactionModule = await import("../issue-thread-interactions.js");
+    const documentModule = await import("../documents.js");
+    const interactionSpy = vi.spyOn(interactionModule, "issueThreadInteractionService").mockReturnValue({
+      create: async (_issue: unknown, data: unknown) => {
+        created.push(data as Record<string, unknown>);
+        return { id: "confirmation", status: "pending" };
+      },
+    } as never);
+    const documentSpy = vi.spyOn(documentModule, "documentService").mockReturnValue({
+      getIssueDocumentByKey: async () => document,
+      upsertIssueDocument: async () => ({ document }),
+    } as never);
+    try {
+      const result = await synchronizeCompletedProviderPlan({
+        db,
+        execution: {
+          ...execution,
+          executionMode: "plan",
+          planningContext: { baseRevisionId: "base-revision" },
+        } as never,
+        event: {
+          sourceEventId: "plan-event",
+          turnId: "turn-1",
+          eventType: "plan.updated",
+          payload: { complete: true, planId: "plan-1", revision: 1, markdown: "# Approved plan" },
+        },
+      });
+      expect(result).toMatchObject({ status: "synchronized", confirmationId: "confirmation" });
+      expect(created).toEqual([expect.objectContaining({
+        kind: "request_confirmation",
+        addresseeAgentId: null,
+        addresseeUserId: owner,
+      })]);
+    } finally {
+      interactionSpy.mockRestore();
+      documentSpy.mockRestore();
+    }
+  });
+
+  it("fails closed when a synchronized plan approval has no bound run owner", async () => {
+    const created: Record<string, unknown>[] = [];
+    const document = {
+      id: "plan-document",
+      latestRevisionId: "plan-revision",
+      latestRevisionNumber: 3,
+      body: "# Unaddressable plan",
+    };
+    let selectCount = 0;
+    const db = {
+      select: () => {
+        selectCount += 1;
+        return {
+          from: () => ({
+            innerJoin: () => ({
+              where: () => ({ orderBy: () => ({ limit: async () => [] }) }),
+            }),
+            where: () => ({
+              limit: async () => (selectCount === 3 ? [{ responsibleUserId: null }] : []),
+            }),
+          }),
+        };
+      },
+    } as unknown as Db;
+    const interactionModule = await import("../issue-thread-interactions.js");
+    const documentModule = await import("../documents.js");
+    const interactionSpy = vi.spyOn(interactionModule, "issueThreadInteractionService").mockReturnValue({
+      create: async (_issue: unknown, data: unknown) => {
+        created.push(data as Record<string, unknown>);
+        throw unprocessable(
+          "A request_confirmation requires a concrete user or agent addressee",
+          {
+            code: "interaction_unaddressable",
+            reason: "missing_addressee",
+          },
+        );
+      },
+    } as never);
+    const documentSpy = vi.spyOn(documentModule, "documentService").mockReturnValue({
+      getIssueDocumentByKey: async () => document,
+      upsertIssueDocument: async () => ({ document }),
+    } as never);
+    try {
+      await expect(synchronizeCompletedProviderPlan({
+        db,
+        execution: {
+          ...execution,
+          executionMode: "plan",
+          planningContext: { baseRevisionId: "base-revision" },
+        } as never,
+        event: {
+          sourceEventId: "plan-event",
+          turnId: "turn-1",
+          eventType: "plan.updated",
+          payload: { complete: true, planId: "plan-1", revision: 1, markdown: "# Unaddressable plan" },
+        },
+      })).rejects.toMatchObject({
+        status: 422,
+        details: { code: "interaction_unaddressable", reason: "missing_addressee" },
+      });
+      expect(created).toEqual([expect.objectContaining({
+        kind: "request_confirmation",
+        addresseeAgentId: null,
+        addresseeUserId: null,
+      })]);
+    } finally {
+      interactionSpy.mockRestore();
+      documentSpy.mockRestore();
+    }
+  });
+
   it("prefers the provider's completed Markdown when it is available", () => {
     expect(
       providerPlanMarkdown({
