@@ -128,6 +128,34 @@ export function buildIssueBlockersResolvedWakeStateKey(input: IssueBlockersResol
   );
 }
 
+/**
+ * SUP-23849/SUP-23854: stable idempotency key for the blocked-restored wake
+ * (`mutation: "blocked_dependency_restored"`). Unlike
+ * `buildIssueBlockersResolvedWakeStateKey` this key deliberately does NOT hash
+ * `blockedTransitionAt`: a dependent that repeatedly re-blocks on the same
+ * already-done blocker set stamps a new blocked cycle (and therefore a new
+ * cycle key) on every attempt, which re-armed the restored-blocker wake loop
+ * observed in the SUP-23842 incident. Keying only on (dependent, sorted
+ * blocker set) makes the dedup permanent for that set — at most one
+ * restored-state wake per (dependent issue, blocker set), across any number of
+ * re-block cycles. The distinct `restored-state` leaf means it can never
+ * collide with — or disturb the suppression semantics of — the cycle-scoped
+ * `state` keys used by the `blocker_done` paths.
+ */
+export function buildIssueBlockersResolvedRestoredWakeIdempotencyKey(input: {
+  dependentIssueId: string;
+  blockerIssueIds: string[];
+}) {
+  const sortedBlockerIssueIds = uniqueSortedBlockerIssueIds(input.blockerIssueIds);
+  return [
+    ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+    "restored-state",
+    input.dependentIssueId,
+    String(sortedBlockerIssueIds.length),
+    hashBlockerReadyStateDigest(sortedBlockerIssueIds, null),
+  ].join(":");
+}
+
 function parseWakeCycleDate(blockedTransitionAt: IssueBlockersResolvedWakeCycleInput): Date | null {
   if (blockedTransitionAt == null || blockedTransitionAt === "") return null;
   const parsed = blockedTransitionAt instanceof Date
