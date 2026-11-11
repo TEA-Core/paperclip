@@ -329,6 +329,7 @@ type RecoveryWakeupOptions = {
   reason?: string | null;
   payload?: Record<string, unknown> | null;
   idempotencyKey?: string | null;
+  completedRearmCutoff?: Date | null;
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
@@ -8290,6 +8291,7 @@ export function recoveryService(
               ...(zeroBlockerHeal ? { zeroBlockerHeal: true } : {}),
             },
             idempotencyKey,
+            completedRearmCutoff: cutoff,
             requestedByActorType: "system",
             requestedByActorId,
             contextSnapshot: {

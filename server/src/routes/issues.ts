@@ -368,10 +368,8 @@ import {
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeStateKey,
-  buildIssueBlockersResolvedRestoredWakeIdempotencyKey,
   type IssueBlockersResolvedWakeup,
   findExistingIssueBlockersResolvedWakeForReadyState,
-  findExistingIssueBlockersResolvedWakeForAnyKey,
   buildIssueBlockersResolvedWakeEmittedActivity,
 } from "../services/issue-dependency-wakeups.js";
 import {
@@ -393,6 +391,7 @@ import {
   ORPHANED_DUPLICATE_RUN_CONFLICT_CODE,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   isTerminalOrMissingHeartbeatRun,
+  listUnresolvedBlockerIssueIds,
   expectedUpdatedAtUnsupportedWithSideEffects,
   issueVersionConflict,
   workspaceReopenRequired,
@@ -20004,11 +20003,11 @@ export function issueRoutes(
         ? [...new Set(req.body.blockedByIssueIds as string[])]
         : null;
       const hasUnresolvedBlocker = requestedBlockerIds
-        ? requestedBlockerIds.length > 0 && await db.select({ id: issueRows.id }).from(issueRows).where(and(
-          eq(issueRows.companyId, existing.companyId),
-          inArray(issueRows.id, requestedBlockerIds),
-          notInArray(issueRows.status, ["done", "cancelled"]),
-        )).limit(1).then((rows) => rows.length > 0)
+        ? requestedBlockerIds.length > 0 && (await listUnresolvedBlockerIssueIds(
+          db,
+          existing.companyId,
+          requestedBlockerIds,
+        )).length > 0
         : (await svc.getDependencyReadiness(existing.id)).unresolvedBlockerCount > 0;
       const { pendingInteraction, pendingApproval } = await findPendingResolutionPath();
       if (!hasUnresolvedBlocker && !pendingInteraction && !pendingApproval && !descriptor) {
@@ -20016,51 +20015,36 @@ export function issueRoutes(
         return;
       }
     }
-    // SUP-23849/SUP-23854: refuse a block-intent write that would leave this
-    // issue `blocked` on a non-empty blocker set that is entirely resolved
-    // (every blocker `done`). That state is dependency-ready: parking the card
-    // there re-arms the restored-blocker wake for the assignee (the SUP-23842
-    // re-block loop) and strands the card behind a gate that no longer exists.
-    // Carve-outs: adding a blocker edge that does not exist yet (reshaping the
-    // set) and a pending interaction/approval (waiting on a human) stay
-    // allowed. A set holding any non-done blocker — including a cancelled one,
-    // which liveness handles as `blocked_by_cancelled_issue` — is never
-    // refused. `unblockDescriptor` alone does not carve out: a descriptor
-    // cannot turn a resolved set back into a real gate.
-    const blockIntentWrite = enteringBlocked || Array.isArray(req.body.blockedByIssueIds);
+    // A non-empty all-done blocker set is dependency-ready, not a valid blocked
+    // state. This applies equally to new edges, explicit status replays,
+    // descriptors, and writes with a pending interaction or approval.
+    const blockIntentWrite =
+      updateFields.status === "blocked" ||
+      Array.isArray(req.body.blockedByIssueIds) ||
+      descriptor !== null;
     if (blockIntentWrite && nextStatus === "blocked") {
       const requestedBlockerIds = Array.isArray(req.body.blockedByIssueIds)
         ? [...new Set(req.body.blockedByIssueIds as string[])]
         : null;
       let setEntirelyResolved: boolean;
       if (requestedBlockerIds) {
-        const hasNotDoneBlocker = await db.select({ id: issueRows.id }).from(issueRows).where(and(
-          eq(issueRows.companyId, existing.companyId),
-          inArray(issueRows.id, requestedBlockerIds),
-          notInArray(issueRows.status, ["done"]),
-        )).limit(1).then((rows) => rows.length > 0);
-        setEntirelyResolved = requestedBlockerIds.length > 0 && !hasNotDoneBlocker;
+        const unresolvedBlockerIssueIds = await listUnresolvedBlockerIssueIds(
+          db,
+          existing.companyId,
+          requestedBlockerIds,
+        );
+        setEntirelyResolved = requestedBlockerIds.length > 0 && unresolvedBlockerIssueIds.length === 0;
       } else {
         const readiness = await svc.getDependencyReadiness(existing.id);
         setEntirelyResolved =
           readiness.blockerIssueIds.length > 0 && readiness.unresolvedBlockerCount === 0;
       }
       if (setEntirelyResolved) {
-        const introducesNewBlockerEdge = requestedBlockerIds
-          ? requestedBlockerIds.some(
-              (blockerId) => !(existingRelations?.blockedBy ?? []).some((relation) => relation.id === blockerId),
-            )
-          : false;
-        if (!introducesNewBlockerEdge) {
-          const { pendingInteraction, pendingApproval } = await findPendingResolutionPath();
-          if (!pendingInteraction && !pendingApproval) {
-            res.status(422).json({
-              error: "Cannot block on a blocker set that is already fully resolved. Move the issue forward, or add a blocker that is not done.",
-              details: { reason: "blocked_on_resolved_blockers" },
-            });
-            return;
-          }
-        }
+        res.status(422).json({
+          error: "Cannot block on a blocker set that is already fully resolved. Move the issue forward, or add a blocker that is not done.",
+          details: { reason: "blocked_on_resolved_blockers" },
+        });
+        return;
       }
     }
     if (reviewRequest !== undefined && transition.patch.executionState === undefined) {
@@ -22223,14 +22207,6 @@ export function issueRoutes(
         blockedTransitionAt?: Date | string | null;
         source: string;
         mutation: string;
-        /**
-         * SUP-23849/SUP-23854: `"restored-state"` keys this wake on
-         * (dependent, blocker set) only — permanently, across blocked cycles —
-         * instead of the cycle-scoped state key. Used by the
-         * blocked-restored path so repeat re-blocks of the same resolved set
-         * can never re-arm the wake.
-         */
-        idempotencyScope?: "restored-state";
       }) => {
         // SUP-17092/A: withhold the dependent wake when the resolved blocker's
         // landing was attributed away to a shared carrier; record the withhold
@@ -22262,32 +22238,18 @@ export function issueRoutes(
           );
           return;
         }
-        const restoredStateKey = input.idempotencyScope === "restored-state"
-          ? buildIssueBlockersResolvedRestoredWakeIdempotencyKey({
-              dependentIssueId: input.dependentIssueId,
-              blockerIssueIds: input.blockerIssueIds,
-            })
-          : null;
-        const idempotencyKey = restoredStateKey ?? buildIssueBlockersResolvedWakeStateKey({
+        const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
           dependentIssueId: input.dependentIssueId,
           blockerIssueIds: input.blockerIssueIds,
           blockedTransitionAt: input.blockedTransitionAt,
         });
         try {
-          // The restored-state scope dedups permanently on (dependent, blocker
-          // set) — a completed wake for that exact set never re-arms, no matter
-          // how many new blocked cycles the card stamps afterwards.
-          const existingWake = restoredStateKey
-            ? await findExistingIssueBlockersResolvedWakeForAnyKey(db, {
-                companyId: issue.companyId,
-                idempotencyKeys: [restoredStateKey],
-              })
-            : await findExistingIssueBlockersResolvedWakeForReadyState(db, {
-                companyId: issue.companyId,
-                dependentIssueId: input.dependentIssueId,
-                blockerIssueIds: input.blockerIssueIds,
-                blockedTransitionAt: input.blockedTransitionAt,
-              });
+          const existingWake = await findExistingIssueBlockersResolvedWakeForReadyState(db, {
+            companyId: issue.companyId,
+            dependentIssueId: input.dependentIssueId,
+            blockerIssueIds: input.blockerIssueIds,
+            blockedTransitionAt: input.blockedTransitionAt,
+          });
           if (existingWake) return;
         } catch (err) {
           logger.warn(
@@ -22547,7 +22509,6 @@ export function issueRoutes(
             blockedTransitionAt: issue.blockedTransitionAt,
             source: "issue.blockers_restored",
             mutation: "blocked_dependency_restored",
-            idempotencyScope: "restored-state",
           });
         }
       }

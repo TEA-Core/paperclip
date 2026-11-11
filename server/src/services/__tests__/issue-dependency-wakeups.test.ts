@@ -60,7 +60,7 @@ describe("buildIssueBlockersResolvedRestoredWakeIdempotencyKey", () => {
     expect(emptySet).not.toBe(base);
   });
 
-  it("never collides with the cycle-scoped state key", () => {
+  it("is the canonical stable ready-state key", () => {
     const blockerIssueIds = ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"];
     const blockedTransitionAt = new Date("2026-08-03T18:00:00.000Z");
     const restoredKey = buildIssueBlockersResolvedRestoredWakeIdempotencyKey({
@@ -72,8 +72,8 @@ describe("buildIssueBlockersResolvedRestoredWakeIdempotencyKey", () => {
       blockerIssueIds,
       blockedTransitionAt,
     });
-    expect(restoredKey).not.toBe(stateKey);
-    expect(restoredKey).toContain("restored-state");
-    expect(stateKey).not.toContain("restored-state");
+    expect(restoredKey).toBe(stateKey);
+    expect(restoredKey).toContain(":state:");
+    expect(stateKey).toContain(":state:");
   });
 });

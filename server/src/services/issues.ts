@@ -3115,18 +3115,34 @@ export async function listUnresolvedBlockerIssueIds(
 ) {
   const uniqueBlockerIssueIds = [...new Set(blockerIssueIds.filter(Boolean))];
   if (uniqueBlockerIssueIds.length === 0) return [];
-  return dbOrTx
-    .select({ id: issues.id })
+  const blockerRows = await dbOrTx
+    .select({
+      id: issues.id,
+      status: issues.status,
+      executionWorkspaceId: issues.executionWorkspaceId,
+    })
     .from(issues)
     .where(
       and(
         eq(issues.companyId, companyId),
         inArray(issues.id, uniqueBlockerIssueIds),
-        // Cancelled blockers intentionally remain unresolved until the relation changes.
-        ne(issues.status, "done"),
       ),
+    );
+  const pendingFinalizeBlockerIssueIds = await listPendingFinalizeBlockerIssueIds(
+    dbOrTx,
+    companyId,
+    blockerRows.flatMap((row) =>
+      row.status === "done" && row.executionWorkspaceId
+        ? [{ blockerIssueId: row.id, executionWorkspaceId: row.executionWorkspaceId }]
+        : []
+    ),
+  );
+  return blockerRows
+    .filter((row) =>
+      row.status !== "done" ||
+      (row.executionWorkspaceId !== null && pendingFinalizeBlockerIssueIds.has(row.id))
     )
-    .then((rows) => rows.map((row) => row.id));
+    .map((row) => row.id);
 }
 async function getProjectDefaultGoalId(
   db: ProjectGoalReader,
