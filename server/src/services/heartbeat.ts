@@ -20609,6 +20609,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   eq(heartbeatRuns.companyId, run.companyId),
                   ne(heartbeatRuns.id, run.id),
                   inArray(heartbeatRuns.status, ["running", "succeeded"]),
+                  sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
                   sql`${heartbeatRuns.contextSnapshot} ->> 'nativeReviewInteractionId' = ${nativeReviewContext.nativeReviewInteractionId}`,
                 ),
               )

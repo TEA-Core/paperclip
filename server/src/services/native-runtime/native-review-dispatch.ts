@@ -35,6 +35,7 @@ export async function claimQueuedNativeReviewRun(db: Db, input: {
       eq(heartbeatRuns.companyId, input.run.companyId),
       ne(heartbeatRuns.id, input.run.id),
       inArray(heartbeatRuns.status, ["running", "succeeded"]),
+      sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
       sql`${heartbeatRuns.contextSnapshot} ->> 'nativeReviewInteractionId' = ${reviewContext.nativeReviewInteractionId}`,
     )).limit(1);
     if (sibling) return null;
