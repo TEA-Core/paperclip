@@ -243,6 +243,27 @@ describeEmbeddedPostgres("issue list completion window", () => {
     expect(Array.isArray(res.body.supportedQueryParameters)).toBe(true);
   });
 
+  it("rejects the historical snake_case close-window probe shapes and names the canonical parameters", async () => {
+    const f = await seedCensusFixtures();
+    for (const query of [
+      "completed_after=2026-07-01T00:00:00.000Z&completed_before=2026-07-03T00:00:00.000Z",
+      "sort=completed&order=desc",
+    ]) {
+      const res = await request(f.app())
+        .get(`/api/companies/${f.companyId}/issues?${query}`)
+        .expect(400);
+      expect(res.body.error).toContain("unknown query parameter");
+      expect(res.body.supportedQueryParameters).toEqual(
+        expect.arrayContaining([
+          "completedAfter",
+          "completedBefore",
+          "sortField",
+          "sortDir",
+        ]),
+      );
+    }
+  });
+
   it("rejects sortField values outside the supported set", async () => {
     const f = await seedCensusFixtures();
     const res = await request(f.app())
