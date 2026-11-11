@@ -1019,11 +1019,16 @@ export async function provisionIssueExecutionWorkspace(
     input.selectedEnvironmentForConfig?.driver === "sandbox" &&
     selectedEnvironmentConfigForFingerprint.reuseLease === true &&
     selectedEnvironmentConfigForFingerprint.runnerLifecycleMode === "warm";
+  // Upstream #13655 (43acbcc39): native provider checkpoints bind to the workspace row,
+  // including ordinary local shared workspaces. Persist that binding independently of the
+  // opt-in isolated-workspace UI, just as warm sandbox continuity already does.
+  const nativeSharedWorkspace = agent.adapterType === "paperclip_runner" &&
+    input.effectiveExecutionWorkspaceMode === "shared_workspace";
   const shouldSwitchIssueToExistingWorkspace =
     issueRef?.executionWorkspacePreference === "reuse_existing" ||
     input.effectiveExecutionWorkspaceMode === "isolated_workspace" ||
     input.effectiveExecutionWorkspaceMode === "operator_branch" ||
-    warmReusableExecutionWorkspace;
+    warmReusableExecutionWorkspace || nativeSharedWorkspace;
   // SUP-16886: a card pinned to `agent_default` resolves to the agent home and must
   // never carry a `projectWorkspaceId` (the create boundary, SUP-16608, normalizes
   // the pair away with `agent_default` winning; the issues PATCH boundary heals it).
@@ -1085,7 +1090,8 @@ export async function provisionIssueExecutionWorkspace(
       // to the agent's company. The fork extracted this block out of heartbeat.ts, so the fold's
       // merge could not carry upstream's change here -- it lands in a file neither parent
       // conflicts on and would otherwise be dropped in silence.
-      // NOT ported: upstream also passes `{ bindRuntimeSharedWorkspace: warmReusableExecutionWorkspace
+      // NOT ported: upstream also passes `{ bindRuntimeSharedWorkspace: (warmReusableExecutionWorkspace
+      // || nativeSharedWorkspace)
       // && workspace.mode === "shared_workspace" }`. That option THROWS `unprocessable` unless the
       // issue's stored executionWorkspacePreference is already "reuse_existing" AND its
       // executionWorkspaceSettings.mode is "shared_workspace", which the fork's patch path does not

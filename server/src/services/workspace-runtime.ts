@@ -8302,28 +8302,42 @@ export async function waitForRuntimeServiceReadiness(input: {
   // misleading `probe timed out after 1ms`. Give every probe after the first at
   // least one interval, and stop early rather than issue one that can only fail.
   const minProbeBudgetMs = Math.min(RUNTIME_SERVICE_READINESS_PROBE_TIMEOUT_MS, intervalMs);
-  const deadline = now() + timeoutSec * 1000;
+  const startedAt = now();
+  const deadline = startedAt + timeoutSec * 1000;
   let lastError = "service did not become ready";
   let probed = false;
+  let lastCause: unknown;
+  let probes = 0;
   while (now() < deadline) {
     const probeBudgetMs = Math.max(1, Math.min(RUNTIME_SERVICE_READINESS_PROBE_TIMEOUT_MS, deadline - now()));
     if (probed && probeBudgetMs < minProbeBudgetMs) break;
     probed = true;
+    probes += 1;
     try {
       const response = await fetchImpl(readinessUrl, { signal: AbortSignal.timeout(probeBudgetMs) });
       if (response.ok) return;
       lastError = `received HTTP ${response.status}`;
+      lastCause = undefined;
     } catch (err) {
+      lastCause = err;
       lastError = isReadinessProbeTimeout(err)
         ? `probe timed out after ${probeBudgetMs}ms`
         : err instanceof Error
           ? err.message
           : String(err);
+      // Node fetch hides connection errors behind "fetch failed". Retain the
+      // transport cause so a refused port is distinguishable from a timeout.
+      if (!isReadinessProbeTimeout(err) && err instanceof Error && err.cause instanceof Error) {
+        lastError += `: ${err.cause.message}`;
+      }
     }
     if (now() >= deadline) break;
     await delay(Math.min(intervalMs, Math.max(0, deadline - now())));
   }
-  throw new Error(`Readiness check failed for ${readinessUrl}: ${lastError}`);
+  throw new Error(
+    `Readiness check failed for ${readinessUrl}: ${lastError} (${probes} probes over ${now() - startedAt}ms)`,
+    { cause: lastCause },
+  );
 }
 
 async function waitForAllocatedPortBind(input: {

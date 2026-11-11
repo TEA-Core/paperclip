@@ -13,6 +13,41 @@ test.setTimeout(120_000);
  * live in ./agent-chat.shared.ts; project, attachment, and history flows run
  * in agent-chat-projects.spec.ts.
  */
+test("built chat initializes after service worker takeover and reload with a slow CPU", async ({
+  page,
+  context,
+  request,
+}) => {
+  const f = await setup(request);
+  try {
+    const cdp = await context.newCDPSession(page);
+    try {
+      await cdp.send("Emulation.setCPUThrottlingRate", { rate: 4 });
+      await page.goto(f.route);
+      await expect(page.getByTestId("task-chat-composer-input")).toBeVisible();
+      // The failed CI traces stopped before React evaluated, while a service
+      // worker forwarded the Vite module graph. Keep this test on shipped assets
+      // and cover both first takeover and subsequent controlled navigations.
+      const scripts = await page.locator('script[type="module"][src]').evaluateAll(
+        (elements) => elements.map((element) => element.getAttribute("src")),
+      );
+      expect(scripts.length).toBeGreaterThan(0);
+      expect(scripts.every((src) => src?.startsWith("/assets/"))).toBe(true);
+      await page.evaluate(async () => { await navigator.serviceWorker.ready; });
+      for (let reload = 0; reload < 3; reload += 1) {
+        await page.reload();
+        await expect(page.getByTestId("task-chat-composer-input")).toBeVisible();
+        expect(await page.evaluate(() => !!navigator.serviceWorker.controller)).toBe(true);
+      }
+      expect(await json(await request.get(f.chatPath))).toBeNull();
+    } finally {
+      await cdp.detach();
+    }
+  } finally {
+    await f.restore();
+  }
+});
+
 test("chat first open is read-only; concurrent first sends and retries share one task", async ({
   page,
   context,
@@ -261,7 +296,7 @@ test("sidebar discovery, stars, recent agents, configuration links, and drafts s
     }
     await expect(chatLinks).toHaveText(["Alpha", "Zeta", "Epsilon", "Delta", "Gamma"]);
     const star = page.getByRole("button", { name: "Star Zeta", exact: true });
-    await page.getByTestId("task-chat-composer-input").click();
+    await page.getByTestId("task-chat-composer-input").hover();
     await expect(star).toHaveCSS("opacity", "0");
     // `toBeFocused` also requires `document.hasFocus()`, which is not the
     // reveal condition. The control fades in on `:focus-within`; focus it

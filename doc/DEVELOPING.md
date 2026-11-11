@@ -385,6 +385,14 @@ pnpm test:release-smoke
 
 These browser suites are intended for targeted local verification and CI, not the default agent/human test command.
 
+The default E2E configuration builds the UI into `server/ui-dist` before starting
+its throwaway instance and serves that build with
+`PAPERCLIP_UI_DEV_MIDDLEWARE=false`. This exercises the
+shipped assets, including service-worker takeover and reload, without traversing
+the development server's unbundled module graph on each navigation. Browser
+assertion deadlines and retries remain unchanged. Use `pnpm dev` separately when
+verifying Vite/HMR behavior.
+
 For normal issue work, start with the smallest targeted check that proves the change. Reserve repo-wide typecheck/build/test runs for PR-ready handoff or changes broad enough that narrow checks do not cover the risk.
 
 ### Test Worker Limits
@@ -712,6 +720,8 @@ Tasks use every distinct repository attached to their project, including reposit
 When an additional repository has a configured local checkout, Paperclip seeds the task copy from its current commit and uncommitted files. Git-ignored files stay out of that copy. Subsequent task edits stay in the task copy. They do not overwrite the configured source folder. Existing task copies retain their work across runs.
 
 Sandbox staging, including Daytona, transfers each repository's Git history and working files. Restore merges files and commits back into each local task checkout independently. Durable sandbox recovery keeps the same repository snapshots. Normal ignore and workspace exclusion rules still apply. A clone failure stops task preparation with an error so the agent does not start with only part of the project.
+
+Staging preserves relative symlink targets in secondary repositories, including skill links such as `.claude/skills/demo -> ../../skills/demo`. It does not rewrite them to host temporary paths or copy their target contents in place of the link. Daytona still rejects outbound archives with absolute or escaping link targets before extraction.
 
 If a repository is detached or its source configuration changes, its previous task copy is retained under `.paperclip-runtime/detached-repositories/` and excluded from future sandbox transfers. Referenced projects continue to use the separate read-only multi-project workspace behavior.
 
@@ -1041,6 +1051,25 @@ In Vite middleware mode, Paperclip gives HMR a dedicated HTTP server bound to th
 
 When a workspace service runs Paperclip for browser OAuth QA, configure its `expose.urlTemplate` with the canonical URL the browser can reach. Paperclip preserves explicit `PAPERCLIP_PUBLIC_URL` or `BETTER_AUTH_URL` settings; otherwise it uses a valid exposed HTTPS origin (or loopback HTTP) as the managed runtime fallback for Better Auth and `/api/tools/oauth/callback`. Internal service names such as `http://paperclip-dev:<port>` are rejected unless that hostname is genuinely the browser route. Use a unique origin per isolated worktree. See [Execution Workspaces And Runtime Services](../docs/guides/board-operator/execution-workspaces-and-runtime-services.md#browser-reachable-origins-for-oauth-qa) for configuration and verification.
 
+## Wake Context Delivery
+
+Built-in adapters deliver wake context through the run prompt, including structured
+execution-continuation data. They do not export `PAPERCLIP_WAKE_PAYLOAD_JSON`. A
+large JSON environment entry can prevent the agent process from starting with
+`E2BIG`, even when the same context fits in the prompt transport. Configured values
+for this retired variable are ignored. Scalar runtime variables such as
+`PAPERCLIP_TASK_ID` and `PAPERCLIP_WAKE_REASON` remain available.
+
+Custom instructions that read the retired variable must use the wake payload in
+the prompt instead. This transport change adds no history limits or truncation;
+existing comment windows and resume-delta rendering still apply. Gateway request
+bodies and Hermes prompt-template JSON variables remain supported.
+
+This removes the duplicate environment entry, not every possible `E2BIG` cause.
+Legacy CLI paths that put prompts in command-line arguments (Gemini, Grok, Kimi,
+Pi, and Hermes) still have argument-size limits. ACP turns, SDK requests, and
+CLI paths that use stdin avoid that separate limit for the wake prompt.
+
 ## Paperclip Runner Adapter Conversion
 
 The experimental Paperclip Runner offers native Codex, OpenCode, and **ACPX
@@ -1073,10 +1102,33 @@ cancellation remain enforced; the snapshot is removed when the provider exits.
 Native Codex is qualified only with `codexPermissionMode: "never"`. The create
 and edit surfaces do not offer `on-request` or `untrusted`, and a persisted
 unsupported value fails with remediation instead of being silently coerced.
-OpenCode retains `allow`, `ask`, and `deny`; ACPX retains `approve-all`,
-`approve-reads`, and `deny-all`. Codex conversion keeps a non-empty model and
+OpenCode defaults to `allow`, with explicit `ask` and `deny` options; ACPX
+defaults to `approve-all`, with explicit `approve-paperclip`, `approve-reads`,
+and `deny-all` options. Codex conversion keeps a non-empty model and
 otherwise stores the shared `gpt-5.6-sol` default. The native execution boundary
 applies the same default to older runner rows whose model is missing or blank.
+
+For an Agent Chat test drive, enable **Agent Chat** in Experimental settings and
+configure two agents with Paperclip Runner: native Codex and ACPX Claude. Connect
+the Claude account through the agent's **AI connection** section (or supply an
+explicit supported provider credential); an ambient Claude CLI login alone is
+not a credential source for its isolated runner home. The default
+`approve-all` setting approves harness operations across assigned tools and
+connections, including provider-native tools. Company permissions, approval
+gates, and workspace isolation still apply. Explicit restrictive modes remain
+restrictive; omitted settings use full auto.
+
+Test questions, saved plan revisions, approval before task handoff, status
+lookups, and `/new` preserving chat history. Hiring additionally requires the
+operator-controlled [runner API tools](runner-api-tools.md) rollout; enabling
+Agent Chat does not enable that API surface. Failed-turn retries restore the
+selected run's user comments so the agent can answer the original request.
+
+A native continuation that requires reconciliation shows **Recovery needed**
+with **Inspect run**; inspect the original outcome before resolving its recovery
+hold. A generic retry cannot resolve this incident. The runner's
+`get_task_context` includes up to 100 existing direct child tasks and a truncation
+flag so resumed agents can reuse delegated work and inspect completed results.
 
 For native Codex runs, Paperclip passes the resolved execution workspace as
 `PAPERCLIP_WORKSPACE_CWD` and uses it as the provider containment boundary. A
@@ -1118,6 +1170,20 @@ that classification finishes.
 - A verified live runner re-registers its existing PRP authority and reconnects
   with the same operating-system PID. Paperclip does not spawn a competing
   runner.
+- For a running sandbox session, recovery checks the original provider lease,
+  remote workspace, durable runner identity, and process marker inside that
+  sandbox. The process marker must include the Linux boot ID and start ticks;
+  recovery compares them with the live process before adoption and signaling.
+  Collection uses the required Node runtime and is optional for fresh launches. Older
+  markers or images without that proof remain blocked for recovery. Remote
+  PIDs are never interpreted as controller-local PIDs. The runner must
+  authenticate to its existing PRP authority; reconnection neither
+  launches another provider nor consumes a provider retry. A replacement
+  sandbox or mismatched identity blocks adoption without overwriting evidence.
+- Shutdown waits up to 30 seconds for an in-progress native startup to reach
+  its detach acknowledgement. It reports a startup deadline failure instead
+  of claiming that an unfinished bootstrap detached safely. A queued turn
+  waits for the previous executor to finish releasing its task resources.
 - A verified dead runner starts a replacement from the same durable root and
   resumes the same provider checkpoint. Only the operating-system PID changes.
 - A runner that died before its first authenticated connection can restart on
@@ -1680,6 +1746,12 @@ Networking behavior for this smoke script:
 
 See [execution GitHub identity](execution-github-identity.md) for the operation-time credential contract, continuation rules, runtime rollout, and acceptance-test requirements.
 
+### Agent persona Storybook
+
+See [agent-personas.md](agent-personas.md) for the dynamic avatar endpoint, cache,
+and character stories. Set `PAPERCLIP_STORYBOOK_API_URL` to your isolated
+Paperclip API URL when running dev Storybook. Published Storybook builds automatically
+package avatar PNGs using the API renderer; static hosting needs no API proxy.
 
 ### Investigating polling load
 
@@ -1712,3 +1784,12 @@ from stored configuration problems. Verify connection transport and endpoint
 fields before disabling a connection. Verify workspace ownership, active runs,
 Git state, and runtime-service readiness before closing a workspace. A missing
 URL or old workspace timestamp alone does not prove that a row is disposable.
+
+### Browser realtime connection recovery
+
+If a browser cannot construct a WebSocket, the live-update and run transcript
+clients use their disconnected retry paths. While the company event stream is
+disconnected, visible active queries refresh every 15 seconds. This fallback
+stops when the socket opens, the tab is hidden, or the provider unmounts. A
+reconnected socket also refreshes visible queries to recover missed events.
+Run log views retain their existing HTTP polling fallback.
