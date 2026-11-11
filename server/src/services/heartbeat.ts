@@ -20137,10 +20137,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           };
           if (nativeReviewContext) {
             try {
-              return await claimQueuedNativeReviewRun(tx, {
+              return await tx.transaction((savepoint) => claimQueuedNativeReviewRun(savepoint as unknown as typeof tx, {
                 run, claimedAt, claimValues,
                 agentNameKey: normalizeAgentNameKey(agent.name),
-              });
+              }));
             } catch (error) {
               logger.warn(
                 { err: error, runId: run.id },
