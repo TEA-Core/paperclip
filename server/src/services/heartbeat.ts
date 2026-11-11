@@ -13,7 +13,7 @@ import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
-import { getNativeReviewAssignment, isNativeReviewWakeProvenance, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
+import { bindNativeReviewCommitterWakeToRun, getNativeReviewAssignment, isNativeReviewRunBoundToCommitterWake, isNativeReviewWakeProvenance, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
 import { buildNativeReviewRequest } from "./native-runtime/native-review-prompt.js";
 import {
@@ -20616,7 +20616,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .limit(1)
               .then((rows) => rows[0] ?? null);
             if (sibling) duplicateNativeReviewRun = true;
-            else isNativeReviewRun = true;
+            else if (
+              await isNativeReviewRunBoundToCommitterWake(dbOrTx, {
+                companyId: run.companyId,
+                issueId,
+                runId: run.id,
+                contextSnapshot: context,
+              })
+            ) isNativeReviewRun = true;
           }
         }
       } catch (error) {
@@ -20641,6 +20648,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           nativeReviewInteractionId: nativeReviewContext.nativeReviewInteractionId,
         },
         handoffAgentId: null,
+      };
+    }
+    // A run carrying native-review markers that no longer validates can never
+    // be claimed as a native review, so it must not survive on a legacy
+    // exemption (interaction wake, review participant, or recovery) and stay
+    // queued for every sweep.
+    if (nativeReviewContext && !isNativeReviewRun) {
+      const nextOwnerAgentId =
+        (reviewParticipant?.type === "agent" ? reviewParticipant.agentId : null) ??
+        issue.assigneeAgentId;
+      const handoffAgentId = nextOwnerAgentId && nextOwnerAgentId !== run.agentId
+        ? nextOwnerAgentId
+        : null;
+      return {
+        stale: true,
+        errorCode: "issue_assignee_changed",
+        reason: handoffAgentId
+          ? "Cancelled because the native-review assignment is no longer valid before the queued run could start; the current owner will be woken instead"
+          : "Cancelled because the native-review assignment is no longer valid before the queued run could start; the issue has no agent owner, so no replacement run was queued",
+        details: {
+          issueId,
+          previousAssigneeAgentId: run.agentId,
+          currentAssigneeAgentId: issue.assigneeAgentId,
+        },
+        handoffAgentId,
       };
     }
 
@@ -30539,6 +30571,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             updatedAt: now,
           })
           .where(eq(agentWakeupRequests.id, deferred.id));
+
+        // Promotion rewrites this wake's reason; transfer the committer
+        // wake's run binding to the promoted run so native-review provenance
+        // survives the promotion.
+        await bindNativeReviewCommitterWakeToRun(txDb, {
+          companyId: deferredAgent.companyId,
+          issueId: issue.id,
+          runId: newRun.id,
+          contextSnapshot: promotedContextSnapshot,
+        });
 
         await tx
           .update(issues)

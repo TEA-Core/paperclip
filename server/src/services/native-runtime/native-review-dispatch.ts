@@ -1,7 +1,7 @@
 import { agentWakeupRequests, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import type { PgUpdateSetSource } from "drizzle-orm/pg-core";
-import { claimNativeReviewExecutionLock, isNativeReviewWakeProvenance, readNativeReviewAssignmentContext } from "./native-review-participant.js";
+import { claimNativeReviewExecutionLock, isNativeReviewRunBoundToCommitterWake, isNativeReviewWakeProvenance, readNativeReviewAssignmentContext } from "./native-review-participant.js";
 
 /** The run, wake, and issue lock form one reviewer admission claim. */
 export async function claimQueuedNativeReviewRun(db: Db, input: {
@@ -39,6 +39,10 @@ export async function claimQueuedNativeReviewRun(db: Db, input: {
       sql`${heartbeatRuns.contextSnapshot} ->> 'nativeReviewInteractionId' = ${reviewContext.nativeReviewInteractionId}`,
     )).limit(1);
     if (sibling) return null;
+    if (!await isNativeReviewRunBoundToCommitterWake(tx as unknown as Db, {
+      companyId: input.run.companyId, issueId, runId: input.run.id,
+      contextSnapshot: context,
+    })) return null;
     const [run] = await tx.select().from(heartbeatRuns).where(and(
       eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId),
       eq(heartbeatRuns.agentId, input.run.agentId),

@@ -17,6 +17,7 @@ import {
   issueThreadInteractions,
   issues,
   nativeRunResults,
+  statusDecisionEffects,
   statusDecisions,
   workAssessments,
 } from "@paperclipai/db";
@@ -93,6 +94,12 @@ async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 3_000) {
 
 const HEARTBEAT_INVALIDATION_TRUNCATE_SQL = `
   TRUNCATE TABLE
+    "issue_thread_interactions",
+    "status_decision_effects",
+    "status_decisions",
+    "work_assessments",
+    "native_run_results",
+    "completion_contracts",
     "company_skills",
     "issue_comments",
     "issue_documents",
@@ -661,6 +668,18 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         }).where(eq(agentWakeupRequests.id, queued.wakeupRequestId));
       }
     }
+    if (wakeupRequestIds.length > 0) {
+      await db.insert(statusDecisionEffects).values({
+        companyId, issueId, decisionId, ordinal: 1, effectKind: "bind_reviewer",
+        targetType: "issue_thread_interaction", targetId: interactionId,
+        idempotencyKey: `native-status:${decisionId}:1`,
+        payload: {
+          interactionId, ownerAgentId: reviewerId,
+          reviewerWakeId: wakeupRequestIds[0],
+        },
+        deliveryState: "delivered", deliveredAt: new Date(),
+      });
+    }
     return {
       companyId, workerId, reviewerId, issueId, interactionId, decisionId,
       runId: runIds[0]!, runIds, wakeupRequestId: wakeupRequestIds[0]!, wakeupRequestIds,
@@ -676,10 +695,13 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
 
   async function resumeAndReadRun(runId: string, service: ReturnType<typeof heartbeatService> = heartbeat) {
     await service.resumeQueuedRuns();
-    await waitForCondition(async () => {
-      const run = await readRunState(runId);
-      return run?.status !== "queued" && run?.status !== "running";
-    });
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const settled = await waitForCondition(async () => {
+        const run = await readRunState(runId);
+        return run?.status !== "queued" && run?.status !== "running";
+      });
+      if (settled) break;
+    }
     return readRunState(runId);
   }
 
@@ -882,6 +904,111 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect((await readRunState(ordinary.runId))?.status).toBe("succeeded");
     expect(countExecuteCallsForRun(ordinary.runId)).toBe(1);
     expect((await readRunState(fixture.runId))?.status).toBe("queued");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(0);
+  });
+
+  it("cancels a cloned server-actor native-review wake that the committer never bound to its run", async () => {
+    const fixture = await seedNativeReviewFixture({ queuedRunCount: 0 });
+    // The genuine committer wake exists but was never dispatched to a run.
+    const genuineWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: genuineWakeId,
+      companyId: fixture.companyId,
+      agentId: fixture.reviewerId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "native_completion_review",
+      payload: {
+        issueId: fixture.issueId,
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+      status: "queued",
+      requestedByActorType: "system",
+      requestedByActorId: "native-status-committer",
+      idempotencyKey: `native-review:${fixture.interactionId}`,
+    });
+    await db.insert(statusDecisionEffects).values({
+      companyId: fixture.companyId, issueId: fixture.issueId, decisionId: fixture.decisionId,
+      ordinal: 1, effectKind: "bind_reviewer",
+      targetType: "issue_thread_interaction", targetId: fixture.interactionId,
+      idempotencyKey: `native-status:${fixture.decisionId}:1`,
+      payload: {
+        interactionId: fixture.interactionId, ownerAgentId: fixture.reviewerId,
+        reviewerWakeId: genuineWakeId,
+      },
+      deliveryState: "delivered", deliveredAt: new Date(),
+    });
+    // A clone copies every wake-provenance field, including the server actor.
+    const clone = await seedQueuedRun({
+      companyId: fixture.companyId,
+      agentId: fixture.reviewerId,
+      issueId: fixture.issueId,
+      wakeReason: "native_completion_review",
+      contextExtras: {
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+    });
+    await db.update(agentWakeupRequests).set({
+      idempotencyKey: `native-review:${fixture.interactionId}`,
+      requestedByActorType: "system",
+      requestedByActorId: "native-status-committer",
+      payload: {
+        issueId: fixture.issueId,
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+    }).where(eq(agentWakeupRequests.id, clone.wakeupRequestId));
+
+    const run = await resumeAndReadRun(clone.runId);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_assignee_changed");
+    expect(countExecuteCallsForRun(clone.runId)).toBe(0);
+  });
+
+  it("claims a promoted native-review run whose wake receipt reason was rewritten", async () => {
+    const fixture = await seedNativeReviewFixture();
+    // Promotion keeps the wake row and payload but rewrites its reason to
+    // issue_execution_promoted and rebinds it to the promoted run.
+    await db.update(agentWakeupRequests).set({
+      reason: "issue_execution_promoted",
+      requestedByActorId: `native-status-wake-dispatch:${fixture.wakeupRequestId}`,
+      payload: {
+        issueId: fixture.issueId,
+        _paperclipWakeContext: {
+          issueId: fixture.issueId,
+          nativeReviewInteractionId: fixture.interactionId,
+          nativeReviewDecisionId: fixture.decisionId,
+          wakeReason: "native_completion_review",
+        },
+      },
+    }).where(eq(agentWakeupRequests.id, fixture.wakeupRequestId));
+    const run = await resumeAndReadRun(fixture.runId);
+    expect(run?.errorCode).not.toBe("issue_assignee_changed");
+    expect(run?.status).toBe("succeeded");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(1);
+  });
+
+  it("cancels an invalid native-review run even when the agent is the current review participant", async () => {
+    const fixture = await seedNativeReviewFixture({ interactionStatus: "rejected" });
+    await db.update(issues).set({
+      executionState: {
+        status: "pending",
+        currentStageId: randomUUID(),
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: fixture.reviewerId, userId: null },
+        returnAssignee: { type: "agent", agentId: fixture.workerId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, fixture.issueId));
+    const run = await resumeAndReadRun(fixture.runId);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_assignee_changed");
     expect(countExecuteCallsForRun(fixture.runId)).toBe(0);
   });
 
