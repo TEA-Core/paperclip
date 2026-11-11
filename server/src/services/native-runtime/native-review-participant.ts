@@ -103,39 +103,26 @@ export function isNativeReviewWakeProvenance(
 
 /**
  * The committer records its reviewer wake in the decision-effect row, which
- * wake creation cannot write. A run is bound only when that wake was
- * dispatched to this exact run, so cloned wake fields do not bind a clone.
+ * wake creation cannot write. Returns that wake's bound run id: the exact run
+ * the intent was dispatched to, null while it is still unclaimed, or null
+ * (outer) when no committer intent exists for the assignment.
  */
-export async function isNativeReviewRunBoundToCommitterWake(
+export async function readNativeReviewCommitterWakeBinding(
   db: Db,
   input: {
     companyId: string;
     issueId: string;
-    runId: string;
     contextSnapshot: unknown;
   },
-): Promise<boolean> {
+): Promise<{ runId: string | null } | null> {
   const context = readNativeReviewAssignmentContext(input.contextSnapshot);
-  if (!context) return false;
-  const effect = await db
-    .select({ payload: statusDecisionEffects.payload })
-    .from(statusDecisionEffects)
-    .where(
-      and(
-        eq(statusDecisionEffects.companyId, input.companyId),
-        eq(statusDecisionEffects.issueId, input.issueId),
-        eq(statusDecisionEffects.decisionId, context.nativeReviewDecisionId),
-        eq(statusDecisionEffects.effectKind, "bind_reviewer"),
-        eq(statusDecisionEffects.targetId, context.nativeReviewInteractionId),
-      ),
-    )
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-  const reviewerWakeId =
-    effect?.payload && typeof effect.payload === "object"
-      ? (effect.payload as Record<string, unknown>).reviewerWakeId
-      : null;
-  if (typeof reviewerWakeId !== "string") return false;
+  if (!context) return null;
+  const reviewerWakeId = await readCommitterReviewerWakeId(db, {
+    companyId: input.companyId,
+    issueId: input.issueId,
+    context,
+  });
+  if (!reviewerWakeId) return null;
   const wake = await db
     .select({ runId: agentWakeupRequests.runId })
     .from(agentWakeupRequests)
@@ -147,7 +134,20 @@ export async function isNativeReviewRunBoundToCommitterWake(
     )
     .limit(1)
     .then((rows) => rows[0] ?? null);
-  return wake?.runId === input.runId;
+  return wake ? { runId: wake.runId } : null;
+}
+
+export async function isNativeReviewRunBoundToCommitterWake(
+  db: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    runId: string;
+    contextSnapshot: unknown;
+  },
+): Promise<boolean> {
+  const binding = await readNativeReviewCommitterWakeBinding(db, input);
+  return binding?.runId === input.runId;
 }
 
 async function readCommitterReviewerWakeId(
@@ -175,7 +175,12 @@ async function readCommitterReviewerWakeId(
   return typeof reviewerWakeId === "string" ? reviewerWakeId : null;
 }
 
-/** Rebind the committer wake to a promoted run (promotion creates a new run). */
+/**
+ * Rebind the committer wake to a promoted run (promotion creates a new run).
+ * Only transfers when the deferred wake being promoted is the recorded
+ * committer wake itself or its authorized dispatch; an unrelated deferred
+ * wake that merely carries merged review context stays unbound.
+ */
 export async function bindNativeReviewCommitterWakeToRun(
   db: Db,
   input: {
@@ -183,6 +188,12 @@ export async function bindNativeReviewCommitterWakeToRun(
     issueId: string;
     runId: string;
     contextSnapshot: unknown;
+    wake: {
+      id: string;
+      idempotencyKey: string | null;
+      requestedByActorType: string | null;
+      requestedByActorId: string | null;
+    };
   },
 ): Promise<void> {
   const context = readNativeReviewAssignmentContext(input.contextSnapshot);
@@ -193,6 +204,12 @@ export async function bindNativeReviewCommitterWakeToRun(
     context,
   });
   if (!reviewerWakeId) return;
+  const isCommitterWake = input.wake.id === reviewerWakeId;
+  const isAuthorizedDispatch =
+    input.wake.requestedByActorType === "system" &&
+    input.wake.requestedByActorId === `native-status-wake-dispatch:${reviewerWakeId}` &&
+    input.wake.idempotencyKey === `native-review:${context.nativeReviewInteractionId}`;
+  if (!isCommitterWake && !isAuthorizedDispatch) return;
   await db
     .update(agentWakeupRequests)
     .set({ runId: input.runId })

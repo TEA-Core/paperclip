@@ -13,7 +13,7 @@ import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
-import { bindNativeReviewCommitterWakeToRun, getNativeReviewAssignment, isNativeReviewRunBoundToCommitterWake, isNativeReviewWakeProvenance, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
+import { bindNativeReviewCommitterWakeToRun, getNativeReviewAssignment, isNativeReviewWakeProvenance, readNativeReviewAssignmentContext, readNativeReviewCommitterWakeBinding } from "./native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
 import { buildNativeReviewRequest } from "./native-runtime/native-review-prompt.js";
 import {
@@ -20591,7 +20591,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     eq(agentWakeupRequests.id, run.wakeupRequestId),
                     eq(agentWakeupRequests.companyId, run.companyId),
                     eq(agentWakeupRequests.agentId, run.agentId),
-                    eq(agentWakeupRequests.runId, run.id),
                   ),
                 )
                 .then((rows) => rows[0] ?? null)
@@ -20600,6 +20599,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ...nativeReviewContext,
             issueId,
           });
+
           if (hasWakeProvenance) {
             const sibling = await dbOrTx
               .select({ id: heartbeatRuns.id })
@@ -20616,14 +20616,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .limit(1)
               .then((rows) => rows[0] ?? null);
             if (sibling) duplicateNativeReviewRun = true;
-            else if (
-              await isNativeReviewRunBoundToCommitterWake(dbOrTx, {
+            else {
+              const binding = await readNativeReviewCommitterWakeBinding(dbOrTx, {
                 companyId: run.companyId,
                 issueId,
-                runId: run.id,
                 contextSnapshot: context,
-              })
-            ) isNativeReviewRun = true;
+              });
+              if (binding?.runId === run.id) isNativeReviewRun = true;
+              // The committer intent exists but the dispatcher has not bound
+              // it to any run yet (immediate start raced the assignment):
+              // defer this run instead of cancelling or exempting it.
+              else if (binding && binding.runId === null) nativeReviewLookupDeferred = true;
+            }
           }
         }
       } catch (error) {
@@ -20654,7 +20658,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // be claimed as a native review, so it must not survive on a legacy
     // exemption (interaction wake, review participant, or recovery) and stay
     // queued for every sweep.
-    if (nativeReviewContext && !isNativeReviewRun) {
+    if (nativeReviewContext && !isNativeReviewRun && !nativeReviewLookupDeferred) {
       const nextOwnerAgentId =
         (reviewParticipant?.type === "agent" ? reviewParticipant.agentId : null) ??
         issue.assigneeAgentId;
@@ -30580,6 +30584,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           issueId: issue.id,
           runId: newRun.id,
           contextSnapshot: promotedContextSnapshot,
+          wake: {
+            id: deferred.id,
+            idempotencyKey: deferred.idempotencyKey,
+            requestedByActorType: deferred.requestedByActorType,
+            requestedByActorId: deferred.requestedByActorId,
+          },
         });
 
         await tx

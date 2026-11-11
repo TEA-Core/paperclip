@@ -32,6 +32,7 @@ import {
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
 } from "../services/heartbeat.ts";
+import { bindNativeReviewCommitterWakeToRun } from "../services/native-runtime/native-review-participant.ts";
 import { runningProcesses } from "../adapters/index.ts";
 import { recoveryService } from "../services/recovery/service.ts";
 
@@ -961,6 +962,24 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       },
     }).where(eq(agentWakeupRequests.id, clone.wakeupRequestId));
 
+    // While the committer intent is unbound the clone is deferred, never
+    // executed; once the intent is bound to the genuine run it is cancelled.
+    await heartbeat.resumeQueuedRuns();
+    expect((await readRunState(clone.runId))?.status).toBe("queued");
+    expect(countExecuteCallsForRun(clone.runId)).toBe(0);
+
+    const genuine = await seedQueuedRun({
+      companyId: fixture.companyId,
+      agentId: fixture.reviewerId,
+      issueId: fixture.issueId,
+      wakeReason: "native_completion_review",
+      contextExtras: {
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+    });
+    await db.update(agentWakeupRequests).set({ runId: genuine.runId })
+      .where(eq(agentWakeupRequests.id, genuineWakeId));
     const run = await resumeAndReadRun(clone.runId);
     expect(run?.status).toBe("cancelled");
     expect(run?.errorCode).toBe("issue_assignee_changed");
@@ -1010,6 +1029,63 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(run?.status).toBe("cancelled");
     expect(run?.errorCode).toBe("issue_assignee_changed");
     expect(countExecuteCallsForRun(fixture.runId)).toBe(0);
+  });
+
+  it("defers a native-review run until the committer intent is bound to it", async () => {
+    const fixture = await seedNativeReviewFixture();
+    // Unbound intent, kept out of the dispatcher's candidate set (completed)
+    // so only the gate sees it: admission must defer, not cancel or execute.
+    await db.update(agentWakeupRequests).set({ runId: null, status: "completed" })
+      .where(eq(agentWakeupRequests.id, fixture.wakeupRequestId));
+
+    await heartbeat.resumeQueuedRuns();
+    expect((await readRunState(fixture.runId))?.status).toBe("queued");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(0);
+
+    await db.update(agentWakeupRequests).set({ runId: fixture.runId, status: "queued" })
+      .where(eq(agentWakeupRequests.id, fixture.wakeupRequestId));
+    const run = await resumeAndReadRun(fixture.runId);
+    expect(run?.status).toBe("succeeded");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(1);
+  });
+
+  it("transfers the committer binding on promotion only for the committer wake or its dispatch", async () => {
+    const fixture = await seedNativeReviewFixture();
+    const promoted = await seedQueuedRun({
+      companyId: fixture.companyId,
+      agentId: fixture.reviewerId,
+      issueId: fixture.issueId,
+      wakeReason: "issue_execution_promoted",
+    });
+    const committerRunId = async () => db.select({ runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, fixture.wakeupRequestId))
+      .then((rows) => rows[0]?.runId ?? null);
+    const context = {
+      issueId: fixture.issueId,
+      nativeReviewInteractionId: fixture.interactionId,
+      nativeReviewDecisionId: fixture.decisionId,
+    };
+
+    await bindNativeReviewCommitterWakeToRun(db, {
+      companyId: fixture.companyId, issueId: fixture.issueId, runId: promoted.runId,
+      contextSnapshot: context,
+      wake: {
+        id: randomUUID(), idempotencyKey: null,
+        requestedByActorType: "user", requestedByActorId: "someone",
+      },
+    });
+    expect(await committerRunId()).toBe(fixture.runId);
+
+    await bindNativeReviewCommitterWakeToRun(db, {
+      companyId: fixture.companyId, issueId: fixture.issueId, runId: promoted.runId,
+      contextSnapshot: context,
+      wake: {
+        id: fixture.wakeupRequestId, idempotencyKey: `native-review:${fixture.interactionId}`,
+        requestedByActorType: "system", requestedByActorId: "native-status-committer",
+      },
+    });
+    expect(await committerRunId()).toBe(promoted.runId);
   });
 
   it("cancels a native-review wake whose provenance actor is not the server committer", async () => {
