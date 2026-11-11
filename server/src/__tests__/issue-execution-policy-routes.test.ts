@@ -107,7 +107,7 @@ const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 // it accepts a final-stage review escalation. Default delegates to the real
 // guard (set in registerModuleMocks) so every other close path is unaffected;
 // the refusal test overrides one call to prove the refusal is surfaced.
-const mockEvaluateDoneTransitionGuard = vi.hoisted(() => vi.fn());
+const mockEvaluateDoneTransitionGuard = vi.hoisted(() => vi.fn()); const mockEvaluateDoneTierDeclaration = vi.hoisted(() => vi.fn());
 // The summary-generation forced-return resolver (SUP-15768). issues.ts imports
 // this directly from ../services/summary-slots.js, so it is not covered by the
 // ../services/index.js module mock. Default resolves null (a non-summary issue
@@ -137,8 +137,8 @@ function registerModuleMocks() {
   // keeps the genuine guard (and the module's other exports) verbatim.
   vi.doMock("../services/done-transition-guard.js", async (importOriginal) => {
     const actual = await importOriginal<typeof import("../services/done-transition-guard.js")>();
-    mockEvaluateDoneTransitionGuard.mockImplementation(actual.evaluateDoneTransitionGuard);
-    return { ...actual, evaluateDoneTransitionGuard: mockEvaluateDoneTransitionGuard };
+    mockEvaluateDoneTransitionGuard.mockImplementation(actual.evaluateDoneTransitionGuard); mockEvaluateDoneTierDeclaration.mockImplementation(actual.evaluateDoneTierDeclaration);
+    return { ...actual, evaluateDoneTransitionGuard: mockEvaluateDoneTransitionGuard, evaluateDoneTierDeclaration: mockEvaluateDoneTierDeclaration };
   });
 
   vi.doMock("../services/runner-goals.js", () => ({
@@ -3976,6 +3976,96 @@ describe("issue execution policy routes", () => {
       expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
     });
 
+    it("does not cancel a replacement run when repository-delivery terminal approval preflight detects reassignment", async () => {
+      const stageId = "11111111-1111-4111-8111-111111111111";
+      const replacementRunId = "44444444-4444-4444-8444-444444444444";
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [{
+          id: stageId,
+          type: "approval",
+          participants: [{ type: "agent", agentId: reviewerAgentId }],
+        }],
+      })!;
+      const issue = {
+        id: issueId,
+        companyId: "company-1",
+        status: "in_review",
+        assigneeAgentId: reviewerAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-1012",
+        title: "Concurrent repository-delivery terminal approval",
+        deliveryRequirement: "repository_delivery",
+        executionPolicy: policy,
+        checkoutRunId: runId,
+        executionRunId: runId,
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "approval",
+          currentParticipant: { type: "agent", agentId: reviewerAgentId },
+          returnAssignee: { type: "agent", agentId: nextAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      };
+      const replacementIssue = {
+        ...issue,
+        checkoutRunId: replacementRunId,
+        executionRunId: replacementRunId,
+        updatedAt: new Date(),
+      };
+      const app = await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId,
+      });
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.getByIdForUpdate
+        .mockResolvedValueOnce(issue)
+        .mockResolvedValueOnce(issue)
+        .mockResolvedValueOnce(replacementIssue);
+      mockEvaluateDoneTransitionGuard.mockResolvedValue({
+        allowed: true,
+        reason: "Repository delivery certified",
+        branch: "issue-branch",
+        defaultRef: "main",
+        owner: "paperclip",
+        repo: "paperclip",
+        aheadBy: 1,
+        skipped: false,
+        skipReason: null,
+      });
+      mockEvaluateDoneTierDeclaration.mockResolvedValue({
+        allowed: true,
+        reason: "Tier 1 declaration certified for preflight test",
+        tier: "tier1",
+        skipped: false,
+        skipReason: null,
+      });
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "done",
+          assigneeAgentId: nextAgentId,
+          comment: "Final approval.",
+          doneTier: {
+            tier: "tier1",
+            reason: "Concurrent preflight rejection does not require a liveness probe",
+            landing: { mode: "landedAtTip", mergeCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("approval_final_delivery_preflight_stale");
+      expect(mockIssueService.getByIdForUpdate).toHaveBeenCalledTimes(3);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
     it("cancels the issuing run only after a terminal workflow approval commits", async () => {
       const stageId = "11111111-1111-4111-8111-111111111111";
       const policy = normalizeIssueExecutionPolicy({
@@ -4016,7 +4106,38 @@ describe("issue execution policy routes", () => {
         updatedAt: new Date(),
       }));
 
-      const app = await createApp();
+      const app = await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId,
+      });
+      mockEvaluateDoneTierDeclaration.mockResolvedValue({
+        allowed: true,
+        reason: "Tier 2 declaration certified for commit-ordering test",
+        tier: "tier2",
+        skipped: false,
+        skipReason: null,
+      });
+      let finishCallback!: () => void;
+      const callbackFinished = new Promise<void>((resolve) => {
+        finishCallback = resolve;
+      });
+      let releaseCommit!: () => void;
+      const commitAllowed = new Promise<void>((resolve) => {
+        releaseCommit = resolve;
+      });
+      mockDb.transaction.mockImplementation(async (callback: (tx: Record<string, unknown>) => Promise<unknown>) => {
+        const result = await callback({
+          select: mockDbSelect,
+          insert: () => mockTxWriteChain([{}]),
+          update: () => mockTxWriteChain([]),
+          delete: () => mockTxWriteChain([]),
+        });
+        finishCallback();
+        await commitAllowed;
+        return result;
+      });
       mockEvaluateDoneTransitionGuard.mockResolvedValue({
         allowed: true,
         reason: "Record-only issue; transition allowed",
@@ -4028,7 +4149,7 @@ describe("issue execution policy routes", () => {
         skipped: true,
         skipReason: "record_only_delivery_skipped",
       });
-      const res = await request(app)
+      const responsePromise = Promise.resolve(request(app)
         .patch(`/api/issues/${issueId}`)
         .send({
           status: "done",
@@ -4038,7 +4159,14 @@ describe("issue execution policy routes", () => {
             tier: "tier2",
             probeEvidence: "probe `route-ordering-check` head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa post-merge: terminal approval persisted before run cancellation",
           },
-        });
+        }));
+      await callbackFinished;
+      try {
+        expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+      } finally {
+        releaseCommit();
+      }
+      const res = await responsePromise;
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(mockIssueService.update).toHaveBeenCalledWith(
@@ -4048,7 +4176,7 @@ describe("issue execution policy routes", () => {
           assigneeAgentId: nextAgentId,
         }),
         expect.anything(),
-        expect.anything(),
+        undefined,
         expect.anything(),
       );
       expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
@@ -4060,7 +4188,7 @@ describe("issue execution policy routes", () => {
         .toBeLessThan(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]);
     });
 
-    it("does not cancel the issuing run when a terminal workflow approval fails to commit", async () => {
+    it.each(["update", "transaction commit"] as const)("does not cancel the issuing run when a terminal workflow approval %s fails", async (failureStage) => {
       const stageId = "11111111-1111-4111-8111-111111111111";
       const policy = normalizeIssueExecutionPolicy({
         stages: [{
@@ -4094,9 +4222,39 @@ describe("issue execution policy routes", () => {
         },
       };
       mockIssueService.getById.mockResolvedValue(issue);
-      mockIssueService.update.mockRejectedValue(new Error("simulated terminal update failure"));
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => {
+        if (failureStage === "update") throw new Error("simulated terminal update failure");
+        return {
+          ...issue,
+          ...patch,
+          updatedAt: new Date(),
+        };
+      });
+      if (failureStage === "transaction commit") {
+        mockDb.transaction.mockImplementation(async (callback: (tx: Record<string, unknown>) => Promise<unknown>) => {
+          await callback({
+            select: mockDbSelect,
+            insert: () => mockTxWriteChain([{}]),
+            update: () => mockTxWriteChain([]),
+            delete: () => mockTxWriteChain([]),
+          });
+          throw new Error("simulated terminal commit failure");
+        });
+      }
 
-      const app = await createApp();
+      const app = await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId,
+      });
+      mockEvaluateDoneTierDeclaration.mockResolvedValue({
+        allowed: true,
+        reason: "Tier 2 declaration certified for commit-failure test",
+        tier: "tier2",
+        skipped: false,
+        skipReason: null,
+      });
       mockEvaluateDoneTransitionGuard.mockResolvedValue({
         allowed: true,
         reason: "Record-only issue; transition allowed",
