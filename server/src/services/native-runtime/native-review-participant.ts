@@ -61,6 +61,43 @@ export type NativeReviewAssignment = {
   sourceRun: typeof heartbeatRuns.$inferSelect;
 };
 
+/** Server-set provenance on the wake that created a native-review run. */
+export function isNativeReviewWakeProvenance(
+  wake: {
+    reason: string | null;
+    idempotencyKey: string | null;
+    payload: unknown;
+    requestedByActorType: string | null;
+    requestedByActorId: string | null;
+  } | null | undefined,
+  expected: NativeReviewAssignmentContext & { issueId: string },
+): boolean {
+  if (!wake) return false;
+  const payload =
+    wake.payload && typeof wake.payload === "object"
+      ? (wake.payload as Record<string, unknown>)
+      : {};
+  const wakeContext =
+    payload._paperclipWakeContext && typeof payload._paperclipWakeContext === "object"
+      ? (payload._paperclipWakeContext as Record<string, unknown>)
+      : {};
+  const actorIsServerCommitter =
+    wake.requestedByActorType === "system" &&
+    (wake.requestedByActorId === "native-status-committer" ||
+      (typeof wake.requestedByActorId === "string" &&
+        wake.requestedByActorId.startsWith("native-status-wake-dispatch:")));
+  return (
+    wake.reason === "native_completion_review" &&
+    wake.idempotencyKey === `native-review:${expected.nativeReviewInteractionId}` &&
+    actorIsServerCommitter &&
+    (payload.nativeReviewInteractionId ?? wakeContext.nativeReviewInteractionId) ===
+      expected.nativeReviewInteractionId &&
+    (payload.nativeReviewDecisionId ?? wakeContext.nativeReviewDecisionId) ===
+      expected.nativeReviewDecisionId &&
+    (payload.issueId ?? wakeContext.issueId) === expected.issueId
+  );
+}
+
 export function readNativeReviewAssignmentContext(
   snapshot: unknown,
 ): NativeReviewAssignmentContext | null {

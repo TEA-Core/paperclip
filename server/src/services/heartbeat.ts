@@ -13,7 +13,7 @@ import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
-import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
+import { getNativeReviewAssignment, isNativeReviewWakeProvenance, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
 import { buildNativeReviewRequest } from "./native-runtime/native-review-prompt.js";
 import {
@@ -19166,6 +19166,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         return null;
       }
+      if (staleness.defer) return null;
     }
 
     if (issueId) {
@@ -20341,7 +20342,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   type QueuedRunStaleness =
-    | { stale: false }
+    | { stale: false; defer?: boolean }
     | {
         stale: true;
         reason: string;
@@ -20567,6 +20568,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const nativeReviewContext = readNativeReviewAssignmentContext(context);
     let isNativeReviewRun = false;
     let duplicateNativeReviewRun = false;
+    let nativeReviewLookupDeferred = false;
     if (nativeReviewContext) {
       try {
         const assignment = await getNativeReviewAssignment(dbOrTx, {
@@ -20580,6 +20582,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   reason: agentWakeupRequests.reason,
                   idempotencyKey: agentWakeupRequests.idempotencyKey,
                   payload: agentWakeupRequests.payload,
+                  requestedByActorType: agentWakeupRequests.requestedByActorType,
+                  requestedByActorId: agentWakeupRequests.requestedByActorId,
                 })
                 .from(agentWakeupRequests)
                 .where(
@@ -20592,15 +20596,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 )
                 .then((rows) => rows[0] ?? null)
             : null;
-          const wakePayload = parseObject(wake?.payload);
-          const wakeContext = parseObject(wakePayload._paperclipWakeContext);
-          const wakeCarriesAssignment =
-            wakePayload.nativeReviewInteractionId === nativeReviewContext.nativeReviewInteractionId ||
-            wakeContext.nativeReviewInteractionId === nativeReviewContext.nativeReviewInteractionId;
-          const hasWakeProvenance =
-            wake?.reason === "native_completion_review" &&
-            wake.idempotencyKey === `native-review:${nativeReviewContext.nativeReviewInteractionId}` &&
-            wakeCarriesAssignment;
+          const hasWakeProvenance = isNativeReviewWakeProvenance(wake, {
+            ...nativeReviewContext,
+            issueId,
+          });
           if (hasWakeProvenance) {
             const sibling = await dbOrTx
               .select({ id: heartbeatRuns.id })
@@ -20620,13 +20619,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
       } catch (error) {
+        // Fail closed for admission without aborting the sweep: leave this
+        // run queued for a later sweep instead of exempting or cancelling it.
         logger.warn(
           { err: error, runId: run.id, issueId },
-          "evaluateQueuedRunStaleness: native-review assignment lookup failed; deferring to claim revalidation",
+          "evaluateQueuedRunStaleness: native-review assignment lookup failed; leaving run queued",
         );
-        isNativeReviewRun = true;
+        nativeReviewLookupDeferred = true;
       }
     }
+    if (nativeReviewLookupDeferred) return { stale: false, defer: true };
     if (duplicateNativeReviewRun && nativeReviewContext) {
       return {
         stale: true,

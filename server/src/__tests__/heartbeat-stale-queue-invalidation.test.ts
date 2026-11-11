@@ -651,6 +651,8 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       if (opts.authenticateWake ?? true) {
         await db.update(agentWakeupRequests).set({
           idempotencyKey: `native-review:${interactionId}`,
+          requestedByActorType: "system",
+          requestedByActorId: "native-status-committer",
           payload: {
             issueId,
             nativeReviewInteractionId: interactionId,
@@ -679,6 +681,65 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       return run?.status !== "queued" && run?.status !== "running";
     });
     return readRunState(runId);
+  }
+
+  // Faults only queries matching the predicate (by table and bound params),
+  // optionally only the first matching query. All other queries pass through.
+  function createFaultedHeartbeat(
+    shouldFail: (input: { table: unknown; params: unknown[] }) => boolean,
+    opts: { once?: boolean } = {},
+  ) {
+    const injectedError = new Error("injected native-review lookup failure");
+    let faulted = 0;
+    const wrapBuilder = (builder: any, table: unknown): any => new Proxy(builder, {
+      get(bt, bp) {
+        const value = Reflect.get(bt, bp, bt);
+        if (bp === "then") {
+          return (onFulfilled: unknown, onRejected: unknown) => {
+            let targeted = false;
+            try {
+              targeted = table !== undefined && shouldFail({ table, params: bt.toSQL().params as unknown[] });
+            } catch {
+              targeted = false;
+            }
+            if (targeted && (!opts.once || faulted === 0)) {
+              faulted += 1;
+              return Promise.reject(injectedError).then(onFulfilled as any, onRejected as any);
+            }
+            return (value as any).call(bt, onFulfilled, onRejected);
+          };
+        }
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          const result = (value as any).apply(bt, args);
+          if (bp === "from") return wrapBuilder(result, args[0]);
+          return result && typeof result === "object" &&
+            (typeof result.from === "function" || typeof result.where === "function" || typeof result.then === "function")
+            ? wrapBuilder(result, table)
+            : result;
+        };
+      },
+    });
+    const wrapSelect = (target: object): any => new Proxy(target, {
+      get(t, prop, receiver) {
+        if (prop === "transaction") {
+          const value = Reflect.get(t, prop, receiver) as any;
+          return (fn: (tx: unknown) => Promise<unknown>) =>
+            value.call(t, (tx: object) => fn(wrapSelect(tx)));
+        }
+        if (prop !== "select") return Reflect.get(t, prop, receiver);
+        return (...args: unknown[]) => wrapBuilder((t as any).select(...args), undefined);
+      },
+    });
+    const faultedDb = new Proxy(db, {
+      get(t, prop, receiver) {
+        if (prop === "select" || prop === "transaction") return wrapSelect(t)[prop];
+        return Reflect.get(t, prop, receiver);
+      },
+    }) as typeof db;
+    return heartbeatService(faultedDb, {
+      runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" },
+    });
   }
 
   it("claims a bare native-review queued run for the reviewer instead of cancelling it as assignee-changed", async () => {
@@ -810,54 +871,8 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     // Fault only the assignment lookup for this interaction: a query whose
     // bound parameters carry the interaction id. Every other query, including
     // the ordinary run's own interaction reads, passes through untouched.
-    const injectedError = new Error("injected native-review lookup failure");
-    const wrapBuilder = (builder: any): any => new Proxy(builder, {
-      get(bt, bp) {
-        const value = Reflect.get(bt, bp, bt);
-        if (bp === "then") {
-          return (onFulfilled: unknown, onRejected: unknown) => {
-            let targeted = false;
-            try {
-              targeted = JSON.stringify(bt.toSQL().params).includes(fixture.interactionId);
-            } catch {
-              targeted = false;
-            }
-            if (targeted) return Promise.reject(injectedError).then(onFulfilled as any, onRejected as any);
-            return (value as any).call(bt, onFulfilled, onRejected);
-          };
-        }
-        if (typeof value !== "function") return value;
-        return (...args: unknown[]) => {
-          const result = (value as any).apply(bt, args);
-          return result && typeof result === "object" &&
-            (typeof result.from === "function" || typeof result.where === "function" || typeof result.then === "function")
-            ? wrapBuilder(result)
-            : result;
-        };
-      },
-    });
-    const wrapSelect = (target: object): any => new Proxy(target, {
-      get(t, prop, receiver) {
-        if (prop === "transaction") {
-          const value = Reflect.get(t, prop, receiver) as any;
-          return (fn: (tx: unknown) => Promise<unknown>) =>
-            value.call(t, (tx: object) => fn(wrapSelect(tx)));
-        }
-        if (prop !== "select") return Reflect.get(t, prop, receiver);
-        return (...args: unknown[]) => wrapBuilder((t as any).select(...args));
-      },
-    });
-    const faultedDb = new Proxy(db, {
-      get(t, prop, receiver) {
-        if (prop === "select") return wrapSelect(t).select;
-        if (prop !== "transaction") return Reflect.get(t, prop, receiver);
-        return (fn: (tx: unknown) => Promise<unknown>) =>
-          t.transaction((tx) => fn(wrapSelect(tx as object)));
-      },
-    }) as typeof db;
-    const faultedHeartbeat = heartbeatService(faultedDb, {
-      runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" },
-    });
+    const faultedHeartbeat = createFaultedHeartbeat(({ params }) =>
+      params.includes(fixture.interactionId));
 
     await expect(faultedHeartbeat.resumeQueuedRuns()).resolves.toBeUndefined();
     await waitForCondition(async () => {
@@ -868,6 +883,74 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(countExecuteCallsForRun(ordinary.runId)).toBe(1);
     expect((await readRunState(fixture.runId))?.status).toBe("queued");
     expect(countExecuteCallsForRun(fixture.runId)).toBe(0);
+  });
+
+  it("cancels a native-review wake whose provenance actor is not the server committer", async () => {
+    const fixture = await seedNativeReviewFixture();
+    await db.update(agentWakeupRequests).set({
+      requestedByActorType: "agent",
+      requestedByActorId: fixture.reviewerId,
+    }).where(eq(agentWakeupRequests.id, fixture.wakeupRequestId));
+    const run = await resumeAndReadRun(fixture.runId);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_assignee_changed");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(0);
+  });
+
+  it("does not execute a native-review run when the wake lookup fails once", async () => {
+    const fixture = await seedNativeReviewFixture();
+    const faultedHeartbeat = createFaultedHeartbeat(
+      ({ table, params }) => table === agentWakeupRequests && params.includes(fixture.wakeupRequestId),
+      { once: true },
+    );
+    await expect(faultedHeartbeat.resumeQueuedRuns()).resolves.toBeUndefined();
+    expect((await readRunState(fixture.runId))?.status).toBe("queued");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(0);
+
+    const run = await resumeAndReadRun(fixture.runId);
+    expect(run?.status).toBe("succeeded");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(1);
+  });
+
+  it("does not execute a duplicate native-review run when the sibling lookup fails once", async () => {
+    const fixture = await seedNativeReviewFixture();
+    const first = await resumeAndReadRun(fixture.runId);
+    expect(first?.status).toBe("succeeded");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(1);
+
+    const duplicate = await seedQueuedRun({
+      companyId: fixture.companyId,
+      agentId: fixture.reviewerId,
+      issueId: fixture.issueId,
+      wakeReason: "native_completion_review",
+      contextExtras: {
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+    });
+    await db.update(agentWakeupRequests).set({
+      idempotencyKey: `native-review:${fixture.interactionId}`,
+      requestedByActorType: "system",
+      requestedByActorId: "native-status-committer",
+      payload: {
+        issueId: fixture.issueId,
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+    }).where(eq(agentWakeupRequests.id, duplicate.wakeupRequestId));
+
+    const faultedHeartbeat = createFaultedHeartbeat(
+      ({ table, params }) => table === heartbeatRuns && params.includes(fixture.interactionId),
+      { once: true },
+    );
+    await expect(faultedHeartbeat.resumeQueuedRuns()).resolves.toBeUndefined();
+    expect((await readRunState(duplicate.runId))?.status).toBe("queued");
+    expect(countExecuteCallsForRun(duplicate.runId)).toBe(0);
+
+    const run = await resumeAndReadRun(duplicate.runId);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("native_review_assignment_already_claimed");
+    expect(countExecuteCallsForRun(duplicate.runId)).toBe(0);
   });
 
   it("does not re-open a resolved connection-intent issue parked after claim", async () => {

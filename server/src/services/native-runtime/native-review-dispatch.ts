@@ -1,7 +1,7 @@
 import { agentWakeupRequests, heartbeatRuns, issues, type Db } from "@paperclipai/db";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import type { PgUpdateSetSource } from "drizzle-orm/pg-core";
-import { claimNativeReviewExecutionLock, readNativeReviewAssignmentContext } from "./native-review-participant.js";
+import { claimNativeReviewExecutionLock, isNativeReviewWakeProvenance, readNativeReviewAssignmentContext } from "./native-review-participant.js";
 
 /** The run, wake, and issue lock form one reviewer admission claim. */
 export async function claimQueuedNativeReviewRun(db: Db, input: {
@@ -12,7 +12,8 @@ export async function claimQueuedNativeReviewRun(db: Db, input: {
 }): Promise<typeof heartbeatRuns.$inferSelect | null> {
   const context = input.run.contextSnapshot as Record<string, unknown> | null;
   const issueId = context?.issueId;
-  if (typeof issueId !== "string" || !readNativeReviewAssignmentContext(context)) return null;
+  const reviewContext = readNativeReviewAssignmentContext(context);
+  if (typeof issueId !== "string" || !reviewContext) return null;
   return db.transaction(async (tx) => {
     // Match the queue editor's lock order: issue, wake, then run.
     const [issue] = await tx.select({ id: issues.id }).from(issues).where(and(
@@ -26,7 +27,17 @@ export async function claimQueuedNativeReviewRun(db: Db, input: {
         eq(agentWakeupRequests.agentId, input.run.agentId),
       )).for("update");
       if (!wake || wake.status !== "queued" || wake.runId !== input.run.id) return null;
+      if (!isNativeReviewWakeProvenance(wake, { ...reviewContext, issueId })) return null;
+    } else {
+      return null;
     }
+    const [sibling] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, input.run.companyId),
+      ne(heartbeatRuns.id, input.run.id),
+      inArray(heartbeatRuns.status, ["running", "succeeded"]),
+      sql`${heartbeatRuns.contextSnapshot} ->> 'nativeReviewInteractionId' = ${reviewContext.nativeReviewInteractionId}`,
+    )).limit(1);
+    if (sibling) return null;
     const [run] = await tx.select().from(heartbeatRuns).where(and(
       eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId),
       eq(heartbeatRuns.agentId, input.run.agentId),
