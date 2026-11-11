@@ -3,6 +3,9 @@ import { generateKeyPairSync } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   normalizeRepoUrl,
+  parseRepoUrlRef,
+  canonicalGitHubRepoRef,
+  GITHUB_CANONICAL_HOST,
   resolveGitHubToken,
   resolveGitHubTokenForRepo,
   resolveGitHubTokenCandidatesForRepo,
@@ -1888,5 +1891,65 @@ describe("normalizeRepoUrl", () => {
     expect(normalizeRepoUrl("https://github.com/TEA-Core/paperclip-smart-router")).not.toBe(
       normalizeRepoUrl("https://github.com/TEA-Core/paperclip"),
     );
+  });
+
+  it("still erases the host — which is why an authorization comparison must not use it alone", () => {
+    // SUP-23880: this collapse is the general behavior other callers depend on, but it
+    // makes a GitLab-hosted workspace compare equal to a GitHub one. Host-aware
+    // authorization uses parseRepoUrlRef/canonicalGitHubRepoRef instead.
+    expect(normalizeRepoUrl("https://gitlab.example.com/TEA-Core/paperclip")).toBe(
+      normalizeRepoUrl("https://github.com/TEA-Core/paperclip"),
+    );
+  });
+});
+
+describe("parseRepoUrlRef / canonicalGitHubRepoRef — host-aware repo identity (SUP-23880)", () => {
+  it("parseRepoUrlRef preserves the host so a non-GitHub URL cannot compare equal to a GitHub one", () => {
+    const gitlab = parseRepoUrlRef("https://gitlab.example.com/TEA-Core/paperclip");
+    const github = parseRepoUrlRef("https://github.com/TEA-Core/paperclip");
+    expect(gitlab).toEqual({ host: "gitlab.example.com", owner: "TEA-Core", repo: "paperclip" });
+    expect(github).toEqual({ host: "github.com", owner: "TEA-Core", repo: "paperclip" });
+    expect(gitlab!.host).not.toBe(github!.host);
+  });
+
+  it("keeps registered owner/repo casing, strips .git and trailing slashes, lowercases only the host", () => {
+    expect(parseRepoUrlRef("https://GitHub.com/TEA-Core/Paperclip.git/")).toEqual({
+      host: "github.com",
+      owner: "TEA-Core",
+      repo: "Paperclip",
+    });
+    expect(parseRepoUrlRef("git@GitHub.com:TEA-Core/paperclip.git")).toEqual({
+      host: "github.com",
+      owner: "TEA-Core",
+      repo: "paperclip",
+    });
+    expect(parseRepoUrlRef("TEA-Core/paperclip.git")).toEqual({ host: "", owner: "TEA-Core", repo: "paperclip" });
+    expect(parseRepoUrlRef("https://user@github.com/TEA-Core/paperclip")).toEqual({
+      host: "github.com",
+      owner: "TEA-Core",
+      repo: "paperclip",
+    });
+  });
+
+  it("canonicalGitHubRepoRef admits only a github.com host — bare owner/repo and other hosts fail closed", () => {
+    expect(GITHUB_CANONICAL_HOST).toBe("github.com");
+    expect(canonicalGitHubRepoRef("https://github.com/TEA-Core/paperclip")).toEqual({
+      host: "github.com",
+      owner: "TEA-Core",
+      repo: "paperclip",
+    });
+    expect(canonicalGitHubRepoRef("git@github.com:TEA-Core/paperclip.git")).not.toBeNull();
+    // A bare owner/repo carries no host to prove it is GitHub, so it cannot authorize.
+    expect(canonicalGitHubRepoRef("TEA-Core/paperclip")).toBeNull();
+    expect(canonicalGitHubRepoRef("https://www.github.com/TEA-Core/paperclip")).toBeNull();
+    expect(canonicalGitHubRepoRef("https://gitlab.example.com/TEA-Core/paperclip")).toBeNull();
+  });
+
+  it("returns null for anything that is not exactly owner/repo after the host", () => {
+    expect(parseRepoUrlRef("https://github.com/TEA-Core/paperclip/tree/main")).toBeNull();
+    expect(parseRepoUrlRef("https://github.com/TEA-Core/")).toBeNull();
+    expect(parseRepoUrlRef("https://github.com")).toBeNull();
+    expect(parseRepoUrlRef("")).toBeNull();
+    expect(parseRepoUrlRef("just-a-name")).toBeNull();
   });
 });

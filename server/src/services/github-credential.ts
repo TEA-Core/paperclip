@@ -431,6 +431,11 @@ export async function resolveGitHubToken(
  * Normalize a workspace repoUrl to lowercase `owner/repo` so rows can be
  * compared exactly, regardless of URL scheme, host, `.git` suffix, trailing
  * slash, or casing. GitHub owner/repo references are case-insensitive.
+ *
+ * This deliberately ERASES the host: `https://gitlab.example.com/owner/repo`
+ * and `https://github.com/owner/repo` normalize to the same string. Callers
+ * that depend on that collapse keep using it; any comparison that must not
+ * treat those two as the same repository uses {@link parseRepoUrlRef}.
  */
 export function normalizeRepoUrl(repoUrl: string): string {
   let normalized = repoUrl.trim();
@@ -439,6 +444,68 @@ export function normalizeRepoUrl(repoUrl: string): string {
   normalized = normalized.replace(/\/+$/, "");
   normalized = normalized.replace(/\.git$/i, "");
   return normalized.toLowerCase();
+}
+
+/** The host a workspace registration must carry to be eligible for a GitHub assurance mint (SUP-23880). */
+export const GITHUB_CANONICAL_HOST = "github.com";
+
+/**
+ * A workspace repoUrl split into host + `owner/repo` segments WITHOUT erasing
+ * host identity — the host-aware counterpart of {@link normalizeRepoUrl}.
+ * Casing of owner/repo is preserved as registered; only the host is lowercased
+ * (hosts are case-insensitive). The `.git` suffix and trailing slash are part
+ * of a clone URL's spelling, not of the repository's identity, so they are
+ * stripped from the canonical repo segment.
+ */
+export interface RepoUrlRef {
+  /** Lowercased host as written in the URL; "" for a bare `owner/repo` form with no host at all. */
+  host: string;
+  /** Owner segment with the casing it was registered with. */
+  owner: string;
+  /** Repo segment with the casing it was registered with, `.git` suffix and trailing slash stripped. */
+  repo: string;
+}
+
+/**
+ * Parse a workspace repoUrl into {@link RepoUrlRef}. Returns null for anything
+ * that is not exactly one host (or none) followed by exactly `owner/repo` —
+ * deeper paths, empty segments — so authorization comparisons fail closed
+ * instead of half-matching.
+ */
+export function parseRepoUrlRef(repoUrl: string): RepoUrlRef | null {
+  const trimmed = repoUrl.trim();
+  if (!trimmed) return null;
+  // URL form: scheme://[userinfo@]host/owner/repo — .git suffix and trailing slash optional.
+  const urlForm =
+    /^[a-z][a-z0-9+.-]*:\/\/(?:[^/@]+@)?([^/?#]+)\/([^/?#]+)\/([^/?#]+?)(?:\.git)?\/?$/i.exec(trimmed);
+  if (urlForm) {
+    return { host: urlForm[1]!.toLowerCase(), owner: urlForm[2]!, repo: urlForm[3]! };
+  }
+  // scp-like form: user@host:owner/repo
+  const scpForm = /^[\w.@-]+@([\w.-]+):([^/]+)\/([^/]+?)(?:\.git)?\/?$/i.exec(trimmed);
+  if (scpForm) {
+    return { host: scpForm[1]!.toLowerCase(), owner: scpForm[2]!, repo: scpForm[3]! };
+  }
+  // Bare owner/repo: carries no host, so a caller requiring host identity must fail closed on it.
+  const bare = /^([^/]+)\/([^/]+?)(?:\.git)?\/?$/i.exec(trimmed);
+  if (bare) {
+    return { host: "", owner: bare[1]!, repo: bare[2]! };
+  }
+  return null;
+}
+
+/**
+ * The canonical GitHub owner/repo of a workspace registration, or null when the
+ * URL is not GitHub-hosted — any host other than exactly `github.com`,
+ * including a hostless bare `owner/repo` form. The writer-Auditor assurance
+ * mint authorizes only against this ref: the request's owner/repo must equal
+ * the returned strings exactly, so aliases (different casing, trailing `.git`,
+ * URL-form owner, trailing whitespace) refuse instead of normalizing into an
+ * authorization match.
+ */
+export function canonicalGitHubRepoRef(repoUrl: string): RepoUrlRef | null {
+  const ref = parseRepoUrlRef(repoUrl);
+  return ref && ref.host === GITHUB_CANONICAL_HOST ? ref : null;
 }
 
 export async function resolveGitHubTokenCandidatesForRepo(
