@@ -1780,6 +1780,26 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   ) {
     if (workspace.providerType !== "git_worktree") return;
     const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
+    const [activeReference] = workspacePath
+      ? await db
+          .select({ id: executionWorkspaces.id })
+          .from(executionWorkspaces)
+          .where(and(
+            eq(executionWorkspaces.companyId, workspace.companyId),
+            ne(executionWorkspaces.id, workspace.id),
+            inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+            or(
+              eq(executionWorkspaces.cwd, workspacePath),
+              eq(executionWorkspaces.providerRef, workspacePath),
+            ),
+          ))
+          .limit(1)
+      : [];
+    if (activeReference) {
+      throw new Error(
+        `Refusing terminal workspace cleanup because ${workspacePath} is still referenced by active execution workspace ${activeReference.id}`,
+      );
+    }
     if (workspacePath && !(await pathExists(workspacePath))) {
       // The checkout is already gone. There is no HEAD left to re-verify, and
       // spawning git with that cwd is the ENOENT that stuck these rows. A
@@ -3250,11 +3270,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           keep(workspace, "issue tree is not terminal", "skippedNonTerminalTree");
           continue;
         }
-        // Every archive outside the recorded merged-delivery path changes no work
-        // tree: no git worktree remove, file removal, branch deletion or
-        // runtime-service stop. The tree and branch stay for the host cleanup. The
-        // readiness inspection above can still fetch the default branch when the
-        // recorded branch is missing.
+        // Shared, missing, and non-git record-only archives change no work tree.
+        // Isolated git record-only archives detach first, then use the same fenced
+        // cleanup as merged delivery. The readiness inspection above can still
+        // fetch the default branch when the recorded branch is missing.
         let recordOnlyReason: string | null = null;
         const mergedDelivery = assessment.deliveryState === "merged_via_pr"
           || assessment.deliveryState === "merged_by_ancestry";
@@ -3298,6 +3317,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           keep(workspace, "worktree has local changes", "skippedUndelivered");
           continue;
         }
+        const cleanupRecordOnly = Boolean(recordOnlyReason) && !sharedSession && cwdKind === "git";
         const cleanupReason = recordOnlyReason
           ? `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${recordOnlyReason}`
           : ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON;
@@ -3573,8 +3593,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             ))
             .returning()
             .then((rows) => rows[0] ?? null);
-          // A record-only archive has no cleanup step after it, so detach the
-          // issues here. A closed row left on them breaks dispatch (SUP-17621).
+          // Detach record-only issues before any cleanup. A closed row left on
+          // them breaks dispatch (SUP-17621).
           if (row && recordOnlyReason) {
             await detachIssuesFromClosedExecutionWorkspace(tx as unknown as Db, {
               companyId: row.companyId,
@@ -3602,7 +3622,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             cleanupReason,
           },
         });
-        if (recordOnlyReason) {
+        if (recordOnlyReason && !cleanupRecordOnly) {
           result.archived += 1;
           continue;
         }
