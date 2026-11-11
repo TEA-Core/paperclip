@@ -2,6 +2,7 @@ import express from "express";
 import request from "supertest";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
+import { listUnresolvedBlockerIssueIds as realListUnresolvedBlockerIssueIds } from "../services/issues.js";
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockLoggerWarn = vi.hoisted(() => vi.fn());
@@ -15,6 +16,9 @@ const mockIssueService = vi.hoisted(() => ({
   getRelationSummaries: vi.fn(),
   update: vi.fn(),
   getDependencyReadiness: vi.fn(),
+  listUnresolvedBlockerIssueIds: vi.fn(
+    async (_companyId: string, _blockerIssueIds: string[]) => [] as string[],
+  ),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
   findMentionedAgents: vi.fn(async () => []),
@@ -140,6 +144,14 @@ async function createApp() {
   const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
     "../middleware/index.js",
   );
+  // The route resolves unresolved blockers through the issueService seam; keep
+  // that seam driving the real query over this app's stub db so the guard's
+  // stubRows answers stay the tests' source of truth.
+  const db = createStubDb() as any;
+  mockIssueService.listUnresolvedBlockerIssueIds.mockImplementation(
+    async (companyId: string, blockerIssueIds: string[]) =>
+      realListUnresolvedBlockerIssueIds(db, companyId, blockerIssueIds),
+  );
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -152,7 +164,7 @@ async function createApp() {
     };
     next();
   });
-  app.use("/api", issueRoutes(createStubDb() as any, {} as any));
+  app.use("/api", issueRoutes(db, {} as any));
   app.use(reportUnexpectedRouteError("issue-blocked-without-blockers-signal-routes"));
   app.use(errorHandler);
   return app;

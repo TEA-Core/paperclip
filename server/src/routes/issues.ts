@@ -20126,18 +20126,7 @@ export function issueRoutes(
         if (!member) throw unprocessable("Unblock owner user must be an active company member");
       }
     }
-    const enteringBlocked = existing.status !== "blocked" && updateFields.status === "blocked";
-    if (enteringBlocked) {
-      const requestedBlockerIds = Array.isArray(req.body.blockedByIssueIds)
-        ? [...new Set(req.body.blockedByIssueIds as string[])]
-        : null;
-      const hasUnresolvedBlocker = requestedBlockerIds
-        ? requestedBlockerIds.length > 0 && await db.select({ id: issueRows.id }).from(issueRows).where(and(
-          eq(issueRows.companyId, existing.companyId),
-          inArray(issueRows.id, requestedBlockerIds),
-          notInArray(issueRows.status, ["done", "cancelled"]),
-        )).limit(1).then((rows) => rows.length > 0)
-        : (await svc.getDependencyReadiness(existing.id)).unresolvedBlockerCount > 0;
+    const findPendingResolutionPath = async () => {
       const [pendingInteraction, pendingApproval] = await Promise.all([
         db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
           eq(issueThreadInteractions.companyId, existing.companyId),
@@ -20150,8 +20139,53 @@ export function issueRoutes(
           eq(approvals.status, "pending"),
         )).limit(1).then((rows) => rows[0] ?? null),
       ]);
+      return { pendingInteraction, pendingApproval };
+    };
+    const enteringBlocked = existing.status !== "blocked" && updateFields.status === "blocked";
+    if (enteringBlocked) {
+      const requestedBlockerIds = Array.isArray(req.body.blockedByIssueIds)
+        ? [...new Set(req.body.blockedByIssueIds as string[])]
+        : null;
+      const hasUnresolvedBlocker = requestedBlockerIds
+        ? requestedBlockerIds.length > 0 && (await svc.listUnresolvedBlockerIssueIds(
+          existing.companyId,
+          requestedBlockerIds,
+        )).length > 0
+        : (await svc.getDependencyReadiness(existing.id)).unresolvedBlockerCount > 0;
+      const { pendingInteraction, pendingApproval } = await findPendingResolutionPath();
       if (!hasUnresolvedBlocker && !pendingInteraction && !pendingApproval && !descriptor) {
         res.status(422).json({ error: "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor" });
+        return;
+      }
+    }
+    // A non-empty all-done blocker set is dependency-ready, not a valid blocked
+    // state. This applies equally to new edges, explicit status replays,
+    // descriptors, and writes with a pending interaction or approval.
+    const blockIntentWrite =
+      updateFields.status === "blocked" ||
+      Array.isArray(req.body.blockedByIssueIds) ||
+      descriptor !== null;
+    if (blockIntentWrite && nextStatus === "blocked") {
+      const requestedBlockerIds = Array.isArray(req.body.blockedByIssueIds)
+        ? [...new Set(req.body.blockedByIssueIds as string[])]
+        : null;
+      let setEntirelyResolved: boolean;
+      if (requestedBlockerIds) {
+        const unresolvedBlockerIssueIds = await svc.listUnresolvedBlockerIssueIds(
+          existing.companyId,
+          requestedBlockerIds,
+        );
+        setEntirelyResolved = requestedBlockerIds.length > 0 && unresolvedBlockerIssueIds.length === 0;
+      } else {
+        const readiness = await svc.getDependencyReadiness(existing.id);
+        setEntirelyResolved =
+          readiness.blockerIssueIds.length > 0 && readiness.unresolvedBlockerCount === 0;
+      }
+      if (setEntirelyResolved) {
+        res.status(422).json({
+          error: "Cannot block on a blocker set that is already fully resolved. Move the issue forward, or add a blocker that is not done.",
+          details: { reason: "blocked_on_resolved_blockers" },
+        });
         return;
       }
     }
@@ -22594,10 +22628,20 @@ export function issueRoutes(
       if (restoredBlockedReadyDependency && typeof dependencyReadinessSvc.getDependencyReadiness === "function") {
         const readiness = await dependencyReadinessSvc.getDependencyReadiness(issue.id);
         const resolvedBlockerIssueId = readiness.blockerIssueIds[0] ?? null;
+        // SUP-23849/SUP-23854: a PATCH by the dependent's own assignee agent
+        // must not wake that assignee. A run that parks (or re-parks) its own
+        // issue on an already-resolved blocker set is the producer of the
+        // re-block loop, not a consumer of the wake; operator (board/user)
+        // writes still wake the assignee.
+        const patchActorIsDependentAssignee =
+          actor.actorType === "agent" &&
+          actor.agentId !== null &&
+          actor.agentId === issue.assigneeAgentId;
         if (
           resolvedBlockerIssueId &&
           readiness.isDependencyReady &&
-          readiness.blockerIssueIds.length > 0
+          readiness.blockerIssueIds.length > 0 &&
+          !patchActorIsDependentAssignee
         ) {
           await addDependencyResolvedWakeup({
             agentId: issue.assigneeAgentId!,

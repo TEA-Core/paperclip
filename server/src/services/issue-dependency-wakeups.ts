@@ -1,4 +1,4 @@
-import { and, eq, gte, inArray, or } from "drizzle-orm";
+import { and, eq, gte, inArray, notInArray, or } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests } from "@paperclipai/db";
@@ -38,30 +38,14 @@ export type IssueBlockersResolvedReadyStateInput = {
   blockedTransitionAt?: IssueBlockersResolvedWakeCycleInput;
 };
 
-/**
- * Canonical blocked-cycle stamp for the dependency-ready state key.
- * `blockedTransitionAt` is UTC ISO-8601, or `none` when the dependent has no
- * recorded transition into `blocked`.
- */
-export function formatIssueBlockersResolvedWakeCycle(
-  blockedTransitionAt: IssueBlockersResolvedWakeCycleInput,
-): string {
-  if (blockedTransitionAt == null || blockedTransitionAt === "") return "none";
-  const parsed = blockedTransitionAt instanceof Date
-    ? blockedTransitionAt
-    : new Date(blockedTransitionAt);
-  if (Number.isNaN(parsed.getTime())) return "none";
-  return parsed.toISOString();
-}
-
 function uniqueSortedBlockerIssueIds(blockerIssueIds: string[]): string[] {
   return [...new Set(blockerIssueIds.filter(Boolean))].sort();
 }
 
-function hashBlockerReadyStateDigest(sortedBlockerIssueIds: string[], cycle: string | null): string {
-  const payload = cycle == null
-    ? sortedBlockerIssueIds.join(",")
-    : `${sortedBlockerIssueIds.join(",")}\n${cycle}`;
+function hashBlockerReadyStateDigest(sortedBlockerIssueIds: string[], domain?: string): string {
+  const payload = domain
+    ? `${domain}\n${sortedBlockerIssueIds.join(",")}`
+    : sortedBlockerIssueIds.join(",");
   return createHash("sha256").update(payload).digest("hex").slice(0, 32);
 }
 
@@ -104,28 +88,31 @@ export function buildIssueBlockersResolvedWakeStateKeyWithoutCycle(input: {
   const sortedBlockerIssueIds = uniqueSortedBlockerIssueIds(input.blockerIssueIds);
   return buildStateKey(
     input.dependentIssueId,
-    hashBlockerReadyStateDigest(sortedBlockerIssueIds, null),
+    hashBlockerReadyStateDigest(sortedBlockerIssueIds),
     sortedBlockerIssueIds.length,
   );
 }
 
 /**
- * Level-triggered idempotency key. One key encodes the full set of blockers that
- * defines the current dependency-ready state plus the dependent's current
- * blocked cycle (`blockedTransitionAt`, or `none`). Two wakes for the same ready
- * state share the key. A wake from an earlier blocked cycle has a different
- * cycle stamp, so it produces a different key and never suppresses the current
- * wake. All three emit paths (route-time, finalize-time, periodic backstop) use
- * this key so they share one idempotency rule.
+ * Canonical dependency-ready key. The stable dependent/blocker-set identity is
+ * shared by route, recovery, merge-card, and heartbeat producers across blocked
+ * cycles. `blockedTransitionAt` remains in the input only for legacy lookup.
  */
 export function buildIssueBlockersResolvedWakeStateKey(input: IssueBlockersResolvedReadyStateInput) {
   const sortedBlockerIssueIds = uniqueSortedBlockerIssueIds(input.blockerIssueIds);
-  const cycle = formatIssueBlockersResolvedWakeCycle(input.blockedTransitionAt);
   return buildStateKey(
     input.dependentIssueId,
-    hashBlockerReadyStateDigest(sortedBlockerIssueIds, cycle),
+    hashBlockerReadyStateDigest(sortedBlockerIssueIds, "dependency-ready-v1"),
     sortedBlockerIssueIds.length,
   );
+}
+
+/** Legacy exported name for the canonical stable dependency-ready key. */
+export function buildIssueBlockersResolvedRestoredWakeIdempotencyKey(input: {
+  dependentIssueId: string;
+  blockerIssueIds: string[];
+}) {
+  return buildIssueBlockersResolvedWakeStateKey(input);
 }
 
 function parseWakeCycleDate(blockedTransitionAt: IssueBlockersResolvedWakeCycleInput): Date | null {
@@ -145,7 +132,7 @@ function wakeCoversIssueBlockersResolvedReadyState(
     updatedAt: Date;
   },
   keys: {
-    cycleKey: string;
+    stateKey: string;
     oldStateKey: string;
     legacyKeys: Set<string>;
     blockedTransitionAt: Date | null;
@@ -155,13 +142,13 @@ function wakeCoversIssueBlockersResolvedReadyState(
   const idempotencyKey = wake.idempotencyKey;
   if (!idempotencyKey) return false;
 
-  if (idempotencyKey === keys.cycleKey) {
+  if (idempotencyKey === keys.stateKey) {
     if (IN_FLIGHT_DEPENDENCY_WAKE_STATUS_SET.has(wake.status)) return true;
     if (!IDEMPOTENT_DEPENDENCY_WAKE_STATUS_SET.has(wake.status)) return false;
     // Fork re-arm window: a wake that COMPLETED and left the dependent dead is
     // allowed to re-arm once it ages past the cutoff, which is what feeds the
     // re-arm cap and the blocked_without_blockers escalation. Without this a
-    // completed cycle-key wake would suppress forever and the cap would never
+    // completed stable-key wake would suppress forever and the cap would never
     // fire. No cutoff configured keeps upstream's plain idempotent behaviour.
     if (!keys.completedRearmCutoff) return true;
     return wake.updatedAt.getTime() >= keys.completedRearmCutoff.getTime();
@@ -183,17 +170,17 @@ function wakeCoversIssueBlockersResolvedReadyState(
 
 /**
  * Find a wake that already covers the current dependency-ready state of the
- * dependent issue. The check is level-triggered and cycle-aware:
+ * dependent issue. The check is level-triggered and stable across blocked cycles:
  *
- * - The cycle-aware state key matches a wake in any idempotent status
- *   (including `completed`). This suppresses a duplicate for the SAME ready
- *   state, including the current blocked cycle.
+ * - The canonical state key matches a wake in any idempotent status
+ *   (including `completed`). This suppresses a duplicate for the SAME dependent
+ *   and blocker set, regardless of which producer emitted it or when it blocked.
  * - The old no-cycle state key matches in-flight statuses (deploy overlap),
  *   or a `completed` wake whose `requestedAt` is at or after the current
  *   `blockedTransitionAt` (same cycle). A completed old-key wake from a
  *   previous cycle does not suppress.
  * - Each legacy per-edge key matches only a wake that is still in flight.
- * - `completedRearmCutoff` (fork) lets a COMPLETED cycle-key wake stop
+ * - `completedRearmCutoff` (fork) lets a COMPLETED canonical-key wake stop
  *   suppressing once it ages past the cutoff, so the re-arm cap and the
  *   blocked_without_blockers escalation still have something to count.
  *
@@ -207,9 +194,10 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
     blockerIssueIds: string[];
     blockedTransitionAt?: IssueBlockersResolvedWakeCycleInput;
     completedRearmCutoff?: Date | null;
+    excludeWakeupRequestIds?: string[];
   },
 ) {
-  const cycleKey = buildIssueBlockersResolvedWakeStateKey(input);
+  const stateKey = buildIssueBlockersResolvedWakeStateKey(input);
   const oldStateKey = buildIssueBlockersResolvedWakeStateKeyWithoutCycle(input);
   const legacyKeyList = [
     ...new Set(
@@ -223,12 +211,14 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
         ),
     ),
   ];
-  const lookupKeys = [...new Set([cycleKey, oldStateKey, ...legacyKeyList])];
+  const lookupKeys = [...new Set([stateKey, oldStateKey, ...legacyKeyList])];
   const blockedTransitionAt = parseWakeCycleDate(input.blockedTransitionAt);
+  const excludeWakeupRequestIds = [...new Set((input.excludeWakeupRequestIds ?? []).filter(Boolean))];
 
   const rows = await db
     .select({
       id: agentWakeupRequests.id,
+      runId: agentWakeupRequests.runId,
       status: agentWakeupRequests.status,
       idempotencyKey: agentWakeupRequests.idempotencyKey,
       requestedAt: agentWakeupRequests.requestedAt,
@@ -239,12 +229,15 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
       and(
         eq(agentWakeupRequests.companyId, input.companyId),
         inArray(agentWakeupRequests.idempotencyKey, lookupKeys),
+        ...(excludeWakeupRequestIds.length > 0
+          ? [notInArray(agentWakeupRequests.id, excludeWakeupRequestIds)]
+          : []),
       ),
     );
 
   const covering = rows.find((row) =>
     wakeCoversIssueBlockersResolvedReadyState(row, {
-      cycleKey,
+      stateKey,
       oldStateKey,
       legacyKeys: new Set(legacyKeyList),
       blockedTransitionAt,

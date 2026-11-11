@@ -1,9 +1,8 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  buildIssueBlockersResolvedWakeStateKey,
-} from "../services/issue-dependency-wakeups.ts";
+import { buildIssueBlockersResolvedWakeStateKey } from "../services/issue-dependency-wakeups.ts";
+import { listUnresolvedBlockerIssueIds as realListUnresolvedBlockerIssueIds } from "../services/issues.js";
 import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 // The first test in this suite imports the large `routes/issues.ts` module
@@ -17,7 +16,12 @@ import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-er
 // yet still below the 30s hook timeout.
 vi.setConfig({ testTimeout: 30000 });
 
-const mockWakeup = vi.hoisted(() => vi.fn(async () => undefined));
+const mockWakeup = vi.hoisted(() =>
+  vi.fn(async (_agentId: string, _wakeup?: Record<string, unknown>) => undefined),
+);
+const mockLogActivity = vi.hoisted(() =>
+  vi.fn(async (_db: unknown, _activity: { action?: string }) => undefined),
+);
 const mockFindExistingIssueBlockersResolvedWakeForReadyState = vi.hoisted(() => vi.fn(async () => null));
 const mockIssueService = vi.hoisted(() => ({
   getAncestors: vi.fn(),
@@ -27,8 +31,13 @@ const mockIssueService = vi.hoisted(() => ({
   getComment: vi.fn(),
   getCommentCursor: vi.fn(),
   getRelationSummaries: vi.fn(),
+  checkout: vi.fn(),
   update: vi.fn(),
   getDependencyReadiness: vi.fn(),
+  // SUP-23854: the route resolves wired blocker sets through the service
+  // object; createApp() re-points this at the real function over the stub
+  // routeDb so the finalization-aware filtering stays under test.
+  listUnresolvedBlockerIssueIds: vi.fn(async (_companyId: string, _blockerIssueIds: string[]) => [] as string[]),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
   findMentionedAgents: vi.fn(async () => []),
@@ -40,6 +49,7 @@ vi.mock("../services/index.js", () => ({
   }),
   accessService: () => ({
     canUser: vi.fn(),
+    decide: vi.fn(async () => ({ allowed: true })),
     hasPermission: vi.fn(),
   }),
   agentService: () => ({
@@ -96,7 +106,7 @@ vi.mock("../services/index.js", () => ({
     expirePendingInteractionsOnTerminalIssueStatus: vi.fn(async () => []),
   }),
   issueService: () => mockIssueService,
-  logActivity: vi.fn(async () => undefined),
+  logActivity: mockLogActivity,
   projectService: () => ({
     getById: vi.fn(),
     listByIds: vi.fn(async () => []),
@@ -120,22 +130,91 @@ vi.mock("../services/issue-dependency-wakeups.js", async () => {
   };
 });
 
-async function createApp() {
-  const emptyRows: unknown[] = [];
-  const whereResult = {
-    limit: vi.fn(async () => emptyRows),
-    orderBy: vi.fn(() => whereResult),
-    then: async (resolve: (rows: unknown[]) => unknown) => resolve(emptyRows),
+type RouteTestTableRows = Record<string, Record<string, unknown>[]>;
+
+function applyIssueStatusPredicates(rows: unknown[], condition: unknown): unknown[] {
+  const predicates: Array<(row: Record<string, unknown>) => boolean> = [];
+  const visit = (value: any): void => {
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    if (!Array.isArray(value.queryChunks)) return;
+    const chunks = value.queryChunks;
+    const statusIndex = chunks.findIndex((chunk: any) => chunk?.name === "status" && chunk?.table);
+    if (statusIndex >= 0) {
+      const operator = chunks[statusIndex + 1]?.value?.join("").trim();
+      const rawValues = chunks[statusIndex + 2];
+      const values = (Array.isArray(rawValues) ? rawValues : [rawValues]).map((param) => param?.value);
+      if (operator === "=" || operator === "in") {
+        predicates.push((row) => values.includes(row.status));
+      } else if (operator === "<>") {
+        predicates.push((row) => row.status !== values[0]);
+      } else if (operator === "not in") {
+        predicates.push((row) => !values.includes(row.status));
+      } else {
+        throw new Error(`Unsupported issue status predicate in route test: ${operator}`);
+      }
+    }
+    chunks.forEach(visit);
   };
-  const query: Record<string, unknown> = {};
-  query.innerJoin = vi.fn(() => query);
-  query.where = vi.fn(() => whereResult);
+  visit(condition);
+  return rows.filter((row) => predicates.every((predicate) => predicate(row as Record<string, unknown>)));
+}
+
+async function createApp(
+  options: { actor?: Record<string, unknown>; tableRows?: RouteTestTableRows } = {},
+) {
+  const tableRows = options.tableRows ?? {};
+  // The route module is re-imported after `vi.resetModules()`, so its drizzle
+  // table objects are fresh instances: rows cannot be keyed by table identity.
+  // Key them by the pg table NAME instead — drizzle stores it as the VALUE at
+  // the `Symbol.for("drizzle:Name")` property. Rows are returned as
+  // configured, without evaluating the query predicates: a configured row
+  // stands in for a row that SURVIVES the query's where clause, and an
+  // unconfigured table yields no rows.
+  const rowsForTable = (table: object): unknown[] => {
+    const name = (table as Record<symbol, unknown>)[Symbol.for("drizzle:Name")];
+    if (typeof name === "string" && name in tableRows) return tableRows[name];
+    return [];
+  };
   const routeDb = {
-    select: vi.fn(() => ({
-      from: vi.fn(() => query),
-    })),
-    transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
+    select: vi.fn(() => {
+      let rows: unknown[] = [];
+      let tableName = "";
+      const whereResult = {
+        for: vi.fn(() => whereResult),
+        limit: vi.fn(async () => rows),
+        orderBy: vi.fn(() => whereResult),
+        then: async (resolve: (rows: unknown[]) => unknown) => resolve(rows),
+      };
+      const query: Record<string, unknown> = {};
+      query.innerJoin = vi.fn(() => query);
+      query.where = vi.fn((condition: unknown) => {
+        if (tableName === "issues") rows = applyIssueStatusPredicates(rows, condition);
+        return whereResult;
+      });
+      return {
+        from: vi.fn((table: object) => {
+          tableName = String((table as Record<symbol, unknown>)[Symbol.for("drizzle:Name")] ?? "");
+          rows = rowsForTable(table);
+          return query;
+        }),
+      };
+    }),
+    // Transactions see the same row stubs as the top-level db so the agent
+    // cross-issue attribution guard can resolve its `for update` run lookup.
+    transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(routeDb),
   };
+  mockIssueService.listUnresolvedBlockerIssueIds.mockImplementation(
+    async (companyId: string, blockerIssueIds: string[]) =>
+      realListUnresolvedBlockerIssueIds(
+        routeDb as unknown as Parameters<typeof realListUnresolvedBlockerIssueIds>[0],
+        companyId,
+        blockerIssueIds,
+      ),
+  );
   const { issueRoutes } = await vi.importActual<typeof import("../routes/issues.js")>(
     "../routes/issues.js",
   );
@@ -145,7 +224,7 @@ async function createApp() {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
+    (req as any).actor = options.actor ?? {
       type: "board",
       userId: "local-board",
       companyIds: ["company-1"],
@@ -167,6 +246,7 @@ describe("issue dependency wakeups in issue routes", () => {
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     vi.clearAllMocks();
+    mockWakeup.mockImplementation(async () => undefined);
     mockFindExistingIssueBlockersResolvedWakeForReadyState.mockResolvedValue(null);
     mockIssueService.getAncestors.mockResolvedValue([]);
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
@@ -249,153 +329,43 @@ describe("issue dependency wakeups in issue routes", () => {
     });
   });
 
-  it("wakes an assigned blocked issue when blockers are applied after the blocker is already done", async () => {
-    const parentIssueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const childIssueId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-    mockIssueService.getById.mockResolvedValue({
-      id: parentIssueId,
-      companyId: "company-1",
-      identifier: "PAP-200",
-      title: "Blocked after completion",
-      description: null,
-      status: "todo",
-      priority: "medium",
-      parentId: null,
-      assigneeAgentId: "agent-2",
-      assigneeUserId: null,
-      createdByAgentId: null,
-      createdByUserId: null,
-      executionWorkspaceId: null,
-      labels: [],
-      labelIds: [],
-    });
-    mockIssueService.update.mockResolvedValue({
-      id: parentIssueId,
-      companyId: "company-1",
-      identifier: "PAP-200",
-      title: "Blocked after completion",
-      description: null,
-      status: "blocked",
-      priority: "medium",
-      parentId: null,
-      assigneeAgentId: "agent-2",
-      assigneeUserId: null,
-      createdByAgentId: null,
-      createdByUserId: null,
-      executionWorkspaceId: null,
-      labels: [],
-      labelIds: [],
-    });
-    mockIssueService.getDependencyReadiness.mockResolvedValue({
-      issueId: parentIssueId,
-      blockerIssueIds: [childIssueId],
-      unresolvedBlockerIssueIds: [],
-      unresolvedBlockerCount: 0,
-      pendingFinalizeBlockerIssueIds: [],
-      allBlockersDone: true,
-      isDependencyReady: true,
-    });
+  it("refuses to enter blocked on an already-done blocker even with an unblock descriptor", async () => {
+    const { dependentId, childId } = mockDependencyPatch({ status: "todo" });
 
-    const res = await request(await createApp())
-      .patch(`/api/issues/${parentIssueId}`)
+    const res = await request(await createApp({
+      tableRows: { issues: [{ id: childId, companyId: "company-1", status: "done" }] },
+    }))
+      .patch(`/api/issues/${dependentId}`)
       .send({
         status: "blocked",
-        blockedByIssueIds: [childIssueId],
+        blockedByIssueIds: [childId],
         unblockDescriptor: { owner: "board", action: "Review the restored dependency" },
       });
 
-    expect(res.status).toBe(200);
-    await vi.waitFor(() => {
-      expect(mockWakeup).toHaveBeenCalledWith(
-        "agent-2",
-        expect.objectContaining({
-          reason: "issue_blockers_resolved",
-          payload: expect.objectContaining({
-            issueId: parentIssueId,
-            resolvedBlockerIssueId: childIssueId,
-            mutation: "blocked_dependency_restored",
-          }),
-          contextSnapshot: expect.objectContaining({
-            source: "issue.blockers_restored",
-          }),
-        }),
-      );
-    });
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({ details: { reason: "blocked_on_resolved_blockers" } });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockWakeup).not.toHaveBeenCalled();
   });
 
-  it("wakes a blocked issue when its blocker edge is rewritten to a different done blocker", async () => {
-    const dependentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  it("refuses to rewrite a blocked issue to a different done blocker", async () => {
     const newBlockerId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
-    mockIssueService.getById.mockResolvedValue({
-      id: dependentId,
-      companyId: "company-1",
-      identifier: "PAP-301",
-      title: "Blocked, edge rewrite pending",
-      description: null,
+    const { dependentId } = mockDependencyPatch({
       status: "blocked",
-      priority: "medium",
-      parentId: null,
-      assigneeAgentId: "agent-2",
-      assigneeUserId: null,
-      createdByAgentId: null,
-      createdByUserId: null,
-      executionWorkspaceId: null,
-      labels: [],
-      labelIds: [],
-    });
-    mockIssueService.update.mockResolvedValue({
-      id: dependentId,
-      companyId: "company-1",
-      identifier: "PAP-301",
-      title: "Blocked, edge rewrite pending",
-      description: null,
-      status: "blocked",
-      priority: "medium",
-      parentId: null,
-      assigneeAgentId: "agent-2",
-      assigneeUserId: null,
-      createdByAgentId: null,
-      createdByUserId: null,
-      executionWorkspaceId: null,
-      labels: [],
-      labelIds: [],
-    });
-    // existing relations show the previous (now-removed) blocker
-    mockIssueService.getRelationSummaries.mockResolvedValue({
-      blockedBy: [{ id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" }],
-      blocks: [],
-    });
-    mockIssueService.getDependencyReadiness.mockResolvedValue({
-      issueId: dependentId,
       blockerIssueIds: [newBlockerId],
-      unresolvedBlockerIssueIds: [],
-      unresolvedBlockerCount: 0,
-      pendingFinalizeBlockerIssueIds: [],
-      allBlockersDone: true,
-      isDependencyReady: true,
+      existingBlockerIssueIds: ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"],
     });
 
-    const res = await request(await createApp())
+    const res = await request(await createApp({
+      tableRows: { issues: [{ id: newBlockerId, companyId: "company-1", status: "done" }] },
+    }))
       .patch(`/api/issues/${dependentId}`)
       .send({ blockedByIssueIds: [newBlockerId] });
 
-    expect(res.status).toBe(200);
-    await vi.waitFor(() => {
-      expect(mockWakeup).toHaveBeenCalledWith(
-        "agent-2",
-        expect.objectContaining({
-          reason: "issue_blockers_resolved",
-          payload: expect.objectContaining({
-            issueId: dependentId,
-            resolvedBlockerIssueId: newBlockerId,
-            mutation: "blocked_dependency_restored",
-          }),
-          contextSnapshot: expect.objectContaining({
-            source: "issue.blockers_restored",
-          }),
-        }),
-      );
-    });
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({ details: { reason: "blocked_on_resolved_blockers" } });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockWakeup).not.toHaveBeenCalled();
   });
 
   it("wakes the parent when all direct children become terminal", async () => {
@@ -510,7 +480,51 @@ describe("issue dependency wakeups in issue routes", () => {
     };
   }
 
-  it("wakes a Release-like dependent after a terminal reset using the current blocked cycle", async () => {
+  function mockDependencyPatch(options: {
+    status?: string;
+    updatedStatus?: string;
+    blockerIssueIds?: string[];
+    existingBlockerIssueIds?: string[];
+    unresolvedBlockerIssueIds?: string[];
+    assigneeAgentId?: string;
+  } = {}) {
+    const dependentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const childId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const blockerIssueIds = options.blockerIssueIds ?? [childId];
+    const existingBlockerIssueIds = options.existingBlockerIssueIds ?? blockerIssueIds;
+    const unresolvedBlockerIssueIds = options.unresolvedBlockerIssueIds ?? [];
+    mockIssueService.getById.mockResolvedValue(issueRecord({
+      id: dependentId,
+      identifier: "PAP-DEPENDENT",
+      title: "Dependent",
+      status: options.status ?? "in_progress",
+      assigneeAgentId: options.assigneeAgentId ?? "agent-2",
+    }));
+    mockIssueService.update.mockResolvedValue(issueRecord({
+      id: dependentId,
+      identifier: "PAP-DEPENDENT",
+      title: "Dependent",
+      status: options.updatedStatus ?? "blocked",
+      assigneeAgentId: options.assigneeAgentId ?? "agent-2",
+      blockedTransitionAt: new Date("2026-08-01T12:00:00.000Z"),
+    }));
+    mockIssueService.getRelationSummaries.mockResolvedValue({
+      blockedBy: existingBlockerIssueIds.map((id) => ({ id })),
+      blocks: [],
+    });
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: dependentId,
+      blockerIssueIds,
+      unresolvedBlockerIssueIds,
+      unresolvedBlockerCount: unresolvedBlockerIssueIds.length,
+      pendingFinalizeBlockerIssueIds: [],
+      allBlockersDone: unresolvedBlockerIssueIds.length === 0,
+      isDependencyReady: unresolvedBlockerIssueIds.length === 0,
+    });
+    return { dependentId, childId };
+  }
+
+  it("wakes a Release-like dependent after a terminal reset using the stable ready-state key", async () => {
     const reviewIssueId = "11111111-1111-4111-8111-111111111111";
     const releaseIssueId = "22222222-2222-4222-8222-222222222222";
     const releaseBlockedAt = new Date("2026-08-01T15:00:00.000Z");
@@ -689,68 +703,236 @@ describe("issue dependency wakeups in issue routes", () => {
     expect(mockWakeup).not.toHaveBeenCalledWith("agent-release", expect.anything());
   });
 
-  it("restores a blocked-and-ready dependent under the new blocked cycle key", async () => {
-    const parentIssueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const childIssueId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-    const blockedTransitionAt = new Date("2026-08-03T18:00:00.000Z");
-    mockIssueService.getById.mockResolvedValue(issueRecord({
-      id: parentIssueId,
-      identifier: "PAP-200",
-      title: "Blocked after completion",
-      status: "done",
-      assigneeAgentId: "agent-2",
+  it("refuses three all-done re-block PATCHes without any wake-driven checkout", async () => {
+    const assigneeAgentId = "55555555-5555-4555-8555-555555555555";
+    const { dependentId, childId } = mockDependencyPatch({
+      existingBlockerIssueIds: [],
+      assigneeAgentId,
+    });
+    mockIssueService.checkout.mockResolvedValue(issueRecord({
+      id: dependentId,
+      status: "in_progress",
+      assigneeAgentId,
     }));
-    mockIssueService.update.mockResolvedValue(issueRecord({
-      id: parentIssueId,
-      identifier: "PAP-200",
-      title: "Blocked after completion",
+    const app = await createApp();
+    const checkoutResponseStatuses: number[] = [];
+    mockWakeup.mockImplementation(async (agentId, wakeup) => {
+      if (wakeup?.reason !== "issue_blockers_resolved") return;
+      const checkoutResponse = await request(app)
+        .post(`/api/issues/${dependentId}/checkout`)
+        .send({ agentId, expectedStatuses: ["todo", "in_progress", "blocked"] });
+      checkoutResponseStatuses.push(checkoutResponse.status);
+    });
+
+    const responses = [];
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      responses.push(await request(app)
+        .patch(`/api/issues/${dependentId}`)
+        .send({
+          status: "blocked",
+          blockedByIssueIds: [childId],
+          unblockDescriptor: { owner: "board", action: "Replay the resolved dependency" },
+        }));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(checkoutResponseStatuses).toEqual([]);
+    expect(
+      mockLogActivity.mock.calls.filter(([, activity]) => activity.action === "issue.checked_out"),
+    ).toHaveLength(0);
+    expect(responses.map((response) => response.status)).toEqual([422, 422, 422]);
+    for (const response of responses) {
+      expect(response.body).toMatchObject({ details: { reason: "blocked_on_resolved_blockers" } });
+    }
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("refuses an assignee agent's re-park on a newly added done blocker without a self-wake", async () => {
+    const { dependentId, childId } = mockDependencyPatch({
       status: "blocked",
-      assigneeAgentId: "agent-2",
-      blockedTransitionAt,
-    }));
-    mockIssueService.getDependencyReadiness.mockResolvedValue({
-      issueId: parentIssueId,
-      blockerIssueIds: [childIssueId],
-      unresolvedBlockerIssueIds: [],
-      unresolvedBlockerCount: 0,
-      pendingFinalizeBlockerIssueIds: [],
-      allBlockersDone: true,
-      isDependencyReady: true,
+      existingBlockerIssueIds: [],
+    });
+    const actorRunId = "44444444-4444-4444-8444-444444444444";
+    const actor = {
+      type: "agent",
+      agentId: "agent-2",
+      companyId: "company-1",
+      companyIds: ["company-1"],
+      runId: actorRunId,
+      source: "agent_key",
+      agentApiKeyId: "key-1",
+    };
+    const tableRows: RouteTestTableRows = {
+      heartbeat_runs: [{
+        id: actorRunId,
+        companyId: "company-1",
+        agentId: "agent-2",
+        status: "running",
+        contextSnapshot: { issueId: dependentId },
+      }],
+    };
+
+    const res = await request(await createApp({ actor, tableRows }))
+      .patch(`/api/issues/${dependentId}`)
+      .send({ blockedByIssueIds: [childId] });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({ details: { reason: "blocked_on_resolved_blockers" } });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["interaction", { issue_thread_interactions: [{ id: "itx-1", status: "pending" }] }],
+    ["approval", { issue_approvals: [{ approvalId: "approval-1", status: "pending" }] }],
+  ])("refuses an all-done blocked write while a pending %s exists", async (_kind, tableRows) => {
+    const { dependentId, childId } = mockDependencyPatch({ status: "blocked" });
+
+    const res = await request(await createApp({ tableRows }))
+      .patch(`/api/issues/${dependentId}`)
+      .send({ blockedByIssueIds: [childId] });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({ details: { reason: "blocked_on_resolved_blockers" } });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("refuses entering blocked on an all-done set named only by readiness", async () => {
+    const { dependentId } = mockDependencyPatch({ status: "todo" });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${dependentId}`)
+      .send({
+        status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Re-apply the restored dependency" },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({ details: { reason: "blocked_on_resolved_blockers" } });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("allows a descriptor-backed blocked state with no dependency blockers", async () => {
+    const { dependentId } = mockDependencyPatch({
+      status: "todo",
+      blockerIssueIds: [],
+      existingBlockerIssueIds: [],
     });
 
     const res = await request(await createApp())
-      .patch(`/api/issues/${parentIssueId}`)
+      .patch(`/api/issues/${dependentId}`)
       .send({
         status: "blocked",
-        blockedByIssueIds: [childIssueId],
-        unblockDescriptor: { owner: "board", action: "Review the restored dependency" },
+        unblockDescriptor: { owner: "board", action: "Wait for an operator decision" },
       });
 
     expect(res.status).toBe(200);
-    await vi.waitFor(() => {
-      expect(mockFindExistingIssueBlockersResolvedWakeForReadyState).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({
-          dependentIssueId: parentIssueId,
-          blockerIssueIds: [childIssueId],
-          blockedTransitionAt,
-        }),
-      );
-      expect(mockWakeup).toHaveBeenCalledWith(
-        "agent-2",
-        expect.objectContaining({
-          reason: "issue_blockers_resolved",
-          idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
-            dependentIssueId: parentIssueId,
-            blockerIssueIds: [childIssueId],
-            blockedTransitionAt,
-          }),
-          payload: expect.objectContaining({
-            mutation: "blocked_dependency_restored",
-          }),
-        }),
-      );
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("refuses an explicit blocked-status replay without repeating blocker IDs", async () => {
+    const { dependentId } = mockDependencyPatch({ status: "blocked" });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${dependentId}`)
+      .send({ status: "blocked" });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({ details: { reason: "blocked_on_resolved_blockers" } });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses a descriptor-only replay of an all-done blocked issue", async () => {
+    const { dependentId } = mockDependencyPatch({ status: "blocked" });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${dependentId}`)
+      .send({ unblockDescriptor: { owner: "board", action: "Keep waiting on resolved work" } });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({ details: { reason: "blocked_on_resolved_blockers" } });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { startingStatus: "todo", write: { status: "blocked" } },
+    { startingStatus: "blocked", write: {} },
+  ])("allows a $startingStatus issue to retain a done blocker with pending finalization", async ({ startingStatus, write }) => {
+    const { dependentId, childId } = mockDependencyPatch({ status: startingStatus });
+    const executionWorkspaceId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: dependentId,
+      blockerIssueIds: [childId],
+      unresolvedBlockerIssueIds: [childId],
+      unresolvedBlockerCount: 1,
+      pendingFinalizeBlockerIssueIds: [childId],
+      allBlockersDone: false,
+      isDependencyReady: false,
     });
+    const tableRows: RouteTestTableRows = {
+      issues: [{
+        id: childId,
+        companyId: "company-1",
+        status: "done",
+        executionWorkspaceId,
+      }],
+      workspace_operations: [{
+        companyId: "company-1",
+        issueId: childId,
+        executionWorkspaceId,
+        phase: "workspace_finalize",
+        status: "running",
+        startedAt: new Date("2026-08-01T12:00:00.000Z"),
+      }],
+    };
+
+    const res = await request(await createApp({ tableRows }))
+      .patch(`/api/issues/${dependentId}`)
+      .send({ ...write, blockedByIssueIds: [childId] });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("allows a blocked issue to retain a cancelled blocker", async () => {
+    const { dependentId, childId } = mockDependencyPatch({
+      status: "blocked",
+      unresolvedBlockerIssueIds: ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"],
+    });
+    const tableRows: RouteTestTableRows = {
+      issues: [{ id: childId, companyId: "company-1", status: "cancelled" }],
+    };
+
+    const res = await request(await createApp({ tableRows }))
+      .patch(`/api/issues/${dependentId}`)
+      .send({ blockedByIssueIds: [childId] });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("allows re-blocking when the set still holds a not-done blocker", async () => {
+    const { dependentId, childId } = mockDependencyPatch({
+      unresolvedBlockerIssueIds: ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"],
+    });
+    const tableRows: RouteTestTableRows = {
+      issues: [{ id: childId, companyId: "company-1", status: "in_progress" }],
+    };
+
+    const res = await request(await createApp({ tableRows }))
+      .patch(`/api/issues/${dependentId}`)
+      .send({ status: "blocked", blockedByIssueIds: [childId] });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockWakeup).not.toHaveBeenCalled();
   });
 
   it("does not emit a dependency wake when an unresolved or cancelled blocker remains", async () => {

@@ -449,7 +449,10 @@ import {
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
+import {
+  findExistingIssueBlockersResolvedWakeForReadyState,
+  ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+} from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -4245,6 +4248,7 @@ interface WakeupOptions {
   reason?: string | null;
   payload?: Record<string, unknown> | null;
   idempotencyKey?: string | null;
+  completedRearmCutoff?: Date | null;
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
@@ -31900,6 +31904,93 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
           if (durableReceipt)
             return { kind: "durable" as const, receipt: durableReceipt };
+
+          const rawDependencyBlockerIds = reason === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON
+            ? payload?.blockerIssueIds
+            : null;
+          const dependencyBlockerIds = Array.isArray(rawDependencyBlockerIds) &&
+            rawDependencyBlockerIds.length > 0 &&
+            rawDependencyBlockerIds.every((id) => typeof id === "string" && id.length > 0)
+              ? rawDependencyBlockerIds as string[]
+              : null;
+          if (dependencyBlockerIds) {
+            const nativeStatusWakeIntentId = readNonEmptyString(
+              enrichedContextSnapshot.nativeStatusWakeIntentId,
+            );
+            const snapshotBlockedTransitionAt = readNonEmptyString(
+              enrichedContextSnapshot.blockedTransitionAt,
+            );
+            // Producers do not always stamp blockedTransitionAt into the
+            // context snapshot (the liveness backstop is one). Without the
+            // cycle timestamp an old-key COMPLETED wake from any earlier
+            // blocked cycle would suppress the enqueue, so fall back to the
+            // dependent issue's live cycle timestamp — the same information
+            // the producer's own pre-check used.
+            const dependencyBlockedTransitionAt = snapshotBlockedTransitionAt ??
+              (await tx
+                .select({ blockedTransitionAt: issues.blockedTransitionAt })
+                .from(issues)
+                .where(and(
+                  eq(issues.companyId, agent.companyId),
+                  eq(issues.id, issueId),
+                ))
+                .limit(1)
+                .then((rows) => rows[0]?.blockedTransitionAt ?? null));
+            const existingDependencyWake = await findExistingIssueBlockersResolvedWakeForReadyState(
+              tx as unknown as Db,
+              {
+                companyId: agent.companyId,
+                dependentIssueId: issueId,
+                blockerIssueIds: dependencyBlockerIds,
+                blockedTransitionAt: dependencyBlockedTransitionAt,
+                completedRearmCutoff: opts.completedRearmCutoff,
+                excludeWakeupRequestIds: [nativeStatusWakeIntentId, executionWaitRequestId]
+                  .filter((id): id is string => Boolean(id)),
+              },
+            );
+            if (existingDependencyWake) {
+              const coveringRunId = existingDependencyWake.runId;
+              const coveringRun = coveringRunId
+                ? await tx
+                    .select()
+                    .from(heartbeatRuns)
+                    .where(and(
+                      eq(heartbeatRuns.id, coveringRunId),
+                      eq(heartbeatRuns.companyId, agent.companyId),
+                    ))
+                    .then((rows) => rows[0] ?? null)
+                : null;
+              const now = new Date();
+              if (nativeStatusWakeIntentId) {
+                await tx.update(agentWakeupRequests).set({
+                  status: "coalesced",
+                  coalescedCount: 1,
+                  runId: coveringRun?.id ?? null,
+                  finishedAt: now,
+                  updatedAt: now,
+                }).where(and(
+                  eq(agentWakeupRequests.id, nativeStatusWakeIntentId),
+                  eq(agentWakeupRequests.companyId, agent.companyId),
+                ));
+              }
+              if (executionWaitRequestId) {
+                await tx.update(agentWakeupRequests).set({
+                  status: "coalesced",
+                  runId: coveringRun?.id ?? null,
+                  finishedAt: now,
+                  updatedAt: now,
+                }).where(and(
+                  eq(agentWakeupRequests.id, executionWaitRequestId),
+                  eq(agentWakeupRequests.companyId, agent.companyId),
+                  eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                ));
+              }
+              return coveringRun
+                ? { kind: "replayed" as const, run: coveringRun }
+                : { kind: "skipped" as const };
+            }
+          }
+
           const failedChatRetry = await authorizeFailedChatRunRetryWake(
             db,
             tx as unknown as Db,
@@ -33140,7 +33231,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       if (outcome.kind === "replayed") {
         if (outcome.run.status === "queued")
-          await startNextQueuedRunForAgent(agent.id);
+          await startNextQueuedRunForAgent(outcome.run.agentId);
         return outcome.run;
       }
 
