@@ -5538,7 +5538,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     return workspace;
   }
 
-  it("does not stick cleanup_failed when the worktree directory is already gone", async () => {
+  it("archives a missing worktree as record only without pruning its admin entry", async () => {
     const seeded = await seedTerminalWorkspace({ mergedPr: true });
     await linkProjectRepo(seeded);
     await fs.rm(seeded.worktreePath, { recursive: true, force: true });
@@ -5549,8 +5549,8 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
 
     expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
     expect(workspace?.status).toBe("archived");
-    expect(workspace?.cleanupReason).toBe("issue_terminal");
-    expect(await readGit(seeded.repoRoot, ["worktree", "list", "--porcelain"])).not.toContain(seeded.worktreePath);
+    expect(workspace?.cleanupReason).toBe("issue_terminal | cwd does not exist");
+    expect(await readGit(seeded.repoRoot, ["worktree", "list", "--porcelain"])).toContain(seeded.worktreePath);
   }, 20_000);
 
   it("retries a cleanup_failed spawn ENOENT row and archives it without raising the generation", async () => {
@@ -6190,12 +6190,11 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       });
       await expect(fs.readFile(path.join(plainDir, "note.txt"), "utf8")).resolves.toBe("keep\n");
 
-      const missing = await seedTerminalWorkspace();
+      const missing = await seedTerminalWorkspace({ mergedPr: true });
       const missingPath = path.join(os.tmpdir(), `paperclip-missing-${randomUUID()}`);
       await db.update(executionWorkspaces).set({
         cwd: missingPath,
         providerRef: missingPath,
-        providerType: "local_fs",
       }).where(eq(executionWorkspaces.id, missing.executionWorkspaceId));
       const missingCalls = await gitCallsDuring(() => freshSweep().sweepTerminalWorkspaces());
       expect(missingCalls).toBe("");
