@@ -3,6 +3,7 @@ import { AGENT_CHAT_DIRECTIVE, conversationReplay, currentConversationCommentCon
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
 import { legacyControllerBootId, legacyControllerClaim, renewLegacyControllerLease, hasLiveLegacyController, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
+import { isStrandedIssueRecoveryOriginKind } from "./recovery/origins.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
 import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminationReceipt, stoppedRemoteCleanupScopes } from "./remote-execution-termination.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "./connector-runtime.js";
@@ -3528,6 +3529,34 @@ export function reconcileReusedExecutionWorkspaceProjectWorkspaceId(
   return existingProjectWorkspaceId ?? resolvedProjectWorkspaceId ?? null;
 }
 
+/**
+ * The exhausted-recovery mint (SUP-23493) shape: a record_only board card that
+ * carries no execution workspace and no project checkout binding, minted by
+ * the stranded-issue recovery path with `agent_default`. The mint refused the
+ * failed source workspace, so dispatch may resolve a project checkout for the
+ * owner's wake, but the card is a control-plane record and is not required to
+ * use it. ONLY this shape may skip git-sensitive workspace validation and
+ * issue binding; any other record_only card, including one with a bound
+ * workspace or a checkout binding, keeps every workspace check
+ * (release-assurance pc1145a-adv: the record_only-only skip was too wide).
+ */
+export function isFailedSourceWorkspaceRecoveryCardIssue(issue: {
+  deliveryRequirement?: "repository_delivery" | "record_only" | null;
+  executionWorkspaceId?: string | null;
+  projectWorkspaceId?: string | null;
+  executionWorkspacePreference?: string | null;
+  originKind?: string | null;
+} | null): boolean {
+  return Boolean(
+    issue &&
+      issue.deliveryRequirement === "record_only" &&
+      issue.executionWorkspaceId == null &&
+      issue.projectWorkspaceId == null &&
+      issue.executionWorkspacePreference === "agent_default" &&
+      isStrandedIssueRecoveryOriginKind(issue.originKind),
+  );
+}
+
 export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   adapterType: string;
   agentId: string;
@@ -3536,6 +3565,10 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     identifier: string | null;
     projectId: string | null;
     projectWorkspaceId: string | null;
+    deliveryRequirement?: "repository_delivery" | "record_only" | null;
+    executionWorkspaceId?: string | null;
+    executionWorkspacePreference?: string | null;
+    originKind?: string | null;
   } | null;
   resolvedWorkspace: ResolvedWorkspaceForRun;
   executionWorkspace: RealizedExecutionWorkspace;
@@ -3554,6 +3587,10 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
 
   const issue = input.issue;
   if (!issue) return;
+  // ONLY the exhausted-recovery mint shape (SUP-23493) skips; every other
+  // record_only card keeps the check. See
+  // isFailedSourceWorkspaceRecoveryCardIssue for the exact shape and why.
+  if (isFailedSourceWorkspaceRecoveryCardIssue(issue)) return;
 
   const environmentDriver =
     readNonEmptyString(input.environmentDriver) ?? "local";
@@ -11775,6 +11812,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         priority: issues.priority,
         projectId: issues.projectId,
         projectWorkspaceId: issues.projectWorkspaceId,
+        deliveryRequirement: issues.deliveryRequirement,
         executionWorkspaceId: issues.executionWorkspaceId,
         executionWorkspacePreference: issues.executionWorkspacePreference,
         assigneeAgentId: issues.assigneeAgentId,
@@ -24078,9 +24116,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             description: issueContext.description,
             projectId: issueContext.projectId,
             projectWorkspaceId: issueContext.projectWorkspaceId,
+            deliveryRequirement: issueContext.deliveryRequirement,
             executionWorkspaceId: issueContext.executionWorkspaceId,
             executionWorkspacePreference:
               issueContext.executionWorkspacePreference,
+            originKind: issueContext.originKind,
           }
         : null;
       const continuationSummary = issueRef && !isConversation(issueContext)
@@ -24875,7 +24915,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // issue's current pointer, and never rewrites the issue's binding: a newer run may
       // already have moved or cleared it.
       requestedExecutionWorkspaceIdOverride: persistedNativeExecutionWorkspaceId,
-      skipIssueBinding: nativeRecoveryExecutionWorkspaceId !== null,
+      // The exhausted-recovery mint (SUP-23493) is a control-plane record with
+      // no workspace of its own: binding the realized project checkout back
+      // onto the card would re-create the failed-source-workspace expectation
+      // the mint refused, so the first dispatch re-dooms every later dispatch
+      // (release-assurance pc1145a-adv recovery-card regression).
+      skipIssueBinding:
+        nativeRecoveryExecutionWorkspaceId !== null ||
+        isFailedSourceWorkspaceRecoveryCardIssue(issueRef),
       issueId,
       run,
       runId: run.id,
@@ -26029,6 +26076,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 identifier: issueRef.identifier,
                 projectId: issueRef.projectId,
                 projectWorkspaceId: issueRef.projectWorkspaceId,
+                deliveryRequirement: issueRef.deliveryRequirement,
+                executionWorkspaceId: issueRef.executionWorkspaceId,
+                executionWorkspacePreference:
+                  issueRef.executionWorkspacePreference,
+                originKind: issueRef.originKind,
               }
             : null,
           resolvedWorkspace,
