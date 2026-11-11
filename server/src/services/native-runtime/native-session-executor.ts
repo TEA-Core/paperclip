@@ -1233,6 +1233,15 @@ export async function synchronizeCompletedProviderPlan(input: {
   }
   let confirmationId: string;
   let confirmationPending = false;
+  const run = await input.db
+    .select({ responsibleUserId: heartbeatRuns.responsibleUserId })
+    .from(heartbeatRuns)
+    .where(and(
+      eq(heartbeatRuns.id, input.execution.binding.runId),
+      eq(heartbeatRuns.companyId, input.execution.binding.companyId),
+    ))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
   try {
     const confirmation = await issueThreadInteractionService(input.db).create(
       {
@@ -1243,6 +1252,8 @@ export async function synchronizeCompletedProviderPlan(input: {
         kind: "request_confirmation",
         idempotencyKey: `runner-plan-approval:v1:${input.execution.binding.runId}:${planId}:${providerRevision}:${digest}`,
         sourceRunId: input.execution.binding.runId,
+        addresseeAgentId: null,
+        addresseeUserId: run?.responsibleUserId ?? null,
         title: `Review plan revision ${revision.revisionNumber}`,
         summary: "Review the synchronized Paperclip plan.",
         continuationPolicy: "wake_assignee",
@@ -1273,7 +1284,16 @@ export async function synchronizeCompletedProviderPlan(input: {
     );
     confirmationId = confirmation.id;
     confirmationPending = confirmation.status === "pending";
-  } catch {
+  } catch (error) {
+    if (
+      error instanceof HttpError &&
+      error.status === 422 &&
+      error.details &&
+      typeof error.details === "object" &&
+      (error.details as { code?: unknown }).code === "interaction_unaddressable"
+    ) {
+      throw error;
+    }
     return {
       eventId: input.event.sourceEventId,
       planId,

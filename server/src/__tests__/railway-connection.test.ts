@@ -155,7 +155,7 @@ const initialTools = [
     const f = await fixture();
     const [agent] = await db.insert(agents).values({ companyId: f.company.id, name: "Railway operator", role: "engineer", adapterType: "process", adapterConfig: {} }).returning();
     const [issue] = await db.insert(issues).values({ companyId: f.company.id, title: "Railway proof", assigneeAgentId: agent.id }).returning();
-    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: agent.id, invocationSource: "on_demand", status: "running", contextSnapshot: { issueId: issue.id } }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: agent.id, invocationSource: "on_demand", status: "running", responsibleUserId: actor.actorId, contextSnapshot: { issueId: issue.id } }).returning();
     const [profile] = await db.insert(toolProfiles).values({ companyId: f.company.id, name: "Railway tools", profileKey: randomUUID(), defaultAction: "allow" }).returning();
     await db.insert(toolProfileBindings).values({ companyId: f.company.id, profileId: profile.id, targetType: "agent", targetId: agent.id });
     const gateway = createToolGatewayService(db, { remoteHttpRequest: f.request, toolActionSigningSecret: "railway-fixture-signing-key" });
@@ -172,7 +172,7 @@ const initialTools = [
     await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: target, idempotencyKey: randomUUID() })).rejects.toMatchObject({ status: 409 });
     expect(f.request).not.toHaveBeenCalled();
     const [nextIssue] = await db.insert(issues).values({ companyId: f.company.id, title: "New Railway operation", assigneeAgentId: agent.id }).returning();
-    const [nextRun] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: agent.id, invocationSource: "on_demand", status: "running", contextSnapshot: { issueId: nextIssue.id } }).returning();
+    const [nextRun] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: agent.id, invocationSource: "on_demand", status: "running", responsibleUserId: actor.actorId, contextSnapshot: { issueId: nextIssue.id } }).returning();
     session = await gateway.createSession({ companyId: f.company.id, agentId: agent.id, runId: nextRun.id });
     await db.update(toolPolicies).set({ policyType: "block" }).where(eq(toolPolicies.id, policy.id));
     await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: target, idempotencyKey: randomUUID() })).rejects.toMatchObject({ status: 403 });

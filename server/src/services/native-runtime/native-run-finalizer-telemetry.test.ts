@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
   companies,
   completionContracts,
   createDb,
+  activityLog,
   heartbeatRuns,
+  issueThreadInteractions,
   issues,
   nativeRunFinalizations,
   nativeRunResults,
@@ -173,6 +175,86 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
       callerResultId: `${fixture.runId}:result`,
     });
   }
+
+  it("rejects an unresolved native bind_reviewer without partial status or interaction writes", async () => {
+    const fixture = await seedNativeRun();
+    const resultId = randomUUID();
+    const assessmentId = randomUUID();
+    await db.insert(nativeRunResults).values({
+      id: resultId,
+      companyId,
+      issueId: fixture.issueId,
+      runId: fixture.runId,
+      completionContractId: fixture.contractId,
+      serverFingerprint: `fp-${resultId}`,
+      schemaStatus: "accepted",
+      resultJson: {},
+      canonicalSha256: `sha-${resultId}`,
+    });
+    await db.insert(workAssessments).values({
+      id: assessmentId,
+      companyId,
+      issueId: fixture.issueId,
+      runId: fixture.runId,
+      contractId: fixture.contractId,
+      resultId,
+      triggerKind: "native_result",
+      triggerActorCompanyId: companyId,
+      priorIssueStatus: "in_progress",
+      priorStatusVersion: 0,
+      policyVersion: "telemetry-v1",
+      assessmentJson: {},
+      inputDigest: `digest-${assessmentId}`,
+    });
+    await db.insert(nativeRunFinalizations).values({
+      runId: fixture.runId,
+      companyId,
+      issueId: fixture.issueId,
+      phase: "arbitrating",
+      attempt: 0,
+      resultId,
+    });
+
+    await expect(commitNativeStatusDecision({
+      db,
+      companyId,
+      issueId: fixture.issueId,
+      runId: fixture.runId,
+      assessmentId,
+      priorStatus: "in_progress",
+      priorStatusVersion: 0,
+      priorDecisionId: null,
+      decision: {
+        policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+        statusAction: "in_review",
+        toStatus: "in_review",
+        reasonCode: "completion_review_required",
+        unblockDescriptor: null,
+        effects: [{ kind: "bind_reviewer", prompt: "Review the release before publishing.", ownerUserId: null }],
+      },
+    })).rejects.toMatchObject({
+      status: 422,
+      details: {
+        code: "interaction_unaddressable",
+        reason: "missing_addressee",
+      },
+    });
+
+    const [issue] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, fixture.issueId));
+    expect(issue?.status).toBe("in_progress");
+    expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, fixture.issueId))).toHaveLength(0);
+    const refusals = await db.select().from(activityLog).where(
+      and(
+        eq(activityLog.entityId, fixture.issueId),
+        eq(activityLog.action, "issue.thread_interaction_create_refused"),
+      ),
+    );
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]?.details).toMatchObject({
+      code: "interaction_unaddressable",
+      reason: "missing_addressee",
+    });
+  });
 
   it("emits exactly one agent.task_run event when the native finalizer commits a terminal status", async () => {
     const fixture = await seedNativeRun();

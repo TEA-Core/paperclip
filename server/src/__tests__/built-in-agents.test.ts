@@ -1387,6 +1387,7 @@ describeEmbeddedPostgres("built-in agents", () => {
       title: "Review proposed coaching change",
       summary: "Accept or reject the proposed update.",
       createdByAgentId: created.agentId,
+      addresseeUserId: "board-user",
       payload: {
         version: 1,
         prompt: "Accept the proposed coaching change?",
@@ -1441,8 +1442,8 @@ describeEmbeddedPostgres("built-in agents", () => {
       companyId,
       agentId: coach.id,
       status: "succeeded",
-      triggeredAt: new Date(),
-      completedAt: new Date(),
+      startedAt: new Date(),
+      finishedAt: new Date(),
     });
     await db.insert(issues).values({
       id: routineIssueId,
@@ -1532,8 +1533,8 @@ describeEmbeddedPostgres("built-in agents", () => {
       companyId,
       agentId: coach.id,
       status: "succeeded",
-      triggeredAt: new Date(),
-      completedAt: new Date(),
+      startedAt: new Date(),
+      finishedAt: new Date(),
     });
     await db.insert(issues).values({
       id: routineIssueId,
@@ -1627,8 +1628,8 @@ describeEmbeddedPostgres("built-in agents", () => {
       companyId,
       agentId: coach.id,
       status: "succeeded",
-      triggeredAt: new Date(),
-      completedAt: new Date(),
+      startedAt: new Date(),
+      finishedAt: new Date(),
     });
     await db.insert(issues).values({
       id: routineIssueId,
@@ -1656,6 +1657,7 @@ describeEmbeddedPostgres("built-in agents", () => {
       title: "Review proposed coaching change",
       summary: "Accept or reject the proposed update.",
       createdByAgentId: coach.id,
+      addresseeUserId: "board-user",
       sourceRunId: heartbeatRunId,
       payload: {
         version: 1,
@@ -1784,9 +1786,11 @@ describeEmbeddedPostgres("built-in agents", () => {
       continuationPolicy: "wake_assignee_on_accept",
       title: "Review proposed coaching change",
       summary: "Accept or reject the proposed instruction diff.",
+      addresseeUserId: "board-user",
       payload: {
         version: 1,
         prompt: "Apply this Reflection Coach instruction diff in a follow-up run?",
+        allowDeclineReason: false,
         acceptLabel: "Accept",
         rejectLabel: "Reject",
         detailsMarkdown: [
@@ -1843,9 +1847,11 @@ describeEmbeddedPostgres("built-in agents", () => {
       idempotencyKey: "reflection-coach:proposal-v2",
       title: "Review rejected coaching change",
       summary: "Rejecting this diff must not mutate the target instructions.",
+      addresseeUserId: "board-user",
       payload: {
         version: 1,
         prompt: "Apply this rejected Reflection Coach instruction diff?",
+        allowDeclineReason: false,
         acceptLabel: "Accept",
         rejectLabel: "Reject",
         detailsMarkdown: [

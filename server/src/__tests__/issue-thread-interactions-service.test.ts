@@ -779,7 +779,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       goalId,
       projectId: null,
     }, created.id, {}, {
-      userId: "local-board",
+      userId: "user-board",
     });
 
     expect(accepted.interaction.kind).toBe("suggest_tasks");
@@ -1199,6 +1199,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       },
       {
         kind: "request_confirmation" as const,
+        addresseeUserId: "user-board",
         payload: { version: 1 as const, prompt: "Proceed?" },
       },
       {
@@ -1601,6 +1602,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
 
     const older = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       idempotencyKey: "confirmation:first:older",
       payload: { version: 1, prompt: "Approve the older draft?" },
     }, { agentId: firstAgentId });
@@ -1615,11 +1617,13 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     }, { agentId: firstAgentId });
     const otherAgent = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       idempotencyKey: "confirmation:second",
       payload: { version: 1, prompt: "Approve the second agent's draft?" },
     }, { agentId: secondAgentId });
     const replacement = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       idempotencyKey: "confirmation:first:newer",
       payload: { version: 1, prompt: "Approve the newer draft?" },
     }, { agentId: firstAgentId });
@@ -1695,6 +1699,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     );
     const otherKind = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       payload: { version: 1, prompt: "Approve the draft?" },
     }, { agentId: probingAgentId });
     const otherAgentQuestion = await interactionsSvc.create(
@@ -1929,6 +1934,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: { version: 1, prompt: "Approve after close?" },
     }, {
@@ -1975,6 +1981,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -1996,7 +2003,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       goalId,
       projectId: null,
     }, created.id, {}, {
-      userId: "local-board",
+      userId: "user-board",
     });
 
     expect(accepted.createdIssues).toEqual([]);
@@ -2007,7 +2014,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         version: 1,
         outcome: "accepted",
       },
-      resolvedByUserId: "local-board",
+      resolvedByUserId: "user-board",
     });
 
     const requiresReason = await interactionsSvc.create({
@@ -2015,6 +2022,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       payload: {
         version: 1,
         prompt: "Decline only with a reason?",
@@ -2028,7 +2036,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       id: issueId,
       companyId,
     }, requiresReason.id, {}, {
-      userId: "local-board",
+      userId: "user-board",
     })).rejects.toThrow("A decline reason is required for this confirmation");
   });
 
@@ -2040,6 +2048,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       { id: issueId, companyId },
       {
         kind: "request_confirmation",
+        addresseeUserId: "user-board",
         continuationPolicy: "wake_assignee",
         payload: {
           version: 1,
@@ -2073,7 +2082,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         reason: "Proceed with turn two.",
       },
       {
-        userId: "local-board",
+        userId: "user-board",
       },
     );
 
@@ -2107,7 +2116,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       startedAt: new Date(),
     });
     const created = await interactionsSvc.create({ id: issueId, companyId }, {
-      kind: "request_confirmation",
+      kind: "request_confirmation", addresseeAgentId: resolverAgentId,
       payload: { version: 1, prompt: "Approve this review?" },
       resolverPolicy: "anyone",
     }, {
@@ -2160,7 +2169,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         startedAt: new Date(),
       });
       const created = await interactionsSvc.create({ id: issueId, companyId }, {
-        kind: "request_confirmation",
+        kind: "request_confirmation", addresseeAgentId: resolverAgentId,
         payload: { version: 1, prompt: "Approve this review?" },
       }, {
         userId: "local-board",
@@ -2262,7 +2271,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
 
     const createdByResolver = await interactionsSvc.create({ id: issueId, companyId }, {
-      kind: "request_confirmation",
+      kind: "request_confirmation", addresseeAgentId: resolverAgentId,
       payload: { version: 1, prompt: "Approve your own request?" },
       resolverPolicy: "anyone",
     }, {
@@ -2749,6 +2758,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee_on_accept",
       payload: {
         version: 1,
@@ -2766,7 +2776,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       goalId,
       projectId: null,
     }, created.id, {}, {
-      userId: "local-board",
+      userId: "user-board",
     });
 
     expect(accepted.continuationIssue).toEqual({
@@ -2798,6 +2808,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee_on_accept",
       payload: {
         version: 1,
@@ -2813,7 +2824,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       goalId,
       projectId: null,
     }, agentOwnedConfirmation.id, {}, {
-      userId: "local-board",
+      userId: "user-board",
     });
 
     expect(resumed.continuationIssue).toEqual({
@@ -2841,6 +2852,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee_on_accept",
       payload: {
         version: 1,
@@ -2856,7 +2868,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       goalId,
       projectId: null,
     }, activeConfirmation.id, {}, {
-      userId: "local-board",
+      userId: "user-board",
     });
 
     expect(acceptedWhileActive.continuationIssue).toBeNull();
@@ -2891,6 +2903,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const target = await attachPlanDocument(companyId, issueId);
     const created = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee_on_accept",
       payload: { version: 1, prompt: "Accept this plan?", target },
     }, { agentId });
@@ -2900,7 +2913,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
       goalId,
       projectId: null,
-    }, created.id, {}, { userId: "local-board" });
+    }, created.id, {}, { userId: "user-board" });
 
     expect(accepted.interaction).toMatchObject({
       id: created.id,
@@ -2944,10 +2957,11 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
 
     const nonPlan = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       payload: { version: 1, prompt: "Accept this unrelated decision?" },
     }, { agentId });
     await interactionsSvc.acceptInteraction({ id: issueId, companyId, goalId, projectId: null }, nonPlan.id, {}, {
-      userId: "local-board",
+      userId: "user-board",
     });
     await expect(db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]?.workMode))
       .resolves.toBe("planning");
@@ -2976,11 +2990,12 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const target = await attachPlanDocument(companyId, issueId);
     const created = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       payload: { version: 1, prompt: "Accept this plan?", target },
     }, { userId: "local-board" });
 
     await interactionsSvc.acceptInteraction({ id: issueId, companyId, goalId, projectId: null }, created.id, {}, {
-      userId: "local-board",
+      userId: "user-board",
     });
 
     await expect(db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]?.workMode))
@@ -2993,12 +3008,13 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const target = await attachPlanDocument(companyId, issueId);
     const created = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       payload: { version: 1, prompt: "Accept this plan?", target },
     }, { userId: "local-board" });
 
     const rejected = await interactionsSvc.rejectInteraction({ id: issueId, companyId }, created.id, {
       reason: "Revise the plan",
-    }, { userId: "local-board" });
+    }, { userId: "user-board" });
 
     expect(rejected.status).toBe("rejected");
     await expect(db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]?.workMode))
@@ -3014,6 +3030,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       payload: {
         version: 1,
         prompt: "Proceed with the current draft?",
@@ -3060,6 +3077,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       payload: {
         version: 1,
         prompt: "Proceed with the current draft?",
@@ -3157,6 +3175,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const { companyId, issueId } = await seedConfirmationIssue("Legacy pending interaction on closed issue");
     const created = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       payload: { version: 1, prompt: "Proceed?" },
     }, { userId: "local-board" });
 
@@ -3198,6 +3217,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       payload: {
         version: 1,
         prompt: "Proceed with the current draft?",
@@ -3254,6 +3274,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       payload: {
         version: 1,
         prompt: "Proceed with the current draft?",
@@ -3290,6 +3311,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       payload: {
         version: 1,
         prompt: "Proceed with the current draft?",
@@ -3359,6 +3381,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       payload: {
         version: 1,
         prompt: "Proceed with the current draft?",
@@ -3469,6 +3492,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -3507,7 +3531,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       goalId,
       projectId: null,
     }, created.id, {}, {
-      userId: "local-board",
+      userId: "user-board",
     })).rejects.toMatchObject({
       status: 409,
       details: { code: "interaction_stale_target" },
@@ -3622,6 +3646,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -3646,6 +3671,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -3666,7 +3692,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       goalId,
       projectId: null,
     }, created.id, {}, {
-      userId: "local-board",
+      userId: "user-board",
     })).resolves.toMatchObject({
       interaction: { status: "accepted" },
       continuationIssue: { id: issueId },
@@ -3953,6 +3979,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         companyId,
       }, {
         kind,
+        ...(kind === "request_confirmation" ? { addresseeUserId: "user-board" } : {}),
         continuationPolicy: "wake_assignee",
         sourceRunId,
         payload,
@@ -3997,7 +4024,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         { id: issueId, companyId, goalId, projectId: null },
         interactionId,
         {},
-        { userId: "local-board" },
+        { userId: "user-board" },
       );
 
       expect(accepted.interaction).toMatchObject({
@@ -4025,7 +4052,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
           { id: issueId, companyId, goalId, projectId: null },
           interactionId,
           {},
-          { userId: "local-board" },
+          { userId: "user-board" },
         ),
       ).rejects.toMatchObject({
         status: 409,
@@ -4055,7 +4082,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         { id: issueId, companyId, goalId, projectId: null },
         interactionId,
         {},
-        { userId: "local-board" },
+        { userId: "user-board" },
       );
 
       expect(accepted.interaction).toMatchObject({
@@ -4093,7 +4120,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         { id: issueId, companyId, goalId, projectId: null },
         interactionId,
         {},
-        { userId: "local-board" },
+        { userId: "user-board" },
       );
 
       expect(accepted.interaction).toMatchObject({
@@ -4123,7 +4150,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         { id: issueId, companyId, goalId, projectId: null },
         interactionId,
         {},
-        { userId: "local-board" },
+        { userId: "user-board" },
       );
 
       expect(accepted.interaction).toMatchObject({
@@ -4153,7 +4180,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
           { id: issueId, companyId, goalId, projectId: null },
           interactionId,
           {},
-          { userId: "local-board" },
+          { userId: "user-board" },
         ),
       ).rejects.toMatchObject({
         status: 409,
@@ -4181,7 +4208,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         { id: issueId, companyId, goalId, projectId: null },
         interactionId,
         {},
-        { userId: "local-board" },
+        { userId: "user-board" },
       );
 
       expect(accepted.interaction).toMatchObject({
@@ -4365,6 +4392,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         companyId,
       }, {
         kind: "request_confirmation",
+        addresseeUserId: "user-board",
         continuationPolicy: "wake_assignee",
         payload: {
           version: 1,
@@ -4378,7 +4406,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         { id: issueId, companyId, goalId: null, projectId: null },
         created.id,
         {},
-        { userId: "local-board" },
+        { userId: "user-board" },
       );
 
       expect(accepted.interaction).toMatchObject({
@@ -4397,6 +4425,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -4440,6 +4469,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -4475,6 +4505,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -4508,6 +4539,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -4540,6 +4572,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -4572,6 +4605,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -4601,6 +4635,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -4640,6 +4675,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -4694,6 +4730,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -4756,6 +4793,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -4787,6 +4825,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -4818,6 +4857,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -4855,6 +4895,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -4934,6 +4975,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee_on_accept",
       payload: {
         version: 1,
@@ -4952,7 +4994,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       goalId,
       projectId: null,
     }, created.id, {}, {
-      userId: "local-board",
+      userId: "user-board",
     });
 
     expect(accepted.interaction.status).toBe("accepted");
@@ -5026,6 +5068,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee_on_accept",
       payload: {
         version: 1,
@@ -5042,7 +5085,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       goalId,
       projectId: null,
     }, created.id, {}, {
-      userId: "local-board",
+      userId: "user-board",
     });
 
     expect(accepted.interaction.status).toBe("accepted");
@@ -5115,6 +5158,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee_on_accept",
       payload: {
         version: 1,
@@ -5133,7 +5177,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       goalId,
       projectId: null,
     }, created.id, {}, {
-      userId: "local-board",
+      userId: "user-board",
     });
 
     expect(accepted.interaction.status).toBe("accepted");
@@ -5204,6 +5248,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "user-board",
       continuationPolicy: "wake_assignee_on_accept",
       payload: {
         version: 1,
@@ -5220,7 +5265,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       goalId,
       projectId: null,
     }, created.id, {}, {
-      userId: "local-board",
+      userId: "user-board",
     });
 
     expect(accepted.interaction.status).toBe("accepted");
@@ -5239,4 +5284,150 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       assigneeUserId: null,
     });
   });
+
+  type CreateInteractionInput = Parameters<ReturnType<typeof issueThreadInteractionService>["create"]>[1];
+  type RequestConfirmationInput = Extract<CreateInteractionInput, { kind: "request_confirmation" }>;
+
+  const governedConfirmationPayloads = {
+    toolAction: {
+      version: 1 as const,
+      actionRequestId: randomUUID(),
+      invocationId: randomUUID(),
+      toolName: "forged_tool",
+      toolDisplayName: "Forged tool",
+      connectionId: null,
+      applicationId: null,
+      appDisplayName: null,
+      risk: "write" as const,
+      previewMarkdown: "Perform the governed action",
+      argumentsSummaryJson: "{}",
+      argumentsHash: "a".repeat(64),
+      expiresAt: "2026-12-30T12:00:00.000Z",
+    },
+    secretProposal: {
+      version: 1 as const,
+      proposalId: randomUUID(),
+      sourceSecretLabel: "forged/source",
+      configPath: "access.FORGED_ALIAS",
+      targetAgentId: randomUUID(),
+      targetAgentName: "Target agent",
+      justification: "Trust me",
+      expiresAt: "2026-12-30T12:00:00.000Z",
+    },
+  };
+
+  function confirmationPayload(
+    governedField?: keyof typeof governedConfirmationPayloads,
+  ): RequestConfirmationInput["payload"] {
+    return {
+      version: 1,
+      prompt: "Approve this action?",
+      allowDeclineReason: true,
+      ...(governedField === "toolAction"
+        ? { toolAction: governedConfirmationPayloads.toolAction }
+        : governedField === "secretProposal"
+          ? { secretProposal: governedConfirmationPayloads.secretProposal }
+          : {}),
+    };
+  }
+
+  it.each(["ordinary", "review-escalation"])(
+    "refuses an unaddressed %s confirmation and records one activity per refused attempt",
+    async (context) => {
+      const { companyId, issueId } = await seedConfirmationIssue("Unaddressable confirmation");
+      const agentId = await seedAgent(companyId);
+      const input: RequestConfirmationInput = {
+        kind: "request_confirmation",
+        continuationPolicy: "none",
+        payload: confirmationPayload(),
+        addresseeUserId: null,
+        addresseeAgentId: null,
+        idempotencyKey: `${context}:${issueId}`,
+      };
+      const create = () => interactionsSvc.create({ id: issueId, companyId }, input, { agentId });
+
+      await expect(create()).rejects.toMatchObject({
+        status: 422,
+        details: {
+          code: "interaction_unaddressable",
+          reason: "missing_addressee",
+          kind: "request_confirmation",
+        },
+      });
+      await expect(create()).rejects.toMatchObject({ status: 422 });
+      expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId))).toHaveLength(0);
+      const refusals = await db.select().from(activityLog).where(and(
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.action, "issue.thread_interaction_create_refused"),
+      ));
+      expect(refusals).toHaveLength(2);
+      expect(refusals[0]?.details).toMatchObject({
+        code: "interaction_unaddressable",
+        reason: "missing_addressee",
+        kind: "request_confirmation",
+        idempotencyKey: input.idempotencyKey,
+      });
+      expect(await db.select().from(activityLog).where(and(
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.action, "issue.thread_interaction_created"),
+      ))).toHaveLength(0);
+    },
+  );
+
+  it.each(["toolAction", "secretProposal"] as const)(
+    "refuses an unaddressed governed confirmation containing %s",
+    async (governedField) => {
+      const { companyId, issueId } = await seedConfirmationIssue("Unaddressable governed confirmation");
+      const agentId = await seedAgent(companyId);
+
+      await expect(interactionsSvc.create(
+        { id: issueId, companyId },
+        {
+          kind: "request_confirmation",
+          continuationPolicy: "none",
+          payload: confirmationPayload(governedField),
+          addresseeUserId: null,
+          addresseeAgentId: null,
+        },
+        { agentId },
+      )).rejects.toMatchObject({
+        status: 422,
+        details: { code: "interaction_unaddressable", reason: "missing_addressee" },
+      });
+      expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId))).toHaveLength(0);
+      expect(await db.select().from(activityLog).where(and(
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.action, "issue.thread_interaction_create_refused"),
+      ))).toHaveLength(1);
+    },
+  );
+
+  it("mints a governed confirmation with a concrete user addressee", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Addressed governed confirmation");
+    const agentId = await seedAgent(companyId);
+
+    const created = await interactionsSvc.create(
+      { id: issueId, companyId },
+      {
+        kind: "request_confirmation",
+        addresseeUserId: "user-board",
+        continuationPolicy: "none",
+        payload: confirmationPayload("toolAction"),
+      },
+      { agentId },
+    );
+
+    expect(created).toMatchObject({
+      kind: "request_confirmation",
+      status: "pending",
+      addresseeUserId: "user-board",
+      addresseeAgentId: null,
+      effectiveResolverPolicy: "human_only",
+    });
+    expect(await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, issueId),
+      eq(activityLog.action, "issue.thread_interaction_create_refused"),
+    ))).toHaveLength(0);
+  });
+
 });

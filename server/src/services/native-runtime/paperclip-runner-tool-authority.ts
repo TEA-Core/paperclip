@@ -19,7 +19,7 @@ import { getStorageService } from "../../storage/index.js";
 import type { StorageService } from "../../storage/types.js";
 import { assetService } from "../assets.js";
 import { workspaceFileResourceService } from "../workspace-file-resources.js";
-import { badRequest, forbidden } from "../../errors.js";
+import { badRequest, forbidden, unprocessable } from "../../errors.js";
 import { searchRunnerApi } from "./runner-api-catalog.js";
 import { executeRunnerApi, validateRunnerApiCall, RUNNER_API_MAX_BYTES, type RunnerApiFile } from "./runner-api-client.js";
 import { and, desc, eq, isNull, notInArray } from "drizzle-orm";
@@ -1331,6 +1331,40 @@ export class PaperclipRunnerToolAuthority {
     if (!kind) throw new Error("paperclip_runner_interaction_kind_invalid");
     const prompt = requiredString(input.prompt);
     const idempotencyKey = requiredString(input.idempotencyKey);
+    if (kind === "request_confirmation") {
+      const [run] = await this.db
+        .select({ responsibleUserId: heartbeatRuns.responsibleUserId })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, this.binding.runId),
+          eq(heartbeatRuns.companyId, this.binding.companyId),
+        ))
+        .limit(1);
+      if (!run?.responsibleUserId) {
+        const details = {
+          code: "interaction_unaddressable",
+          reason: "missing_addressee",
+          kind,
+          idempotencyKey,
+        };
+        await persistActivity(this.db, {
+          companyId: this.binding.companyId,
+          actorType: "agent",
+          actorId: this.binding.agentId,
+          agentId: this.binding.agentId,
+          runId: this.binding.runId,
+          issueId: this.binding.issueId,
+          action: "issue.thread_interaction_create_refused",
+          entityType: "issue",
+          entityId: this.binding.issueId,
+          details,
+        });
+        throw unprocessable(
+          "A request_confirmation requires a concrete user or agent addressee",
+          details,
+        );
+      }
+    }
     let publication: Awaited<ReturnType<typeof persistActivity>>["publication"] | null = null;
     const result = await this.#withMutationReceipt(
       "request_human_input",
@@ -1370,6 +1404,10 @@ export class PaperclipRunnerToolAuthority {
           kind,
           idempotencyKey,
           sourceRunId: this.binding.runId,
+          addresseeAgentId: null,
+          addresseeUserId: kind === "request_confirmation"
+            ? context.run.responsibleUserId
+            : null,
           title: requiredString(input.title),
           summary: prompt,
           continuationPolicy: requiredString(input.continuationPolicy),

@@ -1710,6 +1710,7 @@ describe("issue execution policy routes", () => {
     expect(createOptions).toMatchObject({
       kind: "request_confirmation",
       addresseeAgentId: null,
+      addresseeUserId: "board-user",
       resolverPolicy: "human_only",
       continuationPolicy: "wake_assignee",
       sourceRunId: "77777777-7777-4777-8777-777777777777",

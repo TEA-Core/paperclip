@@ -1088,6 +1088,26 @@ async function mintReviewEscalationInteraction(args: {
     ``,
     `Return assignee: ${returnAssigneeLabel}.`,
   ].join("\n");
+  // SUP-23807: the pre-commit assignee validation proved this human assignable
+  // when the decision was recorded, but the mint runs post-commit and the
+  // membership can be gone by then (e.g. archived in between). A human_only
+  // request_confirmation minted at a user who can no longer resolve it would be
+  // permanently unanswerable, so re-check reachability now; on a miss reach the
+  // service's centralized guard with no addressee, which refuses the mint with
+  // the typed interaction_unaddressable error and its countable refusal
+  // activity. The already-committed escalation hold itself stands.
+  const escalationUserActive = await db
+    .select({ id: companyMemberships.id })
+    .from(companyMemberships)
+    .where(
+      and(
+        eq(companyMemberships.companyId, issue.companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, escalation.escalatedToUserId),
+        eq(companyMemberships.status, "active"),
+      ),
+    )
+    .then((rows) => rows.length > 0);
   return issueThreadInteractionService(db).create(
     issue,
     {
@@ -1095,6 +1115,7 @@ async function mintReviewEscalationInteraction(args: {
       title: "Review round cap reached — your decision is needed",
       summary: `Review stage ${escalation.stageId} hit the ${escalation.maxRounds}-round change cap and was escalated to you.`,
       addresseeAgentId: null,
+      addresseeUserId: escalationUserActive ? escalation.escalatedToUserId : null,
       resolverPolicy: "human_only",
       continuationPolicy: "wake_assignee",
       sourceRunId,

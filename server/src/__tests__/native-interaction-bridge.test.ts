@@ -58,6 +58,7 @@ describe("P6-19 native interaction bridge", () => {
       title: "Consume an authorized interaction response",
       status: "in_progress",
       assigneeAgentId: agentId,
+      responsibleUserId: "board-user",
       workMode: "standard",
     });
     await db.insert(heartbeatRuns).values({
@@ -380,6 +381,7 @@ describe("P6-19 native interaction bridge", () => {
         title: `Native attention ${scenario.key}`,
         status: "in_progress",
         assigneeAgentId: agentId,
+        responsibleUserId: "board-user",
         workMode: "standard",
       });
       await db.insert(completionContracts).values({
@@ -523,7 +525,12 @@ describe("P6-19 native interaction bridge", () => {
     const seedAuditRun = async (input: {
       label: string;
       requests: Record<string, unknown>[];
-      interactions: Array<typeof issueThreadInteractions.$inferInsert>;
+      interactions: Array<
+        Omit<
+          typeof issueThreadInteractions.$inferInsert,
+          "companyId" | "issueId"
+        >
+      >;
     }) => {
       const localIssueId = randomUUID();
       const localRunId = randomUUID();
@@ -535,6 +542,7 @@ describe("P6-19 native interaction bridge", () => {
         title: `Audit-only native attention ${input.label}`,
         status: "in_progress",
         assigneeAgentId: agentId,
+        responsibleUserId: "board-user",
         workMode: "standard",
       });
       await db.insert(completionContracts).values({
@@ -575,8 +583,8 @@ describe("P6-19 native interaction bridge", () => {
       if (input.interactions.length > 0) {
         await db.insert(issueThreadInteractions).values(input.interactions.map((interaction) => ({
           ...interaction,
-          companyId: interaction.companyId ?? companyId,
-          issueId: interaction.issueId ?? localIssueId,
+          companyId,
+          issueId: localIssueId,
         })));
       }
       const port = new PaperclipControlPlanePort(db, {
@@ -631,7 +639,7 @@ describe("P6-19 native interaction bridge", () => {
         id: `audit:${label}:duplicate`,
         requestedCapability: "duplicate",
         requiredAuthority: "agent",
-        target: { ownerClass: "current_agent", companyId },
+        target: { ownerClass: "board_user", companyId },
         summary: `Duplicate attention ${label}`,
         responseState: "none",
         targetInteractionId: duplicateId,
@@ -641,7 +649,7 @@ describe("P6-19 native interaction bridge", () => {
         id: `audit:${label}:stale`,
         requestedCapability: "context_lookup",
         requiredAuthority: "agent",
-        target: { ownerClass: "current_agent", companyId },
+        target: { ownerClass: "board_user", companyId },
         summary: `Stale attention ${label}`,
         responseState: "stale",
         targetInteractionId: staleId,
@@ -649,22 +657,43 @@ describe("P6-19 native interaction bridge", () => {
       const requests = label === "duplicate"
         ? [duplicateRequest]
         : label === "stale" ? [staleRequest] : [duplicateRequest, staleRequest];
-      const interactions: Array<typeof issueThreadInteractions.$inferInsert> = [];
+      const interactions: Array<
+        Omit<
+          typeof issueThreadInteractions.$inferInsert,
+          "companyId" | "issueId"
+        >
+      > = [];
       if (label !== "stale") {
         interactions.push(
           {
             id: canonicalId,
             kind: "request_confirmation",
             status: "pending",
+            addresseeUserId: "board-user",
+            continuationPolicy: "none",
+            requestedResolverPolicy: "anyone",
+            effectiveResolverPolicy: "anyone",
+            resolverPolicyProvenance: "inherited",
+            effectiveResolverPolicySource: "requested",
             payload: { version: 1, prompt: `Canonical ${label}` },
           },
           {
             id: duplicateId,
             kind: "request_confirmation",
             status: "expired",
+            addresseeUserId: "board-user",
+            continuationPolicy: "none",
+            requestedResolverPolicy: "anyone",
+            effectiveResolverPolicy: "anyone",
+            resolverPolicyProvenance: "inherited",
+            effectiveResolverPolicySource: "requested",
             resolvedAt: new Date(),
             payload: { version: 1, prompt: `Duplicate ${label}` },
-            result: { version: 1, outcome: "superseded_by_newer_request", supersededByInteractionId: canonicalId },
+            result: {
+              version: 1,
+              outcome: "superseded_by_newer_request",
+              supersededByInteractionId: canonicalId,
+            },
           },
         );
       }
@@ -673,9 +702,19 @@ describe("P6-19 native interaction bridge", () => {
           id: staleId,
           kind: "request_confirmation",
           status: "expired",
+          addresseeUserId: "board-user",
+          continuationPolicy: "none",
+          requestedResolverPolicy: "anyone",
+          effectiveResolverPolicy: "anyone",
+          resolverPolicyProvenance: "inherited",
+          effectiveResolverPolicySource: "requested",
           resolvedAt: new Date(),
           payload: { version: 1, prompt: `Stale ${label}` },
-          result: { version: 1, outcome: "superseded_by_comment", commentId: randomUUID() },
+          result: {
+            version: 1,
+            outcome: "superseded_by_comment",
+            commentId: randomUUID(),
+          },
         });
       }
       const seeded = await seedAuditRun({ label, requests, interactions });
@@ -719,11 +758,11 @@ describe("P6-19 native interaction bridge", () => {
         .filter((request) => (request.payload as Record<string, unknown> | null)?.issueId === seeded.issueId);
       if (label === "stale") {
         expect(issueWakeups).toEqual([
-          expect.objectContaining({ payload: expect.objectContaining({ issueId: seeded.issueId }) }),
+          expect.objectContaining({
+            payload: expect.objectContaining({ issueId: seeded.issueId }),
+          }),
         ]);
       } else {
-        // Duplicate actionable attention is owned by the review interaction;
-        // it must not wake the agent before that human decision is resolved.
         expect(issueWakeups).toEqual([]);
       }
 
@@ -795,7 +834,7 @@ describe("P6-19 native interaction bridge", () => {
           id: `audit:invalid:${label}`,
           requestedCapability: "context_lookup",
           requiredAuthority: "agent",
-          target: { ownerClass: "current_agent", companyId },
+          target: { ownerClass: "board_user", companyId },
           summary: `Invalid audit target ${label}`,
           responseState: "stale",
           targetInteractionId,
