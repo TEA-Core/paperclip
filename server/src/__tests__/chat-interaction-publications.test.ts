@@ -19,7 +19,10 @@ import {
   toolApplications,
   toolConnections,
 } from "@paperclipai/db";
-import type { ChatProvider } from "@paperclipai/shared";
+import type {
+  ChatProvider,
+  CreateIssueThreadInteraction,
+} from "@paperclipai/shared";
 import { enqueueTerminalIssueInteractionChatPublications } from "../services/chat-interaction-publications.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import {
@@ -251,15 +254,17 @@ describeEmbeddedPostgres(
         agentId: foreignAgentId,
         status: "succeeded",
       });
-      const question = {
-        kind: "ask_user_questions" as const,
+      const question: CreateIssueThreadInteraction = {
+        kind: "ask_user_questions",
+        addresseeUserId: "board-user",
+        continuationPolicy: "wake_assignee",
         payload: {
-          version: 1 as const,
+          version: 1,
           questions: [
             {
               id: "priority",
               prompt: "Which priority?",
-              selectionMode: "single" as const,
+              selectionMode: "single",
               allowOther: false,
               options: [{ id: "high", label: "High" }],
             },
@@ -318,10 +323,15 @@ describeEmbeddedPostgres(
         { id: fixture.issueId, companyId: fixture.companyId },
         {
           kind: "request_checkbox_confirmation",
+          addresseeUserId: "board-user",
+          continuationPolicy: "wake_assignee",
           payload: {
             version: 1,
             prompt: "Choose deployment regions",
             options: [{ id: "us", label: "US" }],
+            defaultSelectedOptionIds: [],
+            minSelected: 0,
+            allowDeclineReason: true,
           },
         },
         { agentId: fixture.agentId },
@@ -420,8 +430,13 @@ describeEmbeddedPostgres(
         { id: fixture.issueId, companyId: fixture.companyId },
         {
           kind: "request_confirmation",
+          addresseeUserId: "board-user",
           continuationPolicy: "wake_assignee",
-          payload: { version: 1, prompt: "Ship the GitHub release?" },
+          payload: {
+            version: 1,
+            prompt: "Ship the GitHub release?",
+            allowDeclineReason: true,
+          },
         },
         { agentId: fixture.agentId },
       );
@@ -480,6 +495,8 @@ describeEmbeddedPostgres(
         { id: fixture.issueId, companyId: fixture.companyId },
         {
           kind: "ask_user_questions",
+          addresseeUserId: "board-user",
+          continuationPolicy: "wake_assignee",
           payload: {
             version: 1,
             questions: [
@@ -542,15 +559,17 @@ describeEmbeddedPostgres(
     it("settles UI answers and skips on every provider-native card with no live actions", async () => {
       const fixture = await seedBoundIssue();
       const service = issueThreadInteractionService(db);
-      const questionInput = {
-        kind: "ask_user_questions" as const,
+      const questionInput: CreateIssueThreadInteraction = {
+        kind: "ask_user_questions",
+        addresseeUserId: "board-user",
+        continuationPolicy: "wake_assignee",
         payload: {
-          version: 1 as const,
+          version: 1,
           questions: [
             {
               id: "priority",
               prompt: "Which priority?",
-              selectionMode: "single" as const,
+              selectionMode: "single",
               allowOther: false,
               options: [
                 { id: "high", label: "High" },
@@ -702,8 +721,13 @@ describeEmbeddedPostgres(
           { id: fixture.issueId, companyId: fixture.companyId },
           {
             kind: "request_confirmation",
+            addresseeUserId: "board-user",
             continuationPolicy: "wake_assignee",
-            payload: { version: 1, prompt: `Should we ${outcome}?` },
+            payload: {
+              version: 1,
+              prompt: `Should we ${outcome}?`,
+              allowDeclineReason: true,
+            },
           },
           { agentId: fixture.agentId },
         );
@@ -888,7 +912,13 @@ describeEmbeddedPostgres(
         { id: fixture.issueId, companyId: fixture.companyId },
         {
           kind: "request_confirmation",
-          payload: { version: 1, prompt: "Proceed?" },
+          addresseeUserId: "board-user",
+          continuationPolicy: "none",
+          payload: {
+            version: 1,
+            prompt: "Proceed?",
+            allowDeclineReason: true,
+          },
         },
         { agentId: fixture.agentId },
       );
@@ -940,15 +970,17 @@ describeEmbeddedPostgres(
     it("settles visible question cards when a newer interaction supersedes them", async () => {
       const fixture = await seedBoundIssue();
       const service = issueThreadInteractionService(db);
-      const input = {
-        kind: "ask_user_questions" as const,
+      const input: CreateIssueThreadInteraction = {
+        kind: "ask_user_questions",
+        addresseeUserId: "board-user",
+        continuationPolicy: "wake_assignee",
         payload: {
-          version: 1 as const,
+          version: 1,
           questions: [
             {
               id: "priority",
               prompt: "Which priority?",
-              selectionMode: "single" as const,
+              selectionMode: "single",
               allowOther: false,
               options: [{ id: "high", label: "High" }],
             },
@@ -1009,7 +1041,13 @@ describeEmbeddedPostgres(
         { id: fixture.issueId, companyId: fixture.companyId },
         {
           kind: "request_confirmation",
-          payload: { version: 1, prompt: "Proceed with the release?" },
+          addresseeUserId: "board-user",
+          continuationPolicy: "none",
+          payload: {
+            version: 1,
+            prompt: "Proceed with the release?",
+            allowDeclineReason: true,
+          },
         },
         { agentId: fixture.agentId },
       );
@@ -1051,6 +1089,8 @@ describeEmbeddedPostgres(
         { id: fixture.issueId, companyId: fixture.companyId },
         {
           kind: "ask_user_questions",
+          addresseeUserId: "board-user",
+          continuationPolicy: "wake_assignee",
           payload: {
             version: 1,
             questions: [
@@ -1145,9 +1185,12 @@ describeEmbeddedPostgres(
         { id: fixture.issueId, companyId: fixture.companyId },
         {
           kind: "request_confirmation",
+          addresseeUserId: "board-user",
+          continuationPolicy: "none",
           payload: {
             version: 1,
             prompt: "Apply this plan?",
+            allowDeclineReason: true,
             target: {
               type: "issue_document",
               issueId: fixture.issueId,
@@ -1196,6 +1239,8 @@ describeEmbeddedPostgres(
         { id: fixture.issueId, companyId: fixture.companyId },
         {
           kind: "ask_user_questions",
+          addresseeUserId: "board-user",
+          continuationPolicy: "wake_assignee",
           payload: {
             version: 1,
             questions: [

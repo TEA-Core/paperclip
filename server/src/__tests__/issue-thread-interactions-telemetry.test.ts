@@ -142,7 +142,9 @@ describeEmbeddedPostgres("issueThreadInteractionService telemetry", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "local-board",
       resolverPolicy: "board_only",
+      continuationPolicy: "none",
       title: "Private confirmation title",
       summary: "Private confirmation summary",
       payload: {
@@ -151,6 +153,7 @@ describeEmbeddedPostgres("issueThreadInteractionService telemetry", () => {
         detailsMarkdown: "Private confirmation details",
         acceptLabel: "Private accept label",
         rejectLabel: "Private reject label",
+        allowDeclineReason: true,
       },
     }, {
       userId: "local-board",
@@ -169,10 +172,12 @@ describeEmbeddedPostgres("issueThreadInteractionService telemetry", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "local-board",
       continuationPolicy: "none",
       payload: {
         version: 1,
         prompt: "Continue with the proposed change?",
+        allowDeclineReason: true,
       },
     }, {
       userId: "local-board",
@@ -272,6 +277,9 @@ describeEmbeddedPostgres("issueThreadInteractionService telemetry", () => {
           { id: "file-a", label: "a.txt" },
           { id: "file-b", label: "b.txt" },
         ],
+        defaultSelectedOptionIds: [],
+        minSelected: 0,
+        allowDeclineReason: true,
         target: {
           type: "custom",
           key: "cleanup-plan",
@@ -324,10 +332,13 @@ describeEmbeddedPostgres("issueThreadInteractionService telemetry", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeAgentId: resolverAgentId,
       resolverPolicy: "board_or_agents",
+      continuationPolicy: "none",
       payload: {
         version: 1,
         prompt: "Approve this?",
+        allowDeclineReason: true,
       },
     }, {
       userId: "local-board",
@@ -516,9 +527,12 @@ describeEmbeddedPostgres("issueThreadInteractionService telemetry", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "local-board",
+      continuationPolicy: "none",
       payload: {
         version: 1,
         prompt: "Approve the plan?",
+        allowDeclineReason: true,
         target: {
           type: "issue_document",
           issueId,
@@ -562,9 +576,12 @@ describeEmbeddedPostgres("issueThreadInteractionService telemetry", () => {
       companyId,
     }, {
       kind: "request_confirmation",
+      addresseeUserId: "local-board",
+      continuationPolicy: "none",
       payload: {
         version: 1,
         prompt: "Approve this plan?",
+        allowDeclineReason: true,
       },
     }, {
       userId: "local-board",
