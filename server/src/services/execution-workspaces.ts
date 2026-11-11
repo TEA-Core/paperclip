@@ -3317,7 +3317,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           keep(workspace, "worktree has local changes", "skippedUndelivered");
           continue;
         }
-        const cleanupRecordOnly = Boolean(recordOnlyReason) && !sharedSession && cwdKind === "git";
+        const cleanupRecordOnly = Boolean(recordOnlyReason)
+          && !sharedSession
+          && workspace.providerType === "git_worktree"
+          && cwdKind === "git";
         const cleanupReason = recordOnlyReason
           ? `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${recordOnlyReason}`
           : ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON;

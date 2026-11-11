@@ -6098,6 +6098,45 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
     }, 20_000);
 
+    it("SUP-23829 preserves a record-only local_fs workspace whose cwd is a Git directory", async () => {
+      const seeded = await seedManagedCleanWorktree();
+      await db.update(executionWorkspaces).set({
+        providerType: "local_fs",
+        strategyType: "local_fs",
+      }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      const serviceId = randomUUID();
+      await db.insert(workspaceRuntimeServices).values({
+        id: serviceId,
+        companyId: seeded.companyId,
+        projectId: seeded.projectId,
+        executionWorkspaceId: seeded.executionWorkspaceId,
+        issueId: seeded.sourceIssueId,
+        scopeType: "execution_workspace",
+        serviceName: "web",
+        status: "running",
+        lifecycle: "shared",
+        command: "pnpm dev",
+        cwd: seeded.worktreePath,
+        provider: "local_process",
+        healthStatus: "healthy",
+      });
+
+      const sweep = await freshSweep().sweepTerminalWorkspaces();
+      const [service] = await db
+        .select({ status: workspaceRuntimeServices.status })
+        .from(workspaceRuntimeServices)
+        .where(eq(workspaceRuntimeServices.id, serviceId));
+
+      expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
+      expect(await workspaceStatus(seeded.executionWorkspaceId)).toEqual({
+        status: "archived",
+        cleanupReason: "issue_terminal | terminal, clean, nothing unique",
+      });
+      expect(service?.status).toBe("running");
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+      expect(await readGit(seeded.repoRoot, ["worktree", "list", "--porcelain"])).toContain(seeded.worktreePath);
+    }, 20_000);
+
     it("reclaims a clean no-PR worktree without deleting its unowned branch", async () => {
       const seeded = await seedManagedCleanWorktree();
       const branchBefore = await readGit(seeded.repoRoot, ["rev-parse", `refs/heads/${seeded.branchName}`]);
