@@ -1290,6 +1290,57 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(countExecuteCallsForRun(duplicate.runId)).toBe(0);
   });
 
+  it("cancels a duplicate native-review run even when more than five ordinary siblings share the interaction", async () => {
+    const fixture = await seedNativeReviewFixture();
+    const first = await resumeAndReadRun(fixture.runId);
+    expect(first?.status).toBe("succeeded");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(1);
+    // Ordinary succeeded runs carrying copied markers but no provenance
+    // wake, inserted after the genuine review so an unordered bounded
+    // sibling window can be filled by them alone.
+    for (let index = 0; index < 6; index += 1) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId: fixture.companyId,
+        agentId: fixture.workerId,
+        status: "succeeded",
+        contextSnapshot: {
+          issueId: fixture.issueId,
+          nativeReviewInteractionId: fixture.interactionId,
+          nativeReviewDecisionId: fixture.decisionId,
+        },
+        startedAt: new Date(),
+        finishedAt: new Date(),
+      });
+    }
+
+    const duplicate = await seedQueuedRun({
+      companyId: fixture.companyId,
+      agentId: fixture.reviewerId,
+      issueId: fixture.issueId,
+      wakeReason: "native_completion_review",
+      contextExtras: {
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+    });
+    await db.update(agentWakeupRequests).set({
+      idempotencyKey: `native-review:${fixture.interactionId}`,
+      requestedByActorType: "system",
+      requestedByActorId: "native-status-committer",
+      payload: {
+        issueId: fixture.issueId,
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+    }).where(eq(agentWakeupRequests.id, duplicate.wakeupRequestId));
+
+    const run = await resumeAndReadRun(duplicate.runId);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("native_review_assignment_already_claimed");
+    expect(countExecuteCallsForRun(duplicate.runId)).toBe(0);
+  });
+
   it("does not re-open a resolved connection-intent issue parked after claim", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();

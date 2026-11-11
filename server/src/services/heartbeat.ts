@@ -20607,6 +20607,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             const siblingCandidates = await dbOrTx
               .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
               .from(heartbeatRuns)
+              .innerJoin(
+                agentWakeupRequests,
+                and(
+                  eq(agentWakeupRequests.id, heartbeatRuns.wakeupRequestId),
+                  eq(agentWakeupRequests.companyId, run.companyId),
+                  eq(agentWakeupRequests.agentId, heartbeatRuns.agentId),
+                ),
+              )
               .where(
                 and(
                   eq(heartbeatRuns.companyId, run.companyId),
@@ -20614,8 +20622,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   inArray(heartbeatRuns.status, ["running", "succeeded"]),
                   sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
                   sql`${heartbeatRuns.contextSnapshot} ->> 'nativeReviewInteractionId' = ${nativeReviewContext.nativeReviewInteractionId}`,
+                  sql`${heartbeatRuns.contextSnapshot} ->> 'nativeReviewDecisionId' = ${nativeReviewContext.nativeReviewDecisionId}`,
+                  inArray(agentWakeupRequests.reason, ["native_completion_review", "issue_execution_promoted"]),
+                  eq(agentWakeupRequests.idempotencyKey, `native-review:${nativeReviewContext.nativeReviewInteractionId}`),
+                  eq(agentWakeupRequests.requestedByActorType, "system"),
+                  or(
+                    eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
+                    sql`${agentWakeupRequests.requestedByActorId} like 'native-status-wake-dispatch:%'`,
+                  ),
+                  sql`coalesce(${agentWakeupRequests.payload} ->> 'nativeReviewInteractionId', ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'nativeReviewInteractionId') = ${nativeReviewContext.nativeReviewInteractionId}`,
+                  sql`coalesce(${agentWakeupRequests.payload} ->> 'nativeReviewDecisionId', ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'nativeReviewDecisionId') = ${nativeReviewContext.nativeReviewDecisionId}`,
+                  sql`coalesce(${agentWakeupRequests.payload} ->> 'issueId', ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId') = ${issueId}`,
                 ),
               )
+              .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
               .limit(5);
             let sibling: { id: string } | null = null;
             for (const candidate of siblingCandidates) {
