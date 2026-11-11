@@ -3435,7 +3435,7 @@ export function issueThreadInteractionService(
           kind: normalizedData.kind,
           idempotencyKey: normalizedData.idempotencyKey ?? null,
         };
-        await logActivity(db, {
+        await logActivityInTransaction(db, {
           companyId: issue.companyId,
           actorType: actor.systemId ? "system" : actor.agentId ? "agent" : actor.userId ? "user" : "system",
           actorId: actor.systemId ?? actor.agentId ?? actor.userId ?? "issue-thread-interactions",

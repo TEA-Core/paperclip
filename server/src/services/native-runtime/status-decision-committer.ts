@@ -38,11 +38,13 @@ import {
   isExternalChatWaitAuthorizationContention,
   resolveExternalChatResponseWaitAuthorizationInTransaction,
 } from "./chat-attachment-reuse.js";
+import { HttpError } from "../../errors.js";
 import { issueService } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { buildIssueBlockersResolvedWakeIdempotencyKey } from "../issue-dependency-wakeups.js";
 import {
+  logActivity,
   persistActivity,
   publishActivity,
   type ActivityPublication,
@@ -1525,6 +1527,32 @@ async function materializeDecisionEffect(input: {
   return assertNeverEffect(effect);
 }
 
+async function recordUnaddressableInteractionRefusal(input: {
+  db: Db;
+  companyId: string;
+  issueId: string;
+  runId: string;
+  error: unknown;
+}) {
+  if (!(input.error instanceof HttpError) || input.error.status !== 422) return;
+  const details = record(input.error.details);
+  if (
+    details.code !== "interaction_unaddressable" ||
+    details.reason !== "missing_addressee"
+  ) return;
+  await logActivity(input.db, {
+    companyId: input.companyId,
+    actorType: "system",
+    actorId: "native-status-committer",
+    runId: input.runId,
+    action: "issue.thread_interaction_create_refused",
+    entityType: "issue",
+    entityId: input.issueId,
+    issueId: input.issueId,
+    details,
+  });
+}
+
 export async function commitNativeStatusDecision(input: {
   db: Db;
   companyId: string;
@@ -1845,20 +1873,31 @@ export async function commitNativeStatusDecision(input: {
         effect,
       ]),
     );
-    for (const effect of input.decision.effects) {
-      materialized.push(
-        await materializeDecisionEffect({
-          tx: tx as unknown as Db,
-          companyId: input.companyId,
-          issue,
-          runId: input.runId,
-          decisionId: decisionRow.id,
-          effect,
-          failpoint: input.failpoint,
-          preMaterializedEffects,
-          terminalRunsToEmit,
-        }),
-      );
+    try {
+      for (const effect of input.decision.effects) {
+        materialized.push(
+          await materializeDecisionEffect({
+            tx: tx as unknown as Db,
+            companyId: input.companyId,
+            issue,
+            runId: input.runId,
+            decisionId: decisionRow.id,
+            effect,
+            failpoint: input.failpoint,
+            preMaterializedEffects,
+            terminalRunsToEmit,
+          }),
+        );
+      }
+    } catch (error) {
+      await recordUnaddressableInteractionRefusal({
+        db: input.db,
+        companyId: input.companyId,
+        issueId: input.issueId,
+        runId: input.runId,
+        error,
+      });
+      throw error;
     }
 
     let updated: typeof issues.$inferSelect;

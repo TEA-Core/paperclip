@@ -525,7 +525,7 @@ describe("P6-19 native interaction bridge", () => {
     const seedAuditRun = async (input: {
       label: string;
       requests: Record<string, unknown>[];
-        interactions: Array<
+      interactions: Array<
         Omit<
           typeof issueThreadInteractions.$inferInsert,
           "companyId" | "issueId"
@@ -657,7 +657,12 @@ describe("P6-19 native interaction bridge", () => {
       const requests = label === "duplicate"
         ? [duplicateRequest]
         : label === "stale" ? [staleRequest] : [duplicateRequest, staleRequest];
-      const interactions: Array<typeof issueThreadInteractions.$inferInsert> = [];
+      const interactions: Array<
+        Omit<
+          typeof issueThreadInteractions.$inferInsert,
+          "companyId" | "issueId"
+        >
+      > = [];
       if (label !== "stale") {
         interactions.push(
           {
