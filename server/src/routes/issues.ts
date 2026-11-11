@@ -4351,6 +4351,24 @@ function logIssueListRequest(input: {
   });
 }
 
+const STRICT_ISO_TIMESTAMP_RE =
+  /^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,3})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/;
+
+function parseStrictIsoTimestampMs(value: unknown): number | null {
+  if (typeof value !== "string" || !STRICT_ISO_TIMESTAMP_RE.test(value))
+    return null;
+  // Date.parse otherwise normalizes nonexistent dates such as February 30.
+  const day = value.slice(0, 10);
+  const calendar = new Date(`${day}T00:00:00.000Z`);
+  if (
+    !Number.isFinite(calendar.getTime()) ||
+    calendar.toISOString().slice(0, 10) !== day
+  )
+    return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 export function issueRoutes(
   db: Db,
   storage: StorageService,
@@ -11018,6 +11036,47 @@ export function issueRoutes(
     });
   });
 
+  const ISSUE_LIST_QUERY_PARAMETERS = new Set([
+    "attention",
+    "status",
+    "assigneeAgentId",
+    "participantAgentId",
+    "pendingReviewParticipantAgentId",
+    "assigneeUserId",
+    "touchedByUserId",
+    "inboxArchivedByUserId",
+    "unreadForUserId",
+    "projectId",
+    "workspaceId",
+    "executionWorkspaceId",
+    "parentId",
+    "parentIssueId",
+    "descendantOf",
+    "createdFromIssueId",
+    "labelId",
+    "originKind",
+    "originKindPrefix",
+    "originId",
+    "includeRoutineExecutions",
+    "excludeRoutineExecutions",
+    "includePluginOperations",
+    "includeBlockedBy",
+    "includeBlockedInboxAttention",
+    "includeLiveDescendantSummary",
+    "includeHidden",
+    "hasPlanDocument",
+    "q",
+    "limit",
+    "offset",
+    "sortField",
+    "sortDir",
+    "afterId",
+    "updatedSince",
+    "view",
+    "completedAfter",
+    "completedBefore",
+  ]);
+
   router.get("/companies/:companyId/issues", async (req, res) => {
     const startedAt = Date.now();
     const companyId = req.params.companyId as string;
@@ -11025,6 +11084,16 @@ export function issueRoutes(
     if (isTaskBridgeKeyActor(req)) {
       res.status(403).json({
         error: "Task bridge keys cannot use company-wide issue list APIs",
+      });
+      return;
+    }
+    const unknownQueryParameter = Object.keys(req.query).find(
+      (key) => !ISSUE_LIST_QUERY_PARAMETERS.has(key),
+    );
+    if (unknownQueryParameter !== undefined) {
+      res.status(400).json({
+        error: `unknown query parameter '${unknownQueryParameter}'`,
+        supportedQueryParameters: [...ISSUE_LIST_QUERY_PARAMETERS].sort(),
       });
       return;
     }
@@ -11081,6 +11150,16 @@ export function issueRoutes(
     const assigneeAgentFilterRaw = req.query.assigneeAgentId;
     let assigneeAgentId: string | null | undefined;
     const rawUpdatedSince = req.query.updatedSince as string | undefined;
+    const rawCompletedAfter = req.query.completedAfter as string | undefined;
+    const rawCompletedBefore = req.query.completedBefore as string | undefined;
+    const completedAfterMs =
+      rawCompletedAfter !== undefined
+        ? parseStrictIsoTimestampMs(rawCompletedAfter)
+        : null;
+    const completedBeforeMs =
+      rawCompletedBefore !== undefined
+        ? parseStrictIsoTimestampMs(rawCompletedBefore)
+        : null;
 
     if (
       assigneeUserFilterRaw === "me" &&
@@ -11152,10 +11231,12 @@ export function issueRoutes(
       sortField !== undefined &&
       sortField !== "created" &&
       sortField !== "updated" &&
-      sortField !== "id"
+      sortField !== "id" &&
+      sortField !== "completed"
     ) {
       res.status(400).json({
-        error: "sortField must be 'created', 'updated' or 'id' when provided",
+        error:
+          "sortField must be 'created', 'updated', 'id' or 'completed' when provided",
       });
       return;
     }
@@ -11246,6 +11327,46 @@ export function issueRoutes(
       });
       return;
     }
+    if (
+      rawCompletedAfter !== undefined &&
+      completedAfterMs === null
+    ) {
+      res.status(400).json({
+        error: "completedAfter must be a valid ISO 8601 timestamp when provided",
+      });
+      return;
+    }
+    if (
+      rawCompletedBefore !== undefined &&
+      completedBeforeMs === null
+    ) {
+      res.status(400).json({
+        error:
+          "completedBefore must be a valid ISO 8601 timestamp when provided",
+      });
+      return;
+    }
+    if (
+      completedAfterMs !== null &&
+      completedBeforeMs !== null &&
+      completedAfterMs > completedBeforeMs
+    ) {
+      res.status(400).json({
+        error: "completedAfter must not be later than completedBefore",
+      });
+      return;
+    }
+    const completionWindowRequested =
+      rawCompletedAfter !== undefined ||
+      rawCompletedBefore !== undefined ||
+      sortField === "completed";
+    if (attention === "blocked" && completionWindowRequested) {
+      res.status(400).json({
+        error:
+          "completion window filters are not supported with attention=blocked",
+      });
+      return;
+    }
     const offset = parsedOffset ?? 0;
 
     const listFilters: IssueFilters = {
@@ -11292,12 +11413,17 @@ export function issueRoutes(
       limit,
       offset,
       sortField:
-        sortField === "created" || sortField === "updated" || sortField === "id"
+        sortField === "created" ||
+        sortField === "updated" ||
+        sortField === "id" ||
+        sortField === "completed"
           ? sortField
           : undefined,
       afterId: req.query.afterId as string | undefined,
       sortDir: sortDir === "asc" || sortDir === "desc" ? sortDir : undefined,
       updatedSince: rawUpdatedSince,
+      completedAfter: rawCompletedAfter,
+      completedBefore: rawCompletedBefore,
     };
     const requestKey = issueListRequestKey({
       req,
@@ -11386,6 +11512,25 @@ export function issueRoutes(
         };
       },
     });
+
+    // Completion-window queries are census reads: the service includes
+    // plugin-operation rows without requiring unrelated filters. Every other
+    // read (including the blocked-inbox attention view) keeps the default
+    // plugin-operation drop — disclose it so a consumer counting rows knows
+    // the page is not a census.
+    const pluginOperationsExplicitlyIncluded = Boolean(
+      listFilters.includePluginOperations ||
+        listFilters.originKind ||
+        listFilters.originKindPrefix ||
+        listFilters.originId ||
+        listFilters.projectId,
+    );
+    if (
+      !pluginOperationsExplicitlyIncluded &&
+      (attention === "blocked" || !completionWindowRequested)
+    ) {
+      res.setHeader("X-Paperclip-Plugin-Operations-Excluded", "true");
+    }
 
     res.setHeader("X-Paperclip-Request-Cache", coordinated.cacheStatus);
     if (!coordinated.response) {

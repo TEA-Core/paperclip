@@ -17,6 +17,7 @@ import {
   isNull,
   like,
   lt,
+  lte,
   ne,
   notExists,
   notInArray,
@@ -1915,11 +1916,19 @@ export interface IssueFilters {
   q?: string;
   limit?: number;
   offset?: number;
-  sortField?: "created" | "updated" | "id";
+  sortField?: "created" | "updated" | "id" | "completed";
   afterId?: string;
   sortDir?: "asc" | "desc";
   /** ISO 8601 timestamp — only return issues with updatedAt strictly after this value. */
   updatedSince?: string;
+  /**
+   * ISO 8601 timestamps — inclusive completion window on issues.completedAt.
+   * A completion window (either bound, or sortField=completed) is a census
+   * query: it includes plugin-operation and routine-execution rows without
+   * requiring unrelated filters, unlike ordinary list reads.
+   */
+  completedAfter?: string;
+  completedBefore?: string;
 }
 
 type IssueRow = typeof issues.$inferSelect;
@@ -3558,6 +3567,14 @@ function shouldIncludePluginOperationIssues(filters: IssueFilters | undefined) {
   );
 }
 
+function isCompletionWindowQuery(filters: IssueFilters | undefined) {
+  return Boolean(
+    filters?.completedAfter ||
+      filters?.completedBefore ||
+      filters?.sortField === "completed",
+  );
+}
+
 export function deriveIssueUserContext(
   issue: IssueUserContextInput,
   userId: string,
@@ -3680,6 +3697,14 @@ function issueListOrderBy(
   },
 ) {
   if (sortField === "id") return [sortDir === "desc" ? desc(issues.id) : asc(issues.id)];
+  if (sortField === "completed") {
+    const completedOrder =
+      sortDir === "asc"
+        ? sql`${issues.completedAt} asc nulls last`
+        : sql`${issues.completedAt} desc nulls last`;
+    const idOrder = sortDir === "asc" ? asc(issues.id) : desc(issues.id);
+    return hasSearch ? [asc(searchOrder), completedOrder, idOrder] : [completedOrder, idOrder];
+  }
   if (sortField === "created") {
     const createdOrder = sortDir === "asc" ? asc(issues.createdAt) : desc(issues.createdAt);
     const idOrder = sortDir === "asc" ? asc(issues.id) : desc(issues.id);
@@ -8740,7 +8765,10 @@ export function issueService(db: Db) {
           hasPlanDocumentCondition(companyId, filters.hasPlanDocument),
         );
       }
-      if (!shouldIncludePluginOperationIssues(filters)) {
+      if (
+        !shouldIncludePluginOperationIssues(filters) &&
+        !isCompletionWindowQuery(filters)
+      ) {
         conditions.push(nonPluginOperationIssueCondition());
       }
       if (filters?.labelId) {
@@ -8765,6 +8793,20 @@ export function issueService(db: Db) {
         const since = new Date(filters.updatedSince);
         if (Number.isFinite(since.getTime())) {
           conditions.push(gt(issues.updatedAt, since));
+        }
+      }
+      if (filters?.completedAfter || filters?.completedBefore) {
+        if (filters?.completedAfter) {
+          const completedAfter = new Date(filters.completedAfter);
+          if (Number.isFinite(completedAfter.getTime())) {
+            conditions.push(gte(issues.completedAt, completedAfter));
+          }
+        }
+        if (filters?.completedBefore) {
+          const completedBefore = new Date(filters.completedBefore);
+          if (Number.isFinite(completedBefore.getTime())) {
+            conditions.push(lte(issues.completedAt, completedBefore));
+          }
         }
       }
       if (
