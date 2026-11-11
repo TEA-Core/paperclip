@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -31,6 +32,8 @@ import {
   WORKSPACE_READINESS_USER_EMAIL_HEADER,
   WORKSPACE_READINESS_USER_ID_HEADER,
 } from "../auth/workspace-login-handoff.js";
+import { resolvePaperclipInstanceId } from "../home-paths.js";
+import { serverSchemaHead, writeVerifiedInitialization } from "./helpers/worktree-initialization.js";
 
 const tempDirs: string[] = [];
 
@@ -45,12 +48,24 @@ function createMarkerDir(files: Record<string, string> = {}) {
   return { dir, configPath };
 }
 
+/**
+ * A complete v2 seed manifest. Readiness accepts `verified` only with this
+ * completion evidence, for the `minimal` and the `full` seed mode alike.
+ */
 function verifiedManifest(overrides: Record<string, unknown> = {}) {
   return JSON.stringify({
     version: 2,
-    state: "verified",
-    phase: "complete",
+    source: { instanceId: "source", configPath: "/source/config.json" },
+    snapshotAt: "2026-08-18T00:00:00.000Z",
     seedMode: "minimal",
+    migrationRevision: "0001",
+    targetInstanceId: "target",
+    phase: "complete",
+    state: "verified",
+    attemptId: "attempt",
+    startedAt: "2026-08-18T00:00:00.000Z",
+    finishedAt: "2026-08-18T00:01:00.000Z",
+    diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-08-18T00:01:00.000Z" }],
     ...overrides,
   });
 }
@@ -155,6 +170,46 @@ describe("resolveWorkspaceReadiness", () => {
     });
   });
 
+  it("reports a complete full-mode clone as ready alongside minimal", async () => {
+    const { configPath } = createMarkerDir({ "seed-manifest.json": verifiedManifest({ seedMode: "full" }) });
+    const readiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(configPath) });
+    expect(readiness).toMatchObject({ state: "ready", seedState: "verified", seedMode: "full", failurePhase: null });
+  });
+
+  it("fails a v2 verified manifest that lacks completion evidence instead of reporting ready", async () => {
+    const complete = JSON.parse(verifiedManifest()) as Record<string, unknown>;
+    const { snapshotAt: _snapshotAt, ...withoutSnapshot } = complete;
+    const incompleteManifests = [
+      // The bare shape readiness used to accept.
+      JSON.stringify({ version: 2, state: "verified", phase: "complete", seedMode: "minimal" }),
+      JSON.stringify({ ...withoutSnapshot, seedMode: "full" }),
+      verifiedManifest({ diagnostics: [{ phase: "complete", status: "started", at: "2026-08-18T00:01:00.000Z" }] }),
+    ];
+    for (const contents of incompleteManifests) {
+      const { configPath } = createMarkerDir({ "seed-manifest.json": contents });
+      const readiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(configPath) });
+      expect(readiness).toMatchObject({
+        state: "failed",
+        seedState: "failed",
+        failurePhase: "seed_manifest_incomplete",
+      });
+    }
+  });
+
+  it("refuses a manifest behind a linked .paperclip directory", async () => {
+    // Another instance's state directory holds a complete manifest; a worktree
+    // whose `.paperclip` links to it must not borrow it as readiness evidence.
+    const other = createMarkerDir({ "seed-manifest.json": verifiedManifest() });
+    const worktree = mkdtempSync(path.join(os.tmpdir(), "paperclip-workspace-readiness-linked-"));
+    tempDirs.push(worktree);
+    symlinkSync(other.dir, path.join(worktree, ".paperclip"));
+    const readiness = await resolveWorkspaceReadiness({
+      db: readyDb(),
+      env: readyGuestEnv(path.join(worktree, ".paperclip", "config.json")),
+    });
+    expect(readiness).toMatchObject({ state: "failed", seedState: "failed", failurePhase: "seed_manifest_unreadable" });
+  });
+
   it("does not claim the handoff is ready without a signing key", async () => {
     const { configPath } = createMarkerDir({ "seed-manifest.json": verifiedManifest() });
     const readiness = await resolveWorkspaceReadiness({
@@ -218,6 +273,72 @@ describe("resolveWorkspaceReadiness", () => {
       env: readyGuestEnv(configPath),
     });
     expect(readiness).toMatchObject({ state: "failed", failurePhase: "seed_manifest_unreadable" });
+  });
+
+  it("never reports a legacy-unsafe minimal-no-secrets clone as verified", async () => {
+    const { configPath } = createMarkerDir({
+      "seed-manifest.json": verifiedManifest({ seedMode: "minimal-no-secrets" }),
+    });
+    const readiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(configPath) });
+    expect(readiness).toMatchObject({
+      state: "failed",
+      seedState: "failed",
+      failurePhase: "seed_manifest_legacy_unsafe",
+    });
+  });
+
+  it("refuses an initialization manifest this probe cannot confirm", async () => {
+    const { configPath } = createMarkerDir({
+      "seed-manifest.json": JSON.stringify({ version: 3, kind: "worktree-initialization", state: "verified" }),
+    });
+    const readiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(configPath) });
+    expect(readiness).toMatchObject({ state: "failed", failurePhase: "seed_manifest_unsupported" });
+  });
+
+  it("reports a verified fresh initialization as a non-ready fresh preview, never ready or degraded", async () => {
+    const revision = serverSchemaHead();
+    const { dir, configPath } = createMarkerDir();
+    writeVerifiedInitialization(dir, { targetInstanceId: resolvePaperclipInstanceId(), revision });
+    const readiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(configPath) });
+    expect(readiness).toMatchObject({
+      state: "failed",
+      seedState: "failed",
+      seedPhase: "complete",
+      failurePhase: "seed_manifest_fresh_preview",
+    });
+
+    // A fresh manifest for another instance is refused, not a preview.
+    const other = createMarkerDir();
+    writeVerifiedInitialization(other.dir, { targetInstanceId: "wt-other-instance", revision });
+    const refused = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(other.configPath) });
+    expect(refused).toMatchObject({ state: "failed", failurePhase: "seed_manifest_unsupported" });
+  });
+
+  it("refuses a forged fresh initialization manifest instead of reporting a fresh preview", async () => {
+    const { dir, configPath } = createMarkerDir();
+    writeVerifiedInitialization(dir, { targetInstanceId: resolvePaperclipInstanceId(), revision: serverSchemaHead(), forge: true });
+    const readiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(configPath) });
+    expect(readiness).toMatchObject({ state: "failed", failurePhase: "seed_manifest_unsupported" });
+  });
+
+  it("fails fast on a non-object, FIFO or directory manifest without throwing", async () => {
+    for (const contents of ["null", "[]"]) {
+      const { configPath } = createMarkerDir({ "seed-manifest.json": contents });
+      const readiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(configPath) });
+      expect(readiness).toMatchObject({ state: "failed", failurePhase: "seed_manifest_unreadable" });
+    }
+
+    const fifo = createMarkerDir();
+    expect(spawnSync("mkfifo", [path.join(fifo.dir, "seed-manifest.json")]).status).toBe(0);
+    const started = performance.now();
+    const fifoReadiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(fifo.configPath) });
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(fifoReadiness).toMatchObject({ state: "failed", failurePhase: "seed_manifest_unreadable" });
+
+    const directory = createMarkerDir();
+    mkdirSync(path.join(directory.dir, "seed-manifest.json"));
+    const directoryReadiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(directory.configPath) });
+    expect(directoryReadiness).toMatchObject({ state: "failed", failurePhase: "seed_manifest_unreadable" });
   });
 
   it("reports an interrupted seed as provisioning", async () => {

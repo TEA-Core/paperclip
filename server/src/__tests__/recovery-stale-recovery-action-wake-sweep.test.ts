@@ -113,6 +113,7 @@ describeEmbeddedPostgres("reconcileStaleRecoveryActionWakes", () => {
     runId: string;
     issueId: string;
     status: string;
+    startedAt?: Date;
   }) {
     await db.insert(heartbeatRuns).values({
       id: input.runId,
@@ -120,7 +121,7 @@ describeEmbeddedPostgres("reconcileStaleRecoveryActionWakes", () => {
       agentId: input.agentId,
       invocationSource: "manual",
       status: input.status,
-      startedAt: new Date("2026-05-13T18:00:00.000Z"),
+      startedAt: input.startedAt ?? new Date("2026-05-13T18:00:00.000Z"),
       contextSnapshot: { issueId: input.issueId },
     });
   }
@@ -135,6 +136,10 @@ describeEmbeddedPostgres("reconcileStaleRecoveryActionWakes", () => {
     lastAttemptAt: Date;
     status: "active" | "escalated" | "resolved" | "cancelled";
     wakePolicy: Record<string, unknown> | null;
+    kind?: string;
+    ownerType?: "agent" | "board";
+    previousOwnerAgentId?: string | null;
+    updatedAt?: Date;
   }) {
     const [row] = await db
       .insert(issueRecoveryActions)
@@ -143,12 +148,12 @@ describeEmbeddedPostgres("reconcileStaleRecoveryActionWakes", () => {
         companyId: input.companyId,
         sourceIssueId: input.sourceIssueId,
         recoveryIssueId: null,
-        kind: "stranded_assigned_issue",
+        kind: input.kind ?? "stranded_assigned_issue",
         status: input.status,
-        ownerType: "agent",
+        ownerType: input.ownerType ?? "agent",
         ownerAgentId: input.ownerAgentId,
         ownerUserId: null,
-        previousOwnerAgentId: null,
+        previousOwnerAgentId: input.previousOwnerAgentId ?? null,
         returnOwnerAgentId: null,
         cause: input.cause,
         fingerprint: `fingerprint:${input.sourceIssueId}`,
@@ -164,7 +169,7 @@ describeEmbeddedPostgres("reconcileStaleRecoveryActionWakes", () => {
         resolutionNote: null,
         resolvedAt: null,
         createdAt: new Date(),
-        updatedAt: new Date(),
+        updatedAt: input.updatedAt ?? new Date(),
       })
       .returning();
     return row;
@@ -617,5 +622,271 @@ describeEmbeddedPostgres("reconcileStaleRecoveryActionWakes", () => {
     } finally {
       updateSpy.mockRestore();
     }
+  });
+
+  // -- SUP-24251 (redo of SUP-22273): live-owner hold --
+
+  const SWEEP_INTERVAL_MS = 5 * 60_000;
+
+  function minutesBefore(base: Date, minutes: number): Date {
+    return new Date(base.getTime() - minutes * 60_000);
+  }
+
+  function minutesAgo(minutes: number): Date {
+    return minutesBefore(new Date(), minutes);
+  }
+
+  async function readAction(actionId: string) {
+    const [row] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    return row!;
+  }
+
+  async function exhaustionComments(issueId: string) {
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    return comments.filter((c) => (c.body ?? "").includes("exhausted its attempt ceiling"));
+  }
+
+  async function sweepOnce() {
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const result = await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
+    return { result, enqueueWakeup };
+  }
+
+  // Seeds the SUP-21709 shape: an active execution_review_participant_recovery
+  // action owned by the recovery agent for the review participant, one attempt
+  // in, with the owner's only run placed relative to the first sweep.
+  async function seedReviewParticipantRecoveryAction(input: { ownerRunMinutesBeforeStart: number }) {
+    const start = minutesAgo(4 * 60);
+    vi.setSystemTime(start);
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany({ status: "in_review" });
+    const action = await insertRecoveryAction({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: managerId,
+      previousOwnerAgentId: coderId,
+      cause: "execution_review_participant_recovery",
+      attemptCount: 1,
+      maxAttempts: null,
+      lastAttemptAt: minutesBefore(start, 30),
+      status: "active",
+      wakePolicy: { type: "wake_owner" },
+    });
+    await seedHeartbeatRun({
+      companyId,
+      agentId: managerId,
+      runId: randomUUID(),
+      issueId: sourceIssueId,
+      status: "succeeded",
+      startedAt: minutesBefore(start, input.ownerRunMinutesBeforeStart),
+    });
+    return { start, sourceIssueId, actionId: action.id };
+  }
+
+  async function sweepSixTimes(input: { actionId: string; start: Date }) {
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const attemptCounts: number[] = [];
+    const statuses: string[] = [];
+    for (let sweep = 0; sweep < 6; sweep += 1) {
+      // 31 minutes apart: past the longest backoff a below-ceiling row reaches
+      // (4 x 5 min), so only the live-owner hold can stop a re-fire.
+      vi.setSystemTime(new Date(input.start.getTime() + sweep * 31 * 60_000));
+      await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: SWEEP_INTERVAL_MS });
+      const row = await readAction(input.actionId);
+      attemptCounts.push(row.attemptCount);
+      statuses.push(row.status);
+    }
+    return { attemptCounts, statuses, enqueueWakeup };
+  }
+
+  it("SUP-24251 T2: six sweeps neither burn attempts nor escalate while the action owner ran after lastAttemptAt", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const { start, sourceIssueId, actionId } = await seedReviewParticipantRecoveryAction({
+        ownerRunMinutesBeforeStart: 5,
+      });
+
+      const { attemptCounts, statuses, enqueueWakeup } = await sweepSixTimes({ actionId, start });
+
+      expect(attemptCounts).toEqual([1, 1, 1, 1, 1, 1]);
+      expect(statuses).toEqual(["active", "active", "active", "active", "active", "active"]);
+      expect((await readAction(actionId)).outcome).toBeNull();
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+      expect(await exhaustionComments(sourceIssueId)).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("SUP-24251: six sweeps still burn attempts and escalate when the owner has not run since lastAttemptAt", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      // The owner ran inside the live window, but before the last wake.
+      const { start, sourceIssueId, actionId } = await seedReviewParticipantRecoveryAction({
+        ownerRunMinutesBeforeStart: 45,
+      });
+
+      const { attemptCounts, statuses } = await sweepSixTimes({ actionId, start });
+
+      expect(attemptCounts).toEqual([2, 3, 4, 5, 5, 5]);
+      expect(statuses).toEqual(["active", "active", "active", "active", "escalated", "escalated"]);
+      expect((await readAction(actionId)).outcome).toBe("exhausted");
+      expect(await exhaustionComments(sourceIssueId)).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("SUP-24251: holds an at-ceiling action instead of escalating while its owner ran after lastAttemptAt", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const action = await insertRecoveryAction({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      attemptCount: 5,
+      maxAttempts: null,
+      lastAttemptAt: minutesAgo(10),
+      status: "active",
+      wakePolicy: { type: "wake_owner" },
+    });
+    await seedHeartbeatRun({
+      companyId,
+      agentId: managerId,
+      runId: randomUUID(),
+      issueId: sourceIssueId,
+      status: "succeeded",
+      startedAt: minutesAgo(5),
+    });
+
+    const { result, enqueueWakeup } = await sweepOnce();
+
+    expect(result).toMatchObject({ checked: 1, skippedOwnerLive: 1, maxAttemptsReached: 0, reFired: 0 });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(await readAction(action.id)).toMatchObject({
+      status: "active",
+      outcome: null,
+      attemptCount: 5,
+      maxAttempts: null,
+    });
+    expect(await exhaustionComments(sourceIssueId)).toHaveLength(0);
+  });
+
+  it("SUP-24251: holds a board-owned review_stage_unarmed action while its pending participant ran after lastAttemptAt", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const action = await insertRecoveryAction({
+      companyId,
+      sourceIssueId,
+      kind: "review_stage_unarmed",
+      ownerType: "board",
+      ownerAgentId: null,
+      previousOwnerAgentId: coderId,
+      cause: "review_stage_unarmed",
+      attemptCount: 5,
+      maxAttempts: null,
+      lastAttemptAt: minutesAgo(10),
+      status: "active",
+      wakePolicy: null,
+    });
+    await seedHeartbeatRun({
+      companyId,
+      agentId: coderId,
+      runId: randomUUID(),
+      issueId: sourceIssueId,
+      status: "succeeded",
+      startedAt: minutesAgo(5),
+    });
+
+    const { result } = await sweepOnce();
+
+    expect(result).toMatchObject({ skippedOwnerLive: 1, maxAttemptsReached: 0 });
+    expect(await readAction(action.id)).toMatchObject({ status: "active", outcome: null, attemptCount: 5 });
+  });
+
+  it("SUP-24251: a terminal source still escalates at the ceiling even while its owner is live", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany({ status: "done" });
+    const action = await insertRecoveryAction({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      attemptCount: 5,
+      maxAttempts: null,
+      lastAttemptAt: minutesAgo(10),
+      status: "active",
+      wakePolicy: { type: "wake_owner" },
+    });
+    await seedHeartbeatRun({
+      companyId,
+      agentId: managerId,
+      runId: randomUUID(),
+      issueId: sourceIssueId,
+      status: "succeeded",
+      startedAt: minutesAgo(5),
+    });
+
+    const { result } = await sweepOnce();
+
+    expect(result).toMatchObject({ skippedOwnerLive: 0, maxAttemptsReached: 1 });
+    expect(await readAction(action.id)).toMatchObject({ status: "escalated", outcome: "exhausted" });
+  });
+
+  it.each([
+    {
+      label: "the hold deadline (two live windows after the last row update) has passed",
+      kind: "stranded_assigned_issue",
+      lastAttemptMinutesAgo: 13 * 60,
+      updatedMinutesAgo: 13 * 60,
+      ownerRunMinutesAgo: 5,
+    },
+    {
+      label: "the owner's run after lastAttemptAt is outside the live window",
+      kind: "stranded_assigned_issue",
+      lastAttemptMinutesAgo: 8 * 60,
+      updatedMinutesAgo: 0,
+      ownerRunMinutesAgo: 7 * 60,
+    },
+    {
+      label: "the kind is not a stranded-participant kind",
+      kind: "missing_disposition",
+      lastAttemptMinutesAgo: 10,
+      updatedMinutesAgo: 0,
+      ownerRunMinutesAgo: 5,
+    },
+  ])("SUP-24251: burns the attempt as before when $label", async (scenario) => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const action = await insertRecoveryAction({
+      companyId,
+      sourceIssueId,
+      kind: scenario.kind,
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      attemptCount: 2,
+      maxAttempts: null,
+      lastAttemptAt: minutesAgo(scenario.lastAttemptMinutesAgo),
+      updatedAt: minutesAgo(scenario.updatedMinutesAgo),
+      status: "active",
+      wakePolicy: { type: "wake_owner" },
+    });
+    await seedHeartbeatRun({
+      companyId,
+      agentId: managerId,
+      runId: randomUUID(),
+      issueId: sourceIssueId,
+      status: "succeeded",
+      startedAt: minutesAgo(scenario.ownerRunMinutesAgo),
+    });
+
+    const { result } = await sweepOnce();
+
+    expect(result).toMatchObject({ skippedOwnerLive: 0, reFired: 1 });
+    expect((await readAction(action.id)).attemptCount).toBe(3);
   });
 });

@@ -567,6 +567,8 @@ npx paperclipai agent instructions-file:put <agent-id> --path AGENTS.md --conten
 npx paperclipai agent instructions-file:delete <agent-id> --path AGENTS.md
 ```
 
+`permissions:update` requires `canCreateAgents`. `canAssignTasks` is optional. Omit it to leave the agent's `tasks:assign` grant and membership unchanged; omission is the only unconditional way to do that. When you send `canAssignTasks`, the server compares it with the value the agent will have after this update (with the new `canCreateAgents` and the current grant and membership), not with the old `access.canAssignTasks`. A different value writes or removes the grant. For example, turning `canCreateAgents` off with `canAssignTasks: true` on an agent with a suspended membership and no grant writes the grant. A `false` value also removes a stored grant on an agent that has no membership.
+
 Agent config, instructions, skills, project env, environment, secret, and workspace edits affect the next run. Active runs finish with the config they started with. When a saved session, reused workspace, or sandbox lease no longer matches the effective next-run config, Paperclip may start fresh execution and records non-sensitive freshness categories in run result JSON and workspace operation logs.
 
 `agent local-cli` is the quickest way to run local Claude/Codex manually as a Paperclip agent:
@@ -931,6 +933,12 @@ npx paperclipai auth revoke-current
 ```
 
 `--token <challenge-secret>` is still supported for compatibility, but `--token-env` avoids putting challenge secrets in shell history or process arguments.
+
+Use the challenge UUID returned by `auth challenge create` for get, approve, and
+cancel. With the required secret and approval authentication present, malformed
+IDs return HTTP 400 before database access. A status request without a secret
+returns HTTP 404. Unknown challenges or incorrect challenge secrets still return
+HTTP 404. Approval requires board authentication, checked before ID validation.
 
 ## Instance Settings Commands
 

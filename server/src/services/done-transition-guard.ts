@@ -1,6 +1,7 @@
 import path from "node:path";
-import { and, eq, inArray, isNotNull, ne } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, ne, sql } from "drizzle-orm";
 import {
+  activityLog,
   agents,
   documentRevisions,
   documents,
@@ -109,6 +110,8 @@ const ADR072_CLOSE_LADDER: {
 const TIER_2_PREFIX = "Closed at Tier 2 (live):";
 const TIER_1_PREFIX = "Closed at Tier 1 (landed, not liveness-probed):";
 const TIER_1_SUFFIX = "Liveness unverified.";
+// SUP-24299: refusal code for a Tier 2 declaration that also carries TIER_1_SUFFIX.
+export const DONE_TRANSITION_TIER_CONFLICT_CODE = "done_transition_tier_conflict";
 // Machine-checkable accepted forms, embedded verbatim in every rejection message so the
 // 422 remedy and the parser always agree on the exact literal (SUP-15787).
 // SUP-21902: the Tier 2 form is self-verifying — the evidence must name the probe
@@ -124,7 +127,8 @@ export const TIER2_FORM =
 // message (SUP-15787 invariant). Accepted ONLY on record_only cards; a
 // repository_delivery card keeps the merge-head form above unchanged.
 export const TIER2_RECORD_ONLY_FORM =
-  '"Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>"';
+  '"Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>"' +
+  ' or, for a single instant, "Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>"';
 export const TIER1_FORM =
   '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."' +
   ' or "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
@@ -151,9 +155,13 @@ export const DONE_TIER_STRUCTURED_FORMS =
 // set by noRepositoryStructuredFormSuffix, never listed in it, so a
 // repository_delivery remedy stays byte-identical.
 export const DONE_TIER_TIER2_RECORD_ONLY_JSON =
-  '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>" }';
+  '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }';
+// Structured probeEvidence carries the grammar WITHOUT the Tier 2 prefix: the guard
+// composes the prefix itself (SUP-24079).
+export const DONE_TIER_RECORD_ONLY_PROBE_EVIDENCE_NOTE =
+  'probeEvidence excludes the "Closed at Tier 2 (live): " prefix because the guard composes that prefix; for a single instant, write "observed <UTC ISO-8601 timestamp>" in place of the range';
 export const DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS =
-  `${DONE_TIER_TIER2_RECORD_ONLY_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
+  `${DONE_TIER_TIER2_RECORD_ONLY_JSON} (${DONE_TIER_RECORD_ONLY_PROBE_EVIDENCE_NOTE}); ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
 // SUP-22570: the record_only close form. Advertised only on record_only issues,
 // so the repository_delivery remedies stay byte-identical.
 export const TIER1_NO_REPOSITORY_FORM =
@@ -320,6 +328,10 @@ export interface DoneTierDeclarationResult {
   // A remedy specific to this refusal. A door that builds its own generic remedy
   // for a refused declaration uses this one instead when it is set.
   remedy?: string;
+  // Set when the refusal carries its own route error code. A door that maps every
+  // refused declaration to done_transition_missing_tier_declaration uses this one
+  // instead when it is set.
+  code?: typeof DONE_TRANSITION_TIER_CONFLICT_CODE;
 }
 
 function appendSkipReason(current: string | null, piece: string): string {
@@ -651,6 +663,206 @@ async function writeAuditLog(
 }
 
 /**
+ * SUP-24136: a mechanism C refusal is deterministic — the same unsatisfied
+ * stage refuses the same way until a decision lands — yet the 15 s
+ * stranded-summary sweep (execution-control-reconciliation.ts) re-evaluates
+ * the guard on every tick for a Summarizer-assigned card. SUP-24118 got 54
+ * identical rows in 13 minutes, SUP-24121 47, SUP-23420 several hundred.
+ * Bound the audit trail per (company, issue, reason): while fewer than
+ * LADDER_REFUSAL_REPEAT_LIMIT identical refusal rows exist inside the window,
+ * the refusal is recorded unchanged; the next one records a single
+ * `issue.done_transition_ladder_refusal_repeated` escalation row; further
+ * identical refusals inside the window record nothing.
+ *
+ * One clock only: the window test compares `activity_log.created_at` (stamped
+ * by the database default `now()`) with the database `now()` in the same SQL
+ * statement. The application clock is never read, so app/database skew cannot
+ * widen or shrink the window.
+ *
+ * Only the audit row is bounded. The caller computes the refusal verdict
+ * before this runs and returns it unchanged; nothing on the close path reads
+ * these rows. A failed count read records the refusal row, as before the cap.
+ * Two concurrent refusals can both read the same count, so the bound is
+ * approximate under concurrency, never below the pre-cap behaviour.
+ */
+export const LADDER_REFUSAL_REPEAT_LIMIT = 3;
+export const LADDER_REFUSAL_REPEAT_WINDOW_SECONDS = 60 * 60;
+const LADDER_REFUSED_ACTION = "issue.done_transition_ladder_refused";
+const LADDER_REFUSAL_REPEATED_ACTION = "issue.done_transition_ladder_refusal_repeated";
+
+/**
+ * SUP-24298: a done write refused with 422 `done_transition_missing_tier_declaration`
+ * leaves its own refusal-class row, countable like `LADDER_REFUSED_ACTION`. The row
+ * is written per refused write: the thread remedy comment is deduped per guard code
+ * (`postTerminalStatusRefusalComment`), so a repeated refusal posts no second
+ * comment and this row is the only per-write machine trace. Never throws, so the
+ * HTTP result of the refusal is unchanged by a failed audit write.
+ *
+ * SUP-24429: a 409 `done_transition_record_only_flip_refused` (a close request that
+ * also relabels a stored repository_delivery card record_only) writes the same
+ * refusal-class row, naming the stored and requested requirements and recording
+ * that the landing check was not skipped.
+ */
+export const DONE_TRANSITION_REFUSED_ACTION = "issue.done_transition_refused";
+
+export async function writeDoneTransitionRefusedAuditLog(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  details:
+    | {
+        code: "done_transition_missing_tier_declaration";
+        httpStatus: 422;
+        reason: string;
+        decisionCarried: boolean;
+        runId: string | null;
+        stage?: string;
+      }
+    | {
+        code: "done_transition_record_only_flip_refused";
+        httpStatus: 409;
+        reason: string;
+        decisionCarried: boolean;
+        runId: string | null;
+        storedDeliveryRequirement: IssueDeliveryRequirement;
+        requestedDeliveryRequirement: "record_only";
+        landingCheckSkipped: false;
+        // `request`: refused against the unlocked read; `locked_recheck`:
+        // refused under the issue row lock in the write transaction.
+        stage: "request" | "locked_recheck";
+      },
+): Promise<void> {
+  await writeAuditLog(db, issue, DONE_TRANSITION_REFUSED_ACTION, {
+    ...details,
+    source: "done_transition_guard",
+  });
+}
+
+/**
+ * The shared repeat cap behind `writeLadderRefusalAuditLog` and
+ * `writeGuardSkippedAuditLog`. `signatureKey` names the `activity_log.details`
+ * field whose value identifies a repeat; the cap counts `action` rows and
+ * `repeatedAction` escalation rows with that signature inside the window.
+ */
+async function writeRepeatCappedAuditLog(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  cap: {
+    action: string;
+    repeatedAction: string;
+    signatureKey: string;
+    signature: string;
+    details: Record<string, unknown>;
+  },
+): Promise<void> {
+  const { action, repeatedAction, signatureKey, signature, details } = cap;
+  let priorRefusals = 0;
+  let priorEscalations = 0;
+  try {
+    const [counts] = await db
+      .select({
+        refused: sql<number>`count(*) filter (where ${activityLog.action} = ${action})`,
+        escalated: sql<number>`count(*) filter (where ${activityLog.action} = ${repeatedAction})`,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, issue.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issue.id),
+          inArray(activityLog.action, [action, repeatedAction]),
+          sql`${activityLog.details} ->> ${signatureKey}::text = ${signature}`,
+          sql`${activityLog.createdAt} > now() - make_interval(secs => ${LADDER_REFUSAL_REPEAT_WINDOW_SECONDS})`,
+        ),
+      );
+    const refused = Number(counts?.refused);
+    const escalated = Number(counts?.escalated);
+    if (Number.isFinite(refused)) priorRefusals = refused;
+    if (Number.isFinite(escalated)) priorEscalations = escalated;
+  } catch (err) {
+    logger.warn({ err, issueId: issue.id, action }, "failed to count prior repeats; recording the row");
+  }
+  if (priorRefusals < LADDER_REFUSAL_REPEAT_LIMIT) {
+    await writeAuditLog(db, issue, action, details);
+    return;
+  }
+  if (priorEscalations === 0) {
+    await writeAuditLog(db, issue, repeatedAction, {
+      ...details,
+      refusalCount: priorRefusals + 1,
+      repeatLimit: LADDER_REFUSAL_REPEAT_LIMIT,
+      windowSeconds: LADDER_REFUSAL_REPEAT_WINDOW_SECONDS,
+    });
+  }
+}
+
+async function writeLadderRefusalAuditLog(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  details: Record<string, unknown> & { reason: string },
+): Promise<void> {
+  await writeRepeatCappedAuditLog(db, issue, {
+    action: LADDER_REFUSED_ACTION,
+    repeatedAction: LADDER_REFUSAL_REPEATED_ACTION,
+    signatureKey: "reason",
+    signature: details.reason,
+    details,
+  });
+}
+
+/**
+ * SUP-24557 (SUP-24216): the same cap for `issue.done_transition_guard_skipped`
+ * rows whose class is `branch_absent_on_remote`. The sweeps that re-run the
+ * guard every tick (stranded-summary reaper, merged-operator-merge-cards) wrote
+ * one such row per tick for a card whose branch stays absent from the remote.
+ * The signature is (issue, skip action, class, BRANCH): the branch is parsed
+ * out of the skipReason (`branch_absent_on_remote:<branch>[; <pr skip reason>]`,
+ * where the optional `; ` tail varies per tick and is excluded) or taken from
+ * the refusal row's `branch`, and is stored in `details.repeatSignature`. A
+ * second absent branch is its own signature and starts its own count. The
+ * refusal row (`reason: branch_absent_on_remote`, `allowed: false`) and the
+ * fail-open row (`skipReason: branch_absent_on_remote:<branch>`) keep separate
+ * signatures. The escalation row needs its own action name because
+ * `issue.done_transition_ladder_refusal_repeated` is ladder-specific.
+ *
+ * Every other skip row is written unchanged, in the same synchronous step.
+ */
+export const GUARD_SKIP_REPEATED_ACTION = "issue.done_transition_guard_skip_repeated";
+const GUARD_SKIPPED_ACTION = "issue.done_transition_guard_skipped";
+const BRANCH_ABSENT_SKIP_CLASS = "branch_absent_on_remote";
+
+function branchAbsentSkipSignature(details: Record<string, unknown>): string | null {
+  const skipReason = details.skipReason;
+  const prefix = `${BRANCH_ABSENT_SKIP_CLASS}:`;
+  if (typeof skipReason === "string" && skipReason.startsWith(prefix)) {
+    const branch = skipReason.slice(prefix.length).split("; ")[0];
+    return branch ? `${prefix}${branch}` : null;
+  }
+  if (details.reason === BRANCH_ABSENT_SKIP_CLASS && typeof details.branch === "string" && details.branch) {
+    return `refused:${prefix}${details.branch}`;
+  }
+  return null;
+}
+
+export async function writeGuardSkippedAuditLog(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  details: Record<string, unknown>,
+): Promise<void> {
+  const signature = branchAbsentSkipSignature(details);
+  if (signature === null) {
+    await writeAuditLog(db, issue, GUARD_SKIPPED_ACTION, details);
+    return;
+  }
+  await writeRepeatCappedAuditLog(db, issue, {
+    action: GUARD_SKIPPED_ACTION,
+    repeatedAction: GUARD_SKIP_REPEATED_ACTION,
+    signatureKey: "repeatSignature",
+    signature,
+    details: { ...details, repeatSignature: signature },
+  });
+}
+
+/**
  * SUP-14429 (mechanism B): resolve the live GraphQL `reviewDecision` of an open
  * linked PR. This is the only signal that an external reviewer is currently
  * holding the PR open — an undismissed CHANGES_REQUESTED is a pre-existing,
@@ -696,6 +908,156 @@ async function fetchPullRequestReviewDecision(
   } catch {
     return null;
   }
+}
+
+/**
+ * SUP-24135: live landability of a `landing-delegated` carrier PR, read once at
+ * close time. A declaration names the carrier; this is the only read of the
+ * carrier itself before the obligation transfers to the backstop.
+ */
+interface LandingCarrierHealth {
+  headSha: string | null;
+  mergeStateStatus: string | null;
+  /**
+   * Required checks whose every same-type, same-name context on the head is
+   * terminal-failed. Empty when the context list was cut at a page boundary:
+   * a rerun on a later page could still pass, so a partial read never refuses.
+   */
+  failedRequired: Array<{ name: string; conclusion: string }>;
+}
+
+// Terminal check-run conclusions and commit-status states that cannot satisfy a
+// required check. NEUTRAL/SKIPPED/SUCCESS satisfy it; STALE is not terminal-failed.
+// ACTION_REQUIRED awaits manual approval and is not terminal-failed.
+const FAILED_CHECK_RUN_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE"]);
+const FAILED_STATUS_STATES = new Set(["FAILURE", "ERROR"]);
+// A hung carrier read must not hold the close; an aborted read fails open.
+const LANDING_CARRIER_PROBE_TIMEOUT_MS = 10_000;
+// The refusal names at most this many failed checks, each cut to a bounded length.
+const LANDING_CARRIER_REFUSAL_MAX_CHECKS = 3;
+const LANDING_CARRIER_REFUSAL_MAX_NAME_CHARS = 80;
+
+/**
+ * Read-only GraphQL probe of the carrier's head required checks and merge state.
+ * Every unresolvable outcome returns null; callers fail open, as for
+ * fetchPullRequestReviewDecision (never fail closed on a GitHub outage).
+ */
+async function fetchLandingCarrierHealth(
+  pr: LinkedPullRequest,
+  token: string,
+): Promise<LandingCarrierHealth | null> {
+  const query =
+    "query landingCarrier($owner: String!, $name: String!, $number: Int!) { " +
+    "repository(owner: $owner, name: $name) { pullRequest(number: $number) { state mergeStateStatus " +
+    "commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 100) { pageInfo { hasNextPage } nodes { __typename " +
+    "... on CheckRun { name status conclusion isRequired(pullRequestNumber: $number) } " +
+    "... on StatusContext { context state isRequired(pullRequestNumber: $number) } } } } } } } } } }";
+  try {
+    const response = await ghFetch(GITHUB_GRAPHQL_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "user-agent": "paperclip-done-transition-guard",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        query,
+        variables: { owner: pr.owner, name: pr.repo, number: pr.number },
+      }),
+      signal: AbortSignal.timeout(LANDING_CARRIER_PROBE_TIMEOUT_MS),
+    });
+    if (!response.ok) return null;
+    const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!body || (Array.isArray(body.errors) && body.errors.length > 0)) return null;
+    const repository = (body.data as Record<string, unknown> | null | undefined)?.repository as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    const pullRequest = repository?.pullRequest as Record<string, unknown> | null | undefined;
+    if (!pullRequest || pullRequest.state !== "OPEN") return null;
+    const commitNodes = (pullRequest.commits as { nodes?: unknown } | null | undefined)?.nodes;
+    const commit = Array.isArray(commitNodes)
+      ? (commitNodes[0] as { commit?: Record<string, unknown> } | undefined)?.commit
+      : undefined;
+    const rollup = commit?.statusCheckRollup as
+      | { contexts?: { nodes?: unknown; pageInfo?: { hasNextPage?: unknown } | null } }
+      | null
+      | undefined;
+    const contexts = Array.isArray(rollup?.contexts?.nodes) ? rollup.contexts.nodes : [];
+    // A re-run leaves the failed run beside a newer one with the same name, so a
+    // required check counts as failed only when none of its contexts can still pass.
+    // Check runs and commit statuses are separate requirements on GitHub, so one
+    // type never satisfies (or hides) the other: group by type plus name.
+    const byCheck = new Map<string, { name: string; failed: string | null; open: boolean }>();
+    for (const node of contexts) {
+      const ctx = node as Record<string, unknown> | null;
+      if (!ctx || ctx.isRequired !== true) continue;
+      let name: string | null = null;
+      let failed: string | null = null;
+      if (ctx.__typename === "CheckRun" && typeof ctx.name === "string") {
+        name = ctx.name;
+        const conclusion = typeof ctx.conclusion === "string" ? ctx.conclusion : null;
+        if (ctx.status === "COMPLETED" && conclusion && FAILED_CHECK_RUN_CONCLUSIONS.has(conclusion)) failed = conclusion;
+      } else if (ctx.__typename === "StatusContext" && typeof ctx.context === "string") {
+        name = ctx.context;
+        if (typeof ctx.state === "string" && FAILED_STATUS_STATES.has(ctx.state)) failed = ctx.state;
+      }
+      if (name === null) continue;
+      const key = `${ctx.__typename}\u0000${name}`;
+      const entry = byCheck.get(key) ?? { name, failed: null, open: false };
+      if (failed) entry.failed = failed;
+      else entry.open = true;
+      byCheck.set(key, entry);
+    }
+    const partial = rollup?.contexts?.pageInfo?.hasNextPage !== false;
+    const failedRequired = partial
+      ? []
+      : [...byCheck.values()]
+        .filter((entry) => entry.failed !== null && !entry.open)
+        .map((entry) => ({ name: entry.name, conclusion: entry.failed!.toLowerCase() }));
+    return {
+      headSha: typeof commit?.oid === "string" ? commit.oid : null,
+      mergeStateStatus: typeof pullRequest.mergeStateStatus === "string" ? pullRequest.mergeStateStatus : null,
+      failedRequired,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * SUP-24135: refuse a `landing-delegated` close whose carrier cannot land as it
+ * stands. `BLOCKED` alone is the normal delegated state (required checks still
+ * running, review pending) and `UNKNOWN` is GitHub still computing, so neither
+ * refuses; a terminal-failed required check or a merge conflict does.
+ */
+function landingCarrierRefusal(
+  prNumber: number,
+  health: LandingCarrierHealth | null,
+): DoneTierDeclarationResult | null {
+  if (!health) return null;
+  const head = health.headSha ? ` on head ${health.headSha.slice(0, 12)}` : "";
+  if (health.failedRequired.length > 0) {
+    const named = health.failedRequired.slice(0, LANDING_CARRIER_REFUSAL_MAX_CHECKS).map((check) => {
+      const name = check.name.length > LANDING_CARRIER_REFUSAL_MAX_NAME_CHARS
+        ? `${check.name.slice(0, LANDING_CARRIER_REFUSAL_MAX_NAME_CHARS)}…`
+        : check.name;
+      return `${name} (${check.conclusion})`;
+    });
+    const more = health.failedRequired.length - named.length;
+    const checks = more > 0 ? `${named.join(", ")} and ${more} more` : named.join(", ");
+    return refuseTier1(
+      `carrier_required_check_failed: Tier 1 declaration using "landing-delegated" names PR #${prNumber}, but its required check ${checks} is terminal-failed${head}; the carrier cannot land, so the landing obligation cannot transfer to done-close-landing-backstop.`,
+      `Fix the failing required check on PR #${prNumber} (push a fix or re-run it) and close again once it is passing or running, or keep the card open until the carrier can land.`,
+    );
+  }
+  if (health.mergeStateStatus === "DIRTY") {
+    return refuseTier1(
+      `carrier_merge_conflict: Tier 1 declaration using "landing-delegated" names PR #${prNumber}, but it has merge conflicts with its base branch${head}; the carrier cannot land, so the landing obligation cannot transfer to done-close-landing-backstop.`,
+      `Resolve the merge conflicts on PR #${prNumber} and close again, or keep the card open until the carrier can land.`,
+    );
+  }
+  return null;
 }
 
 /**
@@ -853,7 +1215,8 @@ function parseTier1Declaration(body: string): Tier1Parse {
 //    AND belongs to this issue (a linked merged PR merge commit, or this issue's recorded
 //    delivery head / work-product commit — SUP-23031; ancestry alone is not possession).
 //  - `landing-delegated`: names a linked `PR #<N>` and `done-close-landing-backstop` as the
-//    post-merge carrier (the async worker itself is unchanged here).
+//    post-merge carrier, and a live open carrier has no terminal-failed required check and
+//    no merge conflict (SUP-24135; the async worker itself is unchanged here).
 // TIER1_FORM is token-bearing so every emitted accepted form reaches the landing-token pre-check.
 // Tier 2 is a separate live-probe concern and is not checked here; see proveTier2Live.
 const LANDED_AT_TIP_TOKEN = "landed-at-tip";
@@ -1173,6 +1536,15 @@ async function proveLandingDelegated(
               `Tier 1 declaration using "landing-delegated" names PR #${number}, but repository auto-merge is disabled and no merge queue covers the PR's base branch; enable auto-merge, enable a merge queue for the base branch, or use landed-at-tip evidence. The backstop arms merges via GitHub's enablePullRequestAutoMerge, which on a repository with auto-merge disabled and no merge queue has no landing carrier.`,
             );
           }
+        }
+        // SUP-24135: the carrier itself must still be able to land. Only a live
+        // open PR is probed; any unreadable probe fails open (null).
+        if (hydration.hydrated && live.cachedState === "open") {
+          const carrierRefusal = landingCarrierRefusal(
+            number,
+            await fetchLandingCarrierHealth(pr, candidate.token),
+          );
+          if (carrierRefusal) return carrierRefusal;
         }
         break;
       }
@@ -1786,21 +2158,22 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
 // accepted as fresh proof. The guard now loads the closing run's
 // `heartbeat_runs` row and refuses an observation that predates the run's
 // start (`startedAt ?? createdAt` — both precede any probe the run itself can
-// make) or that postdates the evaluation by more than a clock-skew allowance,
-// with the reason naming the run and its start. Fail-closed: a closing run
+// make) or that postdates the evaluation (SUP-24266: no clock-skew allowance —
+// the evaluation precedes the close write that carries the declaration, so an
+// observed instant later than it is later than the close), with the reason
+// naming the run and its start. Fail-closed: a closing run
 // whose row cannot be resolved has no verifiable lifetime, so the observation
 // cannot be attributed to it. The merge-head grammar has no `observed`
 // component and its origin predicate (probe head == delivery merge head) is
 // unchanged: it is stamped with the closing run id but never lifetime-gated.
 // Doors without a run id (human closes, the system backstop) have no lifetime
-// to compare against; they keep the pre-existing grammar checks only, and the
+// to compare against; they keep the pre-existing grammar checks plus the
+// future-observed refusal (SUP-24266, applied to every closer), and the
 // audit row's null `closingRunId` says so. Every accepted result — both forms —
 // is stamped with `closingRunId`/`closingRunStartedAt` so the
 // `issue.done_transition_tier2_close` activity row carries the closing run
 // identity beside the cited observation (SUP-23366's machine record).
 // ───────────────────────────────────────────────────────────────────────
-const TIER2_OBSERVED_CLOCK_SKEW_MS = 5 * 60 * 1000;
-
 async function loadClosingRunStart(
   db: Db,
   companyId: string,
@@ -1837,6 +2210,23 @@ async function attributeTier2EvidenceToClosingRun(
   // no observation instant to place inside the run's lifetime.
   if (audit.tierForm !== "record-only") {
     return { ...result, tier2Audit: audit };
+  }
+  const latestObserved = audit.observedRangeEnd ?? audit.observed;
+  // Compare at the full accepted precision (1-6 fractional digits): `Date.parse`
+  // truncates to milliseconds, so `.7261Z` would tie a `.726Z` close write. The
+  // evaluation clock has millisecond precision, so any observed sub-millisecond
+  // tail past it is strictly later.
+  if (
+    latestObserved &&
+    utcInstantSortKey(latestObserved) > utcInstantSortKey(new Date(Date.now()).toISOString())
+  ) {
+    return refuseTier2(
+      `record-only close Tier 2 probe evidence names observed instant ${latestObserved}, which postdates this ` +
+        "close; an observation cannot be made after the close that cites it, and it must fall inside the " +
+        "closing run, at or before the close write. Re-probe from this run and close with the fresh observed " +
+        "timestamp. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
   }
   if (!runId) {
     // An agent closer has no excuse: every agent request can carry the run id
@@ -1883,16 +2273,6 @@ async function attributeTier2EvidenceToClosingRun(
         `closing run (run ${runId}, started ${runStart.toISOString()}); an observation made before this run began ` +
         "is another run's observation restated, not this run's live proof. Re-probe from this run and close " +
         "with the fresh observed timestamp. " +
-        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
-    );
-  }
-  const latestObserved = audit.observedRangeEnd ?? audit.observed;
-  const latestObservedMs = latestObserved ? Date.parse(latestObserved) : Number.NaN;
-  if (!Number.isNaN(latestObservedMs) && latestObservedMs > Date.now() + TIER2_OBSERVED_CLOCK_SKEW_MS) {
-    return refuseTier2(
-      `record-only close Tier 2 probe evidence names observed instant ${latestObserved}, which postdates this ` +
-        "evaluation by more than the allowed clock skew; an observation cannot be made after the close that " +
-        "cites it. " +
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
@@ -2810,6 +3190,40 @@ function describeTierRejection(tier2: Tier2Parse, tier1: Tier1Parse, tier2Forms:
   return null;
 }
 
+/**
+ * SUP-24299: the Tier 1 marker "Liveness unverified." disclaims the probe that
+ * a Tier 2 (live) declaration claims, so one declaration cannot carry both. The
+ * Tier 2 matchers end in a catch-all (`(.+)$`), which accepted the marker as
+ * part of the predicate text. Returns the refusal, or null when the Tier 2
+ * evidence does not carry the marker. The check reads only the matched evidence
+ * line, so a separate Tier 1 line elsewhere in the same comment is unaffected.
+ */
+function refuseTier2LivenessConflict(
+  evidence: string,
+  tier2Forms: string,
+  tier1Forms: string,
+): DoneTierDeclarationResult | null {
+  if (!evidence.toLowerCase().includes(TIER_1_SUFFIX.toLowerCase())) {
+    return null;
+  }
+  return {
+    allowed: false,
+    reason:
+      `A Tier 2 declaration also carries the Tier 1 marker "${TIER_1_SUFFIX}". The two are mutually ` +
+      'exclusive: "Closed at Tier 2 (live)" claims the running surface was probed, and ' +
+      `"${TIER_1_SUFFIX}" says it was not. ` +
+      `Accepted Tier 2 form: ${tier2Forms} — per SUP-12693.`,
+    tier: null,
+    skipped: false,
+    skipReason: null,
+    code: DONE_TRANSITION_TIER_CONFLICT_CODE,
+    remedy:
+      `If you probed the running surface, remove "${TIER_1_SUFFIX}" from the Tier 2 line and keep the ` +
+      `probe evidence: ${tier2Forms}. If you did not probe it, do not claim Tier 2: close at Tier 1 ` +
+      `with the marker as the suffix of the Tier 1 line: ${tier1Forms} — per SUP-12693.`,
+  };
+}
+
 export async function evaluateDoneTierDeclaration(
   db: Db,
   issue: {
@@ -2858,6 +3272,8 @@ export async function evaluateDoneTierDeclaration(
   if (accompanyingComment && accompanyingComment.trim().length > 0) {
     const tier2 = parseTier2Declaration(accompanyingComment);
     if (tier2.kind === "matched") {
+      const conflict = refuseTier2LivenessConflict(tier2.evidence, tier2Forms, tier1Forms);
+      if (conflict) return conflict;
       // SUP-21902: a matched Tier 2 sentence is no longer accepted on its face —
       // the origin predicate resolves the named probe head and compares it with
       // the delivery merge head before the close is allowed. SUP-22801: on a
@@ -2953,6 +3369,8 @@ export async function evaluateDoneTierDeclaration(
 
   const tier2 = parseTier2Declaration(sameRunComment.body);
   if (tier2.kind === "matched") {
+    const conflict = refuseTier2LivenessConflict(tier2.evidence, tier2Forms, tier1Forms);
+    if (conflict) return conflict;
     // SUP-21902: same-run Tier 2 declarations face the same origin predicate as
     // accompanying-comment ones — a pre-merge or unresolvable head is refused
     // identically on both doors. SUP-23490: the same closing-run lifetime gate
@@ -3402,7 +3820,10 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
     }
   | {
       allowed: false;
-      code: "done_transition_missing_delivery" | "done_transition_missing_tier_declaration";
+      code:
+        | "done_transition_missing_delivery"
+        | "done_transition_missing_tier_declaration"
+        | typeof DONE_TRANSITION_TIER_CONFLICT_CODE;
       reason: string;
     }
 > {
@@ -3427,7 +3848,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
     if (!tierResult.allowed) {
       return {
         allowed: false,
-        code: "done_transition_missing_tier_declaration",
+        code: tierResult.code ?? "done_transition_missing_tier_declaration",
         reason: tierResult.reason,
       };
     }
@@ -4381,6 +4802,9 @@ async function evaluateDoneTransitionGuardCore(
     executionPolicy?: unknown;
     executionState?: unknown;
     deliveryRequirement?: IssueDeliveryRequirement | null;
+    // The status version before this close; it binds a requirement-change
+    // marker to the close (SUP-24429).
+    statusVersion?: number;
   },
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
@@ -4388,6 +4812,9 @@ async function evaluateDoneTransitionGuardCore(
   // exported wrapper can audit a below-threshold carve-out on a successful close
   // without issuing a second countLadderedChildren query.
   observer?: { census?: DoneTransitionCensus },
+  // SUP-24429: the requirement stored before the close request; undefined when
+  // the caller's request does not change it.
+  storedDeliveryRequirement?: IssueDeliveryRequirement | null,
 ): Promise<DoneTransitionGuardResult> {
   const fallback = (reason: string, skipped = false, skipReason: string | null = null): DoneTransitionGuardResult => ({
     allowed: true,
@@ -4501,7 +4928,7 @@ async function evaluateDoneTransitionGuardCore(
   // waved through by a credential-less or network-fail-open configuration.
   if (reviewLadder !== null && !reviewLadder.satisfied) {
     const first = reviewLadder.firstUnsatisfiedStage;
-    void writeAuditLog(db, issue, "issue.done_transition_ladder_refused", {
+    await writeLadderRefusalAuditLog(db, issue, {
       reason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
       skipReason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
       stageIndex: reviewLadder.firstUnsatisfiedIndex,
@@ -4644,12 +5071,14 @@ async function evaluateDoneTransitionGuardCore(
     };
   }
 
-  if (issue.deliveryRequirement === "record_only") {
-    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
-      reason: "record_only_delivery_skipped",
-      skipReason: "record_only_delivery_skipped",
-      source: "done_transition_guard",
-    });
+  // SUP-24429: the skip follows the requirement stored before this request.
+  // A close request that just relabelled a repository_delivery card record_only
+  // falls through to the repository landing check below. A caller that passes
+  // no stored requirement changes nothing in that request.
+  if (
+    issue.deliveryRequirement === "record_only" &&
+    (storedDeliveryRequirement === undefined || storedDeliveryRequirement === "record_only")
+  ) {
     return {
       allowed: true,
       reason: "Record-only delivery requirement: repository/PR delivery is not required; transition allowed",
@@ -4874,6 +5303,17 @@ async function evaluateDoneTransitionGuardCore(
         reason: `open_linked_prs_decision_carried:${openPrs.length}`,
         skipReason: `open_linked_prs_decision_carried:${openPrs.length}`,
         prs: prNames,
+        // SUP-24429: this row is a landing-backstop candidate. When the close
+        // request relabelled the stored requirement, name both sides and the
+        // status version this close produces, so the backstop keeps sweeping
+        // the card under a live record_only label until a later close.
+        ...(storedDeliveryRequirement !== undefined && storedDeliveryRequirement !== issue.deliveryRequirement
+          ? {
+              storedDeliveryRequirement,
+              requestedDeliveryRequirement: issue.deliveryRequirement ?? null,
+              ...(issue.statusVersion !== undefined ? { closeStatusVersion: issue.statusVersion + 1 } : {}),
+            }
+          : {}),
       });
       return {
         allowed: true,
@@ -5108,7 +5548,7 @@ async function evaluateDoneTransitionGuardCore(
             skipReason: prSkipReason,
           };
         }
-        void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+        await writeGuardSkippedAuditLog(db, issue, {
           reason: "branch_absent_on_remote",
           branch,
           defaultRef: ctx.defaultRef,
@@ -5430,9 +5870,20 @@ export async function evaluateDoneTransitionGuard(
   issue: Parameters<typeof evaluateDoneTransitionGuardCore>[1],
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
+  // SUP-24429: the requirement stored before this request, passed by a door that
+  // lets the close request change it. The record-only skip applies only when this
+  // is record_only too; omitted means the request did not change the requirement.
+  storedDeliveryRequirement?: IssueDeliveryRequirement | null,
 ): Promise<DoneTransitionGuardResult> {
   const observer: { census?: DoneTransitionCensus } = {};
-  const result = await evaluateDoneTransitionGuardCore(db, issue, override, decisionCarried, observer);
+  const result = await evaluateDoneTransitionGuardCore(
+    db,
+    issue,
+    override,
+    decisionCarried,
+    observer,
+    storedDeliveryRequirement,
+  );
   const census = observer.census;
   if (
     result.allowed

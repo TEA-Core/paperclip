@@ -31,6 +31,17 @@ import {
   withWorktreePortRegistryLock,
   writeWorktreePortRegistry,
 } from "@paperclipai/shared/worktree-port-registry";
+import { readBoundedStateFile, resolveWorktreeStateRoot } from "@paperclipai/shared/bounded-state-file";
+import {
+  computeWorktreeSchemaLineage,
+  parseWorktreeEnvInstanceId,
+  resolveWorktreeSchemaLineage,
+} from "@paperclipai/shared/worktree-initialization-identity";
+import {
+  classifyWorktreeStateManifest,
+  type WorktreeInitializationManifest,
+  WORKTREE_INITIALIZATION_KEY_FILE,
+} from "@paperclipai/shared/worktree-initialization-manifest";
 import {
   applyPendingMigrations,
   agents,
@@ -60,6 +71,7 @@ import {
   runDatabaseBackup,
   runDatabaseRestore,
   resetPostgresDatabase,
+  MIGRATIONS_FOLDER,
   workspaceRuntimeServices,
   createEmbeddedPostgresLogBuffer,
   formatEmbeddedPostgresError,
@@ -93,6 +105,18 @@ import {
   type WorktreeLocalPaths,
 } from "./worktree-lib.js";
 import {
+  assertFreshInitializationRows,
+  assertNoLinkBelow,
+  buildFreshWorktreeConfig,
+  FreshInitializationRecord,
+  isWorktreeInitProfile,
+  mintFreshWorktreeIdentity,
+  removeFreshWorktreeState,
+  resolveFreshWorktreeDeletionSet,
+  resolveSyntheticWorktreeFixture,
+  type WorktreeInitProfile,
+} from "./worktree-fresh-init.js";
+import {
   buildWorktreeMergePlan,
   parseWorktreeMergeScopes,
   type IssueAttachmentRow,
@@ -121,6 +145,10 @@ type WorktreeInitOptions = {
   seedMode?: string;
   preserveLiveWork?: boolean;
   force?: boolean;
+  /** Fresh isolated initialization profile; omitted keeps the v2 clone seed. */
+  profile?: string;
+  /** Synthetic fixture id for `--profile synthetic-fixture`. */
+  fixture?: string;
 };
 
 type WorktreeMakeOptions = WorktreeInitOptions & {
@@ -247,7 +275,8 @@ export type EnsureWorktreeSeededResult = {
     | "complete_marker"
     | "legacy_unmarked"
     | "legacy_database"
-    | "no_source";
+    | "no_source"
+    | "verified_initialization";
   details?: SeedWorktreeDatabaseResult;
 };
 
@@ -1849,18 +1878,58 @@ function writeNoSourceSeedSkipMarker(
   }, null, 2)}\n`, { mode: 0o600 });
 }
 
-export function readWorktreeSeedManifest(configPath: string): WorktreeSeedManifest | null {
-  const manifestPath = resolveWorktreeSeedMarkerPaths(configPath).manifest;
-  if (!existsSync(manifestPath)) return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(manifestPath, "utf8"));
-  } catch (error) {
-    throw new Error(
-      `Invalid worktree seed manifest at ${manifestPath}: ${error instanceof Error ? error.message : String(error)}`,
-    );
+/**
+ * The verified v3 initialization manifest of this worktree, or `null` when the
+ * state holds no v3 manifest. A v3 manifest is accepted only for the instance
+ * named in the worktree state `.env`, a revision of this build's migration
+ * lineage, and a binding that verifies under the state initialization key; any
+ * other v3 manifest throws with its refusal reason. A manifest that is unsafe
+ * to read (link, FIFO, oversized) throws, as in {@link readWorktreeSeedManifest}.
+ */
+export function readVerifiedWorktreeInitialization(configPath: string): WorktreeInitializationManifest | null {
+  const manifestPath = path.resolve(resolveWorktreeSeedMarkerPaths(configPath).manifest);
+  const stateDir = path.dirname(manifestPath);
+  const trustedRoot = resolveWorktreeStateRoot(manifestPath);
+  const bytes = readBoundedStateFile(manifestPath, { trustedRoot });
+  if (bytes === null) return null;
+  const readOptional = (name: string): Buffer | null => {
+    try {
+      return readBoundedStateFile(path.join(stateDir, name), { trustedRoot });
+    } catch {
+      // An unreadable file cannot confirm the manifest; it is not accepted.
+      return null;
+    }
+  };
+  const envBytes = readOptional(".env");
+  const classification = classifyWorktreeStateManifest(bytes, {
+    targetInstanceId: envBytes === null ? null : parseWorktreeEnvInstanceId(envBytes),
+    schema: resolveWorktreeSchemaLineage(MIGRATIONS_FOLDER),
+    bindingKey: readOptional(WORKTREE_INITIALIZATION_KEY_FILE),
+  });
+  if (classification.kind === "initialization") return classification.manifest;
+  if (classification.kind === "refused" && classification.reason.startsWith("initialization_")) {
+    throw new Error(`Refusing worktree seed manifest at ${manifestPath}: ${classification.message}`);
   }
-  const value = parsed as Partial<WorktreeSeedManifest>;
+  return null;
+}
+
+export function readWorktreeSeedManifest(configPath: string): WorktreeSeedManifest | null {
+  const manifestPath = path.resolve(resolveWorktreeSeedMarkerPaths(configPath).manifest);
+  // The bounded reader refuses links (including a linked `.paperclip` or
+  // `uid-<uid>` state directory), FIFOs, sockets, directories, devices and
+  // oversized or torn files without blocking; its errors never echo content.
+  const bytes = readBoundedStateFile(manifestPath, { trustedRoot: resolveWorktreeStateRoot(manifestPath) });
+  if (bytes === null) return null;
+  // The legacy seed path never provisions a v3 initialization directory, so it
+  // asserts no v3 expectation and every v3 manifest is refused.
+  const classification = classifyWorktreeStateManifest(bytes, { targetInstanceId: null, schema: null, bindingKey: null });
+  if (classification.kind !== "legacy-seed") {
+    const reason = classification.kind === "refused"
+      ? classification.message
+      : "Worktree initialization manifests are not handled by the legacy seed path.";
+    throw new Error(`Refusing worktree seed manifest at ${manifestPath}: ${reason}`);
+  }
+  const value = classification.manifest as Partial<WorktreeSeedManifest>;
   const diagnosticsValid = Array.isArray(value.diagnostics) && value.diagnostics.every((diagnostic) => (
     diagnostic
     && typeof diagnostic === "object"
@@ -2218,6 +2287,11 @@ export async function ensureWorktreeSeeded(
 ): Promise<EnsureWorktreeSeededResult> {
   const configPath = resolveConfigPath(opts.config);
   const markers = resolveWorktreeSeedMarkerPaths(configPath);
+  // A verified fresh initialization is terminal: never seed it from a parent.
+  // Any other v3 manifest throws here with its refusal reason.
+  if (readVerifiedWorktreeInitialization(configPath)) {
+    return { seeded: false, reason: "verified_initialization" };
+  }
   const initialManifest = readWorktreeSeedManifest(configPath);
   if (initialManifest?.state === "verified") {
     return { seeded: false, reason: "verified_manifest" };
@@ -2408,7 +2482,145 @@ export function resolveWorktreeSeedBackupEngine(seedPlan: WorktreeSeedPlan): "au
     : "javascript";
 }
 
+/**
+ * `worktree init --profile fresh|synthetic-fixture`: a new isolated instance
+ * that reads nothing from a parent instance. It never resolves or reads a
+ * source config, `.env`, secrets key or database, and never reuses an inherited
+ * process environment secret. See `worktree-fresh-init.ts`.
+ */
+async function runFreshWorktreeInit(opts: WorktreeInitOptions, profile: WorktreeInitProfile): Promise<void> {
+  if (opts.fromConfig || opts.fromDataDir || opts.preserveLiveWork || opts.seed === false) {
+    throw new Error(
+      `--profile ${profile} creates a new instance without a parent source; `
+      + "do not combine it with --from-config, --from-data-dir, --preserve-live-work or --no-seed.",
+    );
+  }
+  const fixture = profile === "synthetic-fixture" ? resolveSyntheticWorktreeFixture(opts.fixture ?? "starter") : null;
+  if (profile === "fresh" && opts.fixture !== undefined) {
+    throw new Error("--fixture requires --profile synthetic-fixture.");
+  }
+
+  const cwd = process.cwd();
+  const worktreeName = resolveSuggestedWorktreeName(cwd, opts.name ?? detectGitBranchName(cwd) ?? undefined);
+  const instanceId = sanitizeWorktreeInstanceId(opts.instance ?? worktreeName);
+  const paths = resolveWorktreeLocalPaths({ cwd, homeDir: resolveWorktreeHome(opts.home), instanceId });
+  const branding = { name: opts.name ?? worktreeName, color: opts.color ?? generateWorktreeColor() };
+  const markers = resolveWorktreeSeedMarkerPaths(paths.configPath);
+  // This build's migration head is the destination schema the manifest names.
+  const schemaRevision = computeWorktreeSchemaLineage(MIGRATIONS_FOLDER).at(-1)!;
+
+  // Checked before anything is read, written or removed: no state file or the
+  // instance directory may be reached through a symbolic link, so neither a
+  // write nor a --force removal can land outside this worktree and its
+  // instance directory.
+  const deletionSet = resolveFreshWorktreeDeletionSet(paths);
+  const existing = [paths.configPath, paths.envPath, markers.manifest, paths.instanceRoot].filter((entry) => existsSync(entry));
+  if (existing.length > 0 && !opts.force) {
+    throw new Error(
+      `Worktree state already exists (${existing.join(", ")}). Re-run with --force to replace it with a clean generation.`,
+    );
+  }
+  if (opts.force) {
+    // A clean generation: the earlier config (and its backup), env, markers,
+    // initialization key and instance data are removed, never merged or
+    // carried forward. Sibling repo state such as `.paperclip/worktrees/` is kept.
+    removeFreshWorktreeState(deletionSet);
+  }
+  mkdirSync(paths.repoConfigDir, { recursive: true });
+
+  const releaseLock = await acquireWorktreeSeedLock(markers.lock);
+  let databaseHandle: EmbeddedPostgresHandle | null = null;
+  let ports: { serverPort: number; databasePort: number } | null = null;
+  try {
+    const record = new FreshInitializationRecord(markers.manifest, {
+      profile,
+      fixture,
+      targetInstanceId: instanceId,
+      schemaRevision,
+    });
+    await record.phase("destination_validation", () => {
+      const leftovers = [paths.configPath, paths.envPath, paths.instanceRoot].filter((entry) => existsSync(entry));
+      if (leftovers.length > 0) {
+        throw new Error(`Fresh worktree destination is not empty: ${leftovers.join(", ")}.`);
+      }
+    });
+    ports = await record.phase("generation_create", () => withWorktreePortRegistryLock(paths.homeDir, async () => {
+      const registeredConfigPaths = readWorktreePortRegistry(paths.homeDir);
+      const claimedPorts = collectClaimedWorktreePorts(paths.homeDir, paths.instanceId, paths.cwd, registeredConfigPaths);
+      const serverPort = await findAvailablePort(opts.serverPort ?? 3101, claimedPorts.serverPorts);
+      const databasePort = await findAvailablePort(
+        opts.dbPort ?? 54330,
+        new Set([...claimedPorts.databasePorts, serverPort]),
+      );
+      mkdirSync(paths.instanceRoot, { recursive: true, mode: 0o700 });
+      writeConfig(buildFreshWorktreeConfig({ paths, serverPort, databasePort }), paths.configPath);
+      writeWorktreePortRegistry(paths.homeDir, [...registeredConfigPaths, paths.configPath]);
+      return { serverPort, databasePort };
+    }));
+    const selectedPorts = ports;
+    const connectionString = await record.phase("schema_migration", async () => {
+      databaseHandle = await ensureEmbeddedPostgres(paths.embeddedPostgresDataDir, selectedPorts.databasePort, {
+        allowExisting: false,
+      });
+      await ensurePostgresDatabase(`postgres://paperclip:paperclip@127.0.0.1:${databaseHandle.port}/postgres`, "paperclip");
+      const url = `postgres://paperclip:paperclip@127.0.0.1:${databaseHandle.port}/paperclip`;
+      await applyPendingMigrations(url);
+      return url;
+    });
+    await record.phase("identity_mint", () => mintFreshWorktreeIdentity(paths, branding));
+    await record.phase("populate", async () => {
+      if (!fixture) return;
+      const db = createDb(connectionString);
+      try {
+        await fixture.populate(db);
+      } finally {
+        await db.$client?.end?.({ timeout: 5 }).catch(() => undefined);
+      }
+    });
+    await record.phase("validation", async () => {
+      const migrationRevision = resolveWorktreeSeedMigrationRevision(await inspectMigrations(connectionString), "upToDate");
+      if (migrationRevision !== schemaRevision.migrationRevision) {
+        throw new Error("Fresh worktree database migration head does not match this build's migration lineage.");
+      }
+      const db = createDb(connectionString);
+      try {
+        await assertFreshInitializationRows(db, fixture);
+      } finally {
+        await db.$client?.end?.({ timeout: 5 }).catch(() => undefined);
+      }
+    });
+    record.complete();
+  } finally {
+    const handle = databaseHandle as EmbeddedPostgresHandle | null;
+    if (handle?.startedByThisProcess) await handle.stop();
+    await releaseLock();
+  }
+
+  p.log.message(pc.dim(`Repo config: ${paths.configPath}`));
+  p.log.message(pc.dim(`Repo env: ${paths.envPath}`));
+  p.log.message(pc.dim(`Isolated home: ${paths.homeDir}`));
+  p.log.message(pc.dim(`Instance: ${paths.instanceId}`));
+  p.log.message(pc.dim(`Worktree badge: ${branding.name} (${branding.color})`));
+  p.log.message(pc.dim(`Server port: ${ports.serverPort} | DB port: ${ports.databasePort}`));
+  p.log.message(pc.dim(`Initialization profile: ${profile}${fixture ? ` (fixture ${fixture.id}@${fixture.version})` : ""}`));
+  p.outro(
+    pc.green(
+      `Fresh worktree ready. It holds no parent data or keys; run Paperclip inside this repo to use ${paths.instanceId}.`,
+    ),
+  );
+}
+
 async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
+  if (opts.profile !== undefined) {
+    if (!isWorktreeInitProfile(opts.profile)) {
+      throw new Error(`Unsupported initialization profile "${opts.profile}". Expected one of: fresh, synthetic-fixture.`);
+    }
+    await runFreshWorktreeInit(opts, opts.profile);
+    return;
+  }
+  if (opts.fixture !== undefined) {
+    throw new Error("--fixture requires --profile synthetic-fixture.");
+  }
   const cwd = process.cwd();
   const worktreeName = resolveSuggestedWorktreeName(
     cwd,
@@ -2446,12 +2658,14 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
     // Only remove the specific files we're about to rewrite, not the whole
     // repoConfigDir — that directory can contain sibling state such as
     // <repo>/.paperclip/worktrees/ holding every repo-managed worktree
-    // checkout, and a recursive rmSync here would nuke them all.
-    rmSync(paths.configPath, { force: true });
-    rmSync(paths.envPath, { force: true });
+    // checkout, and a recursive rmSync here would nuke them all. Every entry is
+    // checked first, so a linked `.paperclip` or instance directory removes
+    // nothing outside this worktree and its instance directory.
     const seedMarkers = resolveWorktreeSeedMarkerPaths(paths.configPath);
-    rmSync(seedMarkers.pending, { force: true });
-    rmSync(seedMarkers.complete, { force: true });
+    const removals = [paths.configPath, paths.envPath, seedMarkers.pending, seedMarkers.complete];
+    for (const file of removals) assertNoLinkBelow(paths.cwd, file, "file");
+    assertNoLinkBelow(paths.homeDir, paths.instanceRoot, "directory");
+    for (const file of removals) rmSync(file, { force: true });
     rmSync(paths.instanceRoot, { recursive: true, force: true });
   }
 
@@ -2633,6 +2847,8 @@ export async function worktreeEnsureSeededCommand(opts: WorktreeEnsureSeededOpti
       spinner.stop("Validated and adopted an existing legacy worktree database.");
     } else if (result.reason === "no_source") {
       spinner.stop("No distinct worktree seed source exists; skipping database seed.");
+    } else if (result.reason === "verified_initialization") {
+      spinner.stop("Worktree has a verified fresh initialization; it is never seeded from a parent instance.");
     } else {
       spinner.stop("Worktree database already has a verified seed manifest.");
     }
@@ -4496,6 +4712,8 @@ export function registerWorktreeCommands(program: Command): void {
     .option("--preserve-live-work", "Do not quarantine copied agent work or workspace runtime services in the seeded worktree", false)
     .option("--no-seed", "Skip database seeding from the source instance")
     .option("--force", "Replace existing repo-local config and isolated instance data", false)
+    .option("--profile <profile>", "Initialize a fresh instance with no parent data: fresh or synthetic-fixture (default: clone from the source instance)")
+    .option("--fixture <id>", "Synthetic fixture for --profile synthetic-fixture (default: starter)")
     .action(worktreeMakeCommand);
 
   worktree
@@ -4513,6 +4731,8 @@ export function registerWorktreeCommands(program: Command): void {
     .option("--preserve-live-work", "Do not quarantine copied agent work or workspace runtime services in the seeded worktree", false)
     .option("--no-seed", "Skip database seeding from the source instance")
     .option("--force", "Replace existing repo-local config and isolated instance data", false)
+    .option("--profile <profile>", "Initialize a fresh instance with no parent data: fresh or synthetic-fixture (default: clone from the source instance)")
+    .option("--fixture <id>", "Synthetic fixture for --profile synthetic-fixture (default: starter)")
     .action(worktreeInitCommand);
 
   worktree

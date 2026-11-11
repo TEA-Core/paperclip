@@ -1,5 +1,6 @@
 export {
   createDb,
+  withDedicatedDbConnection,
   closeRegisteredClients,
   createRequestScopedDb,
   type RequestScopedDb,
@@ -9,6 +10,7 @@ export {
   resetPostgresDatabase,
   inspectMigrations,
   applyPendingMigrations,
+  MIGRATIONS_FOLDER,
   reconcilePendingMigrationHistory,
   type MigrationState,
   type MigrationHistoryReconcileResult,

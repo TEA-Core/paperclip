@@ -99,7 +99,9 @@ describe("fold decision D1 call-site guard", () => {
         // which would have silently re-armed managed identity in host mode.
         "services/heartbeat.ts": 5,
         "services/execution-workspace-provisioning.ts": 1,
-        "services/execution-workspaces.ts": 1,
+        // Both workspace refresh and reaper reachability fetch are NON-RUN:
+        // neither supplies heartbeatRunId, so D1 keeps host credentials by default.
+        "services/execution-workspaces.ts": 2,
         "routes/execution-workspaces.ts": 1,
       },
       resolveManagedGitHubIdentitySelection: {
@@ -112,9 +114,16 @@ describe("fold decision D1 call-site guard", () => {
         "services/git-credentials.ts": 1,
         "services/github-operation-credentials.ts": 1,
       },
+      // The native session executor only runs this under input.managedGitHub, which heartbeat
+      // sets to `!useHostGitHub && selection.configured`: the driver gate is upstream of the site.
+      // skill-source-github-access.ts (upstream #14713, GitHub-synced skill sources) is
+      // TOOL-PLANE per D1: the control plane reads the repository over the GitHub API with a
+      // Bearer header for an authenticated agent run; the token never reaches the run's host.
       resolveGitHubOperationCredentials: {
         "services/git-credentials.ts": 1,
         "routes/connection-intents.ts": 1,
+        "services/native-runtime/native-session-executor.ts": 1,
+        "services/skill-source-github-access.ts": 1,
       },
       filterResolvedGitHubConnectionsForRun: {
         "services/heartbeat.ts": 2,
@@ -123,7 +132,11 @@ describe("fold decision D1 call-site guard", () => {
       // D3: executeRun reaches the probe only through prepareGitExecutionEnvironmentWithHostFallback,
       // which receives the binding by reference (see git-context-probe-fallback.test.ts).
       prepareGitHubExecutionEnvironment: {},
-      prepareGitHubOperationLaunchers: { "services/heartbeat.ts": 1 },
+      // Upstream moved heartbeat's staging into prepareHeartbeatGitHubLaunchers (still under
+      // `if (!useHostGitHub)`); the native session supervisor stages managed access only for
+      // input.managedGitHub, which is host-gated at the same decision.
+      prepareHeartbeatGitHubLaunchers: { "services/heartbeat.ts": 1 },
+      prepareGitHubOperationLaunchers: { "services/native-runtime/native-github-access.ts": 1 },
       forkForcesHostGitHub: {
         "services/git-credentials.ts": 1,
         "services/heartbeat.ts": 1,

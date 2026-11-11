@@ -35,6 +35,7 @@ import { parseOpenCodeJsonl } from "./parse.js";
 import { OPENCODE_V2_CLI_VERSION, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
   isOpenCodeV2CliVersion,
+  openCodeVersionProbeRefusal,
   probeOpenCodeCliVersion,
   unsupportedDetectedOpenCodeV2CliVersionMessage,
 } from "./version.js";
@@ -153,7 +154,7 @@ export async function testEnvironment(
     checks.push({
       code: "opencode_headless_permissions_enabled",
       level: "info",
-      message: "Headless OpenCode external-directory permissions are auto-approved for unattended runs.",
+      message: "Headless OpenCode permissions are auto-approved for all tools and connections.",
     });
   }
   let restoreWorkspace: (() => Promise<void>) | null = null;
@@ -232,16 +233,20 @@ export async function testEnvironment(
             timeoutSec: 10,
             graceSec: 3,
           });
-          // Only a detected 2.x version other than the pin is refused. A version
-          // that cannot be determined (probe failed, timed out, or empty or
-          // unparseable output) leaves cliVersion empty and is treated as V1.
-          cliVersion = detected?.version ?? "";
-          if (isOpenCodeV2CliVersion(cliVersion) && cliVersion !== OPENCODE_V2_CLI_VERSION) {
-            checks.push({
-              code: "opencode_cli_version_unsupported",
-              level: "error",
-              message: unsupportedDetectedOpenCodeV2CliVersionMessage(command, cliVersion),
-            });
+          if (!detected.ok) {
+            // An undeterminable version is refused, never probed as V1.
+            const refusal = openCodeVersionProbeRefusal(command, detected);
+            checks.push({ code: refusal.code, level: "error", message: refusal.message });
+          } else {
+            cliVersion = detected.version.version;
+            // Only a detected 2.x version other than the pin is refused.
+            if (isOpenCodeV2CliVersion(cliVersion) && cliVersion !== OPENCODE_V2_CLI_VERSION) {
+              checks.push({
+                code: "opencode_cli_version_unsupported",
+                level: "error",
+                message: unsupportedDetectedOpenCodeV2CliVersionMessage(command, cliVersion),
+              });
+            }
           }
         }
         if (isOpenCodeV2CliVersion(cliVersion)) {
@@ -275,8 +280,15 @@ export async function testEnvironment(
       }
     }
 
-    const canRunProbe =
-      checks.every((check) => check.code !== "opencode_cwd_invalid" && check.code !== "opencode_command_unresolvable");
+    // A refused version stops the models and hello probes, as it stops execute
+    // before launch: they would otherwise run a binary Paperclip refuses to run.
+    const canRunProbe = checks.every(
+      (check) =>
+        check.code !== "opencode_cwd_invalid" &&
+        check.code !== "opencode_command_unresolvable" &&
+        check.code !== "opencode_cli_version_unsupported" &&
+        check.code !== "opencode_cli_version_unknown",
+    );
 
     let modelValidationPassed = false;
     const configuredModel = asString(config.model, "").trim();

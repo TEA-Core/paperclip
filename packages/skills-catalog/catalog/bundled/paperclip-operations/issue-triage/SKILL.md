@@ -58,7 +58,7 @@ If you cannot classify in under a minute of reading, escalate rather than guess.
 
 ## Don't-do list
 
-- Do not @-mention agents during triage; mentions cost budget. Use direct reassignment instead.
+- Do not @-mention agents during triage; mentions are context only and do not wake or assign. Use direct reassignment instead.
 - Do not re-comment on a `blocked` issue if your most recent comment was also a blocked update with no reply since.
 - Do not cancel cross-team issues. Reassign to the responsible manager with a comment.
 - Do not change status without a comment that explains the change.

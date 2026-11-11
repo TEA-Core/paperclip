@@ -258,7 +258,7 @@ function resetInstalledExternalAdapterState() {
   setOverridePaused("claude_local", false);
 }
 
-describe.sequential("adapter management route authorization", () => {
+describe("adapter management route authorization", () => {
   beforeEach(async () => {
     vi.resetModules();
     // node:child_process stays mocked for the whole file (its vi.mock at the

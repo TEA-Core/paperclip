@@ -183,6 +183,7 @@ interface CandidateIssue {
   identifier: string | null;
   assigneeAgentId: string | null;
   unblockDescriptor?: IssueUnblockDescriptor | null;
+  statusVersion?: number;
 }
 
 interface CandidateRow {
@@ -302,6 +303,7 @@ export function buildDiscoveryQuery(db: Db, windowStart: Date, discoveryCutoff: 
         identifier: issues.identifier,
         assigneeAgentId: issues.assigneeAgentId,
         unblockDescriptor: issues.unblockDescriptor,
+        statusVersion: issues.statusVersion,
       },
     })
     .from(activityLog)
@@ -315,7 +317,18 @@ export function buildDiscoveryQuery(db: Db, windowStart: Date, discoveryCutoff: 
     .where(
       and(
         eq(activityLog.entityType, "issue"),
-        ne(issues.deliveryRequirement, "record_only"),
+        // SUP-24429: the live record_only label excludes a card unless this row
+        // is the marker of its LATEST done close: a stored repository_delivery
+        // requirement relabelled in that close request, bound to the status
+        // version the close produced. A reopen and a later close advance the
+        // status version, so an older marker no longer counts.
+        or(
+          ne(issues.deliveryRequirement, "record_only"),
+          and(
+            sql`${activityLog.details}->>'storedDeliveryRequirement' = 'repository_delivery'`,
+            sql`${activityLog.details}->>'closeStatusVersion' = ${issues.statusVersion}::text`,
+          ),
+        ),
         or(
           and(
             eq(activityLog.action, SKIPPED_ACTION),
@@ -473,8 +486,14 @@ export function createDoneCloseLandingBackstopService(
     deps: { resolver: ExternalObjectResolver | null; svc: ReturnType<typeof issueService>; graceCutoff: Date },
   ) {
     const issue = row.issue;
-    if (issue.deliveryRequirement === "record_only") return;
     const details = readRecord(row.details);
+    if (
+      issue.deliveryRequirement === "record_only" &&
+      !(
+        readString(details?.storedDeliveryRequirement) === "repository_delivery" &&
+        details?.closeStatusVersion === issue.statusVersion
+      )
+    ) return;
     // SUP-15953: verdicts (confirmed/failed/escalated) require the full landing
     // grace. A candidate inside the wider re-enqueue window but outside this
     // bound is eligible for the re-enqueue leg ONLY.
