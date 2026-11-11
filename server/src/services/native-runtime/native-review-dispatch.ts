@@ -31,14 +31,24 @@ export async function claimQueuedNativeReviewRun(db: Db, input: {
     } else {
       return null;
     }
-    const [sibling] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    const siblingCandidates = await tx.select({
+      id: heartbeatRuns.id,
+      contextSnapshot: heartbeatRuns.contextSnapshot,
+    }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, input.run.companyId),
       ne(heartbeatRuns.id, input.run.id),
       inArray(heartbeatRuns.status, ["running", "succeeded"]),
       sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
       sql`${heartbeatRuns.contextSnapshot} ->> 'nativeReviewInteractionId' = ${reviewContext.nativeReviewInteractionId}`,
-    )).limit(1);
-    if (sibling) return null;
+    )).limit(5);
+    for (const candidate of siblingCandidates) {
+      if (
+        await isNativeReviewRunBoundToCommitterWake(tx as unknown as Db, {
+          companyId: input.run.companyId, issueId, runId: candidate.id,
+          contextSnapshot: candidate.contextSnapshot,
+        })
+      ) return null;
+    }
     if (!await isNativeReviewRunBoundToCommitterWake(tx as unknown as Db, {
       companyId: input.run.companyId, issueId, runId: input.run.id,
       contextSnapshot: context,

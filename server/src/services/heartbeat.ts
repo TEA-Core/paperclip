@@ -13,7 +13,7 @@ import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
-import { bindNativeReviewCommitterWakeToRun, getNativeReviewAssignment, isNativeReviewWakeProvenance, readNativeReviewAssignmentContext, readNativeReviewCommitterWakeBinding } from "./native-runtime/native-review-participant.js";
+import { bindNativeReviewCommitterWakeToRun, getNativeReviewAssignment, isNativeReviewRunBoundToCommitterWake, isNativeReviewWakeProvenance, readNativeReviewAssignmentContext, readNativeReviewCommitterWakeBinding } from "./native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
 import { buildNativeReviewRequest } from "./native-runtime/native-review-prompt.js";
 import {
@@ -20601,8 +20601,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
 
           if (hasWakeProvenance) {
-            const sibling = await dbOrTx
-              .select({ id: heartbeatRuns.id })
+            // Only a sibling that is itself a provenance-bound native review
+            // counts toward the single-claim rule; an ordinary run carrying
+            // a copied interaction id must not block this review.
+            const siblingCandidates = await dbOrTx
+              .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
               .from(heartbeatRuns)
               .where(
                 and(
@@ -20613,8 +20616,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   sql`${heartbeatRuns.contextSnapshot} ->> 'nativeReviewInteractionId' = ${nativeReviewContext.nativeReviewInteractionId}`,
                 ),
               )
-              .limit(1)
-              .then((rows) => rows[0] ?? null);
+              .limit(5);
+            let sibling: { id: string } | null = null;
+            for (const candidate of siblingCandidates) {
+              if (
+                await isNativeReviewRunBoundToCommitterWake(dbOrTx, {
+                  companyId: run.companyId,
+                  issueId,
+                  runId: candidate.id,
+                  contextSnapshot: candidate.contextSnapshot,
+                })
+              ) {
+                sibling = candidate;
+                break;
+              }
+            }
             if (sibling) duplicateNativeReviewRun = true;
             else {
               const binding = await readNativeReviewCommitterWakeBinding(dbOrTx, {
@@ -20782,7 +20798,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const participantMatches =
           currentParticipant.type === "agent" &&
           currentParticipant.agentId === run.agentId;
-        if (!participantMatches && !wakeCommentId) {
+        if (!participantMatches && !wakeCommentId && !isNativeReviewRun) {
           const participantAgentId =
             currentParticipant.type === "agent" ? currentParticipant.agentId ?? null : null;
           const handoffAgentId = participantAgentId && participantAgentId !== run.agentId

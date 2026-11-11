@@ -546,12 +546,12 @@ server/src/__tests__/heartbeat-project-repositories.test.ts(257,11): TS7034
 server/src/__tests__/heartbeat-project-repositories.test.ts(282,64): TS7005
 server/src/__tests__/heartbeat-run-lease-release-terminalization.test.ts(161,17): TS2769
 server/src/__tests__/heartbeat-run-terminalize-before-release.test.ts(308,49): TS2769
-server/src/__tests__/heartbeat-stale-queue-invalidation.test.ts(1510,7): TS2322
-server/src/__tests__/heartbeat-stale-queue-invalidation.test.ts(1528,7): TS2322
-server/src/__tests__/heartbeat-stale-queue-invalidation.test.ts(1546,7): TS2322
+server/src/__tests__/heartbeat-stale-queue-invalidation.test.ts(1644,7): TS2322
+server/src/__tests__/heartbeat-stale-queue-invalidation.test.ts(1662,7): TS2322
+server/src/__tests__/heartbeat-stale-queue-invalidation.test.ts(1680,7): TS2322
 server/src/__tests__/heartbeat-stale-queue-invalidation.test.ts(166,44): TS2493
 server/src/__tests__/heartbeat-stale-queue-invalidation.test.ts(166,66): TS2339
-server/src/__tests__/heartbeat-stale-queue-invalidation.test.ts(2689,9): TS2769
+server/src/__tests__/heartbeat-stale-queue-invalidation.test.ts(2823,9): TS2769
 server/src/__tests__/heartbeat-stale-queue-invalidation.test.ts(339,7): TS2322
 server/src/__tests__/heartbeat-workspace-branch-containment.test.ts(1102,9): TS2367
 server/src/__tests__/heartbeat-workspace-branch-containment.test.ts(1103,45): TS2345
