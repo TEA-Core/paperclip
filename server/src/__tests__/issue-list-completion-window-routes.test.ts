@@ -233,6 +233,16 @@ describeEmbeddedPostgres("issue list completion window", () => {
     expect(res.body.error).toContain("completedAfter");
   });
 
+  it("rejects an inverted completion window below millisecond precision", async () => {
+    const f = await seedCensusFixtures();
+    const res = await request(f.app())
+      .get(
+        `/api/companies/${f.companyId}/issues?completedAfter=2026-07-03T00:00:00.000001Z&completedBefore=2026-07-03T00:00:00.000000Z`,
+      )
+      .expect(400);
+    expect(res.body.error).toContain("completedAfter");
+  });
+
   it("rejects an unknown query parameter instead of silently returning an unfiltered page", async () => {
     const f = await seedCensusFixtures();
     const res = await request(f.app())
