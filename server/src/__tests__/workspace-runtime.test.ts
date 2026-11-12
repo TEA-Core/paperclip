@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -83,6 +83,7 @@ import {
 } from "../services/local-service-supervisor.ts";
 import { logger } from "../middleware/logger.js";
 import type { EnsureSharedGroupOwnershipOptions } from "../services/shared-group-ownership.js";
+import { readLegacySeedManifestObject } from "../worktree-seed-manifest.js";
 import {
   buildWorkspaceRealizationRecord,
   buildWorkspaceRealizationRequest,
@@ -1273,6 +1274,27 @@ describe("resolveRuntimeProvisionCommand", () => {
         }),
       );
       expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
+      // Complete minimal manifests keep skipping provisioning alongside full.
+      const fullManifest = JSON.parse(await fs.readFile(path.join(cwd, ".paperclip", "seed-manifest.json"), "utf8"));
+      await fs.writeFile(
+        path.join(cwd, ".paperclip", "seed-manifest.json"),
+        JSON.stringify({ ...fullManifest, seedMode: "minimal" }),
+      );
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
+      // A legacy-unsafe manifest is not verified, so the provisioner runs and
+      // refuses it loudly; a FIFO manifest is refused without blocking.
+      await fs.writeFile(
+        path.join(cwd, ".paperclip", "seed-manifest.json"),
+        JSON.stringify({ ...fullManifest, seedMode: "minimal-no-secrets" }),
+      );
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(
+        "bash ./scripts/provision-worktree-runtime.sh",
+      );
+      await fs.rm(path.join(cwd, ".paperclip", "seed-manifest.json"));
+      expect(spawnSync("mkfifo", [path.join(cwd, ".paperclip", "seed-manifest.json")]).status).toBe(0);
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(
+        "bash ./scripts/provision-worktree-runtime.sh",
+      );
     } finally {
       await fs.rm(baseCwd, { recursive: true, force: true });
     }
@@ -1361,6 +1383,35 @@ describe("resolveRuntimeProvisionCommand", () => {
 });
 
 describe("readWorkspaceSeedOperationEvidence", () => {
+  it("does not block on a FIFO manifest and refuses a v2 minimal-no-secrets manifest", async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-seed-evidence-bounded-"));
+    try {
+      await fs.mkdir(path.join(cwd, ".paperclip"), { recursive: true });
+      const manifestPath = path.join(cwd, ".paperclip", "seed-manifest.json");
+      expect(spawnSync("mkfifo", [manifestPath]).status).toBe(0);
+      const startedAt = Date.now();
+      expect(readLegacySeedManifestObject(manifestPath)).toBeNull();
+      expect(readWorkspaceSeedOperationEvidence(cwd).verified).toBe(false);
+      expect(Date.now() - startedAt).toBeLessThan(2000);
+      await fs.rm(manifestPath);
+
+      await fs.writeFile(
+        manifestPath,
+        JSON.stringify({
+          version: 2,
+          seedMode: "minimal-no-secrets",
+          state: "verified",
+          phase: "validation",
+          diagnostics: [{ phase: "validation", status: "verified", at: "2026-09-10T00:00:00.000Z" }],
+        }),
+      );
+      expect(readLegacySeedManifestObject(manifestPath)).toBeNull();
+      expect(readWorkspaceSeedOperationEvidence(cwd).verified).toBe(false);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("accepts a recorded no-source seed skip as verified seed evidence", async () => {
     // SUP-15609: the runtime recorder marks a workspace_seed operation failed
     // when the worktree has no verified seed manifest. An env-only worktree
@@ -1404,6 +1455,39 @@ describe("readWorkspaceSeedOperationEvidence", () => {
       const evidence = readWorkspaceSeedOperationEvidence(cwd);
       expect(evidence.verified).toBe(false);
       expect(evidence.error).toMatch(/without a verified manifest/);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("readWorkspaceSeedOperationEvidence refused manifests with a stale skip marker", () => {
+  it.each(["minimal_no_secrets", "fifo"] as const)("refuses a %s manifest quickly", async (variant) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), `paperclip-runtime-seed-evidence-refused-${variant}-`));
+    try {
+      await fs.mkdir(path.join(cwd, ".paperclip"), { recursive: true });
+      await fs.writeFile(path.join(cwd, ".paperclip", "seed-skip-no-source"), "{}\n");
+      const manifestPath = path.join(cwd, ".paperclip", "seed-manifest.json");
+      if (variant === "fifo") {
+        expect(spawnSync("mkfifo", [manifestPath]).status).toBe(0);
+      } else {
+        await fs.writeFile(
+          manifestPath,
+          JSON.stringify({
+            version: 2,
+            seedMode: "minimal-no-secrets",
+            state: "verified",
+            phase: "validation",
+            diagnostics: [{ phase: "validation", status: "verified", at: "2026-09-10T00:00:00.000Z" }],
+          }),
+        );
+      }
+      const startedAt = Date.now();
+      const evidence = readWorkspaceSeedOperationEvidence(cwd);
+      expect(Date.now() - startedAt).toBeLessThan(2000);
+      expect(evidence.verified).toBe(false);
+      expect(evidence.metadata.seedFailurePhase).toBe("seed_manifest_unreadable");
+      expect(evidence.metadata.seedSkippedNoSource).toBeUndefined();
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }

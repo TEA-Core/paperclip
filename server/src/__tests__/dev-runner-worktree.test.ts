@@ -9,11 +9,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
 import {
   bootstrapDevRunnerWorktreeEnv,
   isWorktreeSeedPending,
   isLinkedGitWorktreeCheckout,
   resolveWorktreeEnvFilePath,
+  resolveWorktreeSeedGate,
   resolveWorktreeStateDir,
 } from "../dev-runner-worktree.ts";
 
@@ -71,6 +73,51 @@ describe("dev-runner worktree env bootstrap", () => {
     expect(isWorktreeSeedPending(root)).toBe(false);
 
     fs.writeFileSync(manifestPath, "not-json", "utf8");
+    expect(isWorktreeSeedPending(root)).toBe(true);
+  });
+
+  it("refuses legacy-unsafe, initialization, and non-regular manifests with an actionable message", () => {
+    const root = createTempRoot("paperclip-dev-runner-seed-gate-");
+    const stateDir = path.join(root, ".paperclip");
+    const manifestPath = path.join(stateDir, "seed-manifest.json");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const complete = (seedMode: string) => JSON.stringify({
+      version: 2,
+      source: { instanceId: "source", configPath: "/source/config.json" },
+      snapshotAt: "2026-08-18T00:00:00.000Z",
+      seedMode,
+      migrationRevision: "0001",
+      targetInstanceId: "target",
+      phase: "complete",
+      state: "verified",
+      attemptId: "attempt",
+      startedAt: "2026-08-18T00:00:00.000Z",
+      finishedAt: "2026-08-18T00:01:00.000Z",
+      diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-08-18T00:01:00.000Z" }],
+    });
+
+    fs.writeFileSync(manifestPath, complete("full"), "utf8");
+    expect(resolveWorktreeSeedGate(root)).toEqual({ kind: "ready" });
+
+    fs.writeFileSync(manifestPath, complete("minimal-no-secrets"), "utf8");
+    const unsafe = resolveWorktreeSeedGate(root);
+    expect(unsafe.kind).toBe("refused");
+    expect(unsafe.kind === "refused" ? unsafe.message : "").toMatch(/minimal-no-secrets.*clean generation/s);
+
+    fs.writeFileSync(manifestPath, JSON.stringify({ version: 3, kind: "worktree-initialization", state: "verified" }), "utf8");
+    expect(resolveWorktreeSeedGate(root).kind).toBe("refused");
+
+    fs.rmSync(manifestPath);
+    const target = path.join(root, "complete.json");
+    fs.writeFileSync(target, complete("full"), "utf8");
+    fs.symlinkSync(target, manifestPath);
+    expect(resolveWorktreeSeedGate(root).kind).toBe("refused");
+
+    fs.rmSync(manifestPath);
+    expect(spawnSync("mkfifo", [manifestPath]).status).toBe(0);
+    const started = performance.now();
+    expect(resolveWorktreeSeedGate(root).kind).toBe("refused");
+    expect(performance.now() - started).toBeLessThan(2_000);
     expect(isWorktreeSeedPending(root)).toBe(true);
   });
 

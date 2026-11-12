@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { hasVerifiedWorktreeSeedManifest } from "./worktree-seed-manifest.js";
+import { readWorktreeSeedManifestStatus } from "./worktree-seed-manifest.js";
 
 function parseEnvFile(contents: string): Record<string, string> {
   const entries: Record<string, string> = {};
@@ -67,16 +67,32 @@ export function resolveWorktreeEnvFilePath(rootDir: string): string {
   return path.join(resolveWorktreeStateDir(rootDir), ".env");
 }
 
-export function isWorktreeSeedPending(rootDir: string): boolean {
+export type WorktreeSeedGate =
+  | { kind: "ready" }
+  | { kind: "pending" }
+  | { kind: "refused"; message: string };
+
+export function resolveWorktreeSeedGate(rootDir: string): WorktreeSeedGate {
   // SUP-14087 partitions the marker dir per uid; upstream's seed-manifest
   // verification runs inside that partition rather than a fixed `.paperclip`.
   const markerDir = resolveWorktreeStateDir(rootDir);
-  const manifestPath = path.join(markerDir, "seed-manifest.json");
-  if (existsSync(manifestPath)) {
-    return !hasVerifiedWorktreeSeedManifest(manifestPath);
+  const manifest = readWorktreeSeedManifestStatus(path.join(markerDir, "seed-manifest.json"));
+  switch (manifest.kind) {
+    case "verified":
+      return { kind: "ready" };
+    case "incomplete":
+      return { kind: "pending" };
+    case "refused":
+      return { kind: "refused", message: manifest.message };
+    case "absent":
+      return existsSync(path.join(markerDir, "seed-pending")) && !existsSync(path.join(markerDir, "seed-complete"))
+        ? { kind: "pending" }
+        : { kind: "ready" };
   }
-  return existsSync(path.join(markerDir, "seed-pending"))
-    && !existsSync(path.join(markerDir, "seed-complete"));
+}
+
+export function isWorktreeSeedPending(rootDir: string): boolean {
+  return resolveWorktreeSeedGate(rootDir).kind !== "ready";
 }
 
 function expandHomePrefix(value: string): string {
