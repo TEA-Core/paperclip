@@ -388,6 +388,9 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
           branchName: call.branchName!,
         });
         await occupantMayFinish.promise;
+        // An open issue after a successful run gets a disposition-repair wake that would keep
+        // holding the workspace; close it so releasing the occupant really frees the worktree.
+        await db.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.occupantIssueId));
       }
       return {
         exitCode: 0,
@@ -820,7 +823,7 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
         delayMs: 1_000,
       });
 
-      // One real failure, then two workspace_busy waits.
+      // One real failure, then two workspace_busy waits (waits are counted per reason and spend no failure budget).
       const firstRetry = await insertContenderRun(seeded, {
         status: "cancelled",
         errorCode: "workspace_busy",
@@ -829,14 +832,14 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
         resultJson: workspaceWait,
       });
       const busy = await scheduled(await heartbeat.scheduleBoundedRetry(firstRetry, busyRetry(1)));
-      expect(busy).toMatchObject({ scheduledRetryReason: "workspace_busy", scheduledRetryAttempt: 2 });
+      expect(busy).toMatchObject({ scheduledRetryReason: "workspace_busy", scheduledRetryAttempt: 1 });
       expect(busy.contextSnapshot).toMatchObject({ failureRetriesBeforeWorkspaceWait: 1 });
       await db
         .update(heartbeatRuns)
         .set({ status: "cancelled", errorCode: "workspace_busy", resultJson: workspaceWait })
         .where(eq(heartbeatRuns.id, busy.id));
       const busyAgain = await scheduled(await heartbeat.scheduleBoundedRetry(busy.id, busyRetry(2)));
-      expect(busyAgain).toMatchObject({ scheduledRetryReason: "workspace_busy", scheduledRetryAttempt: 3 });
+      expect(busyAgain).toMatchObject({ scheduledRetryReason: "workspace_busy", scheduledRetryAttempt: 2 });
       expect(busyAgain.contextSnapshot).toMatchObject({ failureRetriesBeforeWorkspaceWait: 1 });
       await failBeforeProvider(busyAgain.id);
       expect(executionFailureRetryCount(await readRun(busyAgain.id))).toBe(1);
@@ -859,7 +862,7 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
       const busyAfterOccupancy = await scheduled(
         await heartbeat.scheduleBoundedRetry(occupancyWait, busyRetry(5)),
       );
-      expect(busyAfterOccupancy).toMatchObject({ scheduledRetryReason: "workspace_busy", scheduledRetryAttempt: 6 });
+      expect(busyAfterOccupancy).toMatchObject({ scheduledRetryReason: "workspace_busy", scheduledRetryAttempt: 1 });
       expect(busyAfterOccupancy.contextSnapshot).toMatchObject({ failureRetriesBeforeWorkspaceWait: 1 });
     }, 60_000);
 
