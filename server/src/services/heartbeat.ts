@@ -13035,8 +13035,125 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
+  // A due monitor with no assignee has no agent to wake, so `dispatch` cannot
+  // run. For the default `wake_owner` policy the monitor is the card's only
+  // wake path, so it must surface a board recovery action instead of staying
+  // armed and unreachable (SUP-24059). Other policies keep their previous
+  // behaviour: unassigned cards are not selected.
+  async function raiseUnassignedIssueMonitorRecovery(
+    claimed: IssueMonitorDispatchRow,
+    input: { now: Date },
+  ) {
+    if (claimed.assigneeAgentId || !claimed.monitorNextCheckAt) {
+      throw conflict("Issue monitor is not an unassigned due monitor");
+    }
+    const scheduledAtIso = claimed.monitorNextCheckAt.toISOString();
+    const policy = normalizeIssueExecutionPolicy(
+      claimed.executionPolicy ?? null,
+    );
+    const monitor = policy?.monitor ?? null;
+    const recoveryActionsSvc = issueRecoveryActionService(db);
+    const fingerprint = `no_live_path_unowned:${claimed.companyId}:${claimed.id}`;
+
+    try {
+      // Any active or escalated action already gives the board a recovery
+      // surface; upserting over a different kind would overwrite it in place.
+      const existingAction = await recoveryActionsSvc.getActiveForIssue(
+        claimed.companyId,
+        claimed.id,
+      );
+      const createdAction = existingAction
+        ? null
+        : await recoveryActionsSvc.upsertSourceScoped({
+            companyId: claimed.companyId,
+            sourceIssueId: claimed.id,
+            kind: "no_live_path_unowned",
+            ownerType: "board",
+            previousOwnerAgentId: null,
+            cause: "no_live_path_unowned",
+            fingerprint,
+            evidence: {
+              identifier: claimed.identifier,
+              status: claimed.status,
+              source: "issue_monitor_unassigned_due",
+              monitorNextCheckAt: scheduledAtIso,
+              monitorServiceName: monitor?.serviceName ?? null,
+              monitorNotes: claimed.monitorNotes ?? null,
+            },
+            nextAction:
+              "A scheduled monitor came due but this issue has no assignee, so no agent could be woken. Assign an owner agent or record an intentional manual resolution.",
+            wakePolicy: null,
+            monitorPolicy: null,
+            maxAttempts: null,
+            lastAttemptAt: input.now,
+          });
+
+      await db
+        .update(issues)
+        .set({
+          ...buildIssueMonitorClearedPatch({
+            issue: claimed,
+            policy,
+            clearReason: "invalid_assignee",
+            clearedAt: input.now,
+          }),
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, claimed.id));
+
+      await logActivity(db, {
+        companyId: claimed.companyId,
+        actorType: "system",
+        actorId: "heartbeat_scheduler",
+        agentId: null,
+        runId: null,
+        action: "issue.monitor_skipped",
+        entityType: "issue",
+        entityId: claimed.id,
+        details: {
+          identifier: claimed.identifier,
+          nextCheckAt: scheduledAtIso,
+          attemptCount: claimed.monitorAttemptCount ?? 0,
+          notes: claimed.monitorNotes ?? null,
+          serviceName: monitor?.serviceName ?? null,
+          recoveryPolicy: monitorRecoveryPolicy(monitor),
+          clearReason: "invalid_assignee",
+          reason: "Issue has no assignee agent; board recovery action raised",
+          recoveryActionCreated: Boolean(createdAction),
+          source: "scheduled",
+        },
+      });
+
+      if (createdAction?.kind === "no_live_path_unowned") {
+        await logActivity(db, {
+          companyId: claimed.companyId,
+          actorType: "system",
+          actorId: "issue_monitor_unassigned_due",
+          action: "issue.no_live_path_unowned_escalated",
+          entityType: "issue",
+          entityId: claimed.id,
+          details: {
+            source: "heartbeat.issue_monitor_unassigned_due",
+            fingerprint,
+          },
+        });
+      }
+      return { outcome: "skipped" as const, reason: "invalid_assignee" };
+    } catch (err) {
+      await db
+        .update(issues)
+        .set({ monitorWakeRequestedAt: null, updatedAt: new Date() })
+        .where(eq(issues.id, claimed.id));
+      throw err;
+    }
+  }
+
   async function tickDueIssueMonitors(now = new Date()) {
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    const hasDispatchTarget = or(
+      sql`${issues.assigneeAgentId} is not null`,
+      sql`coalesce(${issues.executionPolicy}->'monitor'->>'recoveryPolicy', 'wake_owner') = 'wake_owner'`,
+    );
     const dueMonitors = await db
       .select(issueMonitorDispatchColumns)
       .from(issues)
@@ -13047,7 +13164,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           sql`${issues.monitorNextCheckAt} is not null`,
           lte(issues.monitorNextCheckAt, now),
           isNull(issues.assigneeUserId),
-          sql`${issues.assigneeAgentId} is not null`,
+          hasDispatchTarget,
           inArray(issues.status, ["in_progress", "in_review", "blocked"]),
           or(
             isNull(issues.monitorWakeRequestedAt),
@@ -13075,7 +13192,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sql`${issues.monitorNextCheckAt} is not null`,
               lte(issues.monitorNextCheckAt, now),
               isNull(issues.assigneeUserId),
-              sql`${issues.assigneeAgentId} is not null`,
+              hasDispatchTarget,
               inArray(issues.status, ["in_progress", "in_review", "blocked"]),
               or(
                 isNull(issues.monitorWakeRequestedAt),
@@ -13090,19 +13207,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (!claimed) continue;
 
       try {
-        const result = await dispatchClaimedIssueMonitor(claimed, {
-          now,
-          source: "automation",
-          triggerDetail: "system",
-          wakeReason: "issue_monitor_due",
-          actorType: "system",
-          actorId: "heartbeat_scheduler",
-          boardApiKeyId: null,
-          agentId: null,
-          runId: null,
-          clearOnClientError: true,
-          activitySource: "scheduled",
-        });
+        const result = claimed.assigneeAgentId
+          ? await dispatchClaimedIssueMonitor(claimed, {
+              now,
+              source: "automation",
+              triggerDetail: "system",
+              wakeReason: "issue_monitor_due",
+              actorType: "system",
+              actorId: "heartbeat_scheduler",
+              boardApiKeyId: null,
+              agentId: null,
+              runId: null,
+              clearOnClientError: true,
+              activitySource: "scheduled",
+            })
+          : await raiseUnassignedIssueMonitorRecovery(claimed, { now });
         if (result.outcome === "triggered") triggered += 1;
         if (result.outcome === "skipped") skipped += 1;
       } catch (err) {
