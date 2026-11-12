@@ -387,6 +387,7 @@ describe.sequential("execution workspace runtime control conflict and failure re
       try {
         const manifestPath = path.join(fixture.configDir, "seed-manifest.json");
         fs.rmSync(manifestPath);
+        fs.writeFileSync(path.join(fixture.configDir, "seed-skip-no-source"), "{}\n");
         if (variant === "fifo") {
           expect(spawnSync("mkfifo", [manifestPath]).status).toBe(0);
         } else {
