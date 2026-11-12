@@ -810,6 +810,12 @@ describeEmbeddedPostgres("summary slot service", () => {
       expect(issueRow.description).toContain("lastCommentAt 2026-11-05T12:30:00.000Z");
       expect(issueRow.description).toContain("lastCommentAt null");
       expect(issueRow.description).toContain(
+        "GET /api/issues/{identifier}/comments",
+      );
+      expect(issueRow.description).toContain(
+        "substituting the issue's identifier exactly as a snapshot row prints it",
+      );
+      expect(issueRow.description).not.toContain(
         "GET /api/companies/{companyId}/issues/{ref}/comments",
       );
       expect(issueRow.description).toContain("snapshot is an index, not proof of what a card still owes");
