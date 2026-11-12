@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
+import { PgTransaction } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agentApiKeys, companies, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, PLUGIN_EVENT_TYPES, type PluginEventType } from "@paperclipai/shared";
@@ -281,7 +282,7 @@ export async function logActivity(
   postCommitPublications?: ActivityPublication[],
 ) {
   try {
-    const { activity, publication } = await persistActivity(db, input);
+    const { activity, publication } = await persistBestEffortActivity(db, input);
     if (postCommitPublications) {
       postCommitPublications.push(publication);
     } else {
@@ -305,6 +306,11 @@ export async function logActivity(
       "activity log write failed; the audited mutation is unaffected",
     );
   }
+}
+
+async function persistBestEffortActivity(db: Db, input: LogActivityInput) {
+  if (!(db instanceof PgTransaction)) return persistActivity(db, input);
+  return db.transaction(async (savepoint) => persistActivity(savepoint as unknown as Db, input));
 }
 
 /**
