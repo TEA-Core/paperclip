@@ -24188,9 +24188,8 @@ export function issueRoutes(
             },
             ...(escalationApproval ? {
               beforeResolveInTransaction: async (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => {
-                  const [lockedIssue] = await tx.select().from(issueRows)
-                  .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)))
-                  .for("update");
+                const lockedIssue = await svc.getByIdForUpdate(issue.id, tx as unknown as Db);
+
                 if (!lockedIssue) throw notFound("Issue not found");
                 if (lockedIssue.deliveryRequirement !== issue.deliveryRequirement) {
                   throw conflict("Card delivery classification changed before the final delivery preflight; retry the final verdict", {
