@@ -1880,6 +1880,12 @@ describe("claude_local ACP lane", () => {
 
   it("sends assignment-owned markdown and ordered distinct wake comments at the ACP boundary", async () => {
     const root = await makeTempRoot("paperclip-claude-acp-context-owner-");
+    // Fork: the ACP lane checks the shared Claude OAuth credentials through the
+    // managed-home seam. Keep both homes inside the temp root and seed them.
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+    process.env.PAPERCLIP_INSTANCE_ID = "test";
+    process.env.HOME = path.join(root, "server-home");
+    await seedValidOauthCredentials(path.join(root, "server-home"));
     const runtimes: FakeRuntime[] = [];
     const execute = createClaudeAcpExecutor({
       createRuntime: (options: FakeRuntimeOptions) => {
@@ -1949,6 +1955,10 @@ describe("claude_local ACP lane", () => {
 
   it("delivers owned assignment and current events through fresh and healthy resumed ACP turns", async () => {
     const root = await makeTempRoot("paperclip-claude-acp-owned-context-");
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+    process.env.PAPERCLIP_INSTANCE_ID = "test";
+    process.env.HOME = path.join(root, "server-home");
+    await seedValidOauthCredentials(path.join(root, "server-home"));
     const runtimes: FakeRuntime[] = [];
     const fixture = createPromptContextFixture();
     const context = {
@@ -2004,6 +2014,10 @@ describe("claude_local ACP lane", () => {
 
   it("restores the full assignment and current event history when a resume session is missing", async () => {
     const root = await makeTempRoot("paperclip-claude-acp-missing-resume-context-");
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+    process.env.PAPERCLIP_INSTANCE_ID = "test";
+    process.env.HOME = path.join(root, "server-home");
+    await seedValidOauthCredentials(path.join(root, "server-home"));
     const runtimes: MissingResumeRuntime[] = [];
     const assignment = "## Owned assignment\n\nRebuild the launch card. Rebuild the launch card.";
     const compact = "## Compact assignment";
