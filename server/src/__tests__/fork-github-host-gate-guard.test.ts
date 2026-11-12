@@ -114,10 +114,14 @@ describe("fold decision D1 call-site guard", () => {
       },
       // The native session executor only runs this under input.managedGitHub, which heartbeat
       // sets to `!useHostGitHub && selection.configured`: the driver gate is upstream of the site.
+      // skill-source-github-access.ts (upstream #14713, GitHub-synced skill sources) is
+      // TOOL-PLANE per D1: the control plane reads the repository over the GitHub API with a
+      // Bearer header for an authenticated agent run; the token never reaches the run's host.
       resolveGitHubOperationCredentials: {
         "services/git-credentials.ts": 1,
         "routes/connection-intents.ts": 1,
         "services/native-runtime/native-session-executor.ts": 1,
+        "services/skill-source-github-access.ts": 1,
       },
       filterResolvedGitHubConnectionsForRun: {
         "services/heartbeat.ts": 2,

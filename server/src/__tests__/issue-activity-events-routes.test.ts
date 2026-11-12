@@ -185,6 +185,8 @@ function makeIssue() {
 function issueUpdateWithReceipt<T extends Record<string, unknown>>(issue: T, patch: Record<string, unknown>) {
   const {
     actorAgentId: _actorAgentId,
+    actorRunId: _actorRunId,
+    actorRunStopId: _actorRunStopId,
     actorUserId: _actorUserId,
     blockedByIssueIds: _blockedByIssueIds,
     boardApiKeyId: _boardApiKeyId,

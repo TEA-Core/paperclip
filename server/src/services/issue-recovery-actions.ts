@@ -1,6 +1,7 @@
-import { and, asc, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, isNotNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
+import { heartbeatRuns, issueRecoveryActions, issues, workspaceOperations } from "@paperclipai/db";
+import { isUuidLike } from "@paperclipai/shared";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -9,6 +10,8 @@ import type {
   IssueRecoveryActionStatus,
 } from "@paperclipai/shared";
 import { isTerminalRecoveryAction } from "./issue-continuation-path.js";
+
+import { isNativeWorkspaceFinalizationOperationActive } from "./workspace-operations.js";
 
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
@@ -176,6 +179,68 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
     }
   }
 
+  // Coordinator retries reuse the original native run. They are not legacy
+  // scheduled retries, and workspace export can run while the heartbeat still
+  // records its earlier failure. Project their actual activity for every reader.
+  async function projectNativeRunActivity(
+    companyId: string,
+    actions: IssueRecoveryAction[],
+    dbOrTx: DbOrTransaction,
+  ) {
+    const nativeActions = actions.filter((action) => action.wakePolicy?.kind === "resume_native_run");
+    for (const action of nativeActions) action.nativeRunActivity = null;
+    const runIds = [...new Set(nativeActions.flatMap((action) => {
+      const runId = action.wakePolicy?.runId;
+      return typeof runId === "string" && isUuidLike(runId) ? [runId] : [];
+    }))];
+    if (runIds.length === 0) return;
+    const activity = await dbOrTx.select({
+      runId: heartbeatRuns.id,
+      issueId: heartbeatRuns.nativeIssueId,
+      status: heartbeatRuns.status,
+      finishedAt: heartbeatRuns.finishedAt,
+      workspaceOperationId: workspaceOperations.id,
+    }).from(heartbeatRuns).leftJoin(workspaceOperations, and(
+      eq(workspaceOperations.companyId, heartbeatRuns.companyId),
+      eq(workspaceOperations.heartbeatRunId, heartbeatRuns.id),
+      eq(workspaceOperations.issueId, heartbeatRuns.nativeIssueId),
+      eq(workspaceOperations.phase, "workspace_finalize"),
+      eq(workspaceOperations.status, "running"),
+      isNull(workspaceOperations.finishedAt),
+      sql`${workspaceOperations.metadata}->>'owningService' = 'native_workspace_finalizer'`,
+    )).where(and(
+      eq(heartbeatRuns.companyId, companyId),
+      eq(heartbeatRuns.runtimeMode, "native"),
+      inArray(heartbeatRuns.id, runIds),
+      or(
+        and(inArray(heartbeatRuns.status, ["queued", "running"]), isNull(heartbeatRuns.finishedAt)),
+        isNotNull(workspaceOperations.id),
+      ),
+    )).orderBy(desc(workspaceOperations.startedAt));
+    const activityByRun = new Map<string, (typeof activity)[number]>();
+    for (const row of activity) {
+      const liveOperation = row.workspaceOperationId && row.issueId
+        && isNativeWorkspaceFinalizationOperationActive({
+          operationId: row.workspaceOperationId, companyId, runId: row.runId, issueId: row.issueId,
+        });
+      const liveHeartbeat = ["queued", "running"].includes(row.status) && row.finishedAt === null;
+      if (!liveHeartbeat && !liveOperation) continue;
+      const projected = { ...row, workspaceOperationId: liveOperation ? row.workspaceOperationId : null };
+      if (!activityByRun.has(row.runId) || (!activityByRun.get(row.runId)?.workspaceOperationId && liveOperation)) {
+        activityByRun.set(row.runId, projected);
+      }
+    }
+    for (const action of nativeActions) {
+      const row = activityByRun.get(String(action.wakePolicy?.runId).toLowerCase());
+      if (!row || row.issueId !== action.sourceIssueId) continue;
+      action.nativeRunActivity = {
+        runId: row.runId,
+        status: row.workspaceOperationId || row.status === "running" ? "running" : "queued",
+        workspaceOperationId: row.workspaceOperationId,
+      };
+    }
+  }
+
   async function getActiveForIssue(
     companyId: string,
     sourceIssueId: string,
@@ -194,7 +259,10 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
       .orderBy(desc(issueRecoveryActions.updatedAt))
       .limit(1)
       .then((rows) => rows[0] ?? null);
-    return row ? toReadModel(row) : null;
+    if (!row) return null;
+    const action = toReadModel(row);
+    await projectNativeRunActivity(companyId, [action], dbOrTx);
+    return action;
   }
 
   // ADR-093 D2: `getActiveForIssue` counts BOTH `active` and `escalated` rows
@@ -466,6 +534,7 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
     for (const row of rows) {
       if (!result.has(row.sourceIssueId)) result.set(row.sourceIssueId, toReadModel(row));
     }
+    await projectNativeRunActivity(companyId, [...result.values()], db);
     return result;
   }
 

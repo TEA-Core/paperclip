@@ -97,6 +97,15 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   }
 
   afterEach(async () => {
+    // The no-op process fixtures deliberately leave no task disposition. The
+    // real lifecycle can now leave a bounded, scheduled repair after the
+    // monitor assertions. Cancel that remaining work only during teardown.
+    const heartbeat = heartbeatService(db);
+    await heartbeat.drainActiveRunExecutions();
+    const pending = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(sql`${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')`);
+    for (const run of pending) await heartbeat.cancelRun(run.id, "Monitor fixture teardown", { suppressImmediateRecovery: true });
+    await heartbeat.drainActiveRunExecutions();
     seededAgentIds.clear();
     // Hold the quiesce across every retry, not just one cleanupRows call, so a
     // failed attempt cannot hand the next one a freshly dispatched run.

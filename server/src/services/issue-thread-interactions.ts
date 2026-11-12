@@ -1,4 +1,8 @@
-import { currentContinuationOrigins } from "./execution-continuation.js";
+import {
+  currentContinuationOrigins,
+  deliveredContinuationCommentIds,
+} from "./execution-continuation.js";
+import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
 import { connectionIntentDeliveries } from "@paperclipai/db";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -6,6 +10,7 @@ import {
   asc,
   desc,
   eq,
+  gte,
   inArray,
   isNotNull,
   isNull,
@@ -16,6 +21,7 @@ import {
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  authUsers,
   companySecretProposals,
   companies,
   documents,
@@ -91,6 +97,9 @@ import {
 import { z } from "zod";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
+import { authorizationService } from "./authorization.js";
+import { isCloudManagedInstance } from "./cloud-instance.js";
+import { resolveDeploymentMode } from "../config-file.js";
 import {
   REQUEST_CONFIRMATION_INTERACTION_KINDS,
   TARGET_BOUND_INTERACTION_KINDS,
@@ -108,6 +117,7 @@ import {
   readAcceptedPlanConfirmationTarget,
   runWorkspaceIsFinalized,
 } from "./issues.js";
+import { isUniqueViolation } from "../db-errors.js";
 import { questionResponseDeliveryValues } from "./question-response-delivery.js";
 import {
   cancelPendingIssueInteractionChatPublications,
@@ -146,6 +156,14 @@ type InteractionActor = {
   resolutionDetails?: Record<string, unknown>;
 };
 
+async function assertInteractionRunWriteAllowed(tx: Db, issue: { id: string; companyId: string }, actor: InteractionActor) {
+  if (!actor.agentId || !actor.runId) return;
+  // Keep the same issue -> run lock order as task mutation and checkout.
+  await tx.select({ id: issues.id }).from(issues)
+    .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("update");
+  await assertAgentRunWriteAllowed(tx, issue.companyId, actor);
+}
+
 type CreateInteractionOptions = {
   /** Keep independently owned pending cards actionable. Internal runtime bridges use this. */
   supersedePendingSiblingInteractions?: boolean;
@@ -178,6 +196,9 @@ export type IssueThreadInteractionServiceOptions = {
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type InteractionResolutionMutationOptions = {
+  /** Confirmation accept/reject nested in an outer transaction must defer these
+   * effects and flush them with the root database only after its commit. */
+  deferConfirmationCommitEffects?: (effect: (committedDb: Db) => Promise<void>) => void;
   beforeResolveInTransaction?: (tx: DbTransaction) => Promise<void>;
   afterResolveInTransaction?: (
     tx: DbTransaction,
@@ -557,30 +578,23 @@ function isUserCommentSupersedableKind(
   ).includes(kind);
 }
 
+// Drizzle wraps the driver error (`Failed query: ...`), so the SQLSTATE and the
+// constraint name are on `cause`; isUniqueViolation walks that chain.
 function isIssueThreadInteractionIdempotencyConflict(error: unknown): boolean {
-  if (typeof error !== "object" || error === null) return false;
-  const err = error as {
-    code?: string;
-    constraint?: string;
-    constraint_name?: string;
-  };
-  const constraint = err.constraint ?? err.constraint_name;
-  return (
-    err.code === "23505" &&
-    constraint === ISSUE_THREAD_INTERACTION_IDEMPOTENCY_CONSTRAINT
-  );
+  return isUniqueViolation(error, ISSUE_THREAD_INTERACTION_IDEMPOTENCY_CONSTRAINT);
 }
 
 function isEquivalentCreateRequest(
   row: IssueThreadInteractionRow,
   input: CreateIssueThreadInteraction,
   actor: InteractionActor,
+  defaultAddresseeUserId: string | null = null,
 ) {
   return (
     row.kind === input.kind &&
     row.requestedResolverPolicy === input.resolverPolicy &&
     (row.addresseeAgentId ?? null) === (input.addresseeAgentId ?? null) &&
-    (row.addresseeUserId ?? null) === (input.addresseeUserId ?? null) &&
+    (row.addresseeUserId ?? defaultAddresseeUserId) === (input.addresseeUserId ?? defaultAddresseeUserId) &&
     row.continuationPolicy === input.continuationPolicy &&
     (row.idempotencyKey ?? null) === (input.idempotencyKey ?? null) &&
     (row.sourceCommentId ?? null) === (input.sourceCommentId ?? null) &&
@@ -847,7 +861,7 @@ function normalizeCreateInteractionInput(
         ...input,
         payload: {
           ...input.payload,
-          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? true,
+          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? false,
         },
       };
     case "request_confirmation":
@@ -855,7 +869,7 @@ function normalizeCreateInteractionInput(
         ...input,
         payload: {
           ...input.payload,
-          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? true,
+          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? false,
         },
       };
     case "request_checkbox_confirmation":
@@ -863,7 +877,7 @@ function normalizeCreateInteractionInput(
         ...input,
         payload: {
           ...input.payload,
-          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? true,
+          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? false,
         },
       };
     case "request_item_verdicts":
@@ -871,7 +885,7 @@ function normalizeCreateInteractionInput(
         ...input,
         payload: {
           ...input.payload,
-          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? true,
+          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? false,
         },
       };
     case "request_board_approval":
@@ -2126,6 +2140,7 @@ export function issueThreadInteractionService(
     const now = new Date();
     const postCommitActivityPublications: ActivityPublication[] = [];
     const result = await db.transaction(async (tx) => {
+      await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor);
       await args.mutationOptions?.beforeResolveInTransaction?.(tx);
       // Policy mutations and review transitions use the same issue-row lock,
       // so the authoritative review policy and requester are stable through
@@ -2369,9 +2384,12 @@ export function issueThreadInteractionService(
         continuationIssue,
       };
     });
-    for (const publication of postCommitActivityPublications)
-      publishActivity(publication);
-    await emitInteractionResolvedTelemetry(db, result.interaction);
+    const publish = async (committedDb: Db) => {
+      for (const publication of postCommitActivityPublications) publishActivity(publication);
+      await emitInteractionResolvedTelemetry(committedDb, result.interaction);
+    };
+    if (args.mutationOptions?.deferConfirmationCommitEffects) args.mutationOptions.deferConfirmationCommitEffects(publish);
+    else await publish(db);
     return result;
   }
 
@@ -2405,6 +2423,7 @@ export function issueThreadInteractionService(
 
     const now = new Date();
     const updated = await db.transaction(async (tx) => {
+      await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor);
       await args.mutationOptions?.beforeResolveInTransaction?.(tx);
       const issueContext = await tx
         .select({
@@ -2547,7 +2566,9 @@ export function issueThreadInteractionService(
     });
 
     const rejected = hydrateInteraction(updated);
-    await emitInteractionResolvedTelemetry(db, rejected);
+    const publish = (committedDb: Db) => emitInteractionResolvedTelemetry(committedDb, rejected);
+    if (args.mutationOptions?.deferConfirmationCommitEffects) args.mutationOptions.deferConfirmationCommitEffects(publish);
+    else await publish(db);
     return rejected;
   }
 
@@ -3338,6 +3359,24 @@ export function issueThreadInteractionService(
       const data = normalizeCreateInteractionInput(
         createIssueThreadInteractionSchema.parse(input),
       );
+      // Chat ownership is server-owned and immutable. Ordinary human questions
+      // must not depend on a model copying an opaque user identity correctly.
+      let defaultAddresseeUserId: string | null = null;
+      if (data.kind === "ask_user_questions" && !data.addresseeAgentId) {
+        const [conversation] = await db
+          .select({ agentId: issues.conversationAgentId, userId: issues.conversationUserId })
+          .from(issues)
+          .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId)));
+        if (conversation?.agentId && conversation.userId) {
+          defaultAddresseeUserId = conversation.userId;
+          if (data.addresseeUserId && data.addresseeUserId !== defaultAddresseeUserId) {
+            throw unprocessable("Chat questions must address the conversation owner; omit addresseeUserId", {
+              code: "interaction_chat_addressee_mismatch",
+            });
+          }
+          data.addresseeUserId = defaultAddresseeUserId;
+        }
+      }
       const usedDeprecatedResolverPolicyAlias =
         data.resolverPolicy === "board_or_agents" ||
         data.resolverPolicy === "board_only";
@@ -3431,7 +3470,7 @@ export function issueThreadInteractionService(
           idempotencyKey: normalizedData.idempotencyKey,
         });
         if (existing) {
-          if (!isEquivalentCreateRequest(existing, normalizedData, actor)) {
+          if (!isEquivalentCreateRequest(existing, normalizedData, actor, defaultAddresseeUserId)) {
             throw conflict(
               "Interaction idempotency key already exists for a different request",
               {
@@ -3467,11 +3506,16 @@ export function issueThreadInteractionService(
 
       let originCommentIds: string[] = data.sourceCommentId ? [data.sourceCommentId] : [];
       let sourceIdentityContextId: string | null = null;
+      let sourceRunContext: Record<string, unknown> | null = null;
+      let sourceRunCreatedAt: Date | null = null;
       if (data.sourceRunId) {
         const sourceRun = await db
           .select({
             contextSnapshot: heartbeatRuns.contextSnapshot,
             companyId: heartbeatRuns.companyId,
+            agentId: heartbeatRuns.agentId,
+            nativeIssueId: heartbeatRuns.nativeIssueId,
+            createdAt: heartbeatRuns.createdAt,
             activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
           })
           .from(heartbeatRuns)
@@ -3480,6 +3524,22 @@ export function issueThreadInteractionService(
         if (!sourceRun || sourceRun.companyId !== issue.companyId) {
           throw unprocessable("sourceRunId must belong to the same company");
         }
+        if (data.kind === "ask_user_questions") {
+          if (actor.agentId && sourceRun.agentId !== actor.agentId) {
+            throw unprocessable("sourceRunId must belong to the creating agent");
+          }
+          const snapshot = sourceRun.contextSnapshot ?? {};
+          const boundIssueIds = [
+            sourceRun.nativeIssueId,
+            snapshot.issueId,
+            snapshot.taskId,
+          ].filter((value): value is string => typeof value === "string" && value.length > 0);
+          if (boundIssueIds.some((boundIssueId) => boundIssueId !== issue.id)) {
+            throw unprocessable("sourceRunId must belong to the same issue");
+          }
+        }
+        sourceRunContext = sourceRun.contextSnapshot;
+        sourceRunCreatedAt = sourceRun.createdAt;
         originCommentIds = [...new Set([...originCommentIds, ...await currentContinuationOrigins(db, issue.companyId, issue.id, sourceRun.contextSnapshot)])];
         sourceIdentityContextId = actor.identityContextId ?? sourceRun.activeIdentityContextId;
         if (sourceIdentityContextId) {
@@ -3506,8 +3566,9 @@ export function issueThreadInteractionService(
         // Idempotent reuse above stays allowed so retries of a pre-close
         // create keep returning the (by now expired) original.
         const result = await db.transaction(async (tx) => {
+          await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
           const [issueRow] = await tx
-            .select({ status: issues.status })
+            .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId, conversationAgentId: issues.conversationAgentId, conversationUserId: issues.conversationUserId })
             .from(issues)
             .where(
               and(
@@ -3518,6 +3579,67 @@ export function issueThreadInteractionService(
             .for("update");
           if (!issueRow || isTerminalIssueStatus(issueRow.status)) {
             throw conflict("Cannot create an interaction on a closed issue");
+          }
+          if (data.addresseeUserId) {
+            const [user] = await tx.select({ id: authUsers.id }).from(authUsers)
+              .where(eq(authUsers.id, data.addresseeUserId));
+            const cloudManaged = isCloudManagedInstance();
+            // No-login installs have an implicit board, which need not have an
+            // auth row. Never infer this authority in authenticated/Cloud mode.
+            const localImplicit = data.addresseeUserId === "local-board"
+              && !cloudManaged && resolveDeploymentMode() === "local_trusted";
+            // Use the normal board mutation policy, including viewer restrictions,
+            // local/instance-admin eligibility and Cloud's no-stale-admin rule.
+            const decision = user || localImplicit ? await authorizationService(tx).decide({
+              actor: {
+                type: "board",
+                userId: data.addresseeUserId,
+                source: localImplicit ? "local_implicit" : cloudManaged ? "cloud_tenant" : "session",
+              },
+              action: "issue:mutate",
+              resource: { type: "issue", companyId: issue.companyId, issueId: issue.id, ...issueRow },
+            }) : null;
+            if (!decision?.allowed) {
+              throw unprocessable("addresseeUserId must identify a user authorized to respond in this company", {
+                code: "interaction_addressee_user_unavailable",
+              });
+            }
+          }
+          if (
+            data.kind === "ask_user_questions" &&
+            sourceRunContext &&
+            sourceRunCreatedAt
+          ) {
+            const delivered = deliveredContinuationCommentIds(sourceRunContext);
+            if (delivered.known) {
+              const newerHumanComments = await tx
+                .select({ id: issueComments.id })
+                .from(issueComments)
+                .where(
+                  and(
+                    eq(issueComments.companyId, issue.companyId),
+                    eq(issueComments.issueId, issue.id),
+                    eq(issueComments.authorType, "user"),
+                    isNotNull(issueComments.authorUserId),
+                    ne(issueComments.authorUserId, "board-concierge"),
+                    isNull(issueComments.createdByRunId),
+                    isNull(issueComments.deletedAt),
+                    gte(issueComments.createdAt, sourceRunCreatedAt),
+                  ),
+                );
+              const undelivered = newerHumanComments.filter(
+                (comment) => !delivered.ids.has(comment.id),
+              );
+              if (undelivered.length > 0) {
+                throw conflict(
+                  "New user comments arrived after this run's context; continue after queued comments are delivered",
+                  {
+                    reason: "newer_comment_not_delivered",
+                    commentIds: undelivered.map((comment) => comment.id),
+                  },
+                );
+              }
+            }
           }
           // Validate the plan/document confirmation target inside the same
           // transaction (locking the document row) so the latest-revision check
@@ -3562,16 +3684,15 @@ export function issueThreadInteractionService(
 
           // An agent replacing its own still-pending card supersedes the older
           // one so the thread never accumulates stale sibling cards. This covers
-          // request_confirmation drafts and ask_user_questions (PAP-437: probe
-          // question cards that agents never withdrew). Each kind keeps its own
-          // result shape. Scoped strictly to the same agent + issue + kind, so
-          // other agents' or other kinds' pending cards are untouched.
+          // request_confirmation drafts and ordinary task questions. Agent Chat
+          // questions remain answerable in history even when another is asked.
+          // Scoped to the same agent + issue + kind; other actors are untouched.
           const canSupersedeSiblingCards =
             options.supersedePendingSiblingInteractions !== false &&
             ((data.kind === "request_confirmation" &&
               data.payload.toolAction === undefined &&
               data.payload.secretProposal === undefined) ||
-              data.kind === "ask_user_questions");
+              (data.kind === "ask_user_questions" && (!issueRow.conversationAgentId || !issueRow.conversationUserId)));
           if (!actor.agentId || !canSupersedeSiblingCards) {
             await enqueueIssueInteractionChatPublications(
               tx as unknown as Db,
@@ -3603,6 +3724,7 @@ export function issueThreadInteractionService(
                 eq(issueThreadInteractions.createdByAgentId, actor.agentId),
                 eq(issueThreadInteractions.status, "pending"),
                 ne(issueThreadInteractions.id, row.id),
+
               ),
             )
             .returning();
@@ -3649,7 +3771,7 @@ export function issueThreadInteractionService(
           idempotencyKey: normalizedData.idempotencyKey,
         });
         if (!existing) throw error;
-        if (!isEquivalentCreateRequest(existing, normalizedData, actor)) {
+        if (!isEquivalentCreateRequest(existing, normalizedData, actor, defaultAddresseeUserId)) {
           throw conflict(
             "Interaction idempotency key already exists for a different request",
             {
@@ -3868,6 +3990,7 @@ export function issueThreadInteractionService(
       const createdWakeTargets: IssueWakeTarget[] = [];
 
       await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         const resolvedAt = new Date();
         const [claimed] = await tx
           .update(issueThreadInteractions)
@@ -4026,6 +4149,7 @@ export function issueThreadInteractionService(
       assertIssueOpenForInteractionResolution(issue);
       const data = submitIssueThreadInteractionVerdictsSchema.parse(input);
       const submission = await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         const current = await tx
           .select()
           .from(issueThreadInteractions)
@@ -4163,8 +4287,9 @@ export function issueThreadInteractionService(
         throw interactionTerminalError(current);
       }
 
-      const [updated] = await db
-        .update(issueThreadInteractions)
+      const [updated] = await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
+        return tx.update(issueThreadInteractions)
         .set({
           status: "rejected",
           result: {
@@ -4184,6 +4309,7 @@ export function issueThreadInteractionService(
           ),
         )
         .returning();
+      });
 
       if (!updated) {
         throw interactionAlreadyResolvedError();
@@ -4210,6 +4336,9 @@ export function issueThreadInteractionService(
       // machine; createdByRunId can. Only genuine human comments (no run context) supersede.
       if (comment.createdByRunId) return [];
 
+      const [scope] = await db.select({ conversationAgentId: issues.conversationAgentId, conversationUserId: issues.conversationUserId })
+        .from(issues).where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId)));
+
       const rows = await db
         .select()
         .from(issueThreadInteractions)
@@ -4225,6 +4354,7 @@ export function issueThreadInteractionService(
         );
 
       const superseded = rows.filter((row) => {
+        if (row.kind === "ask_user_questions" && scope?.conversationAgentId && scope.conversationUserId) return false;
         if (!isUserCommentSupersedableKind(row.kind)) return false;
         const interaction = hydrateInteraction(
           row,
@@ -4731,6 +4861,7 @@ export function issueThreadInteractionService(
       // review queue while the card is still pending, and an executable
       // request must not outlive a withdrawn card.
       const updated = await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         await resolveLinkedToolActionRequests(tx, current, {
           status: "cancelled",
           fromStatuses: ["pending", "approved"],
@@ -4832,6 +4963,7 @@ export function issueThreadInteractionService(
       });
 
       const updated = await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         await mutationOptions.beforeResolveInTransaction?.(tx);
         const resolvedAt = new Date();
         const [row] = await tx
@@ -4907,6 +5039,7 @@ export function issueThreadInteractionService(
       const reason = data.reason?.trim() || null;
       const now = new Date();
       const updated = await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         await resolveLinkedToolActionRequests(tx, current, {
           status: "cancelled",
           fromStatuses: ["pending", "approved"],
@@ -5003,6 +5136,7 @@ export function issueThreadInteractionService(
 
       const reason = data.reason?.trim() || null;
       const updated = await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         const resolvedAt = new Date();
         const [row] = await tx
           .update(issueThreadInteractions)

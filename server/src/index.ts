@@ -1,4 +1,6 @@
 /// <reference path="./types/express.d.ts" />
+import { subscribeAllCompanyLiveEvents } from "./services/live-events.js";
+import { chatCompletionDeliveryService } from "./services/chat-completion-delivery.js";
 // Kicks off the OTel bootstrap as early as possible (no-op unless
 // OTEL_EXPORTER_OTLP_ENDPOINT is set). startServer() awaits
 // instrumentationReady before opening DB connections or constructing the
@@ -1332,6 +1334,16 @@ async function startServerWithDatabaseTeardown(
   const ENVIRONMENT_LEASE_CLEANUP_SWEEP_BACKOFF_MS = 5 * 60 * 1000;
   const environmentLeaseCleanupHeartbeat =
     heartbeat ?? heartbeatService(db as any, { pluginWorkerManager });
+  const chatCompletionDeliveries = chatCompletionDeliveryService(db as any, environmentLeaseCleanupHeartbeat);
+  // Activity publication happens after the status transaction commits. This is
+  // a best-effort fast path; the durable outbox and sweeps remain authoritative.
+  const unsubscribeChatCompletions = subscribeAllCompanyLiveEvents(event => {
+    if (heartbeatSchedulerStopped || event.type !== "activity.logged" ||
+      event.payload.action !== "issue.updated" || typeof event.payload.entityId !== "string") return;
+    trackHeartbeatSchedulerWork(chatCompletionDeliveries.sweepPending({ companyId: event.companyId, taskId: event.payload.entityId })
+      .catch(err => logger.error({ err }, "post-commit chat completion delivery failed")));
+  });
+  server.on("close", unsubscribeChatCompletions);
   const connectionDeliveries = connectionIntentDeliveryService(db as any, environmentLeaseCleanupHeartbeat);
   const questionResponseDeliveries = questionResponseDeliveryService(db as any, {
     heartbeat: environmentLeaseCleanupHeartbeat,
@@ -1387,6 +1399,7 @@ async function startServerWithDatabaseTeardown(
       }));
   };
 
+  await chatCompletionDeliveries.sweepPending().catch((err) => logger.error({ err }, "startup chat completion delivery recovery failed"));
   await connectionDeliveries.sweepPending();
   await app.locals.toolGateway.sweepActionReviews().catch((err: unknown) => logger.error({ err }, "startup tool review recovery failed"));
   await app.locals.toolActionDeliveries.sweepPending().catch((err: unknown) => logger.error({ err }, "startup tool review delivery sweep failed"));
@@ -1848,6 +1861,7 @@ async function startServerWithDatabaseTeardown(
           reconciled.dispatchRequeued > 0 ||
           reconciled.continuationRequeued > 0 ||
           reconciled.successfulRunHandoffEscalated > 0 ||
+          reconciled.successfulRunHandoffRetried > 0 ||
           reconciled.escalated > 0
         ) {
           logger.warn(
@@ -2160,6 +2174,7 @@ async function startServerWithDatabaseTeardown(
             logger.error({ err }, "periodic abandoned run scratch sweep failed");
           }));
 
+        trackHeartbeatSchedulerWork(chatCompletionDeliveries.sweepPending().catch((err) => logger.error({ err }, "chat completion delivery failed")));
         trackHeartbeatSchedulerWork(connectionDeliveries.sweepPending().catch((err) => logger.error({ err }, "connection continuation delivery failed")));
         trackHeartbeatSchedulerWork(app.locals.toolGateway.sweepActionReviews().catch((err: unknown) => logger.error({ err }, "tool review recovery failed")));
         trackHeartbeatSchedulerWork(app.locals.toolActionDeliveries.sweepPending().catch((err: unknown) => logger.error({ err }, "tool review delivery sweep failed")));
@@ -2192,6 +2207,7 @@ async function startServerWithDatabaseTeardown(
                 reconciled.dispatchRequeued > 0 ||
                 reconciled.continuationRequeued > 0 ||
                 reconciled.successfulRunHandoffEscalated > 0 ||
+                reconciled.successfulRunHandoffRetried > 0 ||
                 reconciled.escalated > 0
               ) {
                 logger.warn(
@@ -2490,6 +2506,7 @@ async function startServerWithDatabaseTeardown(
     // SUP-14227: surface the latch in the liveness snapshot so a reader can
     // tell "scheduler stopped (all sweeps frozen)" from "ran, found nothing".
     sweepLivenessTracker.setSchedulerStopped(true);
+    unsubscribeChatCompletions();
     clearInterval(executionControlInterval);
     if (heartbeatSchedulerInterval) {
       clearInterval(heartbeatSchedulerInterval);

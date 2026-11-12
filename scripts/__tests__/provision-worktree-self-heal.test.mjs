@@ -129,11 +129,12 @@ process.exit(0);
   return baseCwd;
 }
 
-function runProvision(baseCwd, { pathPrefix, setupWorktree, existingWorktree } = {}) {
+function runProvision(baseCwd, { pathPrefix, setupWorktree, setupInstance, existingWorktree } = {}) {
   const worktreeCwd = existingWorktree ?? makeTempDir("paperclip-provision-worktree-");
   setupWorktree?.(worktreeCwd);
   const worktreesHome = makeTempDir("paperclip-provision-home-");
   const paperclipHome = makeInstanceHome();
+  setupInstance?.(paperclipHome);
   const result = spawnSync("bash", [script], {
     cwd: worktreeCwd,
     encoding: "utf8",
@@ -245,15 +246,45 @@ test("uses the base CLI when its import graph boots", () => {
   );
 });
 
+// FORK DIVERGENCE (SUP-15582): upstream #14795's "explains unavailable instance
+// source config without creating target state" expects an absent seed source to
+// fail with setup guidance. This fork provisions a self-contained worktree for an
+// absent source instead; "provisions a self-contained worktree when no seed source
+// config exists on disk" and "runtime provisioning exits 0 when no seed source
+// config exists on disk" below pin that behavior. Present-but-malformed sources are
+// still refused (the symlink and non-regular cases that follow).
+
 test("rejects a dangling base workspace config symlink instead of falling back", () => {
   const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
   fs.mkdirSync(path.join(baseCwd, ".paperclip"), { recursive: true });
   fs.symlinkSync(path.join(baseCwd, "absent.json"), path.join(baseCwd, ".paperclip", "config.json"));
 
-  const { result } = runProvision(baseCwd);
+  const { result, worktreeCwd } = runProvision(baseCwd);
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /seed source config is a symlink/);
+  assert.match(result.stderr, /is not a canonical file \(base project workspace\)/);
+  assert.doesNotMatch(result.stderr, /checkout-only|provisionCommand/);
+  assert.equal(fs.existsSync(path.join(worktreeCwd, ".paperclip")), false);
+  assert.deepEqual(readCliInvocations(baseCwd), []);
+});
+
+test("rejects a non-regular instance config without suggesting a setup bypass", () => {
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const { result, worktreeCwd } = runProvision(baseCwd, {
+    setupInstance: (home) => {
+      const configPath = path.join(home, "instances", "default", "config.json");
+      fs.rmSync(configPath);
+      fs.mkdirSync(configPath);
+    },
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /is not a canonical file \(control-plane instance\)/);
+  assert.match(result.stderr, /Repair the registered source path/);
+  assert.doesNotMatch(result.stderr, /checkout-only|provisionCommand/);
+  assert.equal(fs.existsSync(path.join(worktreeCwd, ".paperclip")), false);
+  assert.deepEqual(readCliInvocations(baseCwd), []);
 });
 
 test("rejects a dangling base workspace .paperclip symlink instead of falling back", () => {

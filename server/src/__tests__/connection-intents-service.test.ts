@@ -255,10 +255,13 @@ describeEmbeddedPostgres("connectionIntentService", () => {
     const previous = process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
     try {
       process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = " CLOUDflare , supabase ";
+      // Upstream #14725 search also returns weaker name matches (for example
+      // "browser-use-cloud"); the exact service ranks first.
       const denied = await connectionIntentService(db).search(claims, "cloudflare");
-      expect(denied.results).toEqual([
+      expect(denied.results[0]).toEqual(
         expect.objectContaining({ service: "cloudflare", state: "unavailable" }),
-      ]);
+      );
+      expect(denied.results.filter((result) => result.service === "cloudflare")).toHaveLength(1);
       expect((await connectionIntentService(db).search(claims, "github")).results).toEqual([
         expect.objectContaining({ service: "github", state: "available" }),
       ]);
@@ -271,9 +274,10 @@ describeEmbeddedPostgres("connectionIntentService", () => {
 
       process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = "";
       const allowed = await connectionIntentService(db).search(claims, "cloudflare");
-      expect(allowed.results).toEqual([
+      expect(allowed.results[0]).toEqual(
         expect.objectContaining({ service: "cloudflare", state: "available" }),
-      ]);
+      );
+      expect(allowed.results.filter((result) => result.service === "cloudflare")).toHaveLength(1);
     } finally {
       if (previous === undefined) delete process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST;
       else process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = previous;
@@ -780,7 +784,8 @@ describeEmbeddedPostgres("connectionIntentService", () => {
       await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
       await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: issueId }).where(eq(heartbeatRuns.id, runId));
       const authority = new PaperclipRunnerToolAuthority(db, { companyId: claims.company_id, issueId, agentId: claims.sub, runId });
-      const result = await authority.execute({ tool: "connections_search", callId: "discover", arguments: { query: "github" } });
+      const query = "Please help me find tools to continue this task. ".repeat(8) + "Look at my Git Hub pull requests";
+      const result = await authority.execute({ tool: "connections_search", callId: "discover", arguments: { query } });
       expect(result).toMatchObject({ results: expect.arrayContaining([expect.objectContaining({ service: "github", state: "available" })]) });
       const request = await authority.execute({ tool: "connection_request", callId: "request", arguments: { service: "github" } });
       expect(request).toMatchObject({ state: "needs_user_action", interactionId: expect.any(String) });
@@ -953,8 +958,20 @@ describeEmbeddedPostgres("connectionIntentService", () => {
     await expect(service.complete(toolRequest.id, connection!.id, claims.responsible_user_id!)).rejects.toThrow("cannot satisfy");
     await expect(service.complete(aiRequest.interactionId!, connection!.id, claims.responsible_user_id!)).resolves.toMatchObject({ status: "accepted" });
     expect((await service.request(aiClaims, "anthropic", { purpose: "ai" })).state).toBe("ready");
+    const search = await service.search(aiClaims, "Find Anthropic authentication for this agent");
+    expect(search.results[0]).toMatchObject({ service: "anthropic", state: "ready", connectionId: connection!.id });
+    expect(search.instruction).not.toContain("Share its setupPath");
+    const multipleAi = await service.search(aiClaims, "Anthropic and xAI");
+    expect(multipleAi.results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ service: "anthropic", state: "ready" }),
+      expect.objectContaining({ service: "xai", state: "available" }),
+    ]));
+    expect(multipleAi.instruction).toContain("setupPath");
+    expect(multipleAi.instruction).toContain("ready AI");
     await expect(service.request(aiClaims, "anthropic")).rejects.toMatchObject({ status: 422 });
-    expect((await service.search(aiClaims, "openrouter")).results.some(result => result.service === "openrouter")).toBe(false);
+    expect((await service.search(aiClaims, "openrouter")).results[0]).toMatchObject({
+      service: "openrouter", methods: [expect.objectContaining({ purpose: "ai", setupPath: expect.any(String) })],
+    });
   });
 
 

@@ -85,3 +85,6 @@ test-results/
 
 # fold-sync.sh writes its conflict list into the merge worktree; slice 1 committed it by accident.
 /.fold-sync-conflicts.txt
+
+# Retained local lifecycle behavior measurements
+.lifecycle-baseline/
