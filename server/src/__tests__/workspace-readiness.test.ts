@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -218,6 +219,46 @@ describe("resolveWorkspaceReadiness", () => {
       env: readyGuestEnv(configPath),
     });
     expect(readiness).toMatchObject({ state: "failed", failurePhase: "seed_manifest_unreadable" });
+  });
+
+  it("never reports a legacy-unsafe minimal-no-secrets clone as verified", async () => {
+    const { configPath } = createMarkerDir({
+      "seed-manifest.json": verifiedManifest({ seedMode: "minimal-no-secrets" }),
+    });
+    const readiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(configPath) });
+    expect(readiness).toMatchObject({
+      state: "failed",
+      seedState: "failed",
+      failurePhase: "seed_manifest_legacy_unsafe",
+    });
+  });
+
+  it("refuses an initialization manifest this probe cannot confirm", async () => {
+    const { configPath } = createMarkerDir({
+      "seed-manifest.json": JSON.stringify({ version: 3, kind: "worktree-initialization", state: "verified" }),
+    });
+    const readiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(configPath) });
+    expect(readiness).toMatchObject({ state: "failed", failurePhase: "seed_manifest_unsupported" });
+  });
+
+  it("fails fast on a non-object, FIFO or directory manifest without throwing", async () => {
+    for (const contents of ["null", "[]"]) {
+      const { configPath } = createMarkerDir({ "seed-manifest.json": contents });
+      const readiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(configPath) });
+      expect(readiness).toMatchObject({ state: "failed", failurePhase: "seed_manifest_unreadable" });
+    }
+
+    const fifo = createMarkerDir();
+    expect(spawnSync("mkfifo", [path.join(fifo.dir, "seed-manifest.json")]).status).toBe(0);
+    const started = performance.now();
+    const fifoReadiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(fifo.configPath) });
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(fifoReadiness).toMatchObject({ state: "failed", failurePhase: "seed_manifest_unreadable" });
+
+    const directory = createMarkerDir();
+    mkdirSync(path.join(directory.dir, "seed-manifest.json"));
+    const directoryReadiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(directory.configPath) });
+    expect(directoryReadiness).toMatchObject({ state: "failed", failurePhase: "seed_manifest_unreadable" });
   });
 
   it("reports an interrupted seed as provisioning", async () => {

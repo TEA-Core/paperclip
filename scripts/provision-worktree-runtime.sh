@@ -33,35 +33,21 @@ if [[ ! -d "$worktree_cwd" ]]; then
   exit 1
 fi
 
-if [[ -e "$seed_manifest_path" ]]; then
-  seed_manifest_state="$(SEED_MANIFEST_PATH="$seed_manifest_path" node <<'EOF'
-const fs = require("node:fs");
-try {
-  const value = JSON.parse(fs.readFileSync(process.env.SEED_MANIFEST_PATH, "utf8"));
-  const complete = value?.version === 2
-    && value?.state === "verified"
-    && value?.phase === "complete"
-    && typeof value?.source?.instanceId === "string" && value.source.instanceId.length > 0
-    && typeof value?.source?.configPath === "string" && value.source.configPath.length > 0
-    && (value?.seedMode === "minimal" || value?.seedMode === "full")
-    && typeof value?.snapshotAt === "string" && value.snapshotAt.length > 0
-    && typeof value?.migrationRevision === "string" && value.migrationRevision.length > 0
-    && typeof value?.targetInstanceId === "string" && value.targetInstanceId.length > 0
-    && typeof value?.attemptId === "string" && value.attemptId.length > 0
-    && typeof value?.startedAt === "string"
-    && typeof value?.finishedAt === "string"
-    && Array.isArray(value?.diagnostics)
-    && value.diagnostics.some((entry) => entry?.phase === "complete" && entry?.status === "succeeded" && typeof entry?.at === "string");
-  process.stdout.write(complete ? "verified" : "incomplete");
-} catch {
-  process.stdout.write("invalid");
-}
-EOF
-)"
-  if [[ "$seed_manifest_state" == "verified" ]]; then
-    echo "Worktree database has a verified seed manifest; skipping runtime provisioning." >&2
-    exit 0
-  fi
+# The seed manifest is validated by the shared bounded reader and validator, not
+# by a shell-local predicate. The checker never follows links or blocks on a
+# FIFO; a refused manifest (legacy-unsafe minimal-no-secrets, any v3
+# initialization manifest, malformed or non-regular input) is a fast error with
+# no automatic reseed and no parent fallback. It runs unconditionally: a
+# pathname test cannot see a manifest inside a state dir this user cannot
+# search, and the checker reports a missing manifest as `absent` itself.
+manifest_check_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/worktree-state-manifest-check.mjs"
+if ! seed_manifest_state="$(node "$manifest_check_script" "$seed_manifest_path")"; then
+  echo "Worktree seed manifest was refused; not provisioning or reseeding this worktree: $seed_manifest_path" >&2
+  exit 1
+fi
+if [[ "$seed_manifest_state" == "verified" ]]; then
+  echo "Worktree database has a verified seed manifest; skipping runtime provisioning." >&2
+  exit 0
 fi
 
 # SUP-15609: an intentional no-source skip is recorded as durable evidence that

@@ -44,7 +44,8 @@ import {
   type EnsureSharedGroupOwnershipOptions,
   type SharedGroupRepairOutcome,
 } from "./shared-group-ownership.js";
-import { hasVerifiedWorktreeSeedManifest, isVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
+import { isVerifiedWorktreeSeedManifest } from "@paperclipai/shared/worktree-initialization-manifest";
+import { hasVerifiedWorktreeSeedManifest, readLegacySeedManifestObject } from "../worktree-seed-manifest.js";
 import {
   buildManagedWorkspaceGuestEnv,
   logManagedWorkspaceReadinessRejection,
@@ -8937,13 +8938,16 @@ export function readWorkspaceSeedOperationEvidence(worktreePath: string): {
   metadata: Record<string, unknown>;
 } {
   const manifestPath = path.join(worktreePath, ".paperclip", "seed-manifest.json");
-  const noSourceSkip = hasNoSourceSeedSkip(worktreePath);
-  let manifest: Record<string, unknown> | null = null;
-  try {
-    manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
-  } catch {
-    manifest = null;
+  const manifest = readLegacySeedManifestObject(manifestPath);
+  let manifestPresent = manifest !== null;
+  if (!manifestPresent) {
+    try {
+      manifestPresent = lstatSync(manifestPath, { throwIfNoEntry: false }) !== undefined;
+    } catch {
+      manifestPresent = true;
+    }
   }
+  const noSourceSkip = !manifestPresent && hasNoSourceSeedSkip(worktreePath);
   if (manifest) {
     const state = typeof manifest.state === "string" ? manifest.state : "unknown";
     const phase = typeof manifest.phase === "string" ? manifest.phase : null;
@@ -8981,7 +8985,7 @@ export function readWorkspaceSeedOperationEvidence(worktreePath: string): {
     error: "Workspace seed command returned without a readable seed manifest.",
     metadata: {
       provisionKind: "workspace_seed",
-      seedState: existsSync(manifestPath) ? "unreadable" : "absent",
+      seedState: manifestPresent ? "unreadable" : "absent",
       seedPhase: null,
       seedFailurePhase: "seed_manifest_unreadable",
     },

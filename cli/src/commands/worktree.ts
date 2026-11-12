@@ -31,6 +31,8 @@ import {
   withWorktreePortRegistryLock,
   writeWorktreePortRegistry,
 } from "@paperclipai/shared/worktree-port-registry";
+import { readBoundedStateFile } from "@paperclipai/shared/bounded-state-file";
+import { classifyWorktreeStateManifest } from "@paperclipai/shared/worktree-initialization-manifest";
 import {
   applyPendingMigrations,
   agents,
@@ -1850,17 +1852,21 @@ function writeNoSourceSeedSkipMarker(
 }
 
 export function readWorktreeSeedManifest(configPath: string): WorktreeSeedManifest | null {
-  const manifestPath = resolveWorktreeSeedMarkerPaths(configPath).manifest;
-  if (!existsSync(manifestPath)) return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(manifestPath, "utf8"));
-  } catch (error) {
-    throw new Error(
-      `Invalid worktree seed manifest at ${manifestPath}: ${error instanceof Error ? error.message : String(error)}`,
-    );
+  const manifestPath = path.resolve(resolveWorktreeSeedMarkerPaths(configPath).manifest);
+  // The bounded reader refuses links, FIFOs, sockets, directories, devices and
+  // oversized or torn files without blocking; its errors never echo content.
+  const bytes = readBoundedStateFile(manifestPath);
+  if (bytes === null) return null;
+  // The legacy seed path never provisions a v3 initialization directory, so it
+  // asserts no v3 expectation and every v3 manifest is refused.
+  const classification = classifyWorktreeStateManifest(bytes, { targetInstanceId: null, schema: null });
+  if (classification.kind !== "legacy-seed") {
+    const reason = classification.kind === "refused"
+      ? classification.message
+      : "Worktree initialization manifests are not handled by the legacy seed path.";
+    throw new Error(`Refusing worktree seed manifest at ${manifestPath}: ${reason}`);
   }
-  const value = parsed as Partial<WorktreeSeedManifest>;
+  const value = classification.manifest as Partial<WorktreeSeedManifest>;
   const diagnosticsValid = Array.isArray(value.diagnostics) && value.diagnostics.every((diagnostic) => (
     diagnostic
     && typeof diagnostic === "object"

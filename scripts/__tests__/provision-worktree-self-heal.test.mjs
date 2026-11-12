@@ -915,6 +915,119 @@ test("runtime provisioning does not trust a truncated verified manifest", () => 
   );
 });
 
+function completeSeedManifest(seedMode) {
+  return JSON.stringify({
+    version: 2,
+    source: { instanceId: "base-source", configPath: "/fixture/source/config.json" },
+    snapshotAt: "2026-08-19T00:00:00.000Z",
+    seedMode,
+    migrationRevision: "0142_test.sql",
+    targetInstanceId: "target-test",
+    phase: "complete",
+    state: "verified",
+    attemptId: "attempt-test",
+    startedAt: "2026-08-19T00:00:00.000Z",
+    finishedAt: "2026-08-19T00:01:00.000Z",
+    diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-08-19T00:01:00.000Z" }],
+  });
+}
+
+function makeManifestWorktree(prefix, writeManifest) {
+  const worktreeCwd = makeTempDir(prefix);
+  fs.mkdirSync(path.join(worktreeCwd, ".paperclip"), { recursive: true });
+  fs.writeFileSync(path.join(worktreeCwd, ".paperclip", "config.json"), "{}\n");
+  writeManifest(path.join(worktreeCwd, ".paperclip", "seed-manifest.json"));
+  return worktreeCwd;
+}
+
+test("runtime provisioning skips complete minimal and full seed manifests", () => {
+  for (const seedMode of ["minimal", "full"]) {
+    const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+    const worktreeCwd = makeManifestWorktree(`paperclip-provision-runtime-${seedMode}-`, (manifestPath) => {
+      fs.writeFileSync(manifestPath, completeSeedManifest(seedMode));
+    });
+    const result = runRuntimeProvision(baseCwd, worktreeCwd);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /verified seed manifest; skipping runtime provisioning/);
+    assert.deepEqual(readCliInvocations(baseCwd), []);
+  }
+});
+
+test("runtime provisioning refuses legacy-unsafe, initialization and malformed manifests without reseeding", () => {
+  const cases = [
+    ["legacy-unsafe", completeSeedManifest("minimal-no-secrets"), /minimal-no-secrets.*clean generation/s],
+    ["initialization", JSON.stringify({ version: 3, kind: "worktree-initialization", state: "verified" }), /initialization manifest/],
+    ["malformed", "{ truncated", /not a complete strict JSON document/],
+    ["null", "null", /not a JSON object/],
+  ];
+  for (const [label, contents, reason] of cases) {
+    const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+    const worktreeCwd = makeManifestWorktree(`paperclip-provision-runtime-refuse-${label}-`, (manifestPath) => {
+      fs.writeFileSync(manifestPath, contents);
+    });
+    const result = runRuntimeProvision(baseCwd, worktreeCwd);
+    assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+    assert.match(result.stderr, reason, label);
+    assert.match(result.stderr, /not provisioning or reseeding this worktree/, label);
+    assert.deepEqual(readCliInvocations(baseCwd), [], `${label}: the seed CLI must not run`);
+    assert.equal(fs.readFileSync(path.join(worktreeCwd, ".paperclip", "seed-manifest.json"), "utf8"), contents, label);
+  }
+});
+
+test("runtime provisioning refuses a manifest in a state dir it cannot search", { skip: process.getuid?.() === 0 ? "root ignores directory search permission" : false }, () => {
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const worktreeCwd = makeManifestWorktree("paperclip-provision-runtime-unsearchable-", (manifestPath) => {
+    fs.writeFileSync(manifestPath, completeSeedManifest("full"));
+  });
+  const stateDir = path.join(worktreeCwd, ".paperclip");
+  fs.chmodSync(stateDir, 0o600);
+  try {
+    const result = runRuntimeProvision(baseCwd, worktreeCwd);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /Refusing worktree state file/);
+    assert.match(result.stderr, /not provisioning or reseeding this worktree/);
+    assert.deepEqual(readCliInvocations(baseCwd), [], "the seed CLI must not run");
+  } finally {
+    fs.chmodSync(stateDir, 0o700);
+  }
+});
+
+test("runtime provisioning refuses FIFO, directory and symlinked manifests without blocking", () => {
+  const cases = [
+    ["fifo", (manifestPath) => assert.equal(spawnSync("mkfifo", [manifestPath]).status, 0), /FIFO/],
+    ["directory", (manifestPath) => fs.mkdirSync(manifestPath), /directory/],
+    ["symlink", (manifestPath) => {
+      const target = path.join(path.dirname(manifestPath), "complete.json");
+      fs.writeFileSync(target, completeSeedManifest("full"));
+      fs.symlinkSync(target, manifestPath);
+    }, /symbolic link/],
+    ["dangling-symlink", (manifestPath) => fs.symlinkSync(path.join(path.dirname(manifestPath), "missing.json"), manifestPath), /symbolic link/],
+  ];
+  for (const [label, writeManifest, reason] of cases) {
+    const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+    const worktreeCwd = makeManifestWorktree(`paperclip-provision-runtime-nonregular-${label}-`, writeManifest);
+    const started = performance.now();
+    const result = spawnSync("bash", [runtimeScript], {
+      cwd: worktreeCwd,
+      encoding: "utf8",
+      timeout: 20_000,
+      env: {
+        PATH: testPath,
+        HOME: os.homedir(),
+        PAPERCLIP_WORKSPACE_BASE_CWD: baseCwd,
+        PAPERCLIP_WORKSPACE_CWD: worktreeCwd,
+        PAPERCLIP_HOME: makeInstanceHome(),
+      },
+    });
+    const elapsedMs = performance.now() - started;
+    assert.equal(result.signal, null, `${label}: the provisioner was killed instead of finishing`);
+    assert.ok(elapsedMs < 2_000, `${label}: took ${Math.round(elapsedMs)}ms`);
+    assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+    assert.match(result.stderr, reason, label);
+    assert.deepEqual(readCliInvocations(baseCwd), [], `${label}: the seed CLI must not run`);
+  }
+});
+
 /**
  * pnpm 9.15.4 calls the deprecated url.parse() once per `pnpm install`
  * (see toNerfDart in the pnpm bundle), which Node 24 reports as DEP0169.
