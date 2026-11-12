@@ -71,7 +71,7 @@ function classifyFile(
 ): WorktreeStateManifestClassification {
   const filePath = manifestPath();
   fs.writeFileSync(filePath, contents);
-  const bytes = readBoundedStateFile(filePath);
+  const bytes = readBoundedStateFile(filePath, { trustedRoot: path.dirname(filePath) });
   if (bytes === null) throw new Error("fixture manifest disappeared");
   return classifyWorktreeStateManifest(bytes, expected);
 }
@@ -286,7 +286,7 @@ describe("classifyWorktreeStateManifest", () => {
     const { manifest } = buildFixture();
     const filePath = manifestPath();
     fs.writeFileSync(filePath, `${JSON.stringify(manifest)}${" ".repeat(STATE_FILE_MAX_BYTES)}`);
-    expect(() => readBoundedStateFile(filePath)).toThrow(BoundedStateFileError);
+    expect(() => readBoundedStateFile(filePath, { trustedRoot: path.dirname(filePath) })).toThrow(BoundedStateFileError);
   });
 
   it("refuses a v2 minimal-no-secrets manifest as legacy-unsafe and keeps complete minimal and full", () => {

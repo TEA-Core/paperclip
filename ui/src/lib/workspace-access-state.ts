@@ -118,6 +118,8 @@ const READINESS_FAILURE_COPY: Record<string, string> = {
     "This workspace was seeded by the retired minimal-no-secrets mode and may hold parent credentials. Retire it and create a clean workspace; it cannot be relabeled or converted.",
   seed_manifest_unsupported:
     "The seed manifest is a version or profile this build does not accept, so the workspace cannot be trusted.",
+  seed_manifest_incomplete:
+    "The seed manifest reports a verified seed without its completion evidence, so the restore cannot be trusted.",
 };
 
 /**

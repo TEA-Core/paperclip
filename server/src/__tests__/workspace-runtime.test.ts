@@ -1199,6 +1199,40 @@ describe("resolveManagedPaperclipRuntimePublicOrigin", () => {
   });
 });
 
+const BUILTIN_SEED_COMMAND = "bash ./scripts/provision-worktree-runtime.sh";
+/** The uid whose `.paperclip/uid-<uid>/` state the seed decision and evidence use. */
+const RUNTIME_UID = process.getuid?.() ?? -1;
+
+/** A complete v2 seed manifest, the only v2 shape that is a verified seed. */
+function completeSeedManifest(overrides: Record<string, unknown> = {}) {
+  return JSON.stringify({
+    version: 2,
+    source: { instanceId: "source", configPath: "/source/config.json" },
+    snapshotAt: "2026-08-18T00:00:00.000Z",
+    seedMode: "full",
+    migrationRevision: "0001",
+    targetInstanceId: "target",
+    phase: "complete",
+    state: "verified",
+    attemptId: "attempt",
+    startedAt: "2026-08-18T00:00:00.000Z",
+    finishedAt: "2026-08-18T00:01:00.000Z",
+    diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-08-18T00:01:00.000Z" }],
+    ...overrides,
+  });
+}
+
+/** A managed git worktree whose base checkout has the built-in seed script. */
+async function createSeedWorktree(prefix: string) {
+  const baseCwd = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  const cwd = path.join(baseCwd, "worktree");
+  await fs.mkdir(path.join(baseCwd, "scripts"), { recursive: true });
+  await fs.writeFile(path.join(baseCwd, "scripts", "provision-worktree-runtime.sh"), "#!/usr/bin/env bash\n");
+  await fs.mkdir(path.join(cwd, ".paperclip"), { recursive: true });
+  const workspace = { ...buildWorkspace(cwd), baseCwd, strategy: "git_worktree" as const, worktreePath: cwd };
+  return { baseCwd, cwd, workspace };
+}
+
 describe("resolveRuntimeProvisionCommand", () => {
   it("backfills deferred seeding for legacy managed git worktrees", async () => {
     const baseCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-provision-"));
@@ -1302,9 +1336,10 @@ describe("resolveRuntimeProvisionCommand", () => {
 
   it("surfaces the runtime provision command for a pending uid-scoped worktree state dir", async () => {
     // SUP-14087: on a cross-uid worktree each uid keeps its state under
-    // .paperclip/uid-<uid>/. When a scoped seed-pending has no sibling
-    // seed-complete, the command must be returned even though the canonical
-    // markers say nothing is pending.
+    // .paperclip/uid-<uid>/, and this uid uses its scoped dir once it holds an
+    // .env. When that scoped seed-pending has no sibling seed-complete, the
+    // command must be returned even though the canonical markers say nothing
+    // is pending.
     const baseCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-provision-scoped-"));
     const cwd = path.join(baseCwd, "worktree");
     try {
@@ -1313,8 +1348,10 @@ describe("resolveRuntimeProvisionCommand", () => {
         path.join(baseCwd, "scripts", "provision-worktree-runtime.sh"),
         "#!/usr/bin/env bash\n",
       );
-      await fs.mkdir(path.join(cwd, ".paperclip", "uid-1001"), { recursive: true });
-      await fs.writeFile(path.join(cwd, ".paperclip", "uid-1001", "seed-pending"), "{}\n");
+      const scopedDir = path.join(cwd, ".paperclip", `uid-${RUNTIME_UID}`);
+      await fs.mkdir(scopedDir, { recursive: true });
+      await fs.writeFile(path.join(scopedDir, ".env"), "");
+      await fs.writeFile(path.join(scopedDir, "seed-pending"), "{}\n");
       const workspace = {
         ...buildWorkspace(cwd),
         baseCwd,
@@ -1326,7 +1363,7 @@ describe("resolveRuntimeProvisionCommand", () => {
         "bash ./scripts/provision-worktree-runtime.sh",
       );
 
-      await fs.writeFile(path.join(cwd, ".paperclip", "uid-1001", "seed-complete"), "{}\n");
+      await fs.writeFile(path.join(scopedDir, "seed-complete"), "{}\n");
       expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
     } finally {
       await fs.rm(baseCwd, { recursive: true, force: true });
@@ -1367,8 +1404,10 @@ describe("resolveRuntimeProvisionCommand", () => {
 
       // A scoped uid state dir with its own recorded skip is complete too.
       const scopedCwd = path.join(baseCwd, "scoped-worktree");
-      await fs.mkdir(path.join(scopedCwd, ".paperclip", "uid-1001"), { recursive: true });
-      await fs.writeFile(path.join(scopedCwd, ".paperclip", "uid-1001", "seed-skip-no-source"), "{}\n");
+      const scopedDir = path.join(scopedCwd, ".paperclip", `uid-${RUNTIME_UID}`);
+      await fs.mkdir(scopedDir, { recursive: true });
+      await fs.writeFile(path.join(scopedDir, ".env"), "");
+      await fs.writeFile(path.join(scopedDir, "seed-skip-no-source"), "{}\n");
       const scopedWorkspace = {
         ...buildWorkspace(scopedCwd),
         baseCwd,
@@ -1376,6 +1415,75 @@ describe("resolveRuntimeProvisionCommand", () => {
         worktreePath: scopedCwd,
       };
       expect(resolveRuntimeProvisionCommand({ config: {}, workspace: scopedWorkspace })).toBe("");
+    } finally {
+      await fs.rm(baseCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("runs the seed command for a refused manifest even when a no-source skip is recorded", async () => {
+    const { baseCwd, cwd, workspace } = await createSeedWorktree("paperclip-runtime-provision-refused-skip-");
+    try {
+      const manifestPath = path.join(cwd, ".paperclip", "seed-manifest.json");
+      await fs.writeFile(path.join(cwd, ".paperclip", "seed-skip-no-source"), "{}\n");
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
+
+      // The provisioner reads the same manifest and refuses it loudly; the
+      // marker must not skip it.
+      await fs.writeFile(manifestPath, completeSeedManifest({ seedMode: "minimal-no-secrets" }));
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(BUILTIN_SEED_COMMAND);
+      await fs.rm(manifestPath);
+      expect(spawnSync("mkfifo", [manifestPath]).status).toBe(0);
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(BUILTIN_SEED_COMMAND);
+
+      // A `.paperclip` link to another instance is refused, although the
+      // target holds a verified manifest and a skip marker.
+      const otherState = path.join(baseCwd, "other-instance", ".paperclip");
+      await fs.mkdir(otherState, { recursive: true });
+      await fs.writeFile(path.join(otherState, "seed-manifest.json"), completeSeedManifest());
+      await fs.writeFile(path.join(otherState, "seed-skip-no-source"), "{}\n");
+      await fs.rm(path.join(cwd, ".paperclip"), { recursive: true, force: true });
+      await fs.symlink(otherState, path.join(cwd, ".paperclip"));
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(BUILTIN_SEED_COMMAND);
+
+      // The same holds in this uid's scoped state dir, for a refused manifest
+      // and for a scoped dir that is a link.
+      const scoped = await createSeedWorktree("paperclip-runtime-provision-refused-scoped-");
+      try {
+        const scopedDir = path.join(scoped.cwd, ".paperclip", `uid-${RUNTIME_UID}`);
+        await fs.mkdir(scopedDir);
+        await fs.writeFile(path.join(scopedDir, ".env"), "");
+        await fs.writeFile(path.join(scopedDir, "seed-skip-no-source"), "{}\n");
+        await fs.writeFile(path.join(scopedDir, "seed-manifest.json"), "{ torn");
+        expect(resolveRuntimeProvisionCommand({ config: {}, workspace: scoped.workspace })).toBe(BUILTIN_SEED_COMMAND);
+
+        await fs.rm(scopedDir, { recursive: true, force: true });
+        await fs.writeFile(path.join(otherState, ".env"), "");
+        await fs.symlink(otherState, scopedDir);
+        expect(resolveRuntimeProvisionCommand({ config: {}, workspace: scoped.workspace })).toBe(BUILTIN_SEED_COMMAND);
+      } finally {
+        await fs.rm(scoped.baseCwd, { recursive: true, force: true });
+      }
+    } finally {
+      await fs.rm(baseCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("decides on this uid's state dir and ignores another uid's scoped state", async () => {
+    // SUP-14087: the built-in seed command works in this uid's state dir, so
+    // another uid's scoped manifest or markers must neither start it nor skip it.
+    const { baseCwd, cwd, workspace } = await createSeedWorktree("paperclip-runtime-provision-other-uid-");
+    try {
+      const otherDir = path.join(cwd, ".paperclip", `uid-${RUNTIME_UID + 1}`);
+      await fs.mkdir(otherDir);
+      await fs.writeFile(path.join(otherDir, ".env"), "");
+      await fs.writeFile(path.join(cwd, ".paperclip", "seed-manifest.json"), completeSeedManifest());
+      await fs.writeFile(path.join(otherDir, "seed-manifest.json"), completeSeedManifest({ seedMode: "minimal-no-secrets" }));
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
+
+      await fs.rm(path.join(cwd, ".paperclip", "seed-manifest.json"));
+      await fs.rm(path.join(otherDir, "seed-manifest.json"));
+      await fs.writeFile(path.join(otherDir, "seed-skip-no-source"), "{}\n");
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(BUILTIN_SEED_COMMAND);
     } finally {
       await fs.rm(baseCwd, { recursive: true, force: true });
     }
@@ -1457,6 +1565,52 @@ describe("readWorkspaceSeedOperationEvidence", () => {
       expect(evidence.error).toMatch(/without a verified manifest/);
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("pairs the skip marker with the manifest in this uid's state dir", async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-seed-evidence-scoped-"));
+    const otherCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-seed-evidence-other-uid-"));
+    const linkedCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-seed-evidence-linked-"));
+    try {
+      // The root manifest is absent; this uid's scoped dir holds a skip marker
+      // next to a refused manifest. The refusal wins.
+      const scopedDir = path.join(cwd, ".paperclip", `uid-${RUNTIME_UID}`);
+      await fs.mkdir(scopedDir, { recursive: true });
+      await fs.writeFile(path.join(scopedDir, ".env"), "");
+      await fs.writeFile(path.join(scopedDir, "seed-skip-no-source"), "{}\n");
+      await fs.writeFile(path.join(scopedDir, "seed-manifest.json"), completeSeedManifest({ seedMode: "minimal-no-secrets" }));
+      let evidence = readWorkspaceSeedOperationEvidence(cwd);
+      expect(evidence.verified).toBe(false);
+      expect(evidence.error).toContain(path.join(scopedDir, "seed-manifest.json"));
+      expect(evidence.metadata).toMatchObject({ seedState: "unreadable", seedFailurePhase: "seed_manifest_unreadable" });
+      expect(evidence.metadata.seedSkippedNoSource).toBeUndefined();
+
+      // Without a manifest in that dir its own marker is the evidence.
+      await fs.rm(path.join(scopedDir, "seed-manifest.json"));
+      evidence = readWorkspaceSeedOperationEvidence(cwd);
+      expect(evidence.verified).toBe(true);
+      expect(evidence.metadata).toMatchObject({ seedState: "skipped-no-source", seedSkippedNoSource: true });
+
+      // Another uid's skip marker is not evidence for this uid's state dir.
+      const otherDir = path.join(otherCwd, ".paperclip", `uid-${RUNTIME_UID + 1}`);
+      await fs.mkdir(otherDir, { recursive: true });
+      await fs.writeFile(path.join(otherDir, ".env"), "");
+      await fs.writeFile(path.join(otherDir, "seed-skip-no-source"), "{}\n");
+      evidence = readWorkspaceSeedOperationEvidence(otherCwd);
+      expect(evidence.verified).toBe(false);
+      expect(evidence.metadata.seedState).toBe("absent");
+
+      // A `.paperclip` link is refused, so the marker behind it is not evidence.
+      await fs.symlink(path.join(otherCwd, ".paperclip"), path.join(linkedCwd, ".paperclip"));
+      await fs.writeFile(path.join(otherCwd, ".paperclip", "seed-skip-no-source"), "{}\n");
+      evidence = readWorkspaceSeedOperationEvidence(linkedCwd);
+      expect(evidence.verified).toBe(false);
+      expect(evidence.metadata.seedState).toBe("unreadable");
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+      await fs.rm(otherCwd, { recursive: true, force: true });
+      await fs.rm(linkedCwd, { recursive: true, force: true });
     }
   });
 });

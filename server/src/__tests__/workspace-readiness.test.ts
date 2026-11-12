@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -46,12 +46,24 @@ function createMarkerDir(files: Record<string, string> = {}) {
   return { dir, configPath };
 }
 
+/**
+ * A complete v2 seed manifest. Readiness accepts `verified` only with this
+ * completion evidence, for the `minimal` and the `full` seed mode alike.
+ */
 function verifiedManifest(overrides: Record<string, unknown> = {}) {
   return JSON.stringify({
     version: 2,
-    state: "verified",
-    phase: "complete",
+    source: { instanceId: "source", configPath: "/source/config.json" },
+    snapshotAt: "2026-08-18T00:00:00.000Z",
     seedMode: "minimal",
+    migrationRevision: "0001",
+    targetInstanceId: "target",
+    phase: "complete",
+    state: "verified",
+    attemptId: "attempt",
+    startedAt: "2026-08-18T00:00:00.000Z",
+    finishedAt: "2026-08-18T00:01:00.000Z",
+    diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-08-18T00:01:00.000Z" }],
     ...overrides,
   });
 }
@@ -154,6 +166,46 @@ describe("resolveWorkspaceReadiness", () => {
       companyId: "company-1",
       failurePhase: null,
     });
+  });
+
+  it("reports a complete full-mode clone as ready alongside minimal", async () => {
+    const { configPath } = createMarkerDir({ "seed-manifest.json": verifiedManifest({ seedMode: "full" }) });
+    const readiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(configPath) });
+    expect(readiness).toMatchObject({ state: "ready", seedState: "verified", seedMode: "full", failurePhase: null });
+  });
+
+  it("fails a v2 verified manifest that lacks completion evidence instead of reporting ready", async () => {
+    const complete = JSON.parse(verifiedManifest()) as Record<string, unknown>;
+    const { snapshotAt: _snapshotAt, ...withoutSnapshot } = complete;
+    const incompleteManifests = [
+      // The bare shape readiness used to accept.
+      JSON.stringify({ version: 2, state: "verified", phase: "complete", seedMode: "minimal" }),
+      JSON.stringify({ ...withoutSnapshot, seedMode: "full" }),
+      verifiedManifest({ diagnostics: [{ phase: "complete", status: "started", at: "2026-08-18T00:01:00.000Z" }] }),
+    ];
+    for (const contents of incompleteManifests) {
+      const { configPath } = createMarkerDir({ "seed-manifest.json": contents });
+      const readiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(configPath) });
+      expect(readiness).toMatchObject({
+        state: "failed",
+        seedState: "failed",
+        failurePhase: "seed_manifest_incomplete",
+      });
+    }
+  });
+
+  it("refuses a manifest behind a linked .paperclip directory", async () => {
+    // Another instance's state directory holds a complete manifest; a worktree
+    // whose `.paperclip` links to it must not borrow it as readiness evidence.
+    const other = createMarkerDir({ "seed-manifest.json": verifiedManifest() });
+    const worktree = mkdtempSync(path.join(os.tmpdir(), "paperclip-workspace-readiness-linked-"));
+    tempDirs.push(worktree);
+    symlinkSync(other.dir, path.join(worktree, ".paperclip"));
+    const readiness = await resolveWorkspaceReadiness({
+      db: readyDb(),
+      env: readyGuestEnv(path.join(worktree, ".paperclip", "config.json")),
+    });
+    expect(readiness).toMatchObject({ state: "failed", seedState: "failed", failurePhase: "seed_manifest_unreadable" });
   });
 
   it("does not claim the handoff is ready without a signing key", async () => {
