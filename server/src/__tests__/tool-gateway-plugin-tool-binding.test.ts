@@ -676,4 +676,80 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
     const invocations = await db.select().from(toolInvocations);
     expect(invocations).toHaveLength(1);
   });
+
+  it("does not replay a side-effecting plugin execute when contents change past the summary window", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+    const base = {
+      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: "a.b:wiki_append_log",
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+    };
+    // Both bodies share their first 500 characters, so a summary-window hash
+    // would collide and wrongly replay the first invocation.
+    const longContent = `entry ${"x".repeat(1200)}`;
+
+    const first = await gateway.executePluginTool({
+      ...base,
+      parameters: { path: "log/index.md", content: longContent },
+    });
+    const second = await gateway.executePluginTool({
+      ...base,
+      parameters: { path: "log/index.md", content: `${longContent}\n- recomposed tail` },
+    });
+
+    expect(first).toMatchObject({ pluginId: "plugin-a", result: { data: { ok: true } } });
+    expect(second).toMatchObject({ pluginId: "plugin-a", result: { data: { ok: true } } });
+    const invocations = await db.select().from(toolInvocations);
+    expect(invocations).toHaveLength(2);
+    expect(new Set(invocations.map((row) => row.id)).size).toBe(2);
+  });
+
+  it("replays a failed side-effecting plugin execute as an explicit error, not a success-shaped null result", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const dispatcher = twoPluginDispatcher();
+    let dispatchAttempts = 0;
+    const gateway = createToolGatewayService(db, {
+      pluginToolDispatcher: {
+        ...dispatcher,
+        executeTool: async (tool, parameters, runContext) => {
+          dispatchAttempts += 1;
+          if (tool === "a.b:wiki_append_log" && dispatchAttempts === 1) {
+            throw new Error("plugin exploded on first attempt");
+          }
+          return dispatcher.executeTool(tool, parameters, runContext);
+        },
+      },
+    });
+    const input = {
+      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: "a.b:wiki_append_log",
+      parameters: { path: "log/index.md", content: "same entry" },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+    };
+
+    await expect(gateway.executePluginTool(input)).rejects.toThrow("plugin exploded on first attempt");
+
+    const replayError = await gateway.executePluginTool(input).then(
+      () => {
+        throw new Error("Expected the replayed failed call to reject");
+      },
+      (caught) => caught as ToolGatewayHttpError,
+    );
+    expect(replayError).toBeInstanceOf(ToolGatewayHttpError);
+    expect(replayError.status).toBe(502);
+    expect(replayError.reasonCode).toBe("tool_execution_failed");
+    expect(replayError.message).toBe("plugin exploded on first attempt");
+    expect(replayError.details).toMatchObject({ replayed: true });
+
+    const invocations = await db.select().from(toolInvocations);
+    expect(invocations).toHaveLength(1);
+    expect(invocations[0]).toMatchObject({
+      status: "failed",
+      errorCode: "tool_execution_failed",
+      errorMessage: "plugin exploded on first attempt",
+    });
+  });
 });

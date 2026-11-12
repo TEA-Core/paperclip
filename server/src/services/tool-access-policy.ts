@@ -251,16 +251,20 @@ function auditOutcome(accessDecision: ToolAccessDecision): "pending" | "success"
 
 function summarizeAndRedact(value: unknown): RedactionResult {
   const redactedFields: string[] = [];
-  const visit = (current: unknown, path: string): unknown => {
+  const visit = (current: unknown, path: string, depth = 0): unknown => {
     if (typeof current === "string") {
       if (SECRET_VALUE_RE.test(current)) {
         redactedFields.push(path || "$");
         return "[REDACTED]";
       }
-      return current.length > 500 ? `${current.slice(0, 500)}...[truncated]` : current;
+      return current;
     }
-    if (Array.isArray(current)) return current.slice(0, 50).map((entry, index) => visit(entry, `${path}[${index}]`));
+    if (Array.isArray(current)) return current.map((entry, index) => visit(entry, `${path}[${index}]`, depth + 1));
     if (!isRecord(current)) return current;
+    if (depth >= 25) {
+      redactedFields.push(path || "$");
+      return "[DEPTH_LIMIT]";
+    }
     const out: Record<string, unknown> = {};
     for (const [key, nested] of Object.entries(current)) {
       const nestedPath = path ? `${path}.${key}` : key;
@@ -268,18 +272,29 @@ function summarizeAndRedact(value: unknown): RedactionResult {
         redactedFields.push(nestedPath);
         out[key] = "[REDACTED]";
       } else {
-        out[key] = visit(nested, nestedPath);
+        out[key] = visit(nested, nestedPath, depth + 1);
       }
     }
     return out;
   };
+  const truncateForDisplay = (current: unknown): unknown => {
+    if (typeof current === "string") {
+      return current.length > 500 ? `${current.slice(0, 500)}...[truncated]` : current;
+    }
+    if (Array.isArray(current)) return current.slice(0, 50).map(truncateForDisplay);
+    if (!isRecord(current)) return current;
+    const out: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(current)) out[key] = truncateForDisplay(nested);
+    return out;
+  };
   const redacted = visit(value ?? {}, "");
-  const text = stableStringify(redacted);
+  const fullText = stableStringify(redacted);
+  const displayText = stableStringify(truncateForDisplay(redacted));
   return {
     summary: {
-      summary: text.length > 4000 ? `${text.slice(0, 4000)}...[truncated]` : text,
-      sizeBytes: Buffer.byteLength(text),
-      sha256: sha256(redacted),
+      summary: displayText.length > 4000 ? `${displayText.slice(0, 4000)}...[truncated]` : displayText,
+      sizeBytes: Buffer.byteLength(fullText),
+      sha256: createHash("sha256").update(fullText).digest("hex"),
       redactedFields,
     },
     redactionPlan: {
