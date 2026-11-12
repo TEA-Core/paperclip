@@ -80,7 +80,6 @@ import {
   rewriteWorkspaceCwdEnvVarsForExecution,
   sanitizeInheritedPaperclipEnv,
   shapePaperclipWorkspaceEnvForExecution,
-  stringifyPaperclipWakePayloadForEnv,
   assertSpawnEnvelopeWithinLimits,
   SpawnEnvelopeTooLargeError,
   isSpawnEnvelopeTooLargeError,
@@ -1659,7 +1658,7 @@ function normalizeMode(config: Record<string, unknown>): "persistent" | "oneshot
 function normalizePermissionMode(config: Record<string, unknown>): "approve-all" | "approve-reads" | "deny-all" {
   const value = asString(config.permissionMode, DEFAULT_ACP_ENGINE_PERMISSION_MODE).trim();
   if (value === "approve-reads" || value === "deny-all") return value;
-  if (value === "default") return "approve-reads";
+  if (value === "default") return DEFAULT_ACP_ENGINE_PERMISSION_MODE;
   return "approve-all";
 }
 
@@ -2165,7 +2164,6 @@ async function buildRuntime(input: {
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
-  const wakePayloadJson = stringifyPaperclipWakePayloadForEnv(context.paperclipWake);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
   const issueIdentifier = readPaperclipIssueIdentifierFromContext(context);
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
@@ -2178,7 +2176,6 @@ async function buildRuntime(input: {
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   applyPaperclipWorkspaceEnv(env, {
     workspaceCwd: shapedWorkspaceEnv.workspaceCwd,
     workspaceSource,

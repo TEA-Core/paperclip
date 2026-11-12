@@ -1,3 +1,4 @@
+import { AgentIdentity } from "@/components/AgentIdentity";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -2958,7 +2959,7 @@ function AgentPicker({
       <PopoverTrigger asChild>
         <Button variant="outline" size="sm">
           {selectedAgent ? (
-            <Identity name={selectedAgent.name} size="xs" />
+            <AgentIdentity agent={selectedAgent} size="xs" />
           ) : (
             <span className="text-muted-foreground">Pick an agent</span>
           )}
@@ -2991,7 +2992,7 @@ function AgentPicker({
                       )}
                       aria-hidden
                     />
-                    <Identity name={agent.name} size="xs" />
+                    <AgentIdentity agent={agent} size="xs" />
                     {!selectable && (
                       <Badge variant="secondary" className="ml-auto">
                         Paused
@@ -3118,7 +3119,7 @@ function RunDetailView({
       <div className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
         <div className="flex flex-wrap items-center gap-2">
           <StatusBadge status={runBadgeStatus(detail.status)} />
-          <Identity name={agentName} size="xs" />
+          <AgentIdentity agent={agent ?? { id: detail.agentId, name: agentName }} size="xs" />
           {removed && <Badge variant="secondary">removed</Badge>}
           <span className="font-mono text-xs text-muted-foreground">
             v{detail.skillVersion.revisionNumber}

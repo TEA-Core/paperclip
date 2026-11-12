@@ -178,7 +178,7 @@ describe("chat and execution identity migration reconciliation", () => {
     }
   });
 
-  it("keeps canonical identity history in every regenerated chat checkpoint", async () => {
+  it("keeps the identity and chat migrations in their reconciled journal order", async () => {
     const journal = JSON.parse(
       await readFile(
         new URL("./migrations/meta/_journal.json", import.meta.url),
@@ -212,8 +212,8 @@ describe("chat and execution identity migration reconciliation", () => {
     // and a fold emits only the journal's newest idx
     // (fold-restamp-migrations.ts step 2), so those
     // fourteen per-migration checkpoints do not exist here. Assert the same
-    // invariants on the checkpoint the fold did regenerate: chained onto the
-    // previous retained snapshot, still carrying the whole execution-identity
+    // invariants on the checkpoint the fold did regenerate: not chained onto an
+    // older retained snapshot, still carrying the whole execution-identity
     // chain, and carrying the end state of every chat feature the per-step walk
     // pinned.
     const metaDirectory = new URL("./migrations/meta/", import.meta.url);
@@ -225,10 +225,22 @@ describe("chat and execution identity migration reconciliation", () => {
     const current = JSON.parse(
       await readFile(new URL(newest, metaDirectory), "utf8"),
     );
-    const previous = JSON.parse(
-      await readFile(new URL(snapshots.at(-2)!, metaDirectory), "utf8"),
-    );
-    expect(current.prevId, newest).toBe(previous.id);
+    // The fold restamp removes the snapshot its regenerated checkpoint
+    // supersedes (fold-restamp-migrations.ts step 2, SUP-20528), so that parent
+    // is normally no longer on disk. When the parent is still retained it must
+    // be the snapshot immediately before the newest; the checkpoint must never
+    // chain onto an older retained snapshot.
+    expect(typeof current.prevId, newest).toBe("string");
+    expect(current.prevId, newest).not.toBe(current.id);
+    const retainedIds = new Map<string, string>();
+    for (const file of snapshots.slice(0, -1)) {
+      const snapshot = JSON.parse(
+        await readFile(new URL(file, metaDirectory), "utf8"),
+      ) as { id: string };
+      retainedIds.set(snapshot.id, file);
+    }
+    const retainedParent = retainedIds.get(current.prevId);
+    if (retainedParent) expect(retainedParent, newest).toBe(snapshots.at(-2));
     for (const column of identityContextColumns)
       expect(
         current.tables["public.run_identity_contexts"].columns[column],

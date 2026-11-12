@@ -1261,8 +1261,8 @@ it("preserves answer and internal wait descriptions in the serialized native too
   ).toContain("not in the top-level user-facing summary");
 });
 
-it("defaults runnerd ACPX permissions to approve reads", () => {
-  expect(resolveRunnerdAcpxPermissionMode(undefined)).toBe("approve-reads");
+it("defaults runnerd ACPX permissions to authorized Paperclip actions", () => {
+  expect(resolveRunnerdAcpxPermissionMode(undefined)).toBe("approve-all");
   expect(resolveRunnerdAcpxPermissionMode("deny-all")).toBe("deny-all");
 });
 
@@ -1519,7 +1519,7 @@ it("preserves OpenCode runtime bindings when a durable runner is respawned", () 
       hasRuntimeContext: false,
     });
   expect(defaultPermissionEnvironment.PAPERCLIP_OPENCODE_PERMISSION_MODE).toBe(
-    "ask",
+    "allow",
   );
 });
 

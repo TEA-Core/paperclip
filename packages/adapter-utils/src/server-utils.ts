@@ -305,8 +305,15 @@ export function isPaperclipRuntimeEnvKey(key: string): boolean {
 // an absent one: absent reads as unattributed, wrong reads as attributed. The
 // issue is a property of the run and known only to the control plane, so there
 // is no legitimate configured value being refused.
+//
+// PAPERCLIP_WAKE_PAYLOAD_JSON is retired: wake context travels in the prompt,
+// and a configured copy can exceed OS process-launch limits.
 export function isForbiddenConfigEnvKey(key: string): boolean {
-  return key === "PAPERCLIP_API_KEY" || key === "PAPERCLIP_ISSUE_IDENTIFIER";
+  return (
+    key === "PAPERCLIP_API_KEY" ||
+    key === "PAPERCLIP_ISSUE_IDENTIFIER" ||
+    key === "PAPERCLIP_WAKE_PAYLOAD_JSON"
+  );
 }
 const PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES = [
   "../../skills",
@@ -2108,7 +2115,7 @@ export function stringifyPaperclipWakePayload(
   value: unknown,
   options: {
     // For prompt-embedded copies of the payload on lanes where another prompt
-    // section already carries the issue description; the env-var copy should
+    // section already carries the issue description. Other serialized copies
     // stay complete.
     omitIssueDescription?: boolean;
   } = {},
@@ -2545,6 +2552,16 @@ export function isAssignmentShapedPaperclipWakeReason(
   );
 }
 
+// Select at the actual provider attempt boundary so a failed resume restores
+// the original snapshot once when retrying with a fresh session.
+export function selectInitialCommunicationGuidance(
+  context: Record<string, unknown> | null | undefined,
+  options: { resumedSession?: boolean } = {},
+): string {
+  return options.resumedSession === true
+    ? "" : asString(context?.paperclipTaskCommunicationGuidance, "").trim();
+}
+
 // Picks the task-context markdown variant for adapters that inject it into the
 // prompt. Fresh sessions, assignment-shaped wakes, and recovery wakes get the
 // full brief; other resume deltas get the compact variant (description
@@ -2552,11 +2569,15 @@ export function isAssignmentShapedPaperclipWakeReason(
 // issue up. Falls back to the full variant when no compact one was provided.
 export function selectPaperclipTaskMarkdown(
   context: Record<string, unknown> | null | undefined,
-  options: { resumedSession?: boolean } = {},
+  options: { resumedSession?: boolean; includeCommunicationGuidance?: boolean } = {},
 ): string {
   const full = asString(context?.paperclipTaskMarkdown, "").trim();
   if (!full) return "";
-  if (options.resumedSession !== true) return full;
+  if (options.resumedSession !== true) {
+    const guidance = options.includeCommunicationGuidance === false
+      ? "" : selectInitialCommunicationGuidance(context, options);
+    return joinPromptSections([guidance, full]);
+  }
   const wake = normalizePaperclipWakePayload(context?.paperclipWake);
   if (!wake) return full;
   if (

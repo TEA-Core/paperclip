@@ -1862,6 +1862,8 @@ describe.sequential("issue comment reopen routes", () => {
         attachmentIds: undefined,
         authorType: "user",
         authorizationReason: "allow_board_actor",
+        clientRequestId: undefined,
+        mirrorToSlack: true,
         presentation: {
           kind: "system_notice",
           tone: "warning",

@@ -269,6 +269,16 @@ function getDeclaredPageRoutePaths(manifest: PaperclipPluginManifestV1): string[
  * Options for the plugin loader service.
  */
 export interface PluginLoaderOptions {
+  /** Image-owned deployment policy, checked before importing code and starting workers. */
+  assertPackageActivation?: (input: {
+    pluginKey?: string;
+    packageRoot: string;
+    /** Persisted source path, even when package resolution used a fallback. */
+    installedPackagePath?: string | null;
+    manifest?: PaperclipPluginManifestV1;
+    /** Persisted grants, supplied before a runtime manifest refresh is saved. */
+    previousManifest?: PaperclipPluginManifestV1;
+  }) => void;
   /**
    * Path to the local plugin directory to scan.
    * Defaults to ~/.paperclip/plugins/
@@ -1144,6 +1154,7 @@ export function pluginLoader(
     migrationDb = db,
     enableLocalFilesystem = true,
     enableNpmDiscovery = true,
+    assertPackageActivation,
   } = options;
 
   const registry = pluginRegistryService(db);
@@ -1269,6 +1280,7 @@ export function pluginLoader(
 
     // Step 3: Read and validate plugin manifest
     // Note: this.loadManifest (used via current context)
+    assertPackageActivation?.({ packageRoot: resolvedPackagePath });
     const pkgJson = await readPackageJson(resolvedPackagePath);
     if (!pkgJson) throw new Error(`Missing package.json at ${resolvedPackagePath}`);
 
@@ -1287,6 +1299,7 @@ export function pluginLoader(
     }
 
     const manifest = await loadManifestFromPath(manifestPath);
+    assertPackageActivation?.({ packageRoot: resolvedPackagePath, pluginKey: manifest.id, manifest });
 
     // Step 4: Reject incompatible plugin API versions
     if (!manifestValidator.getSupportedVersions().includes(manifest.apiVersion)) {
@@ -1418,6 +1431,7 @@ export function pluginLoader(
       );
     }
 
+    assertPackageActivation?.({ packageRoot, installedPackagePath: plugin.packagePath, pluginKey: plugin.pluginKey, manifest, previousManifest: plugin.manifestJson });
     if (JSON.stringify(manifest) === JSON.stringify(plugin.manifestJson)) {
       return plugin;
     }
@@ -1445,6 +1459,7 @@ export function pluginLoader(
     packagePath: string,
     source: PluginSource,
   ): Promise<DiscoveredPlugin | null> {
+    assertPackageActivation?.({ packageRoot: packagePath });
     const pkgJson = await readPackageJson(packagePath);
     if (!pkgJson) return null;
 
@@ -1474,6 +1489,7 @@ export function pluginLoader(
 
     try {
       const manifest = await loadManifestFromPath(manifestPath);
+      assertPackageActivation?.({ packageRoot: packagePath, pluginKey: manifest.id, manifest });
       return {
         packagePath,
         packageName,
@@ -1726,6 +1742,7 @@ export function pluginLoader(
     // -----------------------------------------------------------------------
 
     async loadManifest(packagePath: string): Promise<PaperclipPluginManifestV1 | null> {
+      assertPackageActivation?.({ packageRoot: packagePath });
       const pkgJson = await readPackageJson(packagePath);
       if (!pkgJson) return null;
 
@@ -1740,7 +1757,9 @@ export function pluginLoader(
       const manifestPath = resolveManifestPath(packagePath, pkgJson);
       if (!manifestPath || !existsSync(manifestPath)) return null;
 
-      return loadManifestFromPath(manifestPath);
+      const manifest = await loadManifestFromPath(manifestPath);
+      assertPackageActivation?.({ packageRoot: packagePath, pluginKey: manifest.id, manifest });
+      return manifest;
     },
 
     // -----------------------------------------------------------------------
@@ -2294,8 +2313,10 @@ export function pluginLoader(
       if (packageJson) {
         await ensureLocalPluginBuilt(packageRoot, packageJson);
       }
+      assertPackageActivation?.({ pluginKey, packageRoot, installedPackagePath: activePlugin.packagePath });
       activePlugin = await refreshPluginManifestFromPackage(activePlugin, packageRoot);
       manifest = activePlugin.manifestJson;
+      assertPackageActivation?.({ pluginKey, packageRoot, installedPackagePath: activePlugin.packagePath, manifest });
       const workerEntrypoint = resolveWorkerEntrypoint(activePlugin, localPluginDir);
 
       // ------------------------------------------------------------------
