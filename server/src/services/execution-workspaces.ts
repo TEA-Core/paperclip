@@ -106,25 +106,30 @@ async function canonicalWorkspacePath(value: string): Promise<string> {
   }
 }
 
-function workspacePathsOverlap(left: string, right: string): boolean {
-  return left === right || left.startsWith(`${right}${path.sep}`) || right.startsWith(`${left}${path.sep}`);
+function workspacePathContains(target: string, holder: string): boolean {
+  return target === holder || holder.startsWith(`${target}${path.sep}`);
 }
 
-async function acquireWorkspacePathPublicationLock(tx: DbTransaction): Promise<boolean> {
-  const [row] = await tx.execute<{ acquired: boolean }>(
-    sql`select pg_try_advisory_xact_lock(hashtextextended(${WORKSPACE_PATH_PUBLICATION_LOCK}, 0)) as acquired`,
-  );
+async function acquireWorkspacePathPublicationLock(tx: DbTransaction, cleanup = false): Promise<boolean> {
+  // Publishers share the lock: only destructive cleanup excludes them.
+  const [row] = await tx.execute<{ acquired: boolean }>(cleanup
+    ? sql`select pg_try_advisory_xact_lock(hashtextextended(${WORKSPACE_PATH_PUBLICATION_LOCK}, 0)) as acquired`
+    : sql`select pg_try_advisory_xact_lock_shared(hashtextextended(${WORKSPACE_PATH_PUBLICATION_LOCK}, 0)) as acquired`);
   if (row?.acquired) return false;
-  await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${WORKSPACE_PATH_PUBLICATION_LOCK}, 0))`);
+  await tx.execute(cleanup
+    ? sql`select pg_advisory_xact_lock(hashtextextended(${WORKSPACE_PATH_PUBLICATION_LOCK}, 0))`
+    : sql`select pg_advisory_xact_lock_shared(hashtextextended(${WORKSPACE_PATH_PUBLICATION_LOCK}, 0))`);
   return true;
 }
 
 async function revalidateWorkspacePathAfterCleanup(
   workspace: Pick<ExecutionWorkspaceRow, "cwd" | "providerRef" | "providerType">,
 ) {
+  // Opt-in cleanup removes only Git worktrees, never remote provider resources.
+  if (workspace.providerType !== "git_worktree") return;
   const workspacePath = workspace.providerRef ?? workspace.cwd;
   if (!workspacePath) return;
-  const checkPath = workspace.providerType === "git_worktree" ? path.join(workspacePath, ".git") : workspacePath;
+  const checkPath = path.join(workspacePath, ".git");
   if (!(await pathExists(checkPath))) {
     throw conflict("Workspace was removed while allocation waited for cleanup; provision it again.");
   }
@@ -1828,16 +1833,29 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       id: executionWorkspaces.id,
       cwd: executionWorkspaces.cwd,
       providerRef: executionWorkspaces.providerRef,
+      providerType: executionWorkspaces.providerType,
     }).from(executionWorkspaces).where(and(
       ne(executionWorkspaces.id, workspace.id),
       inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
     ));
+    const paths = new Set<string>();
     for (const reference of references) {
-      for (const value of new Set([reference.cwd, reference.providerRef])) {
-        if (value && workspacePathsOverlap(target, await canonicalWorkspacePath(value))) {
+      if (reference.providerType === "cloud_sandbox") continue;
+      if (reference.cwd) paths.add(reference.cwd);
+      if (reference.providerRef && ["local_fs", "git_worktree"].includes(reference.providerType)) {
+        paths.add(reference.providerRef);
+      }
+    }
+    for (const value of paths) {
+      try {
+        if (workspacePathContains(target, await canonicalWorkspacePath(value))) {
           // Do not disclose another company's row identity.
           return "path overlaps an active execution workspace";
         }
+      } catch {
+        // An unreadable holder might alias the target. Keep this candidate
+        // without aborting the sweep or disclosing the other company's path.
+        return "active execution workspace path could not be verified";
       }
     }
     return null;
@@ -1872,7 +1890,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       await execFileAsync("git", [
         "-C", workspacePath, ...(auth?.configArgs ?? []), "fetch", "--no-tags", "--prune",
         "origin", "+refs/heads/*:refs/remotes/origin/*",
-      ], { cwd: workspacePath, env: auth ? { ...process.env, ...auth.env } : process.env });
+      ], {
+        cwd: workspacePath,
+        timeout: 60_000,
+        env: { ...process.env, ...auth?.env, GIT_TERMINAL_PROMPT: "0" },
+      });
       const missing = await runGit(["rev-list", "--count", "HEAD", "--not", "--remotes=origin/*"], workspacePath);
       return missing.stdout.trim() === "0";
     } catch {
@@ -2178,10 +2200,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       if (reclaimRecordOnly && !(await cleanNoPrWorktreeCanBeReclaimed(workspace, true))) {
         throw new Error("Refusing terminal workspace cleanup because fresh remote reachability is unverified");
       }
-      await acquireWorkspacePathPublicationLock(tx);
-      // Block even non-cooperating SQL writers across the final guard and removal.
-      // NOWAIT avoids lock-order deadlocks with issue/run updates; later sweeps retry.
-      await tx.execute(sql`LOCK TABLE ${executionWorkspaces}, ${issues} IN SHARE ROW EXCLUSIVE MODE NOWAIT`);
+      if (reclaimRecordOnly) {
+        await acquireWorkspacePathPublicationLock(tx, true);
+        // Widened deletion excludes even non-cooperating SQL writers.
+        // Keep legacy cleanup free of host-wide table locks.
+        await tx.execute(sql`LOCK TABLE ${executionWorkspaces}, ${issues} IN SHARE ROW EXCLUSIVE MODE NOWAIT`);
+      }
       await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, tx, reclaimRecordOnly);
       await stopRuntimeServicesForExecutionWorkspace({
         db: cleanupDb,
@@ -3418,13 +3442,6 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           keep(workspace, "worktree has local changes", "skippedUndelivered");
           continue;
         }
-        const reclaimEnabled = opts.reclaimCleanWorktrees
-          ?? /^(1|true|yes)$/i.test(process.env[WORKSPACE_REAPER_RECLAIM_CLEAN_ENV]?.trim() ?? "");
-        const cleanupRecordOnly = reclaimEnabled
-          && recordOnlyReason === TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON
-          && !sharedSession
-          && cwdKind === "git"
-          && await cleanNoPrWorktreeCanBeReclaimed(workspace, !dryRun);
         const cleanupReason = recordOnlyReason
           ? `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${recordOnlyReason}`
           : ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON;
@@ -3508,6 +3525,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           keep(workspace, "active run", "skippedActiveRun");
           continue;
         }
+        const reclaimEnabled = opts.reclaimCleanWorktrees
+          ?? /^(1|true|yes)$/i.test(process.env[WORKSPACE_REAPER_RECLAIM_CLEAN_ENV]?.trim() ?? "");
+        const cleanupRecordOnly = reclaimEnabled
+          && recordOnlyReason === TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON
+          && !sharedSession
+          && cwdKind === "git"
+          && await cleanNoPrWorktreeCanBeReclaimed(workspace, !dryRun);
         // SUP-20746: a recorded merged-delivery marker must not bypass the
         // unpushed-commit check. The inherited cleanup destroys the worktree and
         // the branch ref, so before any destructive cleanup require the
@@ -3638,12 +3662,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         const archived = await db.transaction(async (tx) => {
           await acquireExecutionWorkspaceLifecycleLock(tx, workspace.id);
           if (cleanupRecordOnly) {
-            await acquireWorkspacePathPublicationLock(tx);
+            await acquireWorkspacePathPublicationLock(tx, true);
             await tx.execute(sql`LOCK TABLE ${executionWorkspaces}, ${issues} IN SHARE ROW EXCLUSIVE MODE NOWAIT`);
             if (await terminalCleanupReferenceReason(workspace, tx)) return null;
           }
           if (workspace.mode !== "shared_workspace") {
-            await tx.execute(sql`LOCK TABLE ${issues} IN SHARE ROW EXCLUSIVE MODE NOWAIT`);
             const [openLink] = await tx.select({ id: issues.id }).from(issues).where(and(
               eq(issues.executionWorkspaceId, workspace.id),
               sql`${issues.status} NOT IN ('done', 'cancelled')`,
@@ -3845,7 +3868,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
 
     update: async (id: string, patch: Partial<typeof executionWorkspaces.$inferInsert>) => {
       const row = await db.transaction(async (tx) => {
-        const waitedForCleanup = await acquireWorkspacePathPublicationLock(tx);
+        const publishesPath = patch.cwd !== undefined || patch.providerRef !== undefined
+          || patch.providerType !== undefined
+          || (patch.status !== undefined && ["active", "idle", "in_review"].includes(patch.status));
+        const waitedForCleanup = publishesPath && await acquireWorkspacePathPublicationLock(tx);
         if (waitedForCleanup) {
           const [current] = await tx.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, id));
           if (current && ["active", "idle", "in_review"].includes(patch.status ?? current.status)) {

@@ -1312,6 +1312,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   it("refuses cleanup when the worktree changes after delivery assessment", async () => {
     const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
     await db.update(executionWorkspaces).set({
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
       metadata: {
         createdByRuntime: true,
         config: { cleanupCommand: "rm -f late-work.txt" },
@@ -5611,7 +5612,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     try {
       await db
         .update(executionWorkspaces)
-        .set({ cwd: hidden, providerRef: hidden })
+        .set({ cwd: hidden, providerRef: hidden, updatedAt: new Date("2026-01-01T00:00:00Z") })
         .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
 
       const sweep = await svc.sweepTerminalWorkspaces();
@@ -6086,6 +6087,136 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       },
       30_000,
     );
+
+    it("SUP-20833 removes only the child worktree while a shared primary checkout remains live", async () => {
+      const seeded = await seedManagedCleanWorktree();
+      const holder = await addPathHolder(seeded, { cwd: seeded.repoRoot, providerRef: seeded.repoRoot });
+      await db.update(executionWorkspaces).set({
+        mode: "shared_workspace", providerType: "local_fs", strategyType: "project_primary",
+      }).where(eq(executionWorkspaces.id, holder));
+      const primaryReadme = await fs.readFile(path.join(seeded.repoRoot, "README.md"), "utf8");
+      expect(await freshSweep(0, true).sweepTerminalWorkspaces()).toMatchObject({ archived: 1, cleanupFailed: 0 });
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+      expect((await workspaceStatus(holder))?.status).toBe("active");
+      expect(await fs.readFile(path.join(seeded.repoRoot, "README.md"), "utf8")).toBe(primaryReadme);
+    }, 20_000);
+
+    it.each(["local_fs", "cloud_sandbox"] as const)(
+      "SUP-20833 fails closed on unreadable local holders but ignores remote resources: %s",
+      async (providerType) => {
+        const seeded = await seedManagedCleanWorktree();
+        const loop = path.join(seeded.repoRoot, "loop");
+        await fs.symlink(loop, loop);
+        const holder = await addPathHolder(seeded, { cwd: loop, providerRef: loop });
+        await db.update(executionWorkspaces).set({ providerType }).where(eq(executionWorkspaces.id, holder));
+        const result = await freshSweep(0, true).sweepTerminalWorkspaces();
+        expect(result).toMatchObject({ archived: providerType === "local_fs" ? 0 : 1, cleanupFailed: 0 });
+        expect((await workspaceStatus(holder))?.status).toBe("active");
+        if (providerType === "local_fs") {
+          expect((await workspaceStatus(seeded.executionWorkspaceId))?.status).toBe("active");
+          await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+        } else {
+          await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+        }
+      },
+      20_000,
+    );
+
+    it("SUP-20833 permits independent publications while another publisher owns the shared lock", async () => {
+      const seeded = await seedManagedCleanWorktree();
+      let operation: Promise<unknown> | undefined;
+      await db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock_shared(hashtextextended('execution-workspace:host-path-publication', 0))`);
+        operation = svc.create({
+          companyId: seeded.companyId, projectId: seeded.projectId, name: "remote resource",
+          mode: "isolated_workspace", strategyType: "cloud_sandbox",
+          providerType: "cloud_sandbox", providerRef: "sandbox:not-a-local-path", status: "active",
+        });
+        let settled = false;
+        void operation.then(() => { settled = true; }, () => { settled = true; });
+        await vi.waitFor(() => expect(settled).toBe(true), { timeout: 2_000 });
+        expect(await operation).toMatchObject({ providerRef: "sandbox:not-a-local-path", status: "active" });
+      }).finally(async () => { await operation?.catch(() => undefined); });
+    }, 20_000);
+
+    it("SUP-20833 permits metadata updates without waiting on cleanup publication exclusion", async () => {
+      const seeded = await seedManagedCleanWorktree();
+      let operation: Promise<unknown> | undefined;
+      await db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended('execution-workspace:host-path-publication', 0))`);
+        operation = svc.update(seeded.executionWorkspaceId, { name: "renamed without a path change" });
+        let settled = false;
+        void operation.then(() => { settled = true; }, () => { settled = true; });
+        await vi.waitFor(() => expect(settled).toBe(true), { timeout: 2_000 });
+        expect(await operation).toMatchObject({ name: "renamed without a path change", status: "active" });
+      }).finally(async () => { await operation?.catch(() => undefined); });
+    }, 20_000);
+
+    it.each(["record-only", "merged"] as const)(
+      "SUP-20833 preserves default reaper progress during unrelated issue writes: %s",
+      async (delivery) => {
+        const seeded = delivery === "merged"
+          ? await seedTerminalWorkspace({ mergedPr: true, publish: true })
+          : await seedManagedCleanWorktree();
+        await linkProjectRepo(seeded);
+        await db.transaction(async (tx) => {
+          await tx.insert(issues).values({
+            companyId: seeded.companyId, projectId: seeded.projectId,
+            title: "Unrelated writer", status: "in_progress",
+          });
+          expect(await freshSweep().sweepTerminalWorkspaces()).toMatchObject({
+            archived: 1, cleanupFailed: 0, skippedRace: 0,
+          });
+        });
+        if (delivery === "merged") await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+        else await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+      },
+      20_000,
+    );
+
+    it("SUP-20833 skips fresh reachability fetch while the terminal cooldown is active", async () => {
+      const seeded = await seedManagedCleanWorktree();
+      await db.update(issues).set({ completedAt: new Date() }).where(eq(issues.id, seeded.sourceIssueId));
+      const calls = await gitCallsDuring(async () => {
+        expect(await freshSweep(7, true).sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedCooldown: 1 });
+      }, { passThrough: true });
+      expect(calls).not.toContain("fetch --no-tags --prune");
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    }, 20_000);
+
+    it("SUP-20833 bounds a stalled origin fetch without prompting or deleting local files", async () => {
+      const seeded = await seedManagedCleanWorktree();
+      const bin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fetch-timeout-"));
+      tempDirs.add(bin);
+      const prompt = path.join(bin, "prompt");
+      const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+      await fs.writeFile(path.join(bin, "git"), [
+        "#!/bin/sh",
+        "case \"$*\" in",
+        `  *"fetch --no-tags --prune"*) printf '%s' "$GIT_TERMINAL_PROMPT" > '${prompt}'; exec sleep 120 ;;`,
+        "esac",
+        `exec '${realGit}' "$@"`,
+        "",
+      ].join("\n"));
+      await fs.chmod(path.join(bin, "git"), 0o755);
+      const originalPath = process.env.PATH;
+      const originalPrompt = process.env.GIT_TERMINAL_PROMPT;
+      process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ""}`;
+      process.env.GIT_TERMINAL_PROMPT = "1";
+      const reaper = freshSweep(0, true);
+      try {
+        expect(await reaper.sweepTerminalWorkspaces()).toMatchObject({ archived: 1, cleanupFailed: 0 });
+        expect(await fs.readFile(prompt, "utf8")).toBe("0");
+        await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+      } finally {
+        process.env.PATH = originalPath;
+        if (originalPrompt === undefined) delete process.env.GIT_TERMINAL_PROMPT;
+        else process.env.GIT_TERMINAL_PROMPT = originalPrompt;
+      }
+      const next = await seedManagedCleanWorktree();
+      expect(await reaper.sweepTerminalWorkspaces()).toMatchObject({ archived: 1, cleanupFailed: 0 });
+      await expect(fs.access(next.worktreePath)).rejects.toThrow();
+    }, 90_000);
 
     it("SUP-20833 preserves ignored data and an ignored nested worktree byte-for-byte", async () => {
       const seeded = await seedManagedCleanWorktree();

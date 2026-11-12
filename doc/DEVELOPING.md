@@ -1412,14 +1412,22 @@ Environment overrides:
   untracked files, and **all ignored data** keep the record-only behavior. Symlink
   aliases cannot escape the managed root. The sweep fetches and prunes `origin`
   and requires the tip to be reachable from those freshly fetched refs before
-  deletion; a failed verification preserves the tree and branch.
-  Canonical overlapping live references are checked across companies, and open
-  linked issues block isolated archiving even without runs. Allocation and cleanup
-  share host-wide database exclusion; final reference checks and deletion hold
-  transaction-local table locks. Contention refuses cleanup rather than waiting
-  in a conflicting lock order. Allocation that waited revalidates the path before
-  publishing it. These locks serialize host-path publication and briefly block
-  issue/workspace writes during removal; they do not fence arbitrary host file writes.
+  deletion; a failed verification preserves the tree and branch. This fetch runs
+  after cooldown and active-run checks, disables credential prompts, and times out
+  after 60 seconds.
+  Canonical live references equal to or inside the removal target are checked
+  across companies. A shared primary checkout outside the target does not block
+  removal. Duplicate paths are scanned once per check; remote sandbox paths are
+  excluded. An unreadable local holder keeps the candidate without aborting the
+  sweep. Open linked issues block isolated archiving even without runs.
+  Publishers share a host-wide advisory lock; only opt-in reclamation takes its
+  exclusive side and transaction-local table locks across final checks and
+  deletion. Default merged-PR cleanup and record-only archives take no table
+  locks. Contention refuses opt-in cleanup rather than waiting in a conflicting
+  lock order. A Git-worktree allocation that waited for cleanup revalidates its
+  path; metadata-only updates do not acquire the advisory lock.
+  Opt-in removal briefly blocks issue/workspace writes; these locks do not fence
+  arbitrary host file writes.
   Terminal `cleanup_failed` refusals are reconsidered on later sweep rotations
   under the same gates. Services remain running while deletion is refused.
   Turning the flag off prevents further widened deletion; it cannot restore

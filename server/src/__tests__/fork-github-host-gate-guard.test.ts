@@ -99,7 +99,9 @@ describe("fold decision D1 call-site guard", () => {
         // which would have silently re-armed managed identity in host mode.
         "services/heartbeat.ts": 5,
         "services/execution-workspace-provisioning.ts": 1,
-        "services/execution-workspaces.ts": 1,
+        // Both workspace refresh and reaper reachability fetch are NON-RUN:
+        // neither supplies heartbeatRunId, so D1 keeps host credentials by default.
+        "services/execution-workspaces.ts": 2,
         "routes/execution-workspaces.ts": 1,
       },
       resolveManagedGitHubIdentitySelection: {

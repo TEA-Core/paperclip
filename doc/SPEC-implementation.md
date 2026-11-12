@@ -1315,9 +1315,13 @@ The current app also exposes V1-supporting surfaces for:
   deletion only to isolated, attached, clean no-PR Git worktrees inside the
   canonical repository `.paperclip/worktrees/` root, with no untracked or ignored
   data and fresh fetched-origin reachability. Odd/relative paths, empty provider
-  refs and detached/branchless trees remain record-only. Canonical overlapping
-  references across companies and open linked issues block deletion, checked
-  inside the removal transaction with exclusion against concurrent publication.
+  refs and detached/branchless trees remain record-only. Canonical equal or
+  descendant references across companies and open linked issues block deletion,
+  checked inside the removal transaction with exclusion against concurrent
+  publication. Ancestor primary checkouts remain usable. Remote sandbox paths
+  are excluded; unreadable local references keep the candidate. Origin fetches
+  disable prompts and time out after 60 seconds. Only widened deletion takes
+  host-wide table locks; default cleanup and record-only archives do not.
   Dry run reports potential widened deletion as `not_previewed`, not a
   record-only archive. `doc/DEVELOPING.md` owns the flag, locking and rollback limits.
 - task watchdog configuration and reusable watchdog issue orchestration for explicitly watched issue subtrees
