@@ -881,8 +881,10 @@ describe("instance settings routes", () => {
     });
 
     it("enforces a wildcard allowlist at the API and preserves hidden values", async () => {
-      process.env.PAPERCLIP_HIDDEN_SETTINGS =
-        "instance.experimental.*,!instance.experimental.enableIsolatedWorkspaces";
+      vi.stubEnv(
+        "PAPERCLIP_HIDDEN_SETTINGS",
+        "instance.experimental.*,!instance.experimental.enableIsolatedWorkspaces",
+      );
       const app = await createApp(adminActor);
 
       const rejected = await request(app)
@@ -903,8 +905,10 @@ describe("instance settings routes", () => {
     });
 
     it("does not let an allowlist exception bypass an explicit API restriction", async () => {
-      process.env.PAPERCLIP_HIDDEN_SETTINGS =
-        "instance.experimental.*,!instance.experimental.enableEnvironments,instance.experimental.enableEnvironments";
+      vi.stubEnv(
+        "PAPERCLIP_HIDDEN_SETTINGS",
+        "instance.experimental.*,!instance.experimental.enableEnvironments,instance.experimental.enableEnvironments",
+      );
       const app = await createApp(adminActor);
       const res = await request(app)
         .patch("/api/instance/settings/experimental")
