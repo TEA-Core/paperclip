@@ -1390,8 +1390,8 @@ Environment overrides:
   wrappers surface the last failed backup in `/api/health`
 - `PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS=<days>` sets how long the
   terminal-workspace reaper waits after an issue tree becomes terminal before it
-  archives the execution workspace. Only a row with a recorded merged pull
-  request also has its worktree deleted. Every other archive (shared sessions,
+  archives the execution workspace. By default, only a row with a recorded merged
+  pull request also has its worktree deleted. Every other archive (shared sessions,
   rows with no pull request, missing or non-git cwds) changes the database row and
   no work-tree file, and leaves the directory and branch on disk. One live case
   also touches git metadata: a no-PR row whose recorded branch is gone is first
@@ -1404,6 +1404,26 @@ Environment overrides:
   the work inside this window. The default is `7`. A value of `0` disables the
   cooldown and restores immediate reaping. A negative or non-numeric value falls
   back to the default.
+- `PAPERCLIP_WORKSPACE_REAPER_RECLAIM_CLEAN_WORKTREES=1` (or `true`, `yes`) opts
+  into reclaiming isolated no-PR Git worktrees; default off. Only an attached,
+  recorded branch in a clean worktree whose real path is below the repository's
+  `.paperclip/worktrees/` root is eligible. Empty provider refs, relative paths,
+  `..` components, whitespace/control characters, detached/branchless trees,
+  untracked files, and **all ignored data** keep the record-only behavior. Symlink
+  aliases cannot escape the managed root. The sweep fetches and prunes `origin`
+  and requires the tip to be reachable from those freshly fetched refs before
+  deletion; a failed verification preserves the tree and branch.
+  Canonical overlapping live references are checked across companies, and open
+  linked issues block isolated archiving even without runs. Allocation and cleanup
+  share host-wide database exclusion; final reference checks and deletion hold
+  transaction-local table locks. Contention refuses cleanup rather than waiting
+  in a conflicting lock order. Allocation that waited revalidates the path before
+  publishing it. These locks serialize host-path publication and briefly block
+  issue/workspace writes during removal; they do not fence arbitrary host file writes.
+  Terminal `cleanup_failed` refusals are reconsidered on later sweep rotations
+  under the same gates. Services remain running while deletion is refused.
+  Turning the flag off prevents further widened deletion; it cannot restore
+  directories or runtime-owned branches already removed.
 - `PAPERCLIP_WORKSPACE_REAPER_DRY_RUN=1` (or `true`, `yes`) runs the reaper
   read-only and fetch-free. It changes no file, ref, reflog, index, `FETCH_HEAD`
   or database row, and stops nothing. To classify the record-only archives it
@@ -1414,11 +1434,15 @@ Environment overrides:
   - `archive_record_only`: the row would be archived as a record only, with no
     work-tree change.
   - `not_previewed`: a row with a recorded merged pull request, or a retried
-    `spawn git ENOENT` row, goes through the existing cleanup path. The dry run
+    terminal `cleanup_failed` row, goes through the existing cleanup path. The dry run
     does not preview it (`inherited cleanup path`) and spawns no git command and
     no readiness or cleanup helper for it. It logs these rows before the cooldown
     and active-run checks and counts them in no skip counter, so the dry run's
     skip counters cover previewed rows only and can be lower than the live pass's.
+    With clean-worktree reclamation enabled, potentially reclaimable no-PR rows
+    are also `not_previewed` (fresh remote verification is required). Their
+    read-only local checks run, but no fetch or cleanup does, and they do not
+    count in `wouldArchive`.
   - `clear_reopen_pending`: the live sweep clears a reopen fence and keeps the
     row.
   - `keep`: the row stays as it is. `reason` says why. One exception is not a

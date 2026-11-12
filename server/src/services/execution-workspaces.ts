@@ -90,6 +90,45 @@ export const ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON = "issue_terminal";
 const TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON = "terminal, clean, nothing unique";
 const SHARED_SESSION_RECORD_ARCHIVE_REASON = "shared session record";
 const WORKSPACE_REAPER_DRY_RUN_ENV = "PAPERCLIP_WORKSPACE_REAPER_DRY_RUN";
+const WORKSPACE_REAPER_RECLAIM_CLEAN_ENV = "PAPERCLIP_WORKSPACE_REAPER_RECLAIM_CLEAN_WORKTREES";
+// One host namespace: companies and nested/symlinked paths can share storage.
+const WORKSPACE_PATH_PUBLICATION_LOCK = "execution-workspace:host-path-publication";
+
+async function canonicalWorkspacePath(value: string): Promise<string> {
+  const absolute = path.resolve(value);
+  try {
+    return await fs.realpath(absolute);
+  } catch (error) {
+    if (!isAbsentFilesystemPath(error)) throw error;
+    const parent = path.dirname(absolute);
+    if (parent === absolute) throw error;
+    return path.join(await canonicalWorkspacePath(parent), path.basename(absolute));
+  }
+}
+
+function workspacePathsOverlap(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}${path.sep}`) || right.startsWith(`${left}${path.sep}`);
+}
+
+async function acquireWorkspacePathPublicationLock(tx: DbTransaction): Promise<boolean> {
+  const [row] = await tx.execute<{ acquired: boolean }>(
+    sql`select pg_try_advisory_xact_lock(hashtextextended(${WORKSPACE_PATH_PUBLICATION_LOCK}, 0)) as acquired`,
+  );
+  if (row?.acquired) return false;
+  await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${WORKSPACE_PATH_PUBLICATION_LOCK}, 0))`);
+  return true;
+}
+
+async function revalidateWorkspacePathAfterCleanup(
+  workspace: Pick<ExecutionWorkspaceRow, "cwd" | "providerRef" | "providerType">,
+) {
+  const workspacePath = workspace.providerRef ?? workspace.cwd;
+  if (!workspacePath) return;
+  const checkPath = workspace.providerType === "git_worktree" ? path.join(workspacePath, ".git") : workspacePath;
+  if (!(await pathExists(checkPath))) {
+    throw conflict("Workspace was removed while allocation waited for cleanup; provision it again.");
+  }
+}
 
 export type TerminalWorkspaceSweepSkipCounts = {
   skippedActiveRun: number;
@@ -368,6 +407,8 @@ export type ExecutionWorkspaceServiceOptions = {
   workspaceReaperCooldownDays?: number;
   // Host dry-run. Also enabled by PAPERCLIP_WORKSPACE_REAPER_DRY_RUN. Default off.
   dryRun?: boolean;
+  // Opt-in widening; unset preserves the record-only archive contract.
+  reclaimCleanWorktrees?: boolean;
 };
 
 export function deriveExecutionWorkspaceDeliveryState(input: {
@@ -1774,31 +1815,83 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     };
   }
 
+  async function terminalCleanupReferenceReason(workspace: ExecutionWorkspaceRow, reader: RuntimeServiceReadDb) {
+    const [openIssue] = await reader.select({ id: issues.id }).from(issues).where(and(
+      eq(issues.executionWorkspaceId, workspace.id),
+      sql`${issues.status} NOT IN ('done', 'cancelled')`,
+    )).limit(1);
+    if (openIssue) return "workspace is linked to an open issue";
+    const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
+    if (!workspacePath) return null;
+    const target = await canonicalWorkspacePath(workspacePath);
+    const references = await reader.select({
+      id: executionWorkspaces.id,
+      cwd: executionWorkspaces.cwd,
+      providerRef: executionWorkspaces.providerRef,
+    }).from(executionWorkspaces).where(and(
+      ne(executionWorkspaces.id, workspace.id),
+      inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+    ));
+    for (const reference of references) {
+      for (const value of new Set([reference.cwd, reference.providerRef])) {
+        if (value && workspacePathsOverlap(target, await canonicalWorkspacePath(value))) {
+          // Do not disclose another company's row identity.
+          return "path overlaps an active execution workspace";
+        }
+      }
+    }
+    return null;
+  }
+
+  async function cleanNoPrWorktreeCanBeReclaimed(workspace: ExecutionWorkspaceRow, fetchRemote: boolean) {
+    const workspacePath = workspace.providerRef;
+    if (!workspacePath || !workspace.branchName || workspace.mode !== "isolated_workspace"
+      || workspace.providerType !== "git_worktree" || !path.isAbsolute(workspacePath)
+      || /[\s\x00-\x1f\x7f]/.test(workspacePath) || workspacePath.split(path.sep).includes("..")) return false;
+    try {
+      const target = await fs.realpath(workspacePath);
+      const commonDirRaw = await readGitStdout(["rev-parse", "--git-common-dir"], workspacePath);
+      if (!commonDirRaw) return false;
+      const commonDir = await fs.realpath(path.resolve(workspacePath, commonDirRaw));
+      if (path.basename(commonDir) !== ".git") return false;
+      const managedRoot = await canonicalWorkspacePath(path.join(path.dirname(commonDir), ".paperclip", "worktrees"));
+      if (!target.startsWith(`${managedRoot}${path.sep}`)) return false;
+      const topLevel = await readGitStdout(["rev-parse", "--show-toplevel"], workspacePath);
+      if (!topLevel || await fs.realpath(topLevel) !== target) return false;
+      const branch = await readGitStdout(["symbolic-ref", "--quiet", "--short", "HEAD"], workspacePath);
+      if (branch !== workspace.branchName) return false;
+      // Ignored data is not disposable by default (.env, databases, nested trees).
+      const ignored = await runGit(["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], workspacePath);
+      if (ignored.stdout.length > 0) return false;
+      if (!fetchRemote) return true;
+      const remoteUrl = await readGitStdout(["remote", "get-url", "origin"], workspacePath);
+      if (!remoteUrl) return false;
+      const resolveAuth = createGitRemoteAuthProvider(db, workspace.companyId);
+      const auth = await resolveAuth(remoteUrl);
+      // Prune stale remote tips before treating them as durable delivery evidence.
+      await execFileAsync("git", [
+        "-C", workspacePath, ...(auth?.configArgs ?? []), "fetch", "--no-tags", "--prune",
+        "origin", "+refs/heads/*:refs/remotes/origin/*",
+      ], { cwd: workspacePath, env: auth ? { ...process.env, ...auth.env } : process.env });
+      const missing = await runGit(["rev-list", "--count", "HEAD", "--not", "--remotes=origin/*"], workspacePath);
+      return missing.stdout.trim() === "0";
+    } catch {
+      return false;
+    }
+  }
+
   async function assertTerminalCleanupGitStateUnchanged(
     workspace: ExecutionWorkspaceRow,
     expectedHeadSha: string | null,
+    reader: RuntimeServiceReadDb,
+    reclaimRecordOnly = false,
   ) {
     if (workspace.providerType !== "git_worktree") return;
     const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
-    const [activeReference] = workspacePath
-      ? await db
-          .select({ id: executionWorkspaces.id })
-          .from(executionWorkspaces)
-          .where(and(
-            eq(executionWorkspaces.companyId, workspace.companyId),
-            ne(executionWorkspaces.id, workspace.id),
-            inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
-            or(
-              eq(executionWorkspaces.cwd, workspacePath),
-              eq(executionWorkspaces.providerRef, workspacePath),
-            ),
-          ))
-          .limit(1)
-      : [];
-    if (activeReference) {
-      throw new Error(
-        `Refusing terminal workspace cleanup because ${workspacePath} is still referenced by active execution workspace ${activeReference.id}`,
-      );
+    const referenceReason = await terminalCleanupReferenceReason(workspace, reader);
+    if (referenceReason) throw new Error(`Refusing terminal workspace cleanup because ${referenceReason}`);
+    if (reclaimRecordOnly && !(await cleanNoPrWorktreeCanBeReclaimed(workspace, false))) {
+      throw new Error("Refusing terminal workspace cleanup because ignored data or branch identity changed");
     }
     if (workspacePath && !(await pathExists(workspacePath))) {
       // The checkout is already gone. There is no HEAD left to re-verify, and
@@ -2018,15 +2111,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     workspace: ExecutionWorkspaceRow,
     expectedHeadSha: string | null,
     capturedGeneration: number,
+    reclaimRecordOnly = false,
   ): Promise<{ cleaned: boolean; warnings: string[]; skippedReopened?: boolean }> {
     // The gateway holds the per-workspace lifecycle lock across the destructive
     // actions. A reopen takes the same lock, so a reopen cannot rebuild the
     // worktree while this cleanup runs, and this cleanup cannot delete a worktree
-    // that a reopen already restored. The advisory lock (not a row FOR UPDATE)
-    // gives the exclusion, so the cleanup body can still update the same row on
-    // the pooled connection without a self-block. A reopen restored this
-    // workspace after it was archived when the guard fails, so the cleanup skips
-    // and does not destroy the rebuilt worktree.
+    // that a reopen already restored. All cleanup writes use this transaction,
+    // including runtime-service and operation-log updates. A failed generation
+    // guard skips cleanup rather than destroying a rebuilt worktree.
     return fenceLifecycleGenerationWrite<{ cleaned: boolean; warnings: string[]; skippedReopened?: boolean }>({
       workspaceId: workspace.id,
       expectedGeneration: capturedGeneration,
@@ -2036,11 +2128,17 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         message: "execution workspace cleanup skipped because it was reopened",
       },
       onSkip: () => ({ cleaned: false, warnings: [], skippedReopened: true }),
-      write: () => runTerminalWorkspaceCleanup(workspace, expectedHeadSha),
+      write: ({ tx }) => runTerminalWorkspaceCleanup(workspace, expectedHeadSha, tx, reclaimRecordOnly),
     });
   }
 
-  async function runTerminalWorkspaceCleanup(workspace: ExecutionWorkspaceRow, expectedHeadSha: string | null) {
+  async function runTerminalWorkspaceCleanup(
+    workspace: ExecutionWorkspaceRow,
+    expectedHeadSha: string | null,
+    tx: DbTransaction,
+    reclaimRecordOnly: boolean,
+  ) {
+    const cleanupDb = tx as unknown as Db;
     const [
       {
         acquireGitWorktreeCleanupLock,
@@ -2075,11 +2173,18 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       ? await acquireGitWorktreeCleanupLock(workspace.providerRef ?? workspace.cwd!)
       : null;
     try {
-      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha);
+      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, tx, reclaimRecordOnly);
       await opts.beforeTerminalWorkspaceCleanup?.(workspace);
-      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha);
+      if (reclaimRecordOnly && !(await cleanNoPrWorktreeCanBeReclaimed(workspace, true))) {
+        throw new Error("Refusing terminal workspace cleanup because fresh remote reachability is unverified");
+      }
+      await acquireWorkspacePathPublicationLock(tx);
+      // Block even non-cooperating SQL writers across the final guard and removal.
+      // NOWAIT avoids lock-order deadlocks with issue/run updates; later sweeps retry.
+      await tx.execute(sql`LOCK TABLE ${executionWorkspaces}, ${issues} IN SHARE ROW EXCLUSIVE MODE NOWAIT`);
+      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, tx, reclaimRecordOnly);
       await stopRuntimeServicesForExecutionWorkspace({
-        db,
+        db: cleanupDb,
         executionWorkspaceId: workspace.id,
         workspaceCwd: workspace.cwd,
       });
@@ -2088,11 +2193,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         projectWorkspace,
         cleanupCommand: config?.cleanupCommand ?? null,
         teardownCommand: config?.teardownCommand ?? projectPolicy?.workspaceStrategy?.teardownCommand ?? null,
-        recorder: workspaceOperationService(db).createRecorder({
+        recorder: workspaceOperationService(cleanupDb).createRecorder({
           companyId: workspace.companyId,
           executionWorkspaceId: workspace.id,
         }),
-        assertSafeToCleanup: () => assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha),
+        assertSafeToCleanup: () => assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, tx, reclaimRecordOnly),
         beforeBranchDelete: () => cleanupLock?.releaseBranchRefLock() ?? Promise.resolve(),
         expectedBranchHeadSha: expectedHeadSha,
         // Git index, HEAD, and branch-ref locks prevent a clean HEAD change
@@ -2103,7 +2208,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         forceWorktreeRemoval: false,
       });
       if (cleanup.cleaned && workspace.mode === "shared_workspace") {
-        await db
+        await tx
           .update(issues)
           .set({ executionWorkspaceId: null, updatedAt: now() })
           .where(and(
@@ -2113,7 +2218,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       }
       const cleanupReason = [ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON, ...cleanup.warnings].join(" | ");
       if (!cleanup.cleaned || cleanup.warnings.length > 0) {
-        await db
+        await tx
           .update(executionWorkspaces)
           .set({
             ...(cleanup.cleaned ? {} : { status: "cleanup_failed" }),
@@ -2168,10 +2273,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     });
   }
 
-  // A stuck spawn-ENOENT row is already closed. The retry must not raise the
+  // A failed terminal cleanup is already closed. The retry must not raise the
   // lifecycle generation: the fence above belongs to the failed archive. Promote
   // back to archived only while that generation and cleanup_failed are current.
-  async function markStuckEnoentCleanupArchived(input: {
+  async function markTerminalCleanupArchived(input: {
     workspaceId: string;
     capturedGeneration: number;
     cleanupReason: string;
@@ -3087,16 +3192,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         isNull(executionWorkspaces.closedAt),
         sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
       );
-      // A missing worktree cwd used to throw `spawn <git> ENOENT` after the
-      // row was already closed, and this sweep never reselected `cleanup_failed`.
-      // Retry only that reason. Every gate below still applies, and the cleanup
-      // uses the generation already on the row instead of raising a new one.
-      const stuckEnoentRetryFilter = and(
+      // Refusals are transient: a holder, lock, dirty file or remote can clear.
+      // Re-evaluate all terminal cleanup failures under the same safety gates.
+      const terminalCleanupRetryFilter = and(
         eq(executionWorkspaces.status, "cleanup_failed"),
-        sql<boolean>`${executionWorkspaces.cleanupReason} ~ ${STUCK_GIT_SPAWN_ENOENT_CLEANUP_REASON_PATTERN}`,
+        sql<boolean>`${executionWorkspaces.cleanupReason} LIKE 'issue_terminal | %'`,
         sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
       );
-      const baseCandidateFilter = or(openCandidateFilter, stuckEnoentRetryFilter);
+      const baseCandidateFilter = or(openCandidateFilter, terminalCleanupRetryFilter);
       // Continue the scan after the previous sweep's last row. The keyset
       // predicate uses the same (updatedAt, id) order as the query, so each
       // sweep advances past the rows it already inspected instead of re-reading
@@ -3236,7 +3339,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           // cooldown and active-run gates and counts in no skip counter, so the
           // dry skip counters cover previewed rows only and differ from live.
           const recorded = await assessDelivery(workspace, null);
-          const inheritedCleanup = (workspace.status === "cleanup_failed" && isStuckGitSpawnEnoentCleanupReason(workspace.cleanupReason))
+          const inheritedCleanup = workspace.status === "cleanup_failed"
             || recorded.deliveryState === "merged_via_pr"
             || recorded.deliveryState === "merged_by_ancestry";
           if (inheritedCleanup && recorded.sourceIssueTerminal && recorded.subtreeTerminal) {
@@ -3270,10 +3373,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           keep(workspace, "issue tree is not terminal", "skippedNonTerminalTree");
           continue;
         }
-        // Shared, missing, and non-git record-only archives change no work tree.
-        // Isolated git record-only archives detach first, then use the same fenced
-        // cleanup as merged delivery. The readiness inspection above can still
-        // fetch the default branch when the recorded branch is missing.
+        // Record-only archives preserve files, branches and runtime services.
+        // Only the explicitly enabled, clean, verified no-PR case can widen this.
         let recordOnlyReason: string | null = null;
         const mergedDelivery = assessment.deliveryState === "merged_via_pr"
           || assessment.deliveryState === "merged_by_ancestry";
@@ -3284,7 +3385,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           // without a delivery verdict.
           recordOnlyReason = SHARED_SESSION_RECORD_ARCHIVE_REASON;
         } else if (!mergedDelivery) {
-          if (!isOpenRow || assessment.hasPullRequestProduct) {
+          if (assessment.hasPullRequestProduct) {
             keep(workspace, "delivery is not recorded as merged", "skippedUndelivered");
             continue;
           }
@@ -3317,10 +3418,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           keep(workspace, "worktree has local changes", "skippedUndelivered");
           continue;
         }
-        const cleanupRecordOnly = Boolean(recordOnlyReason)
+        const reclaimEnabled = opts.reclaimCleanWorktrees
+          ?? /^(1|true|yes)$/i.test(process.env[WORKSPACE_REAPER_RECLAIM_CLEAN_ENV]?.trim() ?? "");
+        const cleanupRecordOnly = reclaimEnabled
+          && recordOnlyReason === TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON
           && !sharedSession
-          && workspace.providerType === "git_worktree"
-          && cwdKind === "git";
+          && cwdKind === "git"
+          && await cleanNoPrWorktreeCanBeReclaimed(workspace, !dryRun);
         const cleanupReason = recordOnlyReason
           ? `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${recordOnlyReason}`
           : ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON;
@@ -3426,19 +3530,38 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           logDryRun(workspace, "not_previewed", "inherited cleanup path");
           continue;
         }
-        if (
-          workspace.status === "cleanup_failed"
-          && isStuckGitSpawnEnoentCleanupReason(workspace.cleanupReason)
-        ) {
+        if (dryRun && cleanupRecordOnly) {
+          logDryRun(workspace, "not_previewed", "opt-in clean worktree cleanup requires fresh remote verification");
+          continue;
+        }
+        if (workspace.mode !== "shared_workspace") {
+          const [openLink] = await db.select({ id: issues.id }).from(issues).where(and(
+            eq(issues.executionWorkspaceId, workspace.id),
+            sql`${issues.status} NOT IN ('done', 'cancelled')`,
+          )).limit(1);
+          if (openLink) {
+            keep(workspace, "workspace is linked to an open issue", "skippedNonTerminalTree");
+            continue;
+          }
+        }
+        if (workspace.status === "cleanup_failed") {
           result.eligible += 1;
           const capturedGeneration = readExecutionWorkspaceLifecycleGeneration(
             workspace.metadata as Record<string, unknown> | null,
           );
+          if (recordOnlyReason && !cleanupRecordOnly) {
+            if (await markTerminalCleanupArchived({
+              workspaceId: workspace.id, capturedGeneration, cleanupReason,
+            })) result.archived += 1;
+            else result.skippedReopened += 1;
+            continue;
+          }
           try {
             const cleanup = await cleanupTerminalWorkspace(
               workspace,
               assessment.workspaceHeadSha,
               capturedGeneration,
+              cleanupRecordOnly,
             );
             if (cleanup.skippedReopened) {
               result.skippedReopened += 1;
@@ -3448,7 +3571,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               result.cleanupFailed += 1;
               continue;
             }
-            const promoted = await markStuckEnoentCleanupArchived({
+            const promoted = await markTerminalCleanupArchived({
               workspaceId: workspace.id,
               capturedGeneration,
               cleanupReason: cleanup.warnings.length > 0
@@ -3470,7 +3593,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                 sourceIssueId: workspace.sourceIssueId,
                 deliveryState: assessment.deliveryState,
                 cleanupReason: ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON,
-                retriedStuckSpawnEnoent: true,
+                retriedTerminalCleanup: true,
               },
             });
             result.archived += 1;
@@ -3514,6 +3637,19 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // lock, so it never archives a workspace that a reopen just restored.
         const archived = await db.transaction(async (tx) => {
           await acquireExecutionWorkspaceLifecycleLock(tx, workspace.id);
+          if (cleanupRecordOnly) {
+            await acquireWorkspacePathPublicationLock(tx);
+            await tx.execute(sql`LOCK TABLE ${executionWorkspaces}, ${issues} IN SHARE ROW EXCLUSIVE MODE NOWAIT`);
+            if (await terminalCleanupReferenceReason(workspace, tx)) return null;
+          }
+          if (workspace.mode !== "shared_workspace") {
+            await tx.execute(sql`LOCK TABLE ${issues} IN SHARE ROW EXCLUSIVE MODE NOWAIT`);
+            const [openLink] = await tx.select({ id: issues.id }).from(issues).where(and(
+              eq(issues.executionWorkspaceId, workspace.id),
+              sql`${issues.status} NOT IN ('done', 'cancelled')`,
+            )).limit(1);
+            if (openLink) return null;
+          }
           const row = await tx
             .update(executionWorkspaces)
             .set({
@@ -3605,6 +3741,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             });
           }
           return row;
+        }).catch((error: unknown) => {
+          let cause = error;
+          for (let depth = 0; depth < 8 && cause && typeof cause === "object"; depth += 1) {
+            if ("code" in cause && (cause.code === "55P03" || cause.code === "40P01")) return null;
+            cause = "cause" in cause ? cause.cause : null;
+          }
+          throw error;
         });
         if (!archived) {
           result.skippedRace += 1;
@@ -3634,7 +3777,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           archived.metadata as Record<string, unknown> | null,
         );
         try {
-          const cleanup = await cleanupTerminalWorkspace(archived, assessment.workspaceHeadSha, capturedGeneration);
+          const cleanup = await cleanupTerminalWorkspace(archived, assessment.workspaceHeadSha, capturedGeneration, cleanupRecordOnly);
           if (cleanup.skippedReopened) result.skippedReopened += 1;
           else if (!cleanup.cleaned) result.cleanupFailed += 1;
           else result.archived += 1;
@@ -3681,6 +3824,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           ? `execution-workspace:path:${data.companyId}:${data.projectWorkspaceId}:${data.cwd}`
           : null;
       const row = await db.transaction(async (tx) => {
+        const waitedForCleanup = await acquireWorkspacePathPublicationLock(tx);
+        if (waitedForCleanup) {
+          await revalidateWorkspacePathAfterCleanup({
+            cwd: data.cwd ?? null, providerRef: data.providerRef ?? null, providerType: data.providerType ?? "local_fs",
+          });
+        }
         if (pathGuardKey) {
           await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${pathGuardKey}, 0))`);
         }
@@ -3695,12 +3844,20 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     },
 
     update: async (id: string, patch: Partial<typeof executionWorkspaces.$inferInsert>) => {
-      const row = await db
-        .update(executionWorkspaces)
-        .set({ ...patch, updatedAt: new Date() })
-        .where(eq(executionWorkspaces.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const row = await db.transaction(async (tx) => {
+        const waitedForCleanup = await acquireWorkspacePathPublicationLock(tx);
+        if (waitedForCleanup) {
+          const [current] = await tx.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, id));
+          if (current && ["active", "idle", "in_review"].includes(patch.status ?? current.status)) {
+            await revalidateWorkspacePathAfterCleanup({ ...current, ...patch });
+          }
+        }
+        return tx.update(executionWorkspaces)
+          .set({ ...patch, updatedAt: new Date() })
+          .where(eq(executionWorkspaces.id, id))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      });
       return row ? toExecutionWorkspace(row) : null;
     },
 
@@ -3899,6 +4056,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
 
       return db.transaction(async (tx): Promise<ReopenClosedIsolatedExecutionWorkspaceResult> => {
         await acquireExecutionWorkspaceLifecycleLock(tx, input.workspaceId);
+        await acquireWorkspacePathPublicationLock(tx);
         const row = await tx
           .select()
           .from(executionWorkspaces)
