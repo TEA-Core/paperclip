@@ -6,6 +6,7 @@ import {
   agents,
   agentWakeupRequests,
   companies,
+  completionContracts,
   costEvents,
   createDb,
   documentRevisions,
@@ -15,6 +16,10 @@ import {
   issueDocuments,
   issueThreadInteractions,
   issues,
+  nativeRunResults,
+  statusDecisionEffects,
+  statusDecisions,
+  workAssessments,
 } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import {
@@ -27,6 +32,7 @@ import {
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
 } from "../services/heartbeat.ts";
+import { bindNativeReviewCommitterWakeToRun } from "../services/native-runtime/native-review-participant.ts";
 import { runningProcesses } from "../adapters/index.ts";
 import { recoveryService } from "../services/recovery/service.ts";
 
@@ -89,6 +95,12 @@ async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 3_000) {
 
 const HEARTBEAT_INVALIDATION_TRUNCATE_SQL = `
   TRUNCATE TABLE
+    "issue_thread_interactions",
+    "status_decision_effects",
+    "status_decisions",
+    "work_assessments",
+    "native_run_results",
+    "completion_contracts",
     "company_skills",
     "issue_comments",
     "issue_documents",
@@ -534,6 +546,799 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(wakeup).toMatchObject({ status: "skipped", error: expect.stringContaining("no longer in_progress") });
     expect(issue?.status).toBe("backlog");
     expect(countExecuteCallsForRun(runId)).toBe(0);
+  });
+
+  type NativeReviewFixtureOptions = {
+    interactionStatus?: "pending" | "rejected";
+    wakeReason?: string;
+    runAgentId?: string;
+    authenticateWake?: boolean;
+    queuedRunCount?: number;
+  };
+
+  async function seedNativeReviewFixture(opts: NativeReviewFixtureOptions = {}) {
+    const interactionStatus = opts.interactionStatus ?? "pending";
+    const { companyId, agentId: workerId } = await seedCompanyAndAgent();
+    const reviewerId = randomUUID();
+    await db.insert(agents).values({
+      id: reviewerId,
+      companyId,
+      name: "ReviewLead",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    if (opts.runAgentId && opts.runAgentId !== reviewerId) {
+      await db.insert(agents).values({
+        id: opts.runAgentId,
+        companyId,
+        name: "OtherAgent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      });
+    }
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const contractId = randomUUID();
+    const resultId = randomUUID();
+    const assessmentId = randomUUID();
+    const decisionId = randomUUID();
+    const interactionId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Native review of completed work",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: workerId,
+      statusVersion: 1,
+      lastStatusDecisionId: decisionId,
+    });
+    await db.insert(completionContracts).values({
+      id: contractId, companyId, issueId, revision: 1, schemaVersion: "1",
+      policyVersion: "test", risk: "low", completionAuthority: "agent_claim_policy",
+      incompleteCriteriaPolicy: "block", contractJson: {}, canonicalSha256: randomUUID(),
+      createdByActorType: "agent", createdByActorId: workerId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId, companyId, agentId: workerId, status: "succeeded",
+      runtimeMode: "native", nativeIssueId: issueId, completionContractId: contractId,
+      contextSnapshot: { issueId }, startedAt: new Date(), finishedAt: new Date(),
+    });
+    await db.insert(nativeRunResults).values({
+      id: resultId, companyId, issueId, runId: sourceRunId, completionContractId: contractId,
+      serverFingerprint: randomUUID(), schemaStatus: "valid", resultJson: {},
+      canonicalSha256: randomUUID(),
+    });
+    await db.insert(workAssessments).values({
+      id: assessmentId, companyId, issueId, runId: sourceRunId, contractId, resultId,
+      triggerKind: "test", triggerActorCompanyId: companyId, priorIssueStatus: "in_progress",
+      priorStatusVersion: 0, policyVersion: "test", assessmentJson: {}, inputDigest: randomUUID(),
+    });
+    await db.insert(statusDecisions).values({
+      id: decisionId, companyId, issueId, runId: sourceRunId, assessmentId,
+      decisionVersion: 1, policyVersion: "test", fromStatus: "in_progress",
+      toStatus: "in_review", reasonCode: "completion_review",
+      decisionJson: { projectedStatusVersion: 1 }, decisionDigest: randomUUID(),
+      applicationState: "applied",
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId, companyId, issueId, kind: "request_confirmation", status: interactionStatus,
+      continuationPolicy: "wake_assignee", requestedResolverPolicy: "anyone",
+      effectiveResolverPolicy: "anyone", resolverPolicyProvenance: "inherited",
+      sourceRunId, addresseeAgentId: reviewerId,
+      payload: {
+        version: 1, prompt: "Review",
+        target: { type: "custom", key: "native_completion_review", revisionId: decisionId },
+      },
+    });
+    const runAgentId = opts.runAgentId ?? reviewerId;
+    const wakeReason = opts.wakeReason ?? "native_completion_review";
+    const runIds: string[] = [];
+    const wakeupRequestIds: string[] = [];
+    for (let index = 0; index < (opts.queuedRunCount ?? 1); index += 1) {
+      const queued = await seedQueuedRun({
+        companyId,
+        agentId: runAgentId,
+        issueId,
+        wakeReason,
+        contextExtras: {
+          nativeReviewInteractionId: interactionId,
+          nativeReviewDecisionId: decisionId,
+        },
+      });
+      runIds.push(queued.runId);
+      wakeupRequestIds.push(queued.wakeupRequestId);
+      if (opts.authenticateWake ?? true) {
+        await db.update(agentWakeupRequests).set({
+          idempotencyKey: `native-review:${interactionId}`,
+          requestedByActorType: "system",
+          requestedByActorId: "native-status-committer",
+          payload: {
+            issueId,
+            nativeReviewInteractionId: interactionId,
+            nativeReviewDecisionId: decisionId,
+          },
+        }).where(eq(agentWakeupRequests.id, queued.wakeupRequestId));
+      }
+    }
+    if (wakeupRequestIds.length > 0) {
+      await db.insert(statusDecisionEffects).values({
+        companyId, issueId, decisionId, ordinal: 1, effectKind: "bind_reviewer",
+        targetType: "issue_thread_interaction", targetId: interactionId,
+        idempotencyKey: `native-status:${decisionId}:1`,
+        payload: {
+          interactionId, ownerAgentId: reviewerId,
+          reviewerWakeId: wakeupRequestIds[0],
+        },
+        deliveryState: "delivered", deliveredAt: new Date(),
+      });
+    }
+    return {
+      companyId, workerId, reviewerId, issueId, interactionId, decisionId,
+      runId: runIds[0]!, runIds, wakeupRequestId: wakeupRequestIds[0]!, wakeupRequestIds,
+    };
+  }
+
+  async function readRunState(runId: string) {
+    return db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function resumeAndReadRun(runId: string, service: ReturnType<typeof heartbeatService> = heartbeat) {
+    await service.resumeQueuedRuns();
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const settled = await waitForCondition(async () => {
+        const run = await readRunState(runId);
+        return run?.status !== "queued" && run?.status !== "running";
+      });
+      if (settled) break;
+    }
+    return readRunState(runId);
+  }
+
+  // Faults only queries matching the predicate (by table and bound params),
+  // optionally only the first matching query. All other queries pass through.
+  function createFaultedHeartbeat(
+    shouldFail: (input: { table: unknown; params: unknown[] }) => boolean,
+    opts: { once?: boolean } = {},
+  ) {
+    const injectedError = new Error("injected native-review lookup failure");
+    let faulted = 0;
+    const wrapBuilder = (builder: any, table: unknown): any => new Proxy(builder, {
+      get(bt, bp) {
+        const value = Reflect.get(bt, bp, bt);
+        if (bp === "then") {
+          return (onFulfilled: unknown, onRejected: unknown) => {
+            let targeted = false;
+            try {
+              targeted = table !== undefined && shouldFail({ table, params: bt.toSQL().params as unknown[] });
+            } catch {
+              targeted = false;
+            }
+            if (targeted && (!opts.once || faulted === 0)) {
+              faulted += 1;
+              return Promise.reject(injectedError).then(onFulfilled as any, onRejected as any);
+            }
+            return (value as any).call(bt, onFulfilled, onRejected);
+          };
+        }
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          const result = (value as any).apply(bt, args);
+          if (bp === "from") return wrapBuilder(result, args[0]);
+          return result && typeof result === "object" &&
+            (typeof result.from === "function" || typeof result.where === "function" || typeof result.then === "function")
+            ? wrapBuilder(result, table)
+            : result;
+        };
+      },
+    });
+    const wrapSelect = (target: object): any => new Proxy(target, {
+      get(t, prop, receiver) {
+        if (prop === "transaction") {
+          const value = Reflect.get(t, prop, receiver) as any;
+          return (fn: (tx: unknown) => Promise<unknown>) =>
+            value.call(t, (tx: object) => fn(wrapSelect(tx)));
+        }
+        if (prop !== "select") return Reflect.get(t, prop, receiver);
+        return (...args: unknown[]) => wrapBuilder((t as any).select(...args), undefined);
+      },
+    });
+    const faultedDb = new Proxy(db, {
+      get(t, prop, receiver) {
+        if (prop === "select" || prop === "transaction") return wrapSelect(t)[prop];
+        return Reflect.get(t, prop, receiver);
+      },
+    }) as typeof db;
+    return heartbeatService(faultedDb, {
+      runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" },
+    });
+  }
+
+  it("claims a bare native-review queued run for the reviewer instead of cancelling it as assignee-changed", async () => {
+    const fixture = await seedNativeReviewFixture();
+    const run = await resumeAndReadRun(fixture.runId);
+    const [wakeup] = await db.select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, fixture.wakeupRequestId));
+    expect(run?.errorCode).not.toBe("issue_assignee_changed");
+    expect(run?.status).toBe("succeeded");
+    expect(wakeup?.status).not.toBe("skipped");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(1);
+  });
+
+  it("still cancels a native-review queued run whose interaction is no longer pending", async () => {
+    const fixture = await seedNativeReviewFixture({ interactionStatus: "rejected" });
+    const run = await resumeAndReadRun(fixture.runId);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_assignee_changed");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(0);
+  });
+
+  it("cancels an ordinary issue_assigned wake carrying copied native-review markers", async () => {
+    const fixture = await seedNativeReviewFixture({
+      wakeReason: "issue_assigned",
+      authenticateWake: false,
+    });
+    const run = await resumeAndReadRun(fixture.runId);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_assignee_changed");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(0);
+  });
+
+  it("cancels a native-review queued run queued for an agent who is not the review addressee", async () => {
+    const otherAgentId = randomUUID();
+    const fixture = await seedNativeReviewFixture({ runAgentId: otherAgentId });
+    const run = await resumeAndReadRun(fixture.runId);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_assignee_changed");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(0);
+  });
+
+  it("cancels a native-review queued run whose assignment belongs to another company", async () => {
+    const fixture = await seedNativeReviewFixture();
+    const { companyId: foreignCompanyId, agentId: foreignWorkerId } = await seedCompanyAndAgent();
+    const foreignReviewerId = randomUUID();
+    await db.insert(agents).values({
+      id: foreignReviewerId,
+      companyId: foreignCompanyId,
+      name: "ForeignReviewLead",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    const foreignIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: foreignIssueId,
+      companyId: foreignCompanyId,
+      title: "Foreign issue with copied review markers",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: foreignWorkerId,
+      statusVersion: 1,
+      lastStatusDecisionId: fixture.decisionId,
+    });
+    const { runId } = await seedQueuedRun({
+      companyId: foreignCompanyId,
+      agentId: foreignReviewerId,
+      issueId: foreignIssueId,
+      wakeReason: "native_completion_review",
+      contextExtras: {
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+    });
+    await db.update(agentWakeupRequests).set({
+      idempotencyKey: `native-review:${fixture.interactionId}`,
+      payload: {
+        issueId: foreignIssueId,
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+    }).where(eq(agentWakeupRequests.agentId, foreignReviewerId));
+
+    const run = await resumeAndReadRun(runId);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_assignee_changed");
+    expect(countExecuteCallsForRun(runId)).toBe(0);
+  });
+
+  it("executes only one of two queued runs for the same native-review assignment", async () => {
+    const fixture = await seedNativeReviewFixture({ queuedRunCount: 2 });
+    await heartbeat.resumeQueuedRuns();
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const settled = await waitForCondition(async () => {
+        const states = await Promise.all(fixture.runIds.map((runId) => readRunState(runId)));
+        return states.every((run) => run?.status !== "queued" && run?.status !== "running");
+      });
+      if (settled) break;
+    }
+    const states = await Promise.all(fixture.runIds.map((runId) => readRunState(runId)));
+    expect(states.filter((run) => run?.status === "succeeded")).toHaveLength(1);
+    expect(states.filter((run) => run?.status === "cancelled")).toHaveLength(1);
+    expect(fixture.runIds.reduce((total, runId) => total + countExecuteCallsForRun(runId), 0)).toBe(1);
+  });
+
+  it("keeps the sweep going when the native-review assignment lookup fails", async () => {
+    const fixture = await seedNativeReviewFixture();
+    const { companyId: ordinaryCompanyId, agentId: ordinaryAgentId } = await seedCompanyAndAgent();
+    const ordinaryIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: ordinaryIssueId,
+      companyId: ordinaryCompanyId,
+      title: "Ordinary assigned work in another company",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: ordinaryAgentId,
+    });
+    const ordinary = await seedQueuedRun({
+      companyId: ordinaryCompanyId,
+      agentId: ordinaryAgentId,
+      issueId: ordinaryIssueId,
+      wakeReason: "issue_assigned",
+    });
+
+    // Fault only the assignment lookup for this interaction: a query whose
+    // bound parameters carry the interaction id. Every other query, including
+    // the ordinary run's own interaction reads, passes through untouched.
+    const faultedHeartbeat = createFaultedHeartbeat(({ params }) =>
+      params.includes(fixture.interactionId));
+
+    await expect(faultedHeartbeat.resumeQueuedRuns()).resolves.toBeUndefined();
+    await waitForCondition(async () => {
+      const run = await readRunState(ordinary.runId);
+      return run?.status !== "queued" && run?.status !== "running";
+    });
+    expect((await readRunState(ordinary.runId))?.status).toBe("succeeded");
+    expect(countExecuteCallsForRun(ordinary.runId)).toBe(1);
+    expect((await readRunState(fixture.runId))?.status).toBe("queued");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(0);
+  });
+
+  it("cancels a cloned server-actor native-review wake that the committer never bound to its run", async () => {
+    const fixture = await seedNativeReviewFixture({ queuedRunCount: 0 });
+    // The genuine committer wake exists but was never dispatched to a run.
+    const genuineWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: genuineWakeId,
+      companyId: fixture.companyId,
+      agentId: fixture.reviewerId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "native_completion_review",
+      payload: {
+        issueId: fixture.issueId,
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+      status: "queued",
+      requestedByActorType: "system",
+      requestedByActorId: "native-status-committer",
+      idempotencyKey: `native-review:${fixture.interactionId}`,
+    });
+    await db.insert(statusDecisionEffects).values({
+      companyId: fixture.companyId, issueId: fixture.issueId, decisionId: fixture.decisionId,
+      ordinal: 1, effectKind: "bind_reviewer",
+      targetType: "issue_thread_interaction", targetId: fixture.interactionId,
+      idempotencyKey: `native-status:${fixture.decisionId}:1`,
+      payload: {
+        interactionId: fixture.interactionId, ownerAgentId: fixture.reviewerId,
+        reviewerWakeId: genuineWakeId,
+      },
+      deliveryState: "delivered", deliveredAt: new Date(),
+    });
+    // A clone copies every wake-provenance field, including the server actor.
+    const clone = await seedQueuedRun({
+      companyId: fixture.companyId,
+      agentId: fixture.reviewerId,
+      issueId: fixture.issueId,
+      wakeReason: "native_completion_review",
+      contextExtras: {
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+    });
+    await db.update(agentWakeupRequests).set({
+      idempotencyKey: `native-review:${fixture.interactionId}`,
+      requestedByActorType: "system",
+      requestedByActorId: "native-status-committer",
+      payload: {
+        issueId: fixture.issueId,
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+    }).where(eq(agentWakeupRequests.id, clone.wakeupRequestId));
+
+    // While the committer intent is unbound the clone is deferred, never
+    // executed; once the intent is bound to the genuine run it is cancelled.
+    await heartbeat.resumeQueuedRuns();
+    expect((await readRunState(clone.runId))?.status).toBe("queued");
+    expect(countExecuteCallsForRun(clone.runId)).toBe(0);
+
+    const genuine = await seedQueuedRun({
+      companyId: fixture.companyId,
+      agentId: fixture.reviewerId,
+      issueId: fixture.issueId,
+      wakeReason: "native_completion_review",
+      contextExtras: {
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+    });
+    await db.update(agentWakeupRequests).set({ runId: genuine.runId })
+      .where(eq(agentWakeupRequests.id, genuineWakeId));
+    const run = await resumeAndReadRun(clone.runId);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_assignee_changed");
+    expect(countExecuteCallsForRun(clone.runId)).toBe(0);
+  });
+
+  it("claims a promoted native-review run whose wake receipt reason was rewritten", async () => {
+    const fixture = await seedNativeReviewFixture();
+    // Promotion keeps the wake row and payload but rewrites its reason to
+    // issue_execution_promoted and rebinds it to the promoted run.
+    await db.update(agentWakeupRequests).set({
+      reason: "issue_execution_promoted",
+      requestedByActorId: `native-status-wake-dispatch:${fixture.wakeupRequestId}`,
+      payload: {
+        issueId: fixture.issueId,
+        _paperclipWakeContext: {
+          issueId: fixture.issueId,
+          nativeReviewInteractionId: fixture.interactionId,
+          nativeReviewDecisionId: fixture.decisionId,
+          wakeReason: "native_completion_review",
+        },
+      },
+    }).where(eq(agentWakeupRequests.id, fixture.wakeupRequestId));
+    const run = await resumeAndReadRun(fixture.runId);
+    expect(run?.errorCode).not.toBe("issue_assignee_changed");
+    expect(run?.status).toBe("succeeded");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(1);
+  });
+
+  it("claims a valid native-review run when the current participant is the worker", async () => {
+    const fixture = await seedNativeReviewFixture();
+    await db.update(issues).set({
+      executionState: {
+        status: "pending",
+        currentStageId: randomUUID(),
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: fixture.workerId, userId: null },
+        returnAssignee: { type: "agent", agentId: fixture.workerId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, fixture.issueId));
+    const run = await resumeAndReadRun(fixture.runId);
+    expect(run?.errorCode).not.toBe("issue_review_participant_changed");
+    expect(run?.status).toBe("succeeded");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(1);
+  });
+
+  it("does not let an ordinary run carrying only the interaction id block a valid native review", async () => {
+    const fixture = await seedNativeReviewFixture();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: fixture.companyId,
+      agentId: fixture.workerId,
+      status: "succeeded",
+      contextSnapshot: {
+        issueId: fixture.issueId,
+        nativeReviewInteractionId: fixture.interactionId,
+      },
+      startedAt: new Date(),
+      finishedAt: new Date(),
+    });
+    const run = await resumeAndReadRun(fixture.runId);
+    expect(run?.errorCode).not.toBe("native_review_assignment_already_claimed");
+    expect(run?.status).toBe("succeeded");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(1);
+  });
+
+  it("cancels a real wakeup clone that copies every native-review field including the server actor", async () => {
+    const fixture = await seedNativeReviewFixture({ queuedRunCount: 0 });
+    const genuineWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: genuineWakeId,
+      companyId: fixture.companyId,
+      agentId: fixture.reviewerId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "native_completion_review",
+      payload: {
+        issueId: fixture.issueId,
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+        _paperclipWakeContext: {
+          issueId: fixture.issueId,
+          nativeReviewInteractionId: fixture.interactionId,
+          nativeReviewDecisionId: fixture.decisionId,
+        },
+      },
+      status: "queued",
+      requestedByActorType: "system",
+      requestedByActorId: "native-status-committer",
+      idempotencyKey: `native-review:${fixture.interactionId}`,
+    });
+    await db.insert(statusDecisionEffects).values({
+      companyId: fixture.companyId, issueId: fixture.issueId, decisionId: fixture.decisionId,
+      ordinal: 1, effectKind: "bind_reviewer",
+      targetType: "issue_thread_interaction", targetId: fixture.interactionId,
+      idempotencyKey: `native-status:${fixture.decisionId}:1`,
+      payload: {
+        interactionId: fixture.interactionId, ownerAgentId: fixture.reviewerId,
+        reviewerWakeId: genuineWakeId,
+      },
+      deliveryState: "delivered", deliveredAt: new Date(),
+    });
+
+    const cloneRun = await heartbeat.wakeup(fixture.reviewerId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "native_completion_review",
+      payload: {
+        issueId: fixture.issueId,
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+        _paperclipWakeContext: {
+          issueId: fixture.issueId,
+          nativeReviewInteractionId: fixture.interactionId,
+          nativeReviewDecisionId: fixture.decisionId,
+        },
+      },
+      contextSnapshot: {
+        issueId: fixture.issueId,
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+        _paperclipWakeContext: {
+          issueId: fixture.issueId,
+          nativeReviewInteractionId: fixture.interactionId,
+          nativeReviewDecisionId: fixture.decisionId,
+        },
+      },
+      requestedByActorType: "system",
+      requestedByActorId: "native-status-committer",
+      idempotencyKey: `native-review:${fixture.interactionId}`,
+    });
+
+    const cloneRunId = cloneRun?.id ?? null;
+    expect(cloneRunId).not.toBeNull();
+    // While the committer intent is unbound the clone is deferred, never
+    // executed; once the intent is bound to the genuine run it is cancelled.
+    await heartbeat.resumeQueuedRuns();
+    expect(cloneRunId ? (await readRunState(cloneRunId))?.status : null).toBe("queued");
+    if (cloneRunId) expect(countExecuteCallsForRun(cloneRunId)).toBe(0);
+
+    const genuine = await seedQueuedRun({
+      companyId: fixture.companyId,
+      agentId: fixture.reviewerId,
+      issueId: fixture.issueId,
+      wakeReason: "native_completion_review",
+      contextExtras: {
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+    });
+    await db.update(agentWakeupRequests).set({ runId: genuine.runId })
+      .where(eq(agentWakeupRequests.id, genuineWakeId));
+    await heartbeat.resumeQueuedRuns();
+    const state = cloneRunId ? await readRunState(cloneRunId) : null;
+    expect(state?.status).toBe("cancelled");
+    if (cloneRunId) expect(countExecuteCallsForRun(cloneRunId)).toBe(0);
+  });
+
+  it("cancels an invalid native-review run even when the agent is the current review participant", async () => {
+    const fixture = await seedNativeReviewFixture({ interactionStatus: "rejected" });
+    await db.update(issues).set({
+      executionState: {
+        status: "pending",
+        currentStageId: randomUUID(),
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: fixture.reviewerId, userId: null },
+        returnAssignee: { type: "agent", agentId: fixture.workerId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, fixture.issueId));
+    const run = await resumeAndReadRun(fixture.runId);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_assignee_changed");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(0);
+  });
+
+  it("defers a native-review run until the committer intent is bound to it", async () => {
+    const fixture = await seedNativeReviewFixture();
+    // Unbound intent, kept out of the dispatcher's candidate set (completed)
+    // so only the gate sees it: admission must defer, not cancel or execute.
+    await db.update(agentWakeupRequests).set({ runId: null, status: "completed" })
+      .where(eq(agentWakeupRequests.id, fixture.wakeupRequestId));
+
+    await heartbeat.resumeQueuedRuns();
+    expect((await readRunState(fixture.runId))?.status).toBe("queued");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(0);
+
+    await db.update(agentWakeupRequests).set({ runId: fixture.runId, status: "queued" })
+      .where(eq(agentWakeupRequests.id, fixture.wakeupRequestId));
+    const run = await resumeAndReadRun(fixture.runId);
+    expect(run?.status).toBe("succeeded");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(1);
+  });
+
+  it("transfers the committer binding on promotion only for the committer wake or its dispatch", async () => {
+    const fixture = await seedNativeReviewFixture();
+    const promoted = await seedQueuedRun({
+      companyId: fixture.companyId,
+      agentId: fixture.reviewerId,
+      issueId: fixture.issueId,
+      wakeReason: "issue_execution_promoted",
+    });
+    const committerRunId = async () => db.select({ runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, fixture.wakeupRequestId))
+      .then((rows) => rows[0]?.runId ?? null);
+    const context = {
+      issueId: fixture.issueId,
+      nativeReviewInteractionId: fixture.interactionId,
+      nativeReviewDecisionId: fixture.decisionId,
+    };
+
+    await bindNativeReviewCommitterWakeToRun(db, {
+      companyId: fixture.companyId, issueId: fixture.issueId, runId: promoted.runId,
+      contextSnapshot: context,
+      wake: {
+        id: randomUUID(), idempotencyKey: null,
+        requestedByActorType: "user", requestedByActorId: "someone",
+      },
+    });
+    expect(await committerRunId()).toBe(fixture.runId);
+
+    await bindNativeReviewCommitterWakeToRun(db, {
+      companyId: fixture.companyId, issueId: fixture.issueId, runId: promoted.runId,
+      contextSnapshot: context,
+      wake: {
+        id: fixture.wakeupRequestId, idempotencyKey: `native-review:${fixture.interactionId}`,
+        requestedByActorType: "system", requestedByActorId: "native-status-committer",
+      },
+    });
+    expect(await committerRunId()).toBe(promoted.runId);
+  });
+
+  it("cancels a native-review wake whose provenance actor is not the server committer", async () => {
+    const fixture = await seedNativeReviewFixture();
+    await db.update(agentWakeupRequests).set({
+      requestedByActorType: "agent",
+      requestedByActorId: fixture.reviewerId,
+    }).where(eq(agentWakeupRequests.id, fixture.wakeupRequestId));
+    const run = await resumeAndReadRun(fixture.runId);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_assignee_changed");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(0);
+  });
+
+  it("does not execute a native-review run when the wake lookup fails once", async () => {
+    const fixture = await seedNativeReviewFixture();
+    const faultedHeartbeat = createFaultedHeartbeat(
+      ({ table, params }) => table === agentWakeupRequests && params.includes(fixture.wakeupRequestId),
+      { once: true },
+    );
+    await expect(faultedHeartbeat.resumeQueuedRuns()).resolves.toBeUndefined();
+    expect((await readRunState(fixture.runId))?.status).toBe("queued");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(0);
+
+    const run = await resumeAndReadRun(fixture.runId);
+    expect(run?.status).toBe("succeeded");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(1);
+  });
+
+  it("does not execute a duplicate native-review run when the sibling lookup fails once", async () => {
+    const fixture = await seedNativeReviewFixture();
+    const first = await resumeAndReadRun(fixture.runId);
+    expect(first?.status).toBe("succeeded");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(1);
+
+    const duplicate = await seedQueuedRun({
+      companyId: fixture.companyId,
+      agentId: fixture.reviewerId,
+      issueId: fixture.issueId,
+      wakeReason: "native_completion_review",
+      contextExtras: {
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+    });
+    await db.update(agentWakeupRequests).set({
+      idempotencyKey: `native-review:${fixture.interactionId}`,
+      requestedByActorType: "system",
+      requestedByActorId: "native-status-committer",
+      payload: {
+        issueId: fixture.issueId,
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+    }).where(eq(agentWakeupRequests.id, duplicate.wakeupRequestId));
+
+    const faultedHeartbeat = createFaultedHeartbeat(
+      ({ table, params }) => table === heartbeatRuns && params.includes(fixture.interactionId),
+      { once: true },
+    );
+    await expect(faultedHeartbeat.resumeQueuedRuns()).resolves.toBeUndefined();
+    expect((await readRunState(duplicate.runId))?.status).toBe("queued");
+    expect(countExecuteCallsForRun(duplicate.runId)).toBe(0);
+
+    const run = await resumeAndReadRun(duplicate.runId);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("native_review_assignment_already_claimed");
+    expect(countExecuteCallsForRun(duplicate.runId)).toBe(0);
+  });
+
+  it("cancels a duplicate native-review run even when more than five ordinary siblings share the interaction", async () => {
+    const fixture = await seedNativeReviewFixture();
+    const first = await resumeAndReadRun(fixture.runId);
+    expect(first?.status).toBe("succeeded");
+    expect(countExecuteCallsForRun(fixture.runId)).toBe(1);
+    // Ordinary succeeded runs carrying copied markers but no provenance
+    // wake, inserted after the genuine review so an unordered bounded
+    // sibling window can be filled by them alone.
+    for (let index = 0; index < 6; index += 1) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId: fixture.companyId,
+        agentId: fixture.workerId,
+        status: "succeeded",
+        contextSnapshot: {
+          issueId: fixture.issueId,
+          nativeReviewInteractionId: fixture.interactionId,
+          nativeReviewDecisionId: fixture.decisionId,
+        },
+        startedAt: new Date(),
+        finishedAt: new Date(),
+      });
+    }
+
+    const duplicate = await seedQueuedRun({
+      companyId: fixture.companyId,
+      agentId: fixture.reviewerId,
+      issueId: fixture.issueId,
+      wakeReason: "native_completion_review",
+      contextExtras: {
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+    });
+    await db.update(agentWakeupRequests).set({
+      idempotencyKey: `native-review:${fixture.interactionId}`,
+      requestedByActorType: "system",
+      requestedByActorId: "native-status-committer",
+      payload: {
+        issueId: fixture.issueId,
+        nativeReviewInteractionId: fixture.interactionId,
+        nativeReviewDecisionId: fixture.decisionId,
+      },
+    }).where(eq(agentWakeupRequests.id, duplicate.wakeupRequestId));
+
+    const run = await resumeAndReadRun(duplicate.runId);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("native_review_assignment_already_claimed");
+    expect(countExecuteCallsForRun(duplicate.runId)).toBe(0);
   });
 
   it("does not re-open a resolved connection-intent issue parked after claim", async () => {

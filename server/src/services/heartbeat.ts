@@ -18,7 +18,7 @@ import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
-import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
+import { bindNativeReviewCommitterWakeToRun, getNativeReviewAssignment, isNativeReviewRunBoundToCommitterWake, isNativeReviewWakeProvenance, readNativeReviewAssignmentContext, readNativeReviewCommitterWakeBinding } from "./native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
 import { buildNativeReviewRequest } from "./native-runtime/native-review-prompt.js";
 import {
@@ -19235,6 +19235,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         return null;
       }
+      if (staleness.defer) return null;
     }
 
     if (issueId) {
@@ -20205,10 +20206,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             updatedAt: claimedAt,
           };
           if (nativeReviewContext) {
-            return claimQueuedNativeReviewRun(tx, {
-              run, claimedAt, claimValues,
-              agentNameKey: normalizeAgentNameKey(agent.name),
-            });
+            try {
+              return await tx.transaction((savepoint) => claimQueuedNativeReviewRun(savepoint as unknown as typeof tx, {
+                run, claimedAt, claimValues,
+                agentNameKey: normalizeAgentNameKey(agent.name),
+              }));
+            } catch (error) {
+              logger.warn(
+                { err: error, runId: run.id },
+                "claimQueuedRun: native-review claim failed; leaving run queued",
+              );
+              return null;
+            }
           }
           const claimRow = (executor: Db) => executor.update(heartbeatRuns)
             .set(claimValues)
@@ -20402,7 +20411,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   type QueuedRunStaleness =
-    | { stale: false }
+    | { stale: false; defer?: boolean }
     | {
         stale: true;
         reason: string;
@@ -20413,7 +20422,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           | "issue_not_in_progress"
           | "issue_execution_lock_changed"
           | "issue_review_participant_changed"
-          | "issue_continuation_waiting_on_review";
+          | "issue_continuation_waiting_on_review"
+          | "native_review_assignment_already_claimed";
         details: Record<string, unknown>;
         // Agent that owns the issue now and must be woken in the cancelled run's
         // place. null means this is a deliberate no-enqueue case (the issue is
@@ -20619,6 +20629,161 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const isCurrentReviewParticipant =
       reviewParticipant?.type === "agent" &&
       reviewParticipant.agentId === run.agentId;
+    // A native reviewer is not the issue assignee by design; exempt only while
+    // the assignment still validates and the run's creating wake carries the
+    // server-set native-review provenance, so stale or forged-marker runs fall
+    // to the assignee gate. A lookup error must not abort the whole sweep: log
+    // it and let the claim revalidate (its own failure leaves this run queued).
+    const nativeReviewContext = readNativeReviewAssignmentContext(context);
+    let isNativeReviewRun = false;
+    let duplicateNativeReviewRun = false;
+    let nativeReviewLookupDeferred = false;
+    if (nativeReviewContext) {
+      try {
+        const assignment = await getNativeReviewAssignment(dbOrTx, {
+          companyId: run.companyId, issueId, agentId: run.agentId,
+          contextSnapshot: nativeReviewContext,
+        });
+        if (assignment) {
+          const wake = run.wakeupRequestId
+            ? await dbOrTx
+                .select({
+                  reason: agentWakeupRequests.reason,
+                  idempotencyKey: agentWakeupRequests.idempotencyKey,
+                  payload: agentWakeupRequests.payload,
+                  requestedByActorType: agentWakeupRequests.requestedByActorType,
+                  requestedByActorId: agentWakeupRequests.requestedByActorId,
+                })
+                .from(agentWakeupRequests)
+                .where(
+                  and(
+                    eq(agentWakeupRequests.id, run.wakeupRequestId),
+                    eq(agentWakeupRequests.companyId, run.companyId),
+                    eq(agentWakeupRequests.agentId, run.agentId),
+                  ),
+                )
+                .then((rows) => rows[0] ?? null)
+            : null;
+          const hasWakeProvenance = isNativeReviewWakeProvenance(wake, {
+            ...nativeReviewContext,
+            issueId,
+          });
+
+          if (hasWakeProvenance) {
+            // Only a sibling that is itself a provenance-bound native review
+            // counts toward the single-claim rule; an ordinary run carrying
+            // a copied interaction id must not block this review.
+            const siblingCandidates = await dbOrTx
+              .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
+              .from(heartbeatRuns)
+              .innerJoin(
+                agentWakeupRequests,
+                and(
+                  eq(agentWakeupRequests.id, heartbeatRuns.wakeupRequestId),
+                  eq(agentWakeupRequests.companyId, run.companyId),
+                  eq(agentWakeupRequests.agentId, heartbeatRuns.agentId),
+                ),
+              )
+              .where(
+                and(
+                  eq(heartbeatRuns.companyId, run.companyId),
+                  ne(heartbeatRuns.id, run.id),
+                  inArray(heartbeatRuns.status, ["running", "succeeded"]),
+                  sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+                  sql`${heartbeatRuns.contextSnapshot} ->> 'nativeReviewInteractionId' = ${nativeReviewContext.nativeReviewInteractionId}`,
+                  sql`${heartbeatRuns.contextSnapshot} ->> 'nativeReviewDecisionId' = ${nativeReviewContext.nativeReviewDecisionId}`,
+                  inArray(agentWakeupRequests.reason, ["native_completion_review", "issue_execution_promoted"]),
+                  eq(agentWakeupRequests.idempotencyKey, `native-review:${nativeReviewContext.nativeReviewInteractionId}`),
+                  eq(agentWakeupRequests.requestedByActorType, "system"),
+                  or(
+                    eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
+                    sql`${agentWakeupRequests.requestedByActorId} like 'native-status-wake-dispatch:%'`,
+                  ),
+                  sql`coalesce(${agentWakeupRequests.payload} ->> 'nativeReviewInteractionId', ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'nativeReviewInteractionId') = ${nativeReviewContext.nativeReviewInteractionId}`,
+                  sql`coalesce(${agentWakeupRequests.payload} ->> 'nativeReviewDecisionId', ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'nativeReviewDecisionId') = ${nativeReviewContext.nativeReviewDecisionId}`,
+                  sql`coalesce(${agentWakeupRequests.payload} ->> 'issueId', ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId') = ${issueId}`,
+                ),
+              )
+              .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+              .limit(5);
+            let sibling: { id: string } | null = null;
+            for (const candidate of siblingCandidates) {
+              if (
+                await isNativeReviewRunBoundToCommitterWake(dbOrTx, {
+                  companyId: run.companyId,
+                  issueId,
+                  runId: candidate.id,
+                  contextSnapshot: candidate.contextSnapshot,
+                })
+              ) {
+                sibling = candidate;
+                break;
+              }
+            }
+            if (sibling) duplicateNativeReviewRun = true;
+            else {
+              const binding = await readNativeReviewCommitterWakeBinding(dbOrTx, {
+                companyId: run.companyId,
+                issueId,
+                contextSnapshot: context,
+              });
+              if (binding?.runId === run.id) isNativeReviewRun = true;
+              // The committer intent exists but the dispatcher has not bound
+              // it to any run yet (immediate start raced the assignment):
+              // defer this run instead of cancelling or exempting it.
+              else if (binding && binding.runId === null) nativeReviewLookupDeferred = true;
+            }
+          }
+        }
+      } catch (error) {
+        // Fail closed for admission without aborting the sweep: leave this
+        // run queued for a later sweep instead of exempting or cancelling it.
+        logger.warn(
+          { err: error, runId: run.id, issueId },
+          "evaluateQueuedRunStaleness: native-review assignment lookup failed; leaving run queued",
+        );
+        nativeReviewLookupDeferred = true;
+      }
+    }
+    if (nativeReviewLookupDeferred) return { stale: false, defer: true };
+    if (duplicateNativeReviewRun && nativeReviewContext) {
+      return {
+        stale: true,
+        errorCode: "native_review_assignment_already_claimed",
+        reason:
+          "Cancelled because another run already claimed this native-review assignment before the queued run could start",
+        details: {
+          issueId,
+          nativeReviewInteractionId: nativeReviewContext.nativeReviewInteractionId,
+        },
+        handoffAgentId: null,
+      };
+    }
+    // A run carrying native-review markers that no longer validates can never
+    // be claimed as a native review, so it must not survive on a legacy
+    // exemption (interaction wake, review participant, or recovery) and stay
+    // queued for every sweep.
+    if (nativeReviewContext && !isNativeReviewRun && !nativeReviewLookupDeferred) {
+      const nextOwnerAgentId =
+        (reviewParticipant?.type === "agent" ? reviewParticipant.agentId : null) ??
+        issue.assigneeAgentId;
+      const handoffAgentId = nextOwnerAgentId && nextOwnerAgentId !== run.agentId
+        ? nextOwnerAgentId
+        : null;
+      return {
+        stale: true,
+        errorCode: "issue_assignee_changed",
+        reason: handoffAgentId
+          ? "Cancelled because the native-review assignment is no longer valid before the queued run could start; the current owner will be woken instead"
+          : "Cancelled because the native-review assignment is no longer valid before the queued run could start; the issue has no agent owner, so no replacement run was queued",
+        details: {
+          issueId,
+          previousAssigneeAgentId: run.agentId,
+          currentAssigneeAgentId: issue.assigneeAgentId,
+        },
+        handoffAgentId,
+      };
+    }
 
     const recoveryActionId = readNonEmptyString(context.recoveryActionId);
     const authorizedSourceScopedRecovery =
@@ -20643,6 +20808,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issue.assigneeAgentId !== run.agentId &&
       !isInteractionWake &&
       !isCurrentReviewParticipant &&
+      !isNativeReviewRun &&
       !isNonAssigneeWorkspaceBusyRetry(retryReason, context) &&
       !authorizedSourceScopedRecovery
     ) {
@@ -20721,7 +20887,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const participantMatches =
           currentParticipant.type === "agent" &&
           currentParticipant.agentId === run.agentId;
-        if (!participantMatches && !wakeCommentId) {
+        if (!participantMatches && !wakeCommentId && !isNativeReviewRun) {
           const participantAgentId =
             currentParticipant.type === "agent" ? currentParticipant.agentId ?? null : null;
           const handoffAgentId = participantAgentId && participantAgentId !== run.agentId
@@ -30548,6 +30714,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             updatedAt: now,
           })
           .where(eq(agentWakeupRequests.id, deferred.id));
+
+        // Promotion rewrites this wake's reason; transfer the committer
+        // wake's run binding to the promoted run so native-review provenance
+        // survives the promotion.
+        await bindNativeReviewCommitterWakeToRun(txDb, {
+          companyId: deferredAgent.companyId,
+          issueId: issue.id,
+          runId: newRun.id,
+          contextSnapshot: promotedContextSnapshot,
+          wake: {
+            id: deferred.id,
+            idempotencyKey: deferred.idempotencyKey,
+            requestedByActorType: deferred.requestedByActorType,
+            requestedByActorId: deferred.requestedByActorId,
+          },
+        });
 
         await tx
           .update(issues)

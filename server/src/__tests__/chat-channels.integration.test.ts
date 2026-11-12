@@ -63737,16 +63737,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await waitFor(() =>
         expect(dm.post).toHaveBeenCalledWith(visibleFailure),
       );
-      await expect(
-        db
-          .select({ kind: chatActions.kind, status: chatActions.status })
-          .from(chatActions)
-          .where(eq(chatActions.deliveryId, delivery.id)),
-      ).resolves.toEqual(
-        expect.arrayContaining([
-          { kind: "inbound_wakeup", status: "failed" },
-          { kind: "provider_effect", status: "processed" },
-        ]),
+      // post() resolves before the provider_effect row flips processing -> processed.
+      await waitFor(async () =>
+        expect(
+          await db
+            .select({ kind: chatActions.kind, status: chatActions.status })
+            .from(chatActions)
+            .where(eq(chatActions.deliveryId, delivery.id)),
+        ).toEqual(
+          expect.arrayContaining([
+            { kind: "inbound_wakeup", status: "failed" },
+            { kind: "provider_effect", status: "processed" },
+          ]),
+        ),
       );
     } finally {
       await retirePublicationFixture(service, endpoint.id);
