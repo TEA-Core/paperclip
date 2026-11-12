@@ -454,6 +454,38 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(bodies.some((body) => body.includes("Closed at Tier 1 (landed, not liveness-probed): no-repository-landing"))).toBe(true);
   });
 
+  // SUP-23925: the close measurement runs AFTER the guard evaluator deferred
+  // the tier1 close row and BEFORE the status write. A refusal there must leave
+  // NO orphan tier close row behind — the row is only ever written on the same
+  // transaction as the terminal write (audit #52: 8 orphan tier1 rows on cards
+  // with zero status→done writes and completedAt=null).
+  it("leaves no orphan tier close row when the post-guard close measurement refuses", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    mockMeasureNoRepositoryLanding.mockResolvedValue({ ok: false as const, reason: "the recorded worktree is not clean" });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("the recorded worktree is not clean");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+    expect(await activityCount(fixture.issueId, "issue.done_transition_tier1_close")).toBe(0);
+    expect(await activityCount(fixture.issueId, "issue.done_transition_tier2_close")).toBe(0);
+  });
+
+  it("writes exactly one tier1 close row, on the terminal write's transaction, when the close commits", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(fixture.issueId)).toBe("done");
+    // Same transaction as status→done: the row is committed by the time the
+    // response returns, so no wait-for-audit is needed or permitted here.
+    expect(await activityCount(fixture.issueId, "issue.done_transition_tier1_close")).toBe(1);
+  });
+
   it("names the no-repository form in the missing-declaration remedy only on a record_only issue", async () => {
     const recordOnly = await seed();
     const recordOnlyRes = await request(app).patch(`/api/issues/${recordOnly.identifier}`).send({ status: "done" });

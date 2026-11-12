@@ -5349,7 +5349,16 @@ export function issueRoutes(
   }
 
   type DoneTransitionGuardOutcome =
-    | { ok: true; overrideAccepted?: boolean; noRepositoryLanding?: boolean }
+    | {
+        ok: true;
+        overrideAccepted?: boolean;
+        noRepositoryLanding?: boolean;
+        // SUP-23925: the tier1/tier2 close rows are returned, not written. The
+        // door that lands the terminal write persists them on the SAME
+        // transaction as status→done + completedAt, so a refused or raced
+        // close can never leave an orphan close row behind.
+        closeRowAudits: Array<Parameters<typeof logActivity>[1]>;
+      }
     | { ok: false; status: number; body: Record<string, unknown> };
 
   // Single evaluator for BOTH done-transition guards, shared by every route that can
@@ -5530,7 +5539,7 @@ export function issueRoutes(
         skipReason: "board_actor_bypass",
         decisionCarried,
       });
-      return { ok: true, overrideAccepted };
+      return { ok: true, overrideAccepted, closeRowAudits: [] };
     }
 
     const tierResult = await evaluateDoneTierDeclaration(
@@ -5610,25 +5619,56 @@ export function issueRoutes(
         },
       };
     }
+    // SUP-23925: the tier1/tier2 close rows are no longer written here. They
+    // used to be written per request, before and outside the close transaction
+    // (base branch f012e6fb1), so any refusal or lost race AFTER this point —
+    // a preflight throw, a lost compare-and-set, a rolled-back update — left
+    // an orphan close row on a card that never wrote status→done (audit #52:
+    // 8 orphan tier1 rows on cards with completedAt=null). The rows are now
+    // returned to the door, which persists them on the same transaction as the
+    // terminal write; the one-per-transition verification row written inside
+    // the close transaction is unaffected.
+    const closeRowAudits: Array<Parameters<typeof logActivity>[1]> = [];
     if (tierResult.tier === "tier1") {
-      // Written per request, before and outside the close transaction, exactly as
-      // on the base branch (f012e6fb1): concurrent closes of one issue each write
-      // one row here even though only the first commits (the others refuse at the
-      // compare-and-set). Left in place on purpose; only the verification row,
-      // which is written in the transaction, is one per transition.
-      void writeAuditLog(db, issue, "issue.done_transition_tier1_close", {
-        reason: tierResult.reason,
-        decisionCarried,
-        ...(tierResult.noRepositoryMeasurement
-          ? { noRepositoryLanding: noRepositoryLandingAuditDetails(tierResult.noRepositoryMeasurement) }
-          : {}),
+      closeRowAudits.push({
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "done-transition-guard",
+        agentId: null,
+        runId: null,
+        agentApiKeyId: null,
+        action: "issue.done_transition_tier1_close",
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          identifier: issue.identifier ?? null,
+          reason: tierResult.reason,
+          decisionCarried,
+          ...(tierResult.noRepositoryMeasurement
+            ? { noRepositoryLanding: noRepositoryLandingAuditDetails(tierResult.noRepositoryMeasurement) }
+            : {}),
+        },
       });
     }
     if (tierResult.tier === "tier2" && tierResult.tier2Audit) {
-      void writeAuditLog(db, issue, "issue.done_transition_tier2_close", {
-        reason: tierResult.reason,
-        decisionCarried,
-        ...tierResult.tier2Audit,
+      closeRowAudits.push({
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "done-transition-guard",
+        agentId: null,
+        runId: null,
+        agentApiKeyId: null,
+        action: "issue.done_transition_tier2_close",
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          identifier: issue.identifier ?? null,
+          reason: tierResult.reason,
+          decisionCarried,
+          ...tierResult.tier2Audit,
+        },
       });
     }
     // SUP-20525 (SUP-18110 ask 1): resolve the close comment's cited commit
@@ -5687,7 +5727,12 @@ export function issueRoutes(
         "cited-SHA resolution failed; done transition allowed (fail open)",
       );
     }
-    return { ok: true, overrideAccepted, noRepositoryLanding: tierResult.landing === "noRepositoryLanding" };
+    return {
+      ok: true,
+      overrideAccepted,
+      noRepositoryLanding: tierResult.landing === "noRepositoryLanding",
+      closeRowAudits,
+    };
   }
 
   // Every route that can resolve a blocker routes its dependent wake through these
@@ -14036,6 +14081,7 @@ export function issueRoutes(
       let doneTierResolutionNote = resolutionNote ?? null;
       let structuredDoneTierRendered = false;
       let recoveryOverrideAccepted = false;
+      let pendingRecoveryCloseRowAudits: Array<Parameters<typeof logActivity>[1]> = [];
       if (sourceIssueStatus === "done" && existing.status !== "done") {
         const preTxsRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
           existing.companyId,
@@ -14096,6 +14142,9 @@ export function issueRoutes(
           return;
         }
         recoveryOverrideAccepted = recoveryDoneOutcome.overrideAccepted === true;
+        // SUP-23925: close rows deferred by the guard evaluator; persisted on
+        // the resolution's transaction below, only after the terminal write.
+        pendingRecoveryCloseRowAudits = recoveryDoneOutcome.closeRowAudits;
       }
       const result = await db.transaction(async (tx) => {
         const lockedIssue = await tx
@@ -14480,6 +14529,14 @@ export function issueRoutes(
                 );
           if (!updatedIssue) throw notFound("Issue not found");
           issue = updatedIssue;
+          // SUP-23925: the deferred tier close rows commit on THIS
+          // transaction, only after the terminal write landed, so a refused or
+          // raced close cannot leave an orphan close row behind.
+          if (pendingRecoveryCloseRowAudits.length > 0 && issue.status === "done") {
+            for (const audit of pendingRecoveryCloseRowAudits) {
+              await logActivityInTransaction(tx as unknown as Db, audit);
+            }
+          }
           // SUP-21910: persist a structured done-tier declaration as an issue
           // comment, the same durable record the PATCH close door writes, so the
           // declaration and its evidence survive on the card, not only on the
@@ -17194,6 +17251,7 @@ export function issueRoutes(
         Boolean(executionPolicy?.monitor),
       );
       const issueId = randomUUID();
+      let pendingCreateCloseRowAudits: Array<Parameters<typeof logActivity>[1]> = [];
       if (createBody.status === "done") {
         const outcome = await evaluateDoneTransitionGuards({
           issue: {
@@ -17223,6 +17281,11 @@ export function issueRoutes(
           res.status(outcome.status).json(outcome.body);
           return;
         }
+        // SUP-23925: close rows deferred by the guard evaluator; the create door
+        // has no transaction handle to join, so the rows are written only AFTER
+        // the terminal create commits — a refused or failed create can never
+        // leave an orphan close row behind.
+        pendingCreateCloseRowAudits = outcome.closeRowAudits;
       }
       const sourceTrust = await sourceTrustForActorWrite(
         {
@@ -17269,6 +17332,14 @@ export function issueRoutes(
         const { originKind: _onboardingOriginKind, ...ordinaryCreateInput } =
           createInput;
         issue = await svc.create(companyId, ordinaryCreateInput);
+      }
+      // SUP-23925: the deferred tier close rows are written only after the
+      // terminal create committed, and never on a deduplicated replay (which
+      // can return a pre-existing non-done issue).
+      if (pendingCreateCloseRowAudits.length > 0 && issue.status === "done" && !deduplicationReason) {
+        for (const audit of pendingCreateCloseRowAudits) {
+          await logActivity(db, audit);
+        }
       }
       if (deduplicationReason) {
         const referenceSummary =
@@ -20352,6 +20423,9 @@ export function issueRoutes(
     // certify the issue until that request-owned mutation has finished.
     let deferFinalDeliveryPrefetch = false;
     let doneOverrideAccepted = false;
+    // SUP-23925: close rows deferred by the guard evaluator; persisted on the
+    // same transaction as the terminal write below.
+    let pendingCloseRowAudits: Array<Parameters<typeof logActivity>[1]> = [];
     // SUP-22570: the closer of an accepted record_only no-repository close; the
     // same checks re-run inside the update transaction below.
     let noRepositoryLandingCloser: DoneTierClosingActor | null = null;
@@ -20399,6 +20473,7 @@ export function issueRoutes(
         return;
       }
       doneOverrideAccepted = outcome.overrideAccepted === true;
+      pendingCloseRowAudits = outcome.closeRowAudits;
       if (outcome.noRepositoryLanding === true) noRepositoryLandingCloser = closingActor;
       if (terminalApprovalNeedsClassificationCheck) {
         finalDeliveryPrefetch = await prefetchFinalDelivery(finalDeliveryIssue);
@@ -20837,7 +20912,11 @@ export function issueRoutes(
       )
     );
     const shouldUseTransactionalIssueUpdate =
-      plainCommentJoinsUpdate
+      // SUP-23925: a close that passed the done-guard evaluator must commit its
+      // tier close rows on the same transaction as the terminal write, so the
+      // update is forced onto the transactional path whenever rows are pending.
+      pendingCloseRowAudits.length > 0
+      || plainCommentJoinsUpdate
       || Boolean(commentBody && isClosed && !effectiveMoveToTodoRequested)
       || Boolean(commentAttachmentIds?.length)
       || Boolean(decision)
@@ -21144,6 +21223,14 @@ export function issueRoutes(
           const updated = await updateIssue(tx);
 
           if (!updated) return null;
+          // SUP-23925: the tier1/tier2 close rows commit on THIS transaction,
+          // only after the terminal write landed, so a refused or raced close
+          // cannot leave an orphan close row behind.
+          if (pendingCloseRowAudits.length > 0 && updated.status === "done") {
+            for (const audit of pendingCloseRowAudits) {
+              await logActivityInTransaction(tx as unknown as Db, audit);
+            }
+          }
           if (commentAttachmentIds?.length) {
             // Reassignment, comment creation and upload binding commit together.
             // An invalid or already-bound receipt rolls back the issue update.
@@ -23975,6 +24062,7 @@ export function issueRoutes(
           policy: normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
           executionState: parseIssueExecutionState(issue.executionState),
         });
+      let pendingInteractionCloseRowAudits: Array<Parameters<typeof logActivity>[1]> = [];
       let escalationApproval: {
         prefetch: FinalDeliveryPrefetch | null;
         patch: Record<string, unknown>;
@@ -23999,6 +24087,10 @@ export function issueRoutes(
           res.status(closeOutcome.status).json(closeOutcome.body);
           return;
         }
+        // SUP-23925: close rows deferred by the guard evaluator; persisted on
+        // the escalation decision's transaction below, only after the terminal
+        // write.
+        pendingInteractionCloseRowAudits = closeOutcome.closeRowAudits;
         const projected = applyIssueExecutionPolicyTransition({
           issue, policy: normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
           requestedStatus: "done", requestedAssigneePatch: {},
@@ -24069,6 +24161,16 @@ export function issueRoutes(
             // lock taken by the revalidation, so a stale verdict leaves both pending.
             afterResolveInTransaction: async (tx) => {
               acceptedEscalationDecision.value = await applyEscalationApproval(tx as unknown as Db);
+              // SUP-23925: the deferred tier close rows commit on THIS
+              // transaction, only after the terminal write landed.
+              if (
+                pendingInteractionCloseRowAudits.length > 0 &&
+                acceptedEscalationDecision.value?.issue.status === "done"
+              ) {
+                for (const audit of pendingInteractionCloseRowAudits) {
+                  await logActivityInTransaction(tx as unknown as Db, audit);
+                }
+              }
               if (acceptedEscalationDecision.value && escalationCertifiedDelivery) {
                 const finalDelivery = {
                   ...escalationCertifiedDelivery,
@@ -25843,6 +25945,7 @@ export function issueRoutes(
 
     const currentExecutionState = parseIssueExecutionState(currentIssue.executionState);
     const currentExecutionPolicy = normalizeIssueExecutionPolicy(currentIssue.executionPolicy ?? null);
+    let pendingAutoApproveCloseRowAudits: Array<Parameters<typeof logActivity>[1]> = [];
     const shouldAutoApproveReviewComment =
       currentIssue.status === "in_review" &&
       currentExecutionState?.status === "pending" &&
@@ -25902,6 +26005,9 @@ export function issueRoutes(
           res.status(outcome.status).json(outcome.body);
           return;
         }
+        // SUP-23925: close rows deferred by the guard evaluator; persisted on
+        // the auto-approval transaction below, only after the terminal write.
+        pendingAutoApproveCloseRowAudits = outcome.closeRowAudits;
       }
       const decisionId = transition.decision ? randomUUID() : null;
       if (decisionId) {
@@ -26005,6 +26111,13 @@ export function issueRoutes(
           // Throw (not return null) so drizzle rolls back the inserted comment when the issue
           // has been concurrently deleted between the initial fetch and the in-transaction update.
           if (!updated) throw new AutoApprovalIssueMissingError();
+          // SUP-23925: the deferred tier close rows commit on THIS
+          // transaction, only after the terminal write landed.
+          if (pendingAutoApproveCloseRowAudits.length > 0 && updated.status === "done") {
+            for (const audit of pendingAutoApproveCloseRowAudits) {
+              await logActivityInTransaction(tx as unknown as Db, audit);
+            }
+          }
 
           if (transition.decision && decisionId) {
             await tx.insert(issueExecutionDecisions).values({
