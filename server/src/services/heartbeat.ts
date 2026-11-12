@@ -19489,12 +19489,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ));
         // A terminal result can precede workspace/lease cleanup on this or
         // another controller. Local absence alone is not a release receipt.
-        // Fork: upstream also waits for the local executor
-        // (liveRunExecutions) here. The fork's stale-run handoff wakes the new
-        // owner while the cancelled run is still unwinding, so that wait would
-        // park the handoff until the next scheduler tick. The durable lease and
-        // finalization checks below still fence the transfer.
-        if (!isHeartbeatRunTerminalStatus(previous?.status)) {
+        if (!isHeartbeatRunTerminalStatus(previous?.status) ||
+            liveRunExecutions.has(owner.executionRunId)) {
           return { ownsIssue, blocked: true };
         }
         const [pendingLease] = await tx.select({ id: environmentLeases.id })
