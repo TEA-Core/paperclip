@@ -60,7 +60,7 @@ export type BoundedStateFileReadOptions = {
   };
 };
 
-function describeNonRegular(stat: fs.Stats): string {
+function describeNonRegular(stat: fs.Stats | fs.BigIntStats): string {
   if (stat.isSymbolicLink()) return "it is a symbolic link";
   if (stat.isDirectory()) return "it is a directory";
   if (stat.isFIFO()) return "it is a FIFO";
@@ -71,6 +71,18 @@ function describeNonRegular(stat: fs.Stats): string {
 
 function errorCode(error: unknown): string | undefined {
   return error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
+}
+
+/**
+ * Whether two BigInt stats name the same file. Device and inode numbers are
+ * compared as exact bigints; converting them to Number could make distinct
+ * files above 2^53 compare equal and accept a swapped file.
+ */
+export function isSameFileIdentity(
+  a: Pick<fs.BigIntStats, "dev" | "ino">,
+  b: Pick<fs.BigIntStats, "dev" | "ino">,
+): boolean {
+  return a.dev === b.dev && a.ino === b.ino;
 }
 
 function requireNoFollowFlags(filePath: string): { noFollow: number; nonBlock: number; noCtty: number } {
@@ -126,9 +138,11 @@ export function readBoundedStateFile(filePath: string, options: BoundedStateFile
     throw new BoundedStateFileError("parent_invalid", filePath, "its parent is not a directory.");
   }
 
-  let pathStat: fs.Stats;
+  // BigInt stats keep `dev`/`ino` exact; Number stats lose precision above
+  // 2^53, which could make two distinct files compare as the same inode.
+  let pathStat: fs.BigIntStats;
   try {
-    pathStat = fs.lstatSync(canonicalPath);
+    pathStat = fs.lstatSync(canonicalPath, { bigint: true });
   } catch (error) {
     if (errorCode(error) === "ENOENT") return null;
     throw new BoundedStateFileError("io_error", filePath, "its metadata could not be read.");
@@ -152,23 +166,25 @@ export function readBoundedStateFile(filePath: string, options: BoundedStateFile
   }
 
   try {
-    const fdStat = fs.fstatSync(fd);
+    const fdStat = fs.fstatSync(fd, { bigint: true });
     if (!fdStat.isFile()) {
       throw new BoundedStateFileError("changed", filePath, `the opened file is not regular (${describeNonRegular(fdStat)}).`);
     }
-    if (fdStat.dev !== pathStat.dev || fdStat.ino !== pathStat.ino) {
+    if (!isSameFileIdentity(fdStat, pathStat)) {
       throw new BoundedStateFileError("changed", filePath, "it was replaced while being opened.");
     }
     const owners = trustedOwners(parentStat);
-    if (owners !== null && !owners.has(fdStat.uid)) {
+    if (owners !== null && !owners.has(Number(fdStat.uid))) {
       throw new BoundedStateFileError("owner_mismatch", filePath, "it is owned by an untrusted user.");
     }
-    if (fdStat.nlink !== 1) {
+    if (fdStat.nlink !== 1n) {
       throw new BoundedStateFileError("hard_linked", filePath, "it has more than one hard link.");
     }
-    if (fdStat.size > maxBytes) {
+    if (fdStat.size > BigInt(maxBytes)) {
       throw new BoundedStateFileError("oversize", filePath, `it is larger than ${maxBytes} bytes.`);
     }
+    // Bounded by maxBytes above, so the conversion is exact.
+    const expectedSize = Number(fdStat.size);
 
     options.hooks?.afterDescriptorCheck?.();
 
@@ -182,10 +198,10 @@ export function readBoundedStateFile(filePath: string, options: BoundedStateFile
     if (total > maxBytes) {
       throw new BoundedStateFileError("oversize", filePath, `it grew beyond ${maxBytes} bytes while being read.`);
     }
-    if (total > fdStat.size) {
+    if (total > expectedSize) {
       throw new BoundedStateFileError("grown", filePath, "it grew while being read.");
     }
-    if (total < fdStat.size) {
+    if (total < expectedSize) {
       throw new BoundedStateFileError("truncated", filePath, "it was truncated while being read.");
     }
     return buffer.subarray(0, total);

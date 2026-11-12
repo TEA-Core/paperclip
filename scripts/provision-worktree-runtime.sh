@@ -37,17 +37,17 @@ fi
 # by a shell-local predicate. The checker never follows links or blocks on a
 # FIFO; a refused manifest (legacy-unsafe minimal-no-secrets, any v3
 # initialization manifest, malformed or non-regular input) is a fast error with
-# no automatic reseed and no parent fallback.
+# no automatic reseed and no parent fallback. It runs unconditionally: a
+# pathname test cannot see a manifest inside a state dir this user cannot
+# search, and the checker reports a missing manifest as `absent` itself.
 manifest_check_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/worktree-state-manifest-check.mjs"
-if [[ -e "$seed_manifest_path" || -L "$seed_manifest_path" ]]; then
-  if ! seed_manifest_state="$(node "$manifest_check_script" "$seed_manifest_path")"; then
-    echo "Worktree seed manifest was refused; not provisioning or reseeding this worktree: $seed_manifest_path" >&2
-    exit 1
-  fi
-  if [[ "$seed_manifest_state" == "verified" ]]; then
-    echo "Worktree database has a verified seed manifest; skipping runtime provisioning." >&2
-    exit 0
-  fi
+if ! seed_manifest_state="$(node "$manifest_check_script" "$seed_manifest_path")"; then
+  echo "Worktree seed manifest was refused; not provisioning or reseeding this worktree: $seed_manifest_path" >&2
+  exit 1
+fi
+if [[ "$seed_manifest_state" == "verified" ]]; then
+  echo "Worktree database has a verified seed manifest; skipping runtime provisioning." >&2
+  exit 0
 fi
 
 # SUP-15609: an intentional no-source skip is recorded as durable evidence that

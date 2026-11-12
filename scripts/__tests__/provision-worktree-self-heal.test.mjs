@@ -974,6 +974,24 @@ test("runtime provisioning refuses legacy-unsafe, initialization and malformed m
   }
 });
 
+test("runtime provisioning refuses a manifest in a state dir it cannot search", { skip: process.getuid?.() === 0 ? "root ignores directory search permission" : false }, () => {
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const worktreeCwd = makeManifestWorktree("paperclip-provision-runtime-unsearchable-", (manifestPath) => {
+    fs.writeFileSync(manifestPath, completeSeedManifest("full"));
+  });
+  const stateDir = path.join(worktreeCwd, ".paperclip");
+  fs.chmodSync(stateDir, 0o600);
+  try {
+    const result = runRuntimeProvision(baseCwd, worktreeCwd);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /Refusing worktree state file/);
+    assert.match(result.stderr, /not provisioning or reseeding this worktree/);
+    assert.deepEqual(readCliInvocations(baseCwd), [], "the seed CLI must not run");
+  } finally {
+    fs.chmodSync(stateDir, 0o700);
+  }
+});
+
 test("runtime provisioning refuses FIFO, directory and symlinked manifests without blocking", () => {
   const cases = [
     ["fifo", (manifestPath) => assert.equal(spawnSync("mkfifo", [manifestPath]).status, 0), /FIFO/],

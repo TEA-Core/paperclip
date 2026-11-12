@@ -8,6 +8,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   BoundedStateFileError,
+  isSameFileIdentity,
   readBoundedStateFile,
   STATE_FILE_MAX_BYTES,
   writeStateFileAtomic,
@@ -207,6 +208,16 @@ try {
       expect((error as Error).message).not.toContain(canary);
     }
   });
+
+  it("compares file identities exactly beyond 2^53", () => {
+    const base = 2n ** 53n;
+    // As Numbers these two inodes are the same value, which would accept a
+    // swapped file; as bigints they differ.
+    expect(Number(base)).toBe(Number(base + 1n));
+    expect(isSameFileIdentity({ dev: 1n, ino: base }, { dev: 1n, ino: base + 1n })).toBe(false);
+    expect(isSameFileIdentity({ dev: base, ino: 7n }, { dev: base + 1n, ino: 7n })).toBe(false);
+    expect(isSameFileIdentity({ dev: 1n, ino: base }, { dev: 1n, ino: base })).toBe(true);
+  });
 });
 
 describe("writeStateFileAtomic", () => {
@@ -216,12 +227,12 @@ describe("writeStateFileAtomic", () => {
     const previousUmask = process.umask(0o000);
     try {
       fs.writeFileSync(filePath, "old", { mode: 0o644 });
-      const previousInode = fs.statSync(filePath).ino;
+      const previousInode = fs.statSync(filePath, { bigint: true }).ino;
       const contents = randomBytes(16).toString("hex");
       writeStateFileAtomic(filePath, contents);
 
-      const stat = fs.statSync(filePath);
-      expect(stat.mode & 0o777).toBe(0o600);
+      const stat = fs.statSync(filePath, { bigint: true });
+      expect(stat.mode & 0o777n).toBe(0o600n);
       expect(stat.ino).not.toBe(previousInode);
       expect(readBoundedStateFile(filePath)?.toString("utf8")).toBe(contents);
       expect(fs.readdirSync(root)).toEqual(["seed-manifest.json"]);
