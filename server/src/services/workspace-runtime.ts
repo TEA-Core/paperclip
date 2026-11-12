@@ -45,7 +45,7 @@ import {
   type SharedGroupRepairOutcome,
 } from "./shared-group-ownership.js";
 import { isVerifiedWorktreeSeedManifest } from "@paperclipai/shared/worktree-initialization-manifest";
-import { hasVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
+import { hasVerifiedWorktreeSeedManifest, readLegacySeedManifestObject } from "../worktree-seed-manifest.js";
 import {
   buildManagedWorkspaceGuestEnv,
   logManagedWorkspaceReadinessRejection,
@@ -8925,12 +8925,7 @@ export function readWorkspaceSeedOperationEvidence(worktreePath: string): {
 } {
   const manifestPath = path.join(worktreePath, ".paperclip", "seed-manifest.json");
   const noSourceSkip = hasNoSourceSeedSkip(worktreePath);
-  let manifest: Record<string, unknown> | null = null;
-  try {
-    manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
-  } catch {
-    manifest = null;
-  }
+  const manifest = readLegacySeedManifestObject(manifestPath);
   if (manifest) {
     const state = typeof manifest.state === "string" ? manifest.state : "unknown";
     const phase = typeof manifest.phase === "string" ? manifest.phase : null;

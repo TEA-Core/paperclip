@@ -1,4 +1,5 @@
 import { execFile, spawn, spawnSync } from "node:child_process";
+import { readLegacySeedManifestObject } from "../worktree-seed-manifest.js";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -1377,6 +1378,35 @@ describe("resolveRuntimeProvisionCommand", () => {
 });
 
 describe("readWorkspaceSeedOperationEvidence", () => {
+  it("does not block on a FIFO manifest and refuses a v2 minimal-no-secrets manifest", async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-seed-evidence-bounded-"));
+    try {
+      await fs.mkdir(path.join(cwd, ".paperclip"), { recursive: true });
+      const manifestPath = path.join(cwd, ".paperclip", "seed-manifest.json");
+      expect(spawnSync("mkfifo", [manifestPath]).status).toBe(0);
+      const startedAt = Date.now();
+      expect(readLegacySeedManifestObject(manifestPath)).toBeNull();
+      expect(readWorkspaceSeedOperationEvidence(cwd).verified).toBe(false);
+      expect(Date.now() - startedAt).toBeLessThan(2000);
+      await fs.rm(manifestPath);
+
+      await fs.writeFile(
+        manifestPath,
+        JSON.stringify({
+          version: 2,
+          seedMode: "minimal-no-secrets",
+          state: "verified",
+          phase: "validation",
+          diagnostics: [{ phase: "validation", status: "verified", at: "2026-09-10T00:00:00.000Z" }],
+        }),
+      );
+      expect(readLegacySeedManifestObject(manifestPath)).toBeNull();
+      expect(readWorkspaceSeedOperationEvidence(cwd).verified).toBe(false);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("accepts a recorded no-source seed skip as verified seed evidence", async () => {
     // SUP-15609: the runtime recorder marks a workspace_seed operation failed
     // when the worktree has no verified seed manifest. An env-only worktree

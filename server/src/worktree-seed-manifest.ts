@@ -48,3 +48,19 @@ export function readWorktreeSeedManifestStatus(
 export function hasVerifiedWorktreeSeedManifest(manifestPath: string): boolean {
   return readWorktreeSeedManifestStatus(manifestPath).kind === "verified";
 }
+
+/**
+ * Bounded read of a legacy (v2) seed manifest object. Returns null when the
+ * file is absent, refused (legacy-unsafe, v3, malformed, non-regular) or
+ * unreadable, so callers treat it exactly like an unreadable manifest.
+ */
+export function readLegacySeedManifestObject(manifestPath: string): Record<string, unknown> | null {
+  try {
+    const bytes = readBoundedStateFile(path.resolve(manifestPath));
+    if (bytes === null) return null;
+    const classification = classifyWorktreeStateManifest(bytes, UNCONFIRMED_INITIALIZATION);
+    return classification.kind === "legacy-seed" ? (classification.manifest as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
