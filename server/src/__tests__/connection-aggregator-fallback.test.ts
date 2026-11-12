@@ -262,20 +262,22 @@ const support = await getEmbeddedPostgresTestSupport();
       }
       return connection!;
     }
+    // Fork: github is on the default connection-request denylist (the run already
+    // has gh and GH_TOKEN), so the matched GitHub row is reported unavailable.
     it.each([
-      ["AgentMail create an email address and manage an agent mailbox", "agentmail"],
-      ["Please acquire an email address through agent mail and remember it", "agentmail"],
-      ["I need an Agentmial inbox for receiving mail from customers", "agentmail"],
-      ["Please connect my Linear workspace so I can triage the team's backlog", "linear"],
-      ["Find a Notion connection to search our engineering documentation", "notion"],
-      ["Can you find the OpenRouter connection for the model I want to use?", "openrouter"],
-      ["Please help me connect to Git Hub to look at my pull requests", "github"],
-    ])("finds native connections in natural-language queries: %s", async (query, service) => {
+      ["AgentMail create an email address and manage an agent mailbox", "agentmail", "available"],
+      ["Please acquire an email address through agent mail and remember it", "agentmail", "available"],
+      ["I need an Agentmial inbox for receiving mail from customers", "agentmail", "available"],
+      ["Please connect my Linear workspace so I can triage the team's backlog", "linear", "available"],
+      ["Find a Notion connection to search our engineering documentation", "notion", "available"],
+      ["Can you find the OpenRouter connection for the model I want to use?", "openrouter", "available"],
+      ["Please help me connect to Git Hub to look at my pull requests", "github", "unavailable"],
+    ])("finds native connections in natural-language queries: %s", async (query, service, state) => {
       await resetQuestions();
       await instanceSettingsService(db).updateExperimental({ enableChatConnectors: true });
       try {
         const result = await connectionIntentService(db).search(claims, query);
-        expect(result.results[0]).toMatchObject({ service, state: "available" });
+        expect(result.results[0]).toMatchObject({ service, state });
         expect(result.providerQuestion).toBeUndefined();
       } finally {
         await instanceSettingsService(db).updateExperimental({ enableChatConnectors: false });
