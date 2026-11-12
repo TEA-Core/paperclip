@@ -1724,6 +1724,118 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     );
   });
 
+  it("counts every canonical stable-key wake toward the re-arm cap regardless of which blocker its payload names", async () => {
+    const { companyId, agentId, blockedIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const secondBlockerIssueId = randomUUID();
+    const windowMs = 6 * 60 * 60 * 1000;
+    // Older than the completed-wake cutoff so the seeded canonical rows do not
+    // suppress the candidate as an existing wake; they must still CONSUME the
+    // re-arm budget.
+    const outsideSuppressWindow = new Date(Date.now() - 7 * 60 * 60 * 1000);
+
+    await db.insert(issues).values({
+      id: secondBlockerIssueId,
+      companyId,
+      title: "Synthetic second completed blocker",
+      status: "done",
+      priority: "medium",
+      issueNumber: 3,
+      identifier: "R-CANON-3",
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: secondBlockerIssueId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+    const readiness = await issueService(db).getDependencyReadiness(blockedIssueId);
+    expect(readiness.isDependencyReady).toBe(true);
+    expect(readiness.blockerIssueIds).toHaveLength(2);
+    const [currentEdgeBlockerIssueId, otherEdgeBlockerIssueId] = readiness.blockerIssueIds;
+    expect(currentEdgeBlockerIssueId).toBeTruthy();
+    expect(otherEdgeBlockerIssueId).toBeTruthy();
+    const stateKey = buildIssueBlockersResolvedWakeStateKey({
+      dependentIssueId: blockedIssueId,
+      blockerIssueIds: readiness.blockerIssueIds,
+    });
+
+    // Two completed canonical rows for the SAME stable key, each naming a
+    // DIFFERENT resolved blocker edge in its payload. A canonical wake covers
+    // the full (dependent, blocker-set) ready state, so both must consume the
+    // budget. The legacy per-edge row for the non-current edge must NOT count.
+    await db.insert(agentWakeupRequests).values([
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        payload: {
+          issueId: blockedIssueId,
+          resolvedBlockerIssueId: currentEdgeBlockerIssueId,
+          blockerIssueIds: readiness.blockerIssueIds,
+        },
+        status: "completed",
+        idempotencyKey: stateKey,
+        createdAt: outsideSuppressWindow,
+        updatedAt: outsideSuppressWindow,
+        finishedAt: outsideSuppressWindow,
+      },
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        payload: {
+          issueId: blockedIssueId,
+          resolvedBlockerIssueId: otherEdgeBlockerIssueId,
+          blockerIssueIds: readiness.blockerIssueIds,
+        },
+        status: "completed",
+        idempotencyKey: stateKey,
+        createdAt: outsideSuppressWindow,
+        updatedAt: outsideSuppressWindow,
+        finishedAt: outsideSuppressWindow,
+      },
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_blockers_resolved",
+        payload: {
+          issueId: blockedIssueId,
+          resolvedBlockerIssueId: otherEdgeBlockerIssueId,
+          blockerIssueIds: readiness.blockerIssueIds,
+        },
+        status: "completed",
+        idempotencyKey: `issue_blockers_resolved:${blockedIssueId}:${otherEdgeBlockerIssueId}`,
+        createdAt: outsideSuppressWindow,
+        updatedAt: outsideSuppressWindow,
+        finishedAt: outsideSuppressWindow,
+      },
+    ]);
+
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const result = await recoveryServiceWithMocks({ enqueueWakeup }).reconcileResolvedDependencyWakeBackstop({
+      now: new Date(),
+      rearmWindowMs: windowMs,
+      rearmMaxCount: 2,
+    });
+
+    expect(result.healed).toBe(0);
+    expect(result.reArmCapEscalated).toBe(1);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, blockedIssueId));
+    // Exactly 2: both canonical rows counted, the unrelated legacy edge did not.
+    expect(action?.evidence).toMatchObject({ reArmCount: 2, reArmMax: 2 });
+  });
+
   it("does not spend the re-arm budget when a succeeded run checks out and re-parks the dependent as blocked", async () => {
     const { companyId, agentId, blockedIssueId, blockerIssueId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
