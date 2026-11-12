@@ -105,6 +105,8 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
       await page.goto(action === "inbox_retry" ? `/${company.issuePrefix}/inbox/all` : taskUrl);
       if (action === "task_retry") {
         const notice = page.getByRole("status", { name: "Task recovery" });
+        // Retry renders only after the async runs query resolves; allow a loaded shard the same 45s as below.
+        await expect(notice.getByRole("button", { name: "Retry" })).toBeVisible({ timeout: 45_000 });
         await expect(notice).toHaveText("Automatic recovery of this task stopped.Retry");
         await expect(notice.getByRole("link")).toHaveCount(0);
         const presentation = await notice.evaluate(element => {

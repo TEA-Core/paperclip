@@ -46,8 +46,8 @@ import {
   renderTemplate,
   renderPaperclipWakePrompt,
   selectPaperclipTaskMarkdown,
+  selectInitialCommunicationGuidance,
   isPaperclipRecoveryWakePayload,
-  stringifyPaperclipWakePayloadForEnv,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   isPaperclipSkillSourceMissing,
@@ -885,7 +885,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
-  const wakePayloadJson = stringifyPaperclipWakePayloadForEnv(context.paperclipWake);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
   const issueIdentifier = readPaperclipIssueIdentifierFromContext(context);
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
@@ -898,7 +897,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   refreshPaperclipWorkspaceEnvForExecution({
     env,
     envConfig,
@@ -1359,7 +1357,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
         : "";
     const taskContextNote = context.conversationMode === true
-      ? selectPaperclipTaskMarkdown(context, { resumedSession: Boolean(sessionId) })
+      ? selectPaperclipTaskMarkdown(context, { resumedSession: Boolean(sessionId), includeCommunicationGuidance: false })
       : "";
     const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
       conversationMode: context.conversationMode === true,
@@ -1375,7 +1373,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timeoutSec,
       Number(deadlineEnv.PAPERCLIP_RUN_DEADLINE_EPOCH ?? 0),
     );
-    const prompt = joinPromptSections([
+    const basePrompt = joinPromptSections([
       instructionsPrefix,
       renderedBootstrapPrompt,
       deadlineNotice,
@@ -1385,7 +1383,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       renderedPrompt,
     ]);
     const promptMetrics = {
-      promptChars: prompt.length,
+      promptChars: basePrompt.length,
       instructionsChars: instructionsPrefix.length,
       deadlineNoticeChars: deadlineNotice.length,
       bootstrapPromptChars: renderedBootstrapPrompt.length,
@@ -1478,6 +1476,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     const runAttempt = async (resumeSessionId: string | null) => {
+      const prompt = joinPromptSections([
+        selectInitialCommunicationGuidance(context, { resumedSession: Boolean(resumeSessionId) }),
+        basePrompt,
+      ]);
       const args = useServeTransport ? buildOpenCodeServeArgs() : buildArgs(resumeSessionId);
       if (onMeta) {
         await onMeta({
@@ -1494,7 +1496,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             : [...args, `<stdin prompt ${prompt.length} chars>`],
           env: loggedEnv,
           prompt,
-          promptMetrics,
+          promptMetrics: { ...promptMetrics, promptChars: prompt.length },
           context,
         });
       }

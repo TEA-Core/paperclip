@@ -3872,6 +3872,7 @@ class AutoApprovalIssueMissingError extends Error {
 
 function toCompactIssue(issue: any): CompactIssue {
   return {
+    externalConversationState: issue.externalConversationState ?? null,
     id: issue.id,
     companyId: issue.companyId,
     projectId: issue.projectId,
@@ -5426,6 +5427,7 @@ export function issueRoutes(
           owner: guardResult.owner,
           repo: guardResult.repo,
           decisionCarried,
+          source: "done_transition_guard",
         },
       );
       if (
@@ -21160,6 +21162,7 @@ export function issueRoutes(
               {
                 attachmentIds: commentAttachmentIds,
                 clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
+                mirrorToSlack: actor.actorType === "user",
                 authorizationReason: issueMutationAuthorizationReason,
                 sourceTrust: attachmentCommentSourceTrust,
                 onIssueTouched: noteCommittedUpdatedAt,
@@ -21196,6 +21199,7 @@ export function issueRoutes(
               }, {
                 authorizationReason: issueMutationAuthorizationReason,
                 clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
+                mirrorToSlack: actor.actorType === "user",
                 sourceTrust: await sourceTrustForActorWrite(existing, actor, tx as unknown as Db),
                 onIssueTouched: noteCommittedUpdatedAt,
               }, tx);
@@ -22017,6 +22021,7 @@ export function issueRoutes(
       if (plainCommentJoinsUpdate) {
         if (
           issue.assigneeAgentId &&
+          !issue.externalConversationState &&
           !(
             actor.actorType === "agent" &&
             actor.actorId === issue.assigneeAgentId
@@ -22155,6 +22160,7 @@ export function issueRoutes(
       }, {
         authorizationReason: issueMutationAuthorizationReason,
         clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
+        mirrorToSlack: actor.actorType === "user",
         sourceTrust: await sourceTrustForActorWrite(issue, actor),
         onIssueTouched: noteCommittedUpdatedAt,
       });
@@ -22162,6 +22168,7 @@ export function issueRoutes(
       await externalObjectsSvc.syncCommentSafely(comment.id);
       if (
         issue.assigneeAgentId &&
+        !issue.externalConversationState &&
         !(
           actor.actorType === "agent" &&
           actor.actorId === issue.assigneeAgentId
@@ -22339,6 +22346,11 @@ export function issueRoutes(
           wakeup.payload && typeof wakeup.payload === "object" && typeof wakeup.payload.issueId === "string"
             ? wakeup.payload.issueId
             : issue.id;
+        // Provider turns use the task identifier as their session key. Board
+        // messages must resume that same session instead of creating a UUID-keyed fork.
+        if (wakeIssueId === issue.id && issue.externalConversationState && issue.identifier) {
+          wakeup.contextSnapshot = { ...wakeup.contextSnapshot, taskKey: issue.identifier };
+        }
         wakeups.set(`${agentId}:${wakeIssueId}`, { agentId, wakeup });
       };
       const addDependencyResolvedWakeup = async (input: {
@@ -22429,6 +22441,9 @@ export function issueRoutes(
         assigneeChanged &&
         issue.assigneeAgentId &&
         issue.status !== "backlog" &&
+        // Restoring an assignee on completed work is not a reopen request.
+        // Explicit reopen/resume transitions are already reflected in issue.status.
+        !isClosedIssueStatus(issue.status) &&
         deferWakeForGoal !== true
       ) {
         addWakeup(issue.assigneeAgentId, {
@@ -25948,6 +25963,7 @@ export function issueRoutes(
         metadata: req.body.metadata ?? null,
         attachmentIds: req.body.attachmentIds,
         clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
+        mirrorToSlack: actor.actorType === "user",
         sourceTrust,
       };
       let txResult: { comment: Awaited<ReturnType<typeof svc.addComment>>; issue: NonNullable<Awaited<ReturnType<typeof svc.update>>> };
@@ -26127,6 +26143,7 @@ export function issueRoutes(
         metadata: req.body.metadata ?? null,
         attachmentIds: req.body.attachmentIds,
         clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
+        mirrorToSlack: actor.actorType === "user",
         authorizationReason: commentAuthorizationReason,
         sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
       };
@@ -26146,6 +26163,9 @@ export function issueRoutes(
     await externalObjectsSvc.syncCommentSafely(comment.id);
     if (
       currentIssue.assigneeAgentId &&
+      // Slack-linked messages need the normal attributed wake boundary so
+      // the accepted requester and return-thread receipt travel with the run.
+      !currentIssue.externalConversationState &&
       !(
         actor.actorType === "agent" &&
         actor.actorId === currentIssue.assigneeAgentId
@@ -26295,6 +26315,9 @@ export function issueRoutes(
             : currentIssue.id;
         const key = `${agentId}:${wakeIssueId}`;
         if (wakeups.has(key)) return;
+        if (wakeIssueId === currentIssue.id && issue.externalConversationState && currentIssue.identifier) {
+          wakeup.contextSnapshot = { ...wakeup.contextSnapshot, taskKey: currentIssue.identifier };
+        }
         wakeups.set(key, { agentId, wakeup });
       };
       const addDependencyResolvedWakeup = async (input: {

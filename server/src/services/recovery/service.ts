@@ -1,5 +1,7 @@
 import { constants as fsConstants } from "node:fs";
 import { access } from "node:fs/promises";
+import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
+import { externalConversationStateSql } from "../slack-conversation-state.js";
 import { hasLiveLegacyController } from "../legacy-controller-lease.js";
 // `instanceSettingsService` is NOT re-imported here: the fork already imports it
 // further down this same import block (upstream's copy would duplicate it).
@@ -6186,6 +6188,15 @@ export function recoveryService(
 
     for (const issue of candidates) {
       const completed = await runRecoverySweepIssue(issue, "recovery.reconcile_stranded_assigned_issues", async () => {
+      // Upstream #13809: settle an answered Slack conversation before recovery treats
+      // it as stranded. Kept inside the per-issue isolation wrapper so one refused
+      // settlement cannot abort the rest of the sweep.
+      if (issue.originKind === "chat_channel") {
+        await settleSlackConversation(db, issue.companyId, issue.id);
+        const [current] = await db.select({ externalConversationState: externalConversationStateSql() })
+          .from(issues).where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)));
+        if (current?.externalConversationState === "waiting") { result.skipped += 1; return; }
+      }
       if (issue.conversationAgentId) {
         const lastRun = await getLatestIssueRun(issue.companyId, issue.id);
         if (lastRun?.status === "succeeded") {

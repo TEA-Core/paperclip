@@ -174,13 +174,10 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   await ensureAgentAccessibleTree(runtimeConfigDir);
 
   const existingConfig = await readJsonObject(runtimeConfigPath);
-  const existingPermission = isPlainObject(existingConfig.permission)
-    ? existingConfig.permission
-    : {};
   const notes: string[] = [];
   if (skipPermissions) {
     notes.push(
-      "Injected runtime OpenCode config with permission.external_directory=allow to avoid headless approval prompts.",
+      "Injected runtime OpenCode config with permission=allow for all tools and connections.",
     );
   }
 
@@ -260,10 +257,8 @@ export async function prepareOpenCodeRuntimeConfig(input: {
         "Injected runtime OpenCode V2 permissions allowing all actions and external-directory access.",
       );
     } else {
-      nextConfig.permission = {
-        ...existingPermission,
-        external_directory: "allow",
-      };
+      // Upstream #13693: unattended legacy harnesses allow all tools and connected tools.
+      nextConfig.permission = "allow";
     }
   }
   if (Object.keys(nextProvider).length > 0) {

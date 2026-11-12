@@ -1,8 +1,10 @@
 import {
   agents,
+  agentWakeupRequests,
   heartbeatRuns,
   issueThreadInteractions,
   issues,
+  statusDecisionEffects,
   statusDecisions,
   type Db,
 } from "@paperclipai/db";
@@ -60,6 +62,164 @@ export type NativeReviewAssignment = {
   sourceDecision: typeof statusDecisions.$inferSelect;
   sourceRun: typeof heartbeatRuns.$inferSelect;
 };
+
+/** Server-set provenance on the wake that created a native-review run. */
+export function isNativeReviewWakeProvenance(
+  wake: {
+    reason: string | null;
+    idempotencyKey: string | null;
+    payload: unknown;
+    requestedByActorType: string | null;
+    requestedByActorId: string | null;
+  } | null | undefined,
+  expected: NativeReviewAssignmentContext & { issueId: string },
+): boolean {
+  if (!wake) return false;
+  const payload =
+    wake.payload && typeof wake.payload === "object"
+      ? (wake.payload as Record<string, unknown>)
+      : {};
+  const wakeContext =
+    payload._paperclipWakeContext && typeof payload._paperclipWakeContext === "object"
+      ? (payload._paperclipWakeContext as Record<string, unknown>)
+      : {};
+  const actorIsServerCommitter =
+    wake.requestedByActorType === "system" &&
+    (wake.requestedByActorId === "native-status-committer" ||
+      (typeof wake.requestedByActorId === "string" &&
+        wake.requestedByActorId.startsWith("native-status-wake-dispatch:")));
+  return (
+    (wake.reason === "native_completion_review" ||
+      wake.reason === "issue_execution_promoted") &&
+    wake.idempotencyKey === `native-review:${expected.nativeReviewInteractionId}` &&
+    actorIsServerCommitter &&
+    (payload.nativeReviewInteractionId ?? wakeContext.nativeReviewInteractionId) ===
+      expected.nativeReviewInteractionId &&
+    (payload.nativeReviewDecisionId ?? wakeContext.nativeReviewDecisionId) ===
+      expected.nativeReviewDecisionId &&
+    (payload.issueId ?? wakeContext.issueId) === expected.issueId
+  );
+}
+
+/**
+ * The committer records its reviewer wake in the decision-effect row, which
+ * wake creation cannot write. Returns that wake's bound run id: the exact run
+ * the intent was dispatched to, null while it is still unclaimed, or null
+ * (outer) when no committer intent exists for the assignment.
+ */
+export async function readNativeReviewCommitterWakeBinding(
+  db: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    contextSnapshot: unknown;
+  },
+): Promise<{ runId: string | null } | null> {
+  const context = readNativeReviewAssignmentContext(input.contextSnapshot);
+  if (!context) return null;
+  const reviewerWakeId = await readCommitterReviewerWakeId(db, {
+    companyId: input.companyId,
+    issueId: input.issueId,
+    context,
+  });
+  if (!reviewerWakeId) return null;
+  const wake = await db
+    .select({ runId: agentWakeupRequests.runId })
+    .from(agentWakeupRequests)
+    .where(
+      and(
+        eq(agentWakeupRequests.id, reviewerWakeId),
+        eq(agentWakeupRequests.companyId, input.companyId),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  return wake ? { runId: wake.runId } : null;
+}
+
+export async function isNativeReviewRunBoundToCommitterWake(
+  db: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    runId: string;
+    contextSnapshot: unknown;
+  },
+): Promise<boolean> {
+  const binding = await readNativeReviewCommitterWakeBinding(db, input);
+  return binding?.runId === input.runId;
+}
+
+async function readCommitterReviewerWakeId(
+  db: Db,
+  input: { companyId: string; issueId: string; context: NativeReviewAssignmentContext },
+): Promise<string | null> {
+  const effect = await db
+    .select({ payload: statusDecisionEffects.payload })
+    .from(statusDecisionEffects)
+    .where(
+      and(
+        eq(statusDecisionEffects.companyId, input.companyId),
+        eq(statusDecisionEffects.issueId, input.issueId),
+        eq(statusDecisionEffects.decisionId, input.context.nativeReviewDecisionId),
+        eq(statusDecisionEffects.effectKind, "bind_reviewer"),
+        eq(statusDecisionEffects.targetId, input.context.nativeReviewInteractionId),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  const reviewerWakeId =
+    effect?.payload && typeof effect.payload === "object"
+      ? (effect.payload as Record<string, unknown>).reviewerWakeId
+      : null;
+  return typeof reviewerWakeId === "string" ? reviewerWakeId : null;
+}
+
+/**
+ * Rebind the committer wake to a promoted run (promotion creates a new run).
+ * Only transfers when the deferred wake being promoted is the recorded
+ * committer wake itself or its authorized dispatch; an unrelated deferred
+ * wake that merely carries merged review context stays unbound.
+ */
+export async function bindNativeReviewCommitterWakeToRun(
+  db: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    runId: string;
+    contextSnapshot: unknown;
+    wake: {
+      id: string;
+      idempotencyKey: string | null;
+      requestedByActorType: string | null;
+      requestedByActorId: string | null;
+    };
+  },
+): Promise<void> {
+  const context = readNativeReviewAssignmentContext(input.contextSnapshot);
+  if (!context) return;
+  const reviewerWakeId = await readCommitterReviewerWakeId(db, {
+    companyId: input.companyId,
+    issueId: input.issueId,
+    context,
+  });
+  if (!reviewerWakeId) return;
+  const isCommitterWake = input.wake.id === reviewerWakeId;
+  const isAuthorizedDispatch =
+    input.wake.requestedByActorType === "system" &&
+    input.wake.requestedByActorId === `native-status-wake-dispatch:${reviewerWakeId}` &&
+    input.wake.idempotencyKey === `native-review:${context.nativeReviewInteractionId}`;
+  if (!isCommitterWake && !isAuthorizedDispatch) return;
+  await db
+    .update(agentWakeupRequests)
+    .set({ runId: input.runId })
+    .where(
+      and(
+        eq(agentWakeupRequests.id, reviewerWakeId),
+        eq(agentWakeupRequests.companyId, input.companyId),
+      ),
+    );
+}
 
 export function readNativeReviewAssignmentContext(
   snapshot: unknown,

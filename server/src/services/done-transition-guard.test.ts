@@ -3324,13 +3324,7 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.reason).toContain("repository/PR delivery is not required");
       expect(ghFetchMock).not.toHaveBeenCalled();
       expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
-      expect(logActivity).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({
-          action: "issue.done_transition_guard_skipped",
-          details: expect.objectContaining({ skipReason: "record_only_delivery_skipped" }),
-        }),
-      );
+      expect(logActivity).not.toHaveBeenCalled();
     });
 
     it("does not skip repository delivery for repository_delivery", async () => {

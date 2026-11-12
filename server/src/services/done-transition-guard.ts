@@ -4645,11 +4645,6 @@ async function evaluateDoneTransitionGuardCore(
   }
 
   if (issue.deliveryRequirement === "record_only") {
-    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
-      reason: "record_only_delivery_skipped",
-      skipReason: "record_only_delivery_skipped",
-      source: "done_transition_guard",
-    });
     return {
       allowed: true,
       reason: "Record-only delivery requirement: repository/PR delivery is not required; transition allowed",
