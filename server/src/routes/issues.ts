@@ -5427,6 +5427,7 @@ export function issueRoutes(
           owner: guardResult.owner,
           repo: guardResult.repo,
           decisionCarried,
+          source: "done_transition_guard",
         },
       );
       if (
