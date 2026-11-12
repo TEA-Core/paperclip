@@ -8925,7 +8925,14 @@ export function readWorkspaceSeedOperationEvidence(worktreePath: string): {
 } {
   const manifestPath = path.join(worktreePath, ".paperclip", "seed-manifest.json");
   const manifest = readLegacySeedManifestObject(manifestPath);
-  const manifestPresent = manifest !== null || lstatSync(manifestPath, { throwIfNoEntry: false }) !== undefined;
+  let manifestPresent = manifest !== null;
+  if (!manifestPresent) {
+    try {
+      manifestPresent = lstatSync(manifestPath, { throwIfNoEntry: false }) !== undefined;
+    } catch {
+      manifestPresent = true;
+    }
+  }
   const noSourceSkip = !manifestPresent && hasNoSourceSeedSkip(worktreePath);
   if (manifest) {
     const state = typeof manifest.state === "string" ? manifest.state : "unknown";
