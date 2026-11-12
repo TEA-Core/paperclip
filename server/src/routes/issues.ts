@@ -24176,7 +24176,7 @@ export function issueRoutes(
                   ...escalationCertifiedDelivery,
                   decisionId: acceptedEscalationDecision.value.decisionId,
                 };
-                await tx.update(issueRows).set({
+                await tx.update(issues).set({
                   executionState: sql`jsonb_set(
                     coalesce(${issueRows.executionState}, '{}'::jsonb),
                     '{approvalStatus}',
