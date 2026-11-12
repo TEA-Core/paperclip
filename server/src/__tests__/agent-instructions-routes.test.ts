@@ -719,7 +719,7 @@ describe("agent instructions bundle routes", () => {
         "PUT instructions-bundle/file",
         (baseUrl) => request(baseUrl)
           .put(`/api/agents/${targetAgentId}/instructions-bundle/file`)
-          .send({ path: "AGENTS.md", content: "# Updated Agent\n" }),
+          .send({ path: "notes/extra.md", content: "# Updated Agent\n" }),
       ],
       [
         "DELETE instructions-bundle/file",

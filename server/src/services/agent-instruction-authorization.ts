@@ -7,7 +7,7 @@ import {
   runIdentityContexts,
   type Db,
 } from "@paperclipai/db";
-import { forbidden } from "../errors.js";
+import { forbidden, HttpError } from "../errors.js";
 import {
   authorizationService,
   authorizationDeniedDetails,
@@ -16,6 +16,7 @@ import {
 import {
   agentInstructionsChangeTargetKey,
   changeConsentGateService,
+  REFLECTION_COACH_ADOPTION_CARRIER_REQUIRED,
 } from "./change-consent-gate.js";
 
 type Connection = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -178,12 +179,23 @@ export async function authorizeInstructionCommit(
     decision.reason === "deny_missing_consent" &&
     bound.type === "agent"
   ) {
-    await changeConsentGateService(db).assertConsented({
-      companyId: target.companyId,
-      actorAgentId: bound.agentId,
-      actorRunId: bound.runId,
-      targetKeys: [agentInstructionsChangeTargetKey(target.id)],
-    });
+    try {
+      await changeConsentGateService(db).assertConsented({
+        companyId: target.companyId,
+        actorAgentId: bound.agentId,
+        actorRunId: bound.runId,
+        targetKeys: [agentInstructionsChangeTargetKey(target.id)],
+      });
+    } catch (err) {
+      // Same masking as the route's protected-change gate: only the adoption-carrier
+      // refusal is surfaced; any other consent refusal stays the generic denial.
+      if (err instanceof HttpError && err.status === 403) {
+        const details = err.details as { code?: unknown } | null | undefined;
+        if (details?.code === REFLECTION_COACH_ADOPTION_CARRIER_REQUIRED) throw err;
+        throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+      }
+      throw err;
+    }
     decision = await access.decide({
       ...input,
       scope: { ...input.scope, consentedChange: true },

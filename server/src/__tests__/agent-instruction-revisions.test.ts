@@ -160,7 +160,7 @@ describe("canonical instruction revisions", () => {
     const first = await base();
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, actorId));
     await db.insert(principalPermissionGrants).values({ companyId, principalType: "agent", principalId: actorId, permissionKey: "agents:suggest-changes" });
-    await expect(save("needs approval", first.revision.id)).rejects.toMatchObject({ status: 403 });
+    await expect(save("needs approval", first.revision.id)).rejects.toMatchObject({ status: 403, details: { reason: "deny_missing_consent" } });
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, actorId));
     await db.insert(principalPermissionGrants).values({ companyId, principalType: "agent", principalId: actorId, permissionKey: "agents:configure", scope: { agentIds: [actorId] } });
     await expect(save("out of scope", first.revision.id)).rejects.toMatchObject({ status: 403 });
@@ -173,7 +173,7 @@ describe("canonical instruction revisions", () => {
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, actorId));
     await db.insert(principalPermissionGrants).values({ companyId, principalType: "agent", principalId: actorId, permissionKey: "agents:suggest-changes" });
     await db.insert(issueThreadInteractions).values({ id: interactionId, companyId, issueId, kind: "request_confirmation", status: "accepted", sourceRunId, createdByAgentId: actorId,
-      payload: { version: 1, prompt: "Apply the instruction change?", detailsMarkdown: "```diff\n+approved\n```", target: { type: "custom", key: `agent:${agentId}:instructions`, revisionId: "proposal" } },
+      payload: { version: 1, prompt: "Apply the instruction change?", detailsMarkdown: "```diff\n+approved\n```", target: { type: "custom", key: `agent:${agentId}:instructions`, revisionId: "proposal" }, adoptionCarrier: { issueId } },
       result: { version: 1, outcome: "accepted" }, resolvedByUserId: userId, resolvedAt: new Date(),
     });
     expect((await service.readCurrent(target(), actor))?.revision.id).toBe(first.revision.id);
@@ -184,6 +184,25 @@ describe("canonical instruction revisions", () => {
     expect(receipt.changed).toBe(true);
     expect((await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId)))[0].result).toMatchObject({ consumedByRunId: runId });
     await expect(save("another unapproved change", receipt.revision.id)).rejects.toMatchObject({ status: 403 });
+  });
+  // FORK (#1123): an instruction-target consent must name an adoption carrier, and that
+  // refusal is the one consent refusal the entry-file commit path surfaces unmasked.
+  it("surfaces the adoption-carrier refusal when the accepted consent names no carrier", async () => {
+    const first = await base();
+    const sourceRunId = randomUUID(), issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId, agentId: actorId, status: "succeeded" });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Review instructions" });
+    await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, actorId));
+    await db.insert(principalPermissionGrants).values({ companyId, principalType: "agent", principalId: actorId, permissionKey: "agents:suggest-changes" });
+    await db.insert(issueThreadInteractions).values({ id: randomUUID(), companyId, issueId, kind: "request_confirmation", status: "accepted", sourceRunId, createdByAgentId: actorId,
+      payload: { version: 1, prompt: "Apply the instruction change?", detailsMarkdown: "```diff\n+approved\n```", target: { type: "custom", key: `agent:${agentId}:instructions`, revisionId: "proposal" } },
+      result: { version: 1, outcome: "accepted" }, resolvedByUserId: userId, resolvedAt: new Date(),
+    });
+    await expect(save("no carrier", first.revision.id)).rejects.toMatchObject({
+      status: 403,
+      details: { code: "reflection_coach_adoption_carrier_required" },
+    });
+    expect((await service.readCurrent(target(), actor))?.revision.id).toBe(first.revision.id);
   });
   it("shares head/CAS and attribution between board and agent writers", async () => {
     const first = await base();
