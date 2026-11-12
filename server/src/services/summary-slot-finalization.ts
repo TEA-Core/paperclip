@@ -1,4 +1,5 @@
 import { and, eq, sql } from "drizzle-orm";
+import type { SQLWrapper } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   documents,
@@ -94,8 +95,15 @@ function failureReasonForIssue(issue: TerminalGenerationIssue) {
  * (a generation task can arm more than one slot). Postgres resolves the
  * target-table reference to its pre-UPDATE value; document_id is not modified
  * here, so that is exactly the value we want.
+ *
+ * `companyId`/`issueId` accept either literal values (the UPDATE path binds
+ * them as parameters) or column references (the refresh sweep projects this
+ * predicate over `summary_slots` in a SELECT, correlating on each row's own
+ * `company_id`/`generating_issue_id` — SUP-22977). With a NULL
+ * `generating_issue_id` the comparison is NULL and EXISTS resolves false, so
+ * the predicate is safe to project onto non-generating rows.
  */
-function generationWroteSlotSql(companyId: string, issueId: string) {
+export function generationWroteSlotSql(companyId: string | SQLWrapper, issueId: string | SQLWrapper) {
   return sql`(
     EXISTS (
       SELECT 1
@@ -105,8 +113,8 @@ function generationWroteSlotSql(companyId: string, issueId: string) {
       WHERE doc.id = ${summarySlots.documentId}
         AND hr.company_id = ${companyId}
         AND (
-          hr.context_snapshot ->> 'issueId' = ${issueId}
-          OR (hr.context_snapshot -> 'paperclipIssue') ->> 'id' = ${issueId}
+          hr.context_snapshot ->> 'issueId' = ${issueId}::text
+          OR (hr.context_snapshot -> 'paperclipIssue') ->> 'id' = ${issueId}::text
         )
     )
   )`;

@@ -10,7 +10,9 @@ All commands below assume you are in the **project root** (the directory contain
 docker build -t paperclip-local .
 ```
 
-The Dockerfile installs common agent tools (`git`, `gh`, `curl`, `wget`, `ripgrep`, `python3`) and the Claude, Codex, and OpenCode CLIs.
+The Dockerfile installs common agent tools (`git`, `gh`, `curl`, `wget`, `ripgrep`, `python3`) and the Claude, Codex, and OpenCode CLIs. OpenCode on `PATH` is pinned to `opencode-ai@1.19.5` (`/usr/local/bin/opencode`). OpenCode V2 `@opencode/cli@2.2.4` is installed only at `/opt/opencode-v2/bin/opencode` and is not linked onto `PATH`, so a non-opted-in launch still runs V1. Opt in by setting that absolute path as the agent command. The linux/x64 binary digest is `25facd7099c19018e83dce858f3ab922cd2d49ad29b144bc36968418ca6eb5aa`, written to `/opt/opencode-v2/OPENCODE_V2_SHA256` and checked on amd64 image builds. Both opencode installs run with an explicit npm `--allow-scripts` permission for their package: npm 11 ships only a stub `bin/opencode.exe`, and the real platform binary is placed by the package `postinstall` (without the allowance npm warns on every uncovered lifecycle script, and a future enforcement would leave the stub that errors).
+
+The `docker-build-assert` job (scheduled for PRs per the `pull_request.paths` filter in `.github/workflows/docker.yml`) also proves the rebuilt image still runs the unchanged V1 agent path: it launches `scripts/assert-opencode-v1-baseline-launch.sh` inside a container built from the image. It stages the adapter-shaped XDG config with the V1 router plugin (`scripts/opencode-v1-plugin-fixture/`, a sha256-pinned copy of the V1 router plugin with its router endpoint defaults replaced by placeholders; the probe supplies the router URLs), serves the router catalog on loopback, and asserts the plugin registers the router providers and a full agent turn completes as the agent principal (`node-agent`, uid 1001).
 
 Build arguments:
 
@@ -32,40 +34,29 @@ docker build -t paperclip-local \
   --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g) .
 ```
 
-## Cloud image addresses
+## Standard images and downstream composition
 
-The Docker workflow publishes the managed deployment image for Linux AMD64.
-`Cloud readiness` starts `Docker cloud` on each master push independently of the
-multi-platform self-hosted build. Different commits use separate concurrency groups and existing
-GitHub-hosted runners, so an older production or cloud build does not hold the
-new commit in a workflow queue. Available GitHub runner capacity still applies.
-Release tags and manual `Docker` dispatches call the same cloud build workflow.
+The Docker workflow publishes the standard `production` target for Linux AMD64
+and ARM64. Canonical master pushes also publish
+`ghcr.io/paperclipai/paperclip:sha-<FULL_SHA>` and a GitHub/Sigstore attestation
+for its immutable multi-platform digest. Downstream services can compose their
+own images from this public base without rebuilding Core.
 
-Each commit exports to its own `buildcache-cloud-<FULL_SHA>` registry tag.
-Builds import the current commit and nine first-parent ancestors, plus the
-legacy `buildcache-cloud` fallback. This preserves reusable layers without
-letting concurrent builds overwrite one shared cache manifest. Retain recent
-cache tags if registry cleanup is configured; deleting them makes builds colder.
+The legacy recurring public `-cloud` publisher is retired. Master pushes,
+release tags, and manual `Docker` dispatches no longer build that variant.
+Existing `-cloud` tags and digests remain in the registry for rollback; their
+release-channel aliases no longer advance. This change deletes no images,
+cache tags, or migrator artifacts.
 
-Cloud CI skips SDK and cache cleanup when both the Docker data filesystem and
-the checkout filesystem have at least 64 GiB available. Below that conservative
-headroom threshold, or when the measurement fails, it retains the existing
-cleanup. The threshold selects the fast path; it is not a new minimum disk
-requirement for local builds or smaller runners.
+The `cloud` Dockerfile target remains available for explicit
+[preview builds](preview-release-artifacts.md). Those requests still publish a
+full-SHA `-cloud` tag when needed. They do not advance a release channel or
+replace downstream private composition.
 
-After the pushed image passes its Sentry and orphan-reaping checks, the workflow verifies its
-commit label and platform and adds `ghcr.io/paperclipai/paperclip:sha-<full-commit-sha>-cloud`.
-This address lets commit-based deployment tooling reuse the normal build.
-Existing short-SHA and release tags remain available.
-
-The full-SHA tag identifies the source commit. It does not certify that source
-tests passed or that a compatible database migrator is available. Deployment
-tooling must still check those prerequisites and pin the resolved image digest;
-a rebuild of the same source can update the tag's digest.
-
-The separate [cloud readiness check](cloud-build-readiness.md) combines source
-verification, successful cloud image checks, and exact-source migrator
-availability. It runs outside the full npm release's concurrency queue.
+A published image alone does not prove source tests or migration compatibility.
+Downstream deployment tooling must verify [source proof](cloud-build-readiness.md),
+the standard image attestation, the exact-source migrator, and its own composed
+image before rollout. Resolve immutable digests instead of deploying mutable tags.
 
 ## One-liner (build + run)
 

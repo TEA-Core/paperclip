@@ -2,24 +2,30 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   agents as agentsTable,
+  heartbeatRuns as heartbeatRunsTable,
   issueExecutionDecisions as issueExecutionDecisionsTable,
   issueLabels as issueLabelsTable,
   issueRelations as issueRelationsTable,
   issues as issuesTable,
+  issueWorkProducts as issueWorkProductsTable,
   labels as labelsTable,
 } from "@paperclipai/db";
 import {
   countLadderedChildren,
   evaluateDoneTransitionGuard,
+  evaluateDoneTransitionGuardForBackstopClose,
   evaluateDoneTierDeclaration,
   extractCitedCommitShas,
   resolveCitedCommits,
+  DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS,
   DONE_TIER_STRUCTURED_FORMS,
   DONE_TIER_TIER1_DELEGATED_JSON,
   DONE_TIER_TIER1_LANDED_JSON,
   DONE_TIER_TIER2_JSON,
+  DONE_TIER_TIER2_RECORD_ONLY_JSON,
   renderDoneTierDeclaration,
   TIER1_FORM,
+  TIER2_RECORD_ONLY_FORM,
   GitHubAuthError,
   type DoneTransitionOverride,
 } from "./done-transition-guard.js";
@@ -149,7 +155,7 @@ function filterLabelRowsByName(
  * `select().from().where()` resolves to the `executionWorkspaces` rows exactly
  * as the legacy positional chain did, so pre-existing tests are untouched.
  */
-function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[] }) {
+function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; projectWorkspaces?: Record<string, unknown>[]; projects?: Record<string, unknown>[]; issues?: Record<string, unknown>[]; blockedByIssues?: Record<string, unknown>[]; issueRelations?: Record<string, unknown>[]; agents?: Record<string, unknown>[]; issueExecutionDecisions?: Record<string, unknown>[]; labels?: Record<string, unknown>[]; issueLabels?: Record<string, unknown>[]; issueWorkProducts?: Record<string, unknown>[]; heartbeatRuns?: Record<string, unknown>[] }) {
   // SUP-15233: the guard reads the issues table twice inside
   // countLadderedChildren: read 1 is the parent_id edge (decomposition
   // children), read 2 is the inArray re-read (blockedBy edge, only present in
@@ -205,6 +211,21 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
     where: vi.fn().mockResolvedValue(rows.issueLabels ?? []),
     then: vi.fn().mockResolvedValue(rows.issueLabels ?? []),
   };
+  const workProductsChain = {
+    from: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
+    then: vi.fn().mockResolvedValue(rows.issueWorkProducts ?? []),
+  };
+  // SUP-23490: the tier evaluator reads the closing run's heartbeat row
+  // (startedAt/createdAt) to place a record-only observation inside the
+  // closing run's lifetime. Dispatch by table identity; unseeded tests
+  // return [] so a run id that no test seeds resolves to no row (the
+  // lifetime gate then refuses record-only evidence that carries one).
+  const heartbeatRunsChain = {
+    from: vi.fn().mockReturnThis(),
+    where: vi.fn().mockResolvedValue(rows.heartbeatRuns ?? []),
+    then: vi.fn().mockResolvedValue(rows.heartbeatRuns ?? []),
+  };
   const selectChain = {
     from: vi.fn().mockReturnThis(),
     where: vi.fn().mockResolvedValue(rows.executionWorkspaces ?? []),
@@ -240,6 +261,8 @@ function setupDbMock(rows: { executionWorkspaces?: Record<string, unknown>[]; pr
         if (table === issueExecutionDecisionsTable) return decisionsChain;
         if (table === labelsTable) return labelsChain;
         if (table === issueLabelsTable) return issueLabelsChain;
+        if (table === issueWorkProductsTable) return workProductsChain;
+        if (table === heartbeatRunsTable) return heartbeatRunsChain;
         const chain = chains[callCount] ?? selectChain;
         callCount++;
         return chain;
@@ -280,6 +303,12 @@ vi.mock("./github-credential.js", () => ({
   resolveGitHubTokenCandidatesForRepo: mockResolveGitHubTokenCandidatesForRepo,
 }));
 
+const mockReadBuildCommit = vi.hoisted(() => vi.fn());
+vi.mock("../build-commit.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../build-commit.js")>();
+  return { ...actual, readBuildCommit: mockReadBuildCommit };
+});
+
 vi.mock("./activity-log.js", () => ({
   logActivity: vi.fn().mockResolvedValue(undefined),
 }));
@@ -306,9 +335,10 @@ vi.mock("./merge-arming.js", async (importOriginal) => {
 });
 
 const mockExecFile = vi.hoisted(() => vi.fn());
-vi.mock("node:child_process", () => ({
-  execFile: mockExecFile,
-}));
+vi.mock("node:child_process", async () => {
+  const { spawnFromExecFile } = await import("../__tests__/helpers/spawn-from-exec-file.js");
+  return { execFile: mockExecFile, spawn: spawnFromExecFile(mockExecFile) };
+});
 
 import { ghFetch } from "./github-fetch.js";
 import { resolveGitHubToken } from "./github-credential.js";
@@ -380,6 +410,36 @@ describe("evaluateDoneTransitionGuard", () => {
       const override: DoneTransitionOverride = { disposition: "merged-elsewhere" };
       const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
       expect(result.allowed).toBe(true);
+    });
+
+    it("allows control-plane-operation-no-deliverable only without a legitimate delivery branch", async () => {
+      const override: DoneTransitionOverride = { disposition: "control-plane-operation-no-deliverable" };
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
+      expect(result.allowed).toBe(true);
+      expect(result.reason).toContain("control-plane-operation-no-deliverable");
+    });
+
+    it("refuses control-plane-operation-no-deliverable when the issue owns a delivery branch", async () => {
+      vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce(ownDeliveryBranch("SUP-12345-work"));
+      const override: DoneTransitionOverride = { disposition: "control-plane-operation-no-deliverable" };
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("legitimate delivery branch");
+    });
+
+    it("allows control-plane-operation-no-deliverable for an issue-owned workspace with no delivery branch", async () => {
+      vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce({
+        branch: null,
+        branchIsOwn: true,
+        carrier: false,
+        legitimate: true,
+        ownerIssueId: null,
+        refusalReason: null,
+      });
+      const override: DoneTransitionOverride = { disposition: "control-plane-operation-no-deliverable" };
+      const result = await evaluateDoneTransitionGuard(mockDb, issue, override);
+      expect(result.allowed).toBe(true);
+      expect(result.reason).toContain("control-plane-operation-no-deliverable");
     });
 
     it("does not treat unknown disposition as override", async () => {
@@ -3264,13 +3324,7 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.reason).toContain("repository/PR delivery is not required");
       expect(ghFetchMock).not.toHaveBeenCalled();
       expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
-      expect(logActivity).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({
-          action: "issue.done_transition_guard_skipped",
-          details: expect.objectContaining({ skipReason: "record_only_delivery_skipped" }),
-        }),
-      );
+      expect(logActivity).not.toHaveBeenCalled();
     });
 
     it("does not skip repository delivery for repository_delivery", async () => {
@@ -5421,6 +5475,16 @@ describe("evaluateDoneTierDeclaration", () => {
       })).toBe("Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #123 via done-close-landing-backstop — Landing delegated. Liveness unverified.");
     });
 
+    it("renders a no-repository Tier 1 close without a SHA or PR", () => {
+      expect(renderDoneTierDeclaration(null, {
+        tier: "tier1",
+        reason: "No repository artifact was produced",
+        landing: { mode: "noRepositoryLanding" },
+      })).toBe(
+        "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — No repository artifact was produced. Liveness unverified.",
+      );
+    });
+
     it("preserves the body when the existing Tier 2 declaration matches", () => {
       const body = "Context\n\nClosed at Tier 2 (live): existing evidence\n\nFollow-up";
       expect(renderDoneTierDeclaration(body, {
@@ -5468,12 +5532,160 @@ describe("evaluateDoneTierDeclaration", () => {
     });
   });
 
+  // SUP-21902 Tier 2 origin predicate fixtures: the probe head named in the
+  // declaration (short sha), the full delivery merge head the default branch
+  // resolves to, and an unrelated full sha for the mismatch regression.
+  const T2_PROBE_HEAD = "aaaaaaaaaa";
+  const T2_MERGE_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const T2_STRANGER_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const T2_DEFAULT_REF = "fold/tea-patches-v2026.722.0";
+
+  function tier2Line(evidence: string) {
+    return `Closed at Tier 2 (live): ${evidence}`;
+  }
+
+  function validTier2Evidence(head: string = T2_PROBE_HEAD) {
+    return `probe \`curl https://app.example.com/health\` head ${head} post-merge: health endpoint reports the fix is live`;
+  }
+
+  function repoBackedTierIssue() {
+    return {
+      ...tierIssue,
+      projectId: "project-1",
+      projectWorkspaceId: "pw-1",
+      executionWorkspaceId: "ew-1",
+    };
+  }
+
+  // Resolve `/commits/{ref}` URLs the way the origin predicate calls them: a
+  // listed ref maps to the sha it points at, `sha: null` is a 404 (unresolvable
+  // on the remote), and any other URL 404s so unrelated probes never satisfy
+  // the predicate by accident.
+  function mockRefHeadResolutions(
+    resolutions: Array<{ ref: string; sha: string | null; unprocessable?: string; status?: number }>,
+  ) {
+    ghFetchMock.mockImplementation(async (url: string) => {
+      const u = String(url);
+      if (!u.includes("/commits/")) return new Response(JSON.stringify({}), { status: 404 });
+      for (const { ref, sha, unprocessable, status } of resolutions) {
+        if (u.endsWith(`/commits/${encodeURIComponent(ref)}`)) {
+          if (status !== undefined) {
+            return new Response(JSON.stringify({ message: "provider error" }), { status });
+          }
+          if (unprocessable !== undefined) {
+            return new Response(JSON.stringify({ message: unprocessable }), { status: 422 });
+          }
+          return sha === null
+            ? new Response(JSON.stringify({ message: "Not Found" }), { status: 404 })
+            : new Response(JSON.stringify({ sha }), { status: 200 });
+        }
+      }
+      return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+    });
+  }
+
+  const T2_MERGED_AT = "2026-10-30T00:00:00.000Z";
+
+  function setupTier2OriginMocks(
+    recordedMergedPullRequests: Array<{ mergeCommitSha: string; mergedAt?: string }> = [
+      { mergeCommitSha: T2_MERGE_SHA, mergedAt: T2_MERGED_AT },
+    ],
+    workspaceRow: Partial<Record<string, unknown>> = {},
+  ) {
+    ghFetchMock.mockReset();
+    mockResolveGitHubToken.mockReset();
+    mockResolveGitHubToken.mockResolvedValue({
+      token: "test-token",
+      scope: "company",
+      secretName: "GITHUB_TOKEN",
+    });
+    setupDbMock({
+      executionWorkspaces: [mockExecutionWorkspaceRow(workspaceRow)],
+      issueWorkProducts: recordedMergedPullRequests.map((metadata) => ({ metadata })),
+    });
+  }
+
   describe("Tier 2 via accompanying comment", () => {
-    it("allows transition with well-formed Tier 2 declaration and non-empty evidence", async () => {
+    beforeEach(() => {
+      setupTier2OriginMocks();
+    });
+
+    it("SUP-21902: refuses a Tier 2 declaration whose evidence is arbitrary prose, not the probe/head/post-merge shape", async () => {
+      // Distinguishing test (mutated from the pre-SUP-21902 arbitrary-prose
+      // acceptance): non-empty prose matched the Tier 2 prefix and was accepted
+      // with no verification; under the origin predicate it is malformed
+      // evidence and the close fails closed before any GitHub call.
       const result = await evaluateDoneTierDeclaration(
         mockDb,
-        tierIssue,
-        "Closed at Tier 2 (live): probe output shows the fix is live.",
+        repoBackedTierIssue(),
+        tier2Line("probe output shows the fix is live."),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("machine-checkable");
+      expect(result.reason).toContain("post-merge predicate");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("SUP-21902: refuses a valid-shape Tier 2 declaration whose named head differs from the delivery merge head", async () => {
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_STRANGER_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain(T2_PROBE_HEAD);
+      expect(result.reason).toContain(T2_STRANGER_SHA);
+      expect(result.reason).toContain(T2_MERGE_SHA);
+      expect(result.reason).toContain("delivery merge head");
+      expect(result.reason).toContain("recorded for this delivery");
+      const commitsUrls = ghFetchMock.mock.calls.map(([url]) => String(url)).filter((url) => url.includes("/commits/"));
+      expect(commitsUrls.some((url) => url.endsWith(`/commits/${encodeURIComponent(T2_PROBE_HEAD)}`))).toBe(true);
+      // The comparison target is the recorded merge commit, never the live branch tip:
+      // the guard must not resolve the default branch at all.
+      expect(commitsUrls.some((url) => url.endsWith(`/commits/${encodeURIComponent(T2_DEFAULT_REF)}`))).toBe(false);
+    });
+
+    it("SUP-21902: refuses a Tier 2 declaration when no recorded delivery merge commit is available (merge_commit_unrecorded, no branch-tip fallback)", async () => {
+      setupTier2OriginMocks([]);
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("merge_commit_unrecorded");
+      expect(result.reason).toContain("no fallback to the live branch tip");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("SUP-21902: accepts a probe at the recorded merge commit even when the live branch tip has moved past it", async () => {
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_STRANGER_SHA },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
         null,
         () => Promise.resolve([]),
       );
@@ -5481,11 +5693,300 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.tier).toBe("tier2");
     });
 
-    it("allows transition with Tier 2 declaration and evidence on the following line", async () => {
+    it("SUP-21902: refuses a valid-shape Tier 2 declaration whose named head does not resolve (head_unresolvable)", async () => {
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: null },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
       const result = await evaluateDoneTierDeclaration(
         mockDb,
-        tierIssue,
-        "Some context\nClosed at Tier 2 (live):\nProbe output: fix confirmed live.",
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("head_unresolvable");
+      expect(result.reason).toContain(T2_PROBE_HEAD);
+    });
+
+    it("SUP-21902: GitHub's 422 \"No commit found\" for an unknown SHA-shaped head is head_unresolvable, not an unverifiable fault", async () => {
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: null, unprocessable: `No commit found for SHA: ${T2_PROBE_HEAD}` },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("head_unresolvable");
+      expect(result.reason).toContain(T2_PROBE_HEAD);
+    });
+
+    it("SUP-21902: any other 422 from the commits probe is an unverifiable fault, never head_unresolvable", async () => {
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: null, unprocessable: "Validation Failed" },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("could not be verified");
+      expect(result.reason).toContain("GitHub commits API returned 422");
+      expect(result.reason).not.toContain("head_unresolvable");
+    });
+
+    it("SUP-21902: a 401 or 403 from the head resolver refuses the close (never admits on a provider auth failure)", async () => {
+      for (const status of [401, 403]) {
+        mockRefHeadResolutions([{ ref: T2_PROBE_HEAD, sha: null, status }]);
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          repoBackedTierIssue(),
+          tier2Line(validTier2Evidence()),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("could not be verified");
+        expect(result.reason).not.toContain("head_unresolvable");
+      }
+    });
+
+    it("SUP-21902: accepts a valid post-merge Tier 2 declaration whose named head is the delivery merge head", async () => {
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("Tier 2 declaration found:");
+      expect(result.reason).toContain("post-merge:");
+    });
+
+    it("SUP-21902: refuses a valid-shape Tier 2 declaration on a card with no resolvable delivery repository (fail closed)", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        { ...tierIssue, projectId: null, projectWorkspaceId: null, executionWorkspaceId: null },
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("no delivery repository is resolvable");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("SUP-21902: accepts a probe at the recorded merge commit when the repository has no default branch ref (the predicate never reads it)", async () => {
+      setupTier2OriginMocks(undefined, { baseRef: null });
+      mockRefHeadResolutions([{ ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA }]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+    });
+
+    it("SUP-21902: a recorded merge commit shorter than 40 hex never matches, even when it is a prefix of the resolved probe head", async () => {
+      for (const shortRecorded of [T2_MERGE_SHA.slice(0, 7), T2_PROBE_HEAD, T2_MERGE_SHA.slice(0, 39)]) {
+        setupTier2OriginMocks([{ mergeCommitSha: shortRecorded, mergedAt: T2_MERGED_AT }]);
+        mockRefHeadResolutions([{ ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA }]);
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          repoBackedTierIssue(),
+          tier2Line(validTier2Evidence()),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("merge_commit_unrecorded");
+      }
+    });
+
+    it("SUP-21902: compares the probe head only with the most recent merged PR's commit (PR#1 at A, PR#2 at B: probe at A refused, probe at B allowed)", async () => {
+      // Newest row listed first so the outcome cannot depend on row order.
+      const recorded = [
+        { mergeCommitSha: T2_STRANGER_SHA, mergedAt: "2026-10-31T00:00:00.000Z" },
+        { mergeCommitSha: T2_MERGE_SHA, mergedAt: "2026-10-29T00:00:00.000Z" },
+      ];
+      const probeAtB = "bbbbbbbbbb";
+      const resolutions = [
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: probeAtB, sha: T2_STRANGER_SHA },
+      ];
+
+      setupTier2OriginMocks(recorded);
+      mockRefHeadResolutions(resolutions);
+      const atA = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence(T2_PROBE_HEAD)),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(atA.allowed).toBe(false);
+      expect(atA.tier).toBe(null);
+      expect(atA.reason).toContain(T2_STRANGER_SHA);
+      expect(atA.reason).toContain("recorded for this delivery");
+
+      setupTier2OriginMocks(recorded);
+      mockRefHeadResolutions(resolutions);
+      const atB = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence(probeAtB)),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(atB.allowed).toBe(true);
+      expect(atB.tier).toBe("tier2");
+    });
+
+    it("SUP-21902: refuses (merge_commit_unrecorded) when the most recent merged rows tie on mergedAt with different commits", async () => {
+      setupTier2OriginMocks([
+        { mergeCommitSha: T2_MERGE_SHA, mergedAt: T2_MERGED_AT },
+        { mergeCommitSha: T2_STRANGER_SHA, mergedAt: T2_MERGED_AT },
+      ]);
+      mockRefHeadResolutions([{ ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA }]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("merge_commit_unrecorded");
+    });
+
+    it("SUP-21902: refuses malformed Tier 2 shapes (missing probe command, head, or post-merge predicate) without GitHub calls", async () => {
+      for (const evidence of [
+        "curl https://app.example.com/health head aaaaaaaaaa post-merge: fix is live",
+        "probe `curl https://app.example.com/health` post-merge: fix is live",
+        "probe `curl https://app.example.com/health` head aaaaaaaaaa",
+      ]) {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          repoBackedTierIssue(),
+          tier2Line(evidence),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("machine-checkable");
+      }
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("SUP-21902: refuses Tier 2 shapes missing exactly one part (empty probe command, empty post-merge predicate) and a case-and-whitespace probe head", async () => {
+      for (const evidence of [
+        // Only the probe command text is missing (empty backticks); every
+        // other part of the shape is present, so dropping the command
+        // capture from the shape check would admit this.
+        "probe `` head aaaaaaaaaa post-merge: fix is live",
+        // Only the post-merge predicate is missing (empty after the colon);
+        // every other part is present, so allowing an empty predicate
+        // would admit this.
+        "probe `curl -sf https://tea-core.example/healthz` head aaaaaaaaaa post-merge:",
+        // Probe head carries whitespace inside it (and upper case), so it
+        // is not a resolvable hex ref; trimming or case-folding a captured
+        // head into a match would admit this.
+        "probe `curl -sf https://tea-core.example/healthz` head AAAA AAAA post-merge: fix is live",
+      ]) {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          repoBackedTierIssue(),
+          tier2Line(evidence),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("machine-checkable");
+      }
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("SUP-22541: accepts an uppercase Tier 2 probe head at the recorded merge commit (H2: the captured head is case-folded before resolution)", async () => {
+      // The shape regex accepts uppercase hex, and the guard folds the
+      // captured head to lowercase before resolving it: dropping the
+      // casefold would resolve the uppercase ref (404 on a case-sensitive
+      // remote) and refuse this close.
+      mockRefHeadResolutions([{ ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA }]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(validTier2Evidence(T2_PROBE_HEAD.toUpperCase())),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+      const commitsUrls = ghFetchMock.mock.calls.map(([url]) => String(url)).filter((url) => url.includes("/commits/"));
+      expect(commitsUrls.some((url) => url.endsWith(`/commits/${encodeURIComponent(T2_PROBE_HEAD)}`))).toBe(true);
+    });
+
+    it("SUP-22541: refuses Tier 2 probe heads with padding or interior whitespace at the shape check with zero GitHub calls (H18 is an equivalent mutant; regression coverage only)", async () => {
+      // Mutant H18 (adding trim() to the captured probe head) is equivalent:
+      // the shape's head group accepts hex only and can never capture
+      // whitespace, so trim() is a no-op for every reachable input and no
+      // test can kill it. This test is kept as behavioural regression
+      // coverage proving whitespace-bearing heads are refused at the shape
+      // check with zero GitHub calls.
+      for (const evidence of [
+        "probe `curl -sf https://tea-core.example/healthz` head  aaaaaaaaaa post-merge: fix is live",
+        "probe `curl -sf https://tea-core.example/healthz` head aaaaaaaaaa  post-merge: fix is live",
+        "probe `curl -sf https://tea-core.example/healthz` head \taaaaaaaaaa post-merge: fix is live",
+      ]) {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          repoBackedTierIssue(),
+          tier2Line(evidence),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("machine-checkable");
+      }
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("allows transition with Tier 2 declaration and evidence on the following line", async () => {
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        `Some context\nClosed at Tier 2 (live):\n${validTier2Evidence()}`,
         null,
         () => Promise.resolve([]),
       );
@@ -5519,7 +6020,562 @@ describe("evaluateDoneTierDeclaration", () => {
     });
   });
 
+  // SUP-22801: a record_only card owes no repository landing, so the shared
+  // done-tier evaluator accepts a machine-checkable record-only live-evidence
+  // grammar (probe command, observed target, UTC observation instant, pass
+  // predicate/result) with no merge head, and refuses prose, malformed
+  // components, impossible instants, and failing predicates. The merge-head
+  // contract for repository_delivery cards is byte-for-byte unchanged.
+  describe("record-only Tier 2 live evidence (SUP-22801)", () => {
+    function recordOnlyTierIssue() {
+      return { ...tierIssue, deliveryRequirement: "record_only" as const };
+    }
+
+    const RECORD_ONLY_EVIDENCE =
+      "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records";
+
+    beforeEach(() => {
+      // A record-only close must resolve nothing on GitHub: no token, no repo,
+      // no probe head. Reset every provider mock so any call is a failure.
+      setupDbMock({});
+      mockResolveGitHubToken.mockReset();
+      ghFetchMock.mockReset();
+      vi.mocked(logActivity).mockClear();
+    });
+
+    it("accepts a valid record-only declaration on a record_only card with no repo and no merged work product", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        recordOnlyTierIssue(),
+        tier2Line(RECORD_ONLY_EVIDENCE),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+      expect(result.skipped).toBe(false);
+      expect(result.reason).toContain("record-only probe");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveGitHubToken).not.toHaveBeenCalled();
+    });
+
+    async function evaluateObservation(observation: string, verdict: "pass" | "fail" = "pass") {
+      return evaluateDoneTierDeclaration(
+        mockDb,
+        recordOnlyTierIssue(),
+        tier2Line(
+          `record-only probe \`curl -fsS https://ops.example.com/healthz\` target https://ops.example.com observed ${observation} result: ${verdict} endpoint healthy`,
+        ),
+        null,
+        () => Promise.resolve([]),
+      );
+    }
+
+    it("accepts observation ranges including the SUP-23277 sweep and equal endpoints", async () => {
+      for (const observation of [
+        "2026-11-06T21:02:39.503559Z-2026-11-06T21:04:24.162190Z",
+        "2026-11-06T21:02:39.503559Z-2026-11-06T21:02:39.503559Z",
+        "2026-11-06T21:02:39.1Z-2026-11-06T21:02:39.100000Z",
+        "2026-11-06T21:02:39.100000Z-2026-11-06T21:02:39.1Z",
+      ]) {
+        const result = await evaluateObservation(observation);
+        expect(result.allowed, observation).toBe(true);
+        expect(result.tier, observation).toBe("tier2");
+      }
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveGitHubToken).not.toHaveBeenCalled();
+    });
+
+    it.each(["1", "12", "123", "1234", "12345", "123456"])(
+      "accepts %s fractional digits on a single instant and both range ends",
+      async (fraction) => {
+        for (const observation of [
+          `2026-11-06T21:02:39.${fraction}Z`,
+          `2026-11-06T21:02:39.${fraction}Z-2026-11-06T21:04:24.${fraction}Z`,
+        ]) {
+          const result = await evaluateObservation(observation);
+          expect(result.allowed, observation).toBe(true);
+          expect(result.tier, observation).toBe("tier2");
+        }
+      },
+    );
+
+    it("keeps observation-range evidence record-only on a repository_delivery card", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(
+          "record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2026-11-06T21:02:39.503559Z-2026-11-06T21:04:24.162190Z result: pass endpoint healthy",
+        ),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("deliveryRequirement=record_only");
+      expect(result.reason).toContain("probe `<probe command>` head <probe head sha> post-merge:");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("accepts a real leap-day observation instant while refusing the same day on a non-leap year", async () => {
+      // SUP-22801 round-1 repair: the strict component + round-trip check must
+      // not over-reject real calendar instants — 2024-02-29 is a real UTC day
+      // and stays accepted even as 2026-02-29 is refused above.
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        recordOnlyTierIssue(),
+        tier2Line(
+          "record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2024-02-29T23:59:59Z result: pass endpoint healthy",
+        ),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("accepts the same record-only declaration from the same-run comment path", async () => {
+      // SUP-23490: the same-run path faces the closing-run lifetime gate too, so
+      // the seeded run must have started before the cited observation — the
+      // ordinary shape of a run that probed mid-execution — and the accepted
+      // audit stamps the closing run identity beside the observation.
+      setupDbMock({
+        heartbeatRuns: [
+          { id: "run-1", companyId: "company-1", startedAt: new Date("2026-11-04T09:00:00Z"), createdAt: new Date("2026-11-04T08:58:00Z") },
+        ],
+      });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        recordOnlyTierIssue(),
+        null,
+        "run-1",
+        () => Promise.resolve([mockComment(tier2Line(RECORD_ONLY_EVIDENCE), "run-1")]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+      expect(result.reason).toContain("same-run comment");
+      expect(result.tier2Audit).toMatchObject({ closingRunId: "run-1", closingRunStartedAt: "2026-11-04T09:00:00.000Z" });
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses arbitrary prose on a record_only card, naming the record-only accepted form verbatim", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        recordOnlyTierIssue(),
+        tier2Line("the sweep consumed everything on schedule."),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("machine-checkable");
+      expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses an impossible instant, a failing verdict, and a blank component, each naming the record-only form", async () => {
+      for (const [evidence, expected] of [
+        ["record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2026-13-04T09:15:00Z result: pass endpoint healthy", "not a real UTC calendar instant"],
+        // SUP-22801 round-1 repair: these components pass a bare Date.parse
+        // because the engine NORMALIZES them (2026-02-31 -> 2026-03-03,
+        // non-leap 2026-02-29 -> 2026-03-01, 24:00 -> next day); the strict
+        // component + round-trip check must still refuse them.
+        ["record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2026-02-31T09:15:00Z result: pass endpoint healthy", "not a real UTC calendar instant"],
+        ["record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2026-02-29T09:15:00Z result: pass endpoint healthy", "not a real UTC calendar instant"],
+        ["record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2026-11-04T24:00:00Z result: pass endpoint healthy", "not a real UTC calendar instant"],
+        ["record-only probe `curl -fsS https://ops.example.com/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: fail endpoint returned 500", "failing predicate"],
+        ["record-only probe ` ` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass endpoint healthy", "blank probe command"],
+      ] as const) {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidence),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed, evidence).toBe(false);
+        expect(result.tier, evidence).toBe(null);
+        expect(result.reason, evidence).toContain(expected);
+        expect(result.reason, evidence).toContain(TIER2_RECORD_ONLY_FORM);
+      }
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses over-precise instants and invalid observation ranges", async () => {
+      for (const [observation, verdict, expected] of [
+        ["2026-11-06T21:02:39.1234567Z", "pass", "machine-checkable"],
+        ["2026-11-06T21:02:39.1234567Z-2026-11-06T21:04:24.162190Z", "pass", "machine-checkable"],
+        ["2026-11-06T21:02:39.503559Z-2026-11-06T21:04:24.1234567Z", "pass", "machine-checkable"],
+        ["2026-02-29T09:15:00Z-2026-11-06T21:04:24.162190Z", "pass", "not a real UTC calendar instant"],
+        ["2026-11-06T21:02:39.503559Z-2026-11-04T24:00:00Z", "pass", "not a real UTC calendar instant"],
+        ["2026-11-06T21:04:24.162190Z-2026-11-06T21:02:39.503559Z", "pass", "range end must not be before its start"],
+        ["2026-11-06T21:02:39.503559Z-2026-11-06T21:02:39.503558Z", "pass", "range end must not be before its start"],
+        ["2026-11-06T21:02:39.503559Z-2026-11-06T21:04:24.162190Z", "fail", "failing predicate"],
+      ] as const) {
+        const result = await evaluateObservation(observation, verdict);
+        expect(result.allowed, observation).toBe(false);
+        expect(result.tier, observation).toBe(null);
+        expect(result.reason, observation).toContain(expected);
+        expect(result.reason, observation).toContain(TIER2_RECORD_ONLY_FORM);
+      }
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses a malformed observation range before a later observed delimiter without backtracking", async () => {
+      const result = await evaluateObservation(
+        "2026-11-06T21:02:39.1234567Z-2026-11-06T21:04:24.162190Z observed 2026-11-06T21:05:00Z",
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("machine-checkable");
+      expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(mockResolveGitHubToken).not.toHaveBeenCalled();
+    });
+
+    it("keeps the merge-head grammar working on a record_only card that has a recorded merged work product (SUP-21258)", async () => {
+      setupTier2OriginMocks();
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        { ...repoBackedTierIssue(), deliveryRequirement: "record_only" as const },
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier2");
+    });
+
+    it("refuses the merge-head grammar on a repo-less record_only card while naming the form it can actually write", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        recordOnlyTierIssue(),
+        tier2Line(validTier2Evidence()),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      // The refusal stays actionable for a card with no repository: both the
+      // record-only form and the merge-head form are named.
+      expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+      expect(result.reason).toContain("probe `<probe command>` head <probe head sha> post-merge:");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses record-only evidence on a repository_delivery card and keeps the merge-head refusal", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(RECORD_ONLY_EVIDENCE),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("deliveryRequirement=record_only");
+      expect(result.reason).toContain("probe `<probe command>` head <probe head sha> post-merge:");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    // SUP-23490: the record-only `observed` instant must fall inside the
+    // CLOSING run's lifetime. SUP-22817 restated SUP-22444's close line
+    // byte-for-byte — a different run citing the first run's observation five
+    // minutes later — and the guard accepted it because nothing compared the
+    // cited instant against the run that was closing.
+    describe("observation must fall inside the closing run's lifetime (SUP-23490)", () => {
+      function seededRun(startedAt: string) {
+        return { id: "run-1", companyId: "company-1", startedAt: new Date(startedAt), createdAt: new Date("2026-11-04T08:00:00Z") };
+      }
+
+      function evidenceObservedAt(observation: string) {
+        return `record-only probe \`curl -fsS https://ops.example.com/api/sweep/healthz\` target https://ops.example.com observed ${observation} result: pass active recovery action null`;
+      }
+
+      it("refuses an observation predating the closing run's start, naming the run and its start", async () => {
+        setupDbMock({ heartbeatRuns: [seededRun("2026-11-08T07:15:00Z")] });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-08T07:12:36Z")),
+          "run-1",
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("predates the closing run");
+        expect(result.reason).toContain("run run-1, started 2026-11-08T07:15:00.000Z");
+        expect(result.reason).toContain("restated");
+        expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+        expect(ghFetchMock).not.toHaveBeenCalled();
+      });
+
+      it("negative control: the same probe text reused by a second run that started after the observation is refused", async () => {
+        // The SUP-22817 shape: run A observes 07:12:36 and closes; run B starts
+        // 07:14, copies run A's declaration, closes 07:18 — accepted before this
+        // gate, refused now.
+        setupDbMock({ heartbeatRuns: [seededRun("2026-11-08T07:14:00Z")] });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-08T07:12:36Z")),
+          "run-1",
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toContain("predates the closing run");
+      });
+
+      it("an agent close with no resolvable closing run refuses — dropping the run id must not skip the lifetime gate", async () => {
+        // The run id header is optional on agent requests, so an agent closer
+        // can reach the guard with no run id at all. An agent has no excuse:
+        // without a resolvable closing run the cited observation cannot be
+        // proven to be this run's, so the record-only close refuses. Human and
+        // system closers (no closingAgentId) keep the grammar-only behavior.
+        setupDbMock({ heartbeatRuns: [] });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-08T07:12:36Z")),
+          null,
+          () => Promise.resolve([]),
+          null,
+          "agent-1",
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("cannot be attributed to a closing run");
+        expect(result.reason).toContain("agent agent-1");
+        expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+        expect(ghFetchMock).not.toHaveBeenCalled();
+      });
+
+      it("a closer with no agent identity and no run keeps the grammar-only behavior and records a null closing run", async () => {
+        setupDbMock({ heartbeatRuns: [] });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-08T07:12:36Z")),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier2");
+        expect(result.tier2Audit).toMatchObject({
+          observed: "2026-11-08T07:12:36Z",
+          closingRunId: null,
+          closingRunStartedAt: null,
+        });
+      });
+
+      it("accepts an observation inside the run's lifetime and stamps the closing run into the audit", async () => {
+        setupDbMock({ heartbeatRuns: [seededRun("2026-11-08T07:10:00Z")] });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-08T07:12:36Z")),
+          "run-1",
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier2");
+        expect(result.tier2Audit).toMatchObject({
+          observed: "2026-11-08T07:12:36Z",
+          closingRunId: "run-1",
+          closingRunStartedAt: "2026-11-08T07:10:00.000Z",
+        });
+      });
+
+      it("falls back to createdAt when the closing run has no startedAt", async () => {
+        setupDbMock({
+          heartbeatRuns: [{ id: "run-1", companyId: "company-1", startedAt: null, createdAt: new Date("2026-11-08T07:10:00Z") }],
+        });
+        const accepted = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-08T07:12:36Z")),
+          "run-1",
+          () => Promise.resolve([]),
+        );
+        expect(accepted.allowed).toBe(true);
+        expect(accepted.tier2Audit).toMatchObject({ closingRunStartedAt: "2026-11-08T07:10:00.000Z" });
+        const refused = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-08T07:09:00Z")),
+          "run-1",
+          () => Promise.resolve([]),
+        );
+        expect(refused.allowed).toBe(false);
+        expect(refused.reason).toContain("predates the closing run");
+      });
+
+      it("refuses a closing run whose heartbeat row cannot be resolved (fail-closed)", async () => {
+        setupDbMock({});
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-08T07:12:36Z")),
+          "run-1",
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("no heartbeat run row");
+        expect(result.reason).toContain("run run-1");
+      });
+
+      it("refuses an observation postdating the evaluation beyond the clock-skew allowance", async () => {
+        setupDbMock({ heartbeatRuns: [seededRun("2026-11-04T08:00:00Z")] });
+        const future = new Date(Date.now() + 30 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt(future)),
+          "run-1",
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toContain("postdates this evaluation");
+        expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+      });
+
+      it("keeps doors without a run id on the grammar checks alone and records the absent closing run", async () => {
+        // No heartbeatRuns seeded, runId null (human close / system backstop):
+        // there is no lifetime to compare against, so the pre-existing grammar
+        // verdict stands and the audit's closingRunId is null.
+        setupDbMock({});
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(evidenceObservedAt("2026-11-04T09:15:00Z")),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier2");
+        expect(result.tier2Audit).toMatchObject({ closingRunId: null, closingRunStartedAt: null });
+      });
+
+      it("does not lifetime-gate the merge-head grammar but still stamps the closing run", async () => {
+        setupTier2OriginMocks();
+        mockRefHeadResolutions([
+          { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+          { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+        ]);
+        // The merge-head grammar names no `observed` instant — its origin
+        // predicate binds the evidence to the delivery merge head — so the
+        // closing-run lifetime gate must not fire on it; the closing run id is
+        // still recorded on the audit. The closing run row is deliberately NOT
+        // seeded: a live-form close never reads heartbeat_runs.
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          { ...repoBackedTierIssue(), deliveryRequirement: "record_only" as const },
+          tier2Line(validTier2Evidence()),
+          "run-1",
+          () => Promise.resolve([mockComment(tier2Line(validTier2Evidence()), "run-1")]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier2");
+        expect(result.tier2Audit).toMatchObject({ tierForm: "live", closingRunId: "run-1", closingRunStartedAt: null });
+      });
+    });
+
+    it("names the record-only form in the missing-declaration refusal on a record_only card", async () => {
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        recordOnlyTierIssue(),
+        "All done here.",
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("missing a done-tier declaration");
+      expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+    });
+
+    it("backstop close: a record_only card closes through the shared evaluator with a structured record-only doneTier", async () => {
+      const verdict = await evaluateDoneTransitionGuardForBackstopClose({
+        db: mockDb,
+        issue: { ...recordOnlyTierIssue(), projectId: null, projectWorkspaceId: null, executionWorkspaceId: null },
+        actorId: "execution-control-reconciliation",
+        closeComment: null,
+        structuredDoneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+      });
+      expect(verdict.allowed).toBe(true);
+      if (!verdict.allowed) return;
+      expect(verdict.closeComment).toContain("Closed at Tier 2 (live): record-only probe");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+      expect(logActivity).toHaveBeenCalledWith(
+        mockDb,
+        expect.objectContaining({
+          action: "issue.done_transition_tier2_close",
+          entityType: "issue",
+          entityId: "issue-1",
+          details: {
+            identifier: "SUP-12345",
+            reason: expect.stringContaining("Tier 2 declaration found:"),
+            systemBackstopActor: "execution-control-reconciliation",
+            probeEvidence: RECORD_ONLY_EVIDENCE,
+            probeCommand: "curl -fsS https://ops.example.com/api/sweep/healthz",
+            probeTarget: "https://ops.example.com",
+            observed: "2026-11-04T09:15:00Z",
+            observedRangeEnd: null,
+            tierForm: "record-only",
+            probeHead: null,
+            mergeCommit: null,
+            // SUP-23490: the backstop door carries no run id, so the machine
+            // record says so instead of inventing a closing run.
+            closingRunId: null,
+            closingRunStartedAt: null,
+          },
+        }),
+      );
+    });
+  });
+
   describe("Tier 1 via accompanying comment", () => {
+    describe("no-repository landing", () => {
+      const comment = "Closed at Tier 1 (landed, not liveness-probed): no-repository-landing — No repository artifact was produced. Liveness unverified.";
+
+      beforeEach(() => {
+        ghFetchMock.mockReset();
+        setupDbMock({ issueWorkProducts: [] });
+      });
+
+      // SUP-22570: the form is accepted only on a record_only issue closed by an
+      // identified actor through PATCH /api/issues/{id}; the probe-backed proof
+      // lives in done-transition-no-repository-landing-routes.test.ts.
+      it.each([
+        { name: "a repository_delivery issue", deliveryRequirement: "repository_delivery", reason: "only on a record_only issue", namesReclassification: true },
+        { name: "a record_only issue without an identified closing actor", deliveryRequirement: "record_only", reason: "identified closing actor", namesReclassification: false },
+      ])("refuses $name", async ({ deliveryRequirement, reason, namesReclassification }) => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          { ...tierIssue, deliveryRequirement: deliveryRequirement as "record_only" | "repository_delivery" },
+          comment,
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain(reason);
+        if (namesReclassification) {
+          expect(result.remedy).toContain('PATCH /api/issues/{id} { "deliveryRequirement": "record_only" }');
+          expect(result.remedy).toContain("authorized board user");
+        } else {
+          expect(result.remedy).toBeUndefined();
+        }
+        expect(ghFetchMock).not.toHaveBeenCalled();
+      });
+    });
+
     it("refuses a syntactically complete Tier 1 line that is only arbitrary prose", async () => {
       const result = await evaluateDoneTierDeclaration(
         mockDb,
@@ -5552,6 +6608,9 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(TIER1_FORM).toContain("landed-at-tip <sha>");
       expect(TIER1_FORM).toContain("landing-delegated PR #<N>");
       expect(TIER1_FORM).toContain("done-close-landing-backstop");
+      // SUP-22570: the no-repository form is appended per record_only issue by
+      // noRepositoryTier1FormSuffix, never baked into the shared literal.
+      expect(TIER1_FORM).not.toContain("no-repository-landing");
     });
 
     it("SUP-21328: each advertised Tier 1 prose form reaches the landing-token pre-check", async () => {
@@ -5572,7 +6631,7 @@ describe("evaluateDoneTierDeclaration", () => {
     it("SUP-21328: missing-tier remedy names structured doneTier with an exact JSON form per tier", async () => {
       expect(DONE_TIER_STRUCTURED_FORMS).toContain('"doneTier":');
       expect(DONE_TIER_TIER2_JSON).toBe(
-        '"doneTier": { "tier": "tier2", "probeEvidence": "<consumer-surface probe output>" }',
+        '"doneTier": { "tier": "tier2", "probeEvidence": "probe `<probe command>` head <probe head sha> post-merge: <post-merge predicate>" }',
       );
       expect(DONE_TIER_TIER1_LANDED_JSON).toBe(
         '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "landedAtTip", "mergeCommit": "<sha>" } }',
@@ -5583,6 +6642,20 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER2_JSON);
       expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_LANDED_JSON);
       expect(DONE_TIER_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_DELEGATED_JSON);
+      expect(DONE_TIER_STRUCTURED_FORMS).not.toContain("noRepositoryLanding");
+      // SUP-22801: the record-only classification of the structured forms —
+      // its Tier 2 entry carries the record-only grammar, never a merge head,
+      // and Tier 1 entries are carried over unchanged.
+      expect(DONE_TIER_TIER2_RECORD_ONLY_JSON).toBe(
+        '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>" }',
+      );
+      expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER2_RECORD_ONLY_JSON);
+      expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_LANDED_JSON);
+      expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_DELEGATED_JSON);
+      // The no-repository Tier 1 landing (SUP-22570) is appended per issue by
+      // noRepositoryStructuredFormSuffix, never baked into this shared set.
+      expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).not.toContain("noRepositoryLanding");
+      expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).not.toContain("post-merge");
 
       const result = await evaluateDoneTierDeclaration(
         mockDb,
@@ -5601,9 +6674,18 @@ describe("evaluateDoneTierDeclaration", () => {
       // AC1 says "on both doors". The remedy is built once but branches on
       // input.createDoor, so one interpolation per branch is the machine-checkable
       // shape of that promise: a future edit that names the structured field on
-      // only one door drops a count and fails here, not in production.
-      expect((route.match(/\$\{DONE_TIER_STRUCTURED_FORMS\}/g) ?? []).length).toBeGreaterThanOrEqual(2);
+      // only one door drops a count and fails here, not in production. SUP-22801:
+      // the interpolated value is the classification-aware `structuredForms`
+      // ternary, selected by the issue's deliveryRequirement.
+      expect((route.match(/\$\{structuredForms\}/g) ?? []).length).toBeGreaterThanOrEqual(2);
+      expect((route.match(/\$\{tier2CommentForm\}/g) ?? []).length).toBeGreaterThanOrEqual(2);
       expect((route.match(/\$\{TIER1_FORM\}/g) ?? []).length).toBeGreaterThanOrEqual(2);
+      // The classification lever itself must stay wired in the route: the
+      // record-only forms are selected by deliveryRequirement, and both
+      // record-only constants are named there.
+      expect(route).toContain('issue.deliveryRequirement === "record_only"');
+      expect(route).toContain("DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS");
+      expect(route).toContain("TIER2_RECORD_ONLY_FORM");
     });
 
     it("SUP-21474: routes remedy interpolates TIER1_FORM un-cut so both Tier 1 forms keep balanced quotes", () => {
@@ -5611,7 +6693,7 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(route).not.toContain("TIER1_FORM.slice(1, -1)");
       expect(route).toContain("` or ${TIER1_FORM}`");
 
-      const tier2Form = '"Closed at Tier 2 (live): <probe evidence>"';
+      const tier2Form = '"Closed at Tier 2 (live): probe `<probe command>` head <probe head sha> post-merge: <post-merge predicate>"';
       const remedy = `${tier2Form} or ${TIER1_FORM} — per SUP-12693.`;
       expect(remedy).toContain(
         '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."',
@@ -5743,8 +6825,37 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(compareUrl).toContain("fold%2Ftea-patches-v2026.722.0");
     });
 
-    it("accepts landed-at-tip when the named merge commit is an ancestor of the default branch", async () => {
+    it("SUP-23031: refuses landed-at-tip when the ancestor sha does not belong to this issue", async () => {
+      // The SUP-22365 shape: the named sha IS the repo tip (ahead_by 0), but
+      // no linked PR, delivery head, or work product ties it to this card —
+      // ancestry alone must not accept a stranger's already-landed commit.
       compareAhead(0);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain(MERGE_SHA);
+      expect(result.reason).toContain("does not belong to this issue");
+      expect(result.reason).toContain("linked merged PR merge commit");
+      const compareUrl = ghFetchMock.mock.calls.map(([url]) => String(url)).find((url) => url.includes("/compare/"));
+      expect(compareUrl).toContain(encodeURIComponent(MERGE_SHA));
+    });
+
+    it("SUP-23031: accepts landed-at-tip when the named sha equals a linked merged PR's recorded merge_commit_sha", async () => {
+      compareAhead(0);
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        {
+          ...linkedPr(4103, "closed"),
+          merged: true,
+          mergeCommitSha: MERGE_SHA,
+        },
+      ]);
       const result = await evaluateDoneTierDeclaration(
         mockDb,
         landedIssue(),
@@ -5754,9 +6865,382 @@ describe("evaluateDoneTierDeclaration", () => {
       );
       expect(result.allowed).toBe(true);
       expect(result.tier).toBe("tier1");
-      const compareUrl = ghFetchMock.mock.calls.map(([url]) => String(url)).find((url) => url.includes("/compare/"));
-      expect(compareUrl).toContain(encodeURIComponent(MERGE_SHA));
-      expect(compareUrl).toContain("fold%2Ftea-patches-v2026.722.0");
+      // The cached MERGED row corroborates on its own: no live /pulls probe.
+      const urls = ghFetchMock.mock.calls.map(([url]) => String(url));
+      expect(urls.some((u) => u.includes("/pulls/4103"))).toBe(false);
+    });
+
+    it("SUP-23031: accepts landed-at-tip on a short named sha that prefixes the linked merged PR's merge_commit_sha", async () => {
+      compareAhead(0);
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        {
+          ...linkedPr(4104, "closed"),
+          merged: true,
+          mergeCommitSha: MERGE_SHA,
+        },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA.slice(0, 12)}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("SUP-23031: hydrates a stale-open linked row and accepts when the live merge corroborates the named sha", async () => {
+      compareAhead(0);
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        {
+          ...linkedPr(4105, "open"),
+          merged: undefined,
+          mergeCommitSha: null,
+        },
+      ]);
+      ghFetchMock.mockImplementation(async (url: string) => {
+        if (String(url).includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        }
+        if (String(url).includes("/pulls/4105")) {
+          return new Response(
+            JSON.stringify({ state: "closed", merged: true, merge_commit_sha: MERGE_SHA, draft: false }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+      const urls = ghFetchMock.mock.calls.map(([url]) => String(url));
+      expect(urls.some((u) => u.includes("/pulls/4105"))).toBe(true);
+    });
+
+    it("SUP-23031: tries the next repo credential when a stale linked row cannot hydrate with the first", async () => {
+      compareAhead(0);
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        {
+          ...linkedPr(4106, "open"),
+          merged: undefined,
+          mergeCommitSha: null,
+        },
+      ]);
+      mockResolveGitHubTokenCandidatesForRepo.mockResolvedValue([
+        { token: "wrong-repo-token", scope: "company", secretName: "GITHUB_TOKEN" },
+        { token: "right-repo-token", scope: "company", secretName: "GITHUB_TOKEN" },
+      ]);
+      const authByCall: string[] = [];
+      ghFetchMock.mockImplementation(async (url: string, init) => {
+        if (String(url).includes("/compare/")) {
+          return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        }
+        if (String(url).includes("/pulls/4106")) {
+          const authorization = (init as { headers?: Record<string, string> } | undefined)?.headers?.authorization ?? "";
+          authByCall.push(authorization);
+          if (authorization === "Bearer wrong-repo-token") {
+            return new Response("{}", { status: 403 });
+          }
+          return new Response(
+            JSON.stringify({ state: "closed", merged: true, merge_commit_sha: MERGE_SHA, draft: false }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+      expect(authByCall).toEqual(["Bearer wrong-repo-token", "Bearer right-repo-token"]);
+    });
+
+    it("SUP-23031: refuses when the linked PR is recorded merged with a different merge commit and no work product corroborates", async () => {
+      compareAhead(0);
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        {
+          ...linkedPr(4106, "closed"),
+          merged: true,
+          mergeCommitSha: STRANGER_SHA,
+        },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("does not belong to this issue");
+      // A terminally recorded MERGED row with a different sha needs no live probe.
+      const urls = ghFetchMock.mock.calls.map(([url]) => String(url));
+      expect(urls.some((u) => u.includes("/pulls/4106"))).toBe(false);
+    });
+
+    it("SUP-23031: accepts landed-at-tip when the named sha equals the issue's recorded work-product merge commit", async () => {
+      compareAhead(0);
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueWorkProducts: [{ metadata: { mergeCommitSha: MERGE_SHA, mergedAt: "2026-11-04T00:00:00.000Z" } }],
+      });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("SUP-23031: accepts landed-at-tip when the named sha equals the issue's recorded delivery head", async () => {
+      compareAhead(0);
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueWorkProducts: [{ metadata: { headSha: MERGE_SHA, prNumber: 4107 } }],
+      });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("SUP-23031: refuses when a work product exists but records a different head and merge commit", async () => {
+      compareAhead(0);
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueWorkProducts: [{ metadata: { headSha: STRANGER_SHA, mergeCommitSha: STRANGER_SHA } }],
+      });
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("does not belong to this issue");
+    });
+
+    describe("SUP-22973 cross-repo landed-at-tip via linked merged PR", () => {
+      const CROSS_SHA = "cccccccccccccccccccccccccccccccccccccccc";
+      const OTHER_SHA = "dddddddddddddddddddddddddddddddddddddddd";
+      const AGENT_TOOLS = "TEA-Core/paperclip-agent-tools";
+
+      function crossLinkedPr(over: Record<string, unknown> = {}) {
+        return {
+          ...linkedPr(657, "closed"),
+          repo: "paperclip-agent-tools",
+          displayName: `${AGENT_TOOLS}#657`,
+          merged: true,
+          mergeCommitSha: CROSS_SHA,
+          ...over,
+        };
+      }
+
+      // The project-repo compare 404s (the landing lives in ANOTHER repository);
+      // the linked PR's own repository must answer the metadata + compare probes.
+      function crossRepoFetch(
+        opts: { aheadBy?: number; defaultBranch?: string | null; livePr?: Record<string, unknown> | null } = {},
+      ) {
+        ghFetchMock.mockImplementation(async (url: string) => {
+          const u = String(url);
+          if (u.includes("/repos/TEA-Core/paperclip/compare/")) {
+            return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+          }
+          if (u.includes(`/repos/${AGENT_TOOLS}/compare/`)) {
+            return new Response(JSON.stringify({ ahead_by: opts.aheadBy ?? 0 }), { status: 200 });
+          }
+          if (u === `https://api.github.com/repos/${AGENT_TOOLS}`) {
+            if (opts.defaultBranch === null) {
+              return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+            }
+            return new Response(
+              JSON.stringify({ default_branch: opts.defaultBranch ?? "main" }),
+              { status: 200 },
+            );
+          }
+          if (u === `https://api.github.com/repos/${AGENT_TOOLS}/pulls/657`) {
+            if (opts.livePr === null) {
+              return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+            }
+            return new Response(JSON.stringify(opts.livePr ?? {}), { status: 200 });
+          }
+          return new Response(JSON.stringify({}), { status: 404 });
+        });
+      }
+
+      it("accepts landed-at-tip for a cross-repo landing via the linked merged PR's own repository", async () => {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([crossLinkedPr()]);
+        crossRepoFetch();
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line(`landed-at-tip merge commit ${CROSS_SHA} via PR #657 (${AGENT_TOOLS}).`),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+        const urls = ghFetchMock.mock.calls.map(([url]) => String(url));
+        // The project repository was probed first and 404'd...
+        expect(urls.some((u) => u.includes("/repos/TEA-Core/paperclip/compare/"))).toBe(true);
+        // ...then ancestry was proven against the PR repository's default branch.
+        expect(urls).toContain(`https://api.github.com/repos/${AGENT_TOOLS}`);
+        expect(urls).toContain(`https://api.github.com/repos/${AGENT_TOOLS}/compare/main...${CROSS_SHA}`);
+        // The cached MERGED row corroborates on its own: no live /pulls probe.
+        expect(urls.some((u) => u === `https://api.github.com/repos/${AGENT_TOOLS}/pulls/657`)).toBe(false);
+      });
+
+      it("still refuses a project-repo 404 that names no linked PR", async () => {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([crossLinkedPr()]);
+        crossRepoFetch();
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line(`landed-at-tip merge commit ${CROSS_SHA}.`),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.skipped).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("could not be verified against the default branch");
+        expect(result.reason).toContain(CROSS_SHA);
+        expect(result.reason).toContain("must name the linked PR");
+      });
+
+      it("refuses when the named PR is not linked to the card", async () => {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([crossLinkedPr()]);
+        crossRepoFetch();
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line(`landed-at-tip merge commit ${CROSS_SHA} via PR #999 (${AGENT_TOOLS}).`),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("#999");
+        expect(result.reason).toContain("not a linked pull request");
+      });
+
+      it("refuses when the linked PR's recorded merge commit differs from the named sha", async () => {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+          crossLinkedPr({ mergeCommitSha: OTHER_SHA }),
+        ]);
+        crossRepoFetch({ livePr: null });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line(`landed-at-tip merge commit ${CROSS_SHA} via PR #657 (${AGENT_TOOLS}).`),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("does not corroborate");
+        expect(result.reason).toContain(OTHER_SHA);
+        expect(result.reason).toContain("merge_commit_sha");
+      });
+
+      it("refuses when the linked PR is not merged", async () => {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+          crossLinkedPr({ cachedState: "open", merged: false, mergeCommitSha: null }),
+        ]);
+        crossRepoFetch({ livePr: null });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line(`landed-at-tip merge commit ${CROSS_SHA} via PR #657 (${AGENT_TOOLS}).`),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("not recorded as merged");
+      });
+
+      it("refuses when the cross-repo compare shows the merge commit is not at tip", async () => {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([crossLinkedPr()]);
+        crossRepoFetch({ aheadBy: 1 });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line(`landed-at-tip merge commit ${CROSS_SHA} via PR #657 (${AGENT_TOOLS}).`),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("not an ancestor");
+        expect(result.reason).toContain(AGENT_TOOLS);
+        expect(result.reason).toContain("main");
+      });
+
+      it("refuses when the same PR number matches merged linked PRs in multiple repositories", async () => {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+          crossLinkedPr(),
+          crossLinkedPr({
+            repo: "paperclip-agent-tools-mirror",
+            displayName: "TEA-Core/paperclip-agent-tools-mirror#657",
+          }),
+        ]);
+        crossRepoFetch();
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line(`landed-at-tip merge commit ${CROSS_SHA} via PR #657 (${AGENT_TOOLS}).`),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toContain("multiple repositories");
+      });
+
+      it("accepts when the cached row is stale-open but live hydration corroborates the merge", async () => {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+          crossLinkedPr({ cachedState: "open", merged: undefined, mergeCommitSha: null }),
+        ]);
+        crossRepoFetch({
+          livePr: { state: "closed", merged: true, merge_commit_sha: CROSS_SHA, draft: false },
+        });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line(`landed-at-tip merge commit ${CROSS_SHA} via PR #657 (${AGENT_TOOLS}).`),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+        const urls = ghFetchMock.mock.calls.map(([url]) => String(url));
+        expect(urls).toContain(`https://api.github.com/repos/${AGENT_TOOLS}/pulls/657`);
+        expect(urls).toContain(`https://api.github.com/repos/${AGENT_TOOLS}/compare/main...${CROSS_SHA}`);
+      });
     });
 
     it("refuses landing-delegated without a linked PR", async () => {
@@ -6106,6 +7590,82 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(ghFetchMock).not.toHaveBeenCalled();
     });
 
+    it("accepts the named PR from this issue's own pull_request work product", async () => {
+      vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce(ownDeliveryBranch("SUP-12345-work"));
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueWorkProducts: [{
+          id: "work-product-1",
+          title: "Own PR",
+          status: "open",
+          metadata: { repository: "TEA-Core/paperclip", prNumber: 4161, headRef: "SUP-12345-work" },
+        }],
+      });
+      ghFetchMock.mockResolvedValue(new Response("provider unavailable", { status: 503 }));
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4161; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+    });
+
+    it("does not link a same-headRef pull request work product from another repository", async () => {
+      vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce(ownDeliveryBranch("SUP-12345-work"));
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueWorkProducts: [{
+          id: "work-product-1",
+          title: "Cross-repository PR",
+          status: "open",
+          metadata: { repository: "TEA-Core/other-repository", prNumber: 4161, headRef: "SUP-12345-work" },
+        }],
+      });
+      ghFetchMock.mockResolvedValue(new Response("provider unavailable", { status: 503 }));
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4161; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("not a linked pull request");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    it("does not link the same PR number from a foreign-headRef work product", async () => {
+      vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce(ownDeliveryBranch("SUP-12345-work"));
+      setupDbMock({
+        executionWorkspaces: [mockExecutionWorkspaceRow()],
+        issueWorkProducts: [{
+          id: "work-product-1",
+          title: "Foreign PR",
+          status: "open",
+          metadata: { repository: "TEA-Core/paperclip", prNumber: 4161, headRef: "SUP-99999-foreign" },
+        }],
+      });
+
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line("landing-delegated PR #4161; post-merge carrier done-close-landing-backstop."),
+        null,
+        () => Promise.resolve([]),
+      );
+
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain("not a linked pull request");
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
     async function declareDelegated(prNumber: number, cached: Record<string, unknown>) {
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([{ ...linkedPr(prNumber), ...cached }]);
       return evaluateDoneTierDeclaration(
@@ -6235,16 +7795,41 @@ describe("evaluateDoneTierDeclaration", () => {
   });
 
   describe("no accompanying comment — same-run comment lookup", () => {
-    it("allows transition when same-run comment has Tier 2 declaration", async () => {
+    it("allows transition when the same-run comment's Tier 2 declaration names the delivery merge head", async () => {
+      setupTier2OriginMocks();
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
       const result = await evaluateDoneTierDeclaration(
         mockDb,
-        tierIssue,
+        repoBackedTierIssue(),
         null,
         "run-1",
-        () => Promise.resolve([mockComment("Closed at Tier 2 (live): probe evidence here.", "run-1")]),
+        () => Promise.resolve([mockComment(tier2Line(validTier2Evidence()), "run-1")]),
       );
       expect(result.allowed).toBe(true);
       expect(result.tier).toBe("tier2");
+      expect(result.reason).toContain("Tier 2 declaration found in same-run comment:");
+    });
+
+    it("SUP-21902: refuses a same-run Tier 2 declaration whose named head differs from the delivery merge head", async () => {
+      setupTier2OriginMocks();
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_STRANGER_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        null,
+        "run-1",
+        () => Promise.resolve([mockComment(tier2Line(validTier2Evidence()), "run-1")]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("delivery merge head");
+      expect(result.reason).toContain(T2_MERGE_SHA);
     });
 
     it("refuses a same-run Tier 1 substitution that is only arbitrary prose", async () => {
@@ -6324,16 +7909,19 @@ describe("evaluateDoneTierDeclaration", () => {
   });
 
   describe("ordering with SUP-12686", () => {
-    it("Tier 2 declaration in accompanying comment is accepted without GitHub API calls", async () => {
+    it("SUP-21902: malformed Tier 2 evidence is refused before any GitHub API call", async () => {
+      setupTier2OriginMocks();
       const result = await evaluateDoneTierDeclaration(
         mockDb,
-        tierIssue,
+        repoBackedTierIssue(),
         "Closed at Tier 2 (live): probe confirms fix.",
         null,
         () => Promise.resolve([]),
       );
-      expect(result.allowed).toBe(true);
-      expect(result.tier).toBe("tier2");
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.reason).toContain("machine-checkable");
+      expect(ghFetchMock).not.toHaveBeenCalled();
     });
   });
 
@@ -6386,16 +7974,21 @@ describe("evaluateDoneTierDeclaration", () => {
     });
 
     it("accepts a Tier 2 declaration whose evidence follows one or more blank lines (resolves from the next non-empty line)", async () => {
+      setupTier2OriginMocks();
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
       const result = await evaluateDoneTierDeclaration(
         mockDb,
-        tierIssue,
-        "Closed at Tier 2 (live):\n\n\nProbe output: fix is live.",
+        repoBackedTierIssue(),
+        `Closed at Tier 2 (live):\n\n\n${validTier2Evidence()}`,
         null,
         () => Promise.resolve([]),
       );
       expect(result.allowed).toBe(true);
       expect(result.tier).toBe("tier2");
-      expect(result.reason).toContain("Probe output: fix is live.");
+      expect(result.reason).toContain(validTier2Evidence());
     });
 
     it("rejects a Tier 2 declaration followed only by blank lines, naming the missing evidence specifically", async () => {
@@ -6424,16 +8017,21 @@ describe("evaluateDoneTierDeclaration", () => {
       // an `indexOf` regression. The `lines.indexOf(line)` value-match on the
       // prefix is a provable no-op — see the scope/acceptance-correction block
       // below — so it is deliberately not labeled as such here.)
+      setupTier2OriginMocks();
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
       const result = await evaluateDoneTierDeclaration(
         mockDb,
-        tierIssue,
-        "Closed at Tier 2 (live):\n\nProbe: live at 2026-09-11\nProbe: live at 2026-09-11",
+        repoBackedTierIssue(),
+        `Closed at Tier 2 (live):\n\n${validTier2Evidence()}\n${validTier2Evidence()}`,
         null,
         () => Promise.resolve([]),
       );
       expect(result.allowed).toBe(true);
       expect(result.tier).toBe("tier2");
-      expect(result.reason).toContain("Probe: live at 2026-09-11");
+      expect(result.reason).toContain(validTier2Evidence().slice(0, 200));
     });
 
     // ───────────────────────────────────────────────────────────────────────
@@ -6503,23 +8101,23 @@ describe("evaluateDoneTierDeclaration", () => {
 describe("extractCitedCommitShas (SUP-20525)", () => {
   it("extracts each citation grammar (backtick, handle, commit URL, commit/sha word)", () => {
     const text = [
-      "Landed in `674fef15d2` on the fold.",
-      "Also TEA-Core/paperclip@afc6278bea3c and",
-      "https://github.com/TEA-Core/paperclip/commit/9f1d2e3c4b5a6f7 — plus",
-      "merge commit 0d1e2f3a4b5c6d7 and sha c0ffee123456.",
+      "Landed in `674fef15d2000000000000000000000000000000` on the fold.",
+      "Also TEA-Core/paperclip@afc6278bea3c0000000000000000000000000000 and",
+      "https://github.com/TEA-Core/paperclip/commit/9f1d2e3c4b5a6f70000000000000000000000000 — plus",
+      "merge commit 0d1e2f3a4b5c6d70000000000000000000000000 and sha c0ffee1234560000000000000000000000000000.",
     ].join("\n");
     expect(extractCitedCommitShas(text)).toEqual([
-      "674fef15d2",
-      "afc6278bea3c",
-      "9f1d2e3c4b5a6f7",
-      "0d1e2f3a4b5c6d7",
-      "c0ffee123456",
+      "674fef15d2000000000000000000000000000000",
+      "afc6278bea3c0000000000000000000000000000",
+      "9f1d2e3c4b5a6f70000000000000000000000000",
+      "0d1e2f3a4b5c6d70000000000000000000000000",
+      "c0ffee1234560000000000000000000000000000",
     ]);
   });
 
   it("does not extract non-citations: identifiers, PR numbers, and plain-English hex words", () => {
     expect(
-      extractCitedCommitShas("See `SUP-18110` and `PR #873`; the words deadbeef, cafe, and defaced are prose."),
+      extractCitedCommitShas("See `SUP-18110`, `PR #873`, and review comment `2266e31c`; the words deadbeef, cafe, and defaced are prose."),
     ).toEqual([]);
   });
 
@@ -6529,12 +8127,12 @@ describe("extractCitedCommitShas (SUP-20525)", () => {
 
   it("lowercases and dedupes across grammars", () => {
     expect(
-      extractCitedCommitShas("`674FEF15D2` and https://github.com/TEA-Core/paperclip/commit/674fef15d2"),
-    ).toEqual(["674fef15d2"]);
+      extractCitedCommitShas("`674FEF15D2000000000000000000000000000000` and https://github.com/TEA-Core/paperclip/commit/674fef15d2000000000000000000000000000000"),
+    ).toEqual(["674fef15d2000000000000000000000000000000"]);
   });
 
   it("caps extraction at ten SHAs", () => {
-    const many = Array.from({ length: 12 }, (_, i) => `\`${(0x1000000 + i).toString(16)}abcdef\``).join(" ");
+    const many = Array.from({ length: 12 }, (_, i) => `\`${(0x1000000 + i).toString(16)}${"a".repeat(33)}\``).join(" ");
     expect(extractCitedCommitShas(many)).toHaveLength(10);
   });
 
@@ -6549,88 +8147,318 @@ describe("resolveCitedCommits (SUP-20525)", () => {
   const CONTROL_REF = "fold/tea-patches-v2026.722.0";
   const CONTROL_URL = `https://api.github.com/repos/TEA-Core/paperclip/commits/${encodeURIComponent(CONTROL_REF)}`;
   const shaUrl = (sha: string) => `https://api.github.com/repos/TEA-Core/paperclip/commits/${sha}`;
+  const projectRepo = { hostname: "github.com", owner: "TEA-Core", repo: "paperclip" };
+  const unverifiableProject = (sha: string, reason: string) => ({
+    sha,
+    status: "unverifiable" as const,
+    reason,
+    probedRepos: [projectRepo],
+  });
+  const nonexistentProject = (sha: string) => ({
+    sha,
+    status: "nonexistent" as const,
+    probedRepos: [projectRepo],
+  });
 
   const okResponse = (body: unknown = { sha: "head" }) => new Response(JSON.stringify(body), { status: 200 });
   const noCommitFound422 = () =>
-    new Response(JSON.stringify({ message: "No commit found for sha afc6278bea3c" }), { status: 422 });
+    new Response(JSON.stringify({ message: "No commit found for sha afc6278bea3c0000000000000000000000000000" }), { status: 422 });
 
   function probeUrls(): string[] {
     return ghFetchMock.mock.calls.map(([url]) => String(url));
   }
 
+  function crossRepoLinkedPr(shas: { mergeCommitSha?: string | null; headSha?: string | null; baseRefName?: string | null }) {
+    return {
+      id: "pr-cross-repo",
+      owner: "Other-Org",
+      repo: "other-repo",
+      number: 42,
+      nodeId: null,
+      headRefName: "SUP-23243-cross-repo",
+      displayName: "Other-Org/other-repo#42",
+      title: null,
+      cachedState: "closed",
+      lastErrorCode: null,
+      reviewDecision: null,
+      ...shas,
+    };
+  }
+
   beforeEach(() => {
     ghFetchMock.mockReset();
+    mockResolveLinkedPullRequestsWithState.mockReset();
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
     mockResolveGitHubToken.mockReset();
     mockResolveGitHubToken.mockResolvedValue({ token: "test-token", scope: "company", secretName: "GITHUB_TOKEN" });
+    mockReadBuildCommit.mockReset();
+    mockReadBuildCommit.mockReturnValue(null);
+    mockExecFile.mockReset();
     setupDbMock({ executionWorkspaces: [mockExecutionWorkspaceRow()] });
   });
 
   it("marks a SHA resolved on a 200 and does not probe the control ref", async () => {
     ghFetchMock.mockImplementation(async (url: string) => {
-      expect(url).toBe(shaUrl("674fef15d2"));
+      expect(url).toBe(shaUrl("674fef15d2000000000000000000000000000000"));
       return okResponse();
     });
-    const resolution = await resolveCitedCommits(mockDb, issue, "Closed at Tier 2 (live): landed in `674fef15d2`.");
-    expect(resolution).toEqual({ results: [{ sha: "674fef15d2", status: "resolved" }] });
-    expect(probeUrls()).toEqual([shaUrl("674fef15d2")]);
+    const resolution = await resolveCitedCommits(mockDb, issue, "Closed at Tier 2 (live): landed in `674fef15d2000000000000000000000000000000`.");
+    expect(resolution).toEqual({ results: [{ sha: "674fef15d2000000000000000000000000000000", status: "resolved" }] });
+    expect(probeUrls()).toEqual([shaUrl("674fef15d2000000000000000000000000000000")]);
   });
 
-  it("marks a SHA nonexistent on GitHub's 422 No-commit-found, proven by a resolving control ref", async () => {
+  it("marks an explicitly repository-scoped SHA nonexistent on absence with a resolving control in that repository", async () => {
     ghFetchMock.mockImplementation(async (url: string) =>
       url === CONTROL_URL ? okResponse({ ref: CONTROL_REF }) : noCommitFound422(),
     );
-    const resolution = await resolveCitedCommits(mockDb, issue, "merge commit afc6278bea3c");
-    expect(resolution).toEqual({ results: [{ sha: "afc6278bea3c", status: "nonexistent" }] });
-    expect(probeUrls()).toEqual([shaUrl("afc6278bea3c"), CONTROL_URL]);
+    const resolution = await resolveCitedCommits(mockDb, issue, "merge commit TEA-Core/paperclip@afc6278bea3c0000000000000000000000000000");
+    expect(resolution).toEqual({
+      results: [{
+        sha: "afc6278bea3c0000000000000000000000000000",
+        status: "nonexistent",
+        probedRepos: [{ hostname: "github.com", owner: "TEA-Core", repo: "paperclip" }],
+      }],
+    });
+    expect(probeUrls()).toEqual([shaUrl("afc6278bea3c0000000000000000000000000000"), CONTROL_URL]);
+  });
+
+  it("leaves a bare SHA unverifiable when every candidate repository reports absence", async () => {
+    ghFetchMock.mockImplementation(async (url: string) =>
+      url === CONTROL_URL ? okResponse({ ref: CONTROL_REF }) : noCommitFound422(),
+    );
+    const resolution = await resolveCitedCommits(mockDb, issue, "merge commit afc6278bea3c0000000000000000000000000000");
+    expect(resolution).toEqual({
+      results: [{
+        sha: "afc6278bea3c0000000000000000000000000000",
+        status: "unverifiable",
+        reason: "ambiguous_repository_scope",
+        probedRepos: [{ hostname: "github.com", owner: "TEA-Core", repo: "paperclip" }],
+      }],
+    });
+    expect(probeUrls()).toEqual([shaUrl("afc6278bea3c0000000000000000000000000000")]);
+  });
+
+  it("resolves a cited merge SHA from a linked PR in another repository", async () => {
+    const mergeSha = "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19";
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([crossRepoLinkedPr({ mergeCommitSha: mergeSha })]);
+    ghFetchMock.mockImplementation(async (url: string) =>
+      url === CONTROL_URL ? okResponse({ ref: CONTROL_REF }) : noCommitFound422(),
+    );
+
+    const resolution = await resolveCitedCommits(mockDb, issue, `Landed in \`${mergeSha}\`.`);
+
+    expect(resolution).toEqual({ results: [{ sha: mergeSha, status: "resolved" }] });
+    expect(probeUrls()).toEqual([
+      shaUrl(mergeSha),
+      `https://api.github.com/repos/Other-Org/other-repo/commits/${mergeSha}`,
+    ]);
+  });
+
+  it("resolves a cited head SHA from a linked PR in another repository", async () => {
+    const headSha = "c0ffee1234560000000000000000000000000000";
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([crossRepoLinkedPr({ headSha })]);
+    ghFetchMock.mockImplementation(async (url: string) =>
+      url === CONTROL_URL ? okResponse({ ref: CONTROL_REF }) : noCommitFound422(),
+    );
+
+    const resolution = await resolveCitedCommits(mockDb, issue, `Head commit ${headSha}.`);
+
+    expect(resolution).toEqual({ results: [{ sha: headSha, status: "resolved" }] });
+    expect(probeUrls()).toEqual([
+      shaUrl(headSha),
+      `https://api.github.com/repos/Other-Org/other-repo/commits/${headSha}`,
+    ]);
+  });
+
+  it("probes a linked pull-request work-product repository after the project repository reports absence", async () => {
+    const mergeSha = "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19";
+    const otherRepoUrl = `https://api.github.com/repos/Other-Org/other-repo/commits/${mergeSha}`;
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([crossRepoLinkedPr({ baseRefName: "main" })]);
+    ghFetchMock.mockImplementation(async (url: string) =>
+      url === otherRepoUrl ? okResponse({ sha: mergeSha }) : noCommitFound422(),
+    );
+
+    const resolution = await resolveCitedCommits(mockDb, issue, `Landed in \`${mergeSha}\`.`);
+
+    expect(resolution).toEqual({ results: [{ sha: mergeSha, status: "resolved" }] });
+    expect(probeUrls()).toEqual([shaUrl(mergeSha), otherRepoUrl]);
+  });
+
+  it("probes the repository named by an explicit commit URL", async () => {
+    const citedSha = "674fef15d2000000000000000000000000000000";
+    const otherRepoUrl = `https://api.github.com/repos/Other-Org/other-repo/commits/${citedSha}`;
+    ghFetchMock.mockImplementation(async (url: string) =>
+      url === otherRepoUrl ? okResponse({ sha: citedSha }) : noCommitFound422(),
+    );
+
+    const resolution = await resolveCitedCommits(
+      mockDb,
+      issue,
+      `Landed in https://github.com/Other-Org/other-repo/commit/${citedSha}.`,
+    );
+
+    expect(resolution).toEqual({ results: [{ sha: citedSha, status: "resolved" }] });
+    expect(probeUrls()).toEqual([otherRepoUrl]);
+  });
+
+  it("requires a resolving positive control in every explicitly scoped candidate repository", async () => {
+    const missingSha = "afc6278bea3c0000000000000000000000000000";
+    const otherShaUrl = `https://api.github.com/repos/Other-Org/other-repo/commits/${missingSha}`;
+    const otherControlUrl = "https://api.github.com/repos/Other-Org/other-repo/commits/main";
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([crossRepoLinkedPr({ baseRefName: "main" })]);
+    ghFetchMock.mockImplementation(async (url: string) =>
+      url === CONTROL_URL || url === otherControlUrl ? okResponse() : noCommitFound422(),
+    );
+
+    const resolution = await resolveCitedCommits(
+      mockDb,
+      issue,
+      `Other-Org/other-repo@${missingSha}`,
+    );
+
+    expect(resolution).toEqual({
+      results: [{
+        sha: missingSha,
+        status: "nonexistent",
+        probedRepos: [
+          { hostname: "github.com", owner: "Other-Org", repo: "other-repo" },
+          projectRepo,
+        ],
+      }],
+    });
+    expect(probeUrls()).toEqual([otherShaUrl, shaUrl(missingSha), otherControlUrl, CONTROL_URL]);
+  });
+
+  it("probes the served build repository for a cited commit from that repository", async () => {
+    const citedSha = "674fef15d2000000000000000000000000000000";
+    const buildSha = "0ea666699d3f0a7ef86f98cb21a574e95be61d22";
+    const servedRepoUrl = `https://api.github.com/repos/Served-Org/control-plane/commits/${citedSha}`;
+    mockReadBuildCommit.mockReturnValue(buildSha);
+    vi.stubEnv("PAPERCLIP_BUILD_REPO_URL", "https://github.com/Served-Org/control-plane");
+    try {
+      ghFetchMock.mockImplementation(async (url: string) =>
+        url === servedRepoUrl ? okResponse({ sha: citedSha }) : noCommitFound422(),
+      );
+
+      const resolution = await resolveCitedCommits(mockDb, issue, `Control plane fix at \`${citedSha}\`.`);
+
+      expect(resolution).toEqual({ results: [{ sha: citedSha, status: "resolved" }] });
+      expect(probeUrls()).toEqual([shaUrl(citedSha), servedRepoUrl]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("does not fall back to upstream paperclip when the served repository is unavailable", async () => {
+    const citedSha = "674fef15d2000000000000000000000000000000";
+    const upstreamUrl = `https://api.github.com/repos/paperclipai/paperclip/commits/${citedSha}`;
+    mockReadBuildCommit.mockReturnValue("0ea666699d3f0a7ef86f98cb21a574e95be61d22");
+    vi.stubEnv("PAPERCLIP_BUILD_REPO_URL", "");
+    mockGitProbeUnavailable();
+    ghFetchMock.mockImplementation(async (url: string) =>
+      url === upstreamUrl ? okResponse({ sha: citedSha }) : noCommitFound422(),
+    );
+
+    try {
+      const resolution = await resolveCitedCommits(mockDb, issue, `Control plane fix at \`${citedSha}\`.`);
+
+      expect(resolution).toEqual({
+        results: [unverifiableProject(citedSha, "ambiguous_repository_scope")],
+      });
+      expect(probeUrls()).toEqual([shaUrl(citedSha)]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("does not classify a SHA nonexistent when linked PR lookup fails", async () => {
+    const missingSha = "afc6278bea3c0000000000000000000000000000";
+    mockResolveLinkedPullRequestsWithState.mockRejectedValue(new Error("database unavailable"));
+    ghFetchMock.mockImplementation(async (url: string) =>
+      url === CONTROL_URL ? okResponse({ ref: CONTROL_REF }) : noCommitFound422(),
+    );
+
+    const resolution = await resolveCitedCommits(mockDb, issue, `Commit ${missingSha}.`);
+
+    expect(resolution).toEqual({
+      results: [unverifiableProject(missingSha, "linked_pull_request_lookup_failed")],
+    });
+    expect(probeUrls()).toEqual([shaUrl(missingSha)]);
   });
 
   it("also treats a 404 as absence (with control) and probes the control once across SHAs", async () => {
     ghFetchMock.mockImplementation(async (url: string) =>
       url === CONTROL_URL ? okResponse({ ref: CONTROL_REF }) : new Response("Not Found", { status: 404 }),
     );
-    const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c` and `0d1e2f3a4b5c6d7`");
+    const resolution = await resolveCitedCommits(
+      mockDb,
+      issue,
+      "TEA-Core/paperclip@afc6278bea3c0000000000000000000000000000 and TEA-Core/paperclip@0d1e2f3a4b5c6d70000000000000000000000000",
+    );
     expect(resolution.results).toEqual([
-      { sha: "afc6278bea3c", status: "nonexistent" },
-      { sha: "0d1e2f3a4b5c6d7", status: "nonexistent" },
+      nonexistentProject("afc6278bea3c0000000000000000000000000000"),
+      nonexistentProject("0d1e2f3a4b5c6d70000000000000000000000000"),
     ]);
     expect(probeUrls().filter((url) => url === CONTROL_URL)).toHaveLength(1);
   });
 
   it("downgrades absence to unverifiable when the control ref does not resolve", async () => {
     ghFetchMock.mockResolvedValue(new Response("Not Found", { status: 404 }));
-    const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c`");
-    expect(resolution).toEqual({ results: [{ sha: "afc6278bea3c", status: "unverifiable" }] });
+    const resolution = await resolveCitedCommits(
+      mockDb,
+      issue,
+      "TEA-Core/paperclip@afc6278bea3c0000000000000000000000000000",
+    );
+    expect(resolution).toEqual({
+      results: [unverifiableProject("afc6278bea3c0000000000000000000000000000", "positive_control_unavailable")],
+    });
   });
 
   it("treats a 422 with a different message as unverifiable, not absence (no control probe)", async () => {
     ghFetchMock.mockResolvedValue(new Response(JSON.stringify({ message: "Validation Failed" }), { status: 422 }));
-    const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c`");
-    expect(resolution).toEqual({ results: [{ sha: "afc6278bea3c", status: "unverifiable" }] });
-    expect(probeUrls()).toEqual([shaUrl("afc6278bea3c")]);
+    const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c0000000000000000000000000000`");
+    expect(resolution).toEqual({
+      results: [unverifiableProject("afc6278bea3c0000000000000000000000000000", "commit_probe_error")],
+    });
+    expect(probeUrls()).toEqual([shaUrl("afc6278bea3c0000000000000000000000000000")]);
   });
 
   it("fails open (unverifiable) on 401, 403, and 5xx probe outcomes", async () => {
     for (const status of [401, 403, 500]) {
       ghFetchMock.mockResolvedValue(new Response("no", { status }));
-      const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c`");
-      expect(resolution).toEqual({ results: [{ sha: "afc6278bea3c", status: "unverifiable" }] });
+      const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c0000000000000000000000000000`");
+      expect(resolution).toEqual({
+        results: [unverifiableProject("afc6278bea3c0000000000000000000000000000", "commit_probe_error")],
+      });
       ghFetchMock.mockReset();
     }
   });
 
   it("fails open when ghFetch throws (network failure)", async () => {
     ghFetchMock.mockRejectedValue(new Error("network down"));
-    const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c`");
-    expect(resolution).toEqual({ results: [{ sha: "afc6278bea3c", status: "unverifiable" }] });
+    const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c0000000000000000000000000000`");
+    expect(resolution).toEqual({
+      results: [unverifiableProject("afc6278bea3c0000000000000000000000000000", "commit_probe_error")],
+    });
   });
 
   it("marks every SHA unverifiable without probing when no GitHub credential resolves", async () => {
     mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
-    const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c` and `0d1e2f3a4b5c6d7`");
+    const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c0000000000000000000000000000` and `0d1e2f3a4b5c6d70000000000000000000000000`");
     expect(resolution).toEqual({
       results: [
-        { sha: "afc6278bea3c", status: "unverifiable" },
-        { sha: "0d1e2f3a4b5c6d7", status: "unverifiable" },
+        {
+          sha: "afc6278bea3c0000000000000000000000000000",
+          status: "unverifiable",
+          reason: "github_credential_unavailable",
+          probedRepos: [],
+        },
+        {
+          sha: "0d1e2f3a4b5c6d70000000000000000000000000",
+          status: "unverifiable",
+          reason: "github_credential_unavailable",
+          probedRepos: [],
+        },
       ],
     });
     expect(ghFetchMock).not.toHaveBeenCalled();
@@ -6638,8 +8466,15 @@ describe("resolveCitedCommits (SUP-20525)", () => {
 
   it("marks every SHA unverifiable when the issue resolves no delivery repository", async () => {
     setupDbMock({});
-    const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c`");
-    expect(resolution).toEqual({ results: [{ sha: "afc6278bea3c", status: "unverifiable" }] });
+    const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c0000000000000000000000000000`");
+    expect(resolution).toEqual({
+      results: [{
+        sha: "afc6278bea3c0000000000000000000000000000",
+        status: "unverifiable",
+        reason: "repository_scope_unavailable",
+        probedRepos: [],
+      }],
+    });
     expect(ghFetchMock).not.toHaveBeenCalled();
   });
 
@@ -6652,25 +8487,32 @@ describe("resolveCitedCommits (SUP-20525)", () => {
       urls.push(url);
       return new Response("Not Found", { status: 404 });
     });
-    const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c`");
-    expect(urls[0]).toBe("https://git.example.com/api/v3/repos/acme/widget/commits/afc6278bea3c");
-    expect(resolution).toEqual({ results: [{ sha: "afc6278bea3c", status: "unverifiable" }] });
+    const resolution = await resolveCitedCommits(mockDb, issue, "`afc6278bea3c0000000000000000000000000000`");
+    expect(urls[0]).toBe("https://git.example.com/api/v3/repos/acme/widget/commits/afc6278bea3c0000000000000000000000000000");
+    expect(resolution).toEqual({
+      results: [{
+        sha: "afc6278bea3c0000000000000000000000000000",
+        status: "unverifiable",
+        reason: "ambiguous_repository_scope",
+        probedRepos: [{ hostname: "git.example.com", owner: "acme", repo: "widget" }],
+      }],
+    });
   });
 
   it("reports a mixed comment truthfully (resolved alongside nonexistent)", async () => {
     ghFetchMock.mockImplementation(async (url: string) => {
       if (url === CONTROL_URL) return okResponse({ ref: CONTROL_REF });
-      if (url === shaUrl("674fef15d2")) return okResponse();
+      if (url === shaUrl("674fef15d2000000000000000000000000000000")) return okResponse();
       return noCommitFound422();
     });
     const resolution = await resolveCitedCommits(
       mockDb,
       issue,
-      "Landed in `674fef15d2`; fix commit afc6278bea3c followed.",
+      "Landed in `674fef15d2000000000000000000000000000000`; fix commit TEA-Core/paperclip@afc6278bea3c0000000000000000000000000000 followed.",
     );
     expect(resolution.results).toEqual([
-      { sha: "674fef15d2", status: "resolved" },
-      { sha: "afc6278bea3c", status: "nonexistent" },
+      { sha: "674fef15d2000000000000000000000000000000", status: "resolved" },
+      nonexistentProject("afc6278bea3c0000000000000000000000000000"),
     ]);
   });
 

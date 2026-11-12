@@ -19,7 +19,10 @@ import {
   issueInboxArchives,
   issueRecoveryActions,
   issueRelations,
+  executionWorkspaces,
+  issueWorkProducts,
   issues,
+  projects,
   unWakeableArchives,
 } from "@paperclipai/db";
 import {
@@ -35,6 +38,39 @@ import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
+
+// SUP-21902: the done-transition guard resolves a company GitHub token and
+// the declared Tier 2 probe head through the commits API. These mocks are
+// gated on `tier2GuardMock.enabled`, which only the Tier 2 recovery-close
+// test turns on, so every other test in this file keeps the real GitHub
+// behavior; when enabled the fixture remote serves the recorded merge
+// commit for any commit ref.
+const tier2GuardMock = vi.hoisted(() => ({ enabled: false }));
+vi.mock("../services/github-fetch.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/github-fetch.js")>();
+  return {
+    ...actual,
+    ghFetch: (url: string, init?: RequestInit) =>
+      tier2GuardMock.enabled && typeof url === "string" && /\/commits\//.test(url)
+        ? Promise.resolve({ ok: true, status: 200, json: async () => ({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }) } as unknown as Response)
+        : actual.ghFetch(url, init),
+  };
+});
+// Gate on the same flag via the secrets service (the credential module stays
+// real): only the Tier 2 recovery-close test resolves a GitHub token.
+vi.mock("../services/secrets.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/secrets.js")>();
+  return {
+    ...actual,
+    secretService: (...args: Parameters<typeof actual.secretService>) =>
+      tier2GuardMock.enabled
+        ? {
+            getByName: async () => ({ id: "secret-1", name: "GITHUB_TOKEN" }),
+            resolveSecretValue: async () => "test-token",
+          }
+        : actual.secretService(...args),
+  };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -164,7 +200,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(environments);
     await db.delete(issueInboxArchives);
     await db.delete(unWakeableArchives);
+    await db.delete(issueWorkProducts);
     await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projects);
     await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(companies);
@@ -203,7 +242,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         id: coderId,
         companyId,
         name: "Coder",
-        role: "engineer",
+        role: "engineer", capabilities: "Implement and verify repository changes.",
         status: "idle",
         reportsTo: managerId,
         adapterType: "codex_local",
@@ -4321,7 +4360,66 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       },
     );
     await seedHeartbeatRun({ companyId, agentId: managerId, runId, issueId: sourceIssueId });
+    // SUP-21902: synthetic repo binding + recorded delivery merge commit so
+    // the recovery door's Tier 2 close can verify its probe head against this
+    // delivery's recorded merge commit (no live branch-tip fallback).
+    const tier2ProjectId = randomUUID();
+    const tier2WorkspaceId = randomUUID();
+    const tier2Now = new Date();
+    await db.insert(projects).values({
+      id: tier2ProjectId,
+      companyId,
+      name: "Tier 2 Fixture Project",
+      status: "active",
+      createdAt: tier2Now,
+      updatedAt: tier2Now,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: tier2WorkspaceId,
+      companyId,
+      projectId: tier2ProjectId,
+      projectWorkspaceId: null,
+      sourceIssueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "tier2-fixture-ws",
+      status: "active",
+      cwd: "/tmp/test",
+      repoUrl: "https://github.com/TEA-Core/paperclip",
+      baseRef: "fold/tea-patches-v2026.722.0",
+      branchName: "tier2-fixture-ws",
+      providerType: "git_worktree",
+      providerRef: "/tmp/test",
+      lastUsedAt: tier2Now,
+      openedAt: tier2Now,
+      createdAt: tier2Now,
+      updatedAt: tier2Now,
+    });
+    await db.insert(issueWorkProducts).values({
+      companyId,
+      issueId: sourceIssueId,
+      type: "pull_request",
+      provider: "github",
+      externalId: "TEA-Core/paperclip#404",
+      title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404",
+      status: "merged",
+      reviewState: "none",
+      isPrimary: true,
+      healthStatus: "unknown",
+      metadata: {
+        prNumber: 404,
+        repository: "TEA-Core/paperclip",
+        mergedAt: "2026-08-29T00:11:06Z",
+        mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19",
+      },
+    });
+    await db
+      .update(issues)
+      .set({ projectId: tier2ProjectId, executionWorkspaceId: tier2WorkspaceId })
+      .where(eq(issues.id, sourceIssueId));
 
+    tier2GuardMock.enabled = true;
     const resolved = await request(app)
       .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
       .send({
@@ -4331,16 +4429,17 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         // SUP-21910: an agent landing a card on `done` through the recovery
         // door must carry a done-tier declaration, exactly like PATCH.
         resolutionNote:
-          "Owner confirmed the source issue is complete.\nClosed at Tier 2 (live): probed the delivered branch head; tests and lint pass on it.",
+          "Owner confirmed the source issue is complete.\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probed the delivered branch head; tests and lint pass on it.",
       })
       .expect(200);
+    tier2GuardMock.enabled = false;
 
     expect(resolved.body.recoveryAction).toMatchObject({
       id: action.id,
       status: "resolved",
       outcome: "owner_completed",
       resolutionNote:
-        "Owner confirmed the source issue is complete.\nClosed at Tier 2 (live): probed the delivered branch head; tests and lint pass on it.",
+        "Owner confirmed the source issue is complete.\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probed the delivered branch head; tests and lint pass on it.",
     });
 
     const dependencyWakes = wakeCalls.filter(
@@ -4834,6 +4933,193 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       outcome: null,
       resolvedAt: null,
     });
+  });
+
+  it("lets the exact active recovery owner resolve without a source issue grant", async () => {
+    const { companyId, managerId, coderId, sourceIssueId, prefix } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: coderId, assigneeUserId: null })
+      .where(eq(issues.id, sourceIssueId));
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:owner-without-source-grant",
+      evidence: { latestIssueStatus: "blocked" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "manual" },
+    });
+    const recoveryIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: recoveryIssueId,
+      companyId,
+      title: "Recovery owner task",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: managerId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+    });
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: managerId, runId, issueId: recoveryIssueId });
+    const app = createApp({
+      type: "agent",
+      agentId: managerId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "todo",
+        resolutionNote: "Recovery owner restored a live execution path.",
+      })
+      .expect(200);
+
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "todo",
+      activeRecoveryAction: null,
+    });
+    expect(resolved.body.recoveryAction).toMatchObject({
+      id: action.id,
+      status: "resolved",
+      outcome: "restored",
+    });
+  });
+
+  it("admits the declared unblock owner without waiving source mutation authority", async () => {
+    const { companyId, managerId, coderId, sourceIssueId, prefix } = await seedCompany();
+    await db
+      .update(issues)
+      .set({
+        status: "blocked",
+        assigneeAgentId: managerId,
+        assigneeUserId: null,
+        unblockDescriptor: {
+          owner: { agentId: coderId },
+          action: "Unblock to resume work",
+        },
+      })
+      .where(eq(issues.id, sourceIssueId));
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:unblock-owner-without-source-grant",
+      evidence: { latestIssueStatus: "blocked" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "manual" },
+    });
+    const recoveryIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: recoveryIssueId,
+      companyId,
+      title: "Declared unblock owner recovery task",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: coderId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+    });
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: recoveryIssueId });
+    const app = createApp({
+      type: "agent",
+      agentId: coderId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+
+    const rejected = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "todo",
+        resolutionNote: "Declared unblock owner attempted a source mutation.",
+      })
+      .expect(403);
+
+    expect(rejected.body.details.code).toBe("recovery_source_authority_required");
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue?.status).toBe("blocked");
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow?.status).toBe("active");
+  });
+
+  it("rejects a non-owner without a source issue grant", async () => {
+    const { companyId, managerId, coderId, sourceIssueId, prefix } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: managerId, assigneeUserId: null })
+      .where(eq(issues.id, sourceIssueId));
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:non-owner-without-source-grant",
+      evidence: { latestIssueStatus: "blocked" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "manual" },
+    });
+    const recoveryIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: recoveryIssueId,
+      companyId,
+      title: "Non-owner recovery task",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: coderId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+    });
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: recoveryIssueId });
+    const app = createApp({
+      type: "agent",
+      agentId: coderId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+
+    const rejected = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "todo",
+        resolutionNote: "Non-owner should not clear this recovery.",
+      })
+      .expect(403);
+
+    expect(rejected.body.details.code).toBe("issue_write_no_grant");
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue?.status).toBe("blocked");
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow?.status).toBe("active");
   });
 
   it("rejects peer-agent recovery action resolution on a board-owned source issue", async () => {

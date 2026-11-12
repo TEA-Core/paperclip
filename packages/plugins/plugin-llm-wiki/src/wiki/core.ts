@@ -1707,7 +1707,7 @@ async function filterReadableRows<T>(
   return checks.filter((row): row is T => row != null);
 }
 
-async function listLocalFiles(ctx: PluginContext, input: { companyId: string; space: Pick<WikiSpace, "pathPrefix">; relativePath: "wiki" | "raw" }): Promise<PluginLocalFolderEntry[]> {
+async function listLocalFiles(ctx: PluginContext, input: { companyId: string; space: Pick<WikiSpace, "pathPrefix">; relativePath: "wiki" | "raw" }): Promise<{ entries: PluginLocalFolderEntry[]; truncated: boolean }> {
   try {
     const relativePath = spaceRelativePath(input.space, input.relativePath);
     const listing = await ctx.localFolders.list(input.companyId, WIKI_ROOT_FOLDER_KEY, {
@@ -1715,11 +1715,16 @@ async function listLocalFiles(ctx: PluginContext, input: { companyId: string; sp
       recursive: true,
       maxEntries: LOCAL_BROWSE_FILE_LIMIT,
     });
-    return listing.entries
-      .filter((entry) => entry.kind === "file")
-      .map((entry) => ({ ...entry, path: logicalPathFromSpacePath(input.space, entry.path) }));
-  } catch {
-    return [];
+    return {
+      entries: listing.entries
+        .filter((entry) => entry.kind === "file")
+        .map((entry) => ({ ...entry, path: logicalPathFromSpacePath(input.space, entry.path) })),
+      truncated: listing.truncated,
+    };
+  } catch (error) {
+    const code = typeof error === "object" && error && "code" in error ? String((error as { code?: unknown }).code) : "";
+    if (code !== "ENOENT") throw error;
+    return { entries: [], truncated: false };
   }
 }
 
@@ -1759,6 +1764,125 @@ function mergeLocalSourceRows(sources: WikiSourceRow[], entries: PluginLocalFold
 function assertExpectedHash(expectedHash: string | null | undefined, currentHash: string | null, path: string): void {
   if (expectedHash && currentHash && expectedHash !== currentHash) {
     throw new Error(`Refusing to overwrite ${path}: expected hash ${expectedHash} but current hash is ${currentHash}`);
+  }
+}
+
+const WIKI_REDACTION_PLACEHOLDER = "***REDACTED***";
+
+function countRedactionPlaceholders(contents: string): number {
+  let count = 0;
+  let index = contents.indexOf(WIKI_REDACTION_PLACEHOLDER);
+  while (index !== -1) {
+    count += 1;
+    index = contents.indexOf(WIKI_REDACTION_PLACEHOLDER, index + WIKI_REDACTION_PLACEHOLDER.length);
+  }
+  return count;
+}
+
+function countRedactionPlaceholdersInLine(line: string): number {
+  return line.includes(WIKI_REDACTION_PLACEHOLDER) ? countRedactionPlaceholders(line) : 0;
+}
+
+function firstLineWithRedactionPlaceholder(lines: string[]): number {
+  for (let index = 0; index < lines.length; index += 1) {
+    if (lines[index].includes(WIKI_REDACTION_PLACEHOLDER)) return index + 1;
+  }
+  return 0;
+}
+
+function refusePlaceholderWriteMessage(path: string, incomingCount: number, currentCount: number, lineNumber: number): string {
+  const location = lineNumber > 0 ? ` near line ${lineNumber}` : "";
+  return (
+    `Refusing to overwrite ${path}: contents carries redaction placeholder(s) absent from the current page ` +
+    `(${incomingCount} vs ${currentCount} on disk, unmatched position${location}); ` +
+    `re-read from disk bytes, do not write back projected content`
+  );
+}
+
+function alignIncomingLinesToDiskLines(diskLines: string[], incomingLines: string[]): number[] {
+  const matchForIncoming = new Array<number>(incomingLines.length).fill(-1);
+  const n = diskLines.length;
+  const m = incomingLines.length;
+  if (n === 0 || m === 0) return matchForIncoming;
+
+  let prefix = 0;
+  while (prefix < n && prefix < m && diskLines[prefix] === incomingLines[prefix]) {
+    matchForIncoming[prefix] = prefix;
+    prefix += 1;
+  }
+  let suffix = 0;
+  while (suffix < n - prefix && suffix < m - prefix && diskLines[n - 1 - suffix] === incomingLines[m - 1 - suffix]) {
+    matchForIncoming[m - 1 - suffix] = n - 1 - suffix;
+    suffix += 1;
+  }
+
+  const midN = n - prefix - suffix;
+  const midM = m - prefix - suffix;
+  if (midN <= 0 || midM <= 0 || midN * midM > 4_000_000) return matchForIncoming;
+
+  const table: Int32Array[] = Array.from({ length: midN + 1 }, () => new Int32Array(midM + 1));
+  for (let a = midN - 1; a >= 0; a -= 1) {
+    const row = table[a];
+    const below = table[a + 1];
+    const diskLine = diskLines[prefix + a];
+    for (let b = midM - 1; b >= 0; b -= 1) {
+      row[b] = diskLine === incomingLines[prefix + b] ? below[b + 1] + 1 : Math.max(below[b], row[b + 1]);
+    }
+  }
+  let a = 0;
+  let b = 0;
+  while (a < midN && b < midM) {
+    if (diskLines[prefix + a] === incomingLines[prefix + b]) {
+      matchForIncoming[prefix + b] = prefix + a;
+      a += 1;
+      b += 1;
+    } else if (table[a + 1][b] >= table[a][b + 1]) {
+      a += 1;
+    } else {
+      b += 1;
+    }
+  }
+  return matchForIncoming;
+}
+
+function assertNoNewRedactionPlaceholders(incomingContents: string, currentContents: string | null, path: string): void {
+  const incomingLines = incomingContents.split("\n");
+  let incomingCount = 0;
+  for (const line of incomingLines) incomingCount += countRedactionPlaceholdersInLine(line);
+  if (incomingCount === 0) return;
+
+  const diskLines = currentContents == null ? [] : currentContents.split("\n");
+  let currentCount = 0;
+  for (const line of diskLines) currentCount += countRedactionPlaceholdersInLine(line);
+  if (currentCount === 0) {
+    throw new Error(refusePlaceholderWriteMessage(path, incomingCount, 0, firstLineWithRedactionPlaceholder(incomingLines)));
+  }
+
+  const matchForIncoming = alignIncomingLinesToDiskLines(diskLines, incomingLines);
+  const m = incomingLines.length;
+  const n = diskLines.length;
+  let i = 0;
+  let diskPos = 0;
+  while (i < m) {
+    if (matchForIncoming[i] >= 0) {
+      diskPos = matchForIncoming[i] + 1;
+      i += 1;
+      continue;
+    }
+    let regionEnd = i;
+    while (regionEnd < m && matchForIncoming[regionEnd] === -1) regionEnd += 1;
+    const nextAnchorDisk = regionEnd < m ? matchForIncoming[regionEnd] : n;
+    const regionDiskLineCount = nextAnchorDisk - diskPos;
+    for (let r = 0; r < regionEnd - i; r += 1) {
+      const incomingLinePlaceholders = countRedactionPlaceholdersInLine(incomingLines[i + r]);
+      if (incomingLinePlaceholders === 0) continue;
+      const diskLinePlaceholders = r < regionDiskLineCount ? countRedactionPlaceholdersInLine(diskLines[diskPos + r]) : 0;
+      if (incomingLinePlaceholders > diskLinePlaceholders) {
+        throw new Error(refusePlaceholderWriteMessage(path, incomingCount, currentCount, i + r + 1));
+      }
+    }
+    i = regionEnd;
+    diskPos = nextAnchorDisk;
   }
 }
 
@@ -1845,6 +1969,7 @@ export async function writeWikiPage(ctx: PluginContext, input: WritePageInput) {
   const path = assertPagePath(input.path);
   assertPageWriteAllowed(path, input.writer);
   const current = await readCurrentWithHash(ctx, input.companyId, path, space);
+  assertNoNewRedactionPlaceholders(input.contents, current.contents, path);
   assertExpectedHash(input.expectedHash, current.hash, path);
   await ctx.localFolders.writeTextAtomic(input.companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, path), input.contents);
   const metadata = await upsertPageMetadata(ctx, {
@@ -2352,6 +2477,7 @@ export async function createOperationIssue(ctx: PluginContext, input: OperationI
     description: operationPromptWithSpaceContext(operationContext),
     status: "todo",
     priority: input.operationType === "query" ? "medium" : "low",
+    deliveryRequirement: "record_only",
     assigneeAgentId: assignableAgentId,
     billingCode: operationBillingCode(wikiId, space),
     surfaceVisibility: "plugin_operation",
@@ -4068,21 +4194,27 @@ export async function registerWikiTools(ctx: PluginContext) {
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
     const query = requireString(input.query, "query");
     const limit = normalizeLimit(input.limit, 20, 50);
-    const rows = await ctx.db.query<{ kind: string; path: string; title: string | null; match_text: string | null }>(
-      `SELECT 'page' AS kind, path, title, page_type AS match_text
-         FROM ${tableName(ctx.db.namespace, "wiki_pages")}
-        WHERE company_id = $1 AND wiki_id = $2 AND space_id = $5 AND (lower(path) LIKE lower($3) OR lower(coalesce(title, '')) LIKE lower($3))
-       UNION ALL
-       SELECT 'source' AS kind, raw_path AS path, title, source_type AS match_text
-         FROM ${tableName(ctx.db.namespace, "wiki_sources")}
-        WHERE company_id = $1 AND wiki_id = $2 AND space_id = $5 AND (lower(raw_path) LIKE lower($3) OR lower(coalesce(title, '')) LIKE lower($3) OR lower(coalesce(url, '')) LIKE lower($3))
-       ORDER BY kind, path
-       LIMIT $4`,
-      [companyId, wikiId, `%${query}%`, limit, space.id],
-    );
+    const rows: Array<{ kind: string; path: string; title: string | null; match_text: string | null }> = [];
+    for (let offset = 0; rows.length < limit; offset += limit) {
+      const batch = await ctx.db.query<{ kind: string; path: string; title: string | null; match_text: string | null }>(
+        `SELECT 'page' AS kind, path, title, page_type AS match_text
+           FROM ${tableName(ctx.db.namespace, "wiki_pages")}
+          WHERE company_id = $1 AND wiki_id = $2 AND space_id = $5 AND (lower(path) LIKE lower($3) OR lower(coalesce(title, '')) LIKE lower($3))
+         UNION ALL
+         SELECT 'source' AS kind, raw_path AS path, title, source_type AS match_text
+           FROM ${tableName(ctx.db.namespace, "wiki_sources")}
+          WHERE company_id = $1 AND wiki_id = $2 AND space_id = $5 AND (lower(raw_path) LIKE lower($3) OR lower(coalesce(title, '')) LIKE lower($3) OR lower(coalesce(url, '')) LIKE lower($3))
+         ORDER BY kind, path
+         LIMIT $4 OFFSET $6`,
+        [companyId, wikiId, `%${query}%`, limit, space.id, offset],
+      );
+      if (!batch.length) break;
+      rows.push(...(await filterReadableRows(ctx, companyId, space, batch, (row) => row.path)));
+      if (batch.length < limit) break;
+    }
     return {
-      content: rows.length ? rows.map((row) => `${row.kind}: ${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No wiki matches found.",
-      data: { companyId, wikiId, spaceSlug: space.slug, query, results: rows },
+      content: rows.slice(0, limit).map((row) => `${row.kind}: ${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") || "No wiki matches found.",
+      data: { companyId, wikiId, spaceSlug: space.slug, query, results: rows.slice(0, limit) },
     };
   });
 
@@ -4264,13 +4396,16 @@ export async function registerWikiTools(ctx: PluginContext) {
     const companyId = requireString(input.companyId, "companyId");
     const wikiId = normalizeWikiId(input.wikiId);
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
-    const rows = await ctx.db.query<{ path: string; title: string | null; page_type: string | null }>(
-      `SELECT path, title, page_type FROM ${tableName(ctx.db.namespace, "wiki_pages")} WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3 ORDER BY path LIMIT 200`,
-      [companyId, wikiId, space.id],
-    );
+    const result = await listPages(ctx, {
+      companyId,
+      wikiId,
+      spaceSlug: space.slug,
+      limit: typeof input.limit === "number" ? input.limit : null,
+    });
+    const rows = result.pages.map((page) => ({ path: page.path, title: page.title, pageType: page.pageType }));
     return {
       content: rows.length ? rows.map((row) => `${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No pages indexed yet.",
-      data: { companyId, wikiId, spaceSlug: space.slug, pages: rows },
+      data: { companyId, wikiId, spaceSlug: space.slug, pages: rows, truncated: result.truncated },
     };
   });
 }
@@ -4332,7 +4467,7 @@ export async function listPages(ctx: PluginContext, input: {
   pageType?: string | null;
   includeRaw?: boolean;
   limit?: number | null;
-}): Promise<{ pages: WikiPageRow[]; sources: WikiSourceRow[] }> {
+}): Promise<{ pages: WikiPageRow[]; sources: WikiSourceRow[]; truncated: boolean }> {
   const wikiId = normalizeWikiId(input.wikiId);
   const space = await resolveSpace(ctx, { companyId: input.companyId, wikiId, spaceSlug: input.spaceSlug });
   const limit = normalizeLimit(input.limit, 500, LOCAL_BROWSE_FILE_LIMIT);
@@ -4371,17 +4506,21 @@ export async function listPages(ctx: PluginContext, input: {
     updatedAt: row.updated_at,
   }));
   let pagesWithLocalFiles = pages;
+  let truncated = false;
   if (!input.pageType) {
     const wikiFiles = await listLocalFiles(ctx, { companyId: input.companyId, space, relativePath: "wiki" });
-    pagesWithLocalFiles = mergeLocalPageRows(pages, wikiFiles);
+    truncated = wikiFiles.truncated;
+    pagesWithLocalFiles = mergeLocalPageRows(pages, wikiFiles.entries);
   }
 
   let sources: WikiSourceRow[] = [];
   if (input.includeRaw) {
     sources = (await listSources(ctx, { companyId: input.companyId, wikiId, spaceSlug: space.slug, limit, onlyReadable: true })).sources;
-    sources = mergeLocalSourceRows(sources, await listLocalFiles(ctx, { companyId: input.companyId, space, relativePath: "raw" }));
+    const rawFiles = await listLocalFiles(ctx, { companyId: input.companyId, space, relativePath: "raw" });
+    truncated = truncated || rawFiles.truncated;
+    sources = mergeLocalSourceRows(sources, rawFiles.entries);
   }
-  return { pages: pagesWithLocalFiles, sources };
+  return { pages: pagesWithLocalFiles, sources, truncated };
 }
 
 export async function listSources(ctx: PluginContext, input: {

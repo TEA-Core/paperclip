@@ -57,7 +57,7 @@ async function respondTo(
 }
 
 describe("sw.js offline fallback", () => {
-  it("serves the Offline response for a failed navigation with an empty cache", async () => {
+  it("serves an uncached retry page for a failed navigation with an empty cache", async () => {
     const listener = loadServiceWorkerFetchListener({
       fetch: () => Promise.reject(new TypeError("network down")),
       cachesMatch: async () => undefined,
@@ -73,10 +73,15 @@ describe("sw.js offline fallback", () => {
     // fails the navigation with "Failed to convert value to 'Response'".
     expect(response).toBeInstanceOf(Response);
     expect(response!.status).toBe(503);
-    expect(await response!.text()).toBe("Offline");
+    expect(response!.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(response!.headers.get("cache-control")).toBe("no-store");
+    const body = await response!.text();
+    expect(body).toContain("Paperclip is offline");
+    expect(body).toContain("Reload page");
+    expect(body).not.toContain("<html>app shell</html>");
   });
 
-  it("serves the cached shell for a failed navigation when one exists", async () => {
+  it("does not replay a legacy cached shell for a failed navigation", async () => {
     const shell = new Response("<html>app shell</html>", { status: 200 });
     const listener = loadServiceWorkerFetchListener({
       fetch: () => Promise.reject(new TypeError("network down")),
@@ -89,7 +94,13 @@ describe("sw.js offline fallback", () => {
       mode: "navigate",
     });
 
-    expect(response).toBe(shell);
+    expect(response!.status).toBe(503);
+    expect(response!.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(response!.headers.get("cache-control")).toBe("no-store");
+    const body = await response!.text();
+    expect(body).toContain("Paperclip is offline");
+    expect(body).toContain("Reload page");
+    expect(body).not.toContain("<html>app shell</html>");
   });
 
   it("returns a network-error Response for a failed asset with no cache entry", async () => {

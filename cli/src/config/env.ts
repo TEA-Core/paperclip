@@ -7,6 +7,10 @@ import { resolveConfigPath } from "./store.js";
 
 const JWT_SECRET_ENV_KEY = "PAPERCLIP_AGENT_JWT_SECRET";
 const TOOL_ACTION_SIGNING_SECRET_ENV_KEY = "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET";
+const DECISION_SIGNING_SECRET_ENV_KEY = "PAPERCLIP_DECISION_SIGNING_SECRET";
+// Mirrors MIN_SECRET_LENGTH in server/src/services/decision-signing.ts: the
+// server rejects a shorter env value at boot, so anything shorter is invalid.
+export const DECISION_SIGNING_SECRET_MIN_LENGTH = 32;
 const PAPERCLIP_OWNED_ENV_KEY_PATTERN = /^PAPERCLIP_[A-Z0-9_]+$/;
 function resolveEnvFilePath(configPath?: string) {
   return path.resolve(path.dirname(resolveConfigPath(configPath)), ".env");
@@ -110,6 +114,48 @@ export function ensureToolActionSigningSecret(configPath?: string): { secret: st
     mergePaperclipEnvEntries({ [TOOL_ACTION_SIGNING_SECRET_ENV_KEY]: secret }, envFilePath);
   }
 
+  return { secret, created };
+}
+
+export function isValidDecisionSigningSecret(value: string | null | undefined): value is string {
+  return typeof value === "string" && value.trim().length >= DECISION_SIGNING_SECRET_MIN_LENGTH;
+}
+
+export function readDecisionSigningSecretFromEnvFile(filePath: string): string | null {
+  const value = readPaperclipEnvEntries(filePath)[DECISION_SIGNING_SECRET_ENV_KEY];
+  return isValidDecisionSigningSecret(value) ? value.trim() : null;
+}
+
+/**
+ * Per-worktree decision-signing key (SUP-22126). Generated locally, never read
+ * from process.env or a source instance's env: the production key signs
+ * control-plane decision records and must not be copied into an isolated
+ * worktree — adapter-utils' SECRET_ENV_KEYS strips it from child processes for
+ * exactly that reason. A preservedSecret captured before a --force re-init
+ * wins, so regenerating a valid worktree does not rotate its signatures; a
+ * missing or too-short value is replaced.
+ */
+export function ensureDecisionSigningSecret(
+  configPath?: string,
+  preservedSecret?: string | null,
+): { secret: string; created: boolean } {
+  const envFilePath = resolveEnvFilePath(configPath);
+  const fileSecret = readDecisionSigningSecretFromEnvFile(envFilePath);
+  const candidate = isValidDecisionSigningSecret(preservedSecret) ? preservedSecret : fileSecret;
+  let secret: string;
+  let created = false;
+  if (isValidDecisionSigningSecret(candidate)) {
+    secret = candidate.trim();
+  } else {
+    secret = randomBytes(32).toString("hex");
+    created = true;
+  }
+  // Rewrite only when the env file does not already hold this exact value — a
+  // --force re-init wipes .env after the preserved secret was captured, so the
+  // captured value has to be written back into the new file.
+  if (secret !== fileSecret) {
+    mergePaperclipEnvEntries({ [DECISION_SIGNING_SECRET_ENV_KEY]: secret }, envFilePath);
+  }
   return { secret, created };
 }
 

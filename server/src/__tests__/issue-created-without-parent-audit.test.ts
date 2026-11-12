@@ -425,7 +425,7 @@ describeEmbeddedPostgres("issue created without parent audit row (SUP-15668)", (
     expect(remedy).toContain(DONE_TIER_TIER2_JSON);
     expect(remedy).toContain(DONE_TIER_TIER1_LANDED_JSON);
     expect(remedy).toContain(DONE_TIER_TIER1_DELEGATED_JSON);
-    expect(remedy).toContain('"Closed at Tier 2 (live): <probe evidence>"');
+    expect(remedy).toContain('"Closed at Tier 2 (live): probe `<probe command>` head <probe head sha> post-merge: <post-merge predicate>"');
     expect(remedy).toContain(TIER1_FORM);
     expect(remedy).toContain(
       '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."',

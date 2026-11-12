@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -10,14 +10,36 @@ import {
   companies,
   companyMemberships,
   createDb,
+  executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueInboxArchives,
+  issueWorkProducts,
   issues,
   principalPermissionGrants,
+  projects,
   userInboxAgentPolicies,
 } from "@paperclipai/db";
+
+const mockGetByName = vi.hoisted(() => vi.fn());
+const mockResolveSecretValue = vi.hoisted(() => vi.fn());
+vi.mock("../services/secrets.js", () => ({
+  secretService: () => ({ getByName: mockGetByName, resolveSecretValue: mockResolveSecretValue }),
+}));
+// SUP-21902: the done-transition guard resolves the declared probe head and the
+// delivery default branch tip through the commits API; the mocked remote serves
+// the same head for both, so the fixtures' named probe heads match the merge head.
+vi.mock("../services/github-fetch.js", () => ({
+  ghFetch: (url: string) =>
+    typeof url === "string" && /\/commits\//.test(url)
+      ? Promise.resolve({ ok: true, status: 200, json: async () => ({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }) } as unknown as Response)
+      : Promise.resolve(new Response(JSON.stringify({}), { status: 404 })),
+  gitHubApiBase: (hostname: string) =>
+    hostname === "github.com" || hostname === "www.github.com"
+      ? "https://api.github.com"
+      : `https://${hostname}/api/v3`,
+}));
 import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
@@ -44,6 +66,8 @@ describeEmbeddedPostgres("inbox archive routes", () => {
     await db.delete(issueInboxArchives);
     await db.delete(activityLog);
     await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projects);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(userInboxAgentPolicies);
@@ -152,6 +176,50 @@ describeEmbeddedPostgres("inbox archive routes", () => {
       priority: "medium",
       createdByUserId: responsibleUserId,
     });
+    // SUP-21902: bind the card to a repo-backed execution workspace so its Tier 2
+    // close predicate can resolve the default branch and verify the declared head.
+    const tier2ProjectId = randomUUID();
+    const tier2WorkspaceId = randomUUID();
+    await db.insert(projects).values({
+      id: tier2ProjectId,
+      companyId,
+      name: "Tier 2 Fixture Project",
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: tier2WorkspaceId,
+      companyId,
+      projectId: tier2ProjectId,
+      projectWorkspaceId: null,
+      sourceIssueId: null,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "tier2-fixture-ws",
+      status: "active",
+      cwd: "/tmp/test",
+      repoUrl: "https://github.com/TEA-Core/paperclip",
+      baseRef: "fold/tea-patches-v2026.722.0",
+      branchName: "tier2-fixture-ws",
+      providerType: "git_worktree",
+      providerRef: "/tmp/test",
+      lastUsedAt: now,
+      openedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.update(issues).set({ executionWorkspaceId: tier2WorkspaceId }).where(eq(issues.id, issueId));
+    // SUP-21902: recorded delivery merge commit for the Tier 2 origin guard.
+    await db.insert(issueWorkProducts).values({
+      companyId: companyId, issueId: issueId, type: "pull_request", provider: "github",
+      externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+      reviewState: "none", isPrimary: true, healthStatus: "unknown",
+      metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    });
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
     return { companyId, agentId, runId, issueId, responsibleUserId, targetUserId };
   }
 
@@ -299,7 +367,7 @@ describeEmbeddedPostgres("inbox archive routes", () => {
       // SUP-12693: an agent close carries a done-tier declaration. The subject
       // here is that an *agent* completion archives no inbox, so the declaration
       // is supplied rather than the guard relaxed.
-      .send({ status: "done", comment: "Closed at Tier 2 (live): inbox archive attribution exercised." })
+      .send({ status: "done", comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: inbox archive attribution exercised." })
       .expect(200);
 
     expect(await db.select().from(issueInboxArchives)).toHaveLength(0);

@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, gte, inArray, isNull } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, max, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   documentRevisions,
   documents,
   executionWorkspaces,
+  heartbeatRuns,
   issues,
+  issueComments,
   projectWorkspaces,
   projects,
   summarySlots,
@@ -31,7 +33,11 @@ import { builtInAgentService } from "./built-in-agents.js";
 import { agentService } from "./agents.js";
 import { issueService } from "./issues.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
-import { readGenerationToken, releaseSummarySlotBinding } from "./summary-slot-finalization.js";
+import {
+  generationWroteSlotSql,
+  readGenerationToken,
+  releaseSummarySlotBinding,
+} from "./summary-slot-finalization.js";
 
 /** Built-in agent key for the Summarizer bundle (see PAP-13920). */
 export const SUMMARIZER_BUILT_IN_KEY = "summarizer";
@@ -343,7 +349,7 @@ export function summarySlotService(db: Db) {
   }
 
   /**
-   * True when a slot's `generating_issue_id` binding is DEAD (SUP-16945). Two cases:
+   * True when a slot's `generating_issue_id` binding is DEAD (SUP-16945). Three cases:
    *
    *   1. The bound generation issue is TERMINAL (done/cancelled). A terminal issue
    *      can never write a summary (the write guard refuses terminal writes), so its
@@ -359,9 +365,19 @@ export function summarySlotService(db: Db) {
    *      or `escalated`) — and has sat armed for at least `DEAD_GENERATION_GRACE_MS`.
    *      Such a slot would otherwise stay wedged in `generating` forever.
    *
-   * Conservative on purpose for case 2: a generation with a live run or any
-   * in-flight recovery action is in flight and is NEVER reclaimed, regardless of
-   * age.
+   *   3. Written-deliverable completion (SUP-23039): the bound issue is
+   *      non-terminal, has lost its live path, no recovery ladder owns it, and
+   *      THIS generation already wrote the slot's surviving revision (the same
+   *      identity chain the release itself uses to pick `idle`). The binding is
+   *      not merely dead — it is COMPLETE: the deliverable landed and no close
+   *      form is required to prove it (a `record_only` generation card can never
+   *      emit one), so it releases on the first read after the run terminates
+   *      instead of aging out `DEAD_GENERATION_GRACE_MS` presenting a finished
+   *      generation as in-flight on the board tile.
+   *
+   * Conservative on purpose for cases 2 and 3: a generation with a live run or
+   * any in-flight recovery action is in flight and is NEVER reclaimed,
+   * regardless of age or written state.
    *
    * Age is measured from the slot's arm time (`summary_slots.updated_at`) — the
    * moment `generate()` armed the slot to `generating` for this binding — the
@@ -385,7 +401,8 @@ export function summarySlotService(db: Db) {
     // interrupted transition).
     if (TERMINAL_ISSUE_STATUSES.has(issueRow.status as IssueStatus)) return true;
     // Case 2, guard 1: a live run means the generation is actually in flight —
-    // never reclaim, regardless of age.
+    // never reclaim, regardless of age or written state (the run may still be
+    // finishing).
     if (issueRow.executionRunId || issueRow.checkoutRunId) return false;
     // Case 2, guard 2: an in-flight recovery action means the issue is being
     // recovered — never reclaim, regardless of age.
@@ -394,8 +411,32 @@ export function summarySlotService(db: Db) {
       slotRow.generatingIssueId,
     );
     if (activeRecovery) return false;
+    // Case 3: the run is dead, no recovery ladder owns the issue, and this
+    // generation wrote the surviving revision — the binding is complete.
+    // Release immediately; the shared release below resolves it to `idle`
+    // (the same identity probe decides), never `failed`.
+    if (await generationWroteSurvivingRevision(slotRow)) return true;
     // Case 2, aged: armed for at least the grace window since the slot was armed.
     return now.getTime() - slotRow.updatedAt.getTime() >= DEAD_GENERATION_GRACE_MS;
+  }
+
+  /**
+   * Identity probe for the written-deliverable completion case (SUP-23039):
+   * true when THIS generation issue wrote the slot document's surviving (latest)
+   * revision. This is the exact `generationWroteSlotSql` chain the binding
+   * release itself uses to decide `idle`, evaluated before the release so a
+   * provably completed generation (run dead, no recovery) can bypass
+   * `DEAD_GENERATION_GRACE_MS`.
+   */
+  async function generationWroteSurvivingRevision(slotRow: SummarySlotRow): Promise<boolean> {
+    if (!slotRow.generatingIssueId) return false;
+    return db
+      .select({
+        wrote: sql<boolean>`${generationWroteSlotSql(slotRow.companyId, slotRow.generatingIssueId)}`,
+      })
+      .from(summarySlots)
+      .where(eq(summarySlots.id, slotRow.id))
+      .then((rows) => rows[0]?.wrote === true);
   }
 
   /**
@@ -561,24 +602,61 @@ export function summarySlotService(db: Db) {
       status: issues.status,
       priority: issues.priority,
       updatedAt: issues.updatedAt,
+      lastCommentAt: max(issueComments.createdAt),
     };
 
     const [blocked, inReview, inProgress, recentlyDone] = await Promise.all([
       db.select(selectFields).from(issues)
+        .leftJoin(
+          issueComments,
+          and(
+            eq(issueComments.issueId, issues.id),
+            eq(issueComments.companyId, issues.companyId),
+            isNull(issueComments.deletedAt),
+          ),
+        )
         .where(and(...commonConditions, eq(issues.status, "blocked")))
+        .groupBy(issues.id)
         .orderBy(desc(issues.updatedAt)).limit(SUMMARY_SNAPSHOT_GROUP_LIMIT),
       db.select(selectFields).from(issues)
+        .leftJoin(
+          issueComments,
+          and(
+            eq(issueComments.issueId, issues.id),
+            eq(issueComments.companyId, issues.companyId),
+            isNull(issueComments.deletedAt),
+          ),
+        )
         .where(and(...commonConditions, eq(issues.status, "in_review")))
+        .groupBy(issues.id)
         .orderBy(desc(issues.updatedAt)).limit(SUMMARY_SNAPSHOT_GROUP_LIMIT),
       db.select(selectFields).from(issues)
+        .leftJoin(
+          issueComments,
+          and(
+            eq(issueComments.issueId, issues.id),
+            eq(issueComments.companyId, issues.companyId),
+            isNull(issueComments.deletedAt),
+          ),
+        )
         .where(and(...commonConditions, eq(issues.status, "in_progress")))
+        .groupBy(issues.id)
         .orderBy(desc(issues.updatedAt)).limit(SUMMARY_SNAPSHOT_GROUP_LIMIT),
       db.select(selectFields).from(issues)
+        .leftJoin(
+          issueComments,
+          and(
+            eq(issueComments.issueId, issues.id),
+            eq(issueComments.companyId, issues.companyId),
+            isNull(issueComments.deletedAt),
+          ),
+        )
         .where(and(
           ...commonConditions,
           inArray(issues.status, ["done"]),
           gte(issues.updatedAt, recentlyDoneSince),
         ))
+        .groupBy(issues.id)
         .orderBy(desc(issues.updatedAt)).limit(SUMMARY_SNAPSHOT_GROUP_LIMIT),
     ]);
 
@@ -594,7 +672,8 @@ export function summarySlotService(db: Db) {
             const issueLink = companyPrefix
               ? `[${identifier}](/${companyPrefix}/issues/${identifier})`
               : identifier;
-            return `- ${issueLink} — ${row.title} (${row.priority}; updated ${row.updatedAt.toISOString()})`;
+            const lastCommentAt = row.lastCommentAt?.toISOString() ?? "null";
+            return `- ${issueLink} — ${row.title} (${row.priority}; updated ${row.updatedAt.toISOString()}; lastCommentAt ${lastCommentAt})`;
           })
         : ["- None."]),
     ];
@@ -603,7 +682,9 @@ export function summarySlotService(db: Db) {
       "## Prebuilt scope snapshot",
       "",
       `Snapshot generated at ${new Date().toISOString()}. Recently done means updated since ${recentlyDoneSince.toISOString()}.`,
-      "Use this bounded, company-scoped snapshot as the issue source of truth for this run. Do not call issue-list endpoints.",
+       "This bounded, company-scoped snapshot is an index, not proof of what a card still owes. Do not call issue-list endpoints for listing.",
+       "Before writing an action claim about a specific issue — including that it still owes work, never ran, nothing has been sent, or an equivalent claim — read that issue's thread: `GET /api/issues/{identifier}/comments`, substituting the issue's identifier exactly as a snapshot row prints it (for example `SUP-19312`); the issue's UUID also resolves.",
+       "The issue description, the card body, and the previous slot body returned with `latestRevisionId` are unsafe sources for an action claim: descriptions can carry dated amendments, and a false revision becomes the next run's input. `lastCommentAt` makes staleness visible; it does not make a stale body safe.",
       "",
       ...formatGroup("Blocked", blocked),
       "",
@@ -657,7 +738,7 @@ export function summarySlotService(db: Db) {
       "```",
       "",
       "Write one short, colloquial Markdown summary that opens with the 1–3 specific, concrete, actionable items the reader should do right now to unblock this work — each saying what to do and why it's the thing holding up progress, with an inline link — followed by a brief plain-prose status of where things stand. Use your judgment: read whatever issues you need to understand the state, then focus on what's most important. Write for a reader who has not memorized issue ids or threads. If genuinely nothing needs the reader, say so plainly in one line and name the next thing worth watching. Never a trailing list of issue links or any link dump. Not a task list.",
-      "The current-slot response includes the latest document body and `latestRevisionId`; use those directly.",
+       "The current-slot response includes the latest document body and `latestRevisionId`; carry its body forward only after checking the issue thread for every action claim.",
       "Follow the skill's streaming protocol: emit the first plain-text `STATUS:` line immediately — named from the first task in the snapshot, before any analysis — keep emitting `STATUS:` lines as you think, and emit the sentinel-wrapped summary draft before the authoritative summary-slot write.",
       "Pass the `generationIssueId` from the token block above, the previous revision id when present, and the model actually used to the summary-slot write API.",
       "",
@@ -731,6 +812,7 @@ export function summarySlotService(db: Db) {
       description,
       status: "todo",
       priority: "medium",
+      deliveryRequirement: "record_only",
       assigneeAgentId: summarizerAgentId,
       createdByAgentId: actor.agentId ?? null,
       createdByUserId: actor.userId ?? null,
@@ -835,8 +917,24 @@ export function summarySlotService(db: Db) {
       throw forbidden("Generation task does not target this summary slot");
     }
     const runId = actor.runId ?? null;
-    const runMatches =
-      !!runId && (issueRef.row.checkoutRunId === runId || issueRef.row.executionRunId === runId);
+    if (!runId) {
+      throw forbidden("Summary write must run from the linked generation task");
+    }
+    const ownedRun = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.id, runId),
+          eq(heartbeatRuns.companyId, sel.companyId),
+          eq(heartbeatRuns.agentId, actor.agentId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (!ownedRun) {
+      throw forbidden("Summary write must run from the linked generation task");
+    }
+    const runMatches = (issueRef.row.executionRunId ?? issueRef.row.checkoutRunId) === runId;
     if (!runMatches) {
       throw forbidden("Summary write must run from the linked generation task");
     }
@@ -860,6 +958,13 @@ export function summarySlotService(db: Db) {
 
     const now = new Date();
     const result = await db.transaction(async (tx) => {
+      const currentGenerationIssue = await tx
+        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(and(eq(issues.id, input.generationIssueId!), eq(issues.companyId, sel.companyId)))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+
       // The linked slot row is the serialization boundary for document
       // revision allocation. Hold a row lock so concurrent writers for the
       // same slot queue up and re-read the latest document state only after
@@ -879,7 +984,14 @@ export function summarySlotService(db: Db) {
         throw conflict("Summary generation was superseded by a newer task");
       }
 
+      const runStillMatches =
+        (currentGenerationIssue?.executionRunId ?? currentGenerationIssue?.checkoutRunId ?? null) === actor.runId;
+      if (!runStillMatches) {
+        throw forbidden("Summary write must run from the linked generation task");
+      }
+
       let documentRow: typeof documents.$inferSelect;
+
       let revisionRow: typeof documentRevisions.$inferSelect;
 
       const existingDocument = currentSlot?.documentId

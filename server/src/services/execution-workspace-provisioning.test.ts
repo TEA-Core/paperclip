@@ -429,6 +429,515 @@ describeEmbeddedPostgres("provisionIssueExecutionWorkspace", () => {
     expect(issueRows[0]!.executionWorkspaceId).toBe(result.persistedExecutionWorkspace!.id);
   });
 
+  async function provisionWithRecordedDeliveryBranch(
+    recordedBranchFor: (issueIdentifier: string, ancestorIdentifier: string) => string,
+    opts: {
+      boundToDeadAncestorCarrier?: boolean;
+      boundToSourcelessForeignRow?: boolean;
+      reuseOwnBranchlessRow?: boolean;
+      reuseAncestorBranchlessRow?: boolean;
+      issueStatus?: string;
+    } = {},
+  ) {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const issueIdentifier = `${issuePrefix}-1`;
+    const now = new Date("2026-07-07T00:00:00.000Z");
+    const ancestorIdentifier = `${issuePrefix}-2`;
+    const RECORDED_BRANCH = recordedBranchFor(issueIdentifier, ancestorIdentifier);
+    const ancestorIssueId = randomUUID();
+    const carrierWorkspaceId = randomUUID();
+
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-provisioning-carry-"));
+    tempRoots.push(tempRoot);
+    initTempGitRepo(tempRoot);
+
+    await instanceSettingsService(db).updateExperimental({
+      enableIsolatedWorkspaces: true,
+      enableWorkspaceBranchReconcileForward: false,
+      enableWorkspaceDirtyQuarantineRepair: false,
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Acme",
+      issuePrefix,
+      status: "active",
+      defaultResponsibleUserId: "responsible-user",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Provisioning carry test",
+      status: "active",
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        workspaceStrategy: { type: "project_primary" },
+      },
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      cwd: tempRoot,
+      isPrimary: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CarryAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_assigned",
+      },
+      responsibleUserId: "responsible-user",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    if (opts.boundToDeadAncestorCarrier) {
+      await db.insert(issues).values({
+        id: ancestorIssueId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Dead ancestor carrier owner",
+        status: "done",
+        priority: "medium",
+        issueNumber: 2,
+        identifier: ancestorIdentifier,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await db.insert(executionWorkspaces).values({
+        id: carrierWorkspaceId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        sourceIssueId: ancestorIssueId,
+        mode: "shared_workspace",
+        strategyType: "project_primary",
+        name: RECORDED_BRANCH,
+        status: "active",
+        cwd: tempRoot,
+        branchName: RECORDED_BRANCH,
+        providerType: "local_fs",
+        providerRef: tempRoot,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
+    if (opts.reuseAncestorBranchlessRow) {
+      await db.insert(issues).values({
+        id: ancestorIssueId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Live ancestor carrier owner",
+        status: "in_review",
+        priority: "medium",
+        issueNumber: 2,
+        identifier: ancestorIdentifier,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await db.insert(executionWorkspaces).values({
+        id: carrierWorkspaceId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        sourceIssueId: ancestorIssueId,
+        mode: "shared_workspace",
+        strategyType: "project_primary",
+        name: "reused-ancestor-workspace",
+        status: "active",
+        cwd: tempRoot,
+        branchName: null,
+        providerType: "local_fs",
+        providerRef: tempRoot,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
+    if (opts.boundToSourcelessForeignRow || opts.reuseOwnBranchlessRow) {
+      await db.insert(executionWorkspaces).values({
+        id: carrierWorkspaceId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        sourceIssueId: null as never,
+        mode: "isolated_workspace",
+        strategyType: "project_primary",
+        name: opts.reuseOwnBranchlessRow ? "reused-workspace" : RECORDED_BRANCH,
+        status: "active",
+        cwd: tempRoot,
+        branchName: opts.reuseOwnBranchlessRow ? null : RECORDED_BRANCH,
+        providerType: "local_fs",
+        providerRef: tempRoot,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      ...(opts.boundToDeadAncestorCarrier || opts.reuseAncestorBranchlessRow ? { parentId: ancestorIssueId } : {}),
+      title: "Provisioning carry test issue",
+      status: opts.issueStatus ?? "in_review",
+      workMode: "standard",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: runId,
+      executionRunId: runId,
+      executionAgentNameKey: "carryagent",
+      executionLockedAt: now,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: issueIdentifier,
+      executionWorkspaceId:
+        opts.boundToDeadAncestorCarrier || opts.boundToSourcelessForeignRow || opts.reuseOwnBranchlessRow || opts.reuseAncestorBranchlessRow
+          ? carrierWorkspaceId
+          : null,
+      executionWorkspacePreference: opts.reuseOwnBranchlessRow || opts.reuseAncestorBranchlessRow ? "reuse_existing" : null,
+      executionWorkspaceSettings: {
+        mode: "isolated_workspace",
+      },
+      executionState: {
+        delivery: {
+          repo: { owner: "TEA-Core", repo: "paperclip" },
+          branch: RECORDED_BRANCH,
+          headSha: "approved00000000000000000000000000000000001",
+        },
+      },
+      startedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const localEnvironment: Environment = {
+      id: "local-env",
+      name: "Local",
+      description: null,
+      driver: "local",
+      status: "active",
+      config: {},
+      envVars: {},
+      metadata: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const issueRef: ExecutionWorkspaceProvisioningIssueRef = {
+      id: issueId,
+      identifier: issueIdentifier,
+      title: "Provisioning carry test issue",
+      status: opts.issueStatus ?? "in_review",
+      priority: "medium",
+      workMode: "standard",
+      description: null,
+      projectId,
+      projectWorkspaceId,
+      executionWorkspaceId:
+        opts.boundToDeadAncestorCarrier || opts.boundToSourcelessForeignRow || opts.reuseOwnBranchlessRow || opts.reuseAncestorBranchlessRow
+          ? carrierWorkspaceId
+          : null,
+      executionWorkspacePreference: opts.reuseOwnBranchlessRow || opts.reuseAncestorBranchlessRow ? "reuse_existing" : null,
+    };
+
+    const run = await db.query.heartbeatRuns.findFirst({
+      where: eq(heartbeatRuns.id, runId),
+    });
+    expect(run).toBeDefined();
+
+    const agent = await db.query.agents.findFirst({
+      where: eq(agents.id, agentId),
+    });
+    expect(agent).toBeDefined();
+
+    const result = await provisionIssueExecutionWorkspace({
+      db,
+      run: run!,
+      agent: agent!,
+      issueId,
+      issueRef,
+      runId,
+      previousSessionParams: null,
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+      trustPreset: standardTrustResolution(),
+      isolatedWorkspacesEnabled: true,
+      selectedEnvironmentId: null,
+      selectedEnvironmentForConfig: null,
+      localEnvironment,
+      environmentSelectionSource: "local",
+      configSnapshot: null,
+      secretManifest: [],
+      projectExecutionWorkspacePolicy: {
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        allowIssueOverride: true,
+        workspaceStrategy: {
+          type: "project_primary",
+        },
+      },
+      issueExecutionWorkspaceSettings: { mode: "isolated_workspace" },
+      executionProjectId: projectId,
+      resolvedInstanceSettings: {
+        experimental: {
+          enableWorkspaceBranchReconcileForward: false,
+          enableWorkspaceDirtyQuarantineRepair: false,
+        },
+      },
+      mergedConfig: {},
+      executionPolicy: { executionMode: "standard" },
+      context: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      resolveWorkspace: async () =>
+        buildResolvedWorkspace({
+          cwd: tempRoot,
+          source: "project_primary",
+          projectId,
+          workspaceId: projectWorkspaceId,
+          repoUrl: null,
+          repoRef: null,
+        }),
+      resolveSessionConfig: async (_input) => ({
+        previousSessionParams: null,
+        resetTaskSession: true,
+        sessionResetReason: null,
+        sessionConfigFreshness: {
+          reset: true,
+          reasons: ["initial"],
+          changedCategories: [],
+          nextFingerprint: null,
+          storedFingerprint: null,
+        },
+        sessionConfigMetadata: buildTestSessionConfigMetadata(),
+      }),
+      runLifecycle: {
+        onExecutionWorkspaceOccupied: async () => {
+          throw new Error("should not be called for fresh provisioning");
+        },
+      },
+    });
+
+    return { result, recordedBranch: RECORDED_BRANCH, carrierWorkspaceId, issueId };
+  }
+
+  it("carries the recorded delivery branch onto a fresh project_primary workspace", async () => {
+    const { result, recordedBranch } = await provisionWithRecordedDeliveryBranch(
+      (issueIdentifier) => `${issueIdentifier}-delivered`,
+    );
+
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+    expect(result.persistedExecutionWorkspace).not.toBeNull();
+    expect(result.persistedExecutionWorkspace!.branchName).toBe(recordedBranch);
+
+    const persistedRows = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, result.persistedExecutionWorkspace!.id));
+    expect(persistedRows).toHaveLength(1);
+    expect(persistedRows[0]!.branchName).toBe(recordedBranch);
+  });
+
+  it.each(["100%", "fix-50%-cpu"])(
+    "carries a recorded delivery branch with a lone percent sign (%s) onto a fresh workspace",
+    async (suffix) => {
+      const { result, recordedBranch } = await provisionWithRecordedDeliveryBranch(
+        (issueIdentifier) => `${issueIdentifier}-${suffix}`,
+      );
+
+      expect(result.kind).toBe("provisioned");
+      if (result.kind !== "provisioned") return;
+      expect(result.persistedExecutionWorkspace!.branchName).toBe(recordedBranch);
+    },
+  );
+
+  it("does not carry a percent-encoded traversal recorded delivery branch onto a fresh workspace", async () => {
+    const { result } = await provisionWithRecordedDeliveryBranch(
+      (issueIdentifier) => `${issueIdentifier}-%2F..`,
+    );
+
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+    expect(result.persistedExecutionWorkspace!.branchName).toBeNull();
+  });
+
+  it("does not carry a git-invalid recorded delivery branch onto a fresh workspace", async () => {
+    const { result } = await provisionWithRecordedDeliveryBranch(
+      (issueIdentifier) => `${issueIdentifier}-../x`,
+    );
+
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+    expect(result.persistedExecutionWorkspace!.branchName).toBeNull();
+  });
+
+  it("does not carry the recorded delivery branch onto a fresh row once the card left in_review (bounced redo wake)", async () => {
+    const { result, recordedBranch } = await provisionWithRecordedDeliveryBranch(
+      (issueIdentifier) => `${issueIdentifier}-delivered`,
+      { issueStatus: "in_progress" },
+    );
+
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+    expect(result.persistedExecutionWorkspace).not.toBeNull();
+    expect(result.persistedExecutionWorkspace!.branchName).not.toBe(recordedBranch);
+    expect(result.persistedExecutionWorkspace!.branchName).toBeNull();
+
+    const persistedRows = await db
+      .select({ branchName: executionWorkspaces.branchName })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, result.persistedExecutionWorkspace!.id));
+    expect(persistedRows).toHaveLength(1);
+    expect(persistedRows[0]!.branchName).toBeNull();
+  });
+
+  it("does not carry the recorded delivery branch onto a restored ancestor-owned shared row", async () => {
+    const { result, carrierWorkspaceId } = await provisionWithRecordedDeliveryBranch(
+      (issueIdentifier) => `${issueIdentifier}-delivered`,
+      { reuseAncestorBranchlessRow: true },
+    );
+
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+    expect(result.persistedExecutionWorkspace!.id).toBe(carrierWorkspaceId);
+    expect(result.persistedExecutionWorkspace!.branchName).toBeNull();
+
+    const [row] = await db
+      .select({ branchName: executionWorkspaces.branchName })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, carrierWorkspaceId));
+    expect(row!.branchName).toBeNull();
+  });
+
+  it("carries the recorded delivery branch onto a restored branchless row while the card is in_review", async () => {
+    const { result, recordedBranch, carrierWorkspaceId } = await provisionWithRecordedDeliveryBranch(
+      (issueIdentifier) => `${issueIdentifier}-delivered`,
+      { reuseOwnBranchlessRow: true },
+    );
+
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+    expect(result.persistedExecutionWorkspace!.id).toBe(carrierWorkspaceId);
+    expect(result.persistedExecutionWorkspace!.branchName).toBe(recordedBranch);
+  });
+
+  it("does not carry the recorded delivery branch onto a restored branchless row once the card left in_review", async () => {
+    const { result, carrierWorkspaceId } = await provisionWithRecordedDeliveryBranch(
+      (issueIdentifier) => `${issueIdentifier}-delivered`,
+      { reuseOwnBranchlessRow: true, issueStatus: "in_progress" },
+    );
+
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+    expect(result.persistedExecutionWorkspace!.id).toBe(carrierWorkspaceId);
+    expect(result.persistedExecutionWorkspace!.branchName).toBeNull();
+
+    const [row] = await db
+      .select({ branchName: executionWorkspaces.branchName })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, carrierWorkspaceId));
+    expect(row!.branchName).toBeNull();
+  });
+
+  it("does not carry a foreign branch name even when the bound sourceless row carries it", async () => {
+    const { result } = await provisionWithRecordedDeliveryBranch(() => "SUP-9999-foreign", {
+      boundToSourcelessForeignRow: true,
+    });
+
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+    expect(result.persistedExecutionWorkspace).not.toBeNull();
+    expect(result.persistedExecutionWorkspace!.branchName).not.toBe("SUP-9999-foreign");
+    expect(result.persistedExecutionWorkspace!.branchName).toBeNull();
+  });
+
+  it("does not carry a recorded delivery branch that belongs to an unrelated card", async () => {
+    const { result } = await provisionWithRecordedDeliveryBranch(() => "OTHERCARD-9-delivered");
+
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+    expect(result.persistedExecutionWorkspace).not.toBeNull();
+    expect(result.persistedExecutionWorkspace!.branchName).not.toBe("OTHERCARD-9-delivered");
+
+    const persistedRows = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, result.persistedExecutionWorkspace!.id));
+    expect(persistedRows).toHaveLength(1);
+    expect(persistedRows[0]!.branchName).not.toBe("OTHERCARD-9-delivered");
+  });
+
+  it("does not carry a dead ancestor's carrier branch onto a fresh row for a child bound to that carrier", async () => {
+    const { result, recordedBranch, carrierWorkspaceId, issueId } = await provisionWithRecordedDeliveryBranch(
+      (_issueIdentifier, ancestorIdentifier) => `${ancestorIdentifier}-carrier`,
+      { boundToDeadAncestorCarrier: true },
+    );
+
+    expect(result.kind).toBe("provisioned");
+    if (result.kind !== "provisioned") return;
+    expect(result.persistedExecutionWorkspace).not.toBeNull();
+    expect(result.persistedExecutionWorkspace!.branchName).not.toBe(recordedBranch);
+
+    const carrierRows = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, carrierWorkspaceId));
+    expect(carrierRows).toHaveLength(1);
+    expect(carrierRows[0]!.branchName).toBe(recordedBranch);
+
+    const childWorkspaceRows = await db
+      .select({ branchName: executionWorkspaces.branchName })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.sourceIssueId, issueId));
+    expect(childWorkspaceRows.every((row) => row.branchName !== recordedBranch)).toBe(true);
+  });
+
   it("returns a deferred result when the workspace is occupied by another run", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();

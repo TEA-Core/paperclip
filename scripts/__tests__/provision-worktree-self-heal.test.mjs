@@ -433,6 +433,69 @@ test("reconciles deployment mode from the registered source when reusing a guest
   assert.equal(readWorktreeConfig(worktreeCwd).server.exposure, "private");
 });
 
+test("reuses a config whose secrets key file lives under the SUP-12234 worktree key root and preserves the decision-signing secret", () => {
+  // SUP-12234 relocates the worktree master key outside the home volume: the
+  // server-side worktree repair rewrites secrets.localEncrypted.keyFilePath to
+  // /etc/paperclip/worktrees/<instance>/master.key at boot. The usability
+  // validator must accept that path instead of declaring the config stale for
+  // this host — which forced `worktree init --force` on every dispatch and
+  // wiped the worktree .env (SUP-22126).
+  const baseCwd = makeBaseWorkspace({ helpExit: 1, initExit: 0 });
+  const { result: first, worktreeCwd, worktreesHome, paperclipHome } = runProvision(baseCwd);
+  assert.equal(first.status, 0, first.stderr);
+  assert.match(first.stderr, /writing isolated fallback config/);
+  const envPath = path.join(worktreeCwd, ".paperclip", ".env");
+  const configPath = path.join(worktreeCwd, ".paperclip", "config.json");
+  assert.match(
+    fs.readFileSync(envPath, "utf8"),
+    /PAPERCLIP_DECISION_SIGNING_SECRET="[0-9a-f]{64}"/,
+  );
+
+  // Simulate the server-side SUP-12234 repair rewriting the key file path.
+  const config = readWorktreeConfig(worktreeCwd);
+  const instanceId = path.basename(path.dirname(config.database.embeddedPostgresDataDir));
+  config.secrets.localEncrypted.keyFilePath = path.join("/etc/paperclip/worktrees", instanceId, "master.key");
+  fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+
+  const provisionEnv = {
+    PATH: testPath,
+    HOME: os.homedir(),
+    PAPERCLIP_WORKSPACE_BASE_CWD: baseCwd,
+    PAPERCLIP_WORKSPACE_CWD: worktreeCwd,
+    PAPERCLIP_WORKSPACE_BRANCH: "feature/provision-test",
+    PAPERCLIP_WORKTREES_DIR: worktreesHome,
+    PAPERCLIP_HOME: paperclipHome,
+    PAPERCLIP_PROJECT_WORKSPACE_ID: "project-workspace-1",
+    PAPERCLIP_SEED_EXPECTED_COMPANY_ID: "company-1",
+  };
+
+  const second = spawnSync("bash", [script], { cwd: worktreeCwd, encoding: "utf8", env: provisionEnv });
+  assert.equal(second.status, 0, second.stderr);
+  assert.match(second.stderr, /Reusing existing isolated Paperclip worktree config/);
+  assert.doesNotMatch(second.stderr, /stale for this host; regenerating/);
+  const envAfterReuse = fs.readFileSync(envPath, "utf8");
+  assert.match(envAfterReuse, /PAPERCLIP_IN_WORKTREE=true/);
+  assert.match(envAfterReuse, /PAPERCLIP_DECISION_SIGNING_SECRET="[0-9a-f]{64}"/);
+
+  // A genuinely stale config (runtime path outside the instance root) forces a
+  // fallback rewrite; the valid existing decision-signing secret must survive
+  // it rather than being rotated.
+  const decisionSecret = envAfterReuse.match(/PAPERCLIP_DECISION_SIGNING_SECRET="([0-9a-f]{64})"/)?.[1];
+  assert.ok(decisionSecret, "expected a decision-signing secret after reuse");
+  const staleConfig = readWorktreeConfig(worktreeCwd);
+  staleConfig.database.embeddedPostgresDataDir = "/opt/elsewhere/db";
+  fs.writeFileSync(configPath, `${JSON.stringify(staleConfig, null, 2)}\n`);
+
+  const third = spawnSync("bash", [script], { cwd: worktreeCwd, encoding: "utf8", env: provisionEnv });
+  assert.equal(third.status, 0, third.stderr);
+  assert.match(third.stderr, /stale for this host; regenerating/);
+  const envAfterRewrite = fs.readFileSync(envPath, "utf8");
+  assert.ok(
+    envAfterRewrite.includes(decisionSecret),
+    "expected the fallback rewrite to preserve the existing decision-signing secret",
+  );
+});
+
 test("repairs an unhealthy base install under the lock and then uses the CLI", (t) => {
   const hasTools = ["flock", "git"].every(
     (tool) => spawnSync("bash", ["-lc", `command -v ${tool}`], { env: { PATH: testPath } }).status === 0,

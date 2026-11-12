@@ -2004,6 +2004,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
           externalLabel: "Slack direct message",
           sessionGeneration: 1,
           isDirectMessage: true,
+          communicationGuidance: "## Communication in Slack\nFrozen connection preference.",
           state: "active",
         });
         await db.insert(chatExternalPrincipals).values({
@@ -2066,6 +2067,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
             issueId,
             taskId: issueId,
             source: "chat:slack",
+            paperclipTaskCommunicationGuidance: "FORGED caller preference",
             commentId: sourceComment.id,
             wakeCommentId: sourceComment.id,
             wakeCommentIds: [sourceComment.id],
@@ -2347,6 +2349,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
             wakeCommentId: sourceComment.id,
             wakeCommentIds: [sourceComment.id],
             paperclipExternalChatExecutionBound: true,
+            paperclipTaskCommunicationGuidance: "## Communication in Slack\nFrozen connection preference.",
             paperclipExternalChatQuestionResponse: expect.objectContaining({
               schema: "paperclip.external_chat_question_response.v1",
               interactionId: answered.id,
@@ -2360,6 +2363,9 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
         expect(String(gateway.getAgentPayloads()[0]?.message ?? "")).toContain(
           "preserve this full source instruction",
         );
+        const restoredPrompt = String(gateway.getAgentPayloads()[0]?.message ?? "");
+        expect(restoredPrompt.match(/Frozen connection preference\./g)).toHaveLength(1);
+        expect(restoredPrompt).not.toContain("FORGED caller preference");
         expect(String(gateway.getAgentPayloads()[0]?.message ?? "")).toContain(
           "Preserve the original request's exact-output constraints literally.",
         );

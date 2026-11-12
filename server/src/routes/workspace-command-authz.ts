@@ -74,6 +74,33 @@ export function assertNoAgentHostWorkspaceCommandMutation(req: Request, paths: s
   );
 }
 
+function collectOwnKeyPaths(patch: unknown, keys: readonly string[], prefix: string): string[] {
+  if (!isRecord(patch)) return [];
+  return keys.filter((key) => hasOwn(patch, key)).map((key) => prefixPath(prefix, key));
+}
+
+export function collectProjectWorkspaceSourcePaths(workspacePatch: unknown, prefix = ""): string[] {
+  return collectOwnKeyPaths(workspacePatch, ["repoUrl", "repoRef", "defaultRef"], prefix);
+}
+
+export function assertNoAgentProjectWorkspaceSourceMutation(req: Request, paths: string[]) {
+  if (req.actor.type !== "agent" || paths.length === 0) return;
+  throw forbidden(
+    `Agent keys cannot set the repository or branch a project workspace is measured against (${paths.join(", ")}); a board user must.`,
+  );
+}
+
+export function collectExecutionWorkspaceIdentityPaths(workspacePatch: unknown, prefix = ""): string[] {
+  return collectOwnKeyPaths(workspacePatch, ["cwd", "providerRef", "branchName"], prefix);
+}
+
+export function assertNoAgentExecutionWorkspaceIdentityMutation(req: Request, paths: string[]) {
+  if (req.actor.type !== "agent" || paths.length === 0) return;
+  throw forbidden(
+    `Agent keys cannot set the worktree or branch an execution workspace is measured against (${paths.join(", ")}); a board user must.`,
+  );
+}
+
 export function collectAgentAdapterWorkspaceCommandPaths(
   adapterConfig: unknown,
   prefix = "adapterConfig",

@@ -1,6 +1,7 @@
 import {
   type AnyPgColumn,
   boolean,
+  check,
   index,
   integer,
   jsonb,
@@ -10,6 +11,7 @@ import {
   uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { agents } from "./agents.js";
 import { companies } from "./companies.js";
 import { companySecrets } from "./company_secrets.js";
@@ -18,7 +20,13 @@ import { projects } from "./projects.js";
 import { goals } from "./goals.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
 import { folders } from "./folders.js";
-import type { RoutineEnvConfig, RoutineRevisionSnapshotV1, RoutineVariable } from "@paperclipai/shared";
+import type {
+  IssueDeliveryRequirement,
+  RoutineEnvConfig,
+  RoutineRevisionSnapshotV1,
+  RoutineVariable,
+  RoutineWebhookDelivery,
+} from "@paperclipai/shared";
 
 export const routines = pgTable(
   "routines",
@@ -43,6 +51,7 @@ export const routines = pgTable(
     variables: jsonb("variables").$type<RoutineVariable[]>().notNull().default([]),
     env: jsonb("env").$type<RoutineEnvConfig>(),
     executionPolicy: jsonb("execution_policy").$type<Record<string, unknown>>(),
+    deliveryRequirement: text("delivery_requirement").$type<IssueDeliveryRequirement>(),
     executionWorkspacePreference: text("execution_workspace_preference"),
     latestRevisionId: uuid("latest_revision_id"),
     latestRevisionNumber: integer("latest_revision_number").notNull().default(1),
@@ -63,6 +72,10 @@ export const routines = pgTable(
     companyFolderIdx: index("routines_company_folder_idx").on(table.companyId, table.folderId),
     companyResponsibleUserIdx: index("routines_company_responsible_user_idx").on(table.companyId, table.responsibleUserId),
     companyOriginIdx: index("routines_company_origin_idx").on(table.companyId, table.originKind, table.originId),
+    deliveryRequirementCheck: check(
+      "routines_delivery_requirement_check",
+      sql`${table.deliveryRequirement} in ('repository_delivery', 'record_only')`,
+    ),
   }),
 );
 
@@ -114,6 +127,9 @@ export const routineTriggers = pgTable(
     kind: text("kind").notNull(),
     label: text("label"),
     enabled: boolean("enabled").notNull().default(true),
+    setupPending: boolean("setup_pending").notNull().default(false),
+    archived: boolean("archived").notNull().default(false),
+    lastWebhookDelivery: jsonb("last_webhook_delivery").$type<RoutineWebhookDelivery>(),
     cronExpression: text("cron_expression"),
     timezone: text("timezone"),
     nextRunAt: timestamp("next_run_at", { withTimezone: true }),
@@ -176,3 +192,14 @@ export const routineRuns = pgTable(
     idempotencyIdx: index("routine_runs_trigger_idempotency_idx").on(table.triggerId, table.idempotencyKey),
   }),
 );
+
+// Content-free receipts prevent sender retries of setup tests from starting work after activation.
+export const routineWebhookTestReceipts = pgTable("routine_webhook_test_receipts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+  triggerId: uuid("trigger_id").notNull().references(() => routineTriggers.id, { onDelete: "cascade" }),
+  deliveryKeyHash: text("delivery_key_hash").notNull(),
+  receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+  deliveryUq: uniqueIndex("routine_webhook_test_receipts_delivery_uq").on(table.triggerId, table.deliveryKeyHash),
+}));

@@ -1,3 +1,5 @@
+import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
+import { externalConversationStateSql, nonIdleSlackIssueCondition, resumeSlackConversation } from "./slack-conversation-state.js";
 import { documentService } from "./documents.js";
 import { parseTaskSearch, taskSearchCtes, taskSearchScore } from "./task-search.js";
 import { createdFromIssueCondition } from "./issue-creation-origin.js";
@@ -11,12 +13,14 @@ import {
   desc,
   eq,
   gt,
+  getTableColumns,
   gte,
   inArray,
   isNotNull,
   isNull,
   like,
   lt,
+  lte,
   ne,
   notExists,
   notInArray,
@@ -62,6 +66,8 @@ import {
   issueReadStates,
   issueThreadInteractions,
   toolActionRequests,
+  toolActionDeliveries,
+  toolInvocations,
   issues,
   labels,
   projectWorkspaces,
@@ -154,6 +160,10 @@ import {
 } from "./parent-edge-close-ladder-gate.js";
 import { edgeCarriesLadderCarveOutLabel } from "./laddered-child-eligibility.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import {
+  assertAssigneeWriteDoesNotSelfSatisfyReviewStage,
+  assertWikiHandoffWriteIntegrity,
+} from "./issue-assignee-review-gate.js";
 import {
   type CurrentUserRedactionOptions,
   redactCurrentUserText,
@@ -256,6 +266,7 @@ import { isTransactionHandle } from "./db-handle.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
+import { findLiveIssueExecutionHolder } from "./issue-execution-lease.js";
 
 const ALL_ISSUE_STATUSES = [
   "backlog",
@@ -1253,6 +1264,7 @@ export async function resolveChatOriginPublicationBindings(
     const run = await dbOrTx
       .select({
         agentId: heartbeatRuns.agentId,
+        responsibleUserId: heartbeatRuns.responsibleUserId,
         contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
@@ -1266,6 +1278,7 @@ export async function resolveChatOriginPublicationBindings(
         (
           rows: Array<{
             agentId: string;
+            responsibleUserId: string | null;
             contextSnapshot: Record<string, unknown> | null;
           }>,
         ) => rows[0] ?? null,
@@ -1279,6 +1292,12 @@ export async function resolveChatOriginPublicationBindings(
       readStringFromRecord(snapshot, "issueId") ??
       readStringFromRecord(snapshot, "taskId");
     if (snapshotIssueId && snapshotIssueId !== issueId) return [];
+
+    const boardBindings = await slackBoardReplyBindings(dbOrTx, {
+      companyId, issueId, agentId: lineageAgentId!,
+      commentIds: readChatWakeCommentIds(snapshot), userId: run.responsibleUserId,
+    });
+    if (boardBindings.length) return boardBindings;
 
     // A native runner can emit its continuation immediately after the durable
     // `request.resolve` command is queued, before the delivery worker records
@@ -1424,6 +1443,51 @@ export async function resolveChatOriginPublicationBindings(
     }
 
     const contextSource = readStringFromRecord(snapshot, "source");
+    if (contextSource === "tool_action_review") {
+      // Review results use their own durable wake, not the ordinary interaction
+      // response key. Attest the entire batch before following its origin; the
+      // model's context/sourceRunId alone never grants publication authority.
+      const [wake] = await dbOrTx.select({ payload: agentWakeupRequests.payload,
+        idempotencyKey: agentWakeupRequests.idempotencyKey })
+        .from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, lineageAgentId!),
+          eq(agentWakeupRequests.runId, originRunId),
+          like(agentWakeupRequests.idempotencyKey, "tool-action-response:%"),
+        )).limit(1);
+      const requestIds = wake?.payload?.toolActionRequestIds;
+      const sourceRunId = readStringFromRecord(snapshot, "sourceRunId");
+      if (!Array.isArray(requestIds) || requestIds.length === 0 ||
+        requestIds.some((id: unknown) => typeof id !== "string" || !isUuidLike(id)) ||
+        !sourceRunId || !isUuidLike(sourceRunId) || sourceRunId !== wake.payload.sourceRunId ||
+        wake.idempotencyKey !== `tool-action-response:${requestIds[0]}` ||
+        snapshot.interactionId !== wake.payload.interactionId) return [];
+      const receipts = await dbOrTx.select({ id: toolActionRequests.id })
+        .from(toolActionRequests)
+        .innerJoin(toolInvocations, and(
+          eq(toolInvocations.id, toolActionRequests.invocationId),
+          eq(toolInvocations.companyId, companyId),
+          eq(toolInvocations.issueId, issueId),
+          eq(toolInvocations.agentId, lineageAgentId!),
+          eq(toolInvocations.runId, sourceRunId),
+        ))
+        .innerJoin(toolActionDeliveries, and(
+          eq(toolActionDeliveries.actionRequestId, toolActionRequests.id),
+          eq(toolActionDeliveries.companyId, companyId),
+          eq(toolActionDeliveries.issueId, issueId),
+          eq(toolActionDeliveries.interactionId, toolActionRequests.interactionId),
+        ))
+        .where(and(
+          eq(toolActionRequests.companyId, companyId),
+          eq(toolActionRequests.issueId, issueId),
+          eq(toolActionRequests.requestedByAgentId, lineageAgentId!),
+          inArray(toolActionRequests.id, requestIds),
+          inArray(toolActionRequests.status, ["executed", "failed", "rejected", "expired", "cancelled"]),
+        ));
+      if (receipts.length !== requestIds.length) return [];
+      originRunId = sourceRunId;
+      continue;
+    }
     if (contextSource?.startsWith("chat:")) {
       contextSnapshot = snapshot;
       break;
@@ -1910,14 +1974,22 @@ export interface IssueFilters {
   q?: string;
   limit?: number;
   offset?: number;
-  sortField?: "created" | "updated" | "id";
+  sortField?: "created" | "updated" | "id" | "completed";
   afterId?: string;
   sortDir?: "asc" | "desc";
   /** ISO 8601 timestamp — only return issues with updatedAt strictly after this value. */
   updatedSince?: string;
+  /**
+   * ISO 8601 timestamps — inclusive completion window on issues.completedAt.
+   * A completion window (either bound, or sortField=completed) is a census
+   * query: it includes plugin-operation and routine-execution rows without
+   * requiring unrelated filters, unlike ordinary list reads.
+   */
+  completedAfter?: string;
+  completedBefore?: string;
 }
 
-type IssueRow = typeof issues.$inferSelect;
+type IssueRow = typeof issues.$inferSelect & { externalConversationState?: "active" | "waiting" | null };
 type IssueLabelRow = typeof labels.$inferSelect;
 type IssuePlanDecompositionRow = typeof issuePlanDecompositions.$inferSelect;
 type IssueActiveRunRow = {
@@ -2072,6 +2144,8 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   actorResponsibleUserId?: string | null;
   trustExplicitResponsibleUserId?: boolean;
   trustExplicitExecutionPolicy?: boolean;
+  /** Internal only: set by routine dispatch when it re-applies the routine's stored policy; not part of any API schema. */
+  reapplyStoredExecutionPolicy?: boolean;
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
   onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
@@ -3108,18 +3182,34 @@ export async function listUnresolvedBlockerIssueIds(
 ) {
   const uniqueBlockerIssueIds = [...new Set(blockerIssueIds.filter(Boolean))];
   if (uniqueBlockerIssueIds.length === 0) return [];
-  return dbOrTx
-    .select({ id: issues.id })
+  const blockerRows = await dbOrTx
+    .select({
+      id: issues.id,
+      status: issues.status,
+      executionWorkspaceId: issues.executionWorkspaceId,
+    })
     .from(issues)
     .where(
       and(
         eq(issues.companyId, companyId),
         inArray(issues.id, uniqueBlockerIssueIds),
-        // Cancelled blockers intentionally remain unresolved until the relation changes.
-        ne(issues.status, "done"),
       ),
+    );
+  const pendingFinalizeBlockerIssueIds = await listPendingFinalizeBlockerIssueIds(
+    dbOrTx,
+    companyId,
+    blockerRows.flatMap((row) =>
+      row.status === "done" && row.executionWorkspaceId
+        ? [{ blockerIssueId: row.id, executionWorkspaceId: row.executionWorkspaceId }]
+        : []
+    ),
+  );
+  return blockerRows
+    .filter((row) =>
+      row.status !== "done" ||
+      (row.executionWorkspaceId !== null && pendingFinalizeBlockerIssueIds.has(row.id))
     )
-    .then((rows) => rows.map((row) => row.id));
+    .map((row) => row.id);
 }
 async function getProjectDefaultGoalId(
   db: ProjectGoalReader,
@@ -3551,6 +3641,14 @@ function shouldIncludePluginOperationIssues(filters: IssueFilters | undefined) {
   );
 }
 
+function isCompletionWindowQuery(filters: IssueFilters | undefined) {
+  return Boolean(
+    filters?.completedAfter ||
+      filters?.completedBefore ||
+      filters?.sortField === "completed",
+  );
+}
+
 export function deriveIssueUserContext(
   issue: IssueUserContextInput,
   userId: string,
@@ -3673,6 +3771,14 @@ function issueListOrderBy(
   },
 ) {
   if (sortField === "id") return [sortDir === "desc" ? desc(issues.id) : asc(issues.id)];
+  if (sortField === "completed") {
+    const completedOrder =
+      sortDir === "asc"
+        ? sql`${issues.completedAt} asc nulls last`
+        : sql`${issues.completedAt} desc nulls last`;
+    const idOrder = sortDir === "asc" ? asc(issues.id) : desc(issues.id);
+    return hasSearch ? [asc(searchOrder), completedOrder, idOrder] : [completedOrder, idOrder];
+  }
   if (sortField === "created") {
     const createdOrder = sortDir === "asc" ? asc(issues.createdAt) : desc(issues.createdAt);
     const idOrder = sortDir === "asc" ? asc(issues.id) : desc(issues.id);
@@ -5032,7 +5138,7 @@ async function listIssueReviewAttentionMap(
         .select()
         .from(issues)
         .where(
-          and(eq(issues.companyId, companyId), inArray(issues.id, chunk)),
+          and(eq(issues.companyId, companyId), inArray(issues.id, chunk), nonIdleSlackIssueCondition()),
         )),
     );
   }
@@ -5409,6 +5515,7 @@ async function listIssueReviewAttentionMap(
 }
 
 const issueListSelect = {
+  externalConversationState: externalConversationStateSql(),
   conversationAgentId: issues.conversationAgentId,
   conversationUserId: issues.conversationUserId,
   conversationState: issues.conversationState,
@@ -7113,6 +7220,27 @@ export function guardBRefusalCommentLockKey(issueId: string): string {
   return `issue-comment:guard-b-arming-refusal:${issueId}`;
 }
 
+/**
+ * R20: a stall arbiter named by a policy write must be able to take work: an
+ * assignable agent of this company (missing, cross-company, pending,
+ * terminated or bad-chain agents are refused by assertAssignableAgent) that is
+ * not paused, because a stalled stage handed to a paused agent would not move.
+ */
+async function assertStallArbiterCanTakeWork(db: Db, companyId: string, agentId: string): Promise<void> {
+  await assertAssignableAgent(db, companyId, agentId, { kind: "work" });
+  const status = await db
+    .select({ status: agents.status })
+    .from(agents)
+    .where(eq(agents.id, agentId))
+    .then((rows) => rows[0]?.status ?? null);
+  if (status === "paused") {
+    throw conflict(
+      `executionPolicy.stallEscalation.toAgentId ${agentId} is paused; a stalled review would be handed to an agent that does not run. Resume the agent or name another arbiter.`,
+      { code: "stall_arbiter_paused", field: "stallEscalation.toAgentId", agentId, companyId },
+    );
+  }
+}
+
 async function assertIssueExecutionPolicyAgentReferencesResolve(
   db: Pick<Db, "select">,
   companyId: string,
@@ -7134,6 +7262,14 @@ async function assertIssueExecutionPolicyAgentReferencesResolve(
       stageType: "review",
     });
   }
+  // stageIndex sentinels: -1 names the return assignee, -2 the R20 stall arbiter.
+  if (policy.stallEscalation) {
+    references.push({
+      agentId: policy.stallEscalation.toAgentId,
+      stageIndex: -2,
+      stageType: "review",
+    });
+  }
   if (references.length === 0) return;
 
   const agentIds = [...new Set(references.map((reference) => reference.agentId))];
@@ -7152,6 +7288,16 @@ async function assertIssueExecutionPolicyAgentReferencesResolve(
       `executionPolicy.returnAssigneeAgentId ${unresolved.agentId} does not resolve to an agent in company ${companyId}`,
       {
         field: "returnAssigneeAgentId",
+        agentId: unresolved.agentId,
+        companyId,
+      },
+    );
+  }
+  if (unresolved.stageIndex === -2) {
+    throw unprocessable(
+      `executionPolicy.stallEscalation.toAgentId ${unresolved.agentId} does not resolve to an agent in company ${companyId}`,
+      {
+        field: "stallEscalation.toAgentId",
         agentId: unresolved.agentId,
         companyId,
       },
@@ -7186,7 +7332,7 @@ export function issueService(db: Db) {
 
   async function getIssueByUuid(id: string) {
     const row = await db
-      .select()
+      .select({ ...getTableColumns(issues), externalConversationState: externalConversationStateSql() })
       .from(issues)
       .where(eq(issues.id, id))
       .then((rows) => rows[0] ?? null);
@@ -7197,7 +7343,7 @@ export function issueService(db: Db) {
 
   async function getIssueByIdentifier(identifier: string) {
     const row = await db
-      .select()
+      .select({ ...getTableColumns(issues), externalConversationState: externalConversationStateSql() })
       .from(issues)
       .where(eq(issues.identifier, identifier.toUpperCase()))
       .then((rows) => rows[0] ?? null);
@@ -8106,7 +8252,7 @@ export function issueService(db: Db) {
    * returns the same fields; this just saves the caller a round trip it has
    * historically not made.
    */
-  async function loadRunOwnershipLiveness(runId: string, dbOrTx: DbReader = db) {
+  async function loadRunOwnershipLiveness(runId: string, issueId: string, dbOrTx: DbReader = db) {
     return dbOrTx
       .select({
         id: heartbeatRuns.id,
@@ -8116,7 +8262,8 @@ export function issueService(db: Db) {
         finishedAt: heartbeatRuns.finishedAt,
       })
       .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
+      .innerJoin(issues, eq(heartbeatRuns.companyId, issues.companyId))
+      .where(and(eq(heartbeatRuns.id, runId), eq(issues.id, issueId)))
       .then((rows) => rows[0] ?? null);
   }
 
@@ -8134,11 +8281,12 @@ export function issueService(db: Db) {
     actorAgentId: string;
     actorRunId: string;
     expectedCheckoutRunId: string;
-  }) {
-    return db.transaction(async (tx) => {
+  }, dbOrTx: Db | DbTransaction = db) {
+    return dbOrTx.transaction(async (tx) => {
       const lockedIssue = await tx
         .select({
           id: issues.id,
+          companyId: issues.companyId,
           status: issues.status,
           assigneeAgentId: issues.assigneeAgentId,
           checkoutRunId: issues.checkoutRunId,
@@ -8162,17 +8310,17 @@ export function issueService(db: Db) {
 
       await Promise.all([
         tx.execute(
-          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.expectedCheckoutRunId} for update`,
+          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.expectedCheckoutRunId} and ${heartbeatRuns.companyId} = ${lockedIssue.companyId} for update`,
         ),
         tx.execute(
-          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
+          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} and ${heartbeatRuns.companyId} = ${lockedIssue.companyId} for update`,
         ),
       ]);
       const [existingRun, actorRun] = await Promise.all([
         tx
           .select({ status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt })
           .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, input.expectedCheckoutRunId))
+          .where(and(eq(heartbeatRuns.id, input.expectedCheckoutRunId), eq(heartbeatRuns.companyId, lockedIssue.companyId)))
           .then((rows) => rows[0] ?? null),
         tx
           .select({
@@ -8181,7 +8329,7 @@ export function issueService(db: Db) {
             contextSnapshot: heartbeatRuns.contextSnapshot,
           })
           .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, input.actorRunId))
+          .where(and(eq(heartbeatRuns.id, input.actorRunId), eq(heartbeatRuns.companyId, lockedIssue.companyId)))
           .then((rows) => rows[0] ?? null),
       ]);
       const stale = !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status) || isUnstartedScheduledRetry(existingRun);
@@ -8196,6 +8344,10 @@ export function issueService(db: Db) {
         ? readRunContextIssueId(actorRun.contextSnapshot)
         : null;
       if (actorRunIssueId && actorRunIssueId !== input.issueId) {
+        return { adopted: null, latest: lockedIssue };
+      }
+      const liveHolder = await findLiveIssueExecutionHolder(tx, lockedIssue.companyId, input.issueId);
+      if (liveHolder && liveHolder.runId !== input.actorRunId) {
         return { adopted: null, latest: lockedIssue };
       }
 
@@ -8249,8 +8401,11 @@ export function issueService(db: Db) {
     actorRunId: string;
   }) {
     return db.transaction(async (tx) => {
+      const lockedIssue = await tx.select({ companyId: issues.companyId }).from(issues)
+        .where(eq(issues.id, input.issueId)).for("update").then((rows) => rows[0] ?? null);
+      if (!lockedIssue) return null;
       await tx.execute(
-        sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
+        sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} and ${heartbeatRuns.companyId} = ${lockedIssue.companyId} for update`,
       );
       const actorRun = await tx
         .select({
@@ -8258,7 +8413,7 @@ export function issueService(db: Db) {
           contextSnapshot: heartbeatRuns.contextSnapshot,
         })
         .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, input.actorRunId))
+        .where(and(eq(heartbeatRuns.id, input.actorRunId), eq(heartbeatRuns.companyId, lockedIssue.companyId)))
         .then((rows) => rows[0] ?? null);
       if (!actorRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status))
         return null;
@@ -8269,6 +8424,8 @@ export function issueService(db: Db) {
       // with its own run id, corrupting both of B's pointers.
       const actorRunIssueId = readRunContextIssueId(actorRun.contextSnapshot);
       if (actorRunIssueId && actorRunIssueId !== input.issueId) return null;
+      const liveHolder = await findLiveIssueExecutionHolder(tx, lockedIssue.companyId, input.issueId);
+      if (liveHolder && liveHolder.runId !== input.actorRunId) return null;
 
       const now = new Date();
       const adopted = await tx
@@ -8568,7 +8725,12 @@ export function issueService(db: Db) {
       ];
       if (filters?.ids) conditions.push(inArray(issues.id, [...filters.ids]));
       if (filters?.identifiers) conditions.push(inArray(issues.identifier, [...filters.identifiers]));
-      if (!filters?.q?.trim()) conditions.push(isNull(issues.conversationAgentId));
+      if (!filters?.q?.trim()) {
+        conditions.push(isNull(issues.conversationAgentId));
+        if (!filters?.touchedByUserId && !filters?.unreadForUserId && !filters?.inboxArchivedByUserId) {
+          conditions.push(nonIdleSlackIssueCondition());
+        }
+      }
       if (filters?.afterId) conditions.push(gt(issues.id, filters.afterId));
       const assigneeAgentFilter = parseIssueAssigneeAgentFilter(filters?.assigneeAgentId);
       assertValidAssigneeAgentFilter(assigneeAgentFilter);
@@ -8683,7 +8845,10 @@ export function issueService(db: Db) {
           hasPlanDocumentCondition(companyId, filters.hasPlanDocument),
         );
       }
-      if (!shouldIncludePluginOperationIssues(filters)) {
+      if (
+        !shouldIncludePluginOperationIssues(filters) &&
+        !isCompletionWindowQuery(filters)
+      ) {
         conditions.push(nonPluginOperationIssueCondition());
       }
       if (filters?.labelId) {
@@ -8708,6 +8873,20 @@ export function issueService(db: Db) {
         const since = new Date(filters.updatedSince);
         if (Number.isFinite(since.getTime())) {
           conditions.push(gt(issues.updatedAt, since));
+        }
+      }
+      if (filters?.completedAfter || filters?.completedBefore) {
+        if (filters?.completedAfter) {
+          const completedAfter = new Date(filters.completedAfter);
+          if (Number.isFinite(completedAfter.getTime())) {
+            conditions.push(gte(issues.completedAt, completedAfter));
+          }
+        }
+        if (filters?.completedBefore) {
+          const completedBefore = new Date(filters.completedBefore);
+          if (Number.isFinite(completedBefore.getTime())) {
+            conditions.push(lte(issues.completedAt, completedBefore));
+          }
         }
       }
       if (
@@ -8899,7 +9078,12 @@ export function issueService(db: Db) {
         eq(issues.companyId, companyId),
         filters?.includeHidden === true ? isNull(issues.harnessKind) : visibleIssueCondition(),
       ];
-      if (!filters?.q?.trim()) conditions.push(isNull(issues.conversationAgentId));
+      if (!filters?.q?.trim()) {
+        conditions.push(isNull(issues.conversationAgentId));
+        if (!filters?.touchedByUserId && !filters?.unreadForUserId && !filters?.inboxArchivedByUserId) {
+          conditions.push(nonIdleSlackIssueCondition());
+        }
+      }
       const statuses = parseStatusFilter(filters?.status);
       if (statuses.length === 1)
         conditions.push(eq(issues.status, statuses[0]!));
@@ -9711,6 +9895,15 @@ export function issueService(db: Db) {
       };
     },
 
+    // Route-level block-intent validation resolves the requested blocker set
+    // through the service object so fully-mocking route tests can stub it
+    // alongside getDependencyReadiness instead of a module-level import.
+    listUnresolvedBlockerIssueIds: async (
+      companyId: string,
+      blockerIssueIds: string[],
+      dbOrTx: any = db,
+    ) => listUnresolvedBlockerIssueIds(dbOrTx, companyId, blockerIssueIds),
+
     getDependencyReadiness: async (issueId: string, dbOrTx: any = db) => {
       const issue = await dbOrTx
         .select({ id: issues.id, companyId: issues.companyId })
@@ -10426,6 +10619,7 @@ export function issueService(db: Db) {
         actorResponsibleUserId,
         trustExplicitResponsibleUserId,
         trustExplicitExecutionPolicy,
+        reapplyStoredExecutionPolicy,
         idempotencyKey: rawIdempotencyKey,
         allowDuplicate,
         onDeduplicated,
@@ -10469,6 +10663,10 @@ export function issueService(db: Db) {
         issueData.executionPolicy = (normalizedPolicy as Record<string, unknown> | null) ?? null;
         if (normalizedPolicy?.returnAssigneeAgentId) {
           await assertAssignableAgent(db, companyId, normalizedPolicy.returnAssigneeAgentId, { kind: "work" });
+        }
+        // A routine re-applies its stored policy; an arbiter paused since it was saved must not stop the dispatch.
+        if (normalizedPolicy?.stallEscalation && reapplyStoredExecutionPolicy !== true) {
+          await assertStallArbiterCanTakeWork(db, companyId, normalizedPolicy.stallEscalation.toAgentId);
         }
       }
       // Activities logged inside the create transaction must not publish until the
@@ -11609,6 +11807,13 @@ export function issueService(db: Db) {
          * from a request body.
          */
         systemWorkspaceBinding?: boolean;
+        /**
+         * Internal only. Set when the execution-policy transition owns the
+         * assignee written in this update. The persisted assignee is the active
+         * review participant, not an explicit request write, so the
+         * self-satisfying review-stage gate does not apply to it.
+         */
+        workflowControlledAssignment?: boolean;
         companyGuard?: string;
         /**
          * Internal only. Optimistic concurrency token for PATCH /api/issues/:id.
@@ -11665,6 +11870,7 @@ export function issueService(db: Db) {
         systemWorkspaceBinding,
         companyGuard,
         expectedUpdatedAt,
+        workflowControlledAssignment,
         ...issueData
       } = data;
       if (
@@ -11925,6 +12131,20 @@ export function issueService(db: Db) {
         if (normalizedPolicy?.returnAssigneeAgentId) {
           await assertAssignableAgent(dbOrTx as Db, existing.companyId, normalizedPolicy.returnAssigneeAgentId, { kind: "work" });
         }
+        // Only an arbiter this write introduces is checked: an arbiter paused or
+        // terminated after it was set must not block unrelated policy writes
+        // (monitor re-arms); the hand-off itself skips an unavailable arbiter.
+        const storedStall = existing.executionPolicy?.stallEscalation;
+        const storedArbiterId =
+          storedStall && typeof storedStall === "object" && "toAgentId" in storedStall && typeof storedStall.toAgentId === "string"
+            ? storedStall.toAgentId.toLowerCase()
+            : null;
+        if (
+          normalizedPolicy?.stallEscalation &&
+          normalizedPolicy.stallEscalation.toAgentId !== storedArbiterId
+        ) {
+          await assertStallArbiterCanTakeWork(dbOrTx as Db, existing.companyId, normalizedPolicy.stallEscalation.toAgentId);
+        }
       }
       let nextProjectId = issueData.projectId !== undefined ? issueData.projectId : existing.projectId;
       const nextProjectWorkspaceId =
@@ -11952,6 +12172,10 @@ export function issueService(db: Db) {
           ? { ...nextExecutionWorkspaceSettings }
           : null;
       }
+      // These validation reads run on `dbOrTx`. Inside a transactional update
+      // a read on the pool-wide `db` would wait for a second connection while
+      // the transaction holds its first, so more concurrent transactional
+      // updates than the pool has connections wedged the whole process.
       let validatedProjectWorkspace: { projectId: string } | null = null;
       let validatedExecutionWorkspace: { projectId: string } | null = null;
       if (!nextProjectId && nextProjectWorkspaceId) {
@@ -11959,6 +12183,7 @@ export function issueService(db: Db) {
           existing.companyId,
           null,
           nextProjectWorkspaceId,
+          dbOrTx,
         );
         validatedProjectWorkspace = workspace;
         nextProjectId = workspace.projectId;
@@ -11969,6 +12194,7 @@ export function issueService(db: Db) {
           existing.companyId,
           null,
           nextExecutionWorkspaceId,
+          dbOrTx,
         );
         validatedExecutionWorkspace = workspace;
         nextProjectId = workspace.projectId;
@@ -11980,6 +12206,7 @@ export function issueService(db: Db) {
             existing.companyId,
             nextProjectId,
             nextProjectWorkspaceId,
+            dbOrTx,
           );
         }
       }
@@ -11989,6 +12216,7 @@ export function issueService(db: Db) {
             existing.companyId,
             nextProjectId,
             nextExecutionWorkspaceId,
+            dbOrTx,
           );
         }
       }
@@ -12086,6 +12314,76 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // Skip the Wiki handoff guard only when every present key is status or
+        // blocker bookkeeping. Any other key, including assigneeUserId, is an
+        // assignee or identity write and still runs the guard.
+        // status: blockIssueWithUnresolvedBlockers, blocked-without-blockers heal,
+        //   dispatch-suppression park, todo-stranded park, escalateDispositionRepair
+        // blockedByIssueIds: blockIssueWithUnresolvedBlockers,
+        //   resolveContinuationWaitingOnReview, reconcileActiveRecoveryActions
+        // lastStatusDecisionId: dismissObsoleteNativePolicyReviews (with status and
+        //   unblockDescriptor)
+        // unblockDescriptor: repairNativeBlockedWait
+        // companyGuard: blockIssueWithUnresolvedBlockers company scope
+        const wikiHandoffUnguardedWriteKeys = new Set([
+          "status",
+          "blockedByIssueIds",
+          "lastStatusDecisionId",
+          "unblockDescriptor",
+          "companyGuard",
+        ]);
+        const presentWriteKeys = Object.entries(data)
+          .filter(([, value]) => value !== undefined)
+          .map(([key]) => key);
+        const wikiHandoffIdentityWrite = presentWriteKeys.some(
+          (key) => !wikiHandoffUnguardedWriteKeys.has(key),
+        );
+        if (wikiHandoffIdentityWrite) {
+          await assertWikiHandoffWriteIntegrity({
+            db: tx as Db,
+            companyId: receiptExisting.companyId,
+            issue: {
+              title:
+                issueData.title !== undefined ? issueData.title : receiptExisting.title,
+              description:
+                issueData.description !== undefined
+                  ? issueData.description
+                  : receiptExisting.description,
+              executionPolicy:
+                issueData.executionPolicy !== undefined
+                  ? issueData.executionPolicy
+                  : receiptExisting.executionPolicy,
+              executionState:
+                issueData.executionState !== undefined
+                  ? issueData.executionState
+                  : receiptExisting.executionState,
+            },
+            incomingAssigneeAgentId:
+              issueData.assigneeAgentId !== undefined
+                ? issueData.assigneeAgentId
+                : receiptExisting.assigneeAgentId,
+            actorAgentId,
+            currentAssigneeAgentId: receiptExisting.assigneeAgentId,
+            checkReviewStage: false,
+            workflowControlledAssignment,
+          });
+        }
+        if (
+          issueData.assigneeAgentId !== undefined &&
+          !workflowControlledAssignment
+        ) {
+          assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
+            executionPolicy:
+              issueData.executionPolicy !== undefined
+                ? issueData.executionPolicy
+                : receiptExisting.executionPolicy,
+            executionState:
+              issueData.executionState !== undefined
+                ? issueData.executionState
+                : receiptExisting.executionState,
+            incomingAssigneeAgentId: issueData.assigneeAgentId,
+          });
+        }
         if (actorAgentId && patch.status === "done") {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });
@@ -12120,6 +12418,12 @@ export function issueService(db: Db) {
           projectGoalId: nextProjectGoalId,
           defaultGoalId: defaultCompanyGoal?.id ?? null,
         });
+        // Ownership changes invalidate observed handoff versions even if status
+        // stays the same, including an A -> B -> A assignment race.
+        if ((issueData.assigneeAgentId !== undefined && issueData.assigneeAgentId !== receiptExisting.assigneeAgentId)
+          || (issueData.assigneeUserId !== undefined && issueData.assigneeUserId !== receiptExisting.assigneeUserId)) {
+          patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
+        }
         // Reasserting Blocked or changing its blockers is a fresh decision even
         // when the status string stays the same. Invalidate recovery's prior
         // status receipt without treating comment recency as blocking intent.
@@ -12128,6 +12432,28 @@ export function issueService(db: Db) {
               (issueData.status === undefined &&
                 (blockedByIssueIds !== undefined || issueData.unblockDescriptor !== undefined)))) {
           patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
+        }
+        if (
+          patch.executionRunId === null &&
+          (patch.status ?? receiptExisting.status) !== "done" &&
+          (patch.status ?? receiptExisting.status) !== "cancelled" &&
+          ((patch.assigneeAgentId !== undefined && patch.assigneeAgentId !== receiptExisting.assigneeAgentId) ||
+            (patch.assigneeUserId !== undefined && patch.assigneeUserId !== receiptExisting.assigneeUserId)) &&
+          (receiptExisting.executionRunId || receiptExisting.checkoutRunId)
+        ) {
+          const holder = await findLiveIssueExecutionHolder(tx as Db, receiptExisting.companyId, id);
+          if (
+            holder?.status === "running" &&
+            (holder.runId === receiptExisting.executionRunId || holder.runId === receiptExisting.checkoutRunId)
+          ) {
+            // Assignment permission changes now; execution admission waits for
+            // this resolved holder's actual stop, including a failed cancel.
+            const sameExecution = holder.runId === receiptExisting.executionRunId;
+            patch.executionRunId = holder.runId;
+            patch.executionAgentNameKey = sameExecution ? receiptExisting.executionAgentNameKey : null;
+            patch.executionLockedAt =
+              (sameExecution ? receiptExisting.executionLockedAt : null) ?? holder.startedAt ?? patch.updatedAt;
+          }
         }
         // The version predicate is part of this UPDATE, not a check before it.
         // A concurrent writer that commits first changes updated_at, this
@@ -12154,13 +12480,21 @@ export function issueService(db: Db) {
           }
           return null;
         }
+        // An operator explicitly choosing a disposition owns that decision,
+        // including choosing In Review while the conversation is Idle.
+        if (actorUserId && issueData.status !== undefined) {
+          await tx.update(chatConversations).set({ state: "active", updatedAt: new Date() })
+            .where(and(eq(chatConversations.companyId, updated.companyId), eq(chatConversations.issueId, updated.id),
+              eq(chatConversations.state, "waiting"), sql`exists (select 1 from chat_endpoints e
+                where e.id = ${chatConversations.endpointId} and e.company_id = ${chatConversations.companyId} and e.provider = 'slack')`));
+        }
         if (updated.assigneeAgentId !== existing.assigneeAgentId || updated.assigneeUserId !== existing.assigneeUserId) {
           const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
           await issueThreadInteractionService(tx).expireConnectionIntentsForOwnershipChange(updated);
         }
-        if (existing.status !== updated.status) {
+        if (receiptExisting.status !== updated.status) {
           if (
-            (existing.status === "done" || existing.status === "cancelled") &&
+            (receiptExisting.status === "done" || receiptExisting.status === "cancelled") &&
             updated.status !== "done" &&
             updated.status !== "cancelled"
           ) {
@@ -12191,7 +12525,7 @@ export function issueService(db: Db) {
                 entityId: workspace.id,
                 details: {
                   sourceIssueId: updated.id,
-                  previousIssueStatus: existing.status,
+                  previousIssueStatus: receiptExisting.status,
                   nextIssueStatus: updated.status,
                   workspaceAction: "left_archived",
                 },
@@ -12199,6 +12533,31 @@ export function issueService(db: Db) {
             }
           }
           if (updated.status === "done" || updated.status === "cancelled") {
+            const cancelledAt = new Date();
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "cancelled",
+                finishedAt: cancelledAt,
+                error: "Issue closed before deferred execution",
+                updatedAt: cancelledAt,
+              })
+              .where(
+                and(
+                  eq(agentWakeupRequests.companyId, updated.companyId),
+                  eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                  wakeRequestTargetsIssue(updated.id),
+                  sql`not exists (
+                    select 1
+                    from jsonb_array_elements_text(
+                      coalesce(${agentWakeupRequests.payload}->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb)
+                    ) as wake_comment(id)
+                    join ${issueComments} on wake_comment.id = ${issueComments.id}::text
+                    where ${issueComments.issueId} = ${updated.id}
+                      and ${issueComments.authorUserId} is not null
+                  )`,
+                ),
+              );
             await finalizeSummarySlotsForTerminalIssue(tx, updated);
             // Every terminal transition funnels through here, including direct
             // service callers (tree control, recovery, pipelines, status cards)
@@ -12681,181 +13040,273 @@ export function issueService(db: Db) {
       await clearExecutionRunIfTerminal(id);
       await clearCheckoutRunIfTerminal(id);
 
-      if (checkoutRunId) {
-        // A card's execution pointers may only be stamped with a run whose own
-        // context names that same card. If the acting run's context names a
-        // different issue, stamping this card would record a foreign run in both
-        // `checkoutRunId` and `executionRunId`, leaving the card in a permanent
-        // false "mid-run" state and letting it falsely occupy the foreign run's
-        // workspace. Fail secure instead of corrupting the pointers.
-        const actingRunContextIssueId = await db
-          .select({
-            issueId: sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
-          })
-          .from(heartbeatRuns)
-          .where(
-            and(
-              eq(heartbeatRuns.id, checkoutRunId),
-              eq(heartbeatRuns.companyId, issueCompany.companyId),
-            ),
-          )
-          .then((rows) => rows[0]?.issueId ?? null);
-        if (actingRunContextIssueId && actingRunContextIssueId !== id) {
-          throw conflict("Issue checkout conflict", {
-            issueId: id,
-            checkoutRunId,
-            actingRunContextIssueId,
-            reason: "run_context_issue_mismatch",
+      return db.transaction(async (tx) => {
+        const lockedIssue = await tx.select({ status: issues.status }).from(issues)
+          .where(and(eq(issues.id, id), eq(issues.companyId, issueCompany.companyId)))
+          .for("update").then((rows) => rows[0] ?? null);
+        if (!lockedIssue) throw notFound("Issue not found");
+        if (lockedIssue.status === "done" || lockedIssue.status === "cancelled") {
+          throw conflict("Issue cannot be checked out because it is already closed", {
+            code: "checkout_refused_terminal_status", issueId: id, status: lockedIssue.status,
           });
         }
-      }
+        // Keep every acquisition read and fallback stamp on this connection.
+        const db = tx as unknown as Db;
 
-      const dependencyReadiness = await listIssueDependencyReadinessMap(
-        db,
-        issueCompany.companyId,
-        [id],
-      );
-      const readiness = dependencyReadiness.get(id);
-      const unresolvedBlockerIssueIds =
-        readiness?.unresolvedBlockerIssueIds ?? [];
-      if (unresolvedBlockerIssueIds.length > 0) {
-        const unresolvedBlockers = await listUnresolvedBlockerDetails(
+        if (checkoutRunId) {
+          // A card's execution pointers may only be stamped with a run whose own
+          // context names that same card. If the acting run's context names a
+          // different issue, stamping this card would record a foreign run in both
+          // `checkoutRunId` and `executionRunId`, leaving the card in a permanent
+          // false "mid-run" state and letting it falsely occupy the foreign run's
+          // workspace. Fail secure instead of corrupting the pointers.
+          const actingRun = await db
+            .select({
+              id: heartbeatRuns.id,
+              issueId: sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+            })
+            .from(heartbeatRuns)
+            .where(
+              and(
+                eq(heartbeatRuns.id, checkoutRunId),
+                eq(heartbeatRuns.companyId, issueCompany.companyId),
+              ),
+            )
+            .then((rows) => rows[0] ?? null);
+          if (!actingRun) {
+            throw conflict("Issue checkout conflict", { issueId: id, checkoutRunId, reason: "run_not_found" });
+          }
+          const actingRunContextIssueId = actingRun.issueId;
+          if (actingRunContextIssueId && actingRunContextIssueId !== id) {
+            throw conflict("Issue checkout conflict", {
+              issueId: id,
+              checkoutRunId,
+              actingRunContextIssueId,
+              reason: "run_context_issue_mismatch",
+            });
+          }
+        }
+
+        const liveExecutionRun = await findLiveIssueExecutionHolder(db, issueCompany.companyId, id);
+        if (liveExecutionRun && liveExecutionRun.runId !== checkoutRunId) {
+          throw conflict("Issue checkout conflict", {
+            issueId: id,
+            executionRunId: liveExecutionRun.runId,
+          });
+        }
+
+        const dependencyReadiness = await listIssueDependencyReadinessMap(
           db,
           issueCompany.companyId,
-          unresolvedBlockerIssueIds,
-          readiness?.pendingFinalizeBlockerIssueIds,
+          [id],
         );
-        throw unprocessable("Issue is blocked by unresolved blockers", {
-          unresolvedBlockerIssueIds,
-          unresolvedBlockers,
-        });
-      }
-
-      const sameRunAssigneeCondition = checkoutRunId
-        ? and(
-            eq(issues.assigneeAgentId, agentId),
-            or(
-              isNull(issues.checkoutRunId),
-              eq(issues.checkoutRunId, checkoutRunId),
-            ),
-          )
-        : and(
-            eq(issues.assigneeAgentId, agentId),
-            isNull(issues.checkoutRunId),
+        const readiness = dependencyReadiness.get(id);
+        const unresolvedBlockerIssueIds =
+          readiness?.unresolvedBlockerIssueIds ?? [];
+        if (unresolvedBlockerIssueIds.length > 0) {
+          const unresolvedBlockers = await listUnresolvedBlockerDetails(
+            db,
+            issueCompany.companyId,
+            unresolvedBlockerIssueIds,
+            readiness?.pendingFinalizeBlockerIssueIds,
           );
-      const executionLockCondition = checkoutRunId
-        ? or(
-            isNull(issues.executionRunId),
-            eq(issues.executionRunId, checkoutRunId),
-          )
-        : isNull(issues.executionRunId);
-      const updated = await db
-        .update(issues)
-        .set({
-          assigneeAgentId: agentId,
-          assigneeUserId: null,
-          checkoutRunId,
-          executionRunId: checkoutRunId,
-          status: checkoutStatusSql(agentId) as unknown as string,
-          startedAt: now,
-          // A card that is opened (or re-opened) into in_progress must never carry
-          // a completion timestamp; clear any stale one so no row is ever
-          // in_progress with a completedAt.
-          completedAt: null,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issues.id, id),
-            inArray(issues.status, expectedStatuses),
-            or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
-            executionLockCondition,
-          ),
-        )
-        .returning()
-        .then((rows) => rows[0] ?? null);
+          throw unprocessable("Issue is blocked by unresolved blockers", {
+            unresolvedBlockerIssueIds,
+            unresolvedBlockers,
+          });
+        }
 
-      if (updated) {
-        const [enriched] = await withIssueLabels(db, [updated]);
-        return enriched;
-      }
-
-      const current = await db
-        .select({
-          id: issues.id,
-          status: issues.status,
-          assigneeAgentId: issues.assigneeAgentId,
-          checkoutRunId: issues.checkoutRunId,
-          executionRunId: issues.executionRunId,
-        })
-        .from(issues)
-        .where(eq(issues.id, id))
-        .then((rows) => rows[0] ?? null);
-
-      if (!current) throw notFound("Issue not found");
-
-      // SUP-15888 / SUP-15832: the conditional write above can miss when a close
-      // commits after the guard read at the top of this function (the row is no
-      // longer in a live status by the time the WHERE clause re-evaluates). This
-      // fresh read sees the committed status, so if the card is now terminal,
-      // return the distinct refusal instead of the generic checkout conflict.
-      // This keeps the terminal refusal race-safe: a card that ends up closed is
-      // never re-opened by checkout, and the 409 carries the same distinct code
-      // as the guard read rather than a bare "Issue checkout conflict".
-      if (current.status === "done" || current.status === "cancelled") {
-        throw conflict("Issue cannot be checked out because it is already closed", {
-          code: "checkout_refused_terminal_status",
-          issueId: id,
-          status: current.status,
-        });
-      }
-
-      if (
-        current.assigneeAgentId === agentId &&
-        current.status === "in_progress" &&
-        current.checkoutRunId == null &&
-        (current.executionRunId == null ||
-          current.executionRunId === checkoutRunId) &&
-        checkoutRunId
-      ) {
-        const adopted = await db
+        const sameRunAssigneeCondition = checkoutRunId
+          ? and(
+              eq(issues.assigneeAgentId, agentId),
+              or(
+                isNull(issues.checkoutRunId),
+                eq(issues.checkoutRunId, checkoutRunId),
+              ),
+            )
+          : and(
+              eq(issues.assigneeAgentId, agentId),
+              isNull(issues.checkoutRunId),
+            );
+        const executionLockCondition = checkoutRunId
+          ? or(
+              isNull(issues.executionRunId),
+              eq(issues.executionRunId, checkoutRunId),
+            )
+          : isNull(issues.executionRunId);
+        const updated = await db
           .update(issues)
           .set({
+            assigneeAgentId: agentId,
+            assigneeUserId: null,
             checkoutRunId,
             executionRunId: checkoutRunId,
-            updatedAt: new Date(),
+            status: checkoutStatusSql(agentId) as unknown as string,
+            startedAt: now,
+            // A card that is opened (or re-opened) into in_progress must never carry
+            // a completion timestamp; clear any stale one so no row is ever
+            // in_progress with a completedAt.
+            completedAt: null,
+            updatedAt: now,
           })
           .where(
             and(
               eq(issues.id, id),
-              eq(issues.status, "in_progress"),
-              eq(issues.assigneeAgentId, agentId),
-              isNull(issues.checkoutRunId),
-              or(
-                isNull(issues.executionRunId),
-                eq(issues.executionRunId, checkoutRunId),
-              ),
+              inArray(issues.status, expectedStatuses),
+              or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
+              executionLockCondition,
             ),
           )
           .returning()
           .then((rows) => rows[0] ?? null);
-        if (adopted) return adopted;
-      }
 
-      if (
-        checkoutRunId &&
-        current.assigneeAgentId === agentId &&
-        current.status === "in_progress" &&
-        current.checkoutRunId &&
-        current.checkoutRunId !== checkoutRunId
-      ) {
-        const staleAdoption = await adoptStaleCheckoutRun({
-          issueId: id,
-          actorAgentId: agentId,
-          actorRunId: checkoutRunId,
-          expectedCheckoutRunId: current.checkoutRunId,
-        });
-        if (staleAdoption.adopted) {
+        if (updated) {
+          const [enriched] = await withIssueLabels(db, [updated]);
+          return enriched;
+        }
+
+        const current = await db
+          .select({
+            id: issues.id,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(eq(issues.id, id))
+          .then((rows) => rows[0] ?? null);
+
+        if (!current) throw notFound("Issue not found");
+
+        // SUP-15888 / SUP-15832: the conditional write above can miss when a close
+        // commits after the guard read at the top of this function (the row is no
+        // longer in a live status by the time the WHERE clause re-evaluates). This
+        // fresh read sees the committed status, so if the card is now terminal,
+        // return the distinct refusal instead of the generic checkout conflict.
+        // This keeps the terminal refusal race-safe: a card that ends up closed is
+        // never re-opened by checkout, and the 409 carries the same distinct code
+        // as the guard read rather than a bare "Issue checkout conflict".
+        if (current.status === "done" || current.status === "cancelled") {
+          throw conflict("Issue cannot be checked out because it is already closed", {
+            code: "checkout_refused_terminal_status",
+            issueId: id,
+            status: current.status,
+          });
+        }
+
+        if (
+          current.assigneeAgentId === agentId &&
+          current.status === "in_progress" &&
+          current.checkoutRunId == null &&
+          (current.executionRunId == null ||
+            current.executionRunId === checkoutRunId) &&
+          checkoutRunId
+        ) {
+          const adopted = await db
+            .update(issues)
+            .set({
+              checkoutRunId,
+              executionRunId: checkoutRunId,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(issues.id, id),
+                eq(issues.status, "in_progress"),
+                eq(issues.assigneeAgentId, agentId),
+                isNull(issues.checkoutRunId),
+                or(
+                  isNull(issues.executionRunId),
+                  eq(issues.executionRunId, checkoutRunId),
+                ),
+              ),
+            )
+            .returning()
+            .then((rows) => rows[0] ?? null);
+          if (adopted) return adopted;
+        }
+
+        if (
+          checkoutRunId &&
+          current.assigneeAgentId === agentId &&
+          current.status === "in_progress" &&
+          current.checkoutRunId &&
+          current.checkoutRunId !== checkoutRunId
+        ) {
+          const staleAdoption = await adoptStaleCheckoutRun({
+            issueId: id,
+            actorAgentId: agentId,
+            actorRunId: checkoutRunId,
+            expectedCheckoutRunId: current.checkoutRunId,
+          }, db);
+          if (staleAdoption.adopted) {
+            const row = await db
+              .select()
+              .from(issues)
+              .where(eq(issues.id, id))
+              .then((rows) => rows[0] ?? null);
+            if (!row) throw notFound("Issue not found");
+            const [enriched] = await withIssueLabels(db, [row]);
+            return enriched;
+          }
+        }
+
+        // Adopt stale executionRunId — if the execution lock points to a terminal/missing run, clear it and proceed.
+        // Only adopts when the caller's expectedStatuses guard still holds; preserves any existing assigneeUserId
+        // and preserves the original startedAt when the issue is already in_progress.
+        if (
+          checkoutRunId &&
+          current.executionRunId &&
+          current.executionRunId !== checkoutRunId &&
+          (current.assigneeAgentId === agentId || current.assigneeAgentId == null)
+        ) {
+          const stale = await isTerminalOrMissingHeartbeatRun(current.executionRunId, db);
+          if (stale) {
+            const now = new Date();
+            const adoptionSet: Record<string, unknown> = {
+              assigneeAgentId: agentId,
+              checkoutRunId,
+              executionRunId: checkoutRunId,
+              executionAgentNameKey: null,
+              executionLockedAt: now,
+              status: checkoutStatusSql(agentId),
+              // Re-opening into in_progress clears any stale completion timestamp.
+              completedAt: null,
+              updatedAt: now,
+            };
+            if (current.status !== "in_progress") {
+              adoptionSet.startedAt = now;
+            }
+            const adopted = await db
+              .update(issues)
+              .set(adoptionSet)
+              .where(
+                and(
+                  eq(issues.id, id),
+                  inArray(issues.status, expectedStatuses),
+                  eq(issues.executionRunId, current.executionRunId),
+                  or(
+                    isNull(issues.assigneeAgentId),
+                    eq(issues.assigneeAgentId, agentId),
+                  ),
+                ),
+              )
+              .returning()
+              .then((rows) => rows[0] ?? null);
+            if (adopted) {
+              const [enriched] = await withIssueLabels(db, [adopted]);
+              return enriched;
+            }
+          }
+        }
+
+        // If this run already owns it and it's in_progress, return it (no self-409)
+        if (
+          current.assigneeAgentId === agentId &&
+          current.status === "in_progress" &&
+          sameRunLock(current.checkoutRunId, checkoutRunId)
+        ) {
           const row = await db
             .select()
             .from(issues)
@@ -12865,79 +13316,14 @@ export function issueService(db: Db) {
           const [enriched] = await withIssueLabels(db, [row]);
           return enriched;
         }
-      }
 
-      // Adopt stale executionRunId — if the execution lock points to a terminal/missing run, clear it and proceed.
-      // Only adopts when the caller's expectedStatuses guard still holds; preserves any existing assigneeUserId
-      // and preserves the original startedAt when the issue is already in_progress.
-      if (
-        checkoutRunId &&
-        current.executionRunId &&
-        current.executionRunId !== checkoutRunId &&
-        (current.assigneeAgentId === agentId || current.assigneeAgentId == null)
-      ) {
-        const stale = await isTerminalOrMissingHeartbeatRun(current.executionRunId, db);
-        if (stale) {
-          const now = new Date();
-          const adoptionSet: Record<string, unknown> = {
-            assigneeAgentId: agentId,
-            checkoutRunId,
-            executionRunId: checkoutRunId,
-            executionAgentNameKey: null,
-            executionLockedAt: now,
-            status: checkoutStatusSql(agentId),
-            // Re-opening into in_progress clears any stale completion timestamp.
-            completedAt: null,
-            updatedAt: now,
-          };
-          if (current.status !== "in_progress") {
-            adoptionSet.startedAt = now;
-          }
-          const adopted = await db
-            .update(issues)
-            .set(adoptionSet)
-            .where(
-              and(
-                eq(issues.id, id),
-                inArray(issues.status, expectedStatuses),
-                eq(issues.executionRunId, current.executionRunId),
-                or(
-                  isNull(issues.assigneeAgentId),
-                  eq(issues.assigneeAgentId, agentId),
-                ),
-              ),
-            )
-            .returning()
-            .then((rows) => rows[0] ?? null);
-          if (adopted) {
-            const [enriched] = await withIssueLabels(db, [adopted]);
-            return enriched;
-          }
-        }
-      }
-
-      // If this run already owns it and it's in_progress, return it (no self-409)
-      if (
-        current.assigneeAgentId === agentId &&
-        current.status === "in_progress" &&
-        sameRunLock(current.checkoutRunId, checkoutRunId)
-      ) {
-        const row = await db
-          .select()
-          .from(issues)
-          .where(eq(issues.id, id))
-          .then((rows) => rows[0] ?? null);
-        if (!row) throw notFound("Issue not found");
-        const [enriched] = await withIssueLabels(db, [row]);
-        return enriched;
-      }
-
-      throw conflict("Issue checkout conflict", {
-        issueId: current.id,
-        status: current.status,
-        assigneeAgentId: current.assigneeAgentId,
-        checkoutRunId: current.checkoutRunId,
-        executionRunId: current.executionRunId,
+        throw conflict("Issue checkout conflict", {
+          issueId: current.id,
+          status: current.status,
+          assigneeAgentId: current.assigneeAgentId,
+          checkoutRunId: current.checkoutRunId,
+          executionRunId: current.executionRunId,
+        });
       });
     },
 
@@ -13083,8 +13469,8 @@ export function issueService(db: Db) {
       }) => {
         const holderRunId = details.checkoutRunId ?? details.executionRunId;
         const [checkoutRun, actorRun] = await Promise.all([
-          holderRunId ? loadRunOwnershipLiveness(holderRunId) : Promise.resolve(null),
-          actorRunId ? loadRunOwnershipLiveness(actorRunId) : Promise.resolve(null),
+          holderRunId ? loadRunOwnershipLiveness(holderRunId, details.issueId) : Promise.resolve(null),
+          actorRunId ? loadRunOwnershipLiveness(actorRunId, details.issueId) : Promise.resolve(null),
         ]);
         // Two live runs of one agent on one issue: the caller is not a stale
         // straggler racing a finished run, it is a duplicate that should never
@@ -13531,6 +13917,8 @@ export function issueService(db: Db) {
         createdAt?: Date | string | null;
         clientRequestId?: string;
         onIssueTouched?: (updatedAt: Date) => void;
+        /** Server-only: authenticated Paperclip messages also belong in the Slack thread. */
+        mirrorToSlack?: boolean;
       },
       dbOrTx: any = db,
     ): Promise<IssueComment> {
@@ -13552,6 +13940,10 @@ export function issueService(db: Db) {
           CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON
           ? retryNativeChatReviewPresentation(append)
           : append();
+      }
+      // Callers supplying a transaction still share the settlement fence.
+      if (actor.userId && isTransactionHandle(dbOrTx)) {
+        await dbOrTx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
       }
       const issue = await dbOrTx
         .select({ companyId: issues.companyId, conversationAgentId: issues.conversationAgentId })
@@ -14011,6 +14403,12 @@ export function issueService(db: Db) {
       if (issue.conversationAgentId && actor.userId) {
         await dbOrTx.update(issues).set({ conversationState: "active" }).where(eq(issues.id, issueId));
       }
+      if (options?.mirrorToSlack && actor.userId && authorType === "user") {
+        await mirrorSlackBoardComment(dbOrTx, comment, { attachmentIds: options.attachmentIds });
+      }
+      if (authorType === "user" || actor.userId) {
+        await resumeSlackConversation(dbOrTx, issue.companyId, issueId);
+      }
       // Update issue's updatedAt so comment activity is reflected in recency sorting
       const touched = await dbOrTx
         .update(issues)
@@ -14032,7 +14430,13 @@ export function issueService(db: Db) {
         // channel" publications use the separate publication path.
         const chatFinalOwnsProviderReply =
           createdByRun !== null &&
-          isExternalChatPresentationContext(createdByRun.contextSnapshot) &&
+          isExternalChatPresentationContext(
+            createdByRun.contextSnapshot,
+            readStringFromRecord(createdByRun.contextSnapshot, "source") === "tool_action_review" &&
+              (await resolveChatOriginPublicationBindings(
+                dbOrTx, issue.companyId, issueId, createdByRunId,
+              )).length > 0,
+          ) &&
           metadata?.authorizationReason !==
             CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON;
         const interactionOwnsProviderReply = createdByRunId

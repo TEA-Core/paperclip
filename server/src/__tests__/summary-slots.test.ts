@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -12,7 +12,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueRecoveryActions,
-  issues,
+  issues, issueComments,
   projectWorkspaces,
   projects,
   summarySlots,
@@ -738,6 +738,94 @@ describeEmbeddedPostgres("summary slot service", () => {
         failureReason: expect.stringContaining("was cancelled before writing a summary"),
       });
     });
+    it("renders per-issue lastCommentAt and the thread-check duty in the generation snapshot (SUP-23041)", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+
+      await db.insert(issues).values([
+        {
+          companyId,
+          projectId,
+          identifier: `${issuePrefix(companyId)}-201`,
+          issueNumber: 201,
+          title: "Waiting on board approval",
+          status: "blocked",
+          priority: "high",
+        },
+        {
+          companyId,
+          projectId,
+          identifier: `${issuePrefix(companyId)}-202`,
+          issueNumber: 202,
+          title: "Implement summary cards",
+          status: "in_progress",
+          priority: "medium",
+        },
+      ]);
+
+      const commentedIssueId = await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(eq(issues.identifier, `${issuePrefix(companyId)}-201`))
+        .then((rows) => rows[0]!.id);
+      await db.insert(issueComments).values([
+        {
+          companyId,
+          issueId: commentedIssueId,
+          authorType: "user",
+          authorUserId: "board-user",
+          body: "Approval is waiting.",
+          createdAt: new Date("2026-11-05T12:00:00.000Z"),
+        },
+        {
+          companyId,
+          issueId: commentedIssueId,
+          authorType: "user",
+          authorUserId: "board-user",
+          body: "Latest live update.",
+          createdAt: new Date("2026-11-05T12:30:00.000Z"),
+        },
+        {
+          companyId,
+          issueId: commentedIssueId,
+          authorType: "user",
+          authorUserId: "board-user",
+          body: "Deleted update.",
+          createdAt: new Date("2026-11-05T13:00:00.000Z"),
+          deletedAt: new Date("2026-11-05T14:00:00.000Z"),
+        },
+      ]);
+
+      const result = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      expect(result.alreadyGenerating).toBe(false);
+
+      const issueRow = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, result.generatingIssue.id))
+        .then((rows) => rows[0]!);
+      expect(issueRow.description).toContain("## Prebuilt scope snapshot");
+      expect(issueRow.description).toContain("lastCommentAt 2026-11-05T12:30:00.000Z");
+      expect(issueRow.description).toContain("lastCommentAt null");
+      expect(issueRow.description).toContain(
+        "GET /api/issues/{identifier}/comments",
+      );
+      expect(issueRow.description).toContain(
+        "substituting the issue's identifier exactly as a snapshot row prints it",
+      );
+      expect(issueRow.description).not.toContain(
+        "GET /api/companies/{companyId}/issues/{ref}/comments",
+      );
+      expect(issueRow.description).toContain("snapshot is an index, not proof of what a card still owes");
+      expect(issueRow.description).toContain("issue description, the card body, and the previous slot body");
+      expect(issueRow.description).toContain("`lastCommentAt` makes staleness visible; it does not make a stale body safe");
+      expect(issueRow.description).toContain("Do not call issue-list endpoints for listing");
+      expect(issueRow.description).not.toContain("snapshot as the issue source of truth");
+      expect(issueRow.description).toContain("Waiting on board approval");
+      expect(issueRow.description).toContain("Implement summary cards");
+    });
   });
 
   describe("dead generation binding reclaim (SUP-16945)", () => {
@@ -970,6 +1058,125 @@ describeEmbeddedPostgres("summary slot service", () => {
     });
   });
 
+  describe("written-deliverable completion release (SUP-23039)", () => {
+    const GRACE_MS = 30 * 60 * 1_000;
+
+    async function ageSlotBinding(issueId: string, ageMs: number) {
+      await db
+        .update(summarySlots)
+        .set({ updatedAt: new Date(Date.now() - ageMs) })
+        .where(eq(summarySlots.generatingIssueId, issueId));
+    }
+
+    /**
+     * Arms a generation, binds a live run, and writes a real revision through
+     * the service — the identity chain the completion probe follows: slot
+     * document -> latest revision -> writing run's context snapshot issue id.
+     */
+    async function startWrittenGeneration(companyId: string, projectId: string, summarizerAgentId: string) {
+      const svc = summarySlotService(db);
+      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      const runId = await seedRun(companyId, summarizerAgentId, generated.generatingIssue.id);
+      await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, generated.generatingIssue.id));
+      const written = await svc.write(
+        {
+          ...projectSelector(companyId, projectId),
+          markdown: "# Delivered summary",
+          generationIssueId: generated.generatingIssue.id,
+        },
+        { agentId: summarizerAgentId, runId },
+      );
+      return { svc, generated, written };
+    }
+
+    it("releases a completed written generation on the first read after its run dies — no grace window, resolved to idle", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const { svc, generated, written } = await startWrittenGeneration(companyId, projectId, summarizerAgentId);
+
+      // The record_only generation card cannot close: its run terminates
+      // leaving the issue non-terminal (it parks blocked) with no live run and
+      // no recovery ladder. The deliverable already landed.
+      await db
+        .update(issues)
+        .set({ checkoutRunId: null, status: "blocked" })
+        .where(eq(issues.id, generated.generatingIssue.id));
+
+      // First read after the run terminates: released immediately, with no
+      // 30-minute grace aging, and resolved to `idle` (this generation wrote
+      // the surviving revision) — the tile stops presenting the finished
+      // generation as in-flight.
+      const result = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(result.slot).toMatchObject({
+        status: "idle",
+        generatingIssueId: null,
+        failureReason: null,
+      });
+      expect(result.slot!.lastGeneratedAt).not.toBeNull();
+      expect(result.generatingIssue).toBeNull();
+      // The written deliverable survives as the served revision.
+      expect(result.document!.latestRevisionId).toBe(written.revision.id);
+    });
+
+    it("does not release a written generation while its run is still live, even past the grace window", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const { svc, generated } = await startWrittenGeneration(companyId, projectId, summarizerAgentId);
+      // The run is still live: the generation may still be finishing.
+      await ageSlotBinding(generated.generatingIssue.id, GRACE_MS + 5 * 60 * 1_000);
+
+      const result = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(result.slot!.status).toBe("generating");
+      expect(result.slot!.generatingIssueId).toBe(generated.generatingIssue.id);
+      expect(result.generatingIssue?.id).toBe(generated.generatingIssue.id);
+    });
+
+    it("does not release a written generation while a recovery action owns the parked issue", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const { svc, generated } = await startWrittenGeneration(companyId, projectId, summarizerAgentId);
+      // Run dead, deliverable written — but a recovery ladder owns the issue's
+      // next step, so the read path must not reclaim it.
+      await db.update(issues).set({ checkoutRunId: null, status: "blocked" }).where(eq(issues.id, generated.generatingIssue.id));
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId: generated.generatingIssue.id,
+        kind: "active_run_watchdog",
+        status: "active",
+        ownerType: "agent",
+        cause: "stuck_generation",
+        fingerprint: randomUUID(),
+        evidence: {},
+        nextAction: "Recover the stalled summary generation.",
+      });
+      await ageSlotBinding(generated.generatingIssue.id, GRACE_MS + 5 * 60 * 1_000);
+
+      const result = await svc.getSlot(projectSelector(companyId, projectId));
+      expect(result.slot!.status).toBe("generating");
+      expect(result.slot!.generatingIssueId).toBe(generated.generatingIssue.id);
+    });
+
+    it("re-arms a fresh generation when generate is asked for over a completed-but-unreleased written binding", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const { svc, generated } = await startWrittenGeneration(companyId, projectId, summarizerAgentId);
+      // Run dead, deliverable written, binding not yet released (no read in
+      // between). The dedupe must treat the completed binding as dead, not
+      // in-flight, so a board regenerate mints a fresh generation.
+      await db.update(issues).set({ checkoutRunId: null, status: "blocked" }).where(eq(issues.id, generated.generatingIssue.id));
+
+      const second = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      expect(second.alreadyGenerating).toBe(false);
+      expect(second.generatingIssue.id).not.toBe(generated.generatingIssue.id);
+      expect(second.slot.status).toBe("generating");
+      expect(second.slot.generatingIssueId).toBe(second.generatingIssue.id);
+    });
+  });
+
   describe("summarizer writes", () => {
     async function startGeneration(companyId: string, projectId: string, summarizerAgentId: string) {
       const svc = summarySlotService(db);
@@ -1053,6 +1260,57 @@ describeEmbeddedPostgres("summary slot service", () => {
       expect(revisions.revisions[0]!.id).toBe(written.revision.id);
       expect(revisions.revisions[1]!.id).toBe(initial.revision.id);
       expect(revisions.revisions[1]!.body).toContain("First summary for this scope.");
+    });
+
+    it("rejects a write when the generation run changes while the write waits for the issue lock", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const otherAgentId = await seedPlainAgent(companyId);
+      const { svc, generationIssueId, runId } = await startGeneration(companyId, projectId, summarizerAgentId);
+      const otherRunId = await seedRun(companyId, otherAgentId, generationIssueId);
+      let releaseIssueLock!: () => void;
+      const issueLockReleased = new Promise<void>((resolve) => {
+        releaseIssueLock = resolve;
+      });
+      let markIssueLockAcquired!: () => void;
+      const issueLockAcquired = new Promise<void>((resolve) => {
+        markIssueLockAcquired = resolve;
+      });
+      const issueLockTransaction = db.transaction(async (tx) => {
+        await tx.select().from(issues).where(eq(issues.id, generationIssueId)).for("update");
+        markIssueLockAcquired();
+        await tx
+          .update(issues)
+          .set({ checkoutRunId: otherRunId })
+          .where(eq(issues.id, generationIssueId));
+        await issueLockReleased;
+      });
+      await issueLockAcquired;
+
+      const writePromise = svc.write(
+        { ...projectSelector(companyId, projectId), markdown: "# Stale write", generationIssueId },
+        { agentId: summarizerAgentId, runId },
+      );
+      let writeWaitingForIssueLock = false;
+      for (let i = 0; i < 100; i += 1) {
+        const waiting = await db.execute(
+          sql`select 1 from pg_stat_activity where cardinality(pg_blocking_pids(pid)) > 0 and query ilike '%for update%'`,
+        );
+        if (waiting.length > 0) {
+          writeWaitingForIssueLock = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(writeWaitingForIssueLock).toBe(true);
+      releaseIssueLock();
+      await issueLockTransaction;
+
+      await expect(writePromise).rejects.toMatchObject({
+        status: 403,
+        message: "Summary write must run from the linked generation task",
+      });
     });
 
     it("serializes concurrent writes for the same slot into sequential revisions instead of leaking a revision unique-index violation", async () => {
@@ -1428,6 +1686,40 @@ describeEmbeddedPostgres("summary slot service", () => {
       ).rejects.toMatchObject({ status: 403 });
     });
 
+    it("rejects a Summarizer write presenting another agent's run id even when that run is stamped on the generation issue", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const otherAgentId = await seedPlainAgent(companyId);
+      const svc = summarySlotService(db);
+      const generated = await svc.generate(projectSelector(companyId, projectId), { userId: "board-user" });
+      const generationIssueId = generated.generatingIssue.id;
+      const otherRunId = await seedRun(companyId, otherAgentId, generationIssueId);
+      await db
+        .update(issues)
+        .set({ checkoutRunId: otherRunId })
+        .where(eq(issues.id, generationIssueId));
+
+      await expect(
+        svc.write(
+          { ...projectSelector(companyId, projectId), markdown: "# Stolen run", generationIssueId },
+          { agentId: summarizerAgentId, runId: otherRunId },
+        ),
+      ).rejects.toMatchObject({ status: 403 });
+
+      const ownRunId = await seedRun(companyId, summarizerAgentId, generationIssueId);
+      await db
+        .update(issues)
+        .set({ checkoutRunId: ownRunId })
+        .where(eq(issues.id, generationIssueId));
+      await expect(
+        svc.write(
+          { ...projectSelector(companyId, projectId), markdown: "# Own run", generationIssueId },
+          { agentId: summarizerAgentId, runId: ownRunId },
+        ),
+      ).resolves.toMatchObject({ slot: { generatingIssueId: generationIssueId } });
+    });
+
     it("rejects using one generation task to write a different slot", async () => {
       const companyId = await seedCompany();
       const projectId = await seedProject(companyId);
@@ -1563,6 +1855,61 @@ describeEmbeddedPostgres("summary slot service", () => {
         status: "changes_requested",
         returnAssignee: { type: "agent", agentId: summarizerAgentId },
       });
+    });
+  });
+
+  describe("generate record-only delivery", () => {
+    it("creates record-only generation issues for every supported scope", async () => {
+      const companyId = await seedCompany();
+      const projectId = await seedProject(companyId);
+      const projectWorkspaceId = await seedProjectWorkspace(companyId, projectId);
+      const executionWorkspaceId = await seedExecutionWorkspace(companyId, projectId, projectWorkspaceId);
+      await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+      const selectors = [
+        {
+          ...projectSelector(companyId, projectId),
+          projectId,
+          projectWorkspaceId,
+        },
+        {
+          companyId,
+          scopeKind: "workspaces_overview",
+          slotKey: "header",
+          scopeId: null,
+          projectId: null,
+          projectWorkspaceId: null,
+        },
+        {
+          companyId,
+          scopeKind: "project_workspace",
+          slotKey: "header",
+          scopeId: projectWorkspaceId,
+          projectId,
+          projectWorkspaceId,
+        },
+        {
+          ...executionWorkspaceSelector(companyId, executionWorkspaceId),
+          projectId,
+          projectWorkspaceId,
+        },
+      ] as const;
+
+      for (const selector of selectors) {
+        const result = await svc.generate(selector, { userId: "board-user" });
+        const issueRow = await db
+          .select()
+          .from(issues)
+          .where(eq(issues.id, result.generatingIssue.id))
+          .then((rows) => rows[0]!);
+
+        expect(issueRow.deliveryRequirement, selector.scopeKind).toBe("record_only");
+        expect(issueRow.projectId, selector.scopeKind).toBe(selector.projectId);
+        expect(issueRow.projectWorkspaceId, selector.scopeKind).toBe(selector.projectWorkspaceId);
+      }
+
+      const issueRows = await db.select().from(issues).where(eq(issues.companyId, companyId));
+      expect(issueRows).toHaveLength(4);
     });
   });
 });

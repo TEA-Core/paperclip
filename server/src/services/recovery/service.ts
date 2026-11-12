@@ -1,5 +1,7 @@
 import { constants as fsConstants } from "node:fs";
 import { access } from "node:fs/promises";
+import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
+import { externalConversationStateSql } from "../slack-conversation-state.js";
 import { hasLiveLegacyController } from "../legacy-controller-lease.js";
 // `instanceSettingsService` is NOT re-imported here: the fork already imports it
 // further down this same import block (upstream's copy would duplicate it).
@@ -78,8 +80,9 @@ import {
   nativeRunnerOwnershipNotHeldCondition,
 } from "../native-runtime/native-runner-ownership.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
-import { forbidden, notFound } from "../../errors.js";
+import { HttpError, forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
+import { runRecoverySweepIssue } from "../../lib/recovery-sweep-isolation.js";
 import {
   isPidAlive,
   isProcessGroupAlive,
@@ -140,6 +143,10 @@ import {
 } from "../issue-execution-policy.js";
 import { isMonitorableIssueShape } from "./host-restart-strand-sweep.js";
 import {
+  REVIEW_PARTICIPANT_LIVE_WINDOW_MS,
+  participantRanSince,
+} from "./participant-liveness.js";
+import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeIdempotencyKey,
   buildIssueBlockersResolvedWakeStateKey,
@@ -198,7 +205,7 @@ import {
 } from "./origins.js";
 import { withRecoveryContext } from "./status-only-context.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
-import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage } from "../issue-assignee-review-gate.js";
+import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, resolveCanonicalWikiMaintainerAgentId, wikiHandoffWriteWouldViolate } from "../issue-assignee-review-gate.js";
 import { loadConfig } from "../../config.js";
 import {
   canAgentSatisfyIssueWorkspaceSettings,
@@ -324,6 +331,7 @@ type RecoveryWakeupOptions = {
   reason?: string | null;
   payload?: Record<string, unknown> | null;
   idempotencyKey?: string | null;
+  completedRearmCutoff?: Date | null;
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
@@ -1177,7 +1185,28 @@ export function recoveryBounceStatusRank(status: string | null | undefined): num
   return 2;
 }
 
-export type RecoveryBounceCandidateSource = "return_assignee" | "creator";
+export type RecoveryBounceCandidateSource = "return_assignee" | "creator" | "project_lead";
+
+export function canExecuteRecoveryDelivery(
+  deliveryRequirement: string | null | undefined,
+  capabilities: string | null | undefined,
+): boolean {
+  if (deliveryRequirement !== "repository_delivery") return true;
+  const summary = capabilities?.trim() ?? "";
+  if (!summary) return false;
+  if (
+    /\bread[\s-]*only\b/i.test(summary)
+    || /\bdocumentation[\s-]*only\b/i.test(summary)
+    || /\badvisory[\s-]*only\b/i.test(summary)
+    || /\bno[\s-]*code\b/i.test(summary)
+    || /\bno\s+repository\s+changes\b/i.test(summary)
+    || /\bnot\s*:[^.;!\n]*\bimplement(?:ation)?\b/i.test(summary)
+    || /\b(?:not|never)\s+(?:\w+\s+){0,2}implement(?:ation)?\b/i.test(summary)
+  ) {
+    return false;
+  }
+  return /\bimplement(?:s|ing|ation)?\b/i.test(summary) || /\bwrites?\s+code\b/i.test(summary);
+}
 
 export function selectRecoveryBounceCandidate(
   candidates: ReadonlyArray<{
@@ -1214,7 +1243,9 @@ export function isRecoveryBounceTargetLive(
 export type RecoveryReassignmentRefusalReason =
   | "review_stage_self_satisfy"
   | "pending_stage_participant_displaced"
-  | "reassignment_target_not_live";
+  | "reassignment_target_not_live"
+  | "wiki_handoff_non_canonical_assignee"
+  | "wiki_handoff_self_satisfy";
 
 export interface RecoveryReassignmentDecision {
   assigneeAgentId: string | null;
@@ -1279,6 +1310,7 @@ export function decideRecoveryReassignment(input: {
   reviewStageSelfSatisfies: boolean;
   /** Optional so existing callers keep compiling; defaults to "does not displace". */
   pendingStageParticipantDisplaced?: boolean;
+  wikiHandoffViolation?: "wiki_handoff_non_canonical_assignee" | "wiki_handoff_self_satisfy" | null;
   recoveryOwnerLive: boolean;
 }): RecoveryReassignmentDecision {
   const effectiveCurrent = input.currentAssigneeAgentId;
@@ -1289,6 +1321,15 @@ export function decideRecoveryReassignment(input: {
       refused: false,
       refusalReason: null,
       refusedAssigneeAgentId: null,
+      keptAssigneeAgentId: effectiveCurrent,
+    };
+  }
+  if (input.wikiHandoffViolation) {
+    return {
+      assigneeAgentId: effectiveCurrent,
+      refused: true,
+      refusalReason: input.wikiHandoffViolation,
+      refusedAssigneeAgentId: candidate,
       keptAssigneeAgentId: effectiveCurrent,
     };
   }
@@ -1688,6 +1729,51 @@ export function recoveryService(
   function hasFutureMonitorCheck(monitorNextCheckAt: string | Date | null | undefined) {
     if (!monitorNextCheckAt) return false;
     return new Date(monitorNextCheckAt).getTime() > Date.now();
+  }
+
+  async function hasOccupiedExecutionWorkspace(
+    companyId: string,
+    executionWorkspaceId: string,
+    excludingIssueId: string,
+    runner: Db = db,
+  ) {
+    const boundIssues = await runner
+      .select({
+        executionRunId: issues.executionRunId,
+        checkoutRunId: issues.checkoutRunId,
+      })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, companyId),
+        eq(issues.executionWorkspaceId, executionWorkspaceId),
+        isNull(issues.hiddenAt),
+        ne(issues.id, excludingIssueId),
+      ))
+      .limit(50);
+    const boundRunIds = [...new Set(boundIssues.flatMap((issue) =>
+      [issue.executionRunId, issue.checkoutRunId].filter((runId): runId is string => Boolean(runId)),
+    ))];
+    const workspaceRunCondition = or(
+      boundRunIds.length > 0 ? inArray(heartbeatRuns.id, boundRunIds) : sql`false`,
+      sql`${heartbeatRuns.contextSnapshot} ->> 'executionWorkspaceId' = ${executionWorkspaceId}`,
+    );
+    return runner
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        or(
+          inArray(heartbeatRuns.status, ["queued", "running"]),
+          and(
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            eq(heartbeatRuns.scheduledRetryReason, "execution_workspace_occupied"),
+          ),
+        ),
+        workspaceRunCondition,
+        sql`(${heartbeatRuns.contextSnapshot} ->> 'issueId') is distinct from ${excludingIssueId}`,
+      ))
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
   }
 
   async function hasActiveExecutionPath(
@@ -2853,8 +2939,11 @@ export function recoveryService(
         status: issues.status,
         createdByAgentId: issues.createdByAgentId,
         assigneeAgentId: issues.assigneeAgentId,
+        projectId: issues.projectId,
+        deliveryRequirement: issues.deliveryRequirement,
         executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
+        executionWorkspaceId: issues.executionWorkspaceId,
       })
       .from(issueRelations)
       .innerJoin(issues, eq(issueRelations.issueId, issues.id))
@@ -2880,13 +2969,21 @@ export function recoveryService(
     const issueIds: string[] = [];
     const seen = new Set<string>();
     for (const candidate of candidates) {
-      if (seen.has(candidate.id)) continue;
+      const completed = await runRecoverySweepIssue(candidate, "recovery.reconcile_unassigned_blocking_issue", async () => {
+      if (seen.has(candidate.id)) return;
       seen.add(candidate.id);
 
       const creatorAgentId = candidate.createdByAgentId;
       if (!creatorAgentId) {
         skipped += 1;
-        continue;
+        return;
+      }
+      if (
+        candidate.executionWorkspaceId
+        && await hasOccupiedExecutionWorkspace(candidate.companyId, candidate.executionWorkspaceId, candidate.id)
+      ) {
+        skipped += 1;
+        return;
       }
 
       // SUP-14225: consider the recorded return assignee and creator together.
@@ -2896,47 +2993,96 @@ export function recoveryService(
         agent: typeof agents.$inferSelect;
         source: RecoveryBounceCandidateSource;
       }> = [];
+      const bounceCandidateRejections: Array<{
+        source: RecoveryBounceCandidateSource;
+        reason: string;
+      }> = [];
+      const addBounceCandidate = async (
+        agent: typeof agents.$inferSelect | null | undefined,
+        source: RecoveryBounceCandidateSource,
+      ) => {
+        if (!agent || agent.companyId !== candidate.companyId) {
+          bounceCandidateRejections.push({ source, reason: "not available in this company" });
+          return;
+        }
+        if (!canExecuteRecoveryDelivery(candidate.deliveryRequirement, agent.capabilities)) {
+          bounceCandidateRejections.push({ source, reason: "cannot execute repository_delivery" });
+          return;
+        }
+        if (!(await isAgentInvokable(agent))) {
+          bounceCandidateRejections.push({ source, reason: `not invokable (status ${agent.status})` });
+          return;
+        }
+        if (await hasConsecutiveWakeFailuresForAgent(agent.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES)) {
+          bounceCandidateRejections.push({ source, reason: "recent consecutive wake failures" });
+          return;
+        }
+        bounceCandidates.push({ agent, source });
+      };
       const returnAssigneeAgentId = readReturnAssigneeAgentId(candidate.executionState);
       if (returnAssigneeAgentId) {
-        const returnAgent = await getAgent(returnAssigneeAgentId);
-        if (
-          returnAgent &&
-          returnAgent.companyId === candidate.companyId &&
-          (await isAgentInvokable(returnAgent)) &&
-          !(await hasConsecutiveWakeFailuresForAgent(returnAgent.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES))
-        ) {
-          bounceCandidates.push({ agent: returnAgent, source: "return_assignee" });
-        }
+        await addBounceCandidate(await getAgent(returnAssigneeAgentId), "return_assignee");
       }
       const creatorAgent = await getAgent(creatorAgentId);
-      if (
-        creatorAgent &&
-        creatorAgent.companyId === candidate.companyId &&
-        (await isAgentInvokable(creatorAgent)) &&
-        !(await hasConsecutiveWakeFailuresForAgent(creatorAgent.id, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES))
-      ) {
-        bounceCandidates.push({ agent: creatorAgent, source: "creator" });
-      }
-      const selected = selectRecoveryBounceCandidate(
+      await addBounceCandidate(creatorAgent, "creator");
+      let selected = selectRecoveryBounceCandidate(
         bounceCandidates.map(({ agent, source }) => ({
           agentId: agent.id,
           status: agent.status,
           source,
         })),
       );
+      if (!selected && candidate.deliveryRequirement === "repository_delivery" && candidate.projectId) {
+        const project = await db
+          .select({ leadAgentId: projects.leadAgentId })
+          .from(projects)
+          .where(and(eq(projects.id, candidate.projectId), eq(projects.companyId, candidate.companyId)))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (project?.leadAgentId) {
+          await addBounceCandidate(await getAgent(project.leadAgentId), "project_lead");
+        }
+        selected = selectRecoveryBounceCandidate(
+          bounceCandidates.map(({ agent, source }) => ({
+            agentId: agent.id,
+            status: agent.status,
+            source,
+          })),
+        );
+      }
       if (!selected) {
         skipped += 1;
-        continue;
+        return;
       }
       const selectedCandidate = bounceCandidates.find(({ agent, source }) =>
         agent.id === selected.agentId && source === selected.source,
       );
       if (!selectedCandidate) {
         skipped += 1;
-        continue;
+        return;
       }
       const nextAgent = selectedCandidate.agent;
       const reassignSource = selectedCandidate.source;
+      const bounceCandidateLabel = (source: RecoveryBounceCandidateSource) =>
+        source === "return_assignee"
+          ? "recorded return assignee"
+          : source === "project_lead"
+            ? "project lead engineer"
+            : "creator";
+      const outrankedCandidate = bounceCandidates.find(({ agent, source }) =>
+        source !== reassignSource
+        && recoveryBounceStatusRank(agent.status) > recoveryBounceStatusRank(nextAgent.status),
+      );
+      const rejectionReason = bounceCandidateRejections
+        .map(({ source, reason }) => `${bounceCandidateLabel(source)} rejected: ${reason}`)
+        .join("; ");
+      const reassignReason = outrankedCandidate
+        ? `${bounceCandidateLabel(reassignSource)} status ${nextAgent.status} outranked ${bounceCandidateLabel(outrankedCandidate.source)} status ${outrankedCandidate.agent.status}`
+        : rejectionReason || (reassignSource === "return_assignee"
+          ? "recorded return assignee owed the next action"
+          : reassignSource === "project_lead"
+            ? "no execution-capable, invokable creator or recorded return assignee was available"
+            : "no usable return assignee was recorded");
 
       const relations = await issuesSvc.getRelationSummaries(candidate.id);
       const blockingLinks = formatIssueLinksForComment(relations.blocks);
@@ -2952,6 +3098,10 @@ export function recoveryService(
           .for("update").limit(1);
         if (!current) return null;
         if (current.assigneeAgentId || current.assigneeUserId) return null;
+        if (
+          current.executionWorkspaceId
+          && await hasOccupiedExecutionWorkspace(current.companyId, current.executionWorkspaceId, current.id, txDb)
+        ) return null;
         const nextAssigneeAgentId = await resolveRecoveryReassignedAssignee(current, nextAgent.id, txDb);
         if (!nextAssigneeAgentId) return null;
         return issueService(txDb).update(candidate.id, {
@@ -2962,12 +3112,12 @@ export function recoveryService(
       });
       if (!updated) {
         skipped += 1;
-        continue;
+        return;
       }
       const nextAssigneeAgentId = updated.assigneeAgentId;
       if (!nextAssigneeAgentId) {
         skipped += 1;
-        continue;
+        return;
       }
 
       await issuesSvc.addComment(
@@ -2979,7 +3129,10 @@ export function recoveryService(
           "",
           reassignSource === "return_assignee"
             ? "- Assigned it to the recorded return assignee (the executor that owed the next action), not to the creator."
-            : "- Assigned it back to the agent that created the blocker (no usable return assignee was recorded).",
+            : reassignSource === "project_lead"
+              ? "- Assigned it to the project lead engineer."
+              : "- Assigned it back to the agent that created the blocker.",
+          `- Recovery route: ${reassignSource}; reason: ${reassignReason}.`,
           "- Next action: resolve this blocker or reassign it to the right owner.",
         ].join("\n"),
         {},
@@ -2998,6 +3151,7 @@ export function recoveryService(
           identifier: candidate.identifier,
           assigneeAgentId: nextAssigneeAgentId,
           reassignSource,
+          reassignReason,
           source: "recovery.reconcile_unassigned_blocking_issue",
         },
       });
@@ -3032,6 +3186,8 @@ export function recoveryService(
       } else {
         skipped += 1;
       }
+      });
+      if (!completed) skipped += 1;
     }
 
     return { assigned, skipped, issueIds };
@@ -4472,6 +4628,8 @@ export function recoveryService(
     issue: {
       id: string;
       identifier?: string | null;
+      title?: string | null;
+      description?: string | null;
       companyId: string;
       assigneeAgentId: string | null;
       executionPolicy: unknown;
@@ -4508,10 +4666,22 @@ export function recoveryService(
       (await isAgentInvokable(targetAgent, runner)) &&
       !(await hasConsecutiveWakeFailuresForAgent(candidate, RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES, runner));
 
+    const canonicalMaintainerAgentId = await resolveCanonicalWikiMaintainerAgentId(
+      runner,
+      issue.companyId,
+      issue,
+    );
+    const wikiHandoffViolation = wikiHandoffWriteWouldViolate({
+      canonicalMaintainerAgentId,
+      incomingAssigneeAgentId: candidate,
+      executionPolicy: issue.executionPolicy,
+      executionState: issue.executionState,
+    });
     const decision = decideRecoveryReassignment({
       currentAssigneeAgentId: effectiveCurrent,
       recoveryOwnerAgentId,
       reviewStageSelfSatisfies,
+      wikiHandoffViolation: wikiHandoffViolation?.reason ?? null,
       pendingStageParticipantDisplaced: wouldDisplacePendingStageParticipant({
         executionState: issue.executionState,
         currentAssigneeAgentId: effectiveCurrent,
@@ -4539,6 +4709,21 @@ export function recoveryService(
           keptAssigneeAgentId: decision.keptAssigneeAgentId,
         },
         "recovery reassignment refused: it would move the card off its pending review stage participant (orphaned-stage deadlock); keeping current assignee",
+      );
+    } else if (
+      decision.refused &&
+      (decision.refusalReason === "wiki_handoff_non_canonical_assignee" ||
+        decision.refusalReason === "wiki_handoff_self_satisfy")
+    ) {
+      logger.warn(
+        {
+          issueId: issue.id,
+          identifier: issue.identifier,
+          refusedAssigneeAgentId: decision.refusedAssigneeAgentId,
+          keptAssigneeAgentId: decision.keptAssigneeAgentId,
+          refusalReason: decision.refusalReason,
+        },
+        "recovery reassignment refused: Wiki handoff write would violate the canonical maintainer or review-stage invariant; keeping current assignee",
       );
     } else if (decision.refused && decision.refusalReason === "reassignment_target_not_live") {
       logger.warn(
@@ -6002,6 +6187,16 @@ export function recoveryService(
     }
 
     for (const issue of candidates) {
+      const completed = await runRecoverySweepIssue(issue, "recovery.reconcile_stranded_assigned_issues", async () => {
+      // Upstream #13809: settle an answered Slack conversation before recovery treats
+      // it as stranded. Kept inside the per-issue isolation wrapper so one refused
+      // settlement cannot abort the rest of the sweep.
+      if (issue.originKind === "chat_channel") {
+        await settleSlackConversation(db, issue.companyId, issue.id);
+        const [current] = await db.select({ externalConversationState: externalConversationStateSql() })
+          .from(issues).where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)));
+        if (current?.externalConversationState === "waiting") { result.skipped += 1; return; }
+      }
       if (issue.conversationAgentId) {
         const lastRun = await getLatestIssueRun(issue.companyId, issue.id);
         if (lastRun?.status === "succeeded") {
@@ -6010,12 +6205,12 @@ export function recoveryService(
             if (current) Object.assign(issue, current);
           }
         }
-        if (!(await instanceSettingsService(db).getExperimental()).enableAgentChat) { result.skipped += 1; continue; }
+        if (!(await instanceSettingsService(db).getExperimental()).enableAgentChat) { result.skipped += 1; return; }
         {
           await deliverConversationComments(db, issue, deps.enqueueWakeup);
         }
       }
-      if (isWaitingConversation(issue)) { result.skipped += 1; continue; }
+      if (isWaitingConversation(issue)) { result.skipped += 1; return; }
       const now = new Date();
       // Parse the persisted execution state once. `executionState`/`pendingExecutionState`
       // stay gated on `in_review` so every pre-existing status-keyed path below keeps its
@@ -6073,7 +6268,7 @@ export function recoveryService(
         const armed = nonReviewArmedExecutionState;
         if (armed === null) {
           result.skipped += 1;
-          continue;
+          return;
         }
         const armedParticipant = armed.currentParticipant;
         const participantOwnerAgentId =
@@ -6089,7 +6284,7 @@ export function recoveryService(
         // once the lease is released/cleared, detects the genuine wedge.
         if (issue.checkoutRunId || issue.executionRunId) {
           result.skipped += 1;
-          continue;
+          return;
         }
         // Grace is measured from the IMMUTABLE arm anchor — `pendingSince`, the
         // moment the review stage entered its pending state — not the mutable
@@ -6102,7 +6297,7 @@ export function recoveryService(
           now.getTime() - (pendingSinceMs ?? issue.updatedAt.getTime());
         if (msSinceArm < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
           result.skipped += 1;
-          continue;
+          return;
         }
         // An operator-cancelled latest run stands down ALL automatic recovery:
         // the board deliberately stopped the agent, so re-waking the participant
@@ -6118,7 +6313,7 @@ export function recoveryService(
           )
         ) {
           result.skipped += 1;
-          continue;
+          return;
         }
         // The wedged-review wedge is only actionable when NO other live path already
         // owns this card. An in-flight run, a future monitor, a queued/deferred/
@@ -6132,26 +6327,26 @@ export function recoveryService(
         // paths while honouring the guards those paths themselves apply.
         if (hasFutureMonitorCheck(issue.monitorNextCheckAt)) {
           result.skipped += 1;
-          continue;
+          return;
         }
         if (await hasActiveExecutionPath(issue.companyId, issue.id, null)) {
           result.skipped += 1;
-          continue;
+          return;
         }
         if (await hasLiveIssueWake(issue.companyId, issue.id)) {
           result.skipped += 1;
-          continue;
+          return;
         }
         if (await hasPendingWakeInteraction(db, issue.companyId, issue.id)) {
           result.skipped += 1;
-          continue;
+          return;
         }
         const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
         // A board-owned recovery action is already the durable, human-owned path;
         // do not race that authority by minting a participant action on top of it.
         if (existingAction?.ownerType === "board") {
           result.skipped += 1;
-          continue;
+          return;
         }
         // A subtree pause hold suppresses ALL automatic recovery. The participant is
         // deliberately parked, so minting a participant-owned action here would let the
@@ -6167,7 +6362,28 @@ export function recoveryService(
           )
         ) {
           result.skipped += 1;
-          continue;
+          return;
+        }
+        // SUP-22272: the guards above key on THIS card's live paths, but the
+        // parent incident (SUP-21921) had the review participant heartbeating
+        // on other cards while this detector re-minted its action and churned
+        // attemptCount to 5/5. A participant that has run anywhere since the
+        // stage was armed — max(pendingSince, now - 6h) — is live, not wedged:
+        // suppress the mint. The window is the expiry; with no participant run
+        // for 6h this detector mints exactly as before, so a genuinely wedged
+        // reviewer still surfaces.
+        if (
+          participantOwnerAgentId &&
+          (await participantRanSince(
+            db,
+            issue.companyId,
+            participantOwnerAgentId,
+            pendingSinceMs ?? issue.updatedAt.getTime(),
+            REVIEW_PARTICIPANT_LIVE_WINDOW_MS,
+          ))
+        ) {
+          result.skipped += 1;
+          return;
         }
         // Idempotency is scoped to the exact wedge identity (stage + participant).
         // The fingerprint is globally unique among active actions, so equality
@@ -6179,7 +6395,7 @@ export function recoveryService(
         const fingerprint = `review_stage_armed_stranded:${issue.companyId}:${issue.id}:${armed.currentStageId ?? "none"}:${participantOwnerAgentId ?? "none"}`;
         if (existingAction?.fingerprint === fingerprint) {
           result.skipped += 1;
-          continue;
+          return;
         }
         await recoveryActionsSvc.upsertSourceScoped({
           companyId: issue.companyId,
@@ -6229,7 +6445,7 @@ export function recoveryService(
             fingerprint,
           },
         });
-        continue;
+        return;
       }
 
       const agentId =
@@ -6239,12 +6455,12 @@ export function recoveryService(
       if (!agentId) {
         if (issue.status === "in_review") {
           result.skipped += 1;
-          continue;
+          return;
         }
         const msSinceUpdate = now.getTime() - issue.updatedAt.getTime();
         if (msSinceUpdate < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
           result.skipped += 1;
-          continue;
+          return;
         }
         const exemptLabel = await db
           .select({ id: labels.id })
@@ -6272,14 +6488,14 @@ export function recoveryService(
             });
           }
           result.skipped += 1;
-          continue;
+          return;
         }
         const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
         if (existingAction?.kind === "no_live_path_unowned") {
           result.skipped += 1;
-          continue;
+          return;
         }
-        await recoveryActionsSvc.upsertSourceScoped({
+        const upserted = await recoveryActionsSvc.upsertSourceScoped({
           companyId: issue.companyId,
           sourceIssueId: issue.id,
           kind: "no_live_path_unowned",
@@ -6298,6 +6514,13 @@ export function recoveryService(
           maxAttempts: null,
           lastAttemptAt: now,
         });
+        // A terminal action of another kind owns the card, so the upsert
+        // returned it untouched. Logging an escalation anyway wrote one row per
+        // scheduler tick for the same card (SUP-22165: 1,568 rows in 14h).
+        if (upserted.kind !== "no_live_path_unowned") {
+          result.skipped += 1;
+          return;
+        }
         result.noLivePathUnowned += 1;
         result.issueIds.push(issue.id);
         await logActivity(db, {
@@ -6312,7 +6535,7 @@ export function recoveryService(
             fingerprint: `no_live_path_unowned:${issue.companyId}:${issue.id}`,
           },
         });
-        continue;
+        return;
       }
 
       // An unfinished durable session goal owns its continuation lifecycle.
@@ -6323,7 +6546,7 @@ export function recoveryService(
         unfinishedGoalBindings.has(`${issue.companyId}:${issue.id}:${agentId}`)
       ) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
@@ -6337,7 +6560,7 @@ export function recoveryService(
         parseObject(latestRun.resultJson).finalizationReasonCode === "conversation_turn_finished"
       ) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       const agent = await getAgent(agentId);
@@ -6358,7 +6581,7 @@ export function recoveryService(
         (await hasCurrentNativePassiveWait(issue, latestRun))
       ) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       const recoveryNow = new Date();
@@ -6370,7 +6593,7 @@ export function recoveryService(
         : latestRun;
       if (hasPendingRecoveryMonitor(issue, monitorRun, recoveryNow)) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       // FOLD 2c: compose upstream's non-invokable-owner arm with SUP-11085's.
@@ -6430,21 +6653,21 @@ export function recoveryService(
             result.skipped += 1;
           }
         }
-        continue;
+        return;
       }
 
       if (issue.status !== "in_review" && !agentInvokable) {
         const msSinceUpdate = now.getTime() - issue.updatedAt.getTime();
         if (msSinceUpdate < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
           result.skipped += 1;
-          continue;
+          return;
         }
         const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
         if (existingAction?.kind === "no_live_path_owner_unavailable") {
           result.skipped += 1;
-          continue;
+          return;
         }
-        await recoveryActionsSvc.upsertSourceScoped({
+        const upserted = await recoveryActionsSvc.upsertSourceScoped({
           companyId: issue.companyId,
           sourceIssueId: issue.id,
           kind: "no_live_path_owner_unavailable",
@@ -6467,6 +6690,11 @@ export function recoveryService(
           maxAttempts: null,
           lastAttemptAt: now,
         });
+        // Same guard as no_live_path_unowned above: another kind still owns it.
+        if (upserted.kind !== "no_live_path_owner_unavailable") {
+          result.skipped += 1;
+          return;
+        }
         result.noLivePathOwnerUnavailable += 1;
         result.issueIds.push(issue.id);
         await logActivity(db, {
@@ -6481,7 +6709,7 @@ export function recoveryService(
             fingerprint: `no_live_path_owner_unavailable:${issue.companyId}:${issue.id}`,
           },
         });
-        continue;
+        return;
       }
 
       if (
@@ -6492,12 +6720,12 @@ export function recoveryService(
         )
       ) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       if (await hasPendingWakeInteraction(db, issue.companyId, issue.id)) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       // SUP-16697: a `resolved` execution-reconciliation action carrying
@@ -6543,7 +6771,7 @@ export function recoveryService(
           .limit(1);
         if (alreadySurfaced.length > 0) {
           result.skipped += 1;
-          continue;
+          return;
         }
         await recoveryActionsSvc.upsertSourceScoped({
           companyId: issue.companyId,
@@ -6592,7 +6820,7 @@ export function recoveryService(
             fingerprint: holdFingerprint,
           },
         });
-        continue;
+        return;
       }
 
       // A board-owned recovery action is already the durable, human-owned
@@ -6605,7 +6833,7 @@ export function recoveryService(
       );
       if (activeRecoveryAction?.ownerType === "board") {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       if (
@@ -6617,7 +6845,7 @@ export function recoveryService(
         )
       ) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       latestRun = await getLatestIssueRun(issue.companyId, issue.id);
@@ -6637,11 +6865,11 @@ export function recoveryService(
         ).kind !== "clear"
       ) {
         result.skipped += 1;
-        continue;
+        return;
       }
       if (isOperatorCancelledRun(executionRecoverySource, agentId)) {
         result.operatorCancelExempted += 1;
-        continue;
+        return;
       }
       if (
         executionRecoverySource &&
@@ -6668,7 +6896,7 @@ export function recoveryService(
           });
           result.escalated += 1;
           result.issueIds.push(issue.id);
-          continue;
+          return;
         }
       }
       if (await isInvocationBudgetBlocked(issue, agentId)) {
@@ -6704,7 +6932,7 @@ export function recoveryService(
             result.skipped += 1;
           }
         }
-        continue;
+        return;
       }
       const nativeUnblockAction = await nativeBlockedUnblockAction(
         issue,
@@ -6727,14 +6955,14 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
       if (
         latestRun?.status === "succeeded" &&
         (await hasPersistedDurableWaitPath(issue, latestRun))
       ) {
         result.skipped += 1;
-        continue;
+        return;
       }
       if (isStrandedIssueRecoveryIssue(issue) && isUnsuccessfulTerminalIssueRun(latestRun)) {
         const updated = await escalateStrandedRecoveryIssueInPlace({
@@ -6748,7 +6976,7 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
 
       const adapterFailureClassification =
@@ -6761,7 +6989,7 @@ export function recoveryService(
         const targetAgentId = getAdapterFailureRecoveryTargetAgentId(issue);
         if (!targetAgentId || latestRun.agentId !== targetAgentId) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         if (adapterFailureClassification.kind === "provider_quota") {
@@ -6777,10 +7005,10 @@ export function recoveryService(
             );
             result.providerQuotaMonitored += 1;
             result.issueIds.push(issue.id);
-            continue;
+            return;
           }
           result.skipped += 1;
-          continue;
+          return;
         } else {
           const updated = await escalateStrandedAssignedIssue({
             issue,
@@ -6802,7 +7030,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
       }
 
@@ -6839,17 +7067,17 @@ export function recoveryService(
         if (!successfulRunSinceResolution) {
           if (!agentInvokable) {
             result.skipped += 1;
-            continue;
+            return;
           }
 
           if (await hasQueuedIssueWake(issue.companyId, issue.id, agentId)) {
             result.skipped += 1;
-            continue;
+            return;
           }
 
           if (await isInvocationBudgetBlocked(issue, agentId)) {
             result.skipped += 1;
-            continue;
+            return;
           }
 
           const latestPostResolutionRun = await getLatestIssueRunSince(
@@ -6866,7 +7094,7 @@ export function recoveryService(
             if (resolved) {
               result.waitingOnReviewResolved += 1;
               result.issueIds.push(issue.id);
-              continue;
+              return;
             }
             const outcome = await reconcileDispositionRepair(
               issue,
@@ -6885,7 +7113,7 @@ export function recoveryService(
             } else {
               result.skipped += 1;
             }
-            continue;
+            return;
           }
           const { consecutive } = legacyReviewParkAttempts;
           if (
@@ -6896,7 +7124,7 @@ export function recoveryService(
             if (resolved) {
               result.waitingOnReviewResolved += 1;
               result.issueIds.push(issue.id);
-              continue;
+              return;
             }
 
             const updated = await escalateStrandedAssignedIssue({
@@ -6915,7 +7143,7 @@ export function recoveryService(
             } else {
               result.skipped += 1;
             }
-            continue;
+            return;
           }
 
           const queued = await enqueueStrandedIssueRecovery({
@@ -6946,7 +7174,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
       }
 
@@ -6955,7 +7183,26 @@ export function recoveryService(
           const msSinceUpdate = now.getTime() - issue.updatedAt.getTime();
           if (msSinceUpdate < NO_LIVE_PATH_GRACE_THRESHOLD_MS) {
             result.skipped += 1;
-            continue;
+            return;
+          }
+          // SUP-22272: this branch fires when no pending participant pointer
+          // exists, so the recovery target is the assignee (delivery makes the
+          // review participant the assignee). If that agent has run anywhere —
+          // max(updatedAt, now - 6h) — the verdict is likely in flight and a
+          // board mint is churn (parent SUP-21921): suppress. After 6h without
+          // a run the mint proceeds exactly as before.
+          if (
+            issue.assigneeAgentId &&
+            (await participantRanSince(
+              db,
+              issue.companyId,
+              issue.assigneeAgentId,
+              issue.updatedAt.getTime(),
+              REVIEW_PARTICIPANT_LIVE_WINDOW_MS,
+            ))
+          ) {
+            result.skipped += 1;
+            return;
           }
           const existingAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
           // Key on this detector's own fingerprint, not just the shared kind:
@@ -6967,7 +7214,7 @@ export function recoveryService(
             existingAction.fingerprint === `review_stage_unarmed:${issue.companyId}:${issue.id}`
           ) {
             result.skipped += 1;
-            continue;
+            return;
           }
           await recoveryActionsSvc.upsertSourceScoped({
             companyId: issue.companyId,
@@ -7002,7 +7249,7 @@ export function recoveryService(
               fingerprint: `review_stage_unarmed:${issue.companyId}:${issue.id}`,
             },
           });
-          continue;
+          return;
         }
         const participantLatestRun = participantLatestRunForRecovery;
 
@@ -7029,7 +7276,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         const participantAdapterFailureClassification =
@@ -7057,7 +7304,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
         if (
           participantAdapterFailureClassification?.kind ===
@@ -7084,7 +7331,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (!agentInvokable) {
@@ -7103,7 +7350,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (
@@ -7127,7 +7374,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (
@@ -7138,12 +7385,12 @@ export function recoveryService(
           )
         ) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         if (await isInvocationBudgetBlocked(issue, participantAgentId)) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         const queued = await enqueueStrandedIssueRecovery({
@@ -7166,7 +7413,7 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
 
       if (issue.status === "todo") {
@@ -7179,17 +7426,17 @@ export function recoveryService(
           // as stranded).
           if (await isOnboardingFirstTaskAwaitingUser(issue)) {
             result.onboardingFirstTaskExempted += 1;
-            continue;
+            return;
           }
 
           if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
             result.skipped += 1;
-            continue;
+            return;
           }
 
           if (await isInvocationBudgetBlocked(issue, agentId)) {
             result.skipped += 1;
-            continue;
+            return;
           }
 
           const queued = await enqueueInitialAssignedTodoDispatch(
@@ -7202,7 +7449,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (
@@ -7210,7 +7457,7 @@ export function recoveryService(
           !(await wasTodoHandedBackDuringOrAfterLatestRun(issue, latestRun))
         ) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         if (didAutomaticRecoveryFail(latestRun, "assignment_recovery")) {
@@ -7234,12 +7481,12 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (await isInvocationBudgetBlocked(issue, agentId)) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         const queued = await enqueueStrandedIssueRecovery({
@@ -7256,12 +7503,12 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
 
       if (!latestRun && !issue.checkoutRunId && !issue.executionRunId) {
         result.skipped += 1;
-        continue;
+        return;
       }
       if (readDispositionRepairAttempt(latestRun)) {
         const outcome = await reconcileDispositionRepair(issue, latestRun);
@@ -7275,17 +7522,17 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
       const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
       if (handoffEvidence) {
         if (isPluginManagedIssueLifecycle(issue)) {
           result.skipped += 1;
-          continue;
+          return;
         }
         if (!handoffEvidence.exhausted) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         const updated = await escalateStrandedAssignedIssue({
@@ -7302,7 +7549,7 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
       if (isSuccessfulInProgressContinuationRun(latestRun)) {
         const successfulRun = latestRun;
@@ -7315,13 +7562,13 @@ export function recoveryService(
         if (workspace.mode === "shared_workspace" && (await healthyOpenChildIssues(issue, true)).length > 0) {
           result.productiveContinuationObserved += 1;
           result.skipped += 1;
-          continue;
+          return;
         }
 
         if (!isProductiveContinuationRun(successfulRun)) {
           result.successfulContinuationObserved += 1;
           result.skipped += 1;
-          continue;
+          return;
         }
 
         if (isRepeatedProductiveContinuationRecovery(successfulRun)) {
@@ -7335,7 +7582,7 @@ export function recoveryService(
           // mirroring the queued-wake guard the `todo` lane applies.
           if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
             result.skipped += 1;
-            continue;
+            return;
           }
           // GGU-809: skip escalation if the assignee has shown visible progress
           // (comment or attachment) within the exemption window. Falling
@@ -7363,14 +7610,14 @@ export function recoveryService(
             } else {
               result.skipped += 1;
             }
-            continue;
+            return;
           }
           result.recentProgressExempted += 1;
         }
 
         if (await isInvocationBudgetBlocked(issue, agentId)) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         const queued = await enqueueStrandedIssueRecovery({
@@ -7387,7 +7634,7 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
       if (isUnsuccessfulTerminalIssueRun(latestRun)) {
         const classification = classifyContinuationFailure(latestRun);
@@ -7399,7 +7646,7 @@ export function recoveryService(
           if (resolved) {
             result.waitingOnReviewResolved += 1;
             result.issueIds.push(issue.id);
-            continue;
+            return;
           }
 
           const outcome = await reconcileDispositionRepair(issue, latestRun);
@@ -7413,7 +7660,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         if (classification.kind === "non_retryable") {
@@ -7455,7 +7702,7 @@ export function recoveryService(
           } else {
             result.skipped += 1;
           }
-          continue;
+          return;
         }
 
         const { consecutive, latestFinishedAt } = await summarizeRecentContinuationRetries(
@@ -7494,7 +7741,7 @@ export function recoveryService(
             } else {
               result.skipped += 1;
             }
-            continue;
+            return;
           }
 
           if (classification.baseBackoffMs > 0 && latestFinishedAt) {
@@ -7504,7 +7751,7 @@ export function recoveryService(
               Math.pow(2, Math.max(0, consecutive - 1));
             if (elapsed < requiredDelay) {
               result.skipped += 1;
-              continue;
+              return;
             }
           }
         }
@@ -7512,7 +7759,7 @@ export function recoveryService(
 
       if (await isInvocationBudgetBlocked(issue, agentId)) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       const queued = await enqueueStrandedIssueRecovery({
@@ -7529,6 +7776,8 @@ export function recoveryService(
       } else {
         result.skipped += 1;
       }
+      });
+      if (!completed) result.skipped += 1;
     }
 
     const orphanBlockerRecovery = await reconcileUnassignedBlockingIssues();
@@ -7625,6 +7874,7 @@ export function recoveryService(
             identifier: issues.identifier,
             assigneeAgentId: issues.assigneeAgentId,
             blockedTransitionAt: issues.blockedTransitionAt,
+            monitorNextCheckAt: issues.monitorNextCheckAt,
             totalCount: sql<number>`count(*) over()::int`,
           })
           .from(issueRelations)
@@ -7641,6 +7891,7 @@ export function recoveryService(
           identifier: issues.identifier,
           assigneeAgentId: issues.assigneeAgentId,
           blockedTransitionAt: issues.blockedTransitionAt,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
           totalCount: sql<number>`count(*) over()::int`,
         })
         .from(issues)
@@ -7922,6 +8173,11 @@ export function recoveryService(
             ),
           )
           .then((rows) => rows[0]?.count ?? 0) : 0;
+        if (candidate.monitorNextCheckAt) {
+          result.livePathSkipped += 1;
+          continue;
+        }
+
         if (consumedWakes >= maxCount) {
           if (await hasActiveOrEscalatedRecoveryAction(companyId, candidate.id)) {
             result.reArmCapSkipped += 1;
@@ -7956,7 +8212,7 @@ export function recoveryService(
         }
 
         if (
-          (await hasActiveExecutionPath(companyId, candidate.id, agentId)) ||
+          (await hasActiveExecutionPath(companyId, candidate.id, agentId, candidate.monitorNextCheckAt)) ||
           (await hasQueuedIssueWake(companyId, candidate.id, agentId))
         ) {
           result.livePathSkipped += 1;
@@ -8046,6 +8302,7 @@ export function recoveryService(
               ...(zeroBlockerHeal ? { zeroBlockerHeal: true } : {}),
             },
             idempotencyKey,
+            completedRearmCutoff: cutoff,
             requestedByActorType: "system",
             requestedByActorId,
             contextSnapshot: {
@@ -8055,6 +8312,7 @@ export function recoveryService(
               source,
               resolvedBlockerIssueId,
               blockerIssueIds: readiness?.blockerIssueIds ?? [],
+              blockedTransitionAt: candidate.blockedTransitionAt,
               ...(zeroBlockerHeal ? { zeroBlockerHeal: true } : {}),
             },
           });
@@ -8890,11 +9148,12 @@ export function recoveryService(
     };
 
     for (const issue of candidates) {
+      await runRecoverySweepIssue(issue, "recovery.sweep_stale_issue_locks", async () => {
       if (
         !isCleanable(issue.checkoutRunId) ||
         !isCleanable(issue.executionRunId)
       ) {
-        continue;
+        return;
       }
 
       const updated = await db
@@ -8920,7 +9179,7 @@ export function recoveryService(
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
 
-      if (!updated) continue;
+      if (!updated) return;
 
       result.cleared += 1;
       result.issueIds.push(updated.id);
@@ -8940,6 +9199,7 @@ export function recoveryService(
           clearedExecutionRunId: issue.executionRunId,
           referencedRunStatuses: Object.fromEntries(runStatusById),
         },
+      });
       });
     }
 
@@ -9036,15 +9296,33 @@ export function recoveryService(
         recoveryPolicy: null,
       },
     };
-    const transition = applyIssueMonitorPolicyTransition({
-      issue: input.issue,
-      policy,
-      previousPolicy: normalized,
-      requestedStatus: input.issue.status,
-      requestedAssigneePatch: {},
-      actor: { agentId: null, userId: null },
-      monitorExplicitlyUpdated: true,
-    });
+    let transition: ReturnType<typeof applyIssueMonitorPolicyTransition>;
+    try {
+      transition = applyIssueMonitorPolicyTransition({
+        issue: input.issue,
+        policy,
+        previousPolicy: normalized,
+        requestedStatus: input.issue.status,
+        requestedAssigneePatch: {},
+        actor: { agentId: null, userId: null },
+        monitorExplicitlyUpdated: true,
+      });
+    } catch (err) {
+      // A bounds-exhausted re-arm must never kill the sweep (at startup that
+      // exits the server): treat it as "no monitor armed" so callers fall
+      // through to their existing recovery-issue path. Anything else is a
+      // real failure and must surface.
+      const clearReason =
+        err instanceof HttpError && err.status === 422 && typeof err.details === "object" && err.details !== null
+          ? (err.details as { clearReason?: unknown }).clearReason
+          : undefined;
+      if (typeof clearReason !== "string" || clearReason.length === 0) throw err;
+      logger.warn(
+        { issueId: input.issue.id, recoveryActionId: input.recoveryActionId, clearReason },
+        "exhausted recovery monitor re-arm refused: monitor bounds exhausted",
+      );
+      return null;
+    }
     // Never claim a wake from flat columns the transition did not schedule:
     // if the policy module did not write a monitor check time, nothing was armed.
     if (transition.patch.monitorNextCheckAt === undefined || transition.patch.monitorNextCheckAt === null) {
@@ -9063,12 +9341,14 @@ export function recoveryService(
   // board-owned action is only a read-time attention projection — it has no
   // wake/ageing path of its own. Mint (or reuse) a durable recovery issue
   // owned by an invokable agent, link it from the action's `recoveryIssueId`,
-  // and enqueue a wake for the owner. The recovery issue is a first-class
+  // and wake the owner once, at mint only. The recovery issue is a first-class
   // non-terminal card: it ages through assignment/wake machinery, can be
   // escalated or resolved by its owner, and satisfies AC1's
-  // "non-terminal recoveryIssueId" evidence. Idempotent: the origin-scoped
-  // lookup reuses an open recovery issue for the source, and an explicit
-  // `recoveryIssueId` short-circuits re-creation.
+  // "non-terminal recoveryIssueId" evidence. Idempotent: at most one card per
+  // (source, recovery action), ever. The lookup finds it by its
+  // `exhausted_recovery:<actionId>` fingerprint in any status (a card its
+  // owner closed is not re-minted), else reuses an open recovery issue for
+  // the source. A reused card is linked but never re-woken.
   // Returns the recovery issue's id, or null when no invokable owner exists
   // (in which case the escalation itself remains the board's item — there is
   // no agent to wake, and no wake can be honestly claimed).
@@ -9081,8 +9361,9 @@ export function recoveryService(
   // non-terminal source the same live path the exhaustion/drain paths give:
   // a future board monitor when the source is monitor-dispatchable, else a
   // durable non-terminal `recoveryIssueId` owned by an invokable agent.
-  // Idempotent: a source with a future monitor or an open linked recovery
-  // issue is left untouched, so repeat passes mint nothing and post nothing.
+  // Idempotent: a source with a future monitor or a linked recovery issue
+  // (open, or closed by its owner) is left untouched, so repeat passes mint
+  // nothing, wake nothing and post nothing.
   const EXHAUSTED_RECOVERY_DRAIN_CANDIDATE_LIMIT = 500;
 
   async function reconcileExhaustedRecoveryDrain(opts?: {
@@ -9130,7 +9411,8 @@ export function recoveryService(
     result.candidateLimitSkipped = Math.max(0, (rows[0]?.totalCount ?? 0) - rows.length);
 
     for (const { action, issue } of rows) {
-      if (isStrandedIssueRecoveryIssue(issue)) continue;
+      await runRecoverySweepIssue(issue, "recovery.reconcile_exhausted_recovery_drain", async () => {
+      if (isStrandedIssueRecoveryIssue(issue)) return;
 
       const monitorable = isMonitorableIssueShape({
         status: issue.status,
@@ -9141,7 +9423,7 @@ export function recoveryService(
       if (monitorable) {
         if (hasFutureMonitorCheck(issue.monitorNextCheckAt)) {
           result.alreadyLive++;
-          continue;
+          return;
         }
         // SUP-21344 (post-merge review): a due/claimed board monitor armed by
         // this drain belongs to tickDueIssueMonitors. Re-arming here — the
@@ -9152,7 +9434,7 @@ export function recoveryService(
         if (isDueSelfArmedBoardMonitor(issue, now)) {
           result.monitorDueAwaitingClaim++;
           result.alreadyLive++;
-          continue;
+          return;
         }
         const armedAt = await armExhaustedBoardMonitor({
           issue,
@@ -9164,7 +9446,7 @@ export function recoveryService(
           result.monitorArmed++;
           result.issueIds.push(issue.id);
           result.actionIds.push(action.id);
-          continue;
+          return;
         }
         // The policy transition scheduled no check despite a monitorable
         // shape; fall through to the recovery-issue path rather than leave
@@ -9187,6 +9469,7 @@ export function recoveryService(
       } else {
         result.noInvokableOwner++;
       }
+      });
     }
 
     if (result.monitorArmed > 0 || result.recoveryIssueMinted > 0 || result.noInvokableOwner > 0) {
@@ -9284,17 +9567,33 @@ export function recoveryService(
       return true;
     };
 
-    const openRecoveryIssue = await findOpenRecoveryIssue();
-    if (openRecoveryIssue) {
-      if (openRecoveryIssue.id !== input.existingRecoveryIssueId) {
-        await linkRecoveryIssue(openRecoveryIssue.id);
+    // At most one exhausted-recovery card per (source, recovery action), ever.
+    // A card its owner closed, cancelled, or hid is that owner's disposition:
+    // re-minting it handed the same board decision straight back to the same
+    // owner (SUP-21999: four serial cards). Otherwise reuse any open recovery
+    // card for the source. The owner is woken once, when the card is minted;
+    // re-waking it on every drain pass only bought runs that re-parked the
+    // card (SUP-22447: 114 runs), so a reused card gets no wake.
+    const reusableRecoveryIssue =
+      (await db
+        .select()
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, input.issue.companyId),
+            eq(issues.originKind, RECOVERY_ORIGIN_KINDS.strandedIssueRecovery),
+            eq(issues.originId, input.issue.id),
+            eq(issues.originFingerprint, `exhausted_recovery:${input.recoveryActionId}`),
+          ),
+        )
+        .orderBy(desc(issues.createdAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null)) ?? (await findOpenRecoveryIssue());
+    if (reusableRecoveryIssue) {
+      if (reusableRecoveryIssue.id !== input.existingRecoveryIssueId) {
+        await linkRecoveryIssue(reusableRecoveryIssue.id);
       }
-      // A reused issue is not necessarily a live issue: its original wake may
-      // have failed, completed without disposition, or been skipped before the
-      // link was persisted. Re-drive only when no live wake remains so normal
-      // idempotent drain passes do not spam the owner.
-      await enqueueRecoveryIssueWake(openRecoveryIssue);
-      return openRecoveryIssue.id;
+      return reusableRecoveryIssue.id;
     }
 
     const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
@@ -9321,6 +9620,9 @@ export function recoveryService(
         originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
         originId: input.issue.id,
         originFingerprint: `exhausted_recovery:${input.recoveryActionId}`,
+        // The card records a board decision and never ships code, so its owner
+        // must be able to close it without a repository delivery.
+        deliveryRequirement: "record_only",
         billingCode: input.issue.billingCode,
       });
     } catch (error) {
@@ -9328,7 +9630,6 @@ export function recoveryService(
       const winningIssue = await findOpenRecoveryIssue();
       if (!winningIssue) throw error;
       if (winningIssue.id !== input.existingRecoveryIssueId) await linkRecoveryIssue(winningIssue.id);
-      await enqueueRecoveryIssueWake(winningIssue);
       return winningIssue.id;
     }
 
@@ -9425,8 +9726,9 @@ export function recoveryService(
       );
 
       for (const candidate of companyCandidates) {
+        await runRecoverySweepIssue(candidate, "recovery.reconcile_blocked_without_blockers", async () => {
         const readiness = readinessMap.get(candidate.id);
-        if (!readiness || readiness.unresolvedBlockerCount !== 0) continue;
+        if (!readiness || readiness.unresolvedBlockerCount !== 0) return;
 
         // SUP-16951 — deliberate-park exemption. A zero-blocker card that
         // carries a self-owned unblockDescriptor with a non-empty action is a
@@ -9438,34 +9740,34 @@ export function recoveryService(
         // branches alike. Cards with no descriptor fall through unchanged.
         if (hasUsableUnblockDescriptor(candidate.unblockDescriptor)) {
           result.unblockDescriptorExemptSkipped++;
-          continue;
+          return;
         }
 
         const blockedAt = candidate.updatedAt ?? new Date();
         const msInViolation = now.getTime() - blockedAt.getTime();
         if (msInViolation < BLOCKED_WITHOUT_BLOCKERS_GRACE_THRESHOLD_MS) {
           result.graceThresholdSkipped++;
-          continue;
+          return;
         }
 
         if (await hasActiveExecutionPath(companyId, candidate.id, null, candidate.monitorNextCheckAt)) {
           result.livePathSkipped++;
-          continue;
+          return;
         }
 
         if (await hasQueuedIssueWake(companyId, candidate.id, candidate.assigneeAgentId)) {
           result.queuedWakeSkipped++;
-          continue;
+          return;
         }
 
         if (await hasPendingWakeInteraction(db, companyId, candidate.id)) {
           result.interactionSkipped++;
-          continue;
+          return;
         }
 
         if (await isAutomaticRecoverySuppressedByPauseHold(db, companyId, candidate.id, treeControlSvc)) {
           result.pauseHoldSkipped++;
-          continue;
+          return;
         }
 
         const existingAction = await recoveryActionsSvc.getActiveForIssue(companyId, candidate.id);
@@ -9474,7 +9776,7 @@ export function recoveryService(
         if (existingAction?.kind === TIMER_DISPATCH_PARK_RECOVERY_KIND &&
             existingAction.cause === TIMER_DISPATCH_PARK_RECOVERY_CAUSE) {
           result.alreadyActionedSkipped++;
-          continue;
+          return;
         }
 
         // SUP-14151 — cross-fingerprint exhaustion suppression: when the
@@ -9598,7 +9900,7 @@ export function recoveryService(
               },
             });
           }
-          continue;
+          return;
         }
 
         // Guard 2 — rearm-cap-exhausted: a candidate holding an active
@@ -9616,7 +9918,7 @@ export function recoveryService(
           existingAction?.cause === "dependency_wake_rearm_cap_exhausted"
         ) {
           result.rearmCapExhaustedSkipped++;
-          continue;
+          return;
         }
 
         // Auto-heal path — setting-gated, default OFF.
@@ -9670,12 +9972,12 @@ export function recoveryService(
                   );
                 } else {
                   result.deadWorkspaceBindingSkipped++;
-                  continue;
+                  return;
                 }
               }
             } else {
               result.deadWorkspaceBindingSkipped++;
-              continue;
+              return;
             }
           }
           const existingActionIsBwob = existingAction?.kind === "blocked_without_blockers";
@@ -9749,13 +10051,13 @@ export function recoveryService(
               entityId: candidate.id,
               details: { source, fingerprint: `bwob:${companyId}:${candidate.id}` },
             });
-            continue;
+            return;
           }
         }
 
         if (existingAction?.kind === "blocked_without_blockers") {
           result.alreadyActionedSkipped++;
-          continue;
+          return;
         }
 
         const resolvedAction = await recoveryActionsSvc.getLatestResolvedForIssue(
@@ -9766,7 +10068,7 @@ export function recoveryService(
         const healAttemptCount =
           (resolvedAction?.evidence?.healAttemptCount as number | undefined) ?? 0;
 
-        await recoveryActionsSvc.upsertSourceScoped({
+        const upserted = await recoveryActionsSvc.upsertSourceScoped({
           companyId,
           sourceIssueId: candidate.id,
           kind: "blocked_without_blockers",
@@ -9788,6 +10090,13 @@ export function recoveryService(
           maxAttempts: null,
           lastAttemptAt: now,
         });
+        // An exhausted action of another kind that the terminal-action guard
+        // above does not match still owns the card; the upsert returned it
+        // untouched, so there is no escalation to count or log on this tick.
+        if (upserted.kind !== "blocked_without_blockers") {
+          result.alreadyActionedSkipped++;
+          return;
+        }
 
         result.escalated++;
         result.issueIds.push(candidate.id);
@@ -9804,6 +10113,7 @@ export function recoveryService(
             source,
             fingerprint: `bwob:${companyId}:${candidate.id}`,
           },
+        });
         });
       }
     }
@@ -10080,6 +10390,7 @@ export function recoveryService(
     );
 
     for (const candidate of issueRows) {
+      await runRecoverySweepIssue(candidate, "recovery.reconcile_dispatch_suppression_parks", async () => {
       const lastRealActivity = [
         candidate.updatedAt,
         commentLatestById.get(candidate.id) ?? null,
@@ -10093,7 +10404,7 @@ export function recoveryService(
       // (C) sustained window not yet elapsed — the card is not persistently stuck.
       if (!lastRealActivity || now.getTime() - lastRealActivity.getTime() < DISPATCH_SUPPRESSED_PARK_SUSTAINED_MS) {
         result.sustainedWindowSkipped++;
-        continue;
+        return;
       }
 
       // (D) any §2a live path reappeared — never park a live card.
@@ -10106,21 +10417,21 @@ export function recoveryService(
         now,
       )) {
         result.livePathSkipped++;
-        continue;
+        return;
       }
 
       // An active action for another cause already owns this issue's recovery.
       const existingAction = await recoveryActionsSvc.getActiveForIssue(candidate.companyId, candidate.id);
       if (existingAction) {
         result.alreadyActionedSkipped++;
-        continue;
+        return;
       }
 
       // (B) confirm D1 suppression and read the failing §2a disjuncts.
       const suppressionDetails = latestSuppressionById.get(candidate.id);
       if (suppressionDetails === undefined) {
         result.notSuppressedSkipped++;
-        continue;
+        return;
       }
       const rawDisjuncts = parseObject(suppressionDetails).disjuncts;
       const disjuncts: ContinuationPathDisjuncts = {
@@ -10185,6 +10496,7 @@ export function recoveryService(
 
       result.parked++;
       result.issueIds.push(candidate.id);
+      });
     }
 
     if (result.parked > 0) {
@@ -10693,12 +11005,13 @@ export function recoveryService(
     );
 
     for (const candidate of issueRows) {
+      await runRecoverySweepIssue(candidate, "recovery.reconcile_todo_stranded_cards", async () => {
       const assignee = candidate.assigneeAgentId
         ? assigneeById.get(candidate.assigneeAgentId)
         : null;
       if (assignee && isExternalPullAgent(assignee)) {
         result.externalPullSkipped += 1;
-        continue;
+        return;
       }
 
       const leased = Boolean(leasesByCompany.get(candidate.companyId)?.has(candidate.id));
@@ -10747,16 +11060,16 @@ export function recoveryService(
 
       if (leased) {
         result.leasedSkipped += 1;
-        continue;
+        return;
       }
       if (activeRecoveryAction !== null) {
         result.alreadyActionedSkipped += 1;
-        continue;
+        return;
       }
       if (!verdict.stranded) {
         if (activePath || monitorFuture || liveWake) result.livePathSkipped += 1;
         else result.thresholdSkipped += 1;
-        continue;
+        return;
       }
 
       const seatKey = `${candidate.id}:${candidate.assigneeAgentId ?? ""}`;
@@ -10772,7 +11085,7 @@ export function recoveryService(
         );
       if (latestParkedAt && (!latestDischargeAt || latestDischargeAt.getTime() <= latestParkedAt.getTime())) {
         result.alreadyParkedDischargedSkipped += 1;
-        continue;
+        return;
       }
 
       await issuesSvc.update(candidate.id, { status: "blocked" });
@@ -10811,6 +11124,7 @@ export function recoveryService(
 
       result.parked += 1;
       result.issueIds.push(candidate.id);
+      });
     }
 
     if (result.parked > 0) {
@@ -10889,12 +11203,13 @@ export function recoveryService(
 
     result.checked = candidates.length;
     for (const candidate of candidates) {
+      await runRecoverySweepIssue({ id: candidate.sourceIssueId, identifier: null }, "recovery.reconcile_stale_recovery_action_wakes", async () => {
       const effectiveMaxAttempts = candidate.maxAttempts ?? MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
 
       if (candidate.attemptCount >= effectiveMaxAttempts) {
         result.maxAttemptsReached += 1;
         await escalateExhaustedRecoveryAction(candidate, effectiveMaxAttempts, now);
-        continue;
+        return;
       }
 
       const sourceIssue = await db
@@ -10906,7 +11221,7 @@ export function recoveryService(
       // Nothing left to recover: the source issue is gone or already terminal.
       if (!sourceIssue || sourceIssue.status === "done" || sourceIssue.status === "cancelled") {
         result.skippedTerminalSource += 1;
-        continue;
+        return;
       }
 
       // A subtree pause hold suppresses ALL automatic recovery, including this
@@ -10924,7 +11239,7 @@ export function recoveryService(
         )
       ) {
         result.skippedPauseHold += 1;
-        continue;
+        return;
       }
 
       // Mirror the early-return guards in enqueueSourceScopedStrandedRecoveryWake
@@ -10932,19 +11247,19 @@ export function recoveryService(
       const wakePolicyType = readRecoveryWakePolicyType(candidate);
       if (wakePolicyType === "monitor_only" || wakePolicyType === "manual_repair_required") {
         result.nonWakeableSkipped += 1;
-        continue;
+        return;
       }
       if (candidate.cause === "configuration_incomplete") {
         result.nonWakeableSkipped += 1;
-        continue;
+        return;
       }
       if (candidate.cause === "provider_quota" && !candidate.ownerAgentId) {
         result.nonWakeableSkipped += 1;
-        continue;
+        return;
       }
       if (!candidate.ownerAgentId && wakePolicyType !== "board_escalation") {
         result.nonWakeableSkipped += 1;
-        continue;
+        return;
       }
 
       // This action was deliberately sent to the board because its pending
@@ -10957,7 +11272,7 @@ export function recoveryService(
         readNonEmptyString(parseObject(candidate.wakePolicy).reason) === "pending_participant_unavailable"
       ) {
         result.nonWakeableSkipped += 1;
-        continue;
+        return;
       }
 
       // Per-action backoff: an action that has already been re-fired several
@@ -10970,7 +11285,7 @@ export function recoveryService(
         const backoffBefore = new Date(now.getTime() - intervalMs * multiplier);
         if (candidate.lastAttemptAt >= backoffBefore) {
           result.skippedBackoff += 1;
-          continue;
+          return;
         }
       }
 
@@ -11002,7 +11317,7 @@ export function recoveryService(
               ),
             );
           result.nonWakeableSkipped += 1;
-          continue;
+          return;
         }
       }
 
@@ -11036,7 +11351,7 @@ export function recoveryService(
         )
         .returning();
 
-      if (!updated) continue;
+      if (!updated) return;
 
       const action = updated as unknown as IssueRecoveryAction;
       const latestRun = await getLatestIssueRun(candidate.companyId, candidate.sourceIssueId);
@@ -11048,7 +11363,7 @@ export function recoveryService(
           latestRun,
           recoveryCause: candidate.cause as StrandedRecoveryCause,
         });
-        if (!enqueued) continue;
+        if (!enqueued) return;
         if (rerouteOwnerAgentId) result.rerouted += 1;
         else result.reFired += 1;
         result.issueIds.push(candidate.sourceIssueId);
@@ -11060,6 +11375,7 @@ export function recoveryService(
           "failed to re-fire stale recovery action wake",
         );
       }
+      });
     }
 
     if (result.reFired > 0 || result.rerouted > 0 || result.maxAttemptsReached > 0) {
@@ -11771,19 +12087,20 @@ export function recoveryService(
       .limit(STILLBORN_ASSIGNED_BACKLOG_CANDIDATE_LIMIT);
 
     for (const candidate of candidates) {
+      const completed = await runRecoverySweepIssue(candidate, "recovery.reconcile_stillborn_assigned_backlog", async () => {
       if (await hasActiveExecutionPath(candidate.companyId, candidate.id, candidate.assigneeAgentId)) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       if (await hasPendingWakeInteraction(db, candidate.companyId, candidate.id)) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       if (await isAutomaticRecoverySuppressedByPauseHold(db, candidate.companyId, candidate.id, treeControlSvc)) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       const updated = await escalateStrandedAssignedIssue({
@@ -11798,7 +12115,7 @@ export function recoveryService(
       });
       if (!updated) {
         result.skipped += 1;
-        continue;
+        return;
       }
 
       result.reported += 1;
@@ -11823,6 +12140,8 @@ export function recoveryService(
           recoveryActionId: action?.id ?? null,
         },
       });
+      });
+      if (!completed) result.skipped += 1;
     }
 
     const shouldLog =
@@ -11922,6 +12241,8 @@ export function recoveryService(
           assigneeAgentId: issues.assigneeAgentId,
           monitorNextCheckAt: issues.monitorNextCheckAt,
           assigneeAdapterType: agents.adapterType,
+          assigneeStatus: agents.status,
+          assigneeRuntimeConfig: agents.runtimeConfig,
           totalCount: sql<number>`count(*) over()::int`,
         })
         .from(issues)
@@ -11951,6 +12272,22 @@ export function recoveryService(
       // counter, so a card that recovers between cycles counts first-sight
       // again from the next confirmed cycle.
       if (!isPullOnlyAdapterType(candidate.assigneeAdapterType)) {
+        undispatchableAssignedSightCounts.delete(candidate.id);
+        result.skipped += 1;
+        continue;
+      }
+
+      // A declared `external_pull` agent is never invoked by design: it pulls
+      // its queue out of band, so a pull-only adapter type is its normal
+      // shape, not a missing wake path. Same declaration the strand sweeps
+      // honour (strand-skip.ts). Only while its status lets it work: a paused,
+      // terminated or pending-approval agent pulls nothing, so its cards stay
+      // reportable. Existing actions are left to the backstop above, which
+      // still keys on the adapter type alone.
+      if (
+        isExternalPullAgent({ runtimeConfig: candidate.assigneeRuntimeConfig }) &&
+        isAgentStatusInvokable(candidate.assigneeStatus)
+      ) {
         undispatchableAssignedSightCounts.delete(candidate.id);
         result.skipped += 1;
         continue;

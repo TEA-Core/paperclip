@@ -1,4 +1,7 @@
 import type { IssueExecutionStage } from "@paperclipai/shared";
+import { and, eq } from "drizzle-orm";
+import type { Db } from "@paperclipai/db";
+import { pluginManagedResources } from "@paperclipai/db";
 import { unprocessable } from "../errors.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import {
@@ -136,3 +139,189 @@ export function assertAssigneeWriteDoesNotSelfSatisfyReviewStage(input: {
   const nextAction = seatAuthorityNextAction(callerSeat);
   throw unprocessable(`${message}. ${nextAction}`, { ...details, callerSeat, nextAction });
 }
+
+export const WIKI_LLM_WIKI_PLUGIN_KEY = "paperclipai.plugin-llm-wiki" as const;
+export const WIKI_MAINTAINER_AGENT_KEY = "wiki-maintainer" as const;
+
+export function isWikiHandoffTitle(title: unknown): boolean {
+  return (
+    typeof title === "string" &&
+    title.trim().toLowerCase().includes("handoff to wiki maintainer")
+  );
+}
+
+export async function resolveCanonicalWikiMaintainerAgentId(
+  db: Db,
+  companyId: string,
+  issue: { title?: string | null; description?: string | null } | null | undefined,
+): Promise<string | null> {
+  if (!issue?.title?.trim() && !issue?.description?.trim()) return null;
+  if (!isWikiHandoffTitle(issue.title)) return null;
+  const rows = await db
+    .select({ resourceId: pluginManagedResources.resourceId })
+    .from(pluginManagedResources)
+    .where(
+      and(
+        eq(pluginManagedResources.companyId, companyId),
+        eq(pluginManagedResources.pluginKey, WIKI_LLM_WIKI_PLUGIN_KEY),
+        eq(pluginManagedResources.resourceKind, "agent"),
+        eq(pluginManagedResources.resourceKey, WIKI_MAINTAINER_AGENT_KEY),
+      ),
+    )
+    .then((found) => found);
+  return rows[0]?.resourceId ?? null;
+}
+
+function isWorkflowControlledPendingReviewParticipant(input: {
+  executionPolicy: unknown;
+  executionState: unknown;
+  incomingAssigneeAgentId: string | null;
+  workflowControlledAssignment?: boolean;
+}): boolean {
+  if (input.workflowControlledAssignment !== true) return false;
+  const state = parseIssueExecutionState(input.executionState);
+  if (
+    state?.status !== "pending" ||
+    typeof state.currentStageIndex !== "number" ||
+    state.currentStageType !== "review"
+  ) return false;
+  const currentParticipant = state.currentParticipant;
+  if (currentParticipant?.type === "agent") {
+    if (currentParticipant.agentId !== input.incomingAssigneeAgentId) return false;
+  } else if (currentParticipant?.type === "user") {
+    if (input.incomingAssigneeAgentId !== null) return false;
+  } else {
+    return false;
+  }
+  const policy = input.executionPolicy as { stages?: unknown } | null | undefined;
+  if (!policy || typeof policy !== "object" || !Array.isArray(policy.stages)) return false;
+  const rawStage = policy.stages[state.currentStageIndex];
+  if (!rawStage || typeof rawStage !== "object") return false;
+  const stage = rawStage as Pick<IssueExecutionStage, "id" | "type"> & { participants?: unknown };
+  if (
+    stage.type !== "review" ||
+    stage.id !== state.currentStageId ||
+    state.completedStageIds.includes(stage.id) ||
+    state.skippedStageIds?.includes(stage.id)
+  ) return false;
+  return Array.isArray(stage.participants) && stage.participants.some((participant) => {
+    if (!participant || typeof participant !== "object") return false;
+    if (currentParticipant.type === "agent") {
+      return participant.type === "agent" && participant.agentId === currentParticipant.agentId;
+    }
+    return participant.type === "user" && participant.userId === currentParticipant.userId;
+  });
+}
+
+export async function assertWikiHandoffWriteIntegrity(input: {
+  db: Db | { select: unknown };
+  companyId: string;
+  issue: {
+    title?: string | null;
+    description?: string | null;
+    executionPolicy?: unknown;
+    executionState?: unknown;
+  };
+  incomingAssigneeAgentId: string | null | undefined;
+  actorAgentId?: string | null;
+  currentAssigneeAgentId?: string | null;
+  checkReviewStage?: boolean;
+  workflowControlledAssignment?: boolean;
+  refusalContext?: { caller: RefusalCaller; issue: RefusalIssue | null };
+}): Promise<void> {
+  const canonicalMaintainerAgentId = await resolveCanonicalWikiMaintainerAgentId(
+    input.db as Db,
+    input.companyId,
+    input.issue,
+  );
+  if (!canonicalMaintainerAgentId) return;
+  const incoming = typeof input.incomingAssigneeAgentId === "string" && input.incomingAssigneeAgentId.length > 0
+    ? input.incomingAssigneeAgentId
+    : null;
+  const violation = wikiHandoffWriteWouldViolate({
+    canonicalMaintainerAgentId,
+    incomingAssigneeAgentId: incoming,
+    actorAgentId: input.actorAgentId,
+    currentAssigneeAgentId: input.currentAssigneeAgentId,
+    executionPolicy: input.issue.executionPolicy,
+    executionState: input.issue.executionState,
+    checkReviewStage: input.checkReviewStage,
+    workflowControlledAssignment: input.workflowControlledAssignment,
+  });
+  if (!violation) return;
+  if (
+    violation.reason === "wiki_handoff_self_satisfy" &&
+    input.workflowControlledAssignment !== true &&
+    input.checkReviewStage !== false
+  ) {
+    assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
+      executionPolicy: input.issue.executionPolicy,
+      executionState: input.issue.executionState,
+      incomingAssigneeAgentId: incoming,
+      refusalContext: input.refusalContext,
+    });
+    return;
+  }
+  throw unprocessable(
+    violation.reason === "wiki_handoff_self_satisfy"
+      ? "Refusing assigneeAgentId write on a Wiki handoff: the canonical Wiki Maintainer cannot be the only participant able to clear the pending review stage"
+      : "Refusing assigneeAgentId write on a Wiki handoff: the resulting assignee is not the canonical Wiki Maintainer managed by plugin paperclipai.plugin-llm-wiki (resourceKey wiki-maintainer)",
+    {
+      guard: "assignee_review_gate",
+      subGuard: "wiki_handoff",
+      reason: incoming === null ? "wiki_handoff_unassigned" : violation.reason,
+      pluginKey: WIKI_LLM_WIKI_PLUGIN_KEY,
+      resourceKey: WIKI_MAINTAINER_AGENT_KEY,
+      canonicalMaintainerAgentId,
+      assigneeAgentId: incoming,
+    },
+  );
+}
+
+export function wikiHandoffWriteWouldViolate(input: {
+  canonicalMaintainerAgentId: string | null | undefined;
+  incomingAssigneeAgentId: string | null | undefined;
+  actorAgentId?: string | null;
+  currentAssigneeAgentId?: string | null;
+  executionPolicy: unknown;
+  executionState: unknown;
+  checkReviewStage?: boolean;
+  workflowControlledAssignment?: boolean;
+}): { reason: "wiki_handoff_non_canonical_assignee" | "wiki_handoff_self_satisfy" } | null {
+  const canonical = typeof input.canonicalMaintainerAgentId === "string" && input.canonicalMaintainerAgentId.length > 0
+    ? input.canonicalMaintainerAgentId
+    : null;
+  if (!canonical) return null;
+  const incoming = typeof input.incomingAssigneeAgentId === "string" && input.incomingAssigneeAgentId.length > 0
+    ? input.incomingAssigneeAgentId
+    : null;
+  if (incoming !== canonical) {
+    if (
+      (incoming !== null || (
+        input.actorAgentId === canonical &&
+        input.currentAssigneeAgentId === canonical
+      )) &&
+      isWorkflowControlledPendingReviewParticipant({
+        executionPolicy: input.executionPolicy,
+        executionState: input.executionState,
+        incomingAssigneeAgentId: incoming,
+        workflowControlledAssignment: input.workflowControlledAssignment,
+      })
+    ) return null;
+    return { reason: "wiki_handoff_non_canonical_assignee" };
+  }
+  if (input.checkReviewStage === false && input.workflowControlledAssignment !== true) return null;
+  if (
+    findSelfSatisfyingReviewStage({
+      executionPolicy: input.executionPolicy,
+      executionState: input.executionState,
+      incomingAssigneeAgentId: incoming,
+    })
+  ) {
+    return { reason: "wiki_handoff_self_satisfy" };
+  }
+  return null;
+}
+
+export type WikiHandoffViolationReason =
+  "wiki_handoff_non_canonical_assignee" | "wiki_handoff_self_satisfy";

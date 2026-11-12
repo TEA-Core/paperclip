@@ -111,7 +111,7 @@ describeEmbeddedPostgres("issue comment reopen route dispatch (SUP-15065)", () =
     return { company, agent: agent!, issue: issue! };
   }
 
-  async function waitForReopenRun(agentId: string, ms = 8000) {
+  async function waitForRun(agentId: string, wakeReason: string, ms = 8000) {
     const db = pg.db;
     const start = Date.now();
     for (;;) {
@@ -125,8 +125,9 @@ describeEmbeddedPostgres("issue comment reopen route dispatch (SUP-15065)", () =
         .where(eq(heartbeatRuns.agentId, agentId));
       const match = rows.find(
         (row) =>
-          row.contextSnapshot?.wakeReason === "issue_reopened_via_comment" ||
-          row.contextSnapshot?.source === "issue.comment.reopen",
+          row.contextSnapshot?.wakeReason === wakeReason ||
+          (wakeReason === "issue_reopened_via_comment" &&
+            row.contextSnapshot?.source === "issue.comment.reopen"),
       );
       if (match) return match;
       if (Date.now() - start > ms) {
@@ -136,7 +137,7 @@ describeEmbeddedPostgres("issue comment reopen route dispatch (SUP-15065)", () =
           .from(agentWakeupRequests)
           .where(eq(agentWakeupRequests.agentId, agentId));
         throw new Error(
-          `no heartbeat_runs row for the reopen within ${ms}ms. agent_wakeup_requests: ${JSON.stringify(skips)}`,
+          `no heartbeat_runs row for ${wakeReason} within ${ms}ms. agent_wakeup_requests: ${JSON.stringify(skips)}`,
         );
       }
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -166,6 +167,10 @@ describeEmbeddedPostgres("issue comment reopen route dispatch (SUP-15065)", () =
       .post(`/api/issues/${issue.id}/comments`)
       .send({ body: "Please reopen and pick this up.", reopen: true });
     expect(res.status).toBe(201);
+    expect(res.body.wakeReceipt).toEqual({
+      outcome: "not_dispatched",
+      reason: "heartbeat.wakeOnDemand.disabled",
+    });
 
     // The reopen still flipped the card back to todo.
     const refetched = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issue.id));
@@ -178,6 +183,7 @@ describeEmbeddedPostgres("issue comment reopen route dispatch (SUP-15065)", () =
       agentId: agent.id,
       wakeupReason: "issue_reopened_via_comment",
       outcome: "not_dispatched",
+      reason: "heartbeat.wakeOnDemand.disabled",
     });
 
     // ...and no run was enqueued for the assignee (the wake was skipped, not dropped silently).
@@ -200,13 +206,89 @@ describeEmbeddedPostgres("issue comment reopen route dispatch (SUP-15065)", () =
     expect(res.status).toBe(201);
     // POST /comments returns the created comment (its own id), not the issue.
     expect(res.body?.body).toBe("Please reopen and pick this up.");
+    expect(res.body.wakeReceipt).toMatchObject({ outcome: "dispatched" });
 
     // The reopen flipped the card back to todo.
     const refetched = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issue.id));
     expect(refetched[0]?.status).toBe("todo");
 
-    const run = await waitForReopenRun(agent.id);
+    const run = await waitForRun(agent.id, "issue_reopened_via_comment");
     expect(run, "a heartbeat_runs row must exist for the reopen").toBeTruthy();
     expect(run.status).toBeTruthy();
+  });
+
+  it("keeps a different mentioned agent's wake independent of the assignee receipt", async () => {
+    const db = pg.db;
+    const { company, agent, issue } = await seedDoneCard({ wakeOnDemand: false });
+    const [mentionedAgent] = await db.insert(agents).values({
+      companyId: company.companyId,
+      name: "mentioned-QAE",
+      role: "support",
+      status: "idle",
+      adapterType: "opencode_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    }).returning();
+    const app = routeApp(db, company.actor, issueRoutes);
+    const body = `[@QAE](agent://${mentionedAgent!.id}) please reopen and verify.`;
+
+    const res = await request(app)
+      .post(`/api/issues/${issue.id}/comments`)
+      .send({ body, reopen: true });
+
+    expect(res.status).toBe(201);
+    expect(res.body.body).toBe(body);
+    expect(res.body.wakeReceipt).toEqual({
+      outcome: "not_dispatched",
+      reason: "heartbeat.wakeOnDemand.disabled",
+    });
+    const mentionRun = await waitForRun(mentionedAgent!.id, "issue_comment_mentioned");
+    expect(mentionRun).toBeTruthy();
+    const notDispatched = await waitForActivityRow("issue.wake_not_dispatched");
+    expect(notDispatched).toHaveLength(1);
+    expect(notDispatched![0].details).toMatchObject({
+      agentId: agent.id,
+      wakeupReason: "issue_reopened_via_comment",
+      outcome: "not_dispatched",
+      reason: res.body.wakeReceipt.reason,
+    });
+  });
+
+  it("returns a coalesced assignee wake receipt with its durable reason", async () => {
+    const db = pg.db;
+    const { company, agent, issue } = await seedDoneCard();
+    const [existingRun] = await db.insert(heartbeatRuns).values({
+      companyId: company.companyId,
+      agentId: agent.id,
+      status: "queued",
+      contextSnapshot: {
+        issueId: issue.id,
+        taskId: issue.id,
+        wakeReason: "issue_commented",
+      },
+    }).returning();
+    const app = routeApp(db, company.actor, issueRoutes);
+
+    const res = await request(app)
+      .post(`/api/issues/${issue.id}/comments`)
+      .send({ body: "Please reopen and pick this up.", reopen: true });
+
+    expect(res.status).toBe(201);
+    expect(res.body.body).toBe("Please reopen and pick this up.");
+    expect(res.body.wakeReceipt).toEqual({
+      outcome: "coalesced",
+      reason: "issue_execution_same_name",
+    });
+    const wakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agent.id));
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]).toMatchObject({
+      status: "coalesced",
+      reason: "issue_execution_same_name",
+      runId: existingRun!.id,
+    });
   });
 });

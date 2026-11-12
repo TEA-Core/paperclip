@@ -123,13 +123,16 @@ describe("resolveChunkedImportZip", () => {
   it("takes the chunked path for a small zip whose entries inflate past the threshold", async () => {
     const dir = await makeTempDir();
     const zipPath = path.join(dir, "dense-package.zip");
-    // ~64 MB of repetitive text DEFLATEs to a tiny file: far under the raw
-    // 48 MB threshold, but the inline body would carry the inflated entries,
-    // so the estimated request size sends the zip down the chunked path.
-    const zipBytes = buildDeflateZip("dense-package/NOTES.md", "paperclip agent docs\n".repeat(3_200_000));
+    // ~10 MB of repetitive text DEFLATEs to a tiny file: far under the 8 MB
+    // threshold on raw size, but the inline body would carry the inflated
+    // entries, so the estimated request size sends the zip down the chunked
+    // path. The lower existing-company threshold keeps the fixture small
+    // (the fixture's bitwise CRC made a threshold-sized one time out on CI).
+    const zipBytes = buildDeflateZip("dense-package/NOTES.md", "paperclip agent docs\n".repeat(500_000));
     await writeFile(zipPath, zipBytes);
+    expect(zipBytes.length).toBeLessThan(EXISTING_COMPANY_CHUNKED_IMPORT_THRESHOLD_BYTES);
 
-    const resolved = await resolveChunkedImportZip(zipPath);
+    const resolved = await resolveChunkedImportZip(zipPath, EXISTING_COMPANY_CHUNKED_IMPORT_THRESHOLD_BYTES);
     expect(resolved).not.toBeNull();
     expect(resolved!.rootPath).toBe("dense-package");
     expect(sha256Hex(resolved!.zipBytes)).toBe(sha256Hex(zipBytes));

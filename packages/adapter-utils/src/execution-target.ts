@@ -1739,8 +1739,17 @@ export async function prepareGitHubOperationLaunchers(input: {
   const managedPath = basePath ? `${directory}:${basePath}` : directory;
   // Login shells may reorder PATH through /etc/profile or path_helper. Restore
   // the managed launchers after startup without loading a host user's profile.
-  const profile = `export PATH=${shellQuote(managedPath)}\n`;
+  // Empty merge overrides clear host identity before launch, but Git treats
+  // them as an explicit empty author. Remove them once the shell has inherited
+  // its final environment; preserve nonempty per-operation identity values.
+  const clearEmptyGitIdentity = ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"]
+    .map((key) => `if [ -z "\${${key}-}" ]; then unset ${key}; fi\n`)
+    .join("");
+  const profile = `export PATH=${shellQuote(managedPath)}\n${clearEmptyGitIdentity}`;
   const files: Record<string, string> = Object.fromEntries([
+    // Remote launchers live beneath the checkout. Pin their own package scope
+    // so an enclosing project's "type": "module" cannot reinterpret require().
+    ["package.json", '{"type":"commonjs"}\n'],
     ...["git", "gh"].map((name) => [name, githubLauncherSource()] as const),
     ...[".zshenv", ".zprofile", ".zshrc", ".bash_profile", ".bashrc", ".profile"].map((name) => [name, profile] as const),
   ]);
@@ -2056,6 +2065,38 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
     // is not reclassified as ambient merely because it equals the host value.
     env: sanitizeRemoteExecutionEnv(launchEnv, {}),
   }), "utf8").toString("base64");
+  // Base64 plus JSON escaping can push an otherwise valid child environment
+  // past Linux's per-argument/per-variable exec limit. Keep small launches on
+  // the existing path; upload larger envelopes in bounded chunks instead.
+  const commandEnv: Record<string, string> = {};
+  if (commandPayload.length <= 64 * 1024) {
+    commandEnv.PAPERCLIP_PROCESS_SESSION_COMMAND_B64 = commandPayload;
+  } else {
+    const payloadPath = path.posix.join(sessionDir, "command.b64");
+    const runPayloadSetup = async (script: string) => {
+      const result = await runner.execute({
+        command: shellCommand,
+        args: shellCommandArgs(script),
+        cwd: target.remoteCwd,
+        timeoutMs,
+        bypassSession: true,
+      });
+      if (result.timedOut || result.exitCode !== 0) {
+        throw new Error("Failed to stage sandbox process session command payload.");
+      }
+    };
+    try {
+      // The envelope can contain credentials. Its upload intermediates stay
+      // inside a private session directory, and the wrapper deletes it before
+      // spawning the child. Teardown removes it if the wrapper cannot start.
+      await runPayloadSetup(`umask 077 && mkdir -m 700 ${shellQuote(sessionDir)}`);
+      await client.writeTextFile(payloadPath, commandPayload);
+      await runPayloadSetup(`chmod 600 ${shellQuote(payloadPath)}`);
+    } catch (error) {
+      await client.remove(sessionDir).catch(() => undefined);
+      throw error;
+    }
+  }
 
   // Legacy poll path: background the wrapper with `nohup` and read its output
   // event files with the host poll below. The streamed path launches the wrapper
@@ -2070,7 +2111,7 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
           // I3: no numeric process identifier anywhere. Background the
           // wrapper and let it go; do not capture `$!`.
           `PAPERCLIP_PROCESS_SESSION_DIR=${shellQuote(sessionDir)} ` +
-            `PAPERCLIP_PROCESS_SESSION_COMMAND_B64=${shellQuote(commandPayload)} ` +
+            Object.entries(commandEnv).map(([key, value]) => `${key}=${shellQuote(value)} `).join("") +
             `nohup node ${shellQuote(remoteScriptPath)} >/dev/null 2>&1 < /dev/null &`,
         ].join("\n"),
       ),
@@ -2082,8 +2123,12 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
       // The wrapper launch is bridge plumbing. Keep it off the persistent
       // session so it never queues behind an in-run session command.
       bypassSession: true,
+    }).catch(async (error) => {
+      await client.remove(sessionDir).catch(() => undefined);
+      throw error;
     });
     if (startResult.timedOut || (startResult.exitCode ?? 1) !== 0) {
+      await client.remove(sessionDir).catch(() => undefined);
       throw new Error(`Failed to start sandbox ACP process session bridge: ${startResult.stderr || startResult.stdout}`);
     }
   }
@@ -2349,16 +2394,6 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
       for (const line of text.split(/\n/)) parseFrameLine(line);
     };
 
-    const launchEnvForStream =
-      typeof input.env === "function" ? await input.env() : input.env;
-    const streamCommandPayload = Buffer.from(JSON.stringify({
-      command: input.command,
-      args: input.args,
-      cwd: input.cwd || target.remoteCwd,
-      // Same provenance-clean contract as the polled payload above. Preserve
-      // every explicit identity override even when it equals the host value.
-      env: sanitizeRemoteExecutionEnv(launchEnvForStream, {}),
-    }), "utf8").toString("base64");
     await onLog(
       "stdout",
       `[paperclip] Starting streamed ACP process session bridge in sandbox (${target.providerKey ?? "provider"}).\n`,
@@ -2397,7 +2432,7 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
             cwd: target.remoteCwd,
             env: {
               PAPERCLIP_PROCESS_SESSION_DIR: sessionDir,
-              PAPERCLIP_PROCESS_SESSION_COMMAND_B64: streamCommandPayload,
+              ...commandEnv,
               PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge",
             },
             timeoutMs,
@@ -2408,6 +2443,9 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
           });
           ingestFinalText(result.stdout);
           if (!sawTerminal && !stopping) {
+            // A shell can fail before the wrapper emits any frames. Preserve
+            // that launch diagnostic instead of reporting only its exit code.
+            if (result.stderr) await onLog("stderr", result.stderr);
             deliverRemoteEvent({
               type: "exit",
               code: typeof result.exitCode === "number" ? result.exitCode : null,
@@ -2553,7 +2591,18 @@ let buffer = "";
 let exiting = false;
 
 function send(message) {
+  if (exiting) return;
   socket.write(JSON.stringify({ token, ...message }) + "\\n");
+}
+
+function finish(code) {
+  if (exiting) return;
+  exiting = true;
+  process.exitCode = code;
+  // ACP keeps stdin open while waiting for a reply. Release that handle when
+  // the remote process stops, but let pending stdout/stderr writes drain.
+  process.stdin.destroy();
+  socket.end();
 }
 
 socket.on("connect", () => send({ type: "hello" }));
@@ -2574,13 +2623,9 @@ socket.on("data", (chunk) => {
       (message.stream === "stderr" ? process.stderr : process.stdout).write(out);
     } else if (message.type === "error") {
       process.stderr.write(String(message.message || "Process session bridge failed.") + "\\n");
-      exiting = true;
-      process.exitCode = 1;
-      socket.end();
+      finish(1);
     } else if (message.type === "exit") {
-      exiting = true;
-      process.exitCode = typeof message.code === "number" ? message.code : 1;
-      socket.end();
+      finish(typeof message.code === "number" ? message.code : 1);
     }
   }
 });
@@ -3040,6 +3085,34 @@ await captureSessionIdentity();
 void pollStdin().catch((error) => void writeEvent({ type: "error", message: error instanceof Error ? error.message : String(error) }));
 `;
 
+// Shared by both wrappers. Refuse a symlink and remove the private envelope
+// before creating the child; no launch payload file belongs to the agent.
+const PROCESS_SESSION_READ_COMMAND = `
+let config;
+try {
+  let commandPayload = process.env.PAPERCLIP_PROCESS_SESSION_COMMAND_B64;
+  if (!commandPayload) {
+    const payloadPath = path.posix.join(sessionDir, "command.b64");
+    const handle = await fs.open(payloadPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    try {
+      commandPayload = await handle.readFile("utf8");
+    } finally {
+      await handle.close();
+      await fs.rm(payloadPath, { force: true });
+    }
+  }
+  config = JSON.parse(Buffer.from(commandPayload, "base64").toString("utf8"));
+} catch {
+  // No child exists yet. Emit a terminal event on both transports and attest
+  // shutdown, instead of letting a detached polled wrapper fail silently.
+  // Parse errors can quote credential bytes, so use a fixed diagnostic.
+  await writeEvent({ type: "error", message: "Failed to read sandbox process session command payload." });
+  await writeEvent({ type: "shutdownAck" });
+  await new Promise((resolve) => process.stdout.write("", resolve));
+  process.exit(1);
+}
+`;
+
 // Streamed variant: the wrapper writes each output frame as one newline-
 // delimited JSON line to its stdout. The host runs this wrapper as one
 // long-lived session command and reads the frames from the session log stream,
@@ -3053,8 +3126,7 @@ import { promises as fs, constants as fsConstants } from "node:fs";
 import path from "node:path";
 
 const sessionDir = process.env.PAPERCLIP_PROCESS_SESSION_DIR;
-const commandPayload = process.env.PAPERCLIP_PROCESS_SESSION_COMMAND_B64;
-if (!sessionDir || !commandPayload) throw new Error("Missing process session bridge env.");
+if (!sessionDir) throw new Error("Missing process session bridge env.");
 
 const stdinDir = path.posix.join(sessionDir, "stdin");
 let seq = 0;
@@ -3063,7 +3135,6 @@ let shuttingDown = false;
 let terminated = false;
 let killTimer = null;
 
-const config = JSON.parse(Buffer.from(commandPayload, "base64").toString("utf8"));
 await fs.mkdir(stdinDir, { recursive: true });
 
 // One newline-delimited JSON frame per event. Node keeps process.stdout writes
@@ -3090,6 +3161,8 @@ if ((await isSymbolicLink(sessionDir)) || (await isSymbolicLink(stdinDir))) {
   process.exitCode = 1;
   process.exit(1);
 }
+
+${PROCESS_SESSION_READ_COMMAND}
 
 // Hardening (I3, not containment): the wrapper's own launch env carries the
 // session dir and the command payload. Scrub both keys before they reach the
@@ -3136,8 +3209,7 @@ import { promises as fs, constants as fsConstants } from "node:fs";
 import path from "node:path";
 
 const sessionDir = process.env.PAPERCLIP_PROCESS_SESSION_DIR;
-const commandPayload = process.env.PAPERCLIP_PROCESS_SESSION_COMMAND_B64;
-if (!sessionDir || !commandPayload) throw new Error("Missing process session bridge env.");
+if (!sessionDir) throw new Error("Missing process session bridge env.");
 
 const stdinDir = path.posix.join(sessionDir, "stdin");
 const eventsDir = path.posix.join(sessionDir, "events");
@@ -3147,7 +3219,6 @@ let shuttingDown = false;
 let terminated = false;
 let killTimer = null;
 
-const config = JSON.parse(Buffer.from(commandPayload, "base64").toString("utf8"));
 await fs.mkdir(stdinDir, { recursive: true });
 await fs.mkdir(eventsDir, { recursive: true });
 
@@ -3181,6 +3252,8 @@ if ((await isSymbolicLink(sessionDir)) || (await isSymbolicLink(stdinDir))) {
   process.exitCode = 1;
   process.exit(1);
 }
+
+${PROCESS_SESSION_READ_COMMAND}
 
 // Hardening (I3, not containment): the wrapper's own launch env carries the
 // session dir and the command payload. Scrub both keys before they reach the

@@ -1392,6 +1392,19 @@ describe("issue execution policy missing approval stage", () => {
       );
     }
 
+    function escalationInputs() {
+      return mockLogActivityInTransaction.mock.calls
+        .map((call) => (call as unknown[])[1] as Record<string, unknown> | undefined)
+        .filter((input): input is Record<string, unknown> =>
+          input?.action === "issue.adr072_close_ladder_escalated");
+    }
+
+    function escalationComments() {
+      return mockIssueService.addComment.mock.calls.filter((call) =>
+        String(call[1] ?? "").includes("[ADR-072 close ladder escalation]"),
+      );
+    }
+
     function createChildFixture() {
       mockIssueService.createChild.mockResolvedValue({
         issue: {
@@ -1524,6 +1537,46 @@ describe("issue execution policy missing approval stage", () => {
       expect(body).not.toContain("rearmExecutionPolicy");
       // The advisory is the only write to the parent: no policy/status update.
       expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("wakes the parent assignee with the advisory comment", async () => {
+      createChildFixture();
+      mockIssueService.getById.mockResolvedValue(parentIssue(reviewOnlyPolicy()));
+      twoOpenLadderedChildren();
+
+      const res = await request(await createApp(agentActor()))
+        .post(`/api/issues/${PARENT_ID}/children`)
+        .send({ title: "New child", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        AGENT_ID,
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            issueId: PARENT_ID,
+            wakeCommentId: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+          }),
+          contextSnapshot: expect.objectContaining({
+            issueId: PARENT_ID,
+            source: "issue.adr072_close_ladder_advisory",
+          }),
+        }),
+      );
+    });
+
+    it("defers the deadline escalation to the durable sweep (nothing escalates at advisory time)", async () => {
+      createChildFixture();
+      mockIssueService.getById.mockResolvedValue(parentIssue(reviewOnlyPolicy()));
+      twoOpenLadderedChildren();
+
+      const res = await request(await createApp(agentActor()))
+        .post(`/api/issues/${PARENT_ID}/children`)
+        .send({ title: "New child", status: "todo" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(escalationInputs()).toEqual([]);
+      expect(escalationComments()).toEqual([]);
+      expect(advisoryComments()).toHaveLength(1);
     });
 
     it("names the seat-restricted rearm remedy when the pointer has already advanced", async () => {

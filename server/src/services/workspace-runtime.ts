@@ -8302,28 +8302,42 @@ export async function waitForRuntimeServiceReadiness(input: {
   // misleading `probe timed out after 1ms`. Give every probe after the first at
   // least one interval, and stop early rather than issue one that can only fail.
   const minProbeBudgetMs = Math.min(RUNTIME_SERVICE_READINESS_PROBE_TIMEOUT_MS, intervalMs);
-  const deadline = now() + timeoutSec * 1000;
+  const startedAt = now();
+  const deadline = startedAt + timeoutSec * 1000;
   let lastError = "service did not become ready";
   let probed = false;
+  let lastCause: unknown;
+  let probes = 0;
   while (now() < deadline) {
     const probeBudgetMs = Math.max(1, Math.min(RUNTIME_SERVICE_READINESS_PROBE_TIMEOUT_MS, deadline - now()));
     if (probed && probeBudgetMs < minProbeBudgetMs) break;
     probed = true;
+    probes += 1;
     try {
       const response = await fetchImpl(readinessUrl, { signal: AbortSignal.timeout(probeBudgetMs) });
       if (response.ok) return;
       lastError = `received HTTP ${response.status}`;
+      lastCause = undefined;
     } catch (err) {
+      lastCause = err;
       lastError = isReadinessProbeTimeout(err)
         ? `probe timed out after ${probeBudgetMs}ms`
         : err instanceof Error
           ? err.message
           : String(err);
+      // Node fetch hides connection errors behind "fetch failed". Retain the
+      // transport cause so a refused port is distinguishable from a timeout.
+      if (!isReadinessProbeTimeout(err) && err instanceof Error && err.cause instanceof Error) {
+        lastError += `: ${err.cause.message}`;
+      }
     }
     if (now() >= deadline) break;
     await delay(Math.min(intervalMs, Math.max(0, deadline - now())));
   }
-  throw new Error(`Readiness check failed for ${readinessUrl}: ${lastError}`);
+  throw new Error(
+    `Readiness check failed for ${readinessUrl}: ${lastError} (${probes} probes over ${now() - startedAt}ms)`,
+    { cause: lastCause },
+  );
 }
 
 async function waitForAllocatedPortBind(input: {
@@ -9429,17 +9443,25 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     Object.assign(env, buildManagedWorkspaceGuestEnv(managedWorkspaceIdentity));
   }
 
-  if (exposureConfig) {
-    // Paperclip dev-runtime-specific hardening. Other managed processes are
-    // still rejected by the broker unless /proc proves loopback-only listeners.
-    //
-    // Three independent layers force the loopback bind, because a guest checkout
-    // can be arbitrarily old (PAP-17256): the `--bind loopback` argv
-    // added above, these env vars for a runner that reads them, and HOST for one
-    // old enough to ignore both and infer its bind mode from HOST alone.
+  // The loopback bind is forced on a managed Paperclip dev runtime whether or
+  // not managed HTTPS exposure resolved. Without exposure there is no broker to
+  // reject an off-loopback listener, but the child still inherits the control
+  // plane's bind environment: a container-wide HOST outranks the guest config
+  // file's server.host, so a local_trusted guest resolves bind=lan and exits
+  // with `local_trusted requires server.bind=loopback` (SUP-22143). These are
+  // the env-var layers of the PAP-17256 hardening — PAPERCLIP_BIND /
+  // PAPERCLIP_BIND_HOST for a runner that reads them, and HOST for one old
+  // enough to ignore both and infer its bind mode from HOST alone; the
+  // `--bind loopback` argv layer above stays exposure-only. Exposed
+  // non-Paperclip services keep the same env they always had.
+  if (exposureConfig || isPaperclipDevRuntimeService({ serviceName, command })) {
     env.PAPERCLIP_BIND = RUNTIME_EXPOSURE_BIND_MODE;
     env.PAPERCLIP_BIND_HOST = RUNTIME_EXPOSURE_BIND_HOST;
     env.HOST = RUNTIME_EXPOSURE_BIND_HOST;
+  }
+  if (exposureConfig) {
+    // Exposure-only hardening. Other managed processes are still rejected by
+    // the broker unless /proc proves loopback-only listeners.
     env.PAPERCLIP_VITE_HMR_PROTOCOL = "wss";
     env.PAPERCLIP_MANAGED_RUNTIME_EXPOSURE = "tailscale_https";
     env.PAPERCLIP_ALLOWED_HOSTNAMES = exposureHostname!;

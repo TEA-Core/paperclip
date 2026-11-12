@@ -6,12 +6,10 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
-// BOTH image-publishing workflows. Upstream 5c660a32f relocated the cloud
-// build out of docker.yml into docker-cloud.yml and took its registry cache
-// refs with it; a guard that reads docker.yml alone stayed green while the
-// invariant below was broken in the relocated job. Any workflow that pushes
-// to ghcr belongs in this list.
-const workflowPaths = [".github/workflows/docker.yml", ".github/workflows/docker-cloud.yml"];
+// Every image-publishing workflow. Upstream #13827 retired docker-cloud.yml,
+// so docker.yml is the only one today. Any workflow that pushes to ghcr
+// belongs in this list.
+const workflowPaths = [".github/workflows/docker.yml"];
 const workflows = workflowPaths.map(relativePath => ({
   path: relativePath,
   text: readFileSync(path.join(repoRoot, relativePath), "utf8"),
@@ -73,8 +71,8 @@ for (const workflow of workflows) {
     }
   });
 
-  // The cloud job never names a registry ref on its `cache-from:` line: it
-  // builds the import list in a shell step from a `CACHE_IMAGE:` env var, and
+  // A job need not name a registry ref on its `cache-from:` line (the retired
+  // cloud job built the import list in a shell step from a `CACHE_IMAGE:` env var), and
   // BuildKit rejects an uppercase reference on IMPORT as well as export. Line
   // shape alone therefore cannot express the invariant. What actually holds is
   // that the raw mixed-case expression may appear ONLY where something

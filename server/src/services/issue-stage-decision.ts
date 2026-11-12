@@ -3,6 +3,7 @@ import { issues, issueExecutionDecisions, type Db } from "@paperclipai/db";
 import type { IssueExecutionDecisionOutcome } from "@paperclipai/shared";
 import {
   applyIssueExecutionPolicyTransition,
+  assertExecutionDecisionSnapshotCurrent,
   isReviewChangesRequestedTransition,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -74,6 +75,9 @@ export async function applyReviewEscalationDecision(args: {
   // When the caller owns an enclosing transaction that is still open, it passes its
   // queues here and drains them itself after that transaction commits.
   deferredPostCommit?: { activityPublications: ActivityPublication[]; postCommitActions: IssuePostCommitAction[] };
+  // The caller already compared the full snapshot, status included, under the
+  // issue row lock it still holds, and its own resolver wrote the status since.
+  skipStatusCompare?: boolean;
 }): Promise<{
   id: string;
   status: string;
@@ -154,6 +158,9 @@ export async function applyReviewEscalationDecision(args: {
   }
   updateFields.actorAgentId = actor.agentId ?? null;
   updateFields.actorUserId = actor.userId ?? null;
+  if (transition.workflowControlledAssignment) {
+    updateFields.workflowControlledAssignment = true;
+  }
 
   // The `done` close writes into the same transaction as the decision row, so the
   // update needs a post-commit queue: issue-service refuses a human completion in
@@ -162,6 +169,14 @@ export async function applyReviewEscalationDecision(args: {
   const activityPublications = args.deferredPostCommit?.activityPublications ?? [];
   const postCommitActions = args.deferredPostCommit?.postCommitActions ?? [];
   const updatedIssue = await db.transaction(async (tx) => {
+    const lockedIssue = await issueService(db).getByIdForUpdate(issue.id, tx);
+    assertExecutionDecisionSnapshotCurrent(
+      existingState,
+      policy,
+      lockedIssue,
+      issue.id,
+      args.skipStatusCompare ? undefined : issue.status,
+    );
     await tx.insert(issueExecutionDecisions).values({
       id: decisionId,
       companyId: issue.companyId,

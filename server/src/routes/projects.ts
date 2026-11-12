@@ -37,8 +37,10 @@ import {
 } from "../services/workspace-runtime.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
+  assertNoAgentProjectWorkspaceSourceMutation,
   collectProjectExecutionWorkspaceCommandPaths,
   collectProjectWorkspaceCommandPaths,
+  collectProjectWorkspaceSourcePaths,
 } from "./workspace-command-authz.js";
 import { assertCanManageProjectWorkspaceRuntimeServices } from "./workspace-runtime-service-authz.js";
 import { getTelemetryClient } from "../telemetry.js";
@@ -255,6 +257,7 @@ export function projectRoutes(db: Db) {
         ...collectProjectWorkspaceCommandPaths(workspace, "workspace"),
       ],
     );
+    assertNoAgentProjectWorkspaceSourceMutation(req, collectProjectWorkspaceSourcePaths(workspace, "workspace"));
     await assertNoManagedSandboxWorkspacePath(workspace);
     if (projectData.env !== undefined) {
       projectData.env = await secretsSvc.normalizeEnvBindingsForPersistence(
@@ -398,6 +401,7 @@ export function projectRoutes(db: Db) {
       req,
       collectProjectWorkspaceCommandPaths(req.body),
     );
+    assertNoAgentProjectWorkspaceSourceMutation(req, collectProjectWorkspaceSourcePaths(req.body));
     await assertNoManagedSandboxWorkspacePath(req.body);
     const workspace = await svc.createWorkspace(id, req.body);
     if (!workspace) {
@@ -438,6 +442,7 @@ export function projectRoutes(db: Db) {
         req,
         collectProjectWorkspaceCommandPaths(req.body),
       );
+      assertNoAgentProjectWorkspaceSourceMutation(req, collectProjectWorkspaceSourcePaths(req.body));
       await assertNoManagedSandboxWorkspacePath(req.body);
       const workspaceExists = (await svc.listWorkspaces(id)).some((workspace) => workspace.id === workspaceId);
       if (!workspaceExists) {

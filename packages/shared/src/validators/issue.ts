@@ -450,6 +450,34 @@ export const issueExecutionMonitorPolicySchema = z.object({
     .default(null),
 }).strict();
 
+const GIT_COMMIT_SHA_DIGITS = "(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})";
+
+/**
+ * A full git commit sha: 40 hex digits (SHA-1) or 64 (SHA-256), either case,
+ * surrounding whitespace trimmed. The delivered head recorded on
+ * `deliveryIdentity.headSha` must be one, so the R20 same-head stall signal can
+ * never be forged with an arbitrary string.
+ */
+export const gitCommitShaSchema = z
+  .string()
+  .trim()
+  .regex(new RegExp(`^${GIT_COMMIT_SHA_DIGITS}$`), "must be a full git commit sha (40 or 64 hex digits)");
+
+/**
+ * The same rule as a wire pattern for API documentation: a pattern cannot
+ * trim, so it admits the surrounding whitespace `gitCommitShaSchema` trims
+ * away, and it spells out both hex cases instead of relying on a regex flag.
+ */
+export const GIT_COMMIT_SHA_WIRE_PATTERN = new RegExp(`^\\s*${GIT_COMMIT_SHA_DIGITS}\\s*$`);
+
+// R20: bounds only. The cross-field rule (afterRounds within the resolved
+// round ceiling) needs the server's default ceiling, so it is enforced where
+// every policy write normalizes: normalizeIssueExecutionPolicy.
+export const issueExecutionStallEscalationPolicySchema = z.object({
+  afterRounds: z.number().int().positive().max(50),
+  toAgentId: z.string().trim().uuid(),
+}).strict();
+
 export const issueExecutionPolicySchema = z.object({
   mode: z.enum(ISSUE_EXECUTION_POLICY_MODES).optional().default("normal"),
   commentRequired: z.boolean().optional().default(true),
@@ -474,6 +502,7 @@ export const issueExecutionPolicySchema = z.object({
     .optional()
     .nullable()
     .default(null),
+  stallEscalation: issueExecutionStallEscalationPolicySchema.optional().nullable(),
 }).strict();
 
 export const issueExecutionMonitorStateSchema = z.object({
@@ -553,6 +582,20 @@ export const issueExecutionStateSchema = z.object({
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
   changesRequestedCount: z.number().int().nonnegative().optional().default(0),
   pendingSince: z.string().nullable().optional(),
+  // R20 review-stall bookkeeping, written only by the server. The head keys
+  // accept any string so an odd stored value never makes the state
+  // unparseable; the stall trigger ignores a value that is not a full git sha.
+  // `stallHandoff` is validated: only the engine writes it.
+  deliveredHeadSha: z.string().nullable().optional(),
+  bouncedHeadSha: z.string().nullable().optional(),
+  stallHandoff: z.object({
+    stageId: z.string().guid(),
+    arbiterAgentId: z.string().guid(),
+    fromParticipant: issueExecutionStatePrincipalSchema.nullable(),
+    changesRequestedCount: z.number().int().nonnegative(),
+    signals: z.array(z.enum(["same_head_rebounced", "code_acceptable"])),
+    handedOffAt: z.string(),
+  }).nullable().optional(),
   /**
    * Out-of-band publish record written by merge-arming / the approval-status
    * reconciler via jsonb_set (SUP-16977). Enumerated, not modeled: consumers
@@ -814,6 +857,19 @@ const createIssueBaseSchema = z.object({
   priority: z.enum(ISSUE_PRIORITIES).optional().default("medium"),
   reviewPolicy: z.enum(ISSUE_REVIEW_POLICIES).optional().nullable(),
   deliveryRequirement: z.enum(ISSUE_DELIVERY_REQUIREMENTS).optional(),
+  // SUP-23042: classification input for the reflection-coach proposal flow.
+  // The server honors it only when the creating actor is the built-in
+  // Reflection Coach and the value is an exact agent-instructions consent
+  // target; it is never persisted on the issue.
+  proposalTargetKey: z
+    .string()
+    .trim()
+    .min(1)
+    .max(255)
+    .describe(
+      "Consent target the reflection proposal will gate (coach flow only); server-side classification input, not stored",
+    )
+    .optional(),
   assigneeAgentId: z.string().guid().optional().nullable(),
   assigneeUserId: z.string().optional().nullable(),
   requestDepth: issueRequestDepthInputSchema.optional().default(0),
@@ -1055,6 +1111,14 @@ const doneTierLandingDelegatedSchema = z
   })
   .strict();
 
+// SUP-22570: the record_only close with no repository deliverable. It carries
+// no repository evidence by construction; the server proves the claim.
+const doneTierNoRepositoryLandingSchema = z
+  .object({
+    mode: z.literal("noRepositoryLanding"),
+  })
+  .strict();
+
 export const doneTierDeclarationSchema = z.discriminatedUnion("tier", [
   z
     .object({
@@ -1069,6 +1133,7 @@ export const doneTierDeclarationSchema = z.discriminatedUnion("tier", [
       landing: z.discriminatedUnion("mode", [
         doneTierLandedAtTipSchema,
         doneTierLandingDelegatedSchema,
+        doneTierNoRepositoryLandingSchema,
       ]),
     })
     .strict(),
@@ -1391,6 +1456,7 @@ const connectionIntentBrandAssetSchema = z
 
 export const connectionIntentPayloadSchema = z
   .object({
+    upstreamService: z.object({ slug: z.string().min(1).max(120), name: z.string().min(1).max(160), selectionInteractionId: z.string().guid().optional() }).strict().optional(),
     purpose: z.literal("ai").optional(),
     version: z.literal(1),
     serviceSlug: z.string().trim().min(1).max(120),
@@ -1406,6 +1472,7 @@ export const connectionIntentPayloadSchema = z
 export const connectionIntentResultSchema = z
   .object({
     version: z.literal(1),
+    instruction: z.string().max(4000).optional(),
     outcome: z.enum(["connected", "declined", "superseded", "expired"]),
     connectionId: z.string().guid().nullable().optional(),
     reason: z.string().trim().max(4000).nullable().optional(),
@@ -1815,6 +1882,10 @@ export const requestConfirmationSecretProposalPayloadSchema = z.object({
   expiresAt: z.string().datetime({ offset: true }),
 });
 
+export const requestConfirmationAdoptionCarrierSchema = z.object({
+  issueId: z.string().guid(),
+}).strict();
+
 export const requestConfirmationPayloadSchema = z.object({
   version: z.literal(1),
   prompt: z.string().trim().min(1).max(1000),
@@ -1835,6 +1906,7 @@ export const requestConfirmationPayloadSchema = z.object({
   target: requestConfirmationTargetSchema.nullable().optional(),
   toolAction: requestConfirmationToolActionPayloadSchema.optional(),
   secretProposal: requestConfirmationSecretProposalPayloadSchema.optional(),
+  adoptionCarrier: requestConfirmationAdoptionCarrierSchema.nullable().optional(),
 });
 
 export const requestCheckboxConfirmationOptionSchema = z.object({
@@ -2216,6 +2288,44 @@ const createIssueThreadInteractionCommon = {
   addresseeUserId: z.string().trim().min(1).nullable().optional(),
 };
 
+// Validate dual representations on creation, not when reading historical rows.
+// Otherwise a partial canonical form can hide required storage questions.
+const createAskUserQuestionsPayloadSchema = askUserQuestionsPayloadSchema.superRefine((value, ctx) => {
+  if (!value.questionSet) return;
+  const shown = new Set(value.questionSet.questions.map((question) => question.id));
+  const stored = new Set(value.questions.map((question) => question.id));
+  if (shown.size !== stored.size || [...shown].some((id) => !stored.has(id))) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["questionSet", "questions"],
+      message: "questionSet must present every questions entry with the same question IDs. Include choice questions as well as text questions; a partial form hides required answers.",
+    });
+  }
+  const storedById = new Map(value.questions.map((question) => [question.id, question]));
+  for (const [index, question] of value.questionSet.questions.entries()) {
+    const storage = storedById.get(question.id);
+    if (!storage) continue;
+    const mismatch = (field: string) => ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["questionSet", "questions", index, field],
+      message: `questionSet ${field} must match the corresponding questions entry.`,
+    });
+    if (question.prompt !== storage.prompt) mismatch("prompt");
+    // An omitted storage flag adds no constraint; an explicit flag must agree.
+    if (storage.required !== undefined && question.required !== storage.required) mismatch("required");
+    const mode = question.answerMode === "multi_select" ? "multi" : "single";
+    if (storage.selectionMode !== mode) mismatch("answerMode");
+    if (question.answerMode === "text") {
+      if (storage.options.length !== 1 || !storage.options[0].freeText) mismatch("answerMode");
+    } else {
+      // Text/custom-answer sentinels are storage compatibility, not visible choices.
+      const choices = storage.options.filter((option) => !option.freeText);
+      const canonical = new Map((question.options ?? []).map((option) => [option.id, option.label]));
+      if (choices.length !== canonical.size || choices.some((option) => canonical.get(option.id) !== option.label)) mismatch("options");
+    }
+  }
+});
+
 export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
   z.object({
     ...createIssueThreadInteractionCommon,
@@ -2241,7 +2351,7 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     continuationPolicy: issueThreadInteractionContinuationPolicySchema
       .optional()
       .default("wake_assignee"),
-    payload: askUserQuestionsPayloadSchema,
+    payload: createAskUserQuestionsPayloadSchema,
   }),
   z.object({
     ...createIssueThreadInteractionCommon,

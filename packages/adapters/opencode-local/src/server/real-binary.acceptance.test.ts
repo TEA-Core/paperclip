@@ -1,7 +1,7 @@
 import { execFile, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createServer, type Server } from "node:http";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,7 +13,15 @@ import {
   ensureOpenCodeModelConfiguredAndAvailable,
   resetOpenCodeModelsCacheForTests,
 } from "./models.js";
-import { execute } from "./execute.js";
+import {
+  createOpenCodeV2SessionByteMeasurer,
+  readOpenCodeV2SessionState,
+  resolveOpenCodeDatabasePath,
+  startOpenCodeDatabaseGrowthGuard,
+  type OpenCodeDatabaseGrowthSpare,
+  type OpenCodeDatabaseGrowthTrip,
+} from "./db-guard.js";
+import { execute, resolveOpenCodeDatabaseFile } from "./execute.js";
 import { testEnvironment } from "./test.js";
 import { OPENCODE_V2_CLI_VERSION } from "../index.js";
 import { parseOpenCodeCliVersion } from "./version.js";
@@ -24,8 +32,9 @@ import { parseOpenCodeCliVersion } from "./version.js";
 // the `opencode` bin name collides with V1), provisioned by
 // `../../scripts/provision-opencode-v2-binary.mjs` at the version
 // `OPENCODE_V2_CLI_VERSION` pins. Every home, XDG dir and the database is
-// private to the run, and every launch is `--standalone`, so the shared managed
-// OpenCode service is never touched.
+// private to the run, and the adapter drives a private loopback `opencode serve`
+// (per-run port and password) for local V2 runs, so the shared managed OpenCode
+// service is never touched.
 //
 // Reproduce it from a clean checkout with one command — `pnpm
 // test:opencode-v2-acceptance`, which is what the `OpenCode V2 acceptance`
@@ -64,6 +73,16 @@ const model = "paperclip-fixture/acceptance-model";
 // Prompt markers the fixture reacts to; they travel through `promptTemplate`.
 const CANCEL_MARKER = "paperclip-acceptance-cancel";
 const FORCE_LENGTH_MARKER = "paperclip-acceptance-force-length";
+// A prompt carrying one of these markers makes the model call that tool once.
+const SHELL_CALL_MARKER = "paperclip-acceptance-shell-call";
+const QUESTION_CALL_MARKER = "paperclip-acceptance-question-call";
+const PAPERCLIP_SEARCH_MARKER = "paperclip-acceptance-connections-search";
+const DESIRED_SKILL_MARKER = "paperclip-acceptance-desired-skill";
+const UNDESIRED_SKILL_MARKER = "paperclip-acceptance-undesired-skill";
+const taskBoundRequested = process.env.PAPERCLIP_OPENCODE_V2_TASK_BOUND_ACCEPTANCE === "1";
+const QUESTION_ARGS = {
+  questions: [{ question: "Which option?", header: "Pick one", options: [{ label: "A", description: "first" }, { label: "B", description: "second" }] }],
+};
 
 const execFileAsync = promisify(execFile);
 
@@ -72,10 +91,20 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
   let workspace: string;
   let server: Server;
   let baseEnv: Record<string, string>;
+  let guardEnv: Record<string, string>;
+  let fixtureConfig: Record<string, unknown>;
   let emptyCatalogEnv: Record<string, string>;
   let binary: string;
   let cliVersion: string;
   let savedAllowAllModels: string | undefined;
+  // Every request that carried tools, i.e. a main-agent request (title requests carry none).
+  const mainRequests: Array<{
+    tools: string[];
+    messageCount: number;
+    hasDesiredSkill: boolean;
+    hasUndesiredSkill: boolean;
+  }> = [];
+  let mcpServer: Server;
 
   function privateEnv(name: string): Record<string, string> {
     const home = path.join(rootDir, name);
@@ -137,8 +166,37 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
       let body = "";
       for await (const chunk of req) body += chunk;
       const lowered = body.toLowerCase();
+      let toolCall: { name: string; args: unknown } | null = null;
+      try {
+        const parsed = JSON.parse(body) as { tools?: Array<{ function?: { name?: string } }>; messages?: Array<{ role?: string }> };
+        if ((parsed.tools ?? []).length > 0) {
+          mainRequests.push({
+            tools: (parsed.tools ?? []).map((tool) => tool.function?.name ?? ""),
+            messageCount: (parsed.messages ?? []).length,
+            hasDesiredSkill: body.includes(DESIRED_SKILL_MARKER),
+            hasUndesiredSkill: body.includes(UNDESIRED_SKILL_MARKER),
+          });
+          const answered = (parsed.messages ?? []).some((message) => message.role === "tool");
+          if (!answered && lowered.includes(SHELL_CALL_MARKER)) toolCall = { name: "shell", args: { command: "echo hi" } };
+          if (!answered && lowered.includes(QUESTION_CALL_MARKER)) toolCall = { name: "question", args: QUESTION_ARGS };
+          if (!answered && lowered.includes(PAPERCLIP_SEARCH_MARKER)) {
+            const name = (parsed.tools ?? []).map((tool) => tool.function?.name ?? "").find((tool) => /connections_search$/i.test(tool));
+            if (name) toolCall = { name, args: { query: "github" } };
+          }
+        }
+      } catch {
+        // not a JSON chat request
+      }
       if (lowered.includes(CANCEL_MARKER)) {
         await new Promise((resolve) => setTimeout(resolve, 5_000));
+      }
+      if (toolCall) {
+        res.writeHead(200, { "cache-control": "no-cache", connection: "keep-alive", "content-type": "text/event-stream" });
+        const call = { index: 0, id: "call_1", type: "function", function: { name: toolCall.name, arguments: JSON.stringify(toolCall.args) } };
+        res.write(`data: ${JSON.stringify({ id: "chatcmpl-paperclip", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", tool_calls: [call] }, finish_reason: null }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: "chatcmpl-paperclip", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`);
+        res.end("data: [DONE]\n\n");
+        return;
       }
       // A prompt carrying the marker makes the model stop at its output cap
       // instead of a natural end of turn.
@@ -156,10 +214,41 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("Acceptance fixture did not expose a TCP port.");
 
+    // A Streamable HTTP MCP server that lists one tool, the shape of the
+    // Paperclip project-tools route.
+    mcpServer = createServer(async (req, res) => {
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      if (req.method !== "POST") {
+        res.statusCode = 404;
+        res.end();
+        return;
+      }
+      const message = JSON.parse(raw) as { id?: unknown; method?: string };
+      if (message.method === "notifications/initialized") {
+        res.statusCode = 202;
+        res.end();
+        return;
+      }
+      const reply = (result: unknown) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null, result }));
+      };
+      if (message.method === "initialize") {
+        reply({ protocolVersion: "2025-03-26", capabilities: { tools: { listChanged: false } }, serverInfo: { name: "fixture", version: "1" } });
+      } else if (message.method === "tools/list") {
+        reply({ tools: [{ name: "echo", description: "Echo a value.", inputSchema: { type: "object", properties: {} } }] });
+      } else {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null, error: { code: -32601, message: "Method not found" } }));
+      }
+    });
+    await new Promise<void>((resolve) => mcpServer.listen(0, "127.0.0.1", resolve));
+
     // The provider lives in the user's opencode.json, not in a Paperclip-only
     // env var, so plain `opencode models` sees it too.
     baseEnv = privateEnv("main");
-    await writeOpenCodeConfig(baseEnv, {
+    fixtureConfig = {
       provider: {
         "paperclip-fixture": {
           npm: "@ai-sdk/openai-compatible",
@@ -168,7 +257,17 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
           models: { "acceptance-model": { name: "Paperclip acceptance model" } },
         },
       },
-    });
+    };
+    await writeOpenCodeConfig(baseEnv, fixtureConfig);
+
+    // The session guards only arm on the per-agent database the adapter names
+    // itself, which it does only when no OPENCODE_DB is configured.
+    guardEnv = privateEnv("guard");
+    delete guardEnv.OPENCODE_DB;
+    // privateEnv copies the runner's environment; its PWD would root every session
+    // at the runner's directory instead of the workspace the run is spawned in.
+    delete guardEnv.PWD;
+    await writeOpenCodeConfig(guardEnv, fixtureConfig);
 
     // Restricting OpenCode to a provider that does not exist yields a real,
     // exit-0, empty `opencode models` catalog.
@@ -180,6 +279,7 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     if (savedAllowAllModels === undefined) delete process.env.OPENCODE_ALLOW_ALL_MODELS;
     else process.env.OPENCODE_ALLOW_ALL_MODELS = savedAllowAllModels;
     await new Promise<void>((resolve) => server?.close(() => resolve()));
+    await new Promise<void>((resolve) => mcpServer?.close(() => resolve()));
     await rm(rootDir, { recursive: true, force: true });
   });
 
@@ -298,8 +398,227 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     }));
     expect(second.exitCode).toBe(0);
     expect(second.errorMessage).toBeNull();
-    expect(commandArgs[0]).toEqual(expect.arrayContaining(["--standalone", "--session", first.sessionId as string]));
+    expect(commandArgs[0]).toEqual(expect.arrayContaining(["serve", `<resume session ${first.sessionId as string}>`]));
+    // Same session, and the model saw the first run's turn: the second main
+    // request carries strictly more messages than the first.
+    expect(second.sessionId).toBe(first.sessionId);
+    expect(mainRequests.length).toBeGreaterThanOrEqual(2);
+    expect(mainRequests.at(-1)!.messageCount).toBeGreaterThan(mainRequests[0]!.messageCount);
   }, 90_000);
+
+  // SUP-19141: the session guards read the database this very binary wrote, not
+  // a hand-built schema, so a column or table the pinned build changes fails here.
+  async function runSession(
+    runId: string,
+    options: { sessionId?: string | null; sessionParams?: Record<string, unknown> | null; env?: Record<string, string> } = {},
+  ) {
+    const logs: string[] = [];
+    const commandArgs: string[][] = [];
+    const result = await execute(context({
+      runId,
+      runtime: {
+        sessionId: options.sessionId ?? null,
+        sessionParams: options.sessionParams ?? null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        command: binary,
+        cliVersion,
+        cwd: workspace,
+        model,
+        dangerouslySkipPermissions: true,
+        env: { ...guardEnv, ...(options.env ?? {}) },
+      },
+      onLog: async (_stream, chunk) => {
+        logs.push(chunk);
+      },
+      onMeta: async (meta) => {
+        commandArgs.push((meta.commandArgs ?? []).filter((arg): arg is string => typeof arg === "string"));
+      },
+    }));
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionId).toEqual(expect.any(String));
+    return { result, sessionId: result.sessionId as string, log: logs.join(""), args: commandArgs[0] ?? [] };
+  }
+
+  function guardDatabasePath(): string {
+    const file = resolveOpenCodeDatabaseFile({ agentId: "acceptance-agent", env: guardEnv });
+    const resolved = file ? resolveOpenCodeDatabasePath({ databaseFile: file, env: guardEnv }) : null;
+    if (!resolved) throw new Error("The adapter did not name a per-agent database for the guard environment.");
+    return resolved;
+  }
+
+  async function openDatabase(readOnly: boolean) {
+    const { DatabaseSync } = await import("node:sqlite");
+    return new DatabaseSync(guardDatabasePath(), { readOnly });
+  }
+
+  // Grow one session's transcript by `bytes` through the real session_message table.
+  async function padSession(sessionId: string, bytes: number) {
+    const db = await openDatabase(false);
+    try {
+      const next = db.prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM session_message WHERE session_id = ?").get(sessionId);
+      const now = Date.now();
+      db.prepare(
+        "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, 'user', ?, ?, ?, ?)",
+      ).run(`pad_${sessionId}_${now}`, sessionId, Number(next?.seq), now, now, JSON.stringify({ text: "x".repeat(bytes) }));
+    } finally {
+      db.close();
+    }
+  }
+
+  it("reads existence, directory, size and final message from a database the binary wrote", async () => {
+    const { sessionId } = await runSession("acceptance-state");
+    const dbPath = guardDatabasePath();
+    const read = await readOpenCodeV2SessionState(dbPath, sessionId);
+    if (!read.ok) throw new Error(`probe failed against the real database: ${read.error}`);
+    expect(read.state.exists).toBe(true);
+    expect(await realpath(read.state.cwd as string)).toBe(await realpath(workspace));
+    expect(read.state.messageCount).toBeGreaterThanOrEqual(2);
+    expect(read.state.transcriptBytes).toBeGreaterThan(0);
+    expect(read.state.finalMessage).toBe("fixture response");
+
+    const db = await openDatabase(true);
+    try {
+      const raw = db.prepare("SELECT SUM(LENGTH(CAST(data AS BLOB))) AS bytes FROM session_message WHERE session_id = ?").get(sessionId);
+      expect(read.state.transcriptBytes).toBe(Number(raw?.bytes));
+    } finally {
+      db.close();
+    }
+
+    const absent = await readOpenCodeV2SessionState(dbPath, "ses_does_not_exist");
+    expect(absent).toEqual({
+      ok: true,
+      state: { exists: false, cwd: null, messageCount: 0, transcriptBytes: 0, finalMessage: null },
+    });
+  }, 90_000);
+
+  it("keeps size and existence but returns no final message when the newest assistant row is oversized", async () => {
+    const { sessionId } = await runSession("acceptance-final-bound");
+    const dbPath = guardDatabasePath();
+    const before = await readOpenCodeV2SessionState(dbPath, sessionId);
+    if (!before.ok) throw new Error(`probe failed against the real database: ${before.error}`);
+    expect(before.state.finalMessage).toBe("fixture response");
+
+    const db = await openDatabase(false);
+    let addedBytes: number;
+    try {
+      const row = db
+        .prepare(
+          "SELECT id, data FROM session_message WHERE session_id = ? AND type = 'assistant' " +
+            "AND json_extract(data, '$.time.completed') IS NOT NULL ORDER BY seq DESC LIMIT 1",
+        )
+        .get(sessionId);
+      if (!row) throw new Error("The real session has no completed assistant row to enlarge.");
+      const original = String(row.data);
+      const enlarged = JSON.stringify({
+        ...JSON.parse(original),
+        content: [{ type: "text", text: "x".repeat(2 * 1024 * 1024) }],
+      });
+      db.prepare("UPDATE session_message SET data = ? WHERE id = ?").run(enlarged, row.id);
+      addedBytes = Buffer.byteLength(enlarged) - Buffer.byteLength(original);
+    } finally {
+      db.close();
+    }
+
+    const after = await readOpenCodeV2SessionState(dbPath, sessionId);
+    if (!after.ok) throw new Error(`probe failed against the enlarged database: ${after.error}`);
+    expect(after.state.exists).toBe(true);
+    expect(after.state.messageCount).toBe(before.state.messageCount);
+    expect(after.state.transcriptBytes).toBe(before.state.transcriptBytes + addedBytes);
+    expect(after.state.finalMessage).toBeNull();
+  }, 90_000);
+
+  it("reports an unreadable or non-V2 database as an error instead of a measurement", async () => {
+    const missing = await readOpenCodeV2SessionState(path.join(rootDir, "no-such.db"), "ses_x");
+    expect(missing.ok).toBe(false);
+    const { DatabaseSync } = await import("node:sqlite");
+    const v1Shaped = path.join(rootDir, "v1-shaped.db");
+    const db = new DatabaseSync(v1Shaped);
+    db.exec("CREATE TABLE message (id text PRIMARY KEY, session_id text, data text)");
+    db.close();
+    const nonV2 = await readOpenCodeV2SessionState(v1Shaped, "ses_x");
+    expect(nonV2.ok).toBe(false);
+    if (!nonV2.ok) expect(nonV2.error).toMatch(/session_v2/);
+
+    const unavailable: string[] = [];
+    const measure = createOpenCodeV2SessionByteMeasurer((message) => unavailable.push(message));
+    expect(await measure(v1Shaped, "ses_x")).toBeNull();
+    expect(unavailable).toHaveLength(1);
+    expect(unavailable[0]).toContain("ses_x");
+  });
+
+  it("resumes from the recorded session directory and starts fresh for a session the database lacks", async () => {
+    const { sessionId } = await runSession("acceptance-dbcwd");
+    // No cwd in the saved params: a V1 session would be refused as unknown_cwd,
+    // but V2 proves the directory from session_v2.
+    const resumed = await runSession("acceptance-dbcwd-resume", { sessionId });
+    expect(resumed.args).toContain(`<resume session ${sessionId}>`);
+
+    const missing = await runSession("acceptance-missing", {
+      sessionId: "ses_not_in_this_database",
+      sessionParams: { sessionId: "ses_not_in_this_database", cwd: workspace },
+    });
+    expect(missing.args).not.toContain("<resume session ses_not_in_this_database>");
+    expect(missing.log).toContain("is absent from its database");
+  }, 120_000);
+
+  it("starts a fresh session when the real transcript exceeds the resume cap", async () => {
+    const { sessionId } = await runSession("acceptance-cap-seed");
+    const capped = await runSession("acceptance-cap", {
+      sessionId,
+      env: { PAPERCLIP_OPENCODE_SESSION_MAX_BYTES: "1" },
+    });
+    expect(capped.args).not.toContain(`<resume session ${sessionId}>`);
+    expect(capped.log).toContain("resume cap");
+    expect(capped.sessionId).not.toBe(sessionId);
+
+    const uncapped = await runSession("acceptance-cap-off", { sessionId });
+    expect(uncapped.args).toContain(`<resume session ${sessionId}>`);
+  }, 120_000);
+
+  it("attributes growth to the run's own session and spares it for a sibling's growth", async () => {
+    const own = (await runSession("acceptance-own")).sessionId;
+    const sibling = (await runSession("acceptance-sibling")).sessionId;
+    expect(sibling).not.toBe(own);
+    const limitBytes = 200_000;
+    const spares: OpenCodeDatabaseGrowthSpare[] = [];
+    const trips: OpenCodeDatabaseGrowthTrip[] = [];
+    const unavailable: string[] = [];
+    const guard = startOpenCodeDatabaseGrowthGuard({
+      databasePath: guardDatabasePath(),
+      limitBytes,
+      pollIntervalMs: 50,
+      sessionId: own,
+      measureSessionBytes: createOpenCodeV2SessionByteMeasurer((message) => unavailable.push(message)),
+      onSpare: (spare) => spares.push(spare),
+      onTrip: (trip) => trips.push(trip),
+    });
+    try {
+      // The guard polls a real file on a real interval; fake timers cannot drive
+      // SQLite I/O, so this waits on the observed condition, bounded at 10s.
+      const until = async (done: () => boolean) => {
+        for (let i = 0; i < 200 && !done(); i += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(done()).toBe(true);
+      };
+      // Let the guard take its baseline before anything grows.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await padSession(sibling, limitBytes * 2);
+      await until(() => spares.length > 0);
+      expect(trips).toHaveLength(0);
+      expect(spares[0]?.attribution.sessionId).toBe(own);
+      expect(spares[0]?.attribution.growthBytes).toBe(0);
+
+      await padSession(own, limitBytes * 2);
+      await until(() => trips.length > 0);
+      expect(trips[0]?.attribution?.sessionId).toBe(own);
+      expect(trips[0]?.attribution?.growthBytes).toBeGreaterThanOrEqual(limitBytes * 2);
+      expect(unavailable).toEqual([]);
+    } finally {
+      guard.stop();
+    }
+  }, 120_000);
 
   it("reports a forced output cap as a failure, not as an exit-0 success", async () => {
     const result = await execute(context({
@@ -323,6 +642,200 @@ const suite = describe.skipIf(!enabled)("OpenCode V2 real-binary acceptance", ()
     const stdout = String(result.resultJson?.stdout ?? "");
     expect(stdout).toContain("output-limit");
     expect(stdout).toContain('"type":"error"');
+  }, 90_000);
+
+  it("puts an injected MCP server's tool in the first main-agent request", async () => {
+    mainRequests.length = 0;
+    const address = mcpServer.address();
+    if (!address || typeof address === "string") throw new Error("MCP fixture did not expose a TCP port.");
+    const result = await execute(context({
+      runId: "acceptance-mcp",
+      runtimeMcp: {
+        getServers: () => [{
+          name: "paperclip-fixture",
+          url: `http://127.0.0.1:${address.port}/mcp`,
+          token: "acceptance-mcp-bearer",
+          connectionId: "acceptance-connection",
+        }],
+      },
+    }));
+    expect(result.exitCode).toBe(0);
+    expect(mainRequests.length).toBeGreaterThan(0);
+    expect(mainRequests[0]!.tools.some((name) => /paperclip-fixture_echo$/i.test(name))).toBe(true);
+    expect(JSON.stringify(result)).not.toContain("acceptance-mcp-bearer");
+  }, 90_000);
+
+  it.skipIf(!taskBoundRequested)("calls the task-bound Paperclip MCP tool directly in the first main-agent step", async () => {
+    const mcpUrl = process.env.PAPERCLIP_RUNTIME_TOOLS_MCP_URL;
+    const token = process.env.PAPERCLIP_RUNTIME_TOOLS_TOKEN;
+    if (!mcpUrl || !token) throw new Error("Task-bound acceptance needs the live runtime MCP URL and token.");
+
+    const env = privateEnv("task-bound-paperclip");
+    await writeOpenCodeConfig(env, fixtureConfig);
+    const desiredSkill = path.join(rootDir, "desired-skill-source");
+    const undesiredSkill = path.join(rootDir, "undesired-skill-source");
+    await mkdir(desiredSkill, { recursive: true });
+    await mkdir(undesiredSkill, { recursive: true });
+    await writeFile(path.join(desiredSkill, "SKILL.md"), `---\nname: acceptance-desired\ndescription: ${DESIRED_SKILL_MARKER}\n---\n`);
+    await writeFile(path.join(undesiredSkill, "SKILL.md"), `---\nname: acceptance-undesired\ndescription: ${UNDESIRED_SKILL_MARKER}\n---\n`);
+
+    mainRequests.length = 0;
+    const logs: string[] = [];
+    const result = await execute(context({
+      runId: "acceptance-task-bound-paperclip",
+      config: {
+        command: binary,
+        cliVersion,
+        cwd: workspace,
+        model,
+        dangerouslySkipPermissions: true,
+        promptTemplate: `${PAPERCLIP_SEARCH_MARKER}: search connections once, then stop`,
+        env,
+        skillIsolation: "desired-only",
+        paperclipRuntimeSkills: [
+          { key: "acceptance/desired", runtimeName: "acceptance-desired", source: desiredSkill },
+          { key: "acceptance/undesired", runtimeName: "acceptance-undesired", source: undesiredSkill },
+        ],
+        paperclipSkillSync: { desiredSkills: ["acceptance/desired"] },
+      },
+      runtimeMcp: {
+        getServers: () => [{
+          name: "Paperclip connections",
+          url: mcpUrl,
+          token,
+          connectionId: "paperclip-runtime-tools",
+        }],
+      },
+      onLog: async (_stream, chunk) => {
+        logs.push(chunk);
+      },
+    }));
+
+    expect(result.errorMessage).toBeNull();
+    expect(result.exitCode).toBe(0);
+    expect(mainRequests.length).toBeGreaterThan(0);
+    const first = mainRequests[0]!;
+    const directTool = first.tools.find((name) => /^paperclip.*connections_search$/i.test(name));
+    expect(directTool, `first main-agent tools: ${first.tools.join(", ")}`).toBe("Paperclip_connections_connections_search");
+    expect(first.hasDesiredSkill).toBe(true);
+    expect(first.hasUndesiredSkill).toBe(false);
+
+    const toolUses = String(result.resultJson?.stdout ?? "")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { type?: string; part?: { tool?: string; state?: { status?: string; error?: string } } })
+      .filter((event) => event.type === "tool_use");
+    const directCalls = toolUses.filter((event) => event.part?.tool === directTool);
+    expect(directCalls).toHaveLength(1);
+    expect(directCalls[0]?.part?.state?.status).toBe("completed");
+    expect(directCalls[0]?.part?.state?.error).toBeUndefined();
+    expect(logs.join("")).toContain("skillIsolation=desired-only: run exposes 1 skill(s) via per-run HOME");
+    expect(logs.join("")).toContain("names=acceptance-desired");
+    expect(JSON.stringify(result)).not.toContain(token);
+  }, 90_000);
+
+  it.skipIf(!taskBoundRequested)("surfaces a real Paperclip MCP authorization failure in the run result", async () => {
+    const mcpUrl = process.env.PAPERCLIP_RUNTIME_TOOLS_MCP_URL;
+    if (!mcpUrl) throw new Error("Task-bound acceptance needs the live runtime MCP URL.");
+    mainRequests.length = 0;
+    const result = await execute(context({
+      runId: "acceptance-task-bound-paperclip-denied",
+      runtimeMcp: {
+        getServers: () => [{
+          name: "Paperclip connections",
+          url: mcpUrl,
+          token: "acceptance-invalid-runtime-token",
+          connectionId: "paperclip-runtime-tools",
+        }],
+      },
+    }));
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toMatch(/needs_auth|unauthorized|invalid|401/i);
+    expect(mainRequests).toHaveLength(0);
+  }, 60_000);
+
+  it("fails the readiness gate with the MCP server's reported status when it cannot connect", async () => {
+    const denied = createServer((_req, res) => {
+      res.statusCode = 401;
+      res.end("denied");
+    });
+    await new Promise<void>((resolve) => denied.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = denied.address();
+      if (!address || typeof address === "string") throw new Error("Denied MCP fixture did not expose a TCP port.");
+      mainRequests.length = 0;
+      const result = await execute(context({
+        runId: "acceptance-mcp-denied",
+        runtimeMcp: {
+          getServers: () => [{
+            name: "paperclip-denied",
+            url: `http://127.0.0.1:${address.port}/mcp`,
+            token: "acceptance-denied-bearer",
+            connectionId: "acceptance-denied-connection",
+          }],
+        },
+      }));
+      expect(result.exitCode).toBe(1);
+      expect(result.errorMessage).toContain("OpenCode MCP server(s) did not reach connected and quiet within 10s");
+      expect(result.errorMessage).toContain("paperclip-denied: needs_auth");
+      expect(mainRequests).toHaveLength(0);
+      expect(JSON.stringify(result)).not.toContain("acceptance-denied-bearer");
+    } finally {
+      await new Promise<void>((resolve) => denied.close(() => resolve()));
+    }
+  }, 60_000);
+
+  it("auto-rejects a permission request like `opencode run` instead of waiting for a reply", async () => {
+    const askEnv = privateEnv("permission-ask");
+    await writeOpenCodeConfig(askEnv, { ...fixtureConfig, permissions: [{ action: "shell", resource: "*", effect: "ask" }] });
+    const result = await execute(context({
+      runId: "acceptance-permission",
+      config: {
+        command: binary,
+        cliVersion,
+        cwd: workspace,
+        model,
+        timeoutSec: 60,
+        graceSec: 2,
+        dangerouslySkipPermissions: false,
+        promptTemplate: `${SHELL_CALL_MARKER}: run the shell tool once`,
+        env: askEnv,
+      },
+    }));
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(0);
+    const stdout = String(result.resultJson?.stdout ?? "");
+    const toolUses = stdout
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { type?: string; part?: { tool?: string; state?: { status?: string; error?: string } } })
+      .filter((event) => event.type === "tool_use");
+    const shell = toolUses.find((event) => event.part?.tool === "shell");
+    expect(shell?.part?.state?.status).toBe("error");
+    expect(shell?.part?.state?.error).toContain("cannot ask the user for permission");
+    expect(String(result.resultJson?.stderr ?? "")).toMatch(/! permission requested: shell \(.*\); auto-rejecting/);
+  }, 90_000);
+
+  it("cancels the question tool and ends the run as a failure instead of waiting for an answer", async () => {
+    const result = await execute(context({
+      runId: "acceptance-question",
+      config: {
+        command: binary,
+        cliVersion,
+        cwd: workspace,
+        model,
+        timeoutSec: 60,
+        graceSec: 2,
+        dangerouslySkipPermissions: true,
+        promptTemplate: `${QUESTION_CALL_MARKER}: ask the user one question`,
+        env: baseEnv,
+      },
+    }));
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("that a non-interactive run cannot answer");
+    expect(String(result.resultJson?.stderr ?? "")).toMatch(/! question requested: .*; cancelling/);
+    expect(String(result.resultJson?.stdout ?? "")).toContain("The user dismissed this question");
   }, 90_000);
 
   it("rejects an invalid model before launching the real binary", async () => {

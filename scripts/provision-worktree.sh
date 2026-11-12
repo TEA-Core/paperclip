@@ -271,19 +271,38 @@ if (!fs.existsSync(homeDir)) {
 }
 
 const instanceRoot = path.resolve(homeDir, "instances", instanceId);
+const isInside = (rootPath, candidatePath) => {
+  const relative = path.relative(path.resolve(rootPath), path.resolve(candidatePath));
+  return !(relative.startsWith("..") || path.isAbsolute(relative));
+};
+// SUP-12234 relocated the worktree master key outside the home volume: the
+// server-side worktree repair rewrites secrets.localEncrypted.keyFilePath to
+// /etc/paperclip/worktrees/<instance>/master.key at boot, keyed on this same
+// PAPERCLIP_INSTANCE_ID spelling. A key file path is therefore valid inside
+// the instance root (what init writes) or inside that per-instance key root
+// (what the repair writes); any other location is stale for this host.
+const worktreeKeyRoot = path.resolve("/etc/paperclip/worktrees", instanceId);
 const runtimePaths = [
   config.database?.embeddedPostgresDataDir,
   config.database?.backup?.dir,
   config.logging?.logDir,
   config.storage?.localDisk?.baseDir,
-  config.secrets?.localEncrypted?.keyFilePath,
 ].filter((value) => typeof value === "string" && value.length > 0);
 
 for (const rawValue of runtimePaths) {
   const resolved = path.resolve(expandHomePrefix(rawValue));
-  const relative = path.relative(instanceRoot, resolved);
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+  if (!isInside(instanceRoot, resolved)) {
     fail(`existing worktree config path is outside ${instanceRoot}: ${resolved}`);
+  }
+}
+
+const keyFilePath = config.secrets?.localEncrypted?.keyFilePath;
+if (typeof keyFilePath === "string" && keyFilePath.trim().length > 0) {
+  const resolvedKeyFilePath = path.resolve(expandHomePrefix(keyFilePath));
+  if (!isInside(instanceRoot, resolvedKeyFilePath) && !isInside(worktreeKeyRoot, resolvedKeyFilePath)) {
+    fail(
+      `existing worktree secrets key file is outside ${instanceRoot} and ${worktreeKeyRoot}: ${resolvedKeyFilePath}`,
+    );
   }
 }
 EOF
@@ -401,6 +420,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const net = require("node:net");
+const crypto = require("node:crypto");
 
 function expandHomePrefix(value) {
   if (!value) return value;
@@ -635,6 +655,23 @@ async function main() {
       envLines.push(key + "=" + JSON.stringify(value));
     }
   }
+
+  // Per-worktree decision-signing key (SUP-22126): generated here, never copied
+  // from the source instance — the production key signs control-plane decision
+  // records and must not exist inside an isolated worktree. A valid value in the
+  // existing env file survives this rewrite, so a fallback re-write does not
+  // rotate the worktree's decision signatures. Mirrors MIN_SECRET_LENGTH in
+  // server/src/services/decision-signing.ts.
+  const DECISION_SIGNING_MIN_LENGTH = 32;
+  const existingWorktreeEnvEntries = fs.existsSync(envPath)
+    ? parseEnvFile(fs.readFileSync(envPath, "utf8"))
+    : {};
+  const existingDecisionSigningSecret = nonEmpty(existingWorktreeEnvEntries.PAPERCLIP_DECISION_SIGNING_SECRET);
+  const decisionSigningSecret =
+    existingDecisionSigningSecret && existingDecisionSigningSecret.length >= DECISION_SIGNING_MIN_LENGTH
+      ? existingDecisionSigningSecret
+      : crypto.randomBytes(32).toString("hex");
+  envLines.push("PAPERCLIP_DECISION_SIGNING_SECRET=" + JSON.stringify(decisionSigningSecret));
 
   fs.writeFileSync(envPath, `${envLines.join("\n")}\n`, { mode: 0o600 });
 }

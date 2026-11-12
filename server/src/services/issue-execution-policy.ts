@@ -7,11 +7,13 @@ import type {
   IssueExecutionPolicy,
   IssueExecutionStage,
   IssueExecutionStagePrincipal,
+  IssueExecutionStallHandoff,
+  IssueExecutionStallSignal,
   IssueExecutionState,
   IssueMonitorScheduledBy,
 } from "@paperclipai/shared";
-import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
-import { unprocessable } from "../errors.js";
+import { gitCommitShaSchema, issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
+import { conflict, unprocessable } from "../errors.js";
 import { resolveSelfApprovalPrincipals } from "./approval-status-reconciler.js";
 import { resolveCallerSeat, seatAuthorityNextAction } from "./seat-authority-refusal.js";
 
@@ -88,6 +90,15 @@ type TransitionInput = {
    * (`details.callerSeat: "ancestor-hatch"`) on a seat-authority refusal.
    */
   actorViaAncestorHatch?: boolean;
+  /**
+   * R20: whether the policy's stall arbiter can take work now (an agent of
+   * this company that is not paused, terminated or pending approval). The
+   * engine cannot read agents, so the caller resolves it from the agent row.
+   * Absent counts as unavailable: a caller that never checked can never hand
+   * a stalled stage to an agent that will not run it — the round falls
+   * through to the ordinary ceiling behaviour instead.
+   */
+  stallArbiterAvailable?: boolean;
 };
 
 export type ReviewEscalationSignal = {
@@ -98,6 +109,27 @@ export type ReviewEscalationSignal = {
   changesRequestedCount: number;
   returnAssignee: IssueExecutionStagePrincipal;
 };
+
+/**
+ * R20: emitted ONLY on the transition that hands a stalled review stage to its
+ * stall arbiter. A pure signal like `reviewEscalation`: the route that records
+ * the accompanying `changes_requested` decision writes the activity row.
+ */
+export type StallEscalationSignal = {
+  arbiterAgentId: string;
+  stageId: string;
+  stageType: string;
+  afterRounds: number;
+  maxRounds: number;
+  changesRequestedCount: number;
+  signals: IssueExecutionStallSignal[];
+  fromParticipant: IssueExecutionStagePrincipal | null;
+  returnAssignee: IssueExecutionStagePrincipal;
+  deliveredHeadSha: string | null;
+};
+
+/** Activity action recording a review-stall hand-off to the stall arbiter (R20). */
+export const REVIEW_STALL_ESCALATED_ACTION = "issue.review_stall_escalated";
 
 type TransitionResult = {
   patch: Record<string, unknown>;
@@ -119,14 +151,40 @@ type TransitionResult = {
    * re-asserting drift PATCH cannot mint a duplicate.
    */
   reviewEscalation?: ReviewEscalationSignal;
+  /**
+   * Set ONLY when a stalled review stage is handed to the policy's stall
+   * arbiter (R20). Never set by drift re-assertion of an existing hand-off.
+   */
+  stallEscalation?: StallEscalationSignal;
 };
 
 /**
  * Consecutive agent-initiated changes-requested rounds tolerated on one stage
  * before the pending review escalates to the responsible human. Policies can
  * override via `maxReviewRounds`; human decisions always reset the counter.
+ * The raised ceiling of 10 (R20) applies only to a policy that carries
+ * `stallEscalation`: a loop that still makes progress may run to 10, a stalled
+ * one is caught earlier by the arbiter. A policy without `stallEscalation`
+ * keeps `BASE_MAX_REVIEW_ROUNDS`, so the raise never yields a bare 10.
+ * Do not roll back by editing this constant: the rollback procedure (clear
+ * stored `stallEscalation` first) is in docs/guides/execution-policy.md,
+ * "Round Ceiling and Stall Escalation".
  */
-export const DEFAULT_MAX_REVIEW_ROUNDS = 3;
+export const DEFAULT_MAX_REVIEW_ROUNDS = 10;
+
+/** Pre-R20 default ceiling, kept for policies with no stall arbiter. */
+export const BASE_MAX_REVIEW_ROUNDS = 3;
+
+/**
+ * R20 stall signal written by a reviewer: a decision-comment line that is
+ * exactly `Code acceptable: yes` (the remaining finding is not something the
+ * implementer can change). The whole line must be the marker, case-insensitive;
+ * it may be a list item or block quote and may bold the key or the answer.
+ * Prose that mentions the phrase, or a line that adds anything after `yes`,
+ * does not count.
+ */
+const CODE_ACCEPTABLE_MARKER =
+  /^[ \t]*(?:[-*>][ \t]*)?(?:\*\*|__)?code acceptable(?:\*\*|__)?[ \t]*:(?:\*\*|__)?[ \t]*(?:\*\*|__)?yes(?:\*\*|__)?[ \t\r]*$/im;
 
 const COMPLETED_STATUS: IssueExecutionState["status"] = "completed";
 const PENDING_STATUS: IssueExecutionState["status"] = "pending";
@@ -516,6 +574,36 @@ export function normalizeIssueExecutionPolicy(
   const authorizationPolicy = parsed.data.authorizationPolicy;
   const returnAssigneeAgentId = parsed.data.returnAssigneeAgentId ?? null;
   const baseRef = parsed.data.baseRef ?? null;
+  const stallEscalation = parsed.data.stallEscalation ?? null;
+  if (stallEscalation) {
+    // At afterRounds == ceiling the responsible human receives the stage first;
+    // the arbiter acts at that round only when the issue has no responsible human.
+    const ceiling = parsed.data.maxReviewRounds ?? DEFAULT_MAX_REVIEW_ROUNDS;
+    if (stallEscalation.afterRounds > ceiling) {
+      throw unprocessable(
+        `executionPolicy.stallEscalation.afterRounds (${stallEscalation.afterRounds}) must not exceed the review-round ceiling (${ceiling}); the round ceiling would escalate to a human before the stall arbiter could act`,
+        { field: "stallEscalation.afterRounds", afterRounds: stallEscalation.afterRounds, ceiling },
+      );
+    }
+    // The arbiter is a second opinion outside the reviewers and the author:
+    // as the return assignee it would judge its own work, and as a review
+    // participant the hand-off would let it approve the stage it arbitrates.
+    if (sameAgentId(stallEscalation.toAgentId, returnAssigneeAgentId)) {
+      throw unprocessable(
+        "executionPolicy.stallEscalation.toAgentId must not be the policy's returnAssigneeAgentId; the arbiter would judge its own work",
+        { field: "stallEscalation.toAgentId", agentId: stallEscalation.toAgentId },
+      );
+    }
+    const reviewParticipant = stages.some((stage) =>
+      stage.type === "review" && stageHasAgent(stage, stallEscalation.toAgentId),
+    );
+    if (reviewParticipant) {
+      throw unprocessable(
+        "executionPolicy.stallEscalation.toAgentId must not be a review-stage participant; the stall arbiter advises outside the reviewers and never approves the stage",
+        { field: "stallEscalation.toAgentId", agentId: stallEscalation.toAgentId },
+      );
+    }
+  }
 
   if (
     stages.length === 0 &&
@@ -548,6 +636,7 @@ export function normalizeIssueExecutionPolicy(
     ...(reviewPreset ? { reviewPreset } : {}),
     ...(authorizationPolicy ? { authorizationPolicy } : {}),
     ...(parsed.data.maxReviewRounds != null ? { maxReviewRounds: parsed.data.maxReviewRounds } : {}),
+    ...(stallEscalation ? { stallEscalation: { afterRounds: stallEscalation.afterRounds, toAgentId: stallEscalation.toAgentId.toLowerCase() } } : {}),
     ...(baseRef ? { baseRef } : {}),
     ...(releaseAssurance ? { approvalAuthority: "release_assurance" as const } : {}),
   };
@@ -582,11 +671,16 @@ export function normalizeIssueExecutionPolicy(
  * read that policy, edit `monitor.nextCheckAt`, and write the whole object
  * back. That round-trip carries an explicit `stages: []` and used to 422, which
  * left the only working re-arm path a partial `{monitor: {...}}` body that
- * relies on merge semantics. Permitting the round-trip grants no new
- * capability: over an already stage-less policy the identical stored result is
- * reachable today by omitting the `stages` key entirely, so the rejection was
- * blocking an idiom rather than defending the ladder. Over a policy that *has*
- * stages the rejection is unchanged — that is the case ADR-029/ADR-072 guard.
+ * relies on merge semantics. The round-trip is faithful ONLY while the body
+ * keeps carrying the `monitor` key. SUP-22890 falsified the original safety
+ * argument ("the identical stored result is reachable by omitting the `stages`
+ * key entirely"): omitting `stages` PRESERVES the stored stages (SUP-15377),
+ * while the same explicit `stages: []` body with `monitor` dropped normalizes
+ * to `null` (SUP-17459 no-ladder collapse) and silently destroys the watcher's
+ * only wake path. The null-collapse backstop below now protects a stored
+ * monitor, refusing that destructive round-trip with a 422 naming the monitor.
+ * Over a policy that *has* stages the rejection is unchanged — that is the
+ * case ADR-029/ADR-072 guard.
  *
  * SUP-15377: an omitted `stages` key is a preserve signal, not a clear. The
  * schema's `.default([])` silently turned every stage-less partial write —
@@ -596,7 +690,9 @@ export function normalizeIssueExecutionPolicy(
  * carries the stored stages forward onto the normalized result so those
  * partial writes keep the ladder. This guard scopes its null-clear backstop to
  * bodies where `stagesKeyAbsent` is false, so an omission is no longer rejected
- * here; `resolvePatchExecutionPolicy` performs the preserve.
+ * here; `resolvePatchExecutionPolicy` performs the preserve. An explicit empty
+ * stages array must still retain a stored monitor in the request body, even when
+ * another field keeps normalization non-null.
  */
 export function assertPatchableExecutionPolicyWrite(input: {
   raw: unknown;
@@ -624,10 +720,13 @@ export function assertPatchableExecutionPolicyWrite(input: {
   const { raw, currentPolicy, stagesExplicitlyEmpty, stagesKeyAbsent, executionState, rearmPointer } = input;
 
   // SUP-13925: only reject when there is a close ladder to strip. `stages: []`
-  // over a stored policy that is already stage-less is a faithful round-trip,
-  // not a removal. `currentPolicy === null` still rejects: there is no stored
-  // shape being round-tripped, so an explicit empty array there is the
-  // ladder-free policy the guard was written to keep off the board.
+  // over a stored policy that is already stage-less removes no stage, but it is
+  // a faithful round-trip only while the body keeps the policy's other content
+  // (most importantly `monitor`) intact — the null-collapse backstop below
+  // (SUP-22890) refuses the shape that would destroy it. `currentPolicy ===
+  // null` still rejects: there is no stored shape being round-tripped, so an
+  // explicit empty array there is the ladder-free policy the guard was written
+  // to keep off the board.
   if (stagesExplicitlyEmpty && (currentPolicy === null || currentPolicy.stages.length > 0)) {
     throw unprocessable("executionPolicy.stages must not be empty");
   }
@@ -638,18 +737,30 @@ export function assertPatchableExecutionPolicyWrite(input: {
     );
   }
 
-  // SUP-13634 fail-closed backstop: a body that normalizes back to null over a
-  // stored ladder would silently clear it. SUP-15377: a body that OMITS the
-  // `stages` key is no longer a clear — the stored stages are carried forward
-  // by `resolvePatchExecutionPolicy` — so this backstop is scoped to bodies
-  // where the key was not omitted. It is a backstop, not the primary guard:
-  // the explicit-`[]` branch above already refuses every reachable clear.
+  // SUP-13634 fail-closed backstop: a body that normalizes back to null over
+  // stored removable content would silently clear it. SUP-15377: a body that
+  // OMITS the `stages` key is no longer a clear — the stored stages are
+  // carried forward by `resolvePatchExecutionPolicy` — so this backstop is
+  // scoped to bodies where the key was not omitted. SUP-22890: the protected
+  // surface is a close ladder OR a stored monitor. A monitor-only watcher
+  // (`stages: []`) fell through the stages-only gate, so the SUP-13925
+  // round-trip with `monitor` dropped normalized to null and wiped the card's
+  // only wake path while reporting 200. The refusal names the field at risk.
   if (raw !== null && typeof raw === "object" && !Array.isArray(raw) &&
-      currentPolicy !== null && currentPolicy.stages.length > 0 && !stagesKeyAbsent) {
+      currentPolicy !== null && !stagesKeyAbsent &&
+      (currentPolicy.monitor || currentPolicy.stages.length > 0)) {
+    const monitorKeyPresent = Object.prototype.hasOwnProperty.call(raw, "monitor");
+    if (stagesExplicitlyEmpty && currentPolicy.monitor && !monitorKeyPresent) {
+      throw unprocessable(
+        "executionPolicy must not clear the issue's monitor; send the full replacement policy including the monitor, or omit the stages key to clear it explicitly",
+      );
+    }
     const normalized = normalizeIssueExecutionPolicy(raw);
     if (normalized === null) {
       throw unprocessable(
-        "executionPolicy must not clear the issue's existing close stages; send the full replacement policy instead",
+        currentPolicy.stages.length > 0
+          ? "executionPolicy must not clear the issue's existing close stages; send the full replacement policy instead"
+          : "executionPolicy must not clear the issue's monitor; send the full replacement policy including the monitor, or omit the stages key to clear it explicitly",
       );
     }
   }
@@ -953,7 +1064,7 @@ export function applyExecutionPolicyReArm(input: {
     returnAssignee,
     changesRequestedCount: 0,
   });
-  return { patch };
+  return { patch, workflowControlledAssignment: true };
 }
 
 /**
@@ -1005,7 +1116,312 @@ function principalsEqual(a: IssueExecutionStagePrincipal | null, b: IssueExecuti
 
 function resolveMaxReviewRounds(policy: IssueExecutionPolicy | null): number {
   const configured = policy?.maxReviewRounds;
-  return typeof configured === "number" && configured > 0 ? configured : DEFAULT_MAX_REVIEW_ROUNDS;
+  if (typeof configured === "number" && configured > 0) return configured;
+  return policy?.stallEscalation ? DEFAULT_MAX_REVIEW_ROUNDS : BASE_MAX_REVIEW_ROUNDS;
+}
+
+/**
+ * Rounds from which a human non-participant on a pending stage counts as an
+ * escalated hold. Without an explicit `maxReviewRounds` this stays at the
+ * pre-R20 default ceiling, not the raised one: holds escalated at round 3
+ * before the ceiling rose must stay held, and a new escalation always lands at
+ * or above the ceiling, so it is recognised too.
+ */
+function resolveEscalatedHoldMinRounds(policy: IssueExecutionPolicy | null): number {
+  const configured = policy?.maxReviewRounds;
+  return typeof configured === "number" && configured > 0 ? configured : BASE_MAX_REVIEW_ROUNDS;
+}
+
+/** Agent ids are uuids; compare them case-insensitively wherever the arbiter is involved. */
+function sameAgentId(left: string | null | undefined, right: string | null | undefined): boolean {
+  return Boolean(left) && Boolean(right) && left!.toLowerCase() === right!.toLowerCase();
+}
+
+function principalIsAgent(principal: IssueExecutionStagePrincipal | null | undefined, agentId: string): boolean {
+  return principal?.type === "agent" && sameAgentId(principal.agentId, agentId);
+}
+
+function stageHasAgent(stage: IssueExecutionStage, agentId: string): boolean {
+  return stage.participants.some((participant) => principalIsAgent(participant, agentId));
+}
+
+/**
+ * R20: the pending review stage is held by its stall arbiter. The arbiter is
+ * deliberately not a stage participant, so without this the stage-membership
+ * repair would re-seat a configured reviewer on the next PATCH and undo the
+ * hand-off. Only the arbiter the CURRENT policy names, on the stage the
+ * hand-off record names, counts: removing `stallEscalation` from the policy
+ * dissolves the hold back to a configured reviewer.
+ */
+function isStallArbiterHold(input: {
+  policy: IssueExecutionPolicy;
+  state: IssueExecutionState | null;
+  stage: IssueExecutionStage;
+  participant: IssueExecutionStagePrincipal;
+}): boolean {
+  const arbiterId = input.policy.stallEscalation?.toAgentId;
+  const handoff = input.state?.stallHandoff;
+  return (
+    Boolean(arbiterId) &&
+    handoff?.stageId === input.stage.id &&
+    sameAgentId(handoff.arbiterAgentId, arbiterId) &&
+    principalIsAgent(input.participant, arbiterId!) &&
+    !stageHasAgent(input.stage, arbiterId!)
+  );
+}
+
+/**
+ * The one case-fold rule for agent ids in a stored execution row, shared by
+ * the decision snapshot compare and the route's raw-row compares. The seated
+ * participant folds trim + lowercase; the policy's participant list and
+ * `stallEscalation.toAgentId` fold lowercase only. User ids are never folded.
+ */
+function foldSeatedAgentId(agentId: string | null | undefined): string {
+  return (agentId ?? "").trim().toLowerCase();
+}
+
+function foldPolicyAgentId(agentId: string | null | undefined): string {
+  return (agentId ?? "").toLowerCase();
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Raw jsonb `executionState` with the seated agent id folded; every other field is untouched. */
+export function foldExecutionStateAgentIds(state: unknown): unknown {
+  if (!isPlainRecord(state) || !isPlainRecord(state.currentParticipant)) return state;
+  const participant = state.currentParticipant;
+  if (participant.type !== "agent" || typeof participant.agentId !== "string") return state;
+  return { ...state, currentParticipant: { ...participant, agentId: foldSeatedAgentId(participant.agentId) } };
+}
+
+/** Raw jsonb `executionPolicy` with stage participant and `stallEscalation.toAgentId` agent ids folded; every other field is untouched. */
+export function foldExecutionPolicyAgentIds(policy: unknown): unknown {
+  if (!isPlainRecord(policy)) return policy ?? null;
+  const folded: Record<string, unknown> = { ...policy };
+  if (Array.isArray(policy.stages)) {
+    folded.stages = policy.stages.map((stage) => {
+      if (!isPlainRecord(stage) || !Array.isArray(stage.participants)) return stage;
+      return {
+        ...stage,
+        participants: stage.participants.map((participant) =>
+          isPlainRecord(participant) && participant.type === "agent" && typeof participant.agentId === "string"
+            ? { ...participant, agentId: foldPolicyAgentId(participant.agentId) }
+            : participant,
+        ),
+      };
+    });
+  }
+  if (isPlainRecord(policy.stallEscalation) && typeof policy.stallEscalation.toAgentId === "string") {
+    folded.stallEscalation = { ...policy.stallEscalation, toAgentId: foldPolicyAgentId(policy.stallEscalation.toAgentId) };
+  }
+  return folded;
+}
+
+/**
+ * R20: the policy controls that decide whether, when and to whom a stalled
+ * review stage is handed off — the round ceiling, the stall policy and each
+ * stage's identity and participants (agent ids case-folded) — in a comparable
+ * form. Two policies with equal signatures hand a stall off identically.
+ */
+function stallHoldSignature(policy: IssueExecutionPolicy | null): string {
+  return JSON.stringify([
+    policy?.maxReviewRounds ?? null,
+    policy?.stallEscalation?.afterRounds ?? null,
+    policy?.stallEscalation ? foldPolicyAgentId(policy.stallEscalation.toAgentId) : null,
+    (policy?.stages ?? []).map((stage) => [
+      stage.id,
+      stage.type,
+      stage.participants.map((participant) =>
+        participant.type === "agent" ? `agent:${foldPolicyAgentId(participant.agentId)}` : `user:${participant.userId ?? ""}`,
+      ),
+    ]),
+  ]);
+}
+
+/**
+ * R20: whether `previous` and `next` differ in any control that governs a
+ * stall hand-off or the round ceiling. The decision transaction compares the
+ * policy a decision on a stall-escalation card was computed from with the
+ * policy re-read under the row lock, and refuses the decision (hand-off or
+ * ordinary bounce) when the policy has since changed.
+ */
+export function stallHoldControlsDiffer(previous: IssueExecutionPolicy | null, next: IssueExecutionPolicy | null): boolean {
+  return stallHoldSignature(previous) !== stallHoldSignature(next);
+}
+
+function deliveryBindingValue(delivery: unknown, key: "prNumber" | "prUrl" | "headSha"): unknown {
+  if (!delivery || typeof delivery !== "object" || Array.isArray(delivery)) return null;
+  // jsonb delivery is an untyped object; only these three binding fields are compared.
+  const record = delivery as Record<string, unknown>;
+  const value = record[key];
+  return value ?? null;
+}
+
+/**
+ * SUP-23260: whether the delivery binding an execution decision was computed
+ * from differs from the binding on the locked row. A same-head refresh can
+ * add `prNumber` and `prUrl` after the unlocked read; writing the snapshot
+ * back would erase them. `headSha` is included so a moved head is not
+ * overwritten either. Other delivery fields are not part of this compare.
+ */
+export function deliveryBindingDiffers(
+  previous: IssueExecutionState | null,
+  next: IssueExecutionState | null,
+): boolean {
+  const left = previous?.delivery;
+  const right = next?.delivery;
+  return (
+    deliveryBindingValue(left, "prNumber") !== deliveryBindingValue(right, "prNumber") ||
+    deliveryBindingValue(left, "prUrl") !== deliveryBindingValue(right, "prUrl") ||
+    deliveryBindingValue(left, "headSha") !== deliveryBindingValue(right, "headSha")
+  );
+}
+
+function executionDecisionParticipantSignature(
+  participant: IssueExecutionStagePrincipal | null | undefined,
+): string | null {
+  if (!participant) return null;
+  if (participant.type === "agent") {
+    const agentId = foldSeatedAgentId(participant.agentId);
+    return agentId.length > 0 ? `agent:${agentId}` : "agent:";
+  }
+  const userId = participant.userId?.trim() ?? "";
+  return userId.length > 0 ? `user:${userId}` : "user:";
+}
+
+export function assertExecutionDecisionSnapshotCurrent(
+  readState: IssueExecutionState | null,
+  readPolicy: IssueExecutionPolicy | null,
+  locked: { status?: string | null; executionState?: unknown; executionPolicy?: unknown } | null | undefined,
+  issueId: string,
+  readStatus?: string | null,
+): void {
+  const lockedState = parseIssueExecutionState(locked?.executionState ?? null);
+  if (
+    (lockedState?.deliveredHeadSha ?? null) !== (readState?.deliveredHeadSha ?? null) ||
+    (lockedState?.currentStageId ?? null) !== (readState?.currentStageId ?? null) ||
+    executionDecisionParticipantSignature(lockedState?.currentParticipant) !==
+      executionDecisionParticipantSignature(readState?.currentParticipant) ||
+    (lockedState?.lastDecisionId ?? null) !== (readState?.lastDecisionId ?? null) ||
+    (lockedState?.changesRequestedCount ?? 0) !== (readState?.changesRequestedCount ?? 0) ||
+    (readStatus !== undefined && (locked?.status ?? null) !== readStatus) ||
+    stallHoldControlsDiffer(readPolicy, normalizeIssueExecutionPolicy(locked?.executionPolicy ?? null)) ||
+    deliveryBindingDiffers(readState, lockedState)
+  ) {
+    throw conflict(
+      "The delivered head, the delivery binding (pull request number, URL or head), the execution policy (round ceiling, stall arbiter or stages), the review stage, the seated participant, the last decision, the review-round counter or the issue status changed while this decision was in flight; this decision was not recorded and the stage was not handed off. Re-read the issue before deciding.",
+      {
+        code: "review_stall_policy_changed",
+        issueId,
+        stageId: readState?.currentStageId ?? null,
+      },
+    );
+  }
+}
+
+/**
+ * R20: the stage-run's hand-off record seats `agentId` as the stall arbiter of
+ * the pending stage. Keyed on the hand-off record, not on the current policy:
+ * a later policy edit (by anyone) that names another arbiter or lists this
+ * agent as a stage participant does not turn the arbiter into a reviewer of
+ * the stage-run it was handed.
+ */
+function seatedByStallHandoff(state: IssueExecutionState | null, stageId: string | null, agentId: string): boolean {
+  const handoff = state?.stallHandoff;
+  return Boolean(handoff) && handoff!.stageId === stageId && sameAgentId(handoff!.arbiterAgentId, agentId);
+}
+
+/**
+ * R20: `actorAgentId` currently holds the pending stage as its stall arbiter.
+ * While seated, the arbiter may not write the execution policy or the review
+ * policy at all: any such write could lift its own hold (ceiling, afterRounds,
+ * arbiter, the stall policy) or seat it as a reviewer of the stage it
+ * arbitrates.
+ */
+export function isSeatedStallArbiter(state: IssueExecutionState | null, actorAgentId: string | null | undefined): boolean {
+  return (
+    Boolean(actorAgentId) &&
+    state?.status === PENDING_STATUS &&
+    principalIsAgent(state.currentParticipant, actorAgentId!) &&
+    seatedByStallHandoff(state, state.currentStageId, actorAgentId!)
+  );
+}
+
+/**
+ * The decision comment without fenced code blocks (``` or ~~~): a marker line
+ * quoted inside a code fence is an example, not the reviewer's verdict. An
+ * unclosed fence runs to the end of the comment, as in Markdown. A fence
+ * closes only on a true closing line: the opener's fence character, a marker
+ * at least as long as the opener, and nothing after it but spaces, tabs and an
+ * optional CR, so a pseudo-closer (```js, ``` text) cannot end it.
+ */
+function commentOutsideCodeFences(body: string): string {
+  let fence: string | null = null;
+  const kept: string[] = [];
+  for (const line of body.split("\n")) {
+    const marker = /^[ \t]*(`{3,}|~{3,})/.exec(line)?.[1] ?? null;
+    if (fence !== null) {
+      const closer = /^[ \t]*(`{3,}|~{3,})[ \t]*\r?$/.exec(line)?.[1];
+      if (closer !== undefined && closer[0] === fence[0] && closer.length >= fence.length) fence = null;
+      continue;
+    }
+    if (marker !== null) {
+      fence = marker;
+      continue;
+    }
+    kept.push(line);
+  }
+  return kept.join("\n");
+}
+
+/** Same delivered head, compared only between full git shas: a malformed value is never a stall signal. */
+function sameHeadSha(left: string | null | undefined, right: string | null | undefined): boolean {
+  const a = gitCommitShaSchema.safeParse(left);
+  const b = gitCommitShaSchema.safeParse(right);
+  return a.success && b.success && a.data.toLowerCase() === b.data.toLowerCase();
+}
+
+/**
+ * R20 stall trigger, evaluated on an agent changes-requested decision. A
+ * review stage is handed to its arbiter when the consecutive agent rounds
+ * reach `afterRounds` AND the loop shows a stall signal: the head delivered
+ * for this round is the head the previous decision already bounced, or the
+ * reviewer's decision says the code is acceptable. A loop that still makes
+ * progress (a new head, findings about the code) keeps bouncing to the
+ * implementer up to the round ceiling. At most one hand-off per stage-run, and
+ * none when the caller could not confirm the arbiter can take work now.
+ */
+function resolveStallHandoff(input: {
+  policy: IssueExecutionPolicy;
+  state: IssueExecutionState | null;
+  stage: IssueExecutionStage;
+  returnAssignee: IssueExecutionStagePrincipal;
+  nextRounds: number;
+  commentBody: string;
+  arbiterAvailable: boolean;
+}): { arbiter: IssueExecutionStagePrincipal; signals: IssueExecutionStallSignal[] } | null {
+  const config = input.policy.stallEscalation;
+  if (!config || input.stage.type !== "review") return null;
+  if (input.state?.stallHandoff?.stageId === input.stage.id) return null;
+  if (input.nextRounds < config.afterRounds) return null;
+  if (!input.arbiterAvailable) return null;
+  // Self-approval guards: the arbiter never receives a stage it already sits
+  // on as a reviewer, nor one whose work it authored or will be handed back.
+  if (
+    stageHasAgent(input.stage, config.toAgentId) ||
+    principalIsAgent(input.returnAssignee, config.toAgentId) ||
+    principalIsAgent(input.state?.deliveryAuthor, config.toAgentId)
+  ) {
+    return null;
+  }
+  const signals: IssueExecutionStallSignal[] = [];
+  if (sameHeadSha(input.state?.deliveredHeadSha, input.state?.bouncedHeadSha)) signals.push("same_head_rebounced");
+  if (CODE_ACCEPTABLE_MARKER.test(commentOutsideCodeFences(input.commentBody))) signals.push("code_acceptable");
+  return signals.length > 0
+    ? { arbiter: { type: "agent", agentId: config.toAgentId, userId: null }, signals }
+    : null;
 }
 
 /**
@@ -1098,6 +1514,26 @@ function mergeSkippedStageIds(
   return Array.from(new Set([...(previous?.skippedStageIds ?? []), ...(added ?? [])]));
 }
 
+/**
+ * R20 review-stall bookkeeping carried onto a rebuilt state. The delivered head
+ * survives a stage change (the next stage reviews the same delivery); the
+ * bounced head and the arbiter hand-off belong to one stage-run and only carry
+ * while the rebuilt state stays on that stage. Absent keys stay absent so a
+ * state that never used the bookkeeping keeps its exact shape.
+ */
+function carriedStallFields(
+  previous: IssueExecutionState | null,
+  stageId: string | null,
+): Pick<IssueExecutionState, "deliveredHeadSha" | "bouncedHeadSha" | "stallHandoff"> {
+  if (!previous) return {};
+  const sameStage = stageId !== null && previous.currentStageId === stageId;
+  return {
+    ...(previous.deliveredHeadSha ? { deliveredHeadSha: previous.deliveredHeadSha } : {}),
+    ...(sameStage && previous.bouncedHeadSha ? { bouncedHeadSha: previous.bouncedHeadSha } : {}),
+    ...(sameStage && previous.stallHandoff ? { stallHandoff: previous.stallHandoff } : {}),
+  };
+}
+
 function buildCompletedState(
   previous: IssueExecutionState | null,
   currentStage: IssueExecutionStage,
@@ -1123,6 +1559,7 @@ function buildCompletedState(
     changesRequestedCount: 0,
     approvalStatus: previous?.approvalStatus,
     delivery: previous?.delivery,
+    ...carriedStallFields(previous, null),
   };
 }
 
@@ -1148,6 +1585,7 @@ function buildStateWithCompletedStages(input: {
     monitor: input.previous?.monitor ?? null,
     approvalStatus: input.previous?.approvalStatus,
     delivery: input.previous?.delivery,
+    ...carriedStallFields(input.previous, input.previous?.currentStageId ?? null),
   };
 }
 
@@ -1173,6 +1611,7 @@ function buildSkippedStageCompletedState(input: {
     monitor: input.previous?.monitor ?? null,
     approvalStatus: input.previous?.approvalStatus,
     delivery: input.previous?.delivery,
+    ...carriedStallFields(input.previous, null),
   };
 }
 
@@ -1204,6 +1643,7 @@ function buildPendingState(input: {
     pendingSince: new Date().toISOString(),
     approvalStatus: input.previous?.approvalStatus,
     delivery: input.previous?.delivery,
+    ...carriedStallFields(input.previous, input.stage.id),
   };
 }
 
@@ -1235,6 +1675,11 @@ function buildChangesRequestedState(
     reviewRequest: null,
     lastDecisionOutcome: "changes_requested",
     changesRequestedCount,
+    // R20: the bounced round's delivered head becomes the comparison point for
+    // the next round, which starts with no head until its delivery records one.
+    ...(previous?.deliveredHeadSha || previous?.bouncedHeadSha
+      ? { deliveredHeadSha: null, bouncedHeadSha: previous.deliveredHeadSha ?? null }
+      : {}),
   };
 }
 
@@ -1445,7 +1890,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     const escalatedHold =
       currentParticipant.type === "user" &&
       !stageHasParticipant(activeStage, currentParticipant) &&
-      (existingState?.changesRequestedCount ?? 0) >= resolveMaxReviewRounds(input.policy);
+      (existingState?.changesRequestedCount ?? 0) >= resolveEscalatedHoldMinRounds(input.policy);
     if (escalatedHold && !principalsEqual(currentParticipant, actor)) {
       // An empty patch would not override the caller's own requested fields,
       // so a status or assignee change from a non-escalated actor must be
@@ -1475,7 +1920,17 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       }
       return { patch };
     }
-    if (!escalatedHold && !stageHasParticipant(activeStage, currentParticipant)) {
+    // R20: a stage handed to its stall arbiter is held the same way — the
+    // arbiter is not a configured participant, so the membership repair below
+    // would otherwise re-seat a reviewer and undo the hand-off. Every path
+    // after this treats the arbiter as the active participant.
+    const stallArbiterHold = isStallArbiterHold({
+      policy: input.policy,
+      state: existingState,
+      stage: activeStage,
+      participant: currentParticipant,
+    });
+    if (!escalatedHold && !stallArbiterHold && !stageHasParticipant(activeStage, currentParticipant)) {
       const participant = selectStageParticipant(activeStage, {
         preferred: explicitAssignee ?? existingState?.currentParticipant ?? null,
         exclude: resolveReturnAssignee({
@@ -1518,6 +1973,23 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     }
 
     if (principalsEqual(currentParticipant, actor)) {
+      if (
+        requestedStatus === "done" &&
+        (stallArbiterHold || (currentParticipant.type === "agent" && Boolean(currentParticipant.agentId) && seatedByStallHandoff(existingState, activeStage.id, currentParticipant.agentId!)))
+      ) {
+        // The arbiter is a second opinion, not a reviewer: approving here would
+        // skip the required reviewer (synthesis Q1, "advises only"). Keyed on the
+        // hand-off record as well as the hold, so a later policy edit that names
+        // another arbiter or lists this agent on the stage cannot lift it.
+        throw unprocessable(
+          "The stall arbiter advises only and cannot approve this review stage. Request changes with a directive for the implementer (the next delivery returns to the stage reviewer), or park the card blocked naming the blocker and its owner.",
+          {
+            code: "stall_arbiter_cannot_approve",
+            stageId: activeStage.id,
+            arbiterAgentId: currentParticipant.agentId ?? null,
+          },
+        );
+      }
       if (requestedStatus === "done") {
         if (!input.commentBody?.trim()) {
           throw unprocessable(`Approving a review or approval stage requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
@@ -1662,6 +2134,67 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
               },
             };
           }
+        }
+        const stallHandoff = actorIsHuman
+          ? null
+          : resolveStallHandoff({
+              policy: input.policy,
+              state: existingState,
+              stage: activeStage,
+              returnAssignee,
+              nextRounds,
+              commentBody: decision.body,
+              arbiterAvailable: input.stallArbiterAvailable === true,
+            });
+        if (stallHandoff) {
+          // R20: a stalled loop goes to the arbiter once, on the same card and
+          // the same pending stage, instead of back to the implementer. The
+          // reviewer's decision above is still recorded; the round count keeps
+          // running, so the ceiling still escalates to the human after it.
+          const fromParticipant: IssueExecutionStagePrincipal = {
+            type: currentParticipant.type,
+            agentId: currentParticipant.agentId ?? null,
+            userId: currentParticipant.userId ?? null,
+          };
+          const handoff: IssueExecutionStallHandoff = {
+            stageId: activeStage.id,
+            arbiterAgentId: stallHandoff.arbiter.agentId!,
+            fromParticipant,
+            changesRequestedCount: nextRounds,
+            signals: stallHandoff.signals,
+            handedOffAt: new Date().toISOString(),
+          };
+          buildPendingStagePatch({
+            patch,
+            previous: {
+              ...existingState!,
+              bouncedHeadSha: existingState!.deliveredHeadSha ?? null,
+              stallHandoff: handoff,
+            },
+            policy: input.policy,
+            stage: activeStage,
+            participant: stallHandoff.arbiter,
+            returnAssignee,
+            reviewRequest: effectiveReviewRequest,
+            changesRequestedCount: nextRounds,
+          });
+          return {
+            patch,
+            decision,
+            workflowControlledAssignment: true,
+            stallEscalation: {
+              arbiterAgentId: handoff.arbiterAgentId,
+              stageId: activeStage.id,
+              stageType: activeStage.type,
+              afterRounds: input.policy.stallEscalation!.afterRounds,
+              maxRounds: resolveMaxReviewRounds(input.policy),
+              changesRequestedCount: nextRounds,
+              signals: stallHandoff.signals,
+              fromParticipant,
+              returnAssignee,
+              deliveredHeadSha: existingState!.deliveredHeadSha ?? null,
+            },
+          };
         }
         patch.status = "in_progress";
         Object.assign(patch, patchForPrincipal(returnAssignee));

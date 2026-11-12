@@ -1,4 +1,4 @@
-import { and, eq, isNull, lt, ne, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueRecoveryActions, issues, summarySlots } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -9,6 +9,7 @@ import {
   type IssueAssignmentWakeupDeps,
 } from "./issue-assignment-wakeup.js";
 import { summarySlotService } from "./summary-slots.js";
+import { generationWroteSlotSql, releaseSummarySlotBinding } from "./summary-slot-finalization.js";
 import type {
   SummarySlotKey,
   SummarySlotScopeKind,
@@ -39,25 +40,33 @@ import type {
  *     excluded at the query so a recently-written summary is never re-fired.
  *
  * For each candidate the sweep calls `summarySlotService(db).generate` at the
- * service layer — the exact consume-contract the HTTP route uses. For a fresh
+ * service layer — the exact consume-contract that the HTTP route uses. For a fresh
  * claim it records the route-equivalent `summary_slot.generate_requested`
  * activity entry and fires the same assignment wakeup the route fires so the
  * Summarizer claims it. For a slot that is already `generating` with an active,
  * progressing issue it does not re-fire `generate`, but re-delivers the
  * assignee wake so a wake that was rejected on the minting tick is retried
- * instead of leaving the slot stranded unwoken. The route's board gate is left
+ * instead of leaving the slot stranded unwoken — EXCEPT when the linked
+ * generation issue has already written the slot's surviving revision
+ * (SUP-22977): that wake would re-run a completed generation, so it is skipped
+ * and the tick is a no-op read for that slot. The route's board gate is left
  * untouched: this path is board-side, in-process, and does not introduce any
  * new credential or auth branch.
  *
  * Wedged-generation recovery (SUP-15764): `generate` treats a `generating`
  * slot as in-flight while its generation issue is *active* (`status` not in
  * `{done, cancelled}`), and `blocked` counts as active. A slot pinned behind a
- * permanently-`blocked` generation issue — e.g. one parked on a board
- * `missing_disposition` recovery action — would otherwise be re-woken on every
+ * permanently-`blocked` generation issue would otherwise be re-woken on every
  * due tick, forever, and logged nothing. Before claiming such a `generating`
- * candidate the sweep classifies it as *wedged* when EITHER:
+ * candidate the sweep classifies it as *wedged* when ANY of:
  *   - its generation issue is `blocked` and carries an active recovery action
  *     in status `escalated` (`reason: "blocked_escalated_recovery"`), or
+ *   - its generation issue is `blocked` at all (`reason:
+ *     "blocked_generation_parked"`, SUP-22977) — parked is parked with or
+ *     without an escalation trail; while a blocked generation holds the claim,
+ *     the sweep can neither mint the next hour's generation nor let the slot
+ *     serve a fresher revision, and the hourly re-wake burned summarizer runs
+ *     against an already-written deliverable; or
  *   - the linked generation issue has made no progress for longer than the
  *     bounded, env-tunable window `SUMMARY_SLOT_REFRESH_WEDGED_MS` (default
  *     6h) (`reason: "generating_age_exceeded"`). Progress is measured off the
@@ -73,6 +82,21 @@ import type {
  * log instead of a silent strand. A slot that is merely in-flight (its issue
  * progressing or recently updated) is never re-claimed, so live generations
  * are not thrashed.
+ *
+ * Completed-generation release (SUP-23039): before the wedged classification,
+ * a `generating` candidate whose discovery SELECT says its generation issue
+ * already wrote the slot's surviving revision (`wroteSurvivingRevision`) and
+ * whose issue is non-terminal with no live run and no active/escalated
+ * recovery action is COMPLETE — the deliverable landed, and a `record_only`
+ * generation card can never emit the close form the terminal finalizer keys
+ * off, so the binding is released to `idle` right here
+ * (`releaseSummarySlotBinding`, same identity predicate, compare-and-set) and
+ * no fresh generation is minted. Without this, a parked written generation is
+ * re-minted every sweep hour, burning a summarizer run against an
+ * already-written deliverable and parking a fresh un-closable card each time.
+ * The read path (`summary-slots.ts` `isDeadGenerationBinding`) mirrors the
+ * same release so a board read self-heals the tile as soon as the run
+ * terminates instead of after `DEAD_GENERATION_GRACE_MS`.
  *
  * Two safeguards make that re-claim safe (round-3 review fixes):
  *   - The clear is *progress-guarded*: it re-reads the linked issue's progress
@@ -99,6 +123,9 @@ const DEFAULT_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 const DEFAULT_WEDGED_MS = 6 * 60 * 60 * 1000;
 
 export const SUMMARY_SLOT_REFRESH_ACTOR_ID = "system:summary-slot-refresh";
+
+/** Generation issues in these statuses are terminal and owned by the finalizer/read-path reclaim. */
+const TERMINAL_ISSUE_STATUSES = new Set<string>(["done", "cancelled"]);
 
 export interface SummarySlotRefreshSweepOptions {
   /** How old (ms since `lastGeneratedAt`) a summary must be before it counts as stale. */
@@ -133,6 +160,12 @@ export interface SummarySlotRefreshSweepResult {
   claimed: number;
   /** Slots already in flight: a live generation issue existed, so no re-fire; the assignee wake is re-delivered so a previously-rejected wake is retried. */
   inFlight: number;
+  /**
+   * Slots whose generation already completed its deliverable (wrote the
+   * surviving revision) with a dead run: the binding was released to `idle`
+   * and no fresh generation was minted (SUP-23039).
+   */
+  released: number;
   /** Slots whose `generate`, its assignee wake, or an in-flight re-wake threw (Summarizer not configured, target gone, wake rejected, etc.); retried next sweep. */
   failed: number;
 }
@@ -145,10 +178,21 @@ type SummarySlotRefreshCandidate = {
   status: SummarySlotStatus;
   generatingIssueId: string | null;
   updatedAt: Date;
+  /**
+   * Whether the linked generation issue already wrote the slot's surviving
+   * revision (identity-based: slot document -> latest revision -> creating
+   * run's context snapshot issue id). Computed in the discovery SELECT
+   * (SUP-22977); `null`/`false`/missing means "not written (or unknown)", and
+   * the sweep fails open by re-delivering the wake.
+   */
+  wroteSurvivingRevision?: boolean | null;
 };
 
 /** Why a `generating` candidate was classified as wedged and re-claimed. */
-type WedgedReason = "blocked_escalated_recovery" | "generating_age_exceeded";
+type WedgedReason =
+  | "blocked_escalated_recovery"
+  | "blocked_generation_parked"
+  | "generating_age_exceeded";
 
 /** Reads a positive-integer millisecond env var, falling back to `fallbackMs` on missing or invalid values. */
 function readMsEnv(name: string, fallbackMs: number): number {
@@ -185,13 +229,13 @@ export function createSummarySlotRefreshSweepService(
     // The heartbeat tick fires every 30s; generation is expensive, so every
     // non-due tick is a no-op.
     if (lastRunAt !== null && checkedAt.getTime() - lastRunAt < sweepIntervalMs) {
-      return { due: false, summariesEnabled: false, candidates: 0, claimed: 0, inFlight: 0, failed: 0 };
+      return { due: false, summariesEnabled: false, candidates: 0, claimed: 0, inFlight: 0, released: 0, failed: 0 };
     }
     lastRunAt = checkedAt.getTime();
 
     const experimental = await instanceSettingsService(db).getExperimental();
     if (experimental.enableSummaries !== true) {
-      return { due: true, summariesEnabled: false, candidates: 0, claimed: 0, inFlight: 0, failed: 0 };
+      return { due: true, summariesEnabled: false, candidates: 0, claimed: 0, inFlight: 0, released: 0, failed: 0 };
     }
 
     const result: SummarySlotRefreshSweepResult = {
@@ -200,6 +244,7 @@ export function createSummarySlotRefreshSweepService(
       candidates: 0,
       claimed: 0,
       inFlight: 0,
+      released: 0,
       failed: 0,
     };
 
@@ -214,6 +259,10 @@ export function createSummarySlotRefreshSweepService(
         status: summarySlots.status,
         generatingIssueId: summarySlots.generatingIssueId,
         updatedAt: summarySlots.updatedAt,
+        wroteSurvivingRevision: sql<boolean>`${generationWroteSlotSql(
+          summarySlots.companyId,
+          summarySlots.generatingIssueId,
+        )}`,
       })
       .from(summarySlots)
       .where(
@@ -274,11 +323,14 @@ export function createSummarySlotRefreshSweepService(
 
     /**
      * Decides whether a `generating` candidate is wedged behind a
-     * non-progressing generation issue (SUP-15764). Two independent rules,
-     * either of which marks the slot for re-claim:
+     * non-progressing generation issue (SUP-15764). Independent rules, any of
+     * which marks the slot for re-claim:
      *   - the generation issue is `blocked` and has an active recovery action
      *     in status `escalated` — definitively parked on a human, so it will
      *     never progress on its own; or
+     *   - the generation issue is `blocked` at all (SUP-22977) — a parked
+     *     generation holds the claim hostage with the same effect, whether or
+     *     not an escalation trail exists; or
      *   - the generation has made no progress for the bounded `wedgedMs`
      *     window. Progress is measured off the linked issue's `updatedAt` (the
      *     issue is what is actually doing the work), NOT the slot row's
@@ -328,6 +380,15 @@ export function createSummarySlotRefreshSweepService(
         if (escalated) {
           return { wedged: true, reason: "blocked_escalated_recovery", supersededIssueId, observedUpdatedAt };
         }
+        // SUP-22977: a generation issue parked `blocked` WITHOUT an escalated
+        // recovery action is just as parked — nothing progresses it but a human
+        // (or the assignee unblocking it), and while it holds the claim the
+        // sweep can neither mint the next generation nor let the slot serve a
+        // fresher one. The escalated check above only distinguished the reason
+        // for telemetry; both branches reclaim the slot. A parked generation
+        // that later resumes and writes fails closed against the slot's write
+        // identity guard (the claim was superseded), so releasing here is safe.
+        return { wedged: true, reason: "blocked_generation_parked", supersededIssueId, observedUpdatedAt };
       }
 
       // Rule 2: no progress for the bounded window, clocked off the linked
@@ -338,6 +399,75 @@ export function createSummarySlotRefreshSweepService(
         return { wedged: true, reason: "generating_age_exceeded", supersededIssueId, observedUpdatedAt };
       }
       return { wedged: false, reason: null, supersededIssueId, observedUpdatedAt };
+    }
+
+    /**
+     * Releases a generation binding whose deliverable already landed
+     * (SUP-23039). Discovery projected `wroteSurvivingRevision` (the
+     * generation-identity chain: slot document -> latest revision -> writing
+     * run's context snapshot issue id), and the linked generation issue is
+     * non-terminal with no live run and no active/escalated recovery action —
+     * the same guards as the read-path reclaim. Such a generation is COMPLETE:
+     * the slot's surviving revision was written by this generation's run, and
+     * no close form is required to prove it (a `record_only` generation card
+     * can never emit one). Pre-SUP-23039, the wedged classification treated a
+     * parked written generation like any other parked claim and re-minted a
+     * fresh generation every sweep, burning a summarizer run per hour against
+     * an already-written deliverable and parking a new un-closable
+     * `record_only` card each time.
+     *
+     * The release reuses `releaseSummarySlotBinding` so the idle/failed
+     * decision is the same shared identity predicate the terminal finalizer
+     * and the read-path reclaim use (written -> `idle`). The write is
+     * compare-and-set (still `generating` behind this exact issue), so a slot
+     * already released or re-claimed in a race matches 0 rows and the newer
+     * state is never clobbered. Returns true when the release write was issued
+     * (the caller must skip `generate` for that slot this tick).
+     */
+    async function releaseWrittenGenerationDeliverable(
+      candidate: SummarySlotRefreshCandidate,
+    ): Promise<boolean> {
+      if (!candidate.wroteSurvivingRevision || !candidate.generatingIssueId) return false;
+      const issue = await db
+        .select({
+          status: issues.status,
+          executionRunId: issues.executionRunId,
+          checkoutRunId: issues.checkoutRunId,
+        })
+        .from(issues)
+        .where(and(eq(issues.id, candidate.generatingIssueId), eq(issues.companyId, candidate.companyId)))
+        .then((rows) => rows[0] ?? null);
+      // A terminal issue is owned by the terminal-transition finalizer / the
+      // read-path reclaim; a live run means the generation is still working and
+      // may still be finishing.
+      if (
+        !issue ||
+        TERMINAL_ISSUE_STATUSES.has(issue.status) ||
+        issue.executionRunId ||
+        issue.checkoutRunId
+      ) {
+        return false;
+      }
+      // An active or escalated recovery action owns the issue's next step —
+      // the same statuses `getActiveForIssue` treats as in-flight (ADR-093 D2).
+      const activeRecovery = await db
+        .select({ id: issueRecoveryActions.id })
+        .from(issueRecoveryActions)
+        .where(
+          and(
+            eq(issueRecoveryActions.companyId, candidate.companyId),
+            eq(issueRecoveryActions.sourceIssueId, candidate.generatingIssueId),
+            inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          ),
+        )
+        .then((rows) => rows.length > 0);
+      if (activeRecovery) return false;
+      await releaseSummarySlotBinding(
+        db,
+        { id: candidate.generatingIssueId, companyId: candidate.companyId },
+        "Summary generation task stopped before writing a summary.",
+      );
+      return true;
     }
 
     /**
@@ -470,6 +600,18 @@ export function createSummarySlotRefreshSweepService(
         // linked issue advanced since classification it aborts, the slot stays
         // `generating`, and the `generate` below dedupes to in-flight.
         if (candidate.status === "generating") {
+          // SUP-23039: a generation whose deliverable already landed and whose
+          // run is dead is complete — release the binding to `idle` and skip
+          // the wedged classification / re-mint entirely. While the generation
+          // is still working (live run) or a recovery ladder owns it, this
+          // returns false and the classification below proceeds unchanged.
+          if (candidate.wroteSurvivingRevision) {
+            const released = await releaseWrittenGenerationDeliverable(candidate);
+            if (released) {
+              result.released += 1;
+              continue;
+            }
+          }
           const verdict = await classifyGeneratingCandidate(candidate, checkedAt);
           if (verdict.wedged && verdict.reason) {
             clearIssued = await clearStaleGenerationLink(candidate, checkedAt, verdict.observedUpdatedAt);
@@ -497,9 +639,23 @@ export function createSummarySlotRefreshSweepService(
           // Summarizer is never told to claim it. A rejected re-wake throws into
           // the catch below and counts `failed`, so the slot is retried, not
           // stranded.
-          await fireWakeFor(res.generatingIssue, summarySlotRefreshTaskKey(candidate));
+          //
+          // SUP-22977: skip the re-wake when THIS generation issue already wrote
+          // the slot's surviving revision. The wake re-runs the assignee, and a
+          // completed write re-fired hourly just burns summarizer runs against a
+          // generation whose deliverable already landed (observed live: three
+          // wakes for one written revision while the served header froze). The
+          // written check is identity-based (slot document -> latest revision ->
+          // creating run's context snapshot issue id), computed in the discovery
+          // SELECT; a revision landing between discovery and here misses the
+          // guard once and is caught on the next tick, and a missing/unknown
+          // link fails open to the pre-existing re-wake behavior.
+          if (!candidate.wroteSurvivingRevision) {
+            await fireWakeFor(res.generatingIssue, summarySlotRefreshTaskKey(candidate));
+          }
           // In-flight only when the re-wake was delivered (or no dispatcher is
-          // configured); a rejected re-wake lands in the catch -> `failed`.
+          // configured, or the wake was skipped because the generation already
+          // wrote the slot); a rejected re-wake lands in the catch -> `failed`.
           result.inFlight += 1;
           continue;
         }

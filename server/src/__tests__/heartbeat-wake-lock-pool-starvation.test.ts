@@ -143,6 +143,8 @@ describe("wake admission never needs a second pool connection (SUP-17978)", () =
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let setupDb: ReturnType<typeof createDb>;
   const cleanups: Array<() => Promise<void>> = [];
+  // Sequential, not random: 21 `RES`-prefixed seeds in a 4-hex space collided (companies_issue_prefix_idx).
+  let issuePrefixSeq = 0;
 
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase("paperclip-wake-lock-pool-");
@@ -166,7 +168,7 @@ describe("wake admission never needs a second pool connection (SUP-17978)", () =
     await setupDb.insert(companies).values({
       id: companyId,
       name: `Pool ${label}`,
-      issuePrefix: `P${label.slice(0, 3).toUpperCase()}${randomUUID().slice(0, 4).toUpperCase()}`,
+      issuePrefix: `P${String(++issuePrefixSeq).padStart(6, "0")}`,
       status: "active",
       defaultResponsibleUserId: "responsible-user",
     });

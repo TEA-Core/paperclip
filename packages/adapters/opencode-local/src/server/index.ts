@@ -73,3 +73,14 @@ export {
   verifyOpenCodeCliVersion,
 } from "./models.js";
 export { parseOpenCodeJsonl, isOpenCodeUnknownSessionError } from "./parse.js";
+export {
+  OPENCODE_MCP_READY_DEADLINE_MS,
+  OPENCODE_MCP_QUIESCENCE_MS,
+  OpenCodeMcpReadinessError,
+  waitForOpenCodeMcpReady,
+} from "./mcp-readiness-gate.js";
+export type {
+  OpenCodeMcpReadinessFailureReason,
+  OpenCodeMcpReadyInput,
+  OpenCodeMcpReadyResult,
+} from "./mcp-readiness-gate.js";

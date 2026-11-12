@@ -91,8 +91,47 @@ An external review service can also be a valid review path when the issue keeps 
 Each `executionPolicy.stages` entry may set `phase` to `pre_merge` (the default)
 or `post_merge`. The `paperclip/approved` stamp requires all pre-merge stages to
 be completed and the last recorded decision to be approved; a pending post-merge
-stage does not delay that stamp. Stage order and issue completion are unchanged:
-the review workflow still waits for post-merge stages before closing `done`.
+stage does not delay that stamp. The review workflow follows stage order and
+waits for post-merge stages before closing `done`.
+
+For a native completion review addressed to an agent, the server saves the review
+card and a durable reviewer wake in the same transaction. The reviewer can act
+on the child task even when its own parent task waits for that child. The child
+keeps its worker assignee and the parent keeps its dependency. The review run
+can read the submitted work and accept or reject its assigned card. It cannot
+use that role to change ordinary task assignments or dependencies.
+
+Accepting the last required native completion review marks the child Done and
+makes its dependents eligible to continue. Rejection returns the requested
+changes to the worker. A review run that ends without a decision cannot mark
+the child Done. It retains the review and records a bounded recovery action.
+See [native status arbitration](architecture/native-status-arbitration.md#agent-review-handoff)
+for the authorization checks and completion-report rules.
+
+The parent receives recent child review decisions in its continuation evidence
+and through `get_task_context`. Each record names the child, decision, reviewer,
+and review run. The server reads these records from saved review state; it does
+not depend on the parent session remembering a separate review session. These
+records are evidence and do not grant permission to resolve another review.
+
+### Answered Slack conversations
+
+A successful Slack turn with a published final reply and no remaining execution
+or decision path settles to `chat_conversations.state = waiting` and issue
+`in_review`. This is a server-owned passive conversation state, displayed as
+**Idle**, not a request for review. It is excluded from execution counts, work
+queues, and generic review attention, while remaining accessible through
+Conversations, search, recent history, and unread activity.
+
+An admitted Slack or board message clears waiting and returns the issue to
+`todo` in the message transaction; normal wake admission and checkout resume
+execution. Settlement rechecks the
+latest run, message cursor, publication receipt, and outstanding work under the
+task lock. Failed delivery, a newer message, queued work, monitors, dependencies,
+and pending decisions prevent settlement. Reconciliation applies the same rule
+to existing answered threads without another model invocation. Slack identity,
+permissions, and the ability to execute work in the same thread are unchanged.
+Other providers keep their existing lifecycle.
 
 ### `done`
 
@@ -137,7 +176,7 @@ These are related but not identical:
 - `checkoutRunId` answers who currently owns execution rights for the issue
 - `executionRunId` answers which run is actually live right now
 
-Paperclip already clears stale execution locks and can adopt some stale checkout locks when the original run is gone.
+Paperclip clears stale execution locks and can adopt some stale checkout locks when the original run is gone.
 
 The active-lock lifecycle is part of the checkout contract:
 
@@ -146,9 +185,51 @@ The active-lock lifecycle is part of the checkout contract:
 - finalization must not clear a lock already reacquired by a successor run
 - process-loss retry handoff must not leave `checkoutRunId` pinned to the failed run when `executionRunId` moves to the retry run
 - checkout and checkout-owner checks may self-heal lock columns that point at terminal or missing runs before evaluating conflicts
+- checkout and checkout-owner adoption check the same-company execution, checkout and legacy `contextSnapshot.issueId` bindings; another queued, running or scheduled-retry run returns `409`, even when the caller has no run ID or issue context
+- the own-run exemption uses the exact run ID, not the agent ID; status and assignment checks still apply, a running owner takes precedence over an older queued reservation, and an acting run must belong to the issue company
+- the holder check, ownership change and execution stamp use one transaction and keep the issue row locked until commit
+- queued issue-ownership claims fence a different running holder under that same row lock and commit their execution stamp with the transition to `running`; a queued reservation is not already executing, and non-assignee visitor or mention runs do not acquire issue ownership
+- external self-declared run creation also checks and stamps under one issue lock; a live checkout or legacy-context holder refuses creation even when `executionRunId` is clear
 - the recovery sweeper may clear rows whose checkout and execution locks all point at terminal or missing runs
 
 Stale-lock recovery is crash recovery, not a retry loop. Paperclip must not clear or adopt locks held by non-terminal runs. After stale cleanup, a checkout `409` should mean a real live owner, status/assignee mismatch, unresolved blocker, or active gate still prevents checkout. Agents must treat that `409` as an ownership conflict and stop rather than retrying the same checkout.
+
+A non-final workflow handoff may change the assignee while its issuing run is
+still running. Only an issuer whose run context names this issue is exempt from
+its own handoff PATCH's cancellation. For any other issuer, the handoff is saved
+first and cancellation is then attempted only for a run the route's existing
+lookup finds: the execution-lock holder or the assignee's issue-scoped active
+run. The route does not cancel an issuer that this lookup cannot find.
+A cancellation attempt can throw or leave the run running. The handoff stays
+saved; the route logs a warning and a `heartbeat.cancel_failed` activity. A
+terminal approval keeps the confirmed stop before the write: an unconfirmed stop
+returns `409 runner_goal_reassignment_stop_unconfirmed` and saves nothing.
+
+Under the issue row lock, a non-terminal assignee change retains a running
+holder identified by the issue's existing execution or checkout binding. It
+clears checkout permission but preserves execution admission across the saved
+update, a delayed cancellation and a failed cancellation. A request header alone
+grants neither cancellation nor a hold. If only a legacy issue-context binding
+remains, admission recovers it by company and issue, not by the new assignee.
+
+While that issuer runs, the successor stays `deferred_issue_execution`. After
+the issuer stops, `releaseIssueExecutionAndPromote` compare-and-clears only this
+run's actual bindings and promotes their existing deferred intents, including
+bindings outside the run's context issue. It does not clear a different run's
+lock or create automatic recovery for a sibling issue. Existing task, chat,
+comment-disposal and no-replay gates still apply. Recovery and missing-comment
+retry producers retain valid queued intent behind a different running holder;
+a former assignee cannot use a comment retry or a sibling binding to reclaim
+the next stage.
+
+The existing `reapOrphanedRuns` sweep can also finalize a lost run after its
+process-liveness and controller-ownership checks allow recovery. It marks that
+orphan failed and uses the same release/promotion path unless a process-loss
+retry takes over. It skips tracked live executions, live child processes and
+native runs whose ownership is unverified. It is not a forced-stop timeout for
+an issuer that stays active forever. A cancellation attempt alone never
+authorizes release: execution must have stopped. Without a saved binding or
+matching issue context, Paperclip does not infer an issuer hold from a request header.
 
 ### Known execution waits at admission
 
@@ -334,6 +415,12 @@ The valid action-path primitives are:
 - a first-class blocker chain whose unresolved leaf issues are themselves healthy
 - an open explicit recovery action that names the owner and action needed to restore liveness
 
+A bounded review-path recovery for a task from a supported external-chat
+provider retains the source run's admitted message IDs. It does not inherit checkout or authorization
+markers. Before dispatch, Paperclip verifies the recovery run's task ownership
+and current conversation, endpoint, and principal access for every message.
+Missing message references or revoked access still prevent execution.
+
 ### Durable external waits and heartbeat finalization
 
 An external wait counts as a live or waiting path only when the next move survives the current heartbeat and is represented in Paperclip's durable control-plane state. Valid external-wait shapes are:
@@ -376,6 +463,10 @@ Document-scoped activity may still route work when it is converted into an expli
 
 Freeform document approval text is not auto-acceptance. Plan approval, implementation approval, or review acceptance must flow through the explicit interaction, approval, execution-policy, assignment, or blocker primitives that define who owns the next move.
 
+An interaction can be created by a run on another task in the same company, or by a run with no task. That run records the interaction's origin; its comments and results do not become context for the target task. Explicit resume and retry history takes precedence and must belong to the target task.
+
+New interactions exclude known comments from other tasks when recording their origins. At dispatch, older interactions may discard a copied origin only when both the producer's saved context and a comment on that producer's other task prove where it came from. Missing records, cross-company references, explicit wake comments, and unrelated origins still fail closed.
+
 ### Comment interrupts and ownership handoffs
 
 A board comment can be an interrupt, an ownership change, both, or neither. Paperclip must keep those concepts separate in the product contract.
@@ -390,7 +481,7 @@ An ownership change selects who owns the issue after the comment is committed:
 - setting `assigneeUserId`, or clearing `assigneeAgentId`, makes the issue human-owned or unassigned
 - leaving assignee fields unchanged preserves the current owner
 
-A wake is the delivery path for a selected agent owner. If an interrupting update also assigns a non-terminal, non-backlog issue to an agent, Paperclip should enqueue one wake for the new assignee and include the interrupting comment and interrupted run id in the wake payload/context when available. Stale scheduled retries for the previous owner must not run after ownership changes away from that owner.
+A wake is the delivery path for a selected agent owner. If an interrupting update also assigns a non-terminal, non-backlog issue to an agent, Paperclip should enqueue one wake for the new assignee and include the interrupting comment and interrupted run id in the wake payload/context when available. Stale scheduled retries for the previous owner must not run after ownership changes away from that owner. The one exception is a queued native-review run for the reviewer participant: while its native-review assignment is still valid (and no other run has already claimed it), the queued-run staleness gate does not cancel it as `issue_assignee_changed`, so it reaches the native-review claim. An invalid assignment is still cancelled as `issue_assignee_changed`; a duplicate is cancelled as `native_review_assignment_already_claimed`.
 
 If the committed update assigns the issue to a user, clears the agent assignee, or leaves the issue without an agent owner, Paperclip must not imply that an agent handoff happened. The issue is then waiting on the human owner or on a future explicit assignment, blocker, approval, interaction, monitor, or recovery action.
 
@@ -616,18 +707,179 @@ A `blocked` issue is stalled when the unresolved blocker leaf has no active run,
 
 ## 9. Crash and Restart Recovery
 
-Paperclip now treats crash/restart recovery as a stranded-assigned-work problem, not just a stranded-run problem.
+Paperclip treats crash/restart recovery as a stranded-assigned-work problem, not just a stranded-run problem.
 
 The HTTP listener binds before startup recovery so surviving runners can
-reconnect. Recovery-action reconciliation logs and skips an individual failed
-action, allowing the other actions and startup to continue. A fatal startup
-failure after binding instead closes the HTTP listener before ending database
+reconnect. Inside the wrapped startup sweeps below, a per-card failure of any
+error class except a lost database connection is logged and that card is
+skipped. That includes assignee-review refusals and non-connection database
+failures (constraint, check, deadlock). The helper rethrows a lost database
+connection (`CONNECTION_CLOSED`, `CONNECTION_ENDED`, `CONNECTION_DESTROYED`,
+anywhere on the error `cause` chain). For the wrapped sweeps other than the
+host-restart strand sweep, that rethrow fails startup.
+`server/src/index.ts` catches every error from `sweepHostRestartStrandedIssues`,
+including a lost connection. It logs `startup host-restart strand sweep failed`
+and does not rethrow. Later startup steps still run. If those later steps
+succeed, startup can finish after that sweep fails. The log carries
+the issue identifier, the sweep name, and the error class and message. Writes
+made earlier in the same iteration (recovery action, comment, wake) may
+already have persisted. The sweep continues with the remaining cards so
+startup can finish and the listener stays open.
+
+The Wiki handoff guard runs on any issue write that is not purely status and
+blocker bookkeeping. `assigneeUserId` is guarded, the same as
+`assigneeAgentId`. The guard is skipped only when every present key is in this
+allow-list: `status`, `blockedByIssueIds`, `lastStatusDecisionId`,
+`unblockDescriptor`, `companyGuard`. A status-only or blocker-only park still
+passes, and so does the native policy-review cleanup, which writes `status`,
+`lastStatusDecisionId` and `unblockDescriptor` together. Any other key,
+including `priority`, `labelIds`, `hiddenAt`, `parentId`, `billingCode`,
+`requestDepth`, `statusVersion`, and the monitor columns, runs the guard. The
+monitor re-arm paths always send `executionPolicy` with the monitor columns, and
+the native status-decision commits send `statusVersion` with
+`actorAgentId` and `actorUserId` (null values still count as present keys), so
+those keys never form a write on their own and are not allow-listed. Known
+consequence: an exhausted non-canonical Wiki handoff card gets no monitor, and
+the sweep logs one error per tick. The recovery-issue fallback runs when the
+monitor arm returns null. It does not run after a successful arm. A thrown
+guard error stops the card before that fallback, so the card also gets no
+recovery issue. The same monitor refusal holds for a non-canonical Wiki handoff
+card that is `in_progress`, or `in_review` with an invokable participant, whose
+latest run failed on provider quota. That card gets no monitor and no board
+item. If every other present key is allowed bookkeeping, an explicit
+`executionPolicy: undefined` is dropped from the present-key check. The guard
+is skipped, while policy normalization writes `null`.
+
+The boundary is the write path. Per-card isolation is required for every
+startup sweep that writes issue rows through the guarded issue service
+(`issueService.update`), because the Wiki handoff guard and the other assignee
+and review gates can refuse that write. Steps that only write run, wake or
+session rows, or that clear raw lock columns (`executionRunId`,
+`executionAgentNameKey`, `executionLockedAt`, `checkoutRunId`) with direct
+drizzle updates inside a per-run loop, stay fail-fast on purpose: those loops
+are not the guarded issue-service path. A failure there, including a database
+failure, still stops startup.
+
+Each card's repair is processed inside the shared `runRecoverySweepIssue` helper
+in these startup sweeps. For `sweepHostRestartStrandedIssues`, the sweep gathers
+facts for each candidate before it enters the helper. A non-connection error in
+that phase aborts the sweep, and later cards are not processed. Per-card
+isolation applies only to the wrapped repair phase.
+The helper accepts only the names in `RECOVERY_SWEEP_NAMES`
+(`server/src/lib/recovery-sweep-isolation.ts`), so a call site with an
+unregistered name fails typecheck, and the sweep isolation table test runs an
+injected-failure case per registered name, with the failing card in both
+iteration positions, and checks that the sweep's effect landed on the other
+card and not on the refused one. Each line says how the card body
+reaches `issueService.update`, the guarded path:
+
+- `reconcileStrandedAssignedIssues`: `blockIssueWithUnresolvedBlockers`,
+  `escalateStrandedAssignedIssue`, `repairNativeBlockedWait`,
+  `resolveContinuationWaitingOnReview` and
+  `scheduleProviderQuotaRecoveryMonitor` all call it.
+- Unassigned blocking issues (`reconcileUnassignedBlockingIssues`): the
+  reassignment calls `issueService(txDb).update` with `assigneeAgentId`.
+- `reconcileStillbornAssignedBacklog`: `escalateStrandedAssignedIssue` calls it.
+- `reconcileBlockedWithoutBlockers` (also run through
+  `reconcileIssueGraphLiveness`): the heal and `armExhaustedBoardMonitor` call it.
+- `reconcileDispatchSuppressionParks`, park write only: it calls
+  `issuesSvc.update(id, { status: "blocked" })`.
+- `reconcileTodoStrandedCards`: it calls `issuesSvc.update(id, { status: "blocked" })`.
+- `reconcileExhaustedRecoveryDrain`: `armExhaustedBoardMonitor` calls it with the
+  monitor columns and `executionPolicy`.
+- `reconcileStaleRecoveryActionWakes`: its wake path writes only recovery-action
+  and wake rows, but an action at its attempt ceiling goes through
+  `escalateExhaustedRecoveryAction`, which reaches it through
+  `armExhaustedBoardMonitor`.
+- `sweepHostRestartStrandedIssues`: the escalation calls it through
+  `blockIssueWithUnresolvedBlockers`. The re-arm repair is a direct drizzle
+  update. Fact gathering runs before the helper. A non-connection error there
+  aborts the sweep. Isolation covers only the wrapped repair.
+- `reconcileTaskWatchdogs`: `evaluateWatchdog` reaches
+  `ensureReusableWatchdogIssue`, which reopens the watchdog issue with
+  `issuesSvc.update`.
+- `sweepStaleIssueLocks`, the per-card lock clear only: it does not call it. It
+  clears raw lock columns with a direct drizzle update. It stays wrapped as a
+  recorded decision, not because of the boundary above.
+
+Active recovery-action reconciliation (`reconcileActiveRecoveryActions`)
+isolates each action with its own `try`/`catch`; it logs and skips the action
+and does not rethrow a lost database connection.
+
+These startup steps are knowingly left fail-fast. A failure in one of them
+fails startup:
+
+- `scanTerminableSilentActiveRuns` (`terminateSilentActiveRun`), per run: in one
+  transaction marks the run `failed`, fails its wake request, clears the
+  execution lock columns on `issues` with a direct drizzle update, and inserts a
+  watchdog decision row; then appends a run event and an activity row. It does
+  not call `issueService.update`.
+- `scanSilentActiveRuns` (`foldSourceResolvedRun`), per run: in one transaction
+  finalizes the run and its wake request, clears the source issue's execution
+  lock columns with a direct drizzle update, resolves the watchdog recovery
+  action, and inserts a watchdog decision row. For an open evaluation issue it
+  also calls `issuesSvc.update(id, { status: "done" })` and adds a comment. That
+  patch carries only `status`, an allow-listed key, so the Wiki handoff guard
+  does not run, and the assignee review-stage gate (it runs only when the patch
+  has `assigneeAgentId`) is not reached. It is not wrapped, and it runs inside
+  the fold's open transaction.
+- `promoteDueScheduledRetries`, per due retry run: promotes the run to `queued`
+  or cancels a suppressed retry, updates the wake request, and clears the
+  execution lock columns on `issues` with a direct drizzle update. No
+  `issueService.update`.
+- `resumeQueuedRuns`: touches `agent_wakeup_requests`, delivers saved queued
+  comments and releases execution through `releaseIssueExecutionAndPromote` (each
+  call carries its own `.catch` that logs), cancels stale queued runs
+  (`cancelStaleQueuedRun` also clears `executionRunId` and `checkoutRunId` on
+  `issues` with direct drizzle updates), and starts the next queued run per
+  agent. The step's own writes make no `issueService.update` call.
+- `recoverPendingSessionGoalActions`, per pending goal action:
+  `failRunnerGoalAction` on the session-goal action row (its error is swallowed)
+  and `enqueueWakeup` for wake and run rows.
+- `recoverActiveSessionGoals`, per active goal session: `enqueueWakeup` for wake
+  and run rows.
+- The run terminalization pre-pass of `sweepStaleIssueLocks`
+  (`terminalizeOrphanedRunningRun`), per referenced run: updates the
+  `heartbeat_runs` row and appends a run event.
+- `clearStaleRecoveryReplayHolds`, per resolved recovery action, at the tail of
+  `reconcileStrandedAssignedIssues`: rewrites `evidence` on the
+  `issue_recovery_actions` row with a direct drizzle update. It writes no issue
+  row.
+- `reconcileDeferredWakeupReplay`, per deferred wake: a compare-and-swap on the
+  `agent_wakeup_requests` row, then `enqueueWakeup`, whose throw is already caught
+  per wake and counted as `reDriveFailed`. No `issueService.update`.
+- `reconcileUnfinalizableWorkspaceBarriers`, per blocker: report-only; writes
+  one activity-log row. No `issueService.update`.
+- `detectStaleIssueMonitors`, per stale monitor: one select and one activity-log
+  insert. No `issueService.update`.
+- `reconcileResolvedDependencyWakeBackstop`, per candidate: `enqueueWakeup` and
+  an activity-log row. Its enqueue throw is already caught per card and counted
+  as `enqueueFailed`. No `issueService.update`.
+- `reconcilePendingReviewRearm`, per candidate: a recovery-action upsert,
+  `enqueueWakeup` and an activity-log row. Its enqueue throw is already caught
+  per card. No `issueService.update`.
+- `reconcileDispatchSuppressionParks`, park resolution: resolves the recovery
+  action and writes an activity-log row. No `issueService.update`.
+- `ingestStaleInReviewChildIssues`, per stale child: a system comment, a direct
+  drizzle update of `hiddenAt` and an archive row. No `issueService.update`.
+- `reconcileCancelledOnlyBlockerDependents` (action resolution and detection):
+  recovery-action rows and detection activity rows. No `issueService.update`.
+- `reconcileUndispatchableAssignedIssues` (action resolution and escalation):
+  recovery-action rows and activity rows. No `issueService.update`.
+- `sweepCompletedRunStrandedIssues`, per escalation: a system comment through
+  `addComment`, which does not call `issueService.update`.
+- Native-runner restart recovery fails closed by design and rethrows.
+  Hot-restart adoption, the orphaned-run reap and the abandoned run scratch sweep
+  are each caught as a whole by the caller, so startup continues after them.
+
+A failure that escapes a sweep, or any other fatal startup
+failure after binding, closes the HTTP listener before ending database
 clients: a rejected `startServer()` must not leave a port accepting requests
-against a closed pool. The failure is logged and rethrown. When the server runs
+against a closed pool. That failure is logged and rethrown. When the server runs
 as the main module, the entrypoint reports eligible failures to Sentry and exits
-nonzero so the supervisor restarts it. Embedding callers such as the CLI receive
-the rejection with no leaked listener and decide how to recover; the server does
-not hard-kill them.
+nonzero so the supervisor restarts it. Embedding callers such as the CLI
+receive the rejection with no leaked listener and decide how to recover; the
+server does not hard-kill them.
 
 There are two distinct failure modes.
 
@@ -833,7 +1085,7 @@ Verification and escalation semantics:
 - attempt lineage is durable watchdog state: attempt number, the fingerprint each attempt claimed to fix, and the restoration actions taken
 - after N attempts (N = 2–3) on the same fingerprint lineage, the platform stops re-firing and escalates to a human — the watchdog owner or a board notification — carrying the attempt history
 
-This bounds both failure modes: a failed restoration retries instead of going silent (liveness), and the attempt bound plus human escalation prevents an infinite fire loop (no runaway watchdog). Legitimate stops still suppress exactly as before.
+This bounds both failure modes: a failed restoration retries instead of going silent (liveness), and the attempt bound plus human escalation prevents an infinite fire loop (no runaway watchdog). A reviewed legitimate stop suppresses re-firing for its recorded fingerprint.
 
 Task watchdogs must not silently mark source work done from prose comments, must not duplicate child trees for the same accepted plan revision, and must not create another task-watchdog issue for the same source issue.
 
@@ -1050,7 +1302,6 @@ runners. A stop receipt retires only the settled cleanup owner for that exact co
 Missing receipts and failed cleanup retain the hold. Older providers that return
 no receipt remain supported but cannot authorize remote continuation. A terminal
 database status or a PID check on the wrong host is insufficient.
-No historical task is automatically awakened by this change.
 
 Startup waits for provider plugin initialization before remote recovery and
 lease cleanup. The task's blocked notice offers Retry, and a refused retry
@@ -1125,6 +1376,15 @@ runtime selection checks that fence, the running status, and the current startup
 controller lease in the same transaction that creates the native coordinator.
 The native executor rechecks cancellation and terminal status when claiming the
 coordinator, before starting or attaching a provider.
+
+Run-only Stop also covers the interval after the coordinator claim and before
+the provider session publishes its handle. Stop retains its pending audited
+intent and waits up to 30 seconds for that startup to settle. A published
+session receives cancellation before prompt submission; only real dispatch
+sets `dispatched: true`. A deadline leaves the intent pending and the late
+session remains fenced and is closed. Stop acknowledgement alone does not
+certify cleanup: the existing process and environment receipts still govern
+admission of the next message.
 
 A cancelled startup can continue from a newer authenticated user message after
 cleanup. The server requires either its explicit before-selection fence or an
@@ -1245,6 +1505,21 @@ session. A staged provider package is reused only after the complete expected
 manifest and artifact hashes verify. A missing, changed, or incompatible package
 must be replaced and verified before launch.
 
+Warm attachment requires two consecutive authenticated readiness snapshots.
+Blocked readiness probes back off within the reconnect deadline so they do not
+fill the durable command journal while waiting. The fast ready path keeps its
+short second barrier. If readiness never arrives, attachment fails closed with
+the last observed blocker; a full journal is not a substitute for that diagnosis.
+Both native providers publish this readiness contract. ACPX reports its durable
+session identity, active turn, pending audit events, closed state, and unproven
+provider exit as blockers. Explicit readiness probes let the durable runner
+commit and acknowledge retained events under the old run authority; snapshotting
+alone never discards them. ACPX checkpoints its process during the subsequent
+attachment before resuming the same provider session under the new run.
+During an in-place handoff, the ACPX descriptor binds to the validated next run
+while event correlation stays on the old run until durable authority activation.
+A changed session identity or a descriptor that names any other run is rejected.
+
 Safe native replacement may clear a Blocked status only with a durable receipt
 that the same failed run projected that exact status version. Explicitly
 reasserting Blocked or changing its blockers advances the status version, even
@@ -1344,3 +1619,72 @@ permission again or copy Connect / Not now into a generic question. A generic
 question does not start setup. The real connection card keeps user identity,
 access grants, the decision, and continuation together. This guidance does not
 approve a connection or bypass its normal user decision.
+
+## Responses submitted during an active run
+
+A confirmation, checkbox confirmation, or question answer is new conversation
+input. Resolving the card records the decision immediately; it does not implicitly
+interrupt or steer an agent that is doing work. Its typed continuation wake waits
+behind the issue's active execution and appears in the message queue.
+
+The queue projects the original resolved interaction as an immutable response.
+It keeps the selected answers and accepted document revision; it does not create
+an editable comment that could silently change what was approved. Ordinary
+messages retain their existing edit, discard, and reorder behavior.
+
+- Normal run completion promotes the saved response once. The restart scan also
+  finds stranded interaction receipts after the issue execution lock is released.
+- **Steer** explicitly delivers the saved response to a compatible native turn.
+  The acknowledgement consumes the receipt, so a retry cannot create a second
+  delivery. It retains the existing run's execution identity.
+- **Interrupt** stops a legacy turn and starts a continuation with the typed
+  response. Native plan approvals that require a fresh session use Interrupt too;
+  steering cannot turn a planning session into an execution session. Existing
+  process-stop, environment-cleanup, ownership, and recovery gates still apply.
+- If the provider is blocked on the original native question request, answering
+  resolves that tool request directly. It must not wait behind the blocked turn.
+
+An agent may finish its review handoff after the user has already answered its
+card. A resolved card from that same source run, or its queued continuation, is a
+valid live path. A stale agent handback to a human cannot cancel the run and orphan
+a queued response. This does not make an old resolved card a review path for a
+later run, or prevent an explicit board reassignment.
+
+### Persistent sandbox cleanup
+
+A lost bridge cannot indefinitely prevent Daytona termination. Ordinary lease release
+and destruction wait briefly for bridge activity, then call the provider for the exact
+recorded sandbox. Drain timeout is not a stop receipt. Reusable sandboxes prefer
+stop; failed stop falls back to deletion. Stop/delete transport hangs are bounded
+and leave cleanup pending unless the provider confirms termination.
+
+The pending-cleanup sweep retains a durable attempt identity and a 15-minute
+in-flight deadline. It retries after restart, waits at least 30 seconds between
+failed attempts, and slows to 30 minutes after five failures. It reports that
+operator attention is needed at that threshold, while automatic cleanup continues.
+Provider outages never convert a live sandbox into an abandoned manual task.
+Explicit Retry can skip the cooldown after a failed cleanup, but cannot take over
+a live cleanup attempt. Active startup cancellation still stops the sandbox first.
+
+A live cleanup attempt renews its durable claim every 30 seconds. Another sweep in the same controller cannot overlap it, even if the deadline passes. Completion writes require the current attempt identity. After controller loss, cleanup can repeat destruction of the exact quarantined provider resource; providers must make that operation idempotent. A timeout or claim expiry does not prove termination.
+
+Renewal updates only the ownership deadline, never the retry cooldown. Cleanup
+does not await an outstanding renewal; a stalled database response cannot retain
+process-local cleanup ownership. Late responses still require the same active
+attempt, and completed attempts use only the persisted retry cooldown.
+
+
+### Follow-up completion instructions
+
+Generated native completion contracts interpret pending comments within the current
+task brief, assigned-skill instructions, and approval gates. Later human direction
+replaces conflicting scope; clarification alone does not approve execution. A
+wake from a server-verified human card response references that entry in
+`humanResponses`, whose answer is already present in the current request context.
+Agent/tool outcomes and generated summaries are not promoted to human direction.
+
+These are model instructions, not additional execution or permission gates.
+Contracts reference the existing brief and answers instead of copying them again.
+Resumed sessions keep the existing message-delta path; fresh sessions receive the
+full covered history. Stable wording and bounded references avoid adding another
+full brief on each comment, but provider cache hits must be measured separately.

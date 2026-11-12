@@ -46,8 +46,8 @@ import {
   renderTemplate,
   renderPaperclipWakePrompt,
   selectPaperclipTaskMarkdown,
+  selectInitialCommunicationGuidance,
   isPaperclipRecoveryWakePayload,
-  stringifyPaperclipWakePayloadForEnv,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   isPaperclipSkillSourceMissing,
@@ -69,6 +69,14 @@ import {
   parseOpenCodeJsonl,
 } from "./parse.js";
 import {
+  OPENCODE_MCP_QUIESCENCE_MS,
+  OPENCODE_MCP_READY_DEADLINE_MS,
+} from "./mcp-readiness-gate.js";
+import {
+  buildOpenCodeServeArgs,
+  runOpenCodeServeProcess,
+} from "./serve-transport.js";
+import {
   ensureOpenCodeModelConfiguredAndAvailable,
   isTruthyEnvFlag,
   verifyOpenCodeCliVersion,
@@ -77,10 +85,12 @@ import {
 } from "./models.js";
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
 import {
+  createOpenCodeV2SessionByteMeasurer,
   describeOpenCodeDatabaseGrowthSpare,
   describeOpenCodeDatabaseGrowthTrip,
   formatBytes,
   readOpenCodeSessionIdFromChunk,
+  readOpenCodeV2SessionState,
   resolveOpenCodeDatabaseGrowthLimitBytes,
   resolveOpenCodeDatabasePath,
   resolveOpenCodeDatabasePollIntervalMs,
@@ -319,6 +329,17 @@ export function resolveOpenCodeDatabaseFile(input: {
   return `${OPENCODE_DB_AGENT_PREFIX}${agentId.replace(/[^a-zA-Z0-9._-]/g, "-")}.db`;
 }
 
+function describeOpenCodeDatabaseNotAdapterResolved(input: {
+  env: Record<string, string>;
+  executionTargetIsRemote: boolean;
+}): string {
+  if (input.executionTargetIsRemote) return "remote execution target";
+  if (isTruthyEnvFlag(input.env.PAPERCLIP_OPENCODE_SHARED_DB ?? process.env.PAPERCLIP_OPENCODE_SHARED_DB)) {
+    return "shared database (PAPERCLIP_OPENCODE_SHARED_DB)";
+  }
+  return "explicit OPENCODE_DB";
+}
+
 function parseModelProvider(model: string | null): string | null {
   if (!model) return null;
   const trimmed = model.trim();
@@ -517,6 +538,7 @@ export type OpenCodeSessionResumeDecision =
       sessionId: string | null;
       reason:
         | "no_session"
+        | "session_missing"
         | "unknown_cwd"
         | "cwd_mismatch"
         | "execution_target_mismatch"
@@ -649,7 +671,8 @@ export function resolveOpenCodeSessionResume(input: {
   executionTargetMatches: boolean;
   /**
    * Measured bytes of the session's replayed transcript (see
-   * measureOpenCodeSessionTranscriptBytes). null/undefined = not measured, which
+   * measureOpenCodeSessionTranscriptBytes, or readOpenCodeV2SessionState on a V2
+   * database). null/undefined = not measured, which
    * skips the size gate so the session behaves exactly as it did before this
    * change.
    */
@@ -659,12 +682,20 @@ export function resolveOpenCodeSessionResume(input: {
    * to DEFAULT_OPENCODE_SESSION_RESUME_MAX_BYTES when omitted.
    */
   maxSessionTranscriptBytes?: number;
+  /**
+   * False when a V2 database was read successfully and holds no such session.
+   * undefined = not checked (V1, or the read failed), which skips the gate.
+   */
+  sessionExists?: boolean;
 }): OpenCodeSessionResumeDecision {
   if (input.sessionId.length === 0) {
     return { resume: false, sessionId: null, reason: "no_session" };
   }
   if (!input.executionTargetMatches) {
     return { resume: false, sessionId: input.sessionId, reason: "execution_target_mismatch" };
+  }
+  if (input.sessionExists === false) {
+    return { resume: false, sessionId: input.sessionId, reason: "session_missing" };
   }
   if (input.sessionCwd.length === 0) {
     return { resume: false, sessionId: input.sessionId, reason: "unknown_cwd" };
@@ -854,7 +885,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
-  const wakePayloadJson = stringifyPaperclipWakePayloadForEnv(context.paperclipWake);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
   const issueIdentifier = readPaperclipIssueIdentifierFromContext(context);
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
@@ -867,7 +897,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   refreshPaperclipWorkspaceEnvForExecution({
     env,
     envConfig,
@@ -1189,12 +1218,36 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // preserving the previous resume behaviour.
     const sessionResumeMaxBytes = resolveOpenCodeSessionResumeMaxBytes({ env: runtimeEnv });
     let sessionTranscriptBytes: number | null = null;
+    let sessionExists: boolean | undefined;
+    let resumeSessionCwd = runtimeSessionCwd;
+    if (openCodeV2 && (!openCodeDatabaseFile || executionTargetIsRemote)) {
+      await onLog(
+        "stderr",
+        `[paperclip] WARNING: OpenCode V2 database file is not adapter-resolved (${describeOpenCodeDatabaseNotAdapterResolved({ env, executionTargetIsRemote })}). The V2 session is resumed WITHOUT the existence check, WITHOUT the resume size cap and WITHOUT the growth guard.\n`,
+      );
+    }
     if (runtimeSessionId && openCodeDatabaseFile && !executionTargetIsRemote) {
       const sessionTranscriptDbPath = resolveOpenCodeDatabasePath({
         databaseFile: openCodeDatabaseFile,
         env: runtimeEnv,
       });
-      if (sessionTranscriptDbPath) {
+      if (sessionTranscriptDbPath && openCodeV2) {
+        // SUP-19141: a V2 database has no V1 `part`/`message` rows, so the V1
+        // measure would return null and skip the size gate without a word.
+        const v2State = await readOpenCodeV2SessionState(sessionTranscriptDbPath, runtimeSessionId);
+        if (v2State.ok) {
+          sessionTranscriptBytes = v2State.state.transcriptBytes;
+          sessionExists = v2State.state.exists;
+          // The database records the directory the session is rooted at; prefer
+          // it to the copy carried in saved session params.
+          if (v2State.state.cwd) resumeSessionCwd = v2State.state.cwd;
+        } else {
+          await onLog(
+            "stderr",
+            `[paperclip] WARNING: OpenCode V2 session state unavailable for "${runtimeSessionId}" at ${sessionTranscriptDbPath}: ${v2State.error}. The session is resumed WITHOUT the resume size cap and WITHOUT the session-existence check.\n`,
+          );
+        }
+      } else if (sessionTranscriptDbPath) {
         sessionTranscriptBytes = await measureOpenCodeSessionTranscriptBytes(
           sessionTranscriptDbPath,
           runtimeSessionId,
@@ -1203,16 +1256,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     const resumeDecision = resolveOpenCodeSessionResume({
       sessionId: runtimeSessionId,
-      sessionCwd: runtimeSessionCwd,
+      sessionCwd: resumeSessionCwd,
       executionCwd: effectiveExecutionCwd,
       executionTargetMatches: adapterExecutionTargetSessionMatches(
         runtimeRemoteExecution,
         runtimeExecutionTarget,
       ),
+      sessionExists,
       sessionTranscriptBytes,
       maxSessionTranscriptBytes: sessionResumeMaxBytes,
     });
     const sessionId = resumeDecision.resume ? resumeDecision.sessionId : null;
+    if (!resumeDecision.resume && resumeDecision.reason === "session_missing") {
+      await onLog(
+        "stdout",
+        `[paperclip] OpenCode V2 session "${runtimeSessionId}" is absent from its database and will not be resumed. Starting a fresh session.\n`,
+      );
+    }
     if (!resumeDecision.resume && resumeDecision.reason === "execution_target_mismatch") {
       await onLog(
         "stdout",
@@ -1226,7 +1286,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     } else if (!resumeDecision.resume && resumeDecision.reason === "cwd_mismatch") {
       await onLog(
         "stdout",
-        `[paperclip] OpenCode session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
+        `[paperclip] OpenCode session "${runtimeSessionId}" was saved for cwd "${resumeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
       );
     } else if (!resumeDecision.resume && resumeDecision.reason === "session_too_large") {
       // SUP-14964: make the size-based fresh-session start observable in the run
@@ -1297,7 +1357,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
         : "";
     const taskContextNote = context.conversationMode === true
-      ? selectPaperclipTaskMarkdown(context, { resumedSession: Boolean(sessionId) })
+      ? selectPaperclipTaskMarkdown(context, { resumedSession: Boolean(sessionId), includeCommunicationGuidance: false })
       : "";
     const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
       conversationMode: context.conversationMode === true,
@@ -1313,7 +1373,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timeoutSec,
       Number(deadlineEnv.PAPERCLIP_RUN_DEADLINE_EPOCH ?? 0),
     );
-    const prompt = joinPromptSections([
+    const basePrompt = joinPromptSections([
       instructionsPrefix,
       renderedBootstrapPrompt,
       deadlineNotice,
@@ -1323,7 +1383,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       renderedPrompt,
     ]);
     const promptMetrics = {
-      promptChars: prompt.length,
+      promptChars: basePrompt.length,
       instructionsChars: instructionsPrefix.length,
       deadlineNoticeChars: deadlineNotice.length,
       bootstrapPromptChars: renderedBootstrapPrompt.length,
@@ -1378,18 +1438,65 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         autoApprovePermissions: asBoolean(config.dangerouslySkipPermissions, true),
       });
 
+    // Local V2 runs go through `opencode serve` so the adapter can wait for its
+    // injected MCP servers before the first prompt (see serve-transport.ts).
+    // Remote targets cannot reach a loopback server, and explicit extraArgs are
+    // `opencode run` flags, so both keep the one-shot `run` path.
+    const oneShotReason = !openCodeV2
+      ? null
+      : executionTargetIsRemote
+        ? "the execution target is remote"
+        : extraArgs.length > 0
+          ? asStringArray(config.extraArgs).length > 0
+            ? "extraArgs are configured"
+            : "args are configured"
+          : null;
+    const useServeTransport = openCodeV2 && oneShotReason === null;
+    if (useServeTransport) {
+      commandNotes.push(
+        `Running OpenCode V2 through a private \`opencode serve\` (loopback, per-run port and password); ` +
+          (runtimeMcpServers.length > 0
+            ? `the first prompt waits for ${runtimeMcpServers.length} injected MCP server(s) to report connected and remain quiet for ` +
+              `${OPENCODE_MCP_QUIESCENCE_MS}ms (fails after ${OPENCODE_MCP_READY_DEADLINE_MS / 1000}s).`
+            : `no MCP server was injected, so the first prompt does not wait.`),
+      );
+      if (printLogs) {
+        const warning =
+          "PAPERCLIP_OPENCODE_PRINT_LOGS is not applied on the serve path (opencode serve rejects --standalone, " +
+          "so --print-logs cannot be passed); OpenCode's own logs stay in its log file.";
+        commandNotes.push(warning);
+        await onLog("stdout", `[paperclip] Warning: ${warning}\n`);
+      }
+    } else if (oneShotReason) {
+      const warning =
+        `OpenCode V2 is using the one-shot \`opencode run\` path because ${oneShotReason}; ` +
+        `Paperclip-named MCP tools may be missing from the first request (upstream anomalyco/opencode#60893).`;
+      commandNotes.push(warning);
+      await onLog("stdout", `[paperclip] Warning: ${warning}\n`);
+    }
+
     const runAttempt = async (resumeSessionId: string | null) => {
-      const args = buildArgs(resumeSessionId);
+      const prompt = joinPromptSections([
+        selectInitialCommunicationGuidance(context, { resumedSession: Boolean(resumeSessionId) }),
+        basePrompt,
+      ]);
+      const args = useServeTransport ? buildOpenCodeServeArgs() : buildArgs(resumeSessionId);
       if (onMeta) {
         await onMeta({
           adapterType: "opencode_local",
           command: resolvedCommand,
           cwd: effectiveExecutionCwd,
           commandNotes,
-          commandArgs: [...args, `<stdin prompt ${prompt.length} chars>`],
+          commandArgs: useServeTransport
+            ? [
+                ...args,
+                ...(resumeSessionId ? [`<resume session ${resumeSessionId}>`] : []),
+                `<api prompt ${prompt.length} chars>`,
+              ]
+            : [...args, `<stdin prompt ${prompt.length} chars>`],
           env: loggedEnv,
           prompt,
-          promptMetrics,
+          promptMetrics: { ...promptMetrics, promptChars: prompt.length },
           context,
         });
       }
@@ -1427,6 +1534,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             limitBytes: databaseGuardLimitBytes,
             pollIntervalMs: databaseGuardPollIntervalMs,
             sessionId: resumeSessionId,
+            // SUP-19141: a V2 database keeps a session in session_v2/session_message;
+            // the default measurer reads V1 tables and would attribute nothing.
+            measureSessionBytes: openCodeV2
+              ? createOpenCodeV2SessionByteMeasurer((message) => {
+                  void onLog("stderr", `[paperclip] ${message}\n`);
+                })
+              : undefined,
             onSpare: (spare) => {
               void onLog("stdout", `[paperclip] ${describeOpenCodeDatabaseGrowthSpare(spare)}\n`);
             },
@@ -1447,18 +1561,34 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : null;
 
       try {
-        const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
-          cwd,
-          env: preparedRuntimeConfig.env,
-          stdin: prompt,
-          timeoutSec,
-          graceSec,
-          onSpawn,
-          onRuntimeProgress: ctx.onRuntimeProgress,
-          onLog: earlyAbortOnLog,
-          runLogTail: paperclipBridge?.runLogTail,
-          settleRunDisposition: paperclipBridge?.settleRunDisposition,
-        });
+        const proc = useServeTransport
+          ? await runOpenCodeServeProcess({
+              runId,
+              command,
+              cwd,
+              env: preparedRuntimeConfig.env,
+              timeoutSec,
+              graceSec,
+              prompt,
+              model,
+              variant,
+              resumeSessionId,
+              mcpServers: runtimeMcpServers.map((server) => ({ name: server.name, token: server.token })),
+              onSpawn,
+              onLog: earlyAbortOnLog,
+            })
+          : await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
+              cwd,
+              env: preparedRuntimeConfig.env,
+              stdin: prompt,
+              timeoutSec,
+              graceSec,
+              onSpawn,
+              onRuntimeProgress: ctx.onRuntimeProgress,
+              onLog: earlyAbortOnLog,
+              runLogTail: paperclipBridge?.runLogTail,
+              settleRunDisposition: paperclipBridge?.settleRunDisposition,
+            });
         return {
           proc,
           rawStderr: proc.stderr,

@@ -3,7 +3,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   deriveViteHmrPort,
@@ -31,24 +31,27 @@ const HANDLE = "handle-abcdef1234567890";
 // The shared test setup pins the automatic default off so unrelated suites do
 // not probe for a real host broker. This suite is about the default, so it opts
 // back in and restores the harness value afterwards.
-let previousHttpsMode: string | undefined;
-beforeEach(() => {
-  previousHttpsMode = process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
-  process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS = "auto";
+beforeEach(async () => {
+  vi.stubEnv("PAPERCLIP_MANAGED_RUNTIME_HTTPS", "auto");
+  // Registry records and append-only logs must not share a developer's instance
+  // or a previous test's service identity.
+  vi.stubEnv("PAPERCLIP_HOME", await fs.mkdtemp(path.join(guestDir, "home-")));
 });
 
 afterEach(async () => {
-  if (previousHttpsMode === undefined) delete process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS;
-  else process.env.PAPERCLIP_MANAGED_RUNTIME_HTTPS = previousHttpsMode;
   // These tests spawn real loopback backends on dedicated-range ports; reap them
   // rather than leaving one squatting 42xxx/52xxx for every test in the file.
-  await resetRuntimeServicesForTests({ terminateProcesses: true });
+  try {
+    await resetRuntimeServicesForTests({ terminateProcesses: true });
+  } finally {
+    vi.unstubAllEnvs();
+  }
 });
 
 function serviceCommand() {
   // Answers `/api/health` the way a real Paperclip dev runtime does: managed
   // publication requires semantic health, not just a 200 (PAP-17572).
-  return `node -e 'const http=require("http");const p=Number(process.env.PORT);for(const q of [p,p+10000].filter(q=>q<65536))http.createServer((rq,r)=>{if(rq.url==="/api/health"){r.setHeader("content-type","application/json");r.end(JSON.stringify({status:"ok"}));return}r.statusCode=200;r.end("ok")}).listen(q,"127.0.0.1");setInterval(()=>{},1000)'`;
+  return `node -e 'console.log("fixture started",process.pid,Date.now());const http=require("http");const p=Number(process.env.PORT);for(const q of [p,p+10000].filter(q=>q<65536))http.createServer((rq,r)=>{if(rq.url==="/api/health"){r.setHeader("content-type","application/json");r.end(JSON.stringify({status:"ok"}));return}r.statusCode=200;r.end("ok")}).listen(q,"127.0.0.1",()=>console.log("fixture listening",q,Date.now()));setInterval(()=>{},1000)'`;
 }
 
 /**
@@ -124,6 +127,27 @@ setInterval(() => {}, 1000);
 `;
 
 /**
+ * A guest with no `--bind` argv whose bind mode comes from the environment,
+ * the way the real checkout resolves it through config precedence:
+ * `PAPERCLIP_BIND` first, then the config file, then `HOST` (SUP-22143). It
+ * records the spawn env it saw next to itself, so the tests can assert what
+ * the control plane actually passed rather than trusting the start to succeed.
+ */
+const ENV_BIND_GUEST = `
+import http from "node:http";
+import { writeFileSync } from "node:fs";
+const p = Number(process.env.PORT);
+writeFileSync(new URL("./env-probe.json", import.meta.url), JSON.stringify({
+  host: process.env.HOST ?? null,
+  bind: process.env.PAPERCLIP_BIND ?? null,
+  bindHost: process.env.PAPERCLIP_BIND_HOST ?? null,
+}));
+const health = (rq, r) => { if (rq.url === "/api/health") { r.setHeader("content-type","application/json"); r.end(JSON.stringify({status:"ok"})); return true; } return false; };
+http.createServer((rq, r) => { if (health(rq, r)) return; r.statusCode = 200; r.end("ok"); }).listen(p, "127.0.0.1");
+setInterval(() => {}, 1000);
+`;
+
+/**
  * A guest that prints a synthetic `EADDRINUSE` line for its assigned port with no
  * host listener behind it, then exits. It models guest-controlled output that
  * claims a collision the host cannot confirm. The runtime must not quarantine the
@@ -146,9 +170,9 @@ if (p === ${assignedPort}) {
   process.stderr.write("node:events:497\\nError: listen EADDRINUSE: address already in use 127.0.0.1:" + p + "\\n");
   process.exit(1);
 }
-const health = (rq, r) => { if (rq.url === "/api/health") { r.setHeader("content-type", "application/json"); r.end(JSON.stringify({ status: "ok" })); return true; } return false; };
+const answerHealth = (rq, r) => { if (rq.url === "/api/health") { r.setHeader("content-type", "application/json"); r.end(JSON.stringify({ status: "ok" })); return true; } return false; };
 for (const q of [p, p + 10000]) {
-  http.createServer((rq, r) => { if (health(rq, r)) return; r.statusCode = 200; r.end("ok"); }).listen(q, "127.0.0.1");
+  http.createServer((rq, r) => { if (answerHealth(rq, r)) return; r.statusCode = 200; r.end("ok"); }).listen(q, "127.0.0.1");
 }
 setInterval(() => {}, 1000);
 `;
@@ -189,6 +213,7 @@ beforeAll(async () => {
   await fs.writeFile(path.join(guestDir, "dev-runner.mjs"), PRE_MANAGED_EXPOSURE_GUEST);
   await fs.writeFile(path.join(guestDir, "dev-runner-legacy.mjs"), ALWAYS_WILDCARD_GUEST);
   await fs.writeFile(path.join(guestDir, "dev-runner-wildcard-hmr.mjs"), WILDCARD_HMR_GUEST);
+  await fs.writeFile(path.join(guestDir, "dev-runner-env-probe.mjs"), ENV_BIND_GUEST);
   await fs.writeFile(
     path.join(guestDir, "dev-runner-bind-conflict.mjs"),
     'process.stderr.write("local_trusted requires server.bind=loopback\\n"); process.exit(1);\n',
@@ -294,15 +319,17 @@ async function findFreeExposureAppPort(startAt: number): Promise<number> {
  * collision still occurs the scan falls through to the next free pair instead
  * of racing another shard on the same deterministic start.
  */
-async function pickCollisionSafeExposureAppPort(): Promise<number> {
-  const range = RUNTIME_EXPOSURE_APP_PORT_MAX - RUNTIME_EXPOSURE_APP_PORT_MIN + 1;
-  const start = RUNTIME_EXPOSURE_APP_PORT_MIN + Math.floor(Math.random() * range);
+async function pickCollisionSafeExposureAppPort(
+  minAppPort: number = RUNTIME_EXPOSURE_APP_PORT_MIN,
+): Promise<number> {
+  const range = RUNTIME_EXPOSURE_APP_PORT_MAX - minAppPort + 1;
+  const start = minAppPort + Math.floor(Math.random() * range);
   for (let appPort = start; appPort <= RUNTIME_EXPOSURE_APP_PORT_MAX; appPort += 1) {
     if (await isLoopbackPortFree(appPort) && await isLoopbackPortFree(deriveViteHmrPort(appPort))) {
       return appPort;
     }
   }
-  for (let appPort = RUNTIME_EXPOSURE_APP_PORT_MIN; appPort < start; appPort += 1) {
+  for (let appPort = minAppPort; appPort < start; appPort += 1) {
     if (await isLoopbackPortFree(appPort) && await isLoopbackPortFree(deriveViteHmrPort(appPort))) {
       return appPort;
     }
@@ -397,7 +424,24 @@ function startInput(options?: {
 describe("workspace runtime tailscale_https lifecycle", () => {
   it("reserves before spawn, exposes after backend readiness, and removes on stop", async () => {
     const { broker, calls } = createBroker();
-    installDeps({ broker });
+    let reservedPorts: number[] = [];
+    installDeps({
+      broker: {
+        ...broker,
+        async reserve(runtimeId, listeners) {
+          reservedPorts = listeners.map((listener) => listener.port);
+          for (const port of reservedPorts) expect(await isLoopbackPortFree(port)).toBe(true);
+          return broker.reserve(runtimeId, listeners);
+        },
+        async expose(...args) {
+          for (const port of reservedPorts) {
+            const response = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(5_000) });
+            expect(await response.text()).toBe("ok");
+          }
+          return broker.expose(...args);
+        },
+      },
+    });
 
     const [runtime] = await startRuntimeServicesForWorkspaceControl(startInput());
     expect(calls.slice(0, 2)).toEqual(["reserve", "expose"]);
@@ -410,6 +454,7 @@ describe("workspace runtime tailscale_https lifecycle", () => {
       runtimeServiceId: runtime.id,
     });
     expect(calls).toEqual(["reserve", "expose", "remove"]);
+    for (const port of reservedPorts) expect(await isLoopbackPortFree(port)).toBe(true);
   }, 15_000);
 
   it("fails closed and removes the mapping when external HTTPS validation fails", async () => {
@@ -734,6 +779,92 @@ describe("loopback bind is forced on the guest, not merely requested (PAP-17256)
   }, 20_000);
 });
 
+/**
+ * SUP-22143: the deployed regression. On a broker-less host (auto mode,
+ * `isBrokerAvailable()` false) exposure resolves null, and the loopback bind
+ * env used to be set only inside the exposure branch. The spawned guest then
+ * inherited the control-plane container's `HOST=0.0.0.0`, outranked its config
+ * file's `server.host`, resolved `bind=lan`, and a `local_trusted` guest exited
+ * with `local_trusted requires server.bind=loopback` on every start.
+ */
+describe("loopback bind env is forced even when HTTPS exposure is unavailable (SUP-22143)", () => {
+  const probePath = () => path.join(guestDir, "env-probe.json");
+
+  async function readGuestEnvProbe(): Promise<{ host: string | null; bind: string | null; bindHost: string | null }> {
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      try {
+        return JSON.parse(await fs.readFile(probePath(), "utf8")) as {
+          host: string | null;
+          bind: string | null;
+          bindHost: string | null;
+        };
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+    throw new Error("guest env probe was never written");
+  }
+
+  it("forces the loopback bind env on a paperclip-dev service when exposure resolves null", async () => {
+    const { broker, calls } = createBroker();
+    // The broker-less host shape: auto mode with no broker socket.
+    installDeps({ broker, isBrokerAvailable: async () => false });
+
+    // The control-plane container exports HOST=0.0.0.0; the child used to
+    // inherit it verbatim through the sanitized base env.
+    const previousHost = process.env.HOST;
+    process.env.HOST = "0.0.0.0";
+    try {
+      await fs.rm(probePath(), { force: true });
+      const [runtime] = await startRuntimeServicesForWorkspaceControl(startInput({
+        serviceName: "paperclip-dev",
+        command: guestCommand("dev-runner-env-probe.mjs"),
+        expose: LEGACY_HTTP_EXPOSE,
+        port: { type: "auto", envKey: "PORT" },
+      }));
+
+      // The start really took the no-exposure path.
+      expect(calls).toEqual([]);
+      expect(runtime.exposure ?? null).toBeNull();
+
+      const probe = await readGuestEnvProbe();
+      expect(probe.host).toBe("127.0.0.1");
+      expect(probe.bind).toBe("loopback");
+      expect(probe.bindHost).toBe("127.0.0.1");
+    } finally {
+      if (previousHost === undefined) delete process.env.HOST;
+      else process.env.HOST = previousHost;
+    }
+  }, 20_000);
+
+  it("leaves a non-Paperclip service's bind env untouched on the same broker-less host", async () => {
+    const { broker, calls } = createBroker();
+    installDeps({ broker, isBrokerAvailable: async () => false });
+
+    const previousHost = process.env.HOST;
+    process.env.HOST = "0.0.0.0";
+    try {
+      await fs.rm(probePath(), { force: true });
+      const [runtime] = await startRuntimeServicesForWorkspaceControl(startInput({
+        serviceName: "preview",
+        command: guestCommand("dev-runner-env-probe.mjs"),
+        expose: LEGACY_HTTP_EXPOSE,
+        port: { type: "auto", envKey: "PORT" },
+      }));
+
+      expect(calls).toEqual([]);
+      expect(runtime.exposure ?? null).toBeNull();
+
+      const probe = await readGuestEnvProbe();
+      expect(probe.bind).toBeNull();
+      expect(probe.bindHost).toBeNull();
+    } finally {
+      if (previousHost === undefined) delete process.env.HOST;
+      else process.env.HOST = previousHost;
+    }
+  }, 20_000);
+});
+
 describe("readiness probes loopback for an exposed runtime (PAP-17256)", () => {
   it("starts even when the only readiness target is the MagicDNS display URL", async () => {
     // The live project config declares a loopback readiness URL, but when it does
@@ -788,7 +919,7 @@ describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256
   }, 20_000);
 });
 
-describe("recovers when a guest loses its assigned exposure port during startup (PAP-17256)", () => {
+describe.each([false, true])("guest exposure-port collision reporting (base pair occupied: %s)", (basePairOccupied) => {
   // The quarantine decision itself is unit-tested through
   // `classifyExposureHostCollisions` below. A deterministic end-to-end quarantine
   // test is not reachable here: a real host listener that holds the assigned port
@@ -804,13 +935,20 @@ describe("recovers when a guest loses its assigned exposure port during startup 
         return broker.reserve(runtimeId, requested);
       },
     };
-    installDeps({ broker: recordingBroker });
+    installDeps({
+      broker: recordingBroker,
+      isPortAvailable: (port) => basePairOccupied &&
+        [RUNTIME_EXPOSURE_APP_PORT_MIN, deriveViteHmrPort(RUNTIME_EXPOSURE_APP_PORT_MIN)].includes(port)
+        ? Promise.resolve(false) : isLoopbackPortFree(port),
+    });
 
     // Pin a collision-safe app port the same way the rest of the suite does, and
     // write the synthetic guest with that exact port so its guard fires when the
     // runtime hands it that port. A hard-coded `42000` guard is what made this test
     // flake whenever the allocator relocated to a free pair.
-    const port = await pickCollisionSafeExposureAppPort();
+    // Upstream's base-pair-occupied variant makes the base pair unavailable, so a
+    // pinned port must sit above it for the allocator to keep it.
+    const port = await pickCollisionSafeExposureAppPort(RUNTIME_EXPOSURE_APP_PORT_MIN + (basePairOccupied ? 1 : 0));
     await fs.writeFile(
       path.join(guestDir, "dev-runner-eaddrinuse-synthetic.mjs"),
       makeSyntheticAssignedPortEaddrinuseGuest(port),
@@ -854,12 +992,17 @@ describe("recovers when a guest loses its assigned exposure port during startup 
         return broker.reserve(runtimeId, requested);
       },
     };
-    installDeps({ broker: recordingBroker });
+    installDeps({
+      broker: recordingBroker,
+      isPortAvailable: (port) => basePairOccupied &&
+        [RUNTIME_EXPOSURE_APP_PORT_MIN, deriveViteHmrPort(RUNTIME_EXPOSURE_APP_PORT_MIN)].includes(port)
+        ? Promise.resolve(false) : isLoopbackPortFree(port),
+    });
 
     // Pin a collision-safe app port rather than betting the assertion on 42000
     // staying free. The auxiliary guest fails on a fixed unrelated port (39999),
     // so only the assigned app port is host-dependent here.
-    const port = await pickCollisionSafeExposureAppPort();
+    const port = await pickCollisionSafeExposureAppPort(RUNTIME_EXPOSURE_APP_PORT_MIN + (basePairOccupied ? 1 : 0));
 
     const logs: string[] = [];
     const error = await startRuntimeServicesForWorkspaceControl({
@@ -897,13 +1040,18 @@ describe("recovers when a guest loses its assigned exposure port during startup 
         return broker.reserve(runtimeId, requested);
       },
     };
-    installDeps({ broker: recordingBroker });
+    installDeps({
+      broker: recordingBroker,
+      isPortAvailable: (port) => basePairOccupied &&
+        [RUNTIME_EXPOSURE_APP_PORT_MIN, deriveViteHmrPort(RUNTIME_EXPOSURE_APP_PORT_MIN)].includes(port)
+        ? Promise.resolve(false) : isLoopbackPortFree(port),
+    });
 
     // Pin a collision-safe app port so the assertion does not bet on 42000 staying
     // free. The mixed guest names its assigned port on a benign line and the
     // auxiliary port 39999 on the EADDRINUSE line, so only the assigned app port
     // is host-dependent.
-    const port = await pickCollisionSafeExposureAppPort();
+    const port = await pickCollisionSafeExposureAppPort(RUNTIME_EXPOSURE_APP_PORT_MIN + (basePairOccupied ? 1 : 0));
 
     const logs: string[] = [];
     const error = await startRuntimeServicesForWorkspaceControl({

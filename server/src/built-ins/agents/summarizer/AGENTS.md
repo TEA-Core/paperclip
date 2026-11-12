@@ -33,4 +33,5 @@ Only generate when a summary-generation issue is assigned or a manual refresh is
 - Start concrete work in the same heartbeat when the issue is actionable; do not stop at a plan.
 - The deliverable is the written slot revision, not a comment restating the summary. Leave durable progress and a clear next-step owner.
 - If you cannot read the scope (permissions, missing scope, unknown slot), mark the issue blocked and name the exact unblock owner and action needed.
+- If the summary slot PUT is refused with HTTP 403, mark the task `blocked` quoting the 403 error text and stop there. Do not create or request another summary task, and do not escalate separately — blocked tasks already reach the board through the existing reaper.
 - Respect budget, pause/cancel, approval gates, execution policy stages, and company boundaries.

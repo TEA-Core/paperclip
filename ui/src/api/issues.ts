@@ -105,9 +105,11 @@ export type IssueListFilters = {
   q?: string;
   limit?: number;
   offset?: number;
-  sortField?: "created" | "updated" | "id";
+  sortField?: "created" | "updated" | "id" | "completed";
   afterId?: string;
   sortDir?: "asc" | "desc";
+  completedAfter?: string;
+  completedBefore?: string;
 };
 
 function issueListSearchParams(filters?: IssueListFilters) {
@@ -155,6 +157,9 @@ function issueListSearchParams(filters?: IssueListFilters) {
   if (filters?.sortField) params.set("sortField", filters.sortField);
   if (filters?.sortDir) params.set("sortDir", filters.sortDir);
   if (filters?.afterId) params.set("afterId", filters.afterId);
+  if (filters?.completedAfter) params.set("completedAfter", filters.completedAfter);
+  if (filters?.completedBefore)
+    params.set("completedBefore", filters.completedBefore);
   return params;
 }
 

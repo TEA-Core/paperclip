@@ -7,6 +7,7 @@ import {
   createAcceptedPlanDecompositionSchema,
   createChildIssueSchema,
   createIssueSchema,
+  doneTierDeclarationSchema,
   issueBlockedInboxAttentionSchema,
   issueExecutionMonitorPolicySchema,
   issueExecutionPolicySchema,
@@ -23,6 +24,19 @@ import {
 import { createAgentSchema } from "./agent.js";
 
 describe("issue validators", () => {
+  it("accepts a strict no-repository Tier 1 landing declaration", () => {
+    const declaration = {
+      tier: "tier1" as const,
+      reason: "No repository artifact was produced",
+      landing: { mode: "noRepositoryLanding" as const },
+    };
+    expect(doneTierDeclarationSchema.parse(declaration)).toEqual(declaration);
+    expect(doneTierDeclarationSchema.safeParse({
+      ...declaration,
+      landing: { mode: "noRepositoryLanding", mergeCommit: "a".repeat(40) },
+    }).success).toBe(false);
+  });
+
   it("uses the same bounded unique upload ID contract for comment and update requests", () => {
     const id = "9af8228f-0be7-45ae-a104-6fbe0af6f1d3";
     expect(
@@ -119,6 +133,29 @@ describe("issue validators", () => {
     expect(
       updateIssueSchema.parse({ comment: undefined }).comment,
     ).toBeUndefined();
+  });
+
+  it("accepts the structured no-repository Tier 1 declaration and rejects variants carrying evidence", () => {
+    const declaration = {
+      tier: "tier1",
+      reason: "The deliverable is the recorded entry ruling",
+      landing: { mode: "noRepositoryLanding" },
+    };
+    expect(doneTierDeclarationSchema.safeParse(declaration).success).toBe(true);
+    expect(doneTierDeclarationSchema.safeParse({
+      ...declaration,
+      landing: { mode: "noRepositoryLanding", mergeCommit: "3f9c1e0a25b8" },
+    }).success).toBe(false);
+    expect(doneTierDeclarationSchema.safeParse({ tier: "tier1", reason: declaration.reason }).success).toBe(false);
+  });
+
+  it.each([
+    ["constructor inside landing", '{"tier":"tier1","reason":"r","landing":{"mode":"noRepositoryLanding","constructor":{"x":1}}}'],
+    ["prototype inside landing", '{"tier":"tier1","reason":"r","landing":{"mode":"noRepositoryLanding","prototype":{"x":1}}}'],
+    ["constructor at the top level", '{"tier":"tier1","reason":"r","constructor":{},"landing":{"mode":"noRepositoryLanding"}}'],
+    ["prototype on a Tier 2 declaration", '{"tier":"tier2","probeEvidence":"probe `x` head 3f9c1e0a25b8 post-merge: y","prototype":{}}'],
+  ])("rejects an own %s key as an unknown key, without a dedicated check", (_label, raw) => {
+    expect(doneTierDeclarationSchema.safeParse(JSON.parse(raw)).success).toBe(false);
   });
 
   it("accepts delivery requirements on create and update while rejecting unknown values", () => {

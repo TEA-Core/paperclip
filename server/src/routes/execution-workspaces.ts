@@ -51,8 +51,10 @@ import {
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
 import { logger } from "../middleware/logger.js";
 import {
+  assertNoAgentExecutionWorkspaceIdentityMutation,
   assertNoAgentHostWorkspaceCommandMutation,
   collectExecutionWorkspaceCommandPaths,
+  collectExecutionWorkspaceIdentityPaths,
 } from "./workspace-command-authz.js";
 import { assertCanManageExecutionWorkspaceRuntimeServices } from "./workspace-runtime-service-authz.js";
 import { appendWithCap } from "../adapters/utils.js";
@@ -1159,6 +1161,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         metadata: req.body.metadata,
       }),
     );
+    assertNoAgentExecutionWorkspaceIdentityMutation(req, collectExecutionWorkspaceIdentityPaths(req.body));
     const patch: Record<string, unknown> = {
       ...(req.body.name === undefined ? {} : { name: req.body.name }),
       ...(req.body.cwd === undefined ? {} : { cwd: req.body.cwd }),

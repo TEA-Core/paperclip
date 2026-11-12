@@ -18,6 +18,8 @@ import {
   issueDeliveryReceipts,
   issueLabels,
   issueExecutionDecisions,
+  issueRecoveryActions,
+  issueWorkProducts,
   issues,
   labels,
   projectWorkspaces,
@@ -66,18 +68,30 @@ vi.mock("../services/secrets.js", () => ({
 }));
 
 vi.mock("../services/github-fetch.js", () => ({
-  ghFetch: (url: string, init?: RequestInit) => {
+  ghFetch: async (url: string, init?: RequestInit) => {
     // The arming actuator writes a `paperclip/arm-gate` status around every enable; GitHub accepts it here, apart from each test's own fake.
     if (typeof url === "string" && /\/statuses\//.test(url) && init?.method === "POST" && String(init.body ?? "").includes('"paperclip/arm-gate"')) {
-      return Promise.resolve({ ok: true, status: 201, json: async () => ({ id: 9000 }) } as unknown as Response);
+      return { ok: true, status: 201, json: async () => ({ id: 9000 }) } as unknown as Response;
     }
-    // An arm that names no head reads the PR's live head for the gate; a fake that does not model that read gets one.
-    return Promise.resolve(mockGhFetch(url, init)).catch((error: unknown) => {
+    let mocked: unknown;
+    try {
+      mocked = await mockGhFetch(url, init);
+    } catch (error: unknown) {
       if (typeof url === "string" && /\/pulls\/\d+$/.test(url) && /unmocked|unexpected/i.test(String((error as Error)?.message))) {
         return { ok: true, status: 200, json: async () => ({ head: { sha: "c".repeat(40), ref: "live-head" }, state: "open", draft: false, merged: false }) } as unknown as Response;
       }
       throw error;
-    });
+    }
+    if (mocked !== undefined) {
+      return mocked as Response;
+    }
+    if (typeof url === "string" && /\/commits\//.test(url)) {
+      return { ok: true, status: 200, json: async () => ({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }) } as unknown as Response;
+    }
+    if (typeof url === "string" && /\/pulls\/\d+$/.test(url)) {
+      return { ok: true, status: 200, json: async () => ({ head: { sha: "c".repeat(40), ref: "live-head" }, state: "open", draft: false, merged: false }) } as unknown as Response;
+    }
+    return { ok: true, status: 200, json: async () => ({}) } as unknown as Response;
   },
   gitHubApiBase: (hostname: string) =>
     hostname === "github.com" || hostname === "www.github.com"
@@ -370,6 +384,14 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .update(executionWorkspaces)
       .set({ sourceIssueId: issueId })
       .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    // SUP-21902: recorded delivery merge commit for the Tier 2 origin guard.
+    await db.insert(issueWorkProducts).values({
+      companyId, issueId, type: "pull_request", provider: "github",
+      externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+      reviewState: "none", isPrimary: true, healthStatus: "unknown",
+      metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    });
 
     return { companyId, reviewerAgentId, implementerAgentId, issueId, identifier };
   }
@@ -545,6 +567,14 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .update(executionWorkspaces)
       .set({ sourceIssueId: parentIssueId })
       .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    // SUP-21902: recorded delivery merge commit for the Tier 2 origin guard.
+    await db.insert(issueWorkProducts).values({
+      companyId, issueId: parentIssueId, type: "pull_request", provider: "github",
+      externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+      reviewState: "none", isPrimary: true, healthStatus: "unknown",
+      metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    });
 
     const childIdentifiers: { id: string; identifier: string; excluded: boolean }[] = [];
     const totalChildren = opts.ladderedChildren + opts.excludedChildren;
@@ -669,6 +699,11 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       companyId,
       agentId,
       status: "running",
+      // SUP-23490: the done-tier gate places a record-only observation inside
+      // the closing run's lifetime (startedAt ?? createdAt); a run that closes
+      // its own card has always started, so seed the start before the suites'
+      // fixed probe instants (2026-11-04T09:15:00Z).
+      startedAt: new Date("2026-11-04T09:00:00Z"),
       contextSnapshot: { issueId },
     });
     return runId;
@@ -693,6 +728,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     mockGhFetch.mockImplementation(async (url: string) => {
       if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 3 }), { status: 200 });
       if (url.includes("/pulls?")) return new Response(JSON.stringify([{ merged: false, merged_at: null }]), { status: 200 });
+      if (url.includes("/commits/")) return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
       return new Response(JSON.stringify({}), { status: 404 });
     });
   }
@@ -703,6 +739,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     mockResolveSecretValue.mockResolvedValue("test-token");
     mockGhFetch.mockImplementation(async (url: string) => {
       if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+      if (url.includes("/commits/")) return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
       return new Response(JSON.stringify({}), { status: 404 });
     });
   }
@@ -717,7 +754,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .send({
         status: "done",
         comment:
-          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint and it no longer regresses.",
       });
 
     // The approval arms the merge (armMergeOnApproval); blocking it on the
@@ -778,18 +815,20 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D13185B");
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
 
-    // No credential at all -> the guard skips rather than blocks. Before this fix the
-    // decision path wrote nothing here, which is precisely why approval-closed cards
-    // never appeared in the SUP-13140 census.
-    mockGetByName.mockResolvedValue(null);
-    mockResolveSecretValue.mockResolvedValue(null);
+    // A credential resolves so the SUP-21902 Tier 2 origin predicate can verify the
+    // named probe head, but no remote is modeled beyond the commits API, so the
+    // landed-branch probe stays unverifiable and the guard skips rather than
+    // blocks. Before this fix the decision path wrote nothing here, which is
+    // precisely why approval-closed cards never appeared in the SUP-13140 census.
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
 
     const res = await request(app)
       .patch(`/api/issues/${identifier}`)
       .send({
         status: "done",
         comment:
-          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint and it no longer regresses.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -822,7 +861,10 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.code).toBe("done_transition_missing_tier_declaration");
-    expect(res.body.details.remedy).toContain('"Closed at Tier 2 (live): <probe evidence>"');
+    expect(res.body.details.remedy).toContain('"Closed at Tier 2 (live): probe `<probe command>` head <probe head sha> post-merge: <post-merge predicate>"');
+    // SUP-22801: the repository-delivery remedy stays merge-head-only — the
+    // record-only grammar must not leak into it.
+    expect(String(res.body.details.remedy)).not.toContain("record-only probe");
     expect(await statusOf(issueId)).toBe("in_review");
 
     const rows = await auditRows(companyId, issueId, "issue.done_tier_declaration_skipped");
@@ -833,11 +875,11 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     for (const [suffix, tierLine] of [
       [
         "T2",
-        "Closed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+        "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint and it no longer regresses.",
       ],
       [
         "T1",
-        "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip merge commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa. Liveness unverified.",
+        "Closed at Tier 1 (landed, not liveness-probed): landed-at-tip merge commit 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19. Liveness unverified.",
       ],
     ] as const) {
       const { companyId, reviewerAgentId, issueId, identifier } =
@@ -885,7 +927,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     const res = await request(app)
       .post(`/api/issues/${identifier}/comments`)
       .send({
-        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): reviewer probe verified the patched path on the PR head.",
+        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the patched path on the PR head.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
@@ -895,16 +937,30 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
   it("POST comment: record_only auto-approval closes without repository delivery (SUP-21258)", async () => {
     const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D21258A", { deliveryRequirement: "record_only" });
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
 
     const res = await request(app)
       .post(`/api/issues/${identifier}/comments`)
       .send({
-        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): wiki read-back verified.",
+        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: wiki read-back verified.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(await statusOf(issueId)).toBe("done");
-    expect(mockGhFetch).not.toHaveBeenCalled();
+    // SUP-22541: a record_only close makes exactly two read-only GETs — the
+    // Tier-2 probe-head commits resolution and the live open-PR discovery —
+    // so the strict form is the exact (method, URL) call list in order, not
+    // not-called: any extra call, any non-GET method, any delivery endpoint,
+    // or a missing read fails this assertion.
+    const fetchCalls = mockGhFetch.mock.calls.map(([url, init]) => [
+      String((init as RequestInit | undefined)?.method ?? "GET"),
+      String(url),
+    ]);
+    expect(fetchCalls).toEqual([
+      ["GET", "https://api.github.com/repos/TEA-Core/paperclip/commits/7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19"],
+      ["GET", "https://api.github.com/repos/TEA-Core/paperclip/pulls?state=open&per_page=100"],
+    ]);
   });
 
   it("PATCH: record_only close skips repository delivery; repository_delivery keeps it (SUP-21258)", async () => {
@@ -919,11 +975,306 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
       const res = await request(app)
         .patch(`/api/issues/${identifier}`)
-        .send({ status: "done", comment: "Closed at Tier 2 (live): probe verified." });
+        .send({ status: "done", comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe verified." });
 
       expect(res.status, JSON.stringify(res.body)).toBe(expectedStatus);
       expect(await statusOf(issueId)).toBe(expectedStatus === 200 ? "done" : "in_review");
       if (expectedStatus === 409) expect(res.body.code).toBe("done_transition_missing_delivery");
+    }
+  });
+
+  // SUP-22801: record-only Tier 2 live evidence. A record_only card closes
+  // through the shared done-tier evaluator with a machine-checkable
+  // record-only probe declaration and no merge head, on both terminal doors
+  // (PATCH and review auto-approval comment). Prose-only evidence is refused
+  // naming the accepted form, and a repository_delivery card submitting the
+  // record-only grammar is refused by name.
+  const RECORD_ONLY_EVIDENCE =
+    "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records";
+
+  function mockNoOpenPulls() {
+    mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+    mockResolveSecretValue.mockResolvedValue("test-token");
+    mockGhFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/pulls?")) return new Response(JSON.stringify([]), { status: 200 });
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+  }
+
+  it("PATCH: record_only close with structured record-only Tier 2 evidence needs no merge head (SUP-22801)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D22801A", { deliveryRequirement: "record_only" });
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+    const runId = await seedRun(companyId, reviewerAgentId, issueId);
+    currentActor = agentActor(companyId, reviewerAgentId, runId);
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: "Sweep consumed; closing on live probe evidence.",
+        doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(issueId)).toBe("done");
+    // A record-only close resolves no merge head: any GitHub call this door
+    // makes stays a read-only GET and none touches a delivery commits
+    // endpoint (observed: zero calls on this door).
+    for (const [url, init] of mockGhFetch.mock.calls) {
+      expect(String((init as RequestInit | undefined)?.method ?? "GET")).toBe("GET");
+      expect(String(url)).not.toContain("/commits/");
+    }
+    // SUP-23490: the accepted close emits the machine record (SUP-23366) with
+    // the cited observation AND the closing run identity beside it, so a
+    // restated observation is detectable after the fact from the row alone.
+    const tier2Rows = await vi.waitFor(
+      async () => {
+        const found = await auditRows(companyId, issueId, "issue.done_transition_tier2_close");
+        if (found.length === 0) throw new Error("waiting for tier2 close audit row");
+        return found;
+      },
+      { timeout: 5000 },
+    );
+    expect(tier2Rows).toHaveLength(1);
+    expect(tier2Rows[0]?.details).toMatchObject({
+      observed: "2026-11-04T09:15:00Z",
+      tierForm: "record-only",
+      closingRunId: runId,
+      closingRunStartedAt: "2026-11-04T09:00:00.000Z",
+    });
+  });
+
+  it("PATCH: record_only close citing an observation predating the closing run is refused as a restatement (SUP-23490)", async () => {
+    // The SUP-22817 shape: the closing run started AFTER the cited observation
+    // (here 5 minutes after, matching the real restatement), so the cited
+    // liveness cannot belong to the run that is closing. Negative control for
+    // the lifetime gate: the guard refuses with the restatement reason.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23490A", { deliveryRequirement: "record_only" });
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: reviewerAgentId,
+      status: "running",
+      startedAt: new Date("2026-11-04T09:20:00Z"),
+      contextSnapshot: { issueId },
+    });
+    currentActor = agentActor(companyId, reviewerAgentId, runId);
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: "Closing.",
+        doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(String(res.body.error)).toContain("predates the closing run");
+    expect(String(res.body.error)).toContain(runId);
+    expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("PATCH: without a run id header the issue's own checkout run attributes the close and its lifetime gate fires (SUP-23490)", async () => {
+    // The run id header is optional on agent requests. The cross-issue run
+    // context gate resolves the same fallback (header, else the issue's
+    // checkout run) and would let the write through, while the tier guard used
+    // to receive only the header value — so a header-less close escaped the
+    // lifetime gate entirely. The door now passes the resolved closing run, and
+    // here that checkout run started AFTER the cited observation: refused as a
+    // restatement.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23490C", { deliveryRequirement: "record_only" });
+    const checkoutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId: reviewerAgentId,
+      status: "running",
+      invocationSource: "self_declared",
+      startedAt: new Date("2026-11-04T09:20:00Z"),
+      contextSnapshot: { issueId },
+    });
+    await db.update(issues).set({ executionPolicy: null, executionState: null, checkoutRunId }).where(eq(issues.id, issueId));
+    currentActor = { type: "agent", agentId: reviewerAgentId, companyId, source: "agent_key", runId: undefined };
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: "Closing.",
+        doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(String(res.body.error)).toContain("predates the closing run");
+    expect(String(res.body.error)).toContain(checkoutRunId);
+    expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("POST comment: without a run id header the issue's checkout run attributes the approval close and its lifetime gate fires (SUP-23490)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23490E", { deliveryRequirement: "record_only" });
+    const checkoutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId: reviewerAgentId,
+      status: "running",
+      invocationSource: "self_declared",
+      startedAt: new Date("2026-11-04T09:20:00Z"),
+      contextSnapshot: { issueId },
+    });
+    await db.update(issues).set({ checkoutRunId }).where(eq(issues.id, issueId));
+    currentActor = { type: "agent", agentId: reviewerAgentId, companyId, source: "agent_key", runId: undefined };
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({ body: `## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): ${RECORD_ONLY_EVIDENCE}` });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(String(res.body.error)).toContain("predates the closing run");
+    expect(String(res.body.error)).toContain(checkoutRunId);
+    expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("POST comment: an accepted header-less approval stamps the checkout run into the tier2 audit record (SUP-23490)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23490F", { deliveryRequirement: "record_only" });
+    const checkoutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId: reviewerAgentId,
+      status: "running",
+      invocationSource: "self_declared",
+      startedAt: new Date("2026-11-04T09:00:00Z"),
+      contextSnapshot: { issueId },
+    });
+    await db.update(issues).set({ checkoutRunId }).where(eq(issues.id, issueId));
+    currentActor = { type: "agent", agentId: reviewerAgentId, companyId, source: "agent_key", runId: undefined };
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({ body: `## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): ${RECORD_ONLY_EVIDENCE}` });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await statusOf(issueId)).toBe("done");
+    const tier2Rows = await vi.waitFor(
+      async () => {
+        const found = await auditRows(companyId, issueId, "issue.done_transition_tier2_close");
+        if (found.length === 0) throw new Error("waiting for tier2 close audit row");
+        return found;
+      },
+      { timeout: 5000 },
+    );
+    expect(tier2Rows).toHaveLength(1);
+    expect(tier2Rows[0]?.details).toMatchObject({
+      observed: "2026-11-04T09:15:00Z",
+      tierForm: "record-only",
+      closingRunId: checkoutRunId,
+      closingRunStartedAt: "2026-11-04T09:00:00.000Z",
+    });
+  });
+
+  it("PATCH: record_only close with prose-only Tier 2 evidence is refused naming the record-only form (SUP-22801)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D22801B", { deliveryRequirement: "record_only" });
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "Closed at Tier 2 (live): the sweep consumed everything on schedule." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(String(res.body.error)).toContain("record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>");
+    expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("PATCH: the record_only missing-tier 422 remedy names both record-only forms and no merge head (SUP-22801)", async () => {
+    // Round-1 repair (record-only-remedy-omits-structured-form): the 422
+    // remedy is classification-aware. A record_only card is steered to the
+    // structured record-only doneTier form AND the record-only comment form —
+    // never toward fabricating a merge head it cannot lawfully produce.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D22801E", { deliveryRequirement: "record_only" });
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "The sweep consumed everything on schedule." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    const remedy = String(res.body.details.remedy);
+    // The structured record-only form, verbatim.
+    expect(remedy).toContain(
+      '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>" }',
+    );
+    // The comment form for a record_only card is the record-only grammar...
+    expect(remedy).toContain(
+      'record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>',
+    );
+    // ...and the remedy demands no merge head anywhere.
+    expect(remedy).not.toContain("post-merge");
+    expect(remedy).not.toContain("probe head sha");
+    // SUP-22570 re-lands the record_only no-repository Tier 1 form (#1098 was
+    // reverted by #1101), so the record_only remedy names it as a writable form.
+    expect(remedy).toContain('"landing": { "mode": "noRepositoryLanding" }');
+    expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("PATCH: repository_delivery close submitting record-only evidence is refused by name (SUP-22801)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D22801C", { deliveryRequirement: "repository_delivery" });
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockMergedBranch();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: "Landed; closing on live probe evidence.",
+        doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+      });
+
+    // Delivery landed, so the refusal is the tier gate refusing the
+    // record-only grammar on a repository card, naming the merge-head form.
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(String(res.body.error)).toContain("deliveryRequirement=record_only");
+    expect(String(res.body.error)).toContain("probe `<probe command>` head <probe head sha> post-merge:");
+    expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("POST comment: record_only auto-approval closes on record-only Tier 2 evidence with no commits resolution (SUP-22801)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D22801D", { deliveryRequirement: "record_only" });
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({
+        body: `## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): ${RECORD_ONLY_EVIDENCE}`,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await statusOf(issueId)).toBe("done");
+    // Unlike the merge-head close in D21258A (commits + pulls GETs), the
+    // record-only close resolves no merge head: any call this door makes is a
+    // read-only GET and none touches a delivery commits endpoint.
+    for (const [url, init] of mockGhFetch.mock.calls) {
+      expect(String((init as RequestInit | undefined)?.method ?? "GET")).toBe("GET");
+      expect(String(url)).not.toContain("/commits/");
     }
   });
 
@@ -935,7 +1286,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     const res = await request(app)
       .post(`/api/issues/${identifier}/comments`)
       .send({
-        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): reviewer probe verified the patched path on the PR head.",
+        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the patched path on the PR head.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
@@ -951,14 +1302,14 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .post(`/api/issues/${identifier}/comments`)
       .send({
         body: "## Review: APPROVED\n\nShip it.",
-        doneTier: { tier: "tier2", probeEvidence: "reviewer probe verified the patched path on the PR head." },
+        doneTier: { tier: "tier2", probeEvidence: "probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the patched path on the PR head." },
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(await statusOf(issueId)).toBe("done");
 
     const expectedBody =
-      "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): reviewer probe verified the patched path on the PR head.";
+      "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the patched path on the PR head.";
     const comments = await db
       .select({ body: issueComments.body })
       .from(issueComments)
@@ -1066,7 +1417,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       const body = records[0]!.body ?? "";
       expect(body).toContain("[Terminal status refused] done_transition_missing_tier_declaration");
       expect(body).toContain("HTTP 422");
-      expect(body).toContain('"Closed at Tier 2 (live): <probe evidence>"');
+      expect(body).toContain('"Closed at Tier 2 (live): probe `<probe command>` head <probe head sha> post-merge: <post-merge predicate>"');
       expect(body).toContain(`Refusing run: ${runId}`);
     });
 
@@ -1081,7 +1432,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         .send({
           status: "done",
           comment:
-            "Closed at Tier 2 (live): probed the endpoint after deploy and it holds.",
+            "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probed the endpoint after deploy and it holds.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -1159,7 +1510,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         .send({
           status: "done",
           comment:
-            "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint.",
+            "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -1201,7 +1552,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       const res = await request(app)
         .post(`/api/issues/${identifier}/comments`)
         .send({
-          body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): reviewer probe verified the patched path on the PR head.",
+          body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the patched path on the PR head.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -1252,6 +1603,9 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
             { status: 200 },
           );
         }
+        if (url.includes("/commits/")) {
+          return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
+        }
         return new Response(JSON.stringify({}), { status: 404 });
       });
 
@@ -1260,7 +1614,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         .send({
           status: "done",
           comment:
-            "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint.",
+            "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint.",
         });
 
       // The open mergeable PR stays open until the merge lands (ADR-074 D6):
@@ -1270,14 +1624,18 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       const rows = await vi.waitFor(
         async () => {
           const found = await auditRows(companyId, issueId, "issue.done_transition_guard_skipped");
-          if (found.length === 0) throw new Error("waiting for waiver audit row");
-          return found;
+          const hits = found.filter(
+            (r) => (r.details as Record<string, unknown>).reason === "open_linked_prs_decision_carried:1",
+          );
+          if (hits.length === 0) throw new Error("waiting for waiver audit row");
+          return hits;
         },
         { timeout: 5000 },
       );
-      expect(
-        rows.some((r) => (r.details as Record<string, unknown>).reason === "open_linked_prs_decision_carried:1"),
-      ).toBe(true);
+      expect(rows).toHaveLength(1);
+      expect((rows[0]?.details as Record<string, unknown>).skipReason).toBe(
+        "open_linked_prs_decision_carried:1",
+      );
     });
 
   it("POST comment: auto-approval publishes paperclip/approved and persists the Guard A head (SUP-13904)", async () => {
@@ -1293,7 +1651,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
 
     const branchName = `${identifier}-test-branch`;
-    const headSha = "9f8e7d6c5b4a39281706f5e4d3c2b1a09876543210fedcba9876543210";
+    const headSha = "9f8e7d6c5b4a39281706f5e4d3c2b1a0987654321";
     await seedAuthorizedDeliveryReceipt(companyId, issueId, headSha, branchName, 42);
     certifiedDelivery.headSha = headSha;
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
@@ -1318,6 +1676,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         );
       }
       if (url.includes(`/pulls/42`)) return new Response(JSON.stringify({ head: { sha: headSha } }), { status: 200 });
+      if (url.includes("/commits/")) return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
       if (url.includes("/statuses/")) return new Response(JSON.stringify({ id: 1 }), { status: 201 });
       return new Response(JSON.stringify({}), { status: 404 });
     });
@@ -1329,7 +1688,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     const res = await request(app)
       .post(`/api/issues/${identifier}/comments`)
       .send({
-        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): reviewer probe verified the patched path on the PR head.",
+        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the patched path on the PR head.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
@@ -1368,7 +1727,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     const branchName = `${identifier}-test-branch`;
     const headSha42 = "9f8e7d6c5b4a39281706f5e4d3c2b1a09876543210fedcba9876543210";
-    const headSha43 = "0a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f";
+    const headSha43 = "0a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e";
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockResolvedValue("test-token");
     mockGhFetch.mockImplementation(async (url: string) => {
@@ -1407,6 +1766,9 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       if (url.includes(`/pulls/43`)) {
         return new Response(JSON.stringify({ state: "open", head: { sha: headSha43 } }), { status: 200 });
       }
+      if (url.includes("/commits/")) {
+        return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
+      }
       return new Response(JSON.stringify({}), { status: 404 });
     });
 
@@ -1418,7 +1780,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     const res = await request(app)
       .post(`/api/issues/${identifier}/comments`)
       .send({
-        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): reviewer probe verified the patched path on the PR head.",
+        body: "## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe verified the patched path on the PR head.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -1450,6 +1812,316 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toEqual([]);
   });
 
+  describe("recovery-resolution done door final delivery preflight (SUP-21598)", () => {
+    async function seedRecoveryActionFor(companyId: string, issueId: string, agentId: string, runId: string) {
+      const now = new Date();
+      await db.insert(issueRecoveryActions).values({
+        id: randomUUID(),
+        companyId,
+        sourceIssueId: issueId,
+        recoveryIssueId: null,
+        kind: "missing_disposition",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: agentId,
+        ownerUserId: null,
+        previousOwnerAgentId: null,
+        returnOwnerAgentId: null,
+        cause: "successful_run_missing_issue_disposition",
+        fingerprint: `missing-disposition:${issueId}`,
+        evidence: { runId },
+        nextAction: "Choose a valid issue disposition.",
+        wakePolicy: null,
+        monitorPolicy: null,
+        attemptCount: 1,
+        maxAttempts: null,
+        timeoutAt: null,
+        lastAttemptAt: now,
+        outcome: null,
+        resolutionNote: null,
+        resolvedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
+    const closeBody = {
+      outcome: "restored",
+      sourceIssueStatus: "done",
+      resolutionNote: "Delivered on a sibling card's PR; closing this card.",
+      doneTier: {
+        tier: "tier2",
+        probeEvidence: "probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: GET /api/health returned 200 after the sibling PR landed.",
+      },
+    };
+
+    it("refuses the terminal approval with no delivery verdict when no override is supplied", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("R21598A");
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockUnmergedBranch();
+      certifiedDelivery.useRealPreflight = true;
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send(closeBody);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("approval_final_delivery_preflight");
+      expect(await statusOf(issueId)).toBe("in_review");
+    });
+
+    it("refuses the recovery close when the provider answer is contradictory (state open, merged true)", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("R21598C");
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      // Make the card a merged-only terminal-carrier delivery: its workspace
+      // row is a shared row sourced by a done ancestor, carrying the
+      // ancestor's branch, so the recorded identity is accepted only as a
+      // merged delivery. A contradictory PR answer must not close it.
+      const [seededIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const carrierOwnerId = randomUUID();
+      await db.insert(issues).values({
+        id: carrierOwnerId,
+        companyId,
+        identifier: "R21598P-1",
+        issueNumber: 99,
+        title: "Terminal carrier owner",
+        status: "done",
+        priority: "medium",
+        createdByUserId: "cloud-user-1",
+      });
+      await db
+        .update(executionWorkspaces)
+        .set({ sourceIssueId: carrierOwnerId, mode: "shared_workspace", branchName: "R21598P-1-carrier-branch" })
+        .where(eq(executionWorkspaces.id, seededIssue!.executionWorkspaceId!));
+      await db
+        .update(issues)
+        .set({
+          parentId: carrierOwnerId,
+          executionState: {
+            ...(seededIssue!.executionState as Record<string, unknown>),
+            delivery: {
+              repo: { owner: "TEA-Core", repo: "paperclip" },
+              branch: "R21598P-1-carrier-branch",
+              headSha: certifiedDelivery.headSha,
+              prNumber: 404,
+              prUrl: "https://github.com/TEA-Core/paperclip/pull/404",
+            },
+          },
+        })
+        .where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 0, status: "identical" }), { status: 200 });
+        if (url.includes("/git/refs/heads/")) return new Response(JSON.stringify({ object: { sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" } }), { status: 200 });
+        if (url.includes("/pulls?")) {
+          return new Response(JSON.stringify([{
+            number: 404, draft: false, merged: true, merged_at: "2026-08-29T00:11:06Z",
+            head: { ref: "R21598P-1-carrier-branch", sha: certifiedDelivery.headSha },
+            title: "Contradictory PR", body: null,
+          }]), { status: 200 });
+        }
+        if (url.includes("/pulls/")) {
+          return new Response(JSON.stringify({
+            state: "open", merged: true, draft: false, title: "Contradictory PR",
+            merge_commit_sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19",
+            head: { sha: certifiedDelivery.headSha, ref: "R21598P-1-carrier-branch", repo: { full_name: "TEA-Core/paperclip" } },
+            base: { ref: "main" },
+          }), { status: 200 });
+        }
+        if (url.includes("/commits/")) return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      certifiedDelivery.useRealPreflight = true;
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+.send(closeBody);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("approval_final_delivery_preflight");
+      expect(await statusOf(issueId)).toBe("in_review");
+    });
+
+    it("refuses the recovery close for a legacy record whose branch is git-invalid, even with a proven merged PR (read-side validation)", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("R21598D");
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      // A legacy record seeded before the write boundary existed: its branch
+      // is a percent-encoded traversal git itself refuses, and the carrier
+      // row carries the same string, so every other gate (branch equality,
+      // carrier ownership, merged-and-proven PR) would pass. Only the
+      // read-side branch validation in the resolver refuses it; dropping
+      // that check closes the card with 200.
+      const invalidBranch = "R21598Q-1-%2F..";
+      const [seededIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const carrierOwnerId = randomUUID();
+      await db.insert(issues).values({
+        id: carrierOwnerId,
+        companyId,
+        identifier: "R21598Q-1",
+        issueNumber: 98,
+        title: "Terminal carrier owner (legacy invalid branch)",
+        status: "done",
+        priority: "medium",
+        createdByUserId: "cloud-user-1",
+      });
+      await db
+        .update(executionWorkspaces)
+        .set({ sourceIssueId: carrierOwnerId, mode: "shared_workspace", branchName: invalidBranch })
+        .where(eq(executionWorkspaces.id, seededIssue!.executionWorkspaceId!));
+      await db
+        .update(issues)
+        .set({
+          parentId: carrierOwnerId,
+          executionState: {
+            ...(seededIssue!.executionState as Record<string, unknown>),
+            delivery: {
+              repo: { owner: "TEA-Core", repo: "paperclip" },
+              branch: invalidBranch,
+              headSha: certifiedDelivery.headSha,
+              prNumber: 404,
+              prUrl: "https://github.com/TEA-Core/paperclip/pull/404",
+            },
+          },
+        })
+        .where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 0, status: "identical" }), { status: 200 });
+        if (url.includes("/git/refs/heads/")) return new Response(JSON.stringify({ object: { sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" } }), { status: 200 });
+        if (url.includes("/pulls?")) {
+          return new Response(JSON.stringify([{
+            number: 404, draft: false, merged: true, merged_at: "2026-08-29T00:11:06Z",
+            head: { ref: invalidBranch, sha: certifiedDelivery.headSha },
+            title: "Legacy invalid-branch PR", body: null,
+          }]), { status: 200 });
+        }
+        if (url.includes("/pulls/")) {
+          return new Response(JSON.stringify({
+            state: "closed", merged: true, draft: false, title: "Legacy invalid-branch PR",
+            merge_commit_sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19",
+            head: { sha: certifiedDelivery.headSha, ref: invalidBranch, repo: { full_name: "TEA-Core/paperclip" } },
+            base: { ref: "main" },
+          }), { status: 200 });
+        }
+        if (url.includes("/commits/")) return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      certifiedDelivery.useRealPreflight = true;
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send(closeBody);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("approval_final_delivery_preflight");
+      expect(await statusOf(issueId)).toBe("in_review");
+    });
+
+    it("lets an accepted merged-elsewhere doneTransitionOverride clear the preflight and close the card", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("R21598B");
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockUnmergedBranch();
+      certifiedDelivery.useRealPreflight = true;
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          ...closeBody,
+          doneTransitionOverride: {
+            disposition: "merged-elsewhere",
+            reason: "The change landed on a sibling card's PR; nothing is left on this branch.",
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+    });
+
+    it("recovery-action close: the resolved closing run binds the observation lifetime on this door too (SUP-23490)", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("D23490R", { deliveryRequirement: "record_only" });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId: reviewerAgentId,
+        status: "running",
+        invocationSource: "self_declared",
+        startedAt: new Date("2026-11-04T09:20:00Z"),
+        contextSnapshot: { issueId },
+      });
+      await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, issueId));
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      currentActor = { type: "agent", agentId: reviewerAgentId, companyId, source: "agent_key", runId: undefined };
+      mockNoOpenPulls();
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          ...closeBody,
+          doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+      expect(String(res.body.error)).toContain("predates the closing run");
+      expect(String(res.body.error)).toContain(runId);
+      expect(await statusOf(issueId)).toBe("in_review");
+    });
+
+    it("recovery-action close: an accepted close stamps the closing run into the tier2 audit record (SUP-23490)", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("D23490S", { deliveryRequirement: "record_only" });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId: reviewerAgentId,
+        status: "running",
+        invocationSource: "self_declared",
+        startedAt: new Date("2026-11-04T09:00:00Z"),
+        contextSnapshot: { issueId },
+      });
+      await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, issueId));
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockNoOpenPulls();
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          ...closeBody,
+          doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+      const tier2Rows = await vi.waitFor(
+        async () => {
+          const found = await auditRows(companyId, issueId, "issue.done_transition_tier2_close");
+          if (found.length === 0) throw new Error("waiting for tier2 close audit row");
+          return found;
+        },
+        { timeout: 5000 },
+      );
+      expect(tier2Rows).toHaveLength(1);
+      expect(tier2Rows[0]?.details).toMatchObject({
+        observed: "2026-11-04T09:15:00Z",
+        tierForm: "record-only",
+        closingRunId: runId,
+        closingRunStartedAt: "2026-11-04T09:00:00.000Z",
+      });
+    });
+  });
+
   it("PATCH: a decision-carrying close refused by mechanism D carries the mechanism's own remedy, not merge-first (ADR-103 M3)", async () => {
     const {
       companyId,
@@ -1466,7 +2138,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .send({
         status: "done",
         comment:
-          "Approved.\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+          "Approved.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint and it no longer regresses.",
       });
 
     // Before M3 the route selected the remedy from `ladderUnsatisfied`/`decisionCarried`,
@@ -1522,7 +2194,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .patch(`/api/issues/${identifier}`)
       .send({
         status: "done",
-        comment: "Closed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+        comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint and it no longer regresses.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -1564,7 +2236,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .send({
         status: "done",
         comment:
-          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+          "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint and it no longer regresses.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -1589,7 +2261,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       .send({
         status: "done",
         comment:
-          "Approved.\n\nClosed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+          "Approved.\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint and it no longer regresses.",
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -1630,17 +2302,25 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
   ) {
     mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
     mockResolveSecretValue.mockResolvedValue("test-token");
+    let defaultRefProbeCount = 0;
     mockGhFetch.mockImplementation(async (url: string) => {
       if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
-      if (url.includes("/commits/")) {
-        const ref = decodeURIComponent(url.split("/commits/")[1] ?? "");
+      if (url.includes("/commits/") && !url.includes("/statuses/")) {
+        const ref = decodeURIComponent(url.split("/commits/")[1]?.split("?")[0] ?? "");
         if (ref === "fold/tea-patches-v2026.722.0") {
-          return new Response(JSON.stringify({ ref }), { status: controlStatus });
+          defaultRefProbeCount += 1;
+          if (controlStatus !== 200) {
+            return new Response(JSON.stringify({ message: "default branch unavailable" }), { status: controlStatus });
+          }
+          return new Response(
+            JSON.stringify({ ref, sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }),
+            { status: 200 },
+          );
         }
         if (shas[ref] === "absent") {
           return new Response(JSON.stringify({ message: `No commit found for sha ${ref}` }), { status: 422 });
         }
-        return new Response(JSON.stringify({ sha: ref }), { status: 200 });
+        return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
       }
       return new Response(JSON.stringify({}), { status: 404 });
     });
@@ -1649,7 +2329,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
   function commitProbeCalls(): string[] {
     return mockGhFetch.mock.calls
       .map(([url]) => String(url))
-      .filter((url) => url.includes("/commits/"));
+      .filter((url) => url.includes("/commits/") && !url.includes("/statuses/"));
   }
 
   describe("cited-SHA resolver (SUP-20525)", () => {
@@ -1658,21 +2338,21 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
       const runId = await seedRun(companyId, reviewerAgentId, issueId);
       currentActor = agentActor(companyId, reviewerAgentId, runId);
-      mockMergedBranchWithCommitProbes({ afc6278bea3c: "absent" });
+      mockMergedBranchWithCommitProbes({ afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60: "absent" });
 
       const res = await request(app)
         .patch(`/api/issues/${identifier}`)
         .send({
           status: "done",
           comment:
-            "Closed at Tier 2 (live): fix landed in merge commit afc6278bea3c; probe re-hit the endpoint.",
+            "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe re-hit the endpoint; cited commit TEA-Core/paperclip@afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60.",
         });
 
       // The tier line passed; the provably nonexistent cited SHA is the refusal.
       expect(res.status, JSON.stringify(res.body)).toBe(422);
       expect(res.body.code).toBe("done_transition_cited_sha_unresolvable");
-      expect(res.body.details.shas).toEqual(["afc6278bea3c"]);
-      expect(res.body.details.remedy).toContain("afc6278bea3c");
+      expect(res.body.details.shas).toEqual(["afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60"]);
+      expect(res.body.details.remedy).toContain("afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60");
       expect(await statusOf(issueId)).toBe("in_review");
 
       // Thread-readable refusal record per the SUP-17125 contract.
@@ -1683,7 +2363,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       const body = records[0]?.body ?? "";
       expect(body).toContain("[Terminal status refused] done_transition_cited_sha_unresolvable");
       expect(body).toContain("HTTP 422");
-      expect(body).toContain("afc6278bea3c");
+      expect(body).toContain("afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60");
       expect(body).toContain(`Refusing run: ${runId}`);
 
       // The resolution itself is audited with the per-SHA verdict.
@@ -1697,7 +2377,11 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       );
       expect(rows[0]?.details).toMatchObject({
         decisionCarried: false,
-        results: [{ sha: "afc6278bea3c", status: "nonexistent" }],
+        results: [{
+          sha: "afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60",
+          status: "nonexistent",
+          probedRepos: [{ hostname: "github.com", owner: "TEA-Core", repo: "paperclip" }],
+        }],
       });
     });
 
@@ -1705,19 +2389,27 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D20525B");
       await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
       currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
-      mockMergedBranchWithCommitProbes({ "674fef15d2": "present" });
+      mockMergedBranchWithCommitProbes({ "674fef15d2a83c19e74b602df591a38c44be7096": "present" });
 
       const res = await request(app)
         .patch(`/api/issues/${identifier}`)
         .send({
           status: "done",
-          comment: "Closed at Tier 2 (live): landed in `674fef15d2`; probe re-hit the endpoint.",
+          comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 674fef15d2a83c19e74b602df591a38c44be7096 post-merge: probe re-hit the endpoint; cited commit 674fef15d2a83c19e74b602df591a38c44be7096.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(await statusOf(issueId)).toBe("done");
+      // Exact probe list, restored: two calls, both for the same ref — the
+      // Tier 2 origin predicate resolves the named probe head, and the
+      // cited-SHA resolver probes the cited commit. A single call cannot
+      // hold because both predicates now resolve heads; the old singleton
+      // only held while Tier 2 accepted the sentence on its face, which the
+      // re-slice deliberately removed (verified by running this test: the
+      // observed call list is exactly these two).
       expect(commitProbeCalls()).toEqual([
-        "https://api.github.com/repos/TEA-Core/paperclip/commits/674fef15d2",
+        "https://api.github.com/repos/TEA-Core/paperclip/commits/674fef15d2a83c19e74b602df591a38c44be7096",
+        "https://api.github.com/repos/TEA-Core/paperclip/commits/674fef15d2a83c19e74b602df591a38c44be7096",
       ]);
       const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
       expect(comments.filter((c) => c.authorType === "system")).toHaveLength(0);
@@ -1727,15 +2419,15 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D20525C");
       await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
       currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
-      // The SHA probe says absent, but the control ref does not resolve either,
+      // The bare SHA probe says absent, but its repository scope is ambiguous,
       // so absence is unproven: the citation is unverifiable and the close holds.
-      mockMergedBranchWithCommitProbes({ afc6278bea3c: "absent" }, 404);
+      mockMergedBranchWithCommitProbes({ afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60: "absent" }, 404);
 
       const res = await request(app)
         .patch(`/api/issues/${identifier}`)
         .send({
           status: "done",
-          comment: "Closed at Tier 2 (live): landed in `afc6278bea3c`; probe re-hit the endpoint.",
+          comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe re-hit the endpoint; cited commit afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -1749,7 +2441,12 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         { timeout: 5000 },
       );
       expect(rows[0]?.details).toMatchObject({
-        results: [{ sha: "afc6278bea3c", status: "unverifiable" }],
+        results: [{
+          sha: "afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60",
+          status: "unverifiable",
+          reason: "ambiguous_repository_scope",
+          probedRepos: [{ hostname: "github.com", owner: "TEA-Core", repo: "paperclip" }],
+        }],
       });
     });
 
@@ -1765,11 +2462,11 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         isInstanceAdmin: false,
         runId: randomUUID(),
       };
-      mockMergedBranchWithCommitProbes({ afc6278bea3c: "absent" });
+      mockMergedBranchWithCommitProbes({ afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60: "absent" });
 
       const res = await request(app)
         .patch(`/api/issues/${identifier}`)
-        .send({ status: "done", comment: "Board close citing merge commit afc6278bea3c." });
+        .send({ status: "done", comment: "Board close citing merge commit afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60." });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(await statusOf(issueId)).toBe("done");
@@ -1786,12 +2483,15 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         .patch(`/api/issues/${identifier}`)
         .send({
           status: "done",
-          comment: "Closed at Tier 2 (live): reviewer probe re-hit the changed endpoint and it no longer regresses.",
+          comment: "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: reviewer probe re-hit the changed endpoint and it no longer regresses; no cited commit.",
         });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(await statusOf(issueId)).toBe("done");
-      expect(commitProbeCalls()).toHaveLength(0);
+      // One commits probe only: the Tier 2 probe-head resolution. The guard
+      // compares against the recorded merge commit, so it no longer resolves
+      // the live default-branch tip, and the cited-SHA resolver probes nothing.
+      expect(commitProbeCalls()).toHaveLength(1);
       expect(await auditRows(companyId, issueId, "issue.done_transition_cited_sha_resolved")).toHaveLength(0);
     });
   });

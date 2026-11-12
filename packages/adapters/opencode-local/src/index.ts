@@ -57,6 +57,18 @@ export function isValidOpenCodeModelId(value: unknown): value is string {
 
 export const models: Array<{ id: string; label: string }> = [
   { id: DEFAULT_OPENCODE_LOCAL_MODEL, label: DEFAULT_OPENCODE_LOCAL_MODEL },
+  { id: "openai/gpt-6-astra", label: "openai/gpt-6-astra" },
+  { id: "openai/gpt-6-sol", label: "openai/gpt-6-sol" },
+  { id: "openai/gpt-6-luna", label: "openai/gpt-6-luna" },
+  { id: "openai/gpt-5.6-sol", label: "openai/gpt-5.6-sol" },
+  { id: "openai/gpt-5.6-terra", label: "openai/gpt-5.6-terra" },
+  { id: "openai/gpt-5.6-luna", label: "openai/gpt-5.6-luna" },
+  { id: "anthropic/claude-opus-5-5", label: "anthropic/claude-opus-5-5" },
+  { id: "anthropic/claude-opus-5", label: "anthropic/claude-opus-5" },
+  { id: "anthropic/claude-fable-5-1", label: "anthropic/claude-fable-5-1" },
+  { id: "anthropic/claude-sonnet-5", label: "anthropic/claude-sonnet-5" },
+  { id: "google/gemini-3.8-flash", label: "google/gemini-3.8-flash" },
+  { id: "xai/grok-4.7", label: "xai/grok-4.7" },
   { id: "openai/gpt-5.5", label: "openai/gpt-5.5" },
   { id: "openai/gpt-5.4", label: "openai/gpt-5.4" },
   { id: "openai/gpt-5.4-mini", label: "openai/gpt-5.4-mini" },
@@ -84,7 +96,7 @@ Core fields:
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file prepended to the run prompt
 - model (string, required): OpenCode model id in provider/model format (for example anthropic/claude-sonnet-4-5)
 - variant (string, optional): provider-specific reasoning/profile variant passed as --variant (for example minimal|low|medium|high|xhigh|max)
-- dangerouslySkipPermissions (boolean, optional): inject a runtime OpenCode config that allows \`external_directory\` access without interactive prompts; defaults to true for unattended Paperclip runs
+- dangerouslySkipPermissions (boolean, optional): inject a runtime OpenCode config with \`permission=allow\` for all tools and connections; defaults to true for unattended Paperclip runs
 - promptTemplate (string, optional): run prompt template
 - command (string, optional): defaults to "opencode"
 - cliVersion (string, optional): exact OpenCode CLI version; only ${OPENCODE_V2_CLI_VERSION} is accepted and it enables V2 arguments and standalone execution. When omitted, the adapter probes \`command --version\`: a 1.x binary runs as V1, a detected 2.x binary other than ${OPENCODE_V2_CLI_VERSION} is refused, and a version that cannot be determined (probe failed, timed out, or empty or unparseable output) is treated as V1
@@ -112,12 +124,16 @@ Notes:
   \`opencode models\` to list available options in provider/model format.
 - Paperclip requires an explicit \`model\` value for \`opencode_local\` agents.
 - Runs are executed with: opencode run --format json ...
-- Opt-in V2 runs use: opencode run --standalone --format json ...
-- Sessions are resumed with --session when stored session cwd matches current cwd.
+- Opt-in V2 runs use a private loopback \`opencode serve\` (per-run port and password) so \
+  the Paperclip MCP tools are in the first request; remote targets and runs with \
+  \`extraArgs\` or \`args\` keep: opencode run --standalone --format json ... \
+  (see doc/DEVELOPING.md, OpenCode V2 Server Transport).
+- Sessions are resumed (--session on the one-shot run path, the stored session id \
+  over the serve API otherwise) when stored session cwd matches current cwd.
 - The adapter sets OPENCODE_DISABLE_PROJECT_CONFIG=true to prevent OpenCode from \
   writing an opencode.json config file into the project working directory. Model \
   selection is passed via the --model CLI flag instead.
 - When \`dangerouslySkipPermissions\` is enabled, Paperclip injects a temporary \
-  runtime config with \`permission.external_directory=allow\` so headless runs do \
+  runtime config with \`permission=allow\` so headless runs do \
   not stall on approval prompts.
 `;

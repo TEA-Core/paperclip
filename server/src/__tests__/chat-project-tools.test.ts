@@ -2,8 +2,8 @@ import { callProjectTool } from "../services/project-tools.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
-import { issues, heartbeatRuns } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
+import { issues, heartbeatRuns, projects } from "@paperclipai/db";
 import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
 import { issueService } from "../services/issues.js";
 import { documentService } from "../services/documents.js";
@@ -102,13 +102,26 @@ const support = await getEmbeddedPostgresTestSupport();
     await expect(call(f, "create_project", { ...input, name: "Changed" })).rejects.toThrow(/different inputs/);
   });
 
-  it("includes an explicit workspace repository in the committed project card", async () => {
+  it("includes a registered repository URL in the committed project card", async () => {
     const f = await server.fixture({ conversation: true });
-    const project = await call(f, "create_project", { name: "Workspace repo", workspace: { repoUrl: "https://github.com/example/web" }, idempotencyKey: "workspace" }) as any;
+    const project = await call(f, "create_project", { name: "Workspace repo", repositoryUrls: ["https://github.com/example/web"], idempotencyKey: "workspace" }) as any;
     const feed = await activityService(server.db).forIssue(f.issueId);
     expect(feed.find(event => event.entityId === project.id)?.details?.repositories).toEqual([
       expect.objectContaining({ url: "https://github.com/example/web" }),
     ]);
+  });
+
+  it.each([
+    ["repoUrl", { repoUrl: "https://github.com/example/web" }],
+    ["repoRef", { cwd: "/tmp/paperclip-agent-workspace", repoRef: "agent-branch" }],
+    ["defaultRef", { cwd: "/tmp/paperclip-agent-workspace", defaultRef: "agent-branch" }],
+  ])("refuses an agent project whose workspace names a %s, persisting nothing", async (_field, workspace) => {
+    const f = await server.fixture({ conversation: true });
+    const name = `Agent-chosen source ${_field}`;
+    await expect(call(f, "create_project", { name, workspace, idempotencyKey: `source-${_field}` }))
+      .rejects.toThrow(/Agent keys cannot set the repository or branch/);
+    const rows = await server.db.select({ id: projects.id }).from(projects).where(and(eq(projects.companyId, f.companyId), eq(projects.name, name)));
+    expect(rows).toHaveLength(0);
   });
 
   it("registers multiple previously unknown GitHub URLs and deduplicates equivalent URLs", async () => {
@@ -116,7 +129,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const project = await call(f, "create_project", { name: "Across repos", repositoryUrls: ["https://github.com/example/web.git", "https://github.com/example/api", "https://github.com/example/web/"], idempotencyKey: "urls" }) as any;
     expect(project.workspaces.map((w: any) => w.repoUrl).sort()).toEqual(["https://github.com/example/api", "https://github.com/example/web"]);
     expect(project.workspaces.filter((w: any) => w.isPrimary)).toHaveLength(1);
-    await expect(call(f, "create_project", { name: "Invalid", repositoryUrls: ["https://github.com/example/api"], workspace: { repoUrl: "https://github.com/example/web" }, idempotencyKey: "conflict" })).rejects.toThrow(/either workspace/);
+    await expect(call(f, "create_project", { name: "Invalid", repositoryUrls: ["https://github.com/example/api"], workspace: { cwd: "/tmp/paperclip-conflict" }, idempotencyKey: "conflict" })).rejects.toThrow(/either workspace/);
     await expect(call(f, "create_project", { name: "Invalid", repositoryUrls: ["https://user:password@github.com/example/api"], idempotencyKey: "credentials" })).rejects.toThrow(/without credentials/);
   });
 

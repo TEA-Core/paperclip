@@ -367,12 +367,108 @@ const support = externalDatabaseUrl
       await terminalizeLegacyExecution({ db, run, status: "cancelled" });
       const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
       await markExecutionReconciliation(db, action!, { runId: source.runId, providerStopped: true, actionOutcome: "not_performed", outcomeEvidence: "The deterministic fixture has stopped and only printed output." }, "board");
-      await db.update(issueRecoveryActions).set({ status: "resolved" }).where(eq(issueRecoveryActions.id, action!.id));
+      await db.update(issueRecoveryActions).set({ status: "resolved", fingerprint: `reconciled:${source.runId}` }).where(eq(issueRecoveryActions.id, action!.id));
       await terminalizeLegacyExecution({ db, run, status: "cancelled" });
       const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
       expect(actions).toHaveLength(1);
       expect(actions[0]).toMatchObject({ status: "resolved", evidence: { continuationDelivery: "pending", executionReconciliation: { runId: source.runId } } });
       await db.update(issueRecoveryActions).set({ evidence: { ...actions[0]!.evidence, continuationDelivery: "invalidated" } }).where(eq(issueRecoveryActions.id, action!.id));
+    });
+    it("does not re-mint an interrupted conversation run after its hold is settled", async () => {
+      for (const status of ["resolved", "cancelled"] as const) {
+        const source = await seed();
+        const [run] = await db.update(heartbeatRuns).set({
+          runtimeMode: "legacy",
+          status: "interrupted",
+          resultJson: {},
+          runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+        }).where(eq(heartbeatRuns.id, source.runId)).returning();
+        expect(legacyExecutionNeedsReconciliation(run!)).toBe(true);
+        await terminalizeLegacyExecution({ db, run: run!, status: "interrupted" });
+        const [minted] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
+        await db.update(issueRecoveryActions).set({
+          status,
+          fingerprint: `settled:${source.runId}`,
+          outcome: "cancelled",
+          resolutionNote: "Conversation continuation does not replay prior tool calls.",
+          evidence: {
+            ...minted!.evidence,
+            automaticRecovery: { runId: source.runId, replay: "conversation_continuation" },
+          },
+        }).where(eq(issueRecoveryActions.id, minted!.id));
+        await terminalizeLegacyExecution({ db, run: run!, status: "interrupted" });
+        const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
+        expect(actions).toHaveLength(1);
+        expect(actions[0]).toMatchObject({
+          id: minted!.id,
+          status,
+          outcome: "cancelled",
+          resolutionNote: "Conversation continuation does not replay prior tool calls.",
+        });
+      }
+    });
+    it("keeps one legacy recovery action through two conversation settle cycles", async () => {
+      const source = await seed();
+      const [run] = await db.update(heartbeatRuns).set({
+        runtimeMode: "legacy",
+        status: "interrupted",
+        resultJson: {},
+        runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+      }).where(eq(heartbeatRuns.id, source.runId)).returning();
+      let mintedId: string | undefined;
+      for (let cycle = 0; cycle < 2; cycle += 1) {
+        await terminalizeLegacyExecution({ db, run: run!, status: "interrupted" });
+        if (cycle === 0) {
+          const [minted] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
+          mintedId = minted!.id;
+        }
+        await settleUnrecoverableExecutions(db);
+      }
+      const actions = await db.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.sourceIssueId, source.issueId),
+        eq(issueRecoveryActions.fingerprint, `legacy-execution:${source.runId}`),
+      ));
+      expect(actions).toHaveLength(1);
+      expect(actions[0]).toMatchObject({
+        id: mintedId,
+        status: "resolved",
+        outcome: "cancelled",
+        resolutionNote: "Conversation continuation does not replay prior tool calls.",
+      });
+    });
+    it("mints a separate hold for a new run after an earlier run is settled", async () => {
+      const source = await seed();
+      const [run] = await db.update(heartbeatRuns).set({
+        runtimeMode: "legacy",
+        status: "interrupted",
+        resultJson: {},
+        runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+      }).where(eq(heartbeatRuns.id, source.runId)).returning();
+      await terminalizeLegacyExecution({ db, run: run!, status: "interrupted" });
+      await settleUnrecoverableExecutions(db);
+      const nextRunId = randomUUID();
+      const [nextRun] = await db.insert(heartbeatRuns).values({
+        id: nextRunId,
+        companyId: source.companyId,
+        agentId: source.agentId,
+        nativeIssueId: source.issueId,
+        runtimeMode: "legacy",
+        status: "interrupted",
+        contextSnapshot: { issueId: source.issueId },
+        resultJson: {},
+        runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+      }).returning();
+      await terminalizeLegacyExecution({ db, run: nextRun!, status: "interrupted" });
+      const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
+      expect(actions).toHaveLength(2);
+      expect(actions.find(action => action.fingerprint === `legacy-execution:${source.runId}`)).toMatchObject({
+        status: "resolved",
+        outcome: "cancelled",
+      });
+      expect(actions.find(action => action.fingerprint === `legacy-execution:${nextRunId}`)).toMatchObject({
+        status: "active",
+        evidence: { runId: nextRunId },
+      });
     });
     it("surfaces a failed current reviewer without transferring the original assignment", async () => {
       const source = await seed();

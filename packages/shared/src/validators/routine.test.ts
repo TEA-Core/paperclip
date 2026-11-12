@@ -11,7 +11,7 @@ const triggerId = "33333333-3333-4333-8333-333333333333";
 const baseRevisionId = "44444444-4444-4444-8444-444444444444";
 
 describe("routine validators", () => {
-  it("accepts versioned routine revision snapshots with safe trigger metadata", () => {
+  it.each(["bearer", "app_webhook", "fireflies_hmac"])("accepts versioned routine revision snapshots with %s trigger metadata", (signingMode) => {
     const parsed = routineRevisionSnapshotV1Schema.parse({
       version: 1,
       routine: {
@@ -37,7 +37,7 @@ describe("routine validators", () => {
         cronExpression: null,
         timezone: null,
         publicId: "routine_webhook_123",
-        signingMode: "bearer",
+        signingMode,
         replayWindowSec: 300,
       }],
     });
@@ -98,6 +98,16 @@ describe("routine validators", () => {
 
     expect(() => updateRoutineSchema.parse({ activityGatePolicy: "when_busy" })).toThrow();
     expect(() => updateRoutineSchema.parse({ activityGateScope: "agent" })).toThrow();
+  });
+
+  it("accepts and rejects routine delivery requirement values", () => {
+    expect(updateRoutineSchema.parse({ deliveryRequirement: "record_only" })).toMatchObject({
+      deliveryRequirement: "record_only",
+    });
+    expect(updateRoutineSchema.parse({ deliveryRequirement: null })).toMatchObject({
+      deliveryRequirement: null,
+    });
+    expect(() => updateRoutineSchema.parse({ deliveryRequirement: "inferred" })).toThrow();
   });
 
   it("accepts date variables with valid YYYY-MM-DD defaults", () => {

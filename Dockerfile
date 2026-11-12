@@ -154,16 +154,17 @@ COPY --from=deps /app /app
 COPY . .
 RUN find packages/paperclip-runner/runner packages/paperclip-runner/protocol -type f -exec touch -d @0 {} + \
   && touch -d @0 packages/paperclip-runner/rust-toolchain.toml
+# Both the browser bundle and server stamp need the source commit. Declare it
+# after the stable dependency layers, before either application build.
+ARG PAPERCLIP_BUILD_COMMIT=""
 RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/plugin-sdk build
 # The server build runs scripts/write-build-stamp.mjs, which stamps the built
 # commit into dist/build-info.json. The build context has no .git, so the
 # script reads PAPERCLIP_BUILD_COMMIT instead. Docker exposes an ARG to the
-# next RUN as an environment variable, so declare it here — in the build
-# stage — before the server build. The production stage below declares the
+# next RUN as an environment variable. The production stage below declares the
 # same ARG again for the runtime fallback; an ARG goes out of scope at the
 # end of its stage. Empty for local `docker build`, which then writes no stamp.
-ARG PAPERCLIP_BUILD_COMMIT=""
 ENV NODE_OPTIONS=--max-old-space-size=4096
 RUN pnpm --filter @paperclipai/server build
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
@@ -265,7 +266,21 @@ WORKDIR /app
 # never hit the layer cache and rebuilds on every build. The two `--from=build`
 # copies this fork used to open with now sit after the entrypoint, below.
 RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
-  && npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest supabase@latest @moonshot-ai/kimi-code@latest \
+  # npm 11 ships only a stub bin/opencode.exe; the real binary is placed by the
+  # package postinstall. --allow-scripts pins that permission explicitly (npm
+  # warns on every uncovered lifecycle script) so a future npm that starts
+  # enforcing allowScripts cannot silently swap in the stub that errors.
+  && npm install --global --omit=dev --allow-scripts=opencode-ai @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai@1.19.5 @google/gemini-cli@latest supabase@latest @moonshot-ai/kimi-code@latest \
+  && test "$(/usr/local/bin/opencode --version)" = "1.19.5" \
+  && test "$(command -v opencode)" = "/usr/local/bin/opencode" \
+  # npm links global bins as symlinks into lib/node_modules, so readlink -f
+  # lands on the package's bin/opencode.exe, never on /usr/local/bin/opencode
+  # itself. Assert the resolution stays inside the pinned opencode-ai tree.
+  && case "$(readlink -f /usr/local/bin/opencode)" in \
+       /usr/local/lib/node_modules/opencode-ai/bin/*) ;; \
+       *) echo "FAIL: opencode resolves outside the pinned opencode-ai tree: $(readlink -f /usr/local/bin/opencode)" >&2; exit 1 ;; \
+     esac \
+  && test ! -e /usr/local/bin/opencode2 \
   && apt-get update \
   && apt-get install -y --no-install-recommends openssh-client jq \
   # Chromium shared libraries. Playwright downloads its browsers into
@@ -283,6 +298,37 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && rm -rf /var/lib/apt/lists/* \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
+
+# OpenCode V2 sits beside the pinned V1 binary, not on PATH. `npm install -g
+# @opencode/cli` would also link `opencode` and `opencode2` into /usr/local/bin
+# and replace the V1 command non-opted-in agents resolve. The prefix keeps both
+# of those names inside /opt/opencode-v2/bin. /paperclip is a VOLUME, so this
+# must not install under it or the binary disappears at runtime. The package
+# postinstall copies the platform binary into bin/opencode.exe; the image
+# records that file's digest and refuses anything other than the pinned
+# version. Executable by the agent principal (other-execute); not writable.
+#
+# OPENCODE_V2_SHA256 is the linux/x64 postinstall output verified on the host
+# for @opencode/cli@2.2.4 (ELF reports `opencode v2.2.4`). arm64 and musl
+# builds hash their own postinstall output into the same file. The expected
+# value is asserted only when the build target is linux/amd64.
+ARG OPENCODE_V2_VERSION=2.2.4
+ARG OPENCODE_V2_PACKAGE=@opencode/cli@2.2.4
+ARG OPENCODE_V2_SHA256=25facd7099c19018e83dce858f3ab922cd2d49ad29b144bc36968418ca6eb5aa
+RUN npm install --global --omit=dev --allow-scripts=@opencode/cli --prefix /opt/opencode-v2 "${OPENCODE_V2_PACKAGE}" \
+  && test "$(/opt/opencode-v2/bin/opencode --version)" = "opencode v${OPENCODE_V2_VERSION}" \
+  && test "$(/opt/opencode-v2/bin/opencode2 --version)" = "opencode v${OPENCODE_V2_VERSION}" \
+  && sha256sum /opt/opencode-v2/lib/node_modules/@opencode/cli/bin/opencode.exe \
+       | awk '{print $1}' > /opt/opencode-v2/OPENCODE_V2_SHA256 \
+  && if [ "$(uname -m)" = "x86_64" ]; then \
+       test "$(cat /opt/opencode-v2/OPENCODE_V2_SHA256)" = "${OPENCODE_V2_SHA256}"; \
+     fi \
+  && chmod 644 /opt/opencode-v2/OPENCODE_V2_SHA256 \
+  && chown -R root:root /opt/opencode-v2 \
+  && chmod -R a-w /opt/opencode-v2 \
+  && chmod -R a+rX /opt/opencode-v2 \
+  && test "$(/usr/local/bin/opencode --version)" = "1.19.5" \
+  && test ! -e /usr/local/bin/opencode2
 
 # CodeGraph CLI — agent code-exploration index (doctrine/exploration.md: CodeGraph FIRST)
 RUN npm install --global --omit=dev @colbymchenry/codegraph@1.5.0
@@ -349,7 +395,7 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # sit directly above the self-hosted server identity (USER_UID/USER_GID 1000).
 # A build that moves `node` onto one of them -- upstream's cloud variant bakes
 # USER_UID/USER_GID=1001 -- must pass non-colliding AGENT_UID/AGENT_GID/
-# AGENTS_GID (docker-cloud.yml does). The guard at the top of the RUN below
+# AGENTS_GID (the cloud build upstream #13827 retired did). The guard at the top of the RUN below
 # fails such a build with the cause named instead of a bare groupadd/useradd
 # "already exists". Never auto-pick free ids here: the agent principal owns
 # files on persistent volumes, so its ids must be a deterministic input.
@@ -431,7 +477,14 @@ RUN if getent passwd "${AGENT_UID}" >/dev/null \
          = "$(id -u node) 0000000000000028" ]; \
      else \
        echo "SKIP capsh grant probe: cap_kill/cap_fowner not both in the builder's bounding set (capsh presence is still asserted)"; \
-     fi
+     fi \
+  && gosu node-agent test -x /opt/opencode-v2/bin/opencode \
+  && gosu node-agent test ! -w /opt/opencode-v2/bin/opencode \
+  # V2 (bun) creates $HOME/.local/share/opencode/log even for --version; at
+  # build time /paperclip is owned by node, so probe with HOME=/tmp. Runtime
+  # mounts /paperclip writable for the agent principal.
+  && test "$(gosu node-agent env HOME=/tmp /opt/opencode-v2/bin/opencode --version)" = "opencode v${OPENCODE_V2_VERSION}" \
+  && test "$(gosu node /usr/local/bin/opencode --version)" = "1.19.5"
 
 COPY --from=build /app /app
 # SUP-12903: root-own the entire runtime tree so uid-1000 agent runs cannot

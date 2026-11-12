@@ -1940,3 +1940,21 @@ describeEmbeddedPostgres("built-in agents", () => {
     expect(resetRoutine?.title).toBe("Review recent agent trajectories for coaching proposals");
   });
 });
+
+// Kept at the end of the file on purpose: server/src/__tests__/typecheck-baseline.txt
+// keys pre-existing diagnostics by line number, and inserting lines anywhere above
+// the last baselined error in this file shifts those entries and fails
+// `pnpm run check:server-test-typecheck` with the baseline unchanged (SUP-20739).
+describe("built-in agent asset loading: summarizer refusal rule (SUP-20739)", () => {
+  it("summarizer instructions make a refused slot write terminal instead of minting another summary task", () => {
+    const definitions = listBuiltInAgentDefinitions();
+    const summarizer = definitions.find((definition) => definition.key === "summarizer");
+    expect(summarizer).toBeDefined();
+
+    const instructions = summarizer?.defaultInstructions ?? "";
+    expect(instructions).toContain("refused with HTTP 403");
+    expect(instructions).toContain("mark the task `blocked` quoting the 403 error text");
+    expect(instructions).toContain("Do not create or request another summary task");
+    expect(instructions).toContain("do not escalate separately");
+  });
+});

@@ -385,6 +385,14 @@ pnpm test:release-smoke
 
 These browser suites are intended for targeted local verification and CI, not the default agent/human test command.
 
+The default E2E configuration builds the UI into `server/ui-dist` before starting
+its throwaway instance and serves that build with
+`PAPERCLIP_UI_DEV_MIDDLEWARE=false`. This exercises the
+shipped assets, including service-worker takeover and reload, without traversing
+the development server's unbundled module graph on each navigation. Browser
+assertion deadlines and retries remain unchanged. Use `pnpm dev` separately when
+verifying Vite/HMR behavior.
+
 For normal issue work, start with the smallest targeted check that proves the change. Reserve repo-wide typecheck/build/test runs for PR-ready handoff or changes broad enough that narrow checks do not cover the risk.
 
 ### Test Worker Limits
@@ -509,6 +517,68 @@ If the selected data directory already contains any company, `test-drive`
 preserves all companies, agents, and secrets and ignores the bootstrap flags.
 The worktree execution setting is the only value it may reconcile in that
 case.
+
+### Slack chat setup in a test drive
+
+Enable **Chat connectors** in Instance Settings, then open **Connectors → Slack →
+Chat with an agent**. Before connecting, configure a public HTTPS URL that Slack
+can reach. The setup page shows this requirement above the app details.
+Slack app name, bot display name, and slash command are editable while the
+connection is a draft; valid edits save when a field loses focus. **Create Slack
+app** opens Slack with the generated manifest prefilled. **View Slack App Manifest**
+opens the read-only manifest in a modal to inspect or copy it. Once connected,
+the app details are locked so reconnecting cannot silently change the registered
+command. Slack still requires workspace selection, installation approval, and
+copying the bot token and signing secret back into Paperclip.
+
+After Slack verifies its Events Request URL, the wizard asks you to send
+`/<your-command> connect`. This command works before a sender or channel is
+allowed to start work. It records the Slack identity and sends a private,
+one-time confirmation link that expires after 15 minutes; it creates no task
+and grants no access. You can confirm **This is my Slack account** in the wizard,
+or follow the private link and sign into Paperclip. Both paths check company
+membership before linking, and future messages use the linked user's current
+permissions. The wizard only lists identities that sent the connect command to
+this endpoint during the current test.
+
+New Slack connections disable **Allow unlinked people** by default. The Access
+page includes the shareable connect command and instructions for other users.
+Other Slack users join through the same connect command after setup. A signed-in
+nonmember can **Request access** from the confirmation page. This creates a
+pending human join request in the company's existing admin approval queue; it
+does not grant membership or link the identity. After approval, confirm the
+identity, or send the connect command again if the link has expired. Successful
+confirmation also queues a private Slack acknowledgement.
+
+Slack identity invitation pages retain the cloud authentication and bootstrap
+checks. Signed-in nonmembers may open a valid private invitation to request
+membership, but confirmation still requires membership in the invitation's
+company. Preview, access-request, and confirmation APIs also enforce the chat
+connector rollout flag on the server; invitees cannot read board experimental
+settings before they join. Expired or consumed tokens grant no access.
+
+The final wizard step suggests `@<your-bot> you there?`, then continuing in
+the agent's thread. Select the bot from Slack's @mention suggestions so the
+message includes a real mention. It detects a message or task command from the current user's
+linked Slack identity during this setup session and shows a checkmark. This
+conversation test is optional: **I've sent the test message** and **Skip test and
+finish** both finish setup once webhook verification and account linking are
+complete. The separate strict connection-test API retains its conversation and
+delivery checks.
+
+### Chat activity pagination and callback diagnostics
+
+The connection Activity tab loads 25 records per page. `GET /api/chat-endpoints/:id/activity?limit=25`
+returns `{ items, nextCursor }`; pass `cursor` to read older records. The limit must be 1–100.
+A timestamp and ID cursor preserves records with equal timestamps and avoids shifts from new arrivals.
+The first page refreshes automatically; older pages do not poll. Mutable action status can move an
+entry forward in time, so this is a live ledger, not a historical snapshot. Requests without pagination
+parameters retain the recent-100 array response for existing clients.
+
+Slack callback diagnostics tolerate HTTP between a TLS proxy and Paperclip when the public host,
+port, and path still match. A changed authority or path remains stale. This comparison only affects
+health display; it does not trust forwarded headers or alter Slack signature verification.
+
 
 ## Docker Quickstart (No local Node install)
 
@@ -650,6 +720,8 @@ Tasks use every distinct repository attached to their project, including reposit
 When an additional repository has a configured local checkout, Paperclip seeds the task copy from its current commit and uncommitted files. Git-ignored files stay out of that copy. Subsequent task edits stay in the task copy. They do not overwrite the configured source folder. Existing task copies retain their work across runs.
 
 Sandbox staging, including Daytona, transfers each repository's Git history and working files. Restore merges files and commits back into each local task checkout independently. Durable sandbox recovery keeps the same repository snapshots. Normal ignore and workspace exclusion rules still apply. A clone failure stops task preparation with an error so the agent does not start with only part of the project.
+
+Staging preserves relative symlink targets in secondary repositories, including skill links such as `.claude/skills/demo -> ../../skills/demo`. It does not rewrite them to host temporary paths or copy their target contents in place of the link. Daytona still rejects outbound archives with absolute or escaping link targets before extraction.
 
 If a repository is detached or its source configuration changes, its previous task copy is retained under `.paperclip-runtime/detached-repositories/` and excluded from future sandbox transfers. Referenced projects continue to use the separate read-only multi-project workspace behavior.
 
@@ -979,6 +1051,25 @@ In Vite middleware mode, Paperclip gives HMR a dedicated HTTP server bound to th
 
 When a workspace service runs Paperclip for browser OAuth QA, configure its `expose.urlTemplate` with the canonical URL the browser can reach. Paperclip preserves explicit `PAPERCLIP_PUBLIC_URL` or `BETTER_AUTH_URL` settings; otherwise it uses a valid exposed HTTPS origin (or loopback HTTP) as the managed runtime fallback for Better Auth and `/api/tools/oauth/callback`. Internal service names such as `http://paperclip-dev:<port>` are rejected unless that hostname is genuinely the browser route. Use a unique origin per isolated worktree. See [Execution Workspaces And Runtime Services](../docs/guides/board-operator/execution-workspaces-and-runtime-services.md#browser-reachable-origins-for-oauth-qa) for configuration and verification.
 
+## Wake Context Delivery
+
+Built-in adapters deliver wake context through the run prompt, including structured
+execution-continuation data. They do not export `PAPERCLIP_WAKE_PAYLOAD_JSON`. A
+large JSON environment entry can prevent the agent process from starting with
+`E2BIG`, even when the same context fits in the prompt transport. Configured values
+for this retired variable are ignored. Scalar runtime variables such as
+`PAPERCLIP_TASK_ID` and `PAPERCLIP_WAKE_REASON` remain available.
+
+Custom instructions that read the retired variable must use the wake payload in
+the prompt instead. This transport change adds no history limits or truncation;
+existing comment windows and resume-delta rendering still apply. Gateway request
+bodies and Hermes prompt-template JSON variables remain supported.
+
+This removes the duplicate environment entry, not every possible `E2BIG` cause.
+Legacy CLI paths that put prompts in command-line arguments (Gemini, Grok, Kimi,
+Pi, and Hermes) still have argument-size limits. ACP turns, SDK requests, and
+CLI paths that use stdin avoid that separate limit for the wake prompt.
+
 ## Paperclip Runner Adapter Conversion
 
 The experimental Paperclip Runner offers native Codex, OpenCode, and **ACPX
@@ -1011,10 +1102,33 @@ cancellation remain enforced; the snapshot is removed when the provider exits.
 Native Codex is qualified only with `codexPermissionMode: "never"`. The create
 and edit surfaces do not offer `on-request` or `untrusted`, and a persisted
 unsupported value fails with remediation instead of being silently coerced.
-OpenCode retains `allow`, `ask`, and `deny`; ACPX retains `approve-all`,
-`approve-reads`, and `deny-all`. Codex conversion keeps a non-empty model and
+OpenCode defaults to `allow`, with explicit `ask` and `deny` options; ACPX
+defaults to `approve-all`, with explicit `approve-paperclip`, `approve-reads`,
+and `deny-all` options. Codex conversion keeps a non-empty model and
 otherwise stores the shared `gpt-5.6-sol` default. The native execution boundary
 applies the same default to older runner rows whose model is missing or blank.
+
+For an Agent Chat test drive, enable **Agent Chat** in Experimental settings and
+configure two agents with Paperclip Runner: native Codex and ACPX Claude. Connect
+the Claude account through the agent's **AI connection** section (or supply an
+explicit supported provider credential); an ambient Claude CLI login alone is
+not a credential source for its isolated runner home. The default
+`approve-all` setting approves harness operations across assigned tools and
+connections, including provider-native tools. Company permissions, approval
+gates, and workspace isolation still apply. Explicit restrictive modes remain
+restrictive; omitted settings use full auto.
+
+Test questions, saved plan revisions, approval before task handoff, status
+lookups, and `/new` preserving chat history. Hiring additionally requires the
+operator-controlled [runner API tools](runner-api-tools.md) rollout; enabling
+Agent Chat does not enable that API surface. Failed-turn retries restore the
+selected run's user comments so the agent can answer the original request.
+
+A native continuation that requires reconciliation shows **Recovery needed**
+with **Inspect run**; inspect the original outcome before resolving its recovery
+hold. A generic retry cannot resolve this incident. The runner's
+`get_task_context` includes up to 100 existing direct child tasks and a truncation
+flag so resumed agents can reuse delegated work and inspect completed results.
 
 For native Codex runs, Paperclip passes the resolved execution workspace as
 `PAPERCLIP_WORKSPACE_CWD` and uses it as the provider containment boundary. A
@@ -1056,6 +1170,20 @@ that classification finishes.
 - A verified live runner re-registers its existing PRP authority and reconnects
   with the same operating-system PID. Paperclip does not spawn a competing
   runner.
+- For a running sandbox session, recovery checks the original provider lease,
+  remote workspace, durable runner identity, and process marker inside that
+  sandbox. The process marker must include the Linux boot ID and start ticks;
+  recovery compares them with the live process before adoption and signaling.
+  Collection uses the required Node runtime and is optional for fresh launches. Older
+  markers or images without that proof remain blocked for recovery. Remote
+  PIDs are never interpreted as controller-local PIDs. The runner must
+  authenticate to its existing PRP authority; reconnection neither
+  launches another provider nor consumes a provider retry. A replacement
+  sandbox or mismatched identity blocks adoption without overwriting evidence.
+- Shutdown waits up to 30 seconds for an in-progress native startup to reach
+  its detach acknowledgement. It reports a startup deadline failure instead
+  of claiming that an unfinished bootstrap detached safely. A queued turn
+  waits for the previous executor to finish releasing its task resources.
 - A verified dead runner starts a replacement from the same durable root and
   resumes the same provider checkpoint. Only the operating-system PID changes.
 - A runner that died before its first authenticated connection can restart on
@@ -1306,6 +1434,56 @@ and in the default sibling `health/` directory.
 DB backups are not full instance filesystem backups. For full local disaster
 recovery, also back up local storage files and the local encrypted secrets key if
 those providers are enabled.
+
+## OpenCode V2 Server Transport and the Paperclip MCP Gate
+
+A local `opencode_local` run on OpenCode V2 does not use a one-shot
+`opencode run`. A one-shot `run` builds its first model request before a
+`codemode:false` remote MCP server's tools have been listed, so the Paperclip
+project tools were missing from it (upstream issue
+https://github.com/anomalyco/opencode/issues/60893). The adapter instead starts a
+private `opencode serve` on a kernel-assigned loopback port with a per-run
+`OPENCODE_SERVER_PASSWORD`, waits for the MCP servers it injected, and only then
+creates (or resumes) the session and sends the prompt. The server is always
+stopped at the end of the attempt; the password and MCP bearer tokens are
+redacted from run logs and results. The server's events are mapped onto the
+`run --format json` line shape, so result parsing is unchanged. A permission
+request from any session of that private server (child and subagent sessions
+included) is rejected the way a headless `opencode run` rejects it (stderr line
+`! permission requested: ...; auto-rejecting`, the tool call fails and the model
+continues), so a run never waits on a reply; allowing actions stays the job of
+the `dangerouslySkipPermissions` allow-list. A `question` tool form from any
+session is cancelled the same way (stderr line `! question requested: ...;
+cancelling`); unlike a headless `run`, which lets the model continue, the server
+ends that turn as interrupted, so the run fails with a message that the model
+asked a question a non-interactive run cannot answer. The event stream is read
+with `node:http` so a long silent tool call does not hit a body timeout, and
+`PAPERCLIP_OPENCODE_PRINT_LOGS` is not applied on this path (`opencode serve`
+rejects `--standalone`); a run with it set logs a warning saying so.
+
+The gate waits for `mcp.resources.changed` on `GET /api/event` from every
+injected MCP server, settles 1000 ms, and fails the run (exit 1, no session
+created) if the event has not arrived within 15 s. The failure message lists
+each injected server's status as `GET /api/mcp` reports it (for example
+`needs_auth` or `failed`); that is a diagnostic and does not change the gate.
+**The gate is timer-based by necessity**: OpenCode 2.2.4 exposes no endpoint or
+event that says a new session will see an MCP server's tools, and the event
+precedes tool availability by a short unmarked interval (lab: prompting right
+after the event carried the tools in 0 of 5 runs; +100, +250 and +500 ms carried
+them in 5 of 5). On a loaded host
+the settle can be too short and the run starts without its Paperclip tools; the
+host rehearsal must measure that failure rate under load. The event fires with
+`OPENCODE_DISABLE_MODELS_FETCH=true` as well, so that variable does not affect
+the gate.
+
+Remote execution targets cannot reach a loopback server and runs with explicit
+`extraArgs` or `args` (which are `opencode run` flags) keep the one-shot `run`
+path, with its first-request MCP race. Such a run adds a command note and one
+warning log line naming the reason. Real-binary proof:
+`pnpm test:opencode-v2-acceptance` (adapter suite plus
+`server/src/__tests__/opencode-v2-paperclip-mcp.acceptance.test.ts`, which asserts
+the four Paperclip project tools are in the first main-agent request against the
+real `/api/mcp/project-tools` route).
 
 ## OpenCode Database Janitor
 
@@ -1568,6 +1746,12 @@ Networking behavior for this smoke script:
 
 See [execution GitHub identity](execution-github-identity.md) for the operation-time credential contract, continuation rules, runtime rollout, and acceptance-test requirements.
 
+### Agent persona Storybook
+
+See [agent-personas.md](agent-personas.md) for the dynamic avatar endpoint, cache,
+and character stories. Set `PAPERCLIP_STORYBOOK_API_URL` to your isolated
+Paperclip API URL when running dev Storybook. Published Storybook builds automatically
+package avatar PNGs using the API renderer; static hosting needs no API proxy.
 
 ### Investigating polling load
 
@@ -1600,3 +1784,12 @@ from stored configuration problems. Verify connection transport and endpoint
 fields before disabling a connection. Verify workspace ownership, active runs,
 Git state, and runtime-service readiness before closing a workspace. A missing
 URL or old workspace timestamp alone does not prove that a row is disposable.
+
+### Browser realtime connection recovery
+
+If a browser cannot construct a WebSocket, the live-update and run transcript
+clients use their disconnected retry paths. While the company event stream is
+disconnected, visible active queries refresh every 15 seconds. This fallback
+stops when the socket opens, the tab is hidden, or the provider unmounts. A
+reconnected socket also refreshes visible queries to recover missed events.
+Run log views retain their existing HTTP polling fallback.

@@ -54,8 +54,8 @@ import { TIMER_DISPATCH_PARK_RECOVERY_CAUSE, TIMER_DISPATCH_PARK_RECOVERY_KIND }
 import {
   evaluateRecoveryRateAlert,
   isCompleteRecoveryWeek,
+  loadWeeklyRecoveryRates,
   recoveryRateAlertArtifactKey,
-  type WeeklyRecoveryRate,
 } from "./recovery-observability.js";
 import {
   BLOCKER_ATTENTION_MAX_DEPTH,
@@ -1473,38 +1473,9 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
       // same report the dashboard serves, so the artifact can never disagree
       // with it; it exits when no week breaches.
       {
-        const windowWeeks = 8;
-        // Match recovery-observability's week window: from the Monday of the
-        // week (windowWeeks - 1) ago so the "complete week" claim holds.
-        const utcMidnight = Date.UTC(
-          new Date(now).getUTCFullYear(),
-          new Date(now).getUTCMonth(),
-          new Date(now).getUTCDate(),
-        );
-        const mondayOffset = (new Date(utcMidnight).getUTCDay() + 6) % 7;
-        const since = new Date(utcMidnight - (mondayOffset + (windowWeeks - 1) * 7) * 24 * 60 * 60 * 1000);
-        const runRows = (await db.execute(sql`
-          SELECT to_char(date_trunc('week', ${heartbeatRuns.createdAt} AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS week_start,
-                 count(*)::int AS runs
-          FROM ${heartbeatRuns}
-          WHERE ${heartbeatRuns.companyId} = ${companyId} AND ${heartbeatRuns.createdAt} >= ${since.toISOString()}::timestamptz
-          GROUP BY week_start
-        `)) as unknown as Iterable<{ week_start: string; runs: number | string }>;
-        const actionRows = (await db.execute(sql`
-          SELECT to_char(date_trunc('week', ${issueRecoveryActions.createdAt} AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS week_start,
-                 count(*)::int AS actions
-          FROM ${issueRecoveryActions}
-          WHERE ${issueRecoveryActions.companyId} = ${companyId} AND ${issueRecoveryActions.createdAt} >= ${since.toISOString()}::timestamptz
-          GROUP BY week_start
-        `)) as unknown as Iterable<{ week_start: string; actions: number | string }>;
-        const runsByWeek = new Map<string, number>();
-        for (const row of runRows) runsByWeek.set(String(row.week_start), Number(row.runs));
-        const actionsByWeek = new Map<string, number>();
-        for (const row of actionRows) actionsByWeek.set(String(row.week_start), Number(row.actions));
-        const weekly: WeeklyRecoveryRate[] = Array.from(runsByWeek.keys()).sort().map((weekStart) => {
-          const runs = runsByWeek.get(weekStart) ?? 0;
-          const recoveryActions = actionsByWeek.get(weekStart) ?? 0;
-          return { weekStart, runs, recoveryActions, ratePercent: runs > 0 ? Math.round((recoveryActions / runs) * 10000) / 100 : 0 };
+        const weekly = await loadWeeklyRecoveryRates(db, companyId, {
+          now: new Date(now),
+          weeks: 8,
         });
         // Only complete (elapsed) weeks count: the current partial week has an
         // incomplete run denominator and would false-breach.

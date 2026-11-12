@@ -13,6 +13,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueExecutionDecisions,
+  issueWorkProducts,
   issues,
   projects,
   executionWorkspaces,
@@ -44,7 +45,13 @@ import type * as GitHubCredential from "../services/github-credential.js";
 const github = vi.hoisted(() => vi.fn<typeof fetch>());
 vi.mock("../services/github-fetch.js", async (original) => ({
   ...await original<typeof GitHubFetch>(),
-  ghFetch: github,
+  // SUP-21902: the done-transition guard resolves the declared probe head and the
+  // delivery default branch tip through the commits API; the mocked remote serves
+  // the same head for both, so the fixtures' named probe heads match the merge head.
+  ghFetch: (url: string, init?: RequestInit) =>
+    typeof url === "string" && /\/commits\//.test(url)
+      ? Promise.resolve({ ok: true, status: 200, json: async () => ({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }) } as unknown as Response)
+      : github(url, init),
 }));
 vi.mock("../services/github-credential.js", async (original) => {
   const actual = await original<typeof GitHubCredential>();
@@ -139,6 +146,32 @@ async function seedAgent(db: Db, companyId: string, permissions: Record<string, 
     permissions,
   }).returning();
   return agent!;
+}
+
+// The done-transition guard writes its audit rows fire-and-forget (`void writeAuditLog`),
+// so a refused request can return before its activity_log insert commits. That insert
+// can land between the activity_log delete and the companies delete in teardown and
+// block it with activity_log_company_id_companies_id_fk. Re-clear the log and retry.
+// Once the company is gone a still-late insert fails the same FK and is swallowed.
+function causedByActivityLogCompanyFk(error: unknown): boolean {
+  for (let current: unknown = error, depth = 0; current && depth < 6; depth += 1) {
+    if ((current as { constraint_name?: unknown }).constraint_name === "activity_log_company_id_companies_id_fk") return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+async function deleteCompaniesAfterLateAuditWrites(db: Db) {
+  for (let attempt = 0; ; attempt += 1) {
+    await db.delete(activityLog);
+    try {
+      await db.delete(companies);
+      return;
+    } catch (error) {
+      if (attempt >= 4 || !causedByActivityLogCompanyFk(error)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
+    }
+  }
 }
 
 async function seedProject(db: Db, companyId: string, name: string) {
@@ -237,7 +270,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     await db.delete(agents);
     await db.delete(executionWorkspaces);
     await db.delete(projects);
-    await db.delete(companies);
+    await deleteCompaniesAfterLateAuditWrites(db);
   });
 
   afterAll(async () => {
@@ -261,6 +294,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     mergeArmingEnabled = false,
     deliveryRequirement,
     assigneeAgentId = null,
+    mentionState,
   }: {
     draft?: boolean;
     missing?: boolean;
@@ -271,6 +305,8 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     mergeArmingEnabled?: boolean;
     deliveryRequirement?: IssueDeliveryRequirement;
     assigneeAgentId?: string | null;
+    /** SUP-22346: cache the mentioned PR as merged/closed out-of-band ("merged" | "ambiguous") or closed-unmerged. */
+    mentionState?: "merged" | "ambiguous" | "closed-unmerged";
   } = {}) {
     const company = await seedCompany(db);
     if (mergeArmingEnabled) {
@@ -315,9 +351,20 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         skippedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
       },
     }).where(eq(issues.id, issue.id));
+    // SUP-22346: mentionState models the out-of-band-merged carrier — the
+    // cached mention is closed, so every open-PR resolver sees nothing and the
+    // live open-PR list is empty.
+    const mergedMention = mentionState === "merged" || mentionState === "ambiguous";
     const pr = {
       number: 42, state: "open", draft, merged: false, node_id: "sandbox-pr",
       title: identifier, head: { ref: branch, sha: "a".repeat(40), repo: { full_name: "TEA-Core/paperclip" } },
+      ...(mentionState
+        ? {
+            state: "closed" as const,
+            merged: mergedMention,
+            ...(mergedMention ? { merge_commit_sha: "c".repeat(40), base: { ref: "main" } } : {}),
+          }
+        : {}),
     };
     if (repo && !missing) {
       const [object] = await db.insert(externalObjects).values({
@@ -331,6 +378,20 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
           companyId: company.id, sourceIssueId: issue.id, sourceKind: "description",
           objectId: object!.id, providerKey: "github", detectorKey: "github_pr", objectType: "pull_request",
           matchedTextRedacted: "delivery", sanitizedDisplayUrl: object!.sanitizedCanonicalUrl,
+          canonicalIdentityHash: randomUUID(), canonicalIdentity: {},
+        });
+      }
+      if (mentionState === "ambiguous") {
+        const [object43] = await db.insert(externalObjects).values({
+          companyId: company.id, providerKey: "github", objectType: "pull_request",
+          externalId: "TEA-Core/paperclip#pull/43", displayKey: "43", displayTitle: identifier,
+          sanitizedCanonicalUrl: "https://github.com/TEA-Core/paperclip/pull/43",
+          canonicalIdentityHash: randomUUID(), data: { ...pr, number: 43 },
+        }).returning();
+        await db.insert(externalObjectMentions).values({
+          companyId: company.id, sourceIssueId: issue.id, sourceKind: "description",
+          objectId: object43!.id, providerKey: "github", detectorKey: "github_pr", objectType: "pull_request",
+          matchedTextRedacted: "delivery", sanitizedDisplayUrl: object43!.sanitizedCanonicalUrl,
           canonicalIdentityHash: randomUUID(), canonicalIdentity: {},
         });
       }
@@ -375,14 +436,19 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         writes.push({ url, body: JSON.parse(String(init.body)) });
         return Response.json({ id: 1 });
       }
+      if (url.includes("/pulls/43")) {
+        return Response.json({ ...pr, number: 43 });
+      }
       if (url.includes("/pulls/42")) {
         const [stored] = await db.select().from(issues).where(eq(issues.id, issue.id));
         const head = moveAfterPreflight && stored!.executionState?.lastDecisionOutcome === "approved"
           ? { ...pr.head, sha: "b".repeat(40) } : pr.head;
         return Response.json({ ...pr, head });
       }
-      if (url.includes("/pulls?")) return Response.json(missing ? [] : [pr]);
-      if (url.includes("/compare/")) return Response.json({ ahead_by: 1 });
+      if (url.includes("/pulls?")) return Response.json(mentionState ? [] : missing ? [] : [pr]);
+      if (url.includes("/compare/")) {
+        return Response.json(mergedMention ? { status: "behind", ahead_by: 0 } : { ahead_by: 1 });
+      }
       if (url.includes("/git/ref/")) return Response.json({ object: { sha: pr.head.sha } });
       throw new Error(`Unexpected sandbox request: ${url}`);
     });
@@ -583,6 +649,46 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight" });
   });
 
+  it("accepts the final approval whose only resolvable carrier is one verified merged mentioned PR (SUP-22346)", async () => {
+    const fixture = await pendingDelivery({ mentionState: "merged" });
+    const response = await fixture.approve();
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.status).toBe("done");
+    expect(stored.executionState).toMatchObject({
+      completedStageIds: [fixture.stageId], lastDecisionOutcome: "approved",
+      approvalStatus: { approvedHeadSha: fixture.pr.head.sha },
+    });
+    // Publication stays open-PR-only: a merged carrier gets no status write.
+    expect(fixture.writes).toEqual([]);
+    expect(fixture.armCalls).toEqual([]);
+  });
+
+  it("keeps the merged-carrier gate fail-closed when the mentioned PR is closed but NOT merged (SUP-22346)", async () => {
+    const fixture = await pendingDelivery({ mentionState: "closed-unmerged" });
+    const response = await fixture.approve();
+
+    expect(response.status).toBe(409);
+    expect(response.body).toMatchObject({
+      details: { code: "approval_final_delivery_preflight", reason: expect.stringContaining("no-pr") },
+    });
+    expect((await fixture.read()).status).toBe("in_review");
+    expect(fixture.writes).toEqual([]);
+  });
+
+  it("keeps the merged-carrier gate fail-closed when two mentioned PRs are live-merged (SUP-22346)", async () => {
+    const fixture = await pendingDelivery({ mentionState: "ambiguous" });
+    const response = await fixture.approve();
+
+    expect(response.status).toBe(409);
+    expect(response.body).toMatchObject({
+      details: { code: "approval_final_delivery_preflight", reason: expect.stringContaining("ambiguous: multiple merged mentioned PRs (2)") },
+    });
+    expect((await fixture.read()).status).toBe("in_review");
+    expect(fixture.writes).toEqual([]);
+  });
+
   it("allows a final approval with an accepted merged-elsewhere override when no linked PR resolves (SUP-21498)", async () => {
     const fixture = await pendingDelivery({ missing: true, deliveryRequirement: "repository_delivery" });
     const response = await fixture.approve({
@@ -694,6 +800,97 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
     expect(fixture.writes).toEqual([]);
   });
+
+  it("refuses a PATCH final verdict when the assignee changes after external preflight", async () => {
+    const fixture = await pendingDelivery({ holdPull: true, mergeArmingEnabled: true });
+    const other = await seedAgent(db, fixture.company.id);
+    const receipts = await db.select().from(issueDeliveryReceipts)
+      .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id));
+    const approval = fixture.approve().then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, approval, async () => {
+      await db.update(issues).set({ assigneeAgentId: other.id, assigneeUserId: null })
+        .where(eq(issues.id, fixture.issue.id));
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_review");
+    expect(stored.assigneeAgentId).toBe(other.id);
+    expect(stored.assigneeUserId).toBeNull();
+    expect(stored.executionState).toMatchObject({
+      status: "pending", completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+    });
+    expect(stored.executionState?.approvalStatus).toBeUndefined();
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(await db.select().from(issueDeliveryReceipts)
+      .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id))).toEqual(receipts);
+    expect(fixture.writes).toEqual([]);
+    expect(fixture.armCalls).toEqual([]);
+  });
+
+  it("refuses a PATCH final verdict when the execution policy changes after external preflight", async () => {
+    const fixture = await pendingDelivery({ holdPull: true, mergeArmingEnabled: true });
+    const initial = await fixture.read();
+    const racedPolicy = {
+      ...(initial.executionPolicy as Record<string, unknown>),
+      commentRequired: true,
+    };
+    const receipts = await db.select().from(issueDeliveryReceipts)
+      .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id));
+    const approval = fixture.approve().then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, approval, async () => {
+      await db.update(issues).set({ executionPolicy: racedPolicy })
+        .where(eq(issues.id, fixture.issue.id));
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_review");
+    expect(stored.executionPolicy).toEqual(racedPolicy);
+    expect(stored.executionState).toMatchObject({
+      status: "pending", completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+    });
+    expect(stored.executionState?.approvalStatus).toBeUndefined();
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(await db.select().from(issueDeliveryReceipts)
+      .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id))).toEqual(receipts);
+    expect(fixture.writes).toEqual([]);
+    expect(fixture.armCalls).toEqual([]);
+  });
+
+  it.each(["assignee", "execution policy"] as const)(
+    "does not reject a record-only final approval when the %s changes after external preflight",
+    async (change) => {
+      const fixture = await pendingDelivery({ deliveryRequirement: "record_only", holdPull: true });
+      const initial = await fixture.read();
+      const other = await seedAgent(db, fixture.company.id);
+      const racedPolicy = {
+        ...(initial.executionPolicy as Record<string, unknown>),
+        commentRequired: true,
+      };
+      const approval = fixture.approve().then((response) => response);
+      const response = await raceAtDecisionTransaction(fixture, approval, async () => {
+        await db.update(issues)
+          .set(change === "assignee"
+            ? { assigneeAgentId: other.id, assigneeUserId: null }
+            : { executionPolicy: racedPolicy })
+          .where(eq(issues.id, fixture.issue.id));
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body.details).toBeUndefined();
+      const stored = await fixture.read();
+      expect(stored.status).toBe("done");
+      expect(stored.deliveryRequirement).toBe("record_only");
+      expect(stored.executionState).toMatchObject({
+        completedStageIds: [fixture.stageId], lastDecisionOutcome: "approved",
+      });
+      expect(
+        (stored.executionState?.approvalStatus as Record<string, unknown> | undefined)?.finalDelivery,
+      ).toBeUndefined();
+      expect(await db.select({ outcome: issueExecutionDecisions.outcome }).from(issueExecutionDecisions)
+        .where(eq(issueExecutionDecisions.issueId, fixture.issue.id))).toEqual([{ outcome: "approved" }]);
+    },
+  );
 
   it("refuses a final board verdict when the delivery binding changes during the preflight without touching the issue row", async () => {
     const previous = process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
@@ -923,7 +1120,14 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
           unsubscribe();
         }
         expect(response.status, JSON.stringify(response.body)).toBe(409);
-        expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+        // A recorded PR number, issue status, or review stage that moved since the read is a
+        // snapshot change: PATCH and comment lock the row and refuse it with the snapshot guard
+        // before the final delivery preflight runs. The escalation door runs that preflight first.
+        expect(response.body.details).toMatchObject({
+          code: (change === "recorded PR identity" || change === "status" || change === "stage transition") && door !== "escalation"
+            ? "review_stall_policy_changed"
+            : "approval_final_delivery_preflight_stale",
+        });
         const stored = await fixture.read();
         expect(stored.status).toBe(change === "status" ? "blocked" : "in_review");
         expect(stored.executionState).toMatchObject({
@@ -1165,10 +1369,18 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         returnAssignee: { type: "agent", agentId: authorId, userId: null },
       },
     }).where(eq(issues.id, fixture.issue.id));
+    // SUP-21902: recorded delivery merge commit for the Tier 2 origin guard.
+    await db.insert(issueWorkProducts).values({
+      companyId: fixture.company.id, issueId: fixture.issue.id, type: "pull_request", provider: "github",
+      externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+      reviewState: "none", isPrimary: true, healthStatus: "unknown",
+      metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    });
     return {
       app: createApp(db, agentActor(fixture.company, author!, actorRun!.id)),
       actorRun: actorRun!,
-      comment: "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): the stage participant re-ran the close against the armed card and the delivery ref is unchanged.",
+      comment: "Looks good.\n\nkind: review\ndecision: approved\n\nClosed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: the stage participant re-ran the close against the armed card and the delivery ref is unchanged.",
     };
   }
 
@@ -1247,6 +1459,96 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       .where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id))).toEqual(receipts);
     expect(fixture.writes).toEqual([]);
     expect(fixture.armCalls).toEqual([]);
+  });
+
+  async function recaseAgentSeat(fixture: Awaited<ReturnType<typeof pendingDelivery>>, change: { seat?: boolean; policyAgentId?: (agentId: string) => string }) {
+    const row = await fixture.read();
+    const policy = structuredClone(row.executionPolicy) as { stages: Array<{ participants: Array<{ agentId?: string }> }> };
+    const state = structuredClone(row.executionState) as { currentParticipant: { agentId: string } };
+    const participant = policy.stages[0]!.participants[0]!;
+    const original = participant.agentId!;
+    if (change.policyAgentId) participant.agentId = change.policyAgentId(original);
+    if (change.seat) state.currentParticipant.agentId = state.currentParticipant.agentId.toUpperCase();
+    expect(change.seat ? state.currentParticipant.agentId : participant.agentId).not.toBe(original);
+    await db.update(issues).set({ executionPolicy: policy, executionState: state }).where(eq(issues.id, fixture.issue.id));
+  }
+
+  it("approves a final PATCH when only the letter case of the seated agent id and the policy participant agent id changes after the external preflight", async () => {
+    const fixture = await pendingDelivery({ holdPull: true });
+    const { app, comment } = await staleRunFinalReview(fixture);
+    const pending = request(app).patch(`/api/issues/${fixture.issue.id}`)
+      .send({ status: "done", comment }).then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, pending, () =>
+      recaseAgentSeat(fixture, { seat: true, policyAgentId: (agentId) => agentId.toUpperCase() }));
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const stored = await fixture.read();
+    expect(stored.status).toBe("done");
+    expect(stored.executionState).toMatchObject({ lastDecisionOutcome: "approved", completedStageIds: [fixture.stageId] });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([
+      expect.objectContaining({ outcome: "approved", stageId: fixture.stageId }),
+    ]);
+  });
+
+  it("approves a final PATCH when only the letter case of a policy participant agent id changes between the external preflight and the lock", async () => {
+    const fixture = await pendingDelivery({ holdPull: true });
+    const authorId = (await fixture.read()).createdByAgentId!;
+    const seated = await fixture.read();
+    const seededPolicy = structuredClone(seated.executionPolicy) as { stages: Array<{ participants: Array<Record<string, unknown>> }> };
+    seededPolicy.stages[0]!.participants.push({ type: "agent", agentId: authorId, userId: null });
+    await db.update(issues).set({ executionPolicy: seededPolicy }).where(eq(issues.id, fixture.issue.id));
+    const approval = fixture.approve().then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, approval, async () => {
+      const row = await fixture.read();
+      const policy = structuredClone(row.executionPolicy) as { stages: Array<{ participants: Array<{ type: string; agentId?: string }> }> };
+      const agent = policy.stages[0]!.participants.find((participant) => participant.type === "agent")!;
+      expect(agent.agentId).toBe(authorId);
+      agent.agentId = authorId.toUpperCase();
+      expect(agent.agentId).not.toBe(authorId);
+      await db.update(issues).set({ executionPolicy: policy }).where(eq(issues.id, fixture.issue.id));
+    });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect((await fixture.read()).status).toBe("done");
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([expect.objectContaining({ outcome: "approved" })]);
+  });
+
+  it("refuses a final PATCH when the policy participant changes to a different agent after the external preflight", async () => {
+    const fixture = await pendingDelivery({ holdPull: true });
+    const { app, comment } = await staleRunFinalReview(fixture);
+    const other = await seedAgent(db, fixture.company.id);
+    const pending = request(app).patch(`/api/issues/${fixture.issue.id}`)
+      .send({ status: "done", comment }).then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, pending, () =>
+      recaseAgentSeat(fixture, { policyAgentId: () => other.id }));
+
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_progress");
+    expect(stored.executionState).toMatchObject({ status: "pending", completedStageIds: [], lastDecisionId: null });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+  });
+
+  it("refuses a final PATCH when only the letter case of a policy participant user id changes after the external preflight", async () => {
+    const fixture = await pendingDelivery({ holdPull: true });
+    const approval = fixture.approve().then((response) => response);
+    const response = await raceAtDecisionTransaction(fixture, approval, async () => {
+      const row = await fixture.read();
+      const policy = structuredClone(row.executionPolicy) as { stages: Array<{ participants: Array<{ userId?: string }> }> };
+      const participant = policy.stages[0]!.participants[0]!;
+      expect(participant.userId).toBe("board-user");
+      participant.userId = "BOARD-USER";
+      await db.update(issues).set({ executionPolicy: policy }).where(eq(issues.id, fixture.issue.id));
+    });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "review_stall_policy_changed" });
+    const stored = await fixture.read();
+    expect(stored.status).toBe("in_review");
+    expect(stored.executionState).toMatchObject({ status: "pending", completedStageIds: [], lastDecisionId: null });
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    expect(fixture.writes).toEqual([]);
   });
 
   it.each([

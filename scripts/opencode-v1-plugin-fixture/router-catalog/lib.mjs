@@ -1,0 +1,103 @@
+// Pure catalog builder for the opencode router plugin. Kept outside plugin/ on
+// purpose: opencode calls every function a plugin module exports as a plugin.
+
+// Headroom opencode leaves below a model's window before it compacts.
+export const CONTEXT_MARGIN = 76800;
+// Assumed context window for a model that declares none.
+export const DEFAULT_CONTEXT = 262144;
+const OUTPUT = { default: 32768, cheap: 16384 };
+const MODELS_OUTPUT = 32768;
+
+// Header -> env var carrying the run identity. opencode
+// interpolates "{env:VAR}" only while it loads the static config file, so a
+// plugin that returns the template gets it passed through to the provider
+// verbatim. The router would then read "{env:PAPERCLIP_RUN_ID}" as a literal run
+// id, the same string for every request, so the identity would be wrong.
+// Expand here instead.
+const IDENTITY_HEADERS = {
+  "X-Paperclip-Run": "PAPERCLIP_WORKSPACE_CWD",
+  "X-Paperclip-Run-Id": "PAPERCLIP_RUN_ID",
+  // Forwarded when available; omitted rather than empty when a run has no issue.
+  "X-Paperclip-Issue": "PAPERCLIP_ISSUE_IDENTIFIER",
+};
+
+// An unset or empty var omits its header rather than sending a placeholder; the
+// router would then be unable to identify the run.
+function identityHeaders(env) {
+  const headers = {};
+  for (const [header, name] of Object.entries(IDENTITY_HEADERS)) {
+    const value = env?.[name];
+    if (value) headers[header] = value;
+  }
+  return headers;
+}
+
+const SEAT_KEY = /^(.+)-(default|cheap)$/;
+
+function contextLimit(window) {
+  const ctx = window > 0 ? window : DEFAULT_CONTEXT;
+  return Math.max(ctx - CONTEXT_MARGIN, Math.floor(ctx / 2));
+}
+
+function openaiCompatible(name, baseURL, headers) {
+  return { npm: "@ai-sdk/openai-compatible", name, options: { baseURL, headers: { ...headers } }, models: {} };
+}
+
+// Smallest context window declared by any configured target, including ones
+// that may return later, so a turn sized for a larger target cannot overflow it.
+function smallestRungWindow(targets) {
+  const windows = targets.map((t) => t.maxContextTokens ?? 0).filter((w) => w > 0);
+  return windows.length ? Math.min(...windows) : 0;
+}
+
+export function buildCatalog({ rules, models, base, env = process.env }) {
+  const provider = {};
+  const headers = identityHeaders(env);
+
+  for (const [key, role] of Object.entries(rules?.roles ?? {})) {
+    const m = SEAT_KEY.exec(key);
+    if (!m) continue;
+    const [, seat, tier] = m;
+    const targets = role?.targets ?? [];
+    if (!targets.some((t) => !t.disabled)) continue;
+    const id = `router-${seat}`;
+    provider[id] ??= openaiCompatible(`Router ${seat}`, `${base}/${seat}/v1`, headers);
+    provider[id].models[key] = {
+      name: `${key} (router)`,
+      limit: { context: contextLimit(smallestRungWindow(targets)), output: OUTPUT[tier] },
+    };
+  }
+
+  const served = models?.data ?? [];
+  if (served.length) {
+    const r = openaiCompatible("Router models", `${base}/v1`, headers);
+    for (const model of served) {
+      r.models[model.id] = {
+        name: `${model.id} (router)`,
+        limit: { context: contextLimit(model.context_length ?? 0), output: MODELS_OUTPUT },
+      };
+    }
+    provider.router = r;
+  }
+
+  return { provider, enabled_providers: Object.keys(provider) };
+}
+
+// Mutates opencode's merged config in place: router providers only. A stub a
+// caller registered for its configured model (Paperclip does this) is merged
+// under the generated entry rather than discarded.
+export function applyCatalog(cfg, catalog) {
+  const existing = cfg.provider ?? {};
+  const next = {};
+  for (const [id, generated] of Object.entries(catalog.provider)) {
+    const prior = existing[id] ?? {};
+    const models = {};
+    for (const [mid, def] of Object.entries(generated.models)) {
+      models[mid] = { ...(prior.models?.[mid] ?? {}), ...def };
+    }
+    next[id] = { ...generated, models };
+  }
+  cfg.provider = next;
+  cfg.enabled_providers = [...catalog.enabled_providers];
+  return cfg;
+}

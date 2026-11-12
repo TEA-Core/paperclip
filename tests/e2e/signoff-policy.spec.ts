@@ -1,4 +1,12 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { test, expect, request as pwRequest, type APIRequestContext } from "@playwright/test";
+import {
+  TIER2_RECORDED_MERGE_COMMIT,
+  recordTier2MergedDelivery,
+  seedTier2Project,
+} from "./fixtures/tier2-delivery";
 
 /**
  * E2E: Signoff execution policy flow.
@@ -24,6 +32,11 @@ import { test, expect, request as pwRequest, type APIRequestContext } from "@pla
 const PORT = Number(process.env.PAPERCLIP_E2E_PORT ?? 3199);
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 const COMPANY_NAME = `E2E-Signoff-${Date.now()}`;
+// SUP-21902: machine-checkable Tier 2 close line; the probe head is the merge commit
+// recordTier2MergedDelivery stamps on each issue.
+const TIER2_CLOSE_LINE =
+  "Closed at Tier 2 (live): probe `e2e signoff flow re-read the issue post-close on the live deployment` head " +
+  `${TIER2_RECORDED_MERGE_COMMIT} post-merge: verified done.`;
 
 interface AgentAuth {
   agentId: string;
@@ -34,6 +47,8 @@ interface AgentAuth {
 
 interface TestContext {
   companyId: string;
+  projectId: string;
+  projectCwd: string;
   companyPrefix: string;
   executor: AgentAuth;
   reviewer: AgentAuth;
@@ -168,6 +183,29 @@ async function getIssueRunLockState(board: APIRequestContext, issueId: string): 
   };
 }
 
+/**
+ * Run id a lock-race retry should PATCH under: the issue's current lock holder
+ * when that run belongs to `agent`, else the agent's own invoked run.
+ *
+ * A reassignment can leave another agent's still-running run holding the lock
+ * for a moment. The server rejects an agent token carrying a run id that is not
+ * that agent's (403 `cross_issue_influence_run_context_required`), which is not
+ * a 409, so adopting the holder blindly ends the retry loop on a transient lock.
+ * Under the agent's own run id the PATCH stays a 409 until the lock is released.
+ */
+async function lockRunIdForAgent(
+  board: APIRequestContext,
+  agent: AgentAuth,
+  issueRunLock: IssueRunLockState,
+  ownRunId: string,
+) {
+  const holderRunId = issueRunLock.checkoutRunId ?? issueRunLock.executionRunId;
+  if (!holderRunId || holderRunId === ownRunId) return ownRunId;
+  const holderRes = await board.get(`${BASE_URL}/api/heartbeat-runs/${holderRunId}`);
+  if (!holderRes.ok()) return ownRunId;
+  return (await holderRes.json()).agentId === agent.agentId ? holderRunId : ownRunId;
+}
+
 async function retryAgentPatchWithCurrentLockOnConflict(
   board: APIRequestContext,
   agent: AgentAuth,
@@ -183,7 +221,7 @@ async function retryAgentPatchWithCurrentLockOnConflict(
     const issueRunLock = await getIssueRunLockState(board, issueId);
     if (issueRunLock.assigneeAgentId !== agent.agentId) return res;
 
-    const lockedRunId = issueRunLock.checkoutRunId ?? issueRunLock.executionRunId ?? fallbackRunId;
+    const lockedRunId = await lockRunIdForAgent(board, agent, issueRunLock, fallbackRunId);
     res = await agent.request.patch(`${BASE_URL}/api/issues/${issueId}`, {
       headers: { "X-Paperclip-Run-Id": lockedRunId },
       data: patchData,
@@ -236,8 +274,7 @@ async function agentPatch(
     // A 409 on an issue no longer assigned to us is a genuine rejection, not a
     // run-lock race — leave it for the caller to assert on.
     if (issueRunLock.assigneeAgentId !== agent.agentId) break;
-    const retryRunId = issueRunLock.checkoutRunId ?? issueRunLock.executionRunId ?? runId;
-    res = await patchWith(retryRunId);
+    res = await patchWith(await lockRunIdForAgent(board, agent, issueRunLock, runId));
   }
   return res;
 }
@@ -339,6 +376,14 @@ async function setupCompany(boardRequest: APIRequestContext): Promise<TestContex
   const companyId = company.id;
   const companyPrefix = company.issuePrefix ?? company.prefix ?? company.urlKey ?? "E2E";
 
+  // SUP-21902: synthetic repository and credential for the Tier 2 closes below.
+  // The project's primary workspace names the delivery repository and points at
+  // a local git directory: without a cwd every heartbeat run would clone the
+  // real repository from GitHub, which slows run binding enough to widen the
+  // run-lock races this suite already retries around.
+  const projectCwd = await mkdtemp(path.join(os.tmpdir(), "paperclip-signoff-project-"));
+  const projectId = (await seedTier2Project(boardRequest, companyId, "E2E Signoff Repo", projectCwd)).id;
+
   // Helper: hire/approve agent + API key + request context
   async function createAgent(name: string, role: string, title: string): Promise<AgentAuth> {
     const agentRes = await boardRequest.post(`${BASE_URL}/api/companies/${companyId}/agent-hires`, {
@@ -383,6 +428,8 @@ async function setupCompany(boardRequest: APIRequestContext): Promise<TestContex
 
   return {
     companyId,
+    projectId,
+    projectCwd,
     companyPrefix,
     executor,
     reviewer,
@@ -402,12 +449,20 @@ async function createIssueWithPolicy(ctx: TestContext, title: string, stages?: u
       title,
       status: "in_progress",
       assigneeAgentId: ctx.executor.agentId,
+      projectId: ctx.projectId,
+      // SUP-21902: this suite exercises the signoff stage ladder, not the
+      // repository delivery preflight; record-only delivery means the final
+      // close owes only the Tier 2 probe-head predicate (verified against
+      // the synthetic repo/recorded merge commit seeded above).
+      deliveryRequirement: "record_only",
       executionPolicy: { stages: stages ?? defaultStages },
     },
   });
   expect(res.ok()).toBe(true);
   const issue = await res.json();
   ctx.issueIds.push(issue.id);
+  // SUP-21902: record this delivery's merge commit for the Tier 2 origin guard.
+  await recordTier2MergedDelivery(ctx.boardRequest, issue.id);
   return issue;
 }
 
@@ -440,6 +495,7 @@ test.describe("Signoff execution policy", () => {
     }
     await board.delete(`${BASE_URL}/api/companies/${ctx.companyId}`).catch(() => {});
     await board.dispose();
+    await rm(ctx.projectCwd, { recursive: true, force: true });
   });
 
   test("happy path: executor → review → approval → done", async ({ page }) => {
@@ -495,7 +551,7 @@ test.describe("Signoff execution policy", () => {
     // Step 5: Approver approves → should complete
     const step5Res = await agentPatch(
       ctx.boardRequest, ctx.approver, issueId,
-      { status: "done", comment: "Approved. Ship it.\n\nClosed at Tier 2 (live): e2e signoff flow re-read the issue post-close on the live deployment and verified done." },
+      { status: "done", comment: `Approved. Ship it.\n\n${TIER2_CLOSE_LINE}` },
     );
     expect(step5Res.ok()).toBe(true);
     const step5Issue = await step5Res.json();
@@ -612,7 +668,7 @@ test.describe("Signoff execution policy", () => {
     // Reviewer approves → should complete immediately (no approval stage)
     const approveRes = await agentPatch(
       ctx.boardRequest, ctx.reviewer, issue.id,
-      { status: "done", comment: "LGTM.\n\nClosed at Tier 2 (live): e2e signoff flow re-read the issue post-close on the live deployment and verified done." },
+      { status: "done", comment: `LGTM.\n\n${TIER2_CLOSE_LINE}` },
     );
     expect(approveRes.ok()).toBe(true);
     const doneIssue = await approveRes.json();

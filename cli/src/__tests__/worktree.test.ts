@@ -1556,6 +1556,60 @@ describe("worktree helpers", () => {
     }
   });
 
+  it("generates a per-worktree decision-signing secret and preserves it across --force re-init", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-decision-"));
+    const repoRoot = path.join(tempRoot, "repo");
+    const originalCwd = process.cwd();
+    const originalDecisionSigningSecret = process.env.PAPERCLIP_DECISION_SIGNING_SECRET;
+
+    try {
+      fs.mkdirSync(repoRoot, { recursive: true });
+      // The production decision-signing secret must never be copied into an
+      // isolated worktree; init has to generate a fresh per-worktree key.
+      process.env.PAPERCLIP_DECISION_SIGNING_SECRET = "production-decision-signing-secret-value";
+      process.chdir(repoRoot);
+
+      await worktreeInitCommand({
+        seed: false,
+        fromConfig: path.join(tempRoot, "missing", "config.json"),
+        home: path.join(tempRoot, ".paperclip-worktrees"),
+      });
+
+      const envPath = path.join(repoRoot, ".paperclip", ".env");
+      const envContents = fs.readFileSync(envPath, "utf8");
+      const match = envContents.match(/^PAPERCLIP_DECISION_SIGNING_SECRET="?([0-9a-f]{64})"?$/m);
+      expect(match).not.toBeNull();
+      const firstSecret = match?.[1] ?? "";
+      expect(firstSecret).not.toBe("production-decision-signing-secret-value");
+      if (process.platform !== "win32") {
+        expect(fs.statSync(envPath).mode & 0o777).toBe(0o600);
+      }
+
+      // A --force re-init wipes .env and rewrites it: the valid existing key
+      // must survive instead of being rotated.
+      await worktreeInitCommand({
+        seed: false,
+        force: true,
+        fromConfig: path.join(tempRoot, "missing", "config.json"),
+        home: path.join(tempRoot, ".paperclip-worktrees"),
+      });
+
+      const reInitContents = fs.readFileSync(envPath, "utf8");
+      expect(reInitContents).toContain(firstSecret);
+      if (process.platform !== "win32") {
+        expect(fs.statSync(envPath).mode & 0o777).toBe(0o600);
+      }
+    } finally {
+      process.chdir(originalCwd);
+      if (originalDecisionSigningSecret === undefined) {
+        delete process.env.PAPERCLIP_DECISION_SIGNING_SECRET;
+      } else {
+        process.env.PAPERCLIP_DECISION_SIGNING_SECRET = originalDecisionSigningSecret;
+      }
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it("preserves repo-managed worktree checkouts when --force re-runs from the source repo", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-force-preserve-"));
     const repoRoot = path.join(tempRoot, "repo");

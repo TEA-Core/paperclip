@@ -1,0 +1,4 @@
+{"id":"evt_19252ecff001JlOsFtR3LdbjZm","type":"session.execution.started","data":{"sessionID":"ses_e6dad1315ffeW3yIhDMiCAAHPN"}}
+{"id":"evt_19252f4d6001oBOSfD6khozbkh","type":"session.step.started","data":{"sessionID":"ses_e6dad1315ffeW3yIhDMiCAAHPN","agent":"build","model":{"id":"m1","providerID":"fx","variant":"default"},"assistantMessageID":"msg_19252ed260013L4qMuBQjkDnSZ","started":1793456270636}}
+{"id":"evt_19252f4d9001qoMf4cLVi5OcS5","type":"session.step.failed","data":{"sessionID":"ses_e6dad1315ffeW3yIhDMiCAAHPN","assistantMessageID":"msg_19252ed260013L4qMuBQjkDnSZ","error":{"type":"aborted","message":"Step interrupted"}}}
+{"id":"evt_19252f4dc001dtDkN4QG20elIo","type":"session.execution.interrupted","data":{"sessionID":"ses_e6dad1315ffeW3yIhDMiCAAHPN","reason":"user"}}

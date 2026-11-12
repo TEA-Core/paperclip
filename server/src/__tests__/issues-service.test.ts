@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   companyMemberships,
@@ -27,6 +28,8 @@ import {
   issues,
   projectWorkspaces,
   projects,
+  plugins,
+  pluginManagedResources,
   workspaceOperations,
   toolApplications,
   toolConnections,
@@ -391,6 +394,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(agentWakeupRequests);
     await db.delete(issueComments);
     await db.delete(issueThreadInteractions);
     await db.delete(issueRelations);
@@ -721,6 +725,208 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       interactionId,
       interactionKind: "ask_user_questions",
       interactionStatus: "expired",
+    });
+  });
+
+  it.each(["done", "cancelled"] as const)("cancels only ineligible deferred wakes when an issue becomes %s", async (status) => {
+    const companyId = await seedAssignableAgentCompany();
+    const agentId = randomUUID();
+    await db.insert(agents).values(agentRow(companyId, {
+      id: agentId,
+      name: "DeferredWakeAgent",
+    }));
+    const issue = await svc.create(companyId, {
+      title: "Close me with a deferred wake",
+      description: null,
+      status: "todo",
+      priority: "medium",
+    });
+    const [userComment, closingRunComment] = await db.insert(issueComments).values([
+      {
+        companyId,
+        issueId: issue.id,
+        authorUserId: "local-board",
+        body: "Please handle this follow-up",
+      },
+      {
+        companyId,
+        issueId: issue.id,
+        authorAgentId: agentId,
+        body: "Closing this issue",
+      },
+    ]).returning();
+    const otherIssueId = randomUUID();
+    const [targetWake, unrelatedWake, queuedWake, userCommentWake, coalescedCommentWake, agentOnlyCommentWake] = await db.insert(agentWakeupRequests).values([
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_execution_deferred",
+        status: "deferred_issue_execution",
+        payload: { issueId: issue.id },
+      },
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_execution_deferred",
+        status: "deferred_issue_execution",
+        payload: { issueId: otherIssueId },
+      },
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_commented",
+        status: "queued",
+        payload: { issueId: issue.id },
+      },
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_commented",
+        status: "deferred_issue_execution",
+        requestedByActorType: "user",
+        requestedByActorId: "local-board",
+        payload: {
+          issueId: issue.id,
+          _paperclipWakeContext: {
+            issueId: issue.id,
+            wakeCommentIds: [userComment!.id],
+          },
+        },
+      },
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_commented",
+        status: "deferred_issue_execution",
+        requestedByActorType: "user",
+        requestedByActorId: "local-board",
+        payload: {
+          issueId: issue.id,
+          _paperclipWakeContext: {
+            issueId: issue.id,
+            wakeCommentIds: [closingRunComment!.id, userComment!.id],
+          },
+        },
+      },
+      {
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_commented",
+        status: "deferred_issue_execution",
+        requestedByActorType: "agent",
+        requestedByActorId: agentId,
+        payload: {
+          issueId: issue.id,
+          _paperclipWakeContext: {
+            issueId: issue.id,
+            wakeCommentIds: [closingRunComment!.id],
+          },
+        },
+      },
+    ]).returning();
+
+    const updated = await svc.update(issue.id, { status, actorUserId: "local-board" });
+    expect(updated?.status).toBe(status);
+
+    const wakes = await db
+      .select({
+        id: agentWakeupRequests.id,
+        status: agentWakeupRequests.status,
+        finishedAt: agentWakeupRequests.finishedAt,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, companyId));
+    const wakesById = new Map(wakes.map((wake) => [wake.id, wake]));
+    expect(wakesById.get(targetWake!.id)).toMatchObject({
+      status: "cancelled",
+      finishedAt: expect.any(Date),
+    });
+    expect(wakesById.get(unrelatedWake!.id)).toMatchObject({
+      status: "deferred_issue_execution",
+      finishedAt: null,
+    });
+    expect(wakesById.get(queuedWake!.id)).toMatchObject({
+      status: "queued",
+      finishedAt: null,
+    });
+    expect(wakesById.get(userCommentWake!.id)).toMatchObject({
+      status: "deferred_issue_execution",
+      finishedAt: null,
+    });
+    expect(wakesById.get(coalescedCommentWake!.id)).toMatchObject({
+      status: "deferred_issue_execution",
+      finishedAt: null,
+    });
+    expect(wakesById.get(agentOnlyCommentWake!.id)).toMatchObject({
+      status: "cancelled",
+      finishedAt: expect.any(Date),
+    });
+  });
+
+  it("uses the locked status when a concurrent reopen races terminal wake cleanup", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const agentId = randomUUID();
+    await db.insert(agents).values(agentRow(companyId, {
+      id: agentId,
+      name: "DeferredWakeAgent",
+    }));
+    const issue = await svc.create(companyId, {
+      title: "Close after a concurrent reopen",
+      description: null,
+      status: "done",
+      priority: "medium",
+    });
+    const [wake] = await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      reason: "issue_execution_deferred",
+      status: "deferred_issue_execution",
+      payload: { issueId: issue.id },
+    }).returning();
+    const holderPidReady = deferred<number>();
+    const reopenCanCommit = deferred<void>();
+    const concurrentReopen = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select ${issues.id} from ${issues} where ${issues.id} = ${issue.id} for update`,
+      );
+      const [backend] = (await tx.execute(sql`select pg_backend_pid() as pid`)) as unknown as Array<{ pid: number }>;
+      holderPidReady.resolve(backend!.pid);
+      await reopenCanCommit.promise;
+      await tx
+        .update(issues)
+        .set({ status: "todo", completedAt: null, updatedAt: new Date() })
+        .where(eq(issues.id, issue.id));
+    });
+    const holderPid = await holderPidReady.promise;
+    const closePromise = svc.update(issue.id, { status: "done", actorUserId: "local-board" });
+    await expect.poll(async () => {
+      const rows = (await db.execute(
+        sql`select 1 from pg_stat_activity where ${holderPid} = any(pg_blocking_pids(pid))`,
+      )) as unknown as Array<unknown>;
+      return rows.length > 0;
+    }, { timeout: 5_000, interval: 10 }).toBe(true);
+    reopenCanCommit.resolve();
+    await concurrentReopen;
+
+    const closed = await closePromise;
+    expect(closed?.status).toBe("done");
+    const [cancelledWake] = await db
+      .select({
+        status: agentWakeupRequests.status,
+        finishedAt: agentWakeupRequests.finishedAt,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wake!.id));
+    expect(cancelledWake).toMatchObject({
+      status: "cancelled",
+      finishedAt: expect.any(Date),
     });
   });
 
@@ -7199,15 +7405,12 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
   });
 
   it("returns the distinct terminal refusal (not a generic conflict) when a close lands in the checkout write window (SUP-15888)", async () => {
-    // Finding 3: the conditional write is gated by
-    // `inArray(status, expectedStatuses)`. A close that commits AFTER the
-    // terminal guard read at the top of `checkout` but BEFORE the write
-    // re-evaluates makes the write miss; the pre-fix code then fell through to
-    // a generic `Issue checkout conflict` instead of the distinct terminal
-    // refusal. This test forces exactly that interleaving deterministically:
-    // the row is live when the guard reads it, and a close is committed during
-    // the write via a db proxy. `checkout` must re-read, see the terminal
-    // status, and raise the distinct code — never the generic conflict.
+    // Checkout reads the card unlocked for the terminal guard, then takes the
+    // issue row lock for the write. A close that commits between the two must
+    // not be re-opened: the locked re-read sees the terminal status and raises
+    // the distinct refusal, never the generic conflict. The close holds the row
+    // lock uncommitted until checkout is observably blocked behind it, so the
+    // interleaving is deterministic.
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -7231,9 +7434,14 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       runtimeConfig: {},
       permissions: {},
     });
-    // Live at the guard read. Null run pointers keep the clear*IfTerminal
-    // helpers (which run before the write) as no-ops, so the only issues-table
-    // write in this path is the checkout's own conditional update.
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date("2026-09-12T04:00:00.000Z"),
+    });
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -7245,48 +7453,46 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       executionRunId: null,
     });
 
-    let closed = false;
-    const closingDb = new Proxy(db, {
-      get(target, prop, receiver) {
-        if (prop === "update") {
-          return function update(table: unknown) {
-            const builder = (target.update as (t: unknown) => any)(table);
-            if (table !== issues) return builder;
-            return {
-              set(values: unknown) {
-                const afterSet = builder.set(values);
-                return {
-                  where(condition: unknown) {
-                    const afterWhere = afterSet.where(condition);
-                    return {
-                      async returning() {
-                        if (!closed) {
-                          closed = true;
-                          // Commit the close precisely in the window between the
-                          // guard read and this conditional write.
-                          await db
-                            .update(issues)
-                            .set({ status: "done", completedAt, updatedAt: new Date() })
-                            .where(eq(issues.id, issueId));
-                        }
-                        // The real conditional write now misses: the row is no
-                        // longer in the expected (live) status.
-                        return afterWhere.returning();
-                      },
-                    };
-                  },
-                };
-              },
-            };
-          };
-        }
-        return Reflect.get(target, prop, receiver);
-      },
+    let releaseClose!: () => void;
+    const closeMayCommit = new Promise<void>((resolve) => {
+      releaseClose = resolve;
     });
+    let closerPid!: number;
+    let closeLocked!: () => void;
+    const closeHoldsLock = new Promise<void>((resolve) => {
+      closeLocked = resolve;
+    });
+    const closing = db.transaction(async (tx) => {
+      await tx
+        .update(issues)
+        .set({ status: "done", completedAt, updatedAt: new Date() })
+        .where(eq(issues.id, issueId));
+      const pidRows = (await tx.execute(sql`select pg_backend_pid() as pid`)) as unknown as Array<{ pid: number }>;
+      closerPid = pidRows[0]!.pid;
+      closeLocked();
+      await closeMayCommit;
+    });
+    await closeHoldsLock;
 
-    const closingSvc = issueService(closingDb as unknown as ReturnType<typeof createDb>);
+    const checkout = svc.checkout(issueId, agentId, ["in_review"], runId);
+    const refusal = checkout.then(
+      () => null,
+      (error: unknown) => error,
+    );
 
-    await expect(closingSvc.checkout(issueId, agentId, ["in_review"], runId)).rejects.toMatchObject({
+    let checkoutBlocked = false;
+    for (let attempt = 0; attempt < 200 && !checkoutBlocked; attempt++) {
+      const rows = (await db.execute(
+        sql`select 1 from pg_stat_activity where ${closerPid} = any(pg_blocking_pids(pid))`,
+      )) as unknown as Array<unknown>;
+      if (rows[0]) checkoutBlocked = true;
+      else await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    releaseClose();
+    await closing;
+    expect(checkoutBlocked).toBe(true);
+
+    expect(await refusal).toMatchObject({
       status: 409,
       details: { code: "checkout_refused_terminal_status", status: "done" },
     });
@@ -7351,13 +7557,13 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     // checkout/execution run is terminal) must not strip the row's
     // assigneeUserId. We exercise this via the adoptStaleCheckoutRun path,
     // which fires when checkoutRunId points at a terminal run while
-    // executionRunId still points at a different, non-terminal run.
+    // executionRunId already names the live acting run (a queued reservation
+    // for any other run would hold the lock and refuse the adoption).
     const companyId = randomUUID();
     const agentId = randomUUID();
     const userId = randomUUID();
     const issueId = randomUUID();
     const failedCheckoutRunId = randomUUID();
-    const queuedExecutionRunId = randomUUID();
     const successorRunId = randomUUID();
 
     await db.insert(companies).values({
@@ -7387,19 +7593,15 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
         finishedAt: new Date("2026-06-10T10:05:00.000Z"),
       },
       {
-        id: queuedExecutionRunId,
-        companyId,
-        agentId,
-        status: "queued",
-        invocationSource: "manual",
-      },
-      {
         id: successorRunId,
         companyId,
         agentId,
         status: "running",
         invocationSource: "manual",
         startedAt: new Date("2026-06-10T10:07:00.000Z"),
+        // Output keeps the acting run from reading as stillborn, so its
+        // execution pointer survives the pre-checkout self-heal.
+        lastOutputAt: new Date("2026-06-10T10:07:30.000Z"),
       },
     ]);
     await db.insert(issues).values({
@@ -7411,7 +7613,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       assigneeAgentId: agentId,
       assigneeUserId: userId,
       checkoutRunId: failedCheckoutRunId,
-      executionRunId: queuedExecutionRunId,
+      executionRunId: successorRunId,
       executionAgentNameKey: "codexcoder",
       executionLockedAt: new Date("2026-06-10T10:00:00.000Z"),
     });
@@ -8495,6 +8697,392 @@ describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
   });
 });
 
+describeEmbeddedPostgres("issueService.update Wiki handoff guard", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-update-wiki-handoff-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(pluginManagedResources);
+    await db.delete(issues);
+    await db.delete(agents);
+    await db.delete(companyMemberships);
+    await db.delete(plugins);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("rejects a direct service reassignment to a non-canonical agent", async () => {
+    const companyId = randomUUID();
+    const pluginId = randomUUID();
+    const canonicalAgentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      packageName: "@paperclipai/plugin-llm-wiki",
+      version: "0.1.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {} as Record<string, unknown>,
+      status: "ready",
+      installOrder: 1,
+    });
+    await db.insert(agents).values([
+      {
+        id: canonicalAgentId,
+        companyId,
+        name: "Wiki Maintainer",
+        role: "engineer",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherAgentId,
+        companyId,
+        name: "Other Agent",
+        role: "engineer",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(pluginManagedResources).values({
+      companyId,
+      pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      resourceKind: "agent",
+      resourceKey: "wiki-maintainer",
+      resourceId: canonicalAgentId,
+      defaultsJson: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Handoff to Wiki Maintainer",
+      assigneeAgentId: canonicalAgentId,
+      executionPolicy: { mode: "normal", stages: [] },
+      executionState: null,
+    });
+
+    await expect(svc.update(issueId, { assigneeAgentId: otherAgentId })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_non_canonical_assignee" }),
+    });
+    await expect(svc.getById(issueId)).resolves.toMatchObject({ assigneeAgentId: canonicalAgentId });
+
+    await db
+      .update(issues)
+      .set({ title: "Ordinary issue", assigneeAgentId: otherAgentId })
+      .where(eq(issues.id, issueId));
+    await expect(svc.update(issueId, { title: "Handoff to Wiki Maintainer" })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({
+        reason: "wiki_handoff_non_canonical_assignee",
+        assigneeAgentId: otherAgentId,
+      }),
+    });
+    await expect(svc.getById(issueId)).resolves.toMatchObject({
+      title: "Ordinary issue",
+      assigneeAgentId: otherAgentId,
+    });
+  });
+
+  it("refuses a user-only assignee write on an unassigned Wiki handoff", async () => {
+    const companyId = randomUUID();
+    const pluginId = randomUUID();
+    const canonicalAgentId = randomUUID();
+    const issueId = randomUUID();
+    const userId = `board-${randomUUID()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      packageName: "@paperclipai/plugin-llm-wiki",
+      version: "0.1.0",
+      apiVersion: 1,
+      categories: [],
+      manifestJson: {} as never,
+      status: "ready",
+      installOrder: 1,
+    });
+    await db.insert(agents).values({
+      id: canonicalAgentId,
+      companyId,
+      name: "Wiki Maintainer",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(pluginManagedResources).values({
+      companyId,
+      pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      resourceKind: "agent",
+      resourceKey: "wiki-maintainer",
+      resourceId: canonicalAgentId,
+      defaultsJson: {},
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: userId,
+      status: "active",
+      membershipRole: "member",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Handoff to Wiki Maintainer",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      executionPolicy: { mode: "normal", stages: [] },
+      executionState: null,
+    });
+
+    await expect(svc.update(issueId, { assigneeUserId: userId })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
+    });
+    await expect(svc.getById(issueId)).resolves.toMatchObject({
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    });
+  });
+
+  it("admits allow-listed bookkeeping and refuses other keys on a non-canonical Wiki handoff", async () => {
+    const companyId = randomUUID();
+    const pluginId = randomUUID();
+    const canonicalAgentId = randomUUID();
+    const intruderId = randomUUID();
+    const userId = `board-${randomUUID()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      packageName: "@paperclipai/plugin-llm-wiki",
+      version: "0.1.0",
+      apiVersion: 1,
+      categories: [],
+      manifestJson: {} as never,
+      status: "ready",
+      installOrder: 1,
+    });
+    await db.insert(agents).values([
+      { id: canonicalAgentId, companyId, name: "Wiki Maintainer", role: "engineer", status: "active", adapterType: "process", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+      { id: intruderId, companyId, name: "coder-LE", role: "engineer", status: "idle", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
+    ]);
+    await db.insert(pluginManagedResources).values({
+      companyId, pluginId, pluginKey: "paperclipai.plugin-llm-wiki", resourceKind: "agent", resourceKey: "wiki-maintainer", resourceId: canonicalAgentId, defaultsJson: {},
+    });
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "member",
+    });
+    const shapes = [
+      { name: "canonical", assigneeAgentId: canonicalAgentId, assigneeUserId: null, status: "todo" },
+      { name: "non-canonical", assigneeAgentId: intruderId, assigneeUserId: null, status: "in_review" },
+      { name: "unassigned", assigneeAgentId: null, assigneeUserId: null, status: "todo" },
+      { name: "user-owned", assigneeAgentId: null, assigneeUserId: userId, status: "todo" },
+      { name: "incident", assigneeAgentId: intruderId, assigneeUserId: null, status: "in_review" },
+    ];
+    const ids: string[] = [];
+    for (const [index, shape] of shapes.entries()) {
+      const id = randomUUID();
+      ids.push(id);
+      await db.insert(issues).values({
+        id,
+        companyId,
+        title: "Handoff to Wiki Maintainer",
+        status: shape.status,
+        priority: "medium",
+        assigneeAgentId: shape.assigneeAgentId,
+        assigneeUserId: shape.assigneeUserId,
+        issueNumber: index + 1,
+        identifier: `T${index + 1}`,
+      });
+    }
+    for (const id of ids) {
+      await expect(svc.update(id, { status: "todo", companyGuard: companyId })).resolves.toMatchObject({ id });
+      await expect(svc.update(id, { blockedByIssueIds: [] })).resolves.toMatchObject({ id });
+      await expect(
+        svc.update(id, { status: "todo", lastStatusDecisionId: null, unblockDescriptor: null }),
+      ).resolves.toMatchObject({ id });
+    }
+    await expect(svc.update(ids[1]!, { priority: "low" })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_non_canonical_assignee" }),
+    });
+    await expect(svc.update(ids[2]!, { hiddenAt: null })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
+    });
+    await expect(svc.update(ids[2]!, { parentId: null })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
+    });
+    await expect(svc.update(ids[2]!, { billingCode: "x" })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
+    });
+    await expect(svc.update(ids[2]!, { requestDepth: 1 })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
+    });
+    await expect(svc.update(ids[2]!, { labelIds: [] })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
+    });
+    await expect(svc.update(ids[2]!, { status: "todo", assigneeUserId: userId })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
+    });
+    await expect(svc.update(ids[3]!, { assigneeUserId: userId })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
+    });
+  });
+
+  it("uses resulting execution state for direct assignee writes", async () => {
+    const companyId = randomUUID();
+    const pluginId = randomUUID();
+    const canonicalAgentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const stageId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      packageName: "@paperclipai/plugin-llm-wiki",
+      version: "0.1.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {} as Record<string, unknown>,
+      status: "ready",
+      installOrder: 1,
+    });
+    await db.insert(agents).values([
+      {
+        id: canonicalAgentId,
+        companyId,
+        name: "Wiki Maintainer",
+        role: "engineer",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherAgentId,
+        companyId,
+        name: "Other Agent",
+        role: "engineer",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(pluginManagedResources).values({
+      companyId,
+      pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      resourceKind: "agent",
+      resourceKey: "wiki-maintainer",
+      resourceId: canonicalAgentId,
+      defaultsJson: {},
+    });
+    const issue = await db
+      .insert(issues)
+      .values({
+        id: randomUUID(),
+        companyId,
+        title: "Handoff to Wiki Maintainer",
+        assigneeAgentId: canonicalAgentId,
+        executionPolicy: {
+          mode: "normal",
+          stages: [
+            {
+              id: stageId,
+              type: "review",
+              approvalsNeeded: 1,
+              participants: [{ type: "agent", agentId: canonicalAgentId, userId: null }],
+            },
+          ],
+        },
+        executionState: null,
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    await expect(
+      svc.update(issue.id, {
+        assigneeAgentId: canonicalAgentId,
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: canonicalAgentId, userId: null },
+          returnAssignee: null,
+          deliveryAuthor: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ guard: "assignee_review_gate" }),
+    });
+  });
+});
+
 describeEmbeddedPostgres("issueService.create defaultExecutionPolicy inheritance", () => {
   let db!: ReturnType<typeof createDb>;
   let svc!: ReturnType<typeof issueService>;
@@ -9002,5 +9590,252 @@ describeEmbeddedPostgres("issueService.create company defaultExecutionPolicy inh
     });
 
     expect(issue.executionPolicy).toBeNull();
+  });
+});
+
+describeEmbeddedPostgres("issueService.update Wiki handoff workflow-controlled review entry (SUP-23154)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let companyId: string;
+  let issueId: string;
+  let stageId: string;
+  let canonicalAgentId: string;
+  let selectedAgentId: string;
+  let otherAgentId: string;
+
+  function reviewPolicy(participantIds: string[]) {
+    return {
+      mode: "normal",
+      stages: [{
+        id: stageId,
+        type: "review",
+        approvalsNeeded: 1,
+        participants: participantIds.map((agentId) => ({ type: "agent", agentId, userId: null })),
+      }],
+    };
+  }
+
+  function pendingState(agentId: string) {
+    return {
+      status: "pending",
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId, userId: null },
+      returnAssignee: null,
+      deliveryAuthor: null,
+      reviewRequest: null,
+      completedStageIds: [],
+      skippedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    } as const;
+  }
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-update-wiki-workflow-entry-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  beforeEach(async () => {
+    companyId = randomUUID();
+    issueId = randomUUID();
+    stageId = randomUUID();
+    canonicalAgentId = randomUUID();
+    selectedAgentId = randomUUID();
+    otherAgentId = randomUUID();
+    const pluginId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      packageName: "@paperclipai/plugin-llm-wiki",
+      version: "0.1.0",
+      apiVersion: 1,
+      categories: [],
+      manifestJson: {} as never,
+      status: "ready",
+      installOrder: 1,
+    });
+    await db.insert(agents).values([
+      [canonicalAgentId, "Wiki Maintainer"],
+      [selectedAgentId, "Selected Reviewer"],
+      [otherAgentId, "Other Agent"],
+    ].map(([id, name]) => ({
+      id: id!,
+      companyId,
+      name: name!,
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    })));
+    await db.insert(pluginManagedResources).values({
+      companyId,
+      pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      resourceKind: "agent",
+      resourceKey: "wiki-maintainer",
+      resourceId: canonicalAgentId,
+      defaultsJson: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Handoff to Wiki Maintainer",
+      assigneeAgentId: canonicalAgentId,
+      executionPolicy: reviewPolicy([selectedAgentId]),
+      executionState: null,
+    });
+  });
+
+  afterEach(async () => {
+    await db.delete(pluginManagedResources);
+    await db.delete(heartbeatRuns);
+    await db.delete(companyMemberships);
+    await db.delete(issues);
+    await db.delete(agents);
+    await db.delete(plugins);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("allows the selected non-canonical pending participant", async () => {
+    await expect(svc.update(issueId, {
+      status: "in_review",
+      assigneeAgentId: selectedAgentId,
+      executionState: pendingState(selectedAgentId),
+      workflowControlledAssignment: true,
+    })).resolves.toMatchObject({
+      status: "in_review",
+      assigneeAgentId: selectedAgentId,
+      executionState: expect.objectContaining({
+        currentParticipant: expect.objectContaining({ agentId: selectedAgentId }),
+      }),
+    });
+  });
+
+  it("refuses canonical-only workflow entry as wiki_handoff_self_satisfy", async () => {
+    await db.update(issues).set({ executionPolicy: reviewPolicy([canonicalAgentId]) }).where(eq(issues.id, issueId));
+
+    await expect(svc.update(issueId, {
+      status: "in_review",
+      assigneeAgentId: canonicalAgentId,
+      executionState: pendingState(canonicalAgentId),
+      workflowControlledAssignment: true,
+    })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({
+        subGuard: "wiki_handoff",
+        reason: "wiki_handoff_self_satisfy",
+      }),
+    });
+  });
+
+  it("does not let the workflow flag admit an unrelated agent", async () => {
+    await expect(svc.update(issueId, {
+      status: "in_review",
+      assigneeAgentId: otherAgentId,
+      executionState: pendingState(selectedAgentId),
+      workflowControlledAssignment: true,
+    })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_non_canonical_assignee" }),
+    });
+  });
+
+  it("does not let the workflow flag clear the assignee", async () => {
+    await expect(svc.update(issueId, {
+      status: "in_review",
+      assigneeAgentId: null,
+      executionState: pendingState(selectedAgentId),
+      workflowControlledAssignment: true,
+    })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ reason: "wiki_handoff_unassigned" }),
+    });
+  });
+
+  // SUP-23890 / SUP-23886: the combined state no prior test spans — canonical
+  // actor AND canonical stored assignee AND workflow-projected null assignee
+  // AND a user-only pending review stage AND an active issuing run. The route
+  // passes actor + current assignee into this update; the service guard must
+  // forward them so the canonical null-assignee exemption (issue-assignee-
+  // review-gate wikiHandoffWriteWouldViolate) can apply instead of rejecting
+  // wiki_handoff_unassigned.
+  it("admits the canonical Maintainer's issuing-run handoff into a user-only review (SUP-23890)", async () => {
+    const reviewerUserId = `board-${randomUUID()}`;
+    const issuingRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: issuingRunId,
+      companyId,
+      agentId: canonicalAgentId,
+      status: "running",
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: reviewerUserId,
+      status: "active",
+      membershipRole: "member",
+    });
+    await db.update(issues).set({
+      executionPolicy: {
+        mode: "normal",
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ type: "user", agentId: null, userId: reviewerUserId }],
+        }],
+      },
+      executionRunId: issuingRunId,
+    }).where(eq(issues.id, issueId));
+
+    await expect(svc.update(issueId, {
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: reviewerUserId,
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "user", agentId: null, userId: reviewerUserId },
+        returnAssignee: { type: "agent", agentId: canonicalAgentId, userId: null },
+        deliveryAuthor: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+      workflowControlledAssignment: true,
+      actorAgentId: canonicalAgentId,
+    })).resolves.toMatchObject({
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: reviewerUserId,
+      // The issuing run keeps the execution lock until it actually stops
+      // (SUP-23227 re-assert); only the assignment permission moves to the
+      // user now. The route separately declines to cancel it.
+      executionRunId: issuingRunId,
+      executionState: expect.objectContaining({
+        status: "pending",
+        currentParticipant: { type: "user", agentId: null, userId: reviewerUserId },
+      }),
+    });
   });
 });
