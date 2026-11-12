@@ -374,7 +374,7 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
     occupantIssueId: string;
     contenderAgentId: string;
     contenderIssueId: string;
-  }) {
+  }, options: { occupantLeavesIssueOpen?: boolean } = {}) {
     const occupantStarted = deferred<{ executionWorkspaceId: string; cwd: string; branchName: string }>();
     const occupantMayFinish = deferred<void>();
     releaseGates.push(() => occupantMayFinish.resolve());
@@ -390,7 +390,9 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
         await occupantMayFinish.promise;
         // An open issue after a successful run gets a disposition-repair wake that would keep
         // holding the workspace; close it so releasing the occupant really frees the worktree.
-        await db.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.occupantIssueId));
+        if (!options.occupantLeavesIssueOpen) {
+          await db.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.occupantIssueId));
+        }
       }
       return {
         exitCode: 0,
@@ -524,6 +526,86 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
     expect(contenderCalls).toHaveLength(1);
     expect(contenderCalls[0]?.executionWorkspaceId).toBe(occupantWorkspace.executionWorkspaceId);
     expect(contenderCalls[0]?.cwd).toBe(occupantWorkspace.cwd);
+  }, 90_000);
+
+  it("keeps the workspace occupied by the occupant's disposition-repair run when the occupant leaves its issue open (upstream #13888)", async () => {
+    const repoRoot = await createGitRepo();
+    tempRoots.push(repoRoot);
+    const seeded = await seedSharedWorkspaceTargets(db, repoRoot);
+    const heartbeat = heartbeatService(db);
+
+    const { occupantWorkspace, contenderRunId, releaseOccupant, occupantRunId } =
+      await runContenderAgainstOccupiedWorkspace(heartbeat, seeded, { occupantLeavesIssueOpen: true });
+
+    const repairStarted = deferred<string | undefined>();
+    const repairMayFinish = deferred<void>();
+    releaseGates.push(() => repairMayFinish.resolve());
+    adapterExecute.mockImplementation(async (input) => {
+      if (readAdapterCall(input).issueId === seeded.occupantIssueId) {
+        repairStarted.resolve(readAdapterCall(input).executionWorkspaceId);
+        await repairMayFinish.promise;
+      }
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "Workspace occupancy test run.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    releaseOccupant();
+    await waitForRunToFinish(heartbeat, occupantRunId);
+    expect(await repairStarted.promise).toBe(occupantWorkspace.executionWorkspaceId);
+
+    const repairRun = await waitFor(
+      async () =>
+        db
+          .select()
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.agentId, seeded.occupantAgentId),
+            eq(heartbeatRuns.status, "running"),
+          ))
+          .then((rows) =>
+            rows.find((row) =>
+              (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "issue_disposition_repair",
+            ) ?? null),
+      10_000,
+      "the occupant's running disposition-repair run",
+    );
+    expect(repairRun.id).not.toBe(occupantRunId);
+    const successor = await waitFor(
+      async () =>
+        db
+          .select()
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.retryOfRunId, contenderRunId),
+            eq(heartbeatRuns.scheduledRetryReason, "execution_workspace_occupied"),
+          ))
+          .then((rows) => rows[0] ?? null),
+      10_000,
+      "the deferred contender's successor run",
+    );
+    await db
+      .update(heartbeatRuns)
+      .set({ scheduledRetryAt: new Date(Date.now() - 60_000), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, successor.id));
+    await heartbeat.promoteDueScheduledRetries();
+    await heartbeat.resumeQueuedRuns();
+    const deferredAgain = await waitForRunToFinish(heartbeat, successor.id, 30_000);
+    expect(deferredAgain).toMatchObject({
+      status: "cancelled",
+      errorCode: "execution_workspace_occupied",
+    });
+    expect(
+      adapterExecute.mock.calls.filter((call) => readAdapterCall(call[0]).issueId === seeded.contenderIssueId),
+    ).toHaveLength(0);
+
+    repairMayFinish.resolve();
+    await waitForHeartbeatIdle(db);
   }, 90_000);
 
   // Fold 2c / occupancy-retry-count (operator ruling 2026-09-16). Upstream #13075
