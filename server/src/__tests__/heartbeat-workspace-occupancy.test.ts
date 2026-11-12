@@ -537,7 +537,7 @@ describeEmbeddedPostgres("heartbeat shared execution workspace occupancy guard",
     const { occupantWorkspace, contenderRunId, releaseOccupant, occupantRunId } =
       await runContenderAgainstOccupiedWorkspace(heartbeat, seeded, { occupantLeavesIssueOpen: true });
 
-    const repairStarted = deferred<string | undefined>();
+    const repairStarted = deferred<string | null>();
     const repairMayFinish = deferred<void>();
     releaseGates.push(() => repairMayFinish.resolve());
     adapterExecute.mockImplementation(async (input) => {

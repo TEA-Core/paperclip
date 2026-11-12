@@ -1708,6 +1708,8 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/interactions",
   "POST /api/issues/{id}/interactions/{interactionId}/cancel",
   "POST /api/issues/{id}/recovery-actions/resolve",
+  "POST /api/issues/{id}/recovery-actions/retry-workspace-export",
+  "GET /api/companies/{companyId}/chats",
   "POST /api/issues/{id}/scheduled-retry/retry-now",
   "POST /api/issues/{id}/stalled-review-decision",
   "DELETE /api/secrets/{id}",
