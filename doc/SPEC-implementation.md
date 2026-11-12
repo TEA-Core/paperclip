@@ -1344,9 +1344,12 @@ The current app also exposes V1-supporting surfaces for:
   `merged_via_pr | merged_by_ancestry | unmerged | unknown` from a live scan. The terminal workspace
   sweep selects terminal source issues in SQL before inspecting Git, and still requires a terminal
   subtree, cooldown, and no active run. A row with a recorded merged pull request also needs a clean
-  worktree; it is archived with reason `issue_terminal` and its worktree is cleaned up. Every other
-  archive changes the database row and no work-tree file: no worktree removal, file removal, branch
-  deletion or runtime-service stop, and the issues are detached from the closed row. A no-PR row whose
+  worktree; it is archived with reason `issue_terminal` and its worktree is cleaned up.
+  By default, every other archive changes the database row and no work-tree file:
+  no worktree removal, file removal, branch deletion or runtime-service stop, and
+  the issues are detached from the closed row. Open linked issues prevent an
+  isolated workspace from archiving even when they are outside its source tree.
+  A no-PR row whose
   recorded branch is gone is still inspected with the existing default-branch fetch first, which
   updates remote-tracking refs, their reflog and `FETCH_HEAD`. These are a shared-workspace
   session (`issue_terminal | shared session record`, no delivery verdict and no Git), a row with no
@@ -1361,9 +1364,22 @@ The current app also exposes V1-supporting surfaces for:
   that names the archived workspace but lands in a different checkout gets a run-log warning that the
   archived checkout is still on disk. A worktree directory that is already gone counts as removed:
   cleanup prunes the leftover git admin entry from the repo root and archives the workspace instead
-  of leaving it in `cleanup_failed`. The sweep also retries `cleanup_failed` rows whose reason is
-  `issue_terminal | spawn <git> ENOENT` under the same safety gates. Reopening the source issue
+  of leaving it in `cleanup_failed`. The sweep also retries terminal
+  `cleanup_failed` refusals under the same safety gates. Reopening the source issue
   records activity but does not restore that workspace.
+  The default-off `PAPERCLIP_WORKSPACE_REAPER_RECLAIM_CLEAN_WORKTREES` flag widens
+  deletion only to isolated, attached, clean no-PR Git worktrees inside the
+  canonical repository `.paperclip/worktrees/` root, with no untracked or ignored
+  data and fresh fetched-origin reachability. Odd/relative paths, empty provider
+  refs and detached/branchless trees remain record-only. Canonical equal or
+  descendant references across companies and open linked issues block deletion,
+  checked inside the removal transaction with exclusion against concurrent
+  publication. Ancestor primary checkouts remain usable. Remote sandbox paths
+  are excluded; unreadable local references keep the candidate. Origin fetches
+  disable prompts and time out after 60 seconds. Only widened deletion takes
+  host-wide table locks; default cleanup and record-only archives do not.
+  Dry run reports potential widened deletion as `not_previewed`, not a
+  record-only archive. `doc/DEVELOPING.md` owns the flag, locking and rollback limits.
 - task watchdog configuration and reusable watchdog issue orchestration for explicitly watched issue subtrees
 - routines and scheduled/API/webhook triggers
 - plugin installation, configuration, state, jobs, logs, webhooks, and plugin database namespace migration
