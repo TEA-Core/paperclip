@@ -24168,7 +24168,7 @@ export function issueRoutes(
                 acceptedEscalationDecision.value?.issue.status === "done"
               ) {
                 for (const audit of pendingInteractionCloseRowAudits) {
-                  await logActivity(tx as unknown as Db, audit, postCommitActivityPublications);
+                  await logActivity(tx as unknown as Db, audit, deferredPostCommit.activityPublications);
                 }
               }
               if (acceptedEscalationDecision.value && escalationCertifiedDelivery) {
@@ -24178,18 +24178,18 @@ export function issueRoutes(
                 };
                 await tx.update(issues).set({
                   executionState: sql`jsonb_set(
-                    coalesce(${issueRows.executionState}, '{}'::jsonb),
+                    coalesce(${issues.executionState}, '{}'::jsonb),
                     '{approvalStatus}',
-                    coalesce(${issueRows.executionState} -> 'approvalStatus', '{}'::jsonb)
+                    coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb)
                       || jsonb_build_object('finalDelivery', ${JSON.stringify(finalDelivery)}::jsonb)
                   )`,
-                }).where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)));
+                }).where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)));
               }
             },
             ...(escalationApproval ? {
               beforeResolveInTransaction: async (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => {
-                const [lockedIssue] = await tx.select().from(issueRows)
-                  .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)))
+                const [lockedIssue] = await tx.select().from(issues)
+                  .where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)))
                   .for("update");
                 if (!lockedIssue) throw notFound("Issue not found");
                 if (lockedIssue.deliveryRequirement !== issue.deliveryRequirement) {
