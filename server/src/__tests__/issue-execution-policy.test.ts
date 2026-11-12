@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { BASE_MAX_REVIEW_ROUNDS, DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertExecutionDecisionSnapshotCurrent, assertPatchableExecutionPolicyWrite, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, foldExecutionPolicyAgentIds, foldExecutionStateAgentIds, isReviewChangesRequestedTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { listDurablyApprovedStageIds } from "../services/approval-status-reconciler.ts";
 import { HttpError } from "../errors.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
@@ -1661,8 +1662,8 @@ describe("issue execution policy transitions", () => {
         lastDecisionOutcome: "approved",
       };
 
-      it("clears executionState for a non-in_review status (done/cancelled/blocked/in_progress)", () => {
-        for (const status of ["done", "cancelled", "blocked", "in_progress"] as const) {
+      it("clears executionState for a non-terminal status (blocked/in_progress/todo)", () => {
+        for (const status of ["blocked", "in_progress", "todo"] as const) {
           const result = applyIssueExecutionPolicyTransition({
             issue: {
               status: "blocked",
@@ -1679,6 +1680,34 @@ describe("issue execution policy transitions", () => {
             commentBody: "Overriding the stuck review",
           });
           expect(result.patch.executionState).toBeNull();
+          expect(result.decision).toBeUndefined();
+        }
+      });
+
+      it("keeps the completed state on a board done/cancelled close (SUP-24054)", () => {
+        // A successful close leaves nothing stuck to dissolve. The done guard
+        // already read the pre-patch row, so a null here only destroyed the
+        // completed ladder record (completedStageIds, approvalStatus).
+        const approvalStatus = {
+          finalDelivery: { owner: "TEA-Core", repo: "paperclip", number: 404, headSha: "a".repeat(40) },
+        };
+        for (const status of ["done", "cancelled"] as const) {
+          const result = applyIssueExecutionPolicyTransition({
+            issue: {
+              status: "in_progress",
+              assigneeAgentId: coderAgentId,
+              assigneeUserId: null,
+              executionPolicy: policy,
+              executionState: { ...completedState, approvalStatus },
+            },
+            policy,
+            requestedStatus: status,
+            requestedAssigneePatch: {},
+            actor: { userId: boardUserId },
+            allowBoardOverride: true,
+            commentBody: "Closing the approved card",
+          });
+          expect(result.patch).not.toHaveProperty("executionState");
           expect(result.decision).toBeUndefined();
         }
       });
@@ -1958,6 +1987,98 @@ describe("issue execution policy transitions", () => {
       });
 
       expect(result.patch.executionState).toBeNull();
+    });
+  });
+
+  describe("durable approvals survive a reopen (SUP-24054)", () => {
+    // The SUP-24036 shape: the policy returns to the delivering agent, the
+    // review stage has another participant, a reopen nulled the projection,
+    // and the stage's latest decision row is `approved`. The route resolves
+    // `decidedStageIds` from those rows with listDurablyApprovedStageIds.
+    function reviewPolicyReturningToCoder() {
+      return normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: coderAgentId,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      })!;
+    }
+
+    function coderDoneOnNullState(policy: IssueExecutionPolicy, decidedStageIds?: string[]) {
+      return applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: "Closing after the approved delivery",
+        ...(decidedStageIds ? { decidedStageIds } : {}),
+      });
+    }
+
+    it("leaves the requested done in place when every stage holds a current approval", () => {
+      const policy = reviewPolicyReturningToCoder();
+      const result = coderDoneOnNullState(policy, [policy.stages[0].id]);
+
+      expect(result.patch.status).toBeUndefined();
+      expect(result.patch.assigneeAgentId).toBeUndefined();
+      expect(result.patch.executionState).toBeUndefined();
+      expect(result.workflowControlledAssignment).toBeUndefined();
+      expect(result.decision).toBeUndefined();
+    });
+
+    it("still arms the stage when no durable approval exists", () => {
+      const policy = reviewPolicyReturningToCoder();
+      const result = coderDoneOnNullState(policy);
+
+      expect(result.patch.status).toBe("in_review");
+      expect(result.patch.assigneeAgentId).toBe(qaAgentId);
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageId: policy.stages[0].id,
+        completedStageIds: [],
+      });
+      expect(result.workflowControlledAssignment).toBe(true);
+    });
+
+    it("arms the first undecided stage and records the approved one as completed", () => {
+      const policy = twoStagePolicy();
+      const [reviewStage, approvalStage] = policy.stages;
+      const result = coderDoneOnNullState(policy, [reviewStage.id]);
+
+      expect(result.patch.status).toBe("in_review");
+      expect(result.patch.assigneeUserId).toBe(ctoUserId);
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageId: approvalStage.id,
+        currentStageType: "approval",
+        completedStageIds: [reviewStage.id],
+        // An approved stage is decided, not auto-skipped: skippedStageIds stays empty.
+        skippedStageIds: [],
+      });
+      expect(result.workflowControlledAssignment).toBe(true);
+    });
+
+    it("arms a stage whose latest decision is changes_requested (fail closed)", () => {
+      const policy = reviewPolicyReturningToCoder();
+      const stageId = policy.stages[0].id;
+      const decidedStageIds = listDurablyApprovedStageIds(
+        [
+          { id: "d-1", stageId, outcome: "approved", createdAt: new Date("2026-11-12T19:09:34Z") },
+          { id: "d-2", stageId, outcome: "changes_requested", createdAt: new Date("2026-11-12T19:30:00Z") },
+        ],
+        policy.stages.map((stage) => stage.id),
+      );
+      expect(decidedStageIds).toEqual([]);
+
+      const result = coderDoneOnNullState(policy, decidedStageIds);
+      expect(result.patch.status).toBe("in_review");
+      expect(result.patch.assigneeAgentId).toBe(qaAgentId);
+      expect(result.patch.executionState).toMatchObject({ status: "pending", currentStageId: stageId });
     });
   });
 

@@ -128,6 +128,15 @@ interface IssueExecutionDecision {
 4. Runtime routes back to the **same review stage** (not the beginning), with the same reviewer.
 5. This loop continues until the reviewer approves.
 
+### Durable Approvals Across a Reopen
+
+Each stage decision is also stored as a row in `issue_execution_decisions`. A reopen (`done` or `cancelled` back to an open status) sets `executionState` to `null`, but the decision rows stay. A stage is decided when its latest decision row is `approved`. A later `changes_requested` row cancels the approval.
+
+- When a `done` request (`PATCH /api/issues/:id`, or a recovery-action resolve to `done`) finds no active stage, the runtime skips each decided stage. It arms the first stage that is not decided and records the decided stages in `completedStageIds`.
+- When every stage is decided, the runtime does not change the status to `in_review`. The `done` request goes to the done-transition guard. The guard reads the same decision rows and writes an `issue.done_transition_ladder_recovered_from_decisions` activity row, or it refuses the close for its own reason (for example a missing tier declaration or an unlanded delivery).
+- A decision row records no head SHA. So an approval given before a reopen also counts after the reopen, even when new commits were pushed. The guard's delivery checks still apply.
+- A board `done` or `cancelled` on a completed workflow keeps `executionState` (`completedStageIds` and `approvalStatus`). A board `blocked`, `in_progress` or `todo`, or a board assignee change, on a completed workflow still clears it.
+
 ### Round Ceiling and Stall Escalation
 
 Consecutive agent `changes_requested` decisions on one stage are counted in `executionState.changesRequestedCount`; a human decision resets the count. When the count reaches the round ceiling, the stage stays pending and is handed to the issue's responsible human instead of the implementer. The ceiling is `maxReviewRounds` when set; otherwise **10** for a policy that carries `stallEscalation` and **3** for a policy that does not, so the raised ceiling never applies without a stall arbiter.

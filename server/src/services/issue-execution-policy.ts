@@ -99,6 +99,16 @@ type TransitionInput = {
    * through to the ordinary ceiling behaviour instead.
    */
   stallArbiterAvailable?: boolean;
+  /**
+   * SUP-24054: stage ids whose LATEST durable decision row is `approved`,
+   * scoped to the current policy (`listDurablyApprovedStageIds`). Read only when
+   * a `done` request starts the workflow (no active stage). A reopen nulls the
+   * executionState projection while the decision rows survive, so a stage in this
+   * set is not re-armed, and when every stage is in it the requested `done`
+   * reaches the done-transition guard, which recovers the ladder from the same
+   * rows (SUP-14912). Absent counts as empty.
+   */
+  decidedStageIds?: readonly string[];
 };
 
 export type ReviewEscalationSignal = {
@@ -1850,8 +1860,17 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
   // non-in_review status or an assignee/unassign change dissolves the stuck
   // executionState. A requested in_review cannot be honoured — it would strand
   // the issue in_review with no active participant — so it fails loud instead
-  // of the silent empty patch.
-  if (!activeStage && input.allowBoardOverride && existingState?.status === COMPLETED_STATUS) {
+  // of the silent empty patch. A board `done`/`cancelled` is a close, not an
+  // escape hatch: the done guard reads the pre-patch row either way, so the
+  // close skips this branch, reaches the #7893 terminal no-op and keeps the
+  // completed ladder record (completedStageIds, approvalStatus) (SUP-24054).
+  const boardTerminalClose = requestedStatus === "done" || requestedStatus === "cancelled";
+  if (
+    !activeStage &&
+    input.allowBoardOverride &&
+    existingState?.status === COMPLETED_STATUS &&
+    !boardTerminalClose
+  ) {
     const attemptedBoardAdvance =
       requestedAssigneePatchProvided ||
       (requestedStatus !== undefined && requestedStatus !== "in_review");
@@ -2316,10 +2335,23 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     return { patch };
   }
 
+  // SUP-24054: durable approvals survive a reopen. A reopen nulls the projection
+  // while the decision rows survive, so on a `done` request a stage whose latest
+  // decision is `approved` stays decided: the start arms the first undecided
+  // stage (the board stage-decision target rule) and restores the decided ones
+  // into completedStageIds. With every stage decided nothing is re-armed, and
+  // the requested `done` reaches the done-transition guard, which recovers the
+  // ladder from the same rows (SUP-14912).
+  const decidedStageIdSet = new Set(requestedStatus === "done" ? input.decidedStageIds ?? [] : []);
+  const durablyDecidedStageIds = input.policy.stages
+    .map((stage) => stage.id)
+    .filter((stageId) => decidedStageIdSet.has(stageId));
   let pendingStage =
-    existingState?.status === CHANGES_REQUESTED_STATUS && currentStage
-      ? currentStage
-      : nextPendingStage(input.policy, existingState);
+    durablyDecidedStageIds.length > 0
+      ? resolveBoardTargetStage(input.policy, existingState, durablyDecidedStageIds)
+      : existingState?.status === CHANGES_REQUESTED_STATUS && currentStage
+        ? currentStage
+        : nextPendingStage(input.policy, existingState);
   if (!pendingStage) return { patch };
 
   const returnAssignee = resolveReturnAssignee({
@@ -2327,7 +2359,9 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     existingState,
     currentAssignee,
   });
-  const skippedStageIds = [...(existingState?.completedStageIds ?? [])];
+  const skippedStageIds = Array.from(
+    new Set([...(existingState?.completedStageIds ?? []), ...durablyDecidedStageIds]),
+  );
   const newlySkippedStageIds: string[] = [];
   let participant = selectStageParticipant(pendingStage, {
     preferred:

@@ -248,7 +248,7 @@ import { evaluateApprovingLadder, evaluateCertificateProvenance } from "../servi
 import {
   evaluateStageIntegrity,
   resolveSelfApprovalPrincipals,
-  latestDecisionPerStage,
+  listDurablyApprovedStageIds,
   readApprovalHeadDelta,
   readApprovalPullRequest,
   type CandidateRow,
@@ -6024,6 +6024,48 @@ export function issueRoutes(
         agent.status !== "paused" &&
         agent.status !== "terminated" &&
         agent.status !== "pending_approval",
+    );
+  };
+  // SUP-24054: durable approvals survive a reopen. A reopen (or any write that
+  // nulls the projection) leaves the `issue_execution_decisions` rows in place,
+  // and the done-transition guard already counts them (SUP-14912). The engine's
+  // workflow start runs before the guard, so a `done` door passes it the stage
+  // ids whose LATEST decision is `approved`, scoped to the current policy, the
+  // same set the board stage-decision door uses. Only a `done` request with no
+  // active stage starts the workflow; a pending or completed state never reads
+  // the set, so it pays no query.
+  const loadDurablyApprovedStageIdsForDone = async (
+    executor: Db,
+    input: {
+      companyId: string;
+      issueId: string;
+      policy: NormalizedExecutionPolicy | null;
+      executionState: unknown;
+      requestedStatus: string | undefined;
+    },
+  ): Promise<string[] | undefined> => {
+    if (input.requestedStatus !== "done" || !input.policy || input.policy.stages.length === 0) {
+      return undefined;
+    }
+    const stateStatus = parseIssueExecutionState(input.executionState)?.status;
+    if (stateStatus === "pending" || stateStatus === "completed") return undefined;
+    const decisionRows = await executor
+      .select({
+        id: issueExecutionDecisions.id,
+        stageId: issueExecutionDecisions.stageId,
+        outcome: issueExecutionDecisions.outcome,
+        createdAt: issueExecutionDecisions.createdAt,
+      })
+      .from(issueExecutionDecisions)
+      .where(
+        and(
+          eq(issueExecutionDecisions.companyId, input.companyId),
+          eq(issueExecutionDecisions.issueId, input.issueId),
+        ),
+      );
+    return listDurablyApprovedStageIds(
+      decisionRows,
+      input.policy.stages.map((stage) => stage.id),
     );
   };
   const projectsSvc = projectService(db);
@@ -12663,10 +12705,7 @@ export function issueRoutes(
               eq(issueExecutionDecisions.issueId, id),
             ),
           );
-        const decidedStageIds = Array.from(latestDecisionPerStage(decidedRows).values())
-          .filter((decision) => decision.outcome === "approved")
-          .filter((decision) => policyStageIdSet.has(decision.stageId))
-          .map((decision) => decision.stageId);
+        const decidedStageIds = listDurablyApprovedStageIds(decidedRows, policyStageIdSet);
 
         let result: ReturnType<typeof applyBoardStageDecision>;
         try {
@@ -14431,6 +14470,13 @@ export function issueRoutes(
               commentBody: doneTierResolutionNote,
               stallArbiterAvailable: await resolveStallArbiterAvailable({
                 companyId: lockedIssue.companyId,
+                policy: executionPolicy,
+                executionState: lockedIssue.executionState,
+                requestedStatus: sourceIssueStatus,
+              }),
+              decidedStageIds: await loadDurablyApprovedStageIdsForDone(tx as unknown as Db, {
+                companyId: lockedIssue.companyId,
+                issueId: lockedIssue.id,
                 policy: executionPolicy,
                 executionState: lockedIssue.executionState,
                 requestedStatus: sourceIssueStatus,
@@ -19811,6 +19857,13 @@ export function issueRoutes(
       rearmPointer: rearmExecutionPolicyRequested,
       stallArbiterAvailable: await resolveStallArbiterAvailable({
         companyId: existing.companyId,
+        policy: nextExecutionPolicy,
+        executionState: existing.executionState,
+        requestedStatus: requestedTransitionStatus,
+      }),
+      decidedStageIds: await loadDurablyApprovedStageIdsForDone(db, {
+        companyId: existing.companyId,
+        issueId: existing.id,
         policy: nextExecutionPolicy,
         executionState: existing.executionState,
         requestedStatus: requestedTransitionStatus,
@@ -26097,6 +26150,13 @@ export function issueRoutes(
           userId: actor.actorType === "user" ? actor.actorId : null,
         },
         commentBody,
+        decidedStageIds: await loadDurablyApprovedStageIdsForDone(db, {
+          companyId: currentIssue.companyId,
+          issueId: currentIssue.id,
+          policy: currentExecutionPolicy,
+          executionState: currentIssue.executionState,
+          requestedStatus: "done",
+        }),
       });
 
       // This route is a second door onto `done` and used to run neither done-guard, so
