@@ -1624,14 +1624,18 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       const rows = await vi.waitFor(
         async () => {
           const found = await auditRows(companyId, issueId, "issue.done_transition_guard_skipped");
-          if (found.length === 0) throw new Error("waiting for waiver audit row");
-          return found;
+          const hits = found.filter(
+            (r) => (r.details as Record<string, unknown>).reason === "open_linked_prs_decision_carried:1",
+          );
+          if (hits.length === 0) throw new Error("waiting for waiver audit row");
+          return hits;
         },
         { timeout: 5000 },
       );
-      expect(
-        rows.some((r) => (r.details as Record<string, unknown>).reason === "open_linked_prs_decision_carried:1"),
-      ).toBe(true);
+      expect(rows).toHaveLength(1);
+      expect((rows[0]?.details as Record<string, unknown>).skipReason).toBe(
+        "open_linked_prs_decision_carried:1",
+      );
     });
 
   it("POST comment: auto-approval publishes paperclip/approved and persists the Guard A head (SUP-13904)", async () => {

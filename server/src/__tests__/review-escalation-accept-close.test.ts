@@ -267,13 +267,26 @@ describeEmbeddedPostgres("review-escalation accept closes the final stage done",
         .then((rows) => rows[0] ?? null);
       expect(row).toMatchObject({ status: "done", deliveryRequirement });
       const guardAuditRows = await db
-        .select({ details: activityLog.details })
+        .select({ action: activityLog.action, details: activityLog.details })
         .from(activityLog)
         .where(eq(activityLog.entityId, issueId));
       const recordOnlyAudits = guardAuditRows.filter((row) =>
+        row.action === "issue.done_transition_guard_skipped" &&
         row.details && typeof row.details === "object" && "skipReason" in row.details && (row.details as { skipReason?: unknown }).skipReason === "record_only_delivery_skipped",
       );
-      expect(recordOnlyAudits).toHaveLength(deliveryRequirement === "record_only" ? 2 : 0);
+      expect(recordOnlyAudits).toHaveLength(deliveryRequirement === "record_only" ? 1 : 0);
+      if (deliveryRequirement === "record_only") {
+        expect(recordOnlyAudits[0]?.details).toMatchObject({
+          reason: "Record-only delivery requirement: repository/PR delivery is not required; transition allowed",
+          skipReason: "record_only_delivery_skipped",
+          branch: null,
+          defaultRef: null,
+          owner: null,
+          repo: null,
+          decisionCarried: true,
+          source: "done_transition_guard",
+        });
+      }
       await db.delete(issueThreadInteractions);
       await db.delete(issueExecutionDecisions);
       await db.delete(issueApprovals);
