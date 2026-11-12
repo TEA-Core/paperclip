@@ -1,6 +1,14 @@
 import { expect, test, type APIRequestContext } from "@playwright/test";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
+import os from "node:os";
+import path from "node:path";
 import { listenOnFetchAllowedPort } from "./fetch-allowed-port";
+import {
+  TIER2_RECORDED_MERGE_COMMIT,
+  recordTier2MergedDelivery,
+  seedTier2Project,
+} from "./fixtures/tier2-delivery";
 
 type Json = Record<string, unknown>;
 type Seed = { companyId: string; prefix: string };
@@ -165,10 +173,17 @@ const call = await fetch(\`\${process.env.PAPERCLIP_API_URL}/api/tool-gateway/to
 if (!call.ok) throw new Error(await call.text());
 console.log(await call.text());
 // Successful tool use must end with a durable task disposition.
+// FORK DIVERGENCE (fork done-tier guard, fold s3a): the fork refuses a non-board done
+// transition whose close comment carries no tier declaration (422). The task sits in a
+// Tier 2 delivery project with a recorded merged pull request, so the close declares Tier 2
+// with that merge commit, like tests/e2e/fixtures/agent-chat.mjs.
 const completion = await fetch(\`\${process.env.PAPERCLIP_API_URL}/api/issues/\${issueId}\`, {
   method: "PATCH",
   headers: apiHeaders,
-  body: JSON.stringify({ status: "done", comment: "Read the requested Notion page inventory." })
+  body: JSON.stringify({
+    status: "done",
+    comment: "Read the requested Notion page inventory.\\n\\nClosed at Tier 2 (live): probe \`connection intent fixture run\` head ${TIER2_RECORDED_MERGE_COMMIT} post-merge: the issue re-read as done."
+  })
 });
 if (!completion.ok) throw new Error(await completion.text());
 `;
@@ -211,6 +226,7 @@ test("store setup and task connection intent share one fake provider through con
 }) => {
   test.setTimeout(180_000);
   const provider = await startFakeProvider();
+  let projectCwd: string | null = null;
   try {
     const seed = await newCompany(request);
     const holder = await createAgent(
@@ -305,15 +321,21 @@ test("store setup and task connection intent share one fake provider through con
         },
       }),
     );
+    // Fork: the agent closes this task at Tier 2, which needs a delivery project and a
+    // recorded merged pull request (see the completion step in connectionAwareScript).
+    projectCwd = await mkdtemp(path.join(os.tmpdir(), "paperclip-connection-intent-"));
+    const project = await seedTier2Project(request, seed.companyId, "Notion reader delivery", projectCwd);
     const issue = await json<{ id: string; identifier: string }>(
       await request.post(`/api/companies/${seed.companyId}/issues`, {
         data: {
           title: "Read our Notion pages",
           status: "in_progress",
           assigneeAgentId: scout.id,
+          projectId: project.id,
         },
       }),
     );
+    await recordTier2MergedDelivery(request, issue.id);
     // Assigning an in-progress task is the production wake path. Waiting for
     // that run avoids creating a second artificial request from an explicit
     // heartbeat invocation.
@@ -401,5 +423,6 @@ test("store setup and task connection intent share one fake provider through con
     expect(holder.id).not.toBe(scout.id);
   } finally {
     await provider.close();
+    if (projectCwd) await rm(projectCwd, { recursive: true, force: true });
   }
 });
