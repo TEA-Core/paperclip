@@ -4007,6 +4007,7 @@ export function recoveryService(
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
     agentInvokability?: AgentInvokability | null;
+    boardEscalation?: boolean;
   }) {
     const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
     const routing = await resolveStrandedRecoveryRouting({
@@ -4026,10 +4027,17 @@ export function recoveryService(
     // cause is already `manual_repair_required` and
     // enqueueSourceScopedStrandedRecoveryWake returns early for it, so no owner
     // was ever woken.
+    //
+    // FOLD s3a: upstream #14046 escalates a stranded issue whose bounded retry
+    // budget is spent to a board-owned action that spawns no run. The fork's
+    // agent-owner reroute would wake the owner again, which is one more
+    // automatic run after the budget said stop, so those callers pass
+    // `boardEscalation` and the action parks on the board as upstream does.
     const ownerAgentId =
-      recoveryCause === "configuration_incomplete" &&
-      readConfigurationIncompletePayload(input.latestRun)?.reason ===
-        SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON
+      input.boardEscalation ||
+      (recoveryCause === "configuration_incomplete" &&
+        readConfigurationIncompletePayload(input.latestRun)?.reason ===
+          SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON)
         ? null
         : routing.ownerAgentId;
     const now = new Date();
@@ -5764,6 +5772,7 @@ export function recoveryService(
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
     agentInvokability?: AgentInvokability | null;
+    boardEscalation?: boolean;
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
@@ -5797,6 +5806,7 @@ export function recoveryService(
       recoveryOwnerAgentId: input.recoveryOwnerAgentId,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
       agentInvokability: input.agentInvokability,
+      boardEscalation: input.boardEscalation,
     });
     // Recheck the stage and assignee under the issue-row lock and write through
     // the same transaction. A concurrent transition into review cannot be
@@ -7623,6 +7633,7 @@ export function recoveryService(
             latestRun: participantLatestRun,
             notice: buildExecutionReviewParticipantRecoveryNoticeSeed(),
             recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+            boardEscalation: true,
           });
           if (updated) {
             result.escalated += 1;
@@ -7735,6 +7746,7 @@ export function recoveryService(
             issue,
             previousStatus: "todo",
             latestRun,
+            boardEscalation: true,
             notice: {
               body:
                 "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
@@ -8072,6 +8084,7 @@ export function recoveryService(
           issue,
           previousStatus: "in_progress",
           latestRun,
+          boardEscalation: true,
           notice: {
             body:
               "Paperclip retried this issue's run after it ended without finishing, but the bounded retry budget " +
