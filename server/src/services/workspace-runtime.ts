@@ -44,7 +44,8 @@ import {
   type EnsureSharedGroupOwnershipOptions,
   type SharedGroupRepairOutcome,
 } from "./shared-group-ownership.js";
-import { hasVerifiedWorktreeSeedManifest, isVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
+import { isVerifiedWorktreeSeedManifest } from "@paperclipai/shared/worktree-initialization-manifest";
+import { hasVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
 import {
   buildManagedWorkspaceGuestEnv,
   logManagedWorkspaceReadinessRejection,

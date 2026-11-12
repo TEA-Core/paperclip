@@ -1,54 +1,50 @@
-import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+import { readBoundedStateFile } from "@paperclipai/shared/bounded-state-file";
+import {
+  classifyWorktreeStateManifest,
+  isVerifiedWorktreeSeedManifest,
+  type WorktreeInitializationExpectation,
+} from "@paperclipai/shared/worktree-initialization-manifest";
 
-const WORKTREE_SEED_MODES = new Set(["minimal", "full"]);
-
-type SeedDiagnostic = {
-  phase?: unknown;
-  status?: unknown;
-  at?: unknown;
-};
+export type WorktreeSeedManifestStatus =
+  | { kind: "absent" }
+  | { kind: "verified" }
+  | { kind: "incomplete" }
+  | { kind: "refused"; message: string };
 
 /**
- * A manifest is readiness evidence only when the complete validation phase was
- * durably recorded. A bare `state: verified` is deliberately insufficient so
- * truncated or hand-edited files cannot start a partially restored workspace.
+ * Callers that cannot confirm a v3 target identity and destination schema
+ * refuse every v3 initialization manifest.
  */
-export function isVerifiedWorktreeSeedManifest(value: unknown): boolean {
-  if (!value || typeof value !== "object") return false;
-  const manifest = value as Record<string, unknown>;
-  const source = manifest.source as Record<string, unknown> | null;
-  const diagnostics = manifest.diagnostics as SeedDiagnostic[] | null;
-  return manifest.version === 2
-    && manifest.state === "verified"
-    && manifest.phase === "complete"
-    && typeof source?.instanceId === "string"
-    && source.instanceId.length > 0
-    && typeof source.configPath === "string"
-    && source.configPath.length > 0
-    && WORKTREE_SEED_MODES.has(String(manifest.seedMode ?? ""))
-    && typeof manifest.snapshotAt === "string"
-    && manifest.snapshotAt.length > 0
-    && typeof manifest.migrationRevision === "string"
-    && manifest.migrationRevision.length > 0
-    && typeof manifest.targetInstanceId === "string"
-    && manifest.targetInstanceId.length > 0
-    && typeof manifest.attemptId === "string"
-    && manifest.attemptId.length > 0
-    && typeof manifest.startedAt === "string"
-    && typeof manifest.finishedAt === "string"
-    && Array.isArray(diagnostics)
-    && diagnostics.some((diagnostic) => (
-      diagnostic?.phase === "complete"
-      && diagnostic.status === "succeeded"
-      && typeof diagnostic.at === "string"
-    ));
+const UNCONFIRMED_INITIALIZATION: WorktreeInitializationExpectation = { targetInstanceId: null, schema: null };
+
+/**
+ * Read a worktree seed manifest through the bounded no-follow reader.
+ *
+ * `refused` covers legacy-unsafe `minimal-no-secrets`, unsupported or
+ * unconfirmed v3 manifests, and malformed or non-regular files. Callers must
+ * surface it and must not fall back to a parent source or reseed on their own.
+ */
+export function readWorktreeSeedManifestStatus(
+  manifestPath: string,
+  expected: WorktreeInitializationExpectation = UNCONFIRMED_INITIALIZATION,
+): WorktreeSeedManifestStatus {
+  const absolutePath = path.resolve(manifestPath);
+  let bytes: Buffer | null;
+  try {
+    bytes = readBoundedStateFile(absolutePath);
+  } catch (error) {
+    return { kind: "refused", message: error instanceof Error ? error.message : String(error) };
+  }
+  if (bytes === null) return { kind: "absent" };
+  const classification = classifyWorktreeStateManifest(bytes, expected);
+  if (classification.kind === "refused") {
+    return { kind: "refused", message: `Refusing worktree state manifest ${absolutePath}: ${classification.message}` };
+  }
+  if (classification.kind === "initialization") return { kind: "verified" };
+  return isVerifiedWorktreeSeedManifest(classification.manifest) ? { kind: "verified" } : { kind: "incomplete" };
 }
 
 export function hasVerifiedWorktreeSeedManifest(manifestPath: string): boolean {
-  if (!existsSync(manifestPath)) return false;
-  try {
-    return isVerifiedWorktreeSeedManifest(JSON.parse(readFileSync(manifestPath, "utf8")));
-  } catch {
-    return false;
-  }
+  return readWorktreeSeedManifestStatus(manifestPath).kind === "verified";
 }

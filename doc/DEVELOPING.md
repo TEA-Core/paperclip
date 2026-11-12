@@ -816,13 +816,19 @@ The seed process must own the target embedded PostgreSQL lifecycle for that enti
 
 The seed manifest never grants source-path authority. Its source path and instance are diagnostic assertions derived from the realpath-canonical registered source. Deferred seeding resolves registration independently before taking the seed lock; under that lock it replaces stale source diagnostics from the registered value and then revalidates the manifest before any backup, service stop, spawn, or database mutation. Missing registration, invalid registered paths, source/target identity collisions, target-instance mismatches, and company mismatches fail closed.
 
-**Unverified-seed guard.** `pnpm dev` (the dev-runner) refuses to boot a worktree whose manifest is pending, running, failed, malformed, or missing required verification evidence and points you at the fix:
+**Unverified-seed guard.** `pnpm dev` (the dev-runner) refuses to boot a worktree whose manifest is pending, running, failed, or missing required verification evidence and points you at the fix:
 
 ```
 [paperclip] this worktree database is seed-pending. Run `pnpm paperclipai worktree ensure-seeded` before `pnpm dev`.
 ```
 
-This guard (`isWorktreeSeedPending` in `server/src/dev-runner-worktree.ts`) prevents `pnpm dev` from starting the app against an empty or partially restored database — run `worktree ensure-seeded` once and re-run `pnpm dev`.
+This guard (`resolveWorktreeSeedGate` in `server/src/dev-runner-worktree.ts`) prevents `pnpm dev` from starting the app against an empty or partially restored database — run `worktree ensure-seeded` once and re-run `pnpm dev`.
+
+The dev-runner, `worktree ensure-seeded`, the runtime-provision decision, `scripts/provision-worktree-runtime.sh` (through `scripts/worktree-state-manifest-check.mjs`), and workspace readiness open `.paperclip/seed-manifest.json` with the bounded reader in `@paperclipai/shared/bounded-state-file`: it refuses symlinks, directories, sockets, devices, FIFOs, hard-linked aliases, and files over 64 KiB without blocking, and its errors never echo manifest content. The dev-runner prints the refusal reason instead of the seed-pending hint, and none of these readers falls back to a parent source or reseeds automatically on refusal. Refused manifests:
+
+- malformed, non-object, or duplicate-key JSON, or an unknown `version`;
+- a v2 manifest with the retired `minimal-no-secrets` seed mode. That instance may hold parent credentials: retire it and create a clean generation with a new instance and fresh keys. It is never relabeled or converted;
+- every v3 `worktree-initialization` manifest. The validator in `@paperclipai/shared/worktree-initialization-manifest` accepts a v3 manifest only for the exact initialization policy, target instance, generation, and destination schema with completed validation evidence. No current reader can confirm the destination schema yet, so they refuse v3 instead of entering the legacy seed path.
 
 Provisioned git worktrees also pause seeded routines that still have enabled schedule triggers in the isolated worktree database by default. This prevents copied daily/cron routines from firing unexpectedly inside the new workspace instance during development without disabling webhook/API-only routines.
 

@@ -13,7 +13,7 @@ import {
 import { applyDevRunnerOptions } from "./dev-runner-options.ts";
 import { collectWatchedSnapshot as collectDevServerWatchedSnapshot, diffSnapshots } from "./dev-runner-snapshot.mjs";
 import { createDevServiceIdentity, repoRoot } from "./dev-service-profile.ts";
-import { bootstrapDevRunnerWorktreeEnv, isWorktreeSeedPending } from "../server/src/dev-runner-worktree.ts";
+import { bootstrapDevRunnerWorktreeEnv, resolveWorktreeSeedGate } from "../server/src/dev-runner-worktree.ts";
 import {
   readDevServerRestartRequest,
   removeDevServerRestartRequest,
@@ -49,10 +49,15 @@ if (worktreeEnvBootstrap.missingEnv) {
   );
   process.exit(1);
 }
-if (isWorktreeSeedPending(repoRoot)) {
+const worktreeSeedGate = resolveWorktreeSeedGate(repoRoot);
+if (worktreeSeedGate.kind === "pending") {
   console.error(
     "[paperclip] this worktree database is seed-pending. Run `pnpm paperclipai worktree ensure-seeded` before `pnpm dev`.",
   );
+  process.exit(1);
+}
+if (worktreeSeedGate.kind === "refused") {
+  console.error(`[paperclip] ${worktreeSeedGate.message}`);
   process.exit(1);
 }
 

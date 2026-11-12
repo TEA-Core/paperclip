@@ -62,7 +62,7 @@ import { environmentRuntimeService } from "../services/environment-runtime.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { runExclusiveWorkspaceRuntimeControl } from "../services/workspace-operations.js";
 import { resolveManagedWorkspaceInstanceId } from "../services/managed-workspace-identity.js";
-import { isVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
+import { isVerifiedWorktreeSeedManifest } from "@paperclipai/shared/worktree-initialization-manifest";
 import {
   issueWorkspaceLoginHandoff,
   workspaceLoginHandoffFailureStatus,

@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -1268,6 +1268,27 @@ describe("resolveRuntimeProvisionCommand", () => {
         }),
       );
       expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
+      // Complete minimal manifests keep skipping provisioning alongside full.
+      const fullManifest = JSON.parse(await fs.readFile(path.join(cwd, ".paperclip", "seed-manifest.json"), "utf8"));
+      await fs.writeFile(
+        path.join(cwd, ".paperclip", "seed-manifest.json"),
+        JSON.stringify({ ...fullManifest, seedMode: "minimal" }),
+      );
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
+      // A legacy-unsafe manifest is not verified, so the provisioner runs and
+      // refuses it loudly; a FIFO manifest is refused without blocking.
+      await fs.writeFile(
+        path.join(cwd, ".paperclip", "seed-manifest.json"),
+        JSON.stringify({ ...fullManifest, seedMode: "minimal-no-secrets" }),
+      );
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(
+        "bash ./scripts/provision-worktree-runtime.sh",
+      );
+      await fs.rm(path.join(cwd, ".paperclip", "seed-manifest.json"));
+      expect(spawnSync("mkfifo", [path.join(cwd, ".paperclip", "seed-manifest.json")]).status).toBe(0);
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(
+        "bash ./scripts/provision-worktree-runtime.sh",
+      );
     } finally {
       await fs.rm(baseCwd, { recursive: true, force: true });
     }

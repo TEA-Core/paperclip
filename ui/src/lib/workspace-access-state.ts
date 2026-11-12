@@ -114,6 +114,10 @@ const READINESS_FAILURE_COPY: Record<string, string> = {
   cloned_identity_unreadable: "The cloned identity tables could not be read.",
   auth_handoff_not_configured: "The workspace was started without a login handoff key.",
   seed_manifest_unreadable: "The seed manifest is unreadable, so the restore cannot be trusted.",
+  seed_manifest_legacy_unsafe:
+    "This workspace was seeded by the retired minimal-no-secrets mode and may hold parent credentials. Retire it and create a clean workspace; it cannot be relabeled or converted.",
+  seed_manifest_unsupported:
+    "The seed manifest is a version or profile this build does not accept, so the workspace cannot be trusted.",
 };
 
 /**
