@@ -22,7 +22,12 @@ const mockWakeup = vi.hoisted(() =>
 const mockLogActivity = vi.hoisted(() =>
   vi.fn(async (_db: unknown, _activity: { action?: string }) => undefined),
 );
-const mockFindExistingIssueBlockersResolvedWakeForReadyState = vi.hoisted(() => vi.fn(async () => null));
+const mockFindExistingIssueBlockersResolvedWakeForReadyState = vi.hoisted(() =>
+  vi.fn(async (
+    _db: unknown,
+    _input: { completedRearmCutoff?: Date | null },
+  ): Promise<{ id: string } | null> => null),
+);
 const mockIssueService = vi.hoisted(() => ({
   getAncestors: vi.fn(),
   getById: vi.fn(),
@@ -578,6 +583,93 @@ describe("issue dependency wakeups in issue routes", () => {
           }),
         }),
       );
+    });
+  });
+
+  it("suppresses a completed wake from the same blocked generation", async () => {
+    const reviewIssueId = "11111111-1111-4111-8111-111111111111";
+    const releaseIssueId = "22222222-2222-4222-8222-222222222222";
+    const releaseBlockedAt = new Date("2026-08-01T15:00:00.000Z");
+    mockIssueService.getById.mockResolvedValue(issueRecord({
+      id: reviewIssueId,
+      identifier: "PAP-REVIEW",
+      title: "Review",
+      status: "in_progress",
+    }));
+    mockIssueService.update.mockResolvedValue(issueRecord({
+      id: reviewIssueId,
+      identifier: "PAP-REVIEW",
+      title: "Review",
+      status: "done",
+    }));
+    mockIssueService.listWakeableBlockedDependents.mockResolvedValue([
+      {
+        id: releaseIssueId,
+        assigneeAgentId: "agent-release",
+        blockerIssueIds: [reviewIssueId],
+        blockedTransitionAt: releaseBlockedAt,
+      },
+    ]);
+    mockFindExistingIssueBlockersResolvedWakeForReadyState.mockResolvedValue({ id: "wake-current-cycle" });
+
+    const res = await request(await createApp()).patch(`/api/issues/${reviewIssueId}`).send({ status: "done" });
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => {
+      expect(mockFindExistingIssueBlockersResolvedWakeForReadyState).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          dependentIssueId: releaseIssueId,
+          blockedTransitionAt: releaseBlockedAt,
+          completedRearmCutoff: releaseBlockedAt,
+        }),
+      );
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("admits a later blocked generation instead of reusing its completed wake", async () => {
+    const reviewIssueId = "11111111-1111-4111-8111-111111111111";
+    const releaseIssueId = "22222222-2222-4222-8222-222222222222";
+    const releaseBlockedAt = new Date("2026-08-01T15:00:00.000Z");
+    mockIssueService.getById.mockResolvedValue(issueRecord({
+      id: reviewIssueId,
+      identifier: "PAP-REVIEW",
+      title: "Review",
+      status: "in_progress",
+    }));
+    mockIssueService.update.mockResolvedValue(issueRecord({
+      id: reviewIssueId,
+      identifier: "PAP-REVIEW",
+      title: "Review",
+      status: "done",
+    }));
+    mockIssueService.listWakeableBlockedDependents.mockResolvedValue([
+      {
+        id: releaseIssueId,
+        assigneeAgentId: "agent-release",
+        blockerIssueIds: [reviewIssueId],
+        blockedTransitionAt: releaseBlockedAt,
+      },
+    ]);
+    mockFindExistingIssueBlockersResolvedWakeForReadyState.mockImplementation(async (_db, input) =>
+      input.completedRearmCutoff?.getTime() === releaseBlockedAt.getTime()
+        ? null
+        : { id: "wake-cycle" },
+    );
+
+    const res = await request(await createApp()).patch(`/api/issues/${reviewIssueId}`).send({ status: "done" });
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => {
+      expect(mockFindExistingIssueBlockersResolvedWakeForReadyState).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          dependentIssueId: releaseIssueId,
+          blockedTransitionAt: releaseBlockedAt,
+          completedRearmCutoff: releaseBlockedAt,
+        }),
+      );
+      expect(mockWakeup).toHaveBeenCalledTimes(1);
     });
   });
 
