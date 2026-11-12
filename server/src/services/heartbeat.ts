@@ -29249,7 +29249,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
           if (!conversationSettled) {
             await handleIssueReviewPathDisposition(livenessRun);
-            if (livenessRun.runtimeMode !== "native") {
+            // FOLD s3a: an external_pull agent (fork) receives its work out of
+            // band and is never judged by its run process. Upstream's legacy
+            // disposition repair (#13888) would wake it again, so it keeps the
+            // fork's successful-run handoff decision, which resolves a pending
+            // handoff with the out-of-band skip reason and queues no wake.
+            if (livenessRun.runtimeMode !== "native" && !isExternalPullAgent(agent)) {
               await recovery.reconcileLegacyContinuation(livenessRun.id);
             } else {
               await handleRunLivenessContinuation(livenessRun);
