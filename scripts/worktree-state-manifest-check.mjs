@@ -15,8 +15,11 @@
 // or triggers a reseed. Other exits are usage or internal errors.
 //
 // The reader opens with O_NOFOLLOW | O_NONBLOCK, so a FIFO, socket, directory,
-// or symlink is refused without waiting. The validator modules are loaded as
-// TypeScript through Node's built-in type stripping (Node >= 22.18).
+// or symlink is refused without waiting. The directory that holds `.paperclip`
+// is the trusted root: a linked `.paperclip` or `uid-<uid>` state directory is
+// refused, never followed to another instance's manifest. The validator
+// modules are loaded as TypeScript through Node's built-in type stripping
+// (Node >= 22.18).
 import path from "node:path";
 
 const REFUSED_EXIT = 3;
@@ -28,7 +31,7 @@ if (!manifestArgument || process.argv.length !== 3) {
 }
 
 const sharedSource = new URL("../packages/shared/src/", import.meta.url);
-const { readBoundedStateFile } = await import(new URL("bounded-state-file.ts", sharedSource).href);
+const { readBoundedStateFile, resolveWorktreeStateRoot } = await import(new URL("bounded-state-file.ts", sharedSource).href);
 const { classifyWorktreeStateManifest, isVerifiedWorktreeSeedManifest } = await import(
   new URL("worktree-initialization-manifest.ts", sharedSource).href
 );
@@ -36,7 +39,7 @@ const { classifyWorktreeStateManifest, isVerifiedWorktreeSeedManifest } = await 
 const manifestPath = path.resolve(manifestArgument);
 let bytes;
 try {
-  bytes = readBoundedStateFile(manifestPath);
+  bytes = readBoundedStateFile(manifestPath, { trustedRoot: resolveWorktreeStateRoot(manifestPath) });
 } catch (error) {
   process.stderr.write(`${error instanceof Error ? error.message : "Worktree state manifest could not be read."}\n`);
   process.exit(REFUSED_EXIT);

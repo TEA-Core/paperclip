@@ -17,8 +17,11 @@
 
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { readBoundedStateFile } from "@paperclipai/shared/bounded-state-file";
-import { classifyWorktreeStateManifest } from "@paperclipai/shared/worktree-initialization-manifest";
+import { readBoundedStateFile, resolveWorktreeStateRoot } from "@paperclipai/shared/bounded-state-file";
+import {
+  classifyWorktreeStateManifest,
+  isVerifiedWorktreeSeedManifest,
+} from "@paperclipai/shared/worktree-initialization-manifest";
 import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { authUsers, companies, companyMemberships, issues } from "@paperclipai/db";
@@ -62,10 +65,11 @@ function readSeedManifestSummary(markerDir: string): SeedManifestSummary {
   const manifestPath = path.join(markerDir, WORKSPACE_SEED_MANIFEST_BASENAME);
   let bytes: Buffer | null;
   try {
-    bytes = readBoundedStateFile(manifestPath);
+    bytes = readBoundedStateFile(manifestPath, { trustedRoot: resolveWorktreeStateRoot(manifestPath) });
   } catch {
-    // A non-regular, oversized, or torn manifest is never a silent "assume
-    // seeded"; the bounded reader refuses it without blocking.
+    // A non-regular, oversized, or torn manifest, or one behind a linked state
+    // directory, is never a silent "assume seeded"; the bounded reader refuses
+    // it without blocking.
     return { state: "failed", phase: null, mode: null, failurePhase: "seed_manifest_unreadable" };
   }
   if (bytes !== null) {
@@ -96,6 +100,13 @@ function readSeedManifestSummary(markerDir: string): SeedManifestSummary {
         : "unknown";
     const phase = typeof manifest.phase === "string" ? manifest.phase : null;
     const mode = manifest.seedMode === "minimal" || manifest.seedMode === "full" ? manifest.seedMode : null;
+    if (state === "verified" && !isVerifiedWorktreeSeedManifest(manifest)) {
+      // Only a complete v2 `minimal` or `full` manifest (source, snapshot,
+      // migration revision, target, attempt, times and a succeeded `complete`
+      // diagnostic) is seed evidence. A bare `verified` claims a finished seed
+      // it cannot show, so it is a failure, never `ready`.
+      return { state: "failed", phase, mode, failurePhase: "seed_manifest_incomplete" };
+    }
     return {
       state,
       phase,
