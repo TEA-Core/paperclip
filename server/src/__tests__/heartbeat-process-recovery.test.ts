@@ -1337,14 +1337,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         "Expected source-scoped stranded recovery action to be created",
       );
 
+    // Fork stranded escalations stay with the source agent. A disposition-repair
+    // escalation (upstream #13888, deliberate_wait_without_target) is board-owned in
+    // the fork as well as upstream.
+    const boardOwned = input.kind === "deliberate_wait_without_target";
     expect(action).toMatchObject({
       companyId: input.companyId,
       sourceIssueId: input.issueId,
       recoveryIssueId: null,
       kind: input.kind ?? "stranded_assigned_issue",
       status: "active",
-      ownerType: "agent",
-      ownerAgentId: input.agentId,
+      ownerType: boardOwned ? "board" : "agent",
+      ownerAgentId: boardOwned ? null : input.agentId,
       previousOwnerAgentId: input.previousOwnerAgentId ?? input.agentId,
       returnOwnerAgentId: input.returnOwnerAgentId ?? input.agentId,
       cause: input.cause ?? "stranded_assigned_issue",
@@ -1379,6 +1383,23 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ),
       );
     expect(recoveryIssues).toHaveLength(0);
+
+    if (boardOwned) {
+      // A board-owned escalation spawns no wake or run of its own (upstream helper).
+      const boardWakeups = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(sql`${agentWakeupRequests.payload} ->> 'recoveryActionId' = ${action.id}`);
+      expect(boardWakeups).toHaveLength(0);
+      await waitForHeartbeatIdle(db);
+      const boardSourceIssue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, input.issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(boardSourceIssue?.status).toBe("blocked");
+      return action;
+    }
 
     const recoveryWakeup = await waitForValue(async () => {
       const wakeups = await db
@@ -1633,7 +1654,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     "continuation_user_authorization_missing",
     "continuation_task_ownership_changed",
   ])("retains untyped continuation setup failures: %s", async (message) => {
-    const { runId, wakeupRequestId } = await seedQueuedIssueRunFixture();
+    const { runId, wakeupRequestId, issueId } = await seedQueuedIssueRunFixture();
     const error = new Error(message, { cause: Object.assign(new Error("upstream setup failed"), { code: "ECONNRESET" }) });
     const build = vi.spyOn(executionContinuation, "buildExecutionContinuation")
       .mockRejectedValueOnce(error);
@@ -1643,8 +1664,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await waitForRunToSettle(heartbeat, runId);
       await heartbeat.waitForRunExecutionDrain(runId);
       expect(build).toHaveBeenCalled();
+      // Fork: setup-failure messages carry the owning issue's attribution suffix
+      // (" (issue: <identifier> <uuid>)") for per-issue failure attribution.
+      const [issue] = await db.select({ identifier: issues.identifier }).from(issues).where(eq(issues.id, issueId));
+      const attribution = issue?.identifier ? ` (issue: ${issue.identifier} ${issueId})` : ` (issue: ${issueId})`;
       expect(await heartbeat.getRun(runId)).toMatchObject({
-        status: "failed", errorCode: "setup_failed", error: message,
+        status: "failed", errorCode: "setup_failed", error: `${message}${attribution}`,
       });
       const report = await waitForValue(async () => mockCaptureRunFailure.mock.calls.find(([event]) => event.runId === runId)?.[0]);
       expect(report?.diagnostics).toMatchObject({
@@ -15522,8 +15547,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       retryReason: "issue_continuation_needed",
     });
 
+    // The repeated wait now escalates through upstream's board-owned disposition repair
+    // (#13888), which spawns no recovery run, so only the source run exists (as upstream).
     const followupRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-    expect(followupRuns).toHaveLength(2);
+    expect(followupRuns).toHaveLength(1);
   });
 
   it("preserves a persisted issue monitor as the durable external-wait path", async () => {
