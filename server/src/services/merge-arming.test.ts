@@ -2321,6 +2321,70 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       }
     });
 
+    // CodeRabbit minor: the cap must bound the list the live reads actually use.
+    // Mentions added AFTER the cap check (here: right before a second mention
+    // query would start) must not widen the live-read set.
+    it("keeps live reads inside the checked mention list when mentions are added after the cap check (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, state: "open", draft: true });
+      await insertMention(issueId, { number: 50, state: "closed", headRefName: "SUP-50-branch" });
+      installRoutes(mergedCarrierRoutes());
+      mockGhFetch.mockClear();
+      installRoutes(mergedCarrierRoutes());
+
+      let mentionQueries = 0;
+      let injected = false;
+      const injectMentions = async () => {
+        if (injected) return;
+        injected = true;
+        for (let n = 60; n < 66; n++) {
+          await insertMention(issueId, { number: n, state: "closed", headRefName: `SUP-${n}-branch` });
+        }
+      };
+      const wrapBuilder = (builder: any): any =>
+        new Proxy(builder, {
+          get(target, prop) {
+            if (prop === "then") {
+              return (resolve: any, reject: any) => injectMentions().then(() => target.then(resolve, reject));
+            }
+            const value = target[prop];
+            return typeof value === "function" ? (...args: unknown[]) => wrapBuilder(value.apply(target, args)) : value;
+          },
+        });
+      // Every mention query is db.select(...).from(externalObjectMentions)...; the
+      // preflight issues the first two before the cap check. Any later one is
+      // preceded by the injected rows, so a second read of the list sees 8 PRs.
+      const racingDb = new Proxy(db, {
+        get(target, prop) {
+          const value = (target as any)[prop];
+          if (prop !== "select") return typeof value === "function" ? value.bind(target) : value;
+          return (...args: unknown[]) => {
+            const builder = value.apply(target, args);
+            return new Proxy(builder, {
+              get(b, p) {
+                const member = b[p];
+                if (p !== "from" || typeof member !== "function") {
+                  return typeof member === "function" ? member.bind(b) : member;
+                }
+                return (...fromArgs: unknown[]) => {
+                  const next = member.apply(b, fromArgs);
+                  if (fromArgs[0] !== externalObjectMentions) return next;
+                  mentionQueries += 1;
+                  return mentionQueries >= 4 ? wrapBuilder(next) : next;
+                };
+              },
+            });
+          };
+        },
+      }) as typeof db;
+
+      const result = await preflightFinalDelivery(racingDb, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("resolved");
+      const injectedReads = mockGhFetch.mock.calls.filter(([url]) => /\/pulls\/6\d$/.test(String(url)));
+      expect(injectedReads).toHaveLength(0);
+    });
+
     it("refuses without fanning out when the card cites more mentions than the live-read cap (SUP-24033)", async () => {
       const issueId = await insertIssue();
       await insertMention(issueId, { number: 42, state: "open", draft: true });

@@ -3824,7 +3824,7 @@ async function resolveStaleDraftMergedCarrier(
   if (mentioned.length > MAX_STALE_DRAFT_MENTION_READS) return null;
   const owned = await narrowToDelivered(db, companyId, issueId, drafts);
   if (owned.outcome !== "narrowed" || owned.delivered.length !== drafts.length) return null;
-  const carrier = await resolveSingleMergedMentionCarrier(db, companyId, issueId, refusal.reason);
+  const carrier = await resolveSingleMergedMentionCarrier(db, companyId, issueId, refusal.reason, mentioned);
   if (carrier.kind !== "resolved") return null;
   return drafts.some((draft) => samePullRequest(draft, carrier.pr)) ? carrier : null;
 }
@@ -3850,12 +3850,16 @@ async function resolveSingleMergedMentionCarrier(
   companyId: string,
   issueId: string,
   liveDraftRefusal: string | null = null,
+  // SUP-24033: the stale-draft path passes the list it already cap-checked so the
+  // live reads cannot run over a second, uncapped read of the mentions.
+  checkedMentions?: LinkedPullRequest[],
 ): Promise<
   | { kind: "none" }
   | { kind: "resolved"; headSha: string; displayName: string; pr: { owner: string; repo: string; number: number } }
   | { kind: "unresolvable"; reason: string }
 > {
-  const mentioned = await resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts: true });
+  const mentioned =
+    checkedMentions ?? (await resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts: true }));
   const mergedCarriers: Array<{
     kind: "resolved";
     headSha: string;
