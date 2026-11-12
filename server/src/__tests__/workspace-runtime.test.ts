@@ -1,5 +1,4 @@
 import { execFile, spawn, spawnSync } from "node:child_process";
-import { readLegacySeedManifestObject } from "../worktree-seed-manifest.js";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -79,6 +78,7 @@ import {
 } from "../services/local-service-supervisor.ts";
 import { logger } from "../middleware/logger.js";
 import type { EnsureSharedGroupOwnershipOptions } from "../services/shared-group-ownership.js";
+import { readLegacySeedManifestObject } from "../worktree-seed-manifest.js";
 import {
   buildWorkspaceRealizationRecord,
   buildWorkspaceRealizationRequest,
@@ -1450,6 +1450,39 @@ describe("readWorkspaceSeedOperationEvidence", () => {
       const evidence = readWorkspaceSeedOperationEvidence(cwd);
       expect(evidence.verified).toBe(false);
       expect(evidence.error).toMatch(/without a verified manifest/);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("readWorkspaceSeedOperationEvidence refused manifests with a stale skip marker", () => {
+  it.each(["minimal_no_secrets", "fifo"] as const)("refuses a %s manifest quickly", async (variant) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), `paperclip-runtime-seed-evidence-refused-${variant}-`));
+    try {
+      await fs.mkdir(path.join(cwd, ".paperclip"), { recursive: true });
+      await fs.writeFile(path.join(cwd, ".paperclip", "seed-skip-no-source"), "{}\n");
+      const manifestPath = path.join(cwd, ".paperclip", "seed-manifest.json");
+      if (variant === "fifo") {
+        expect(spawnSync("mkfifo", [manifestPath]).status).toBe(0);
+      } else {
+        await fs.writeFile(
+          manifestPath,
+          JSON.stringify({
+            version: 2,
+            seedMode: "minimal-no-secrets",
+            state: "verified",
+            phase: "validation",
+            diagnostics: [{ phase: "validation", status: "verified", at: "2026-09-10T00:00:00.000Z" }],
+          }),
+        );
+      }
+      const startedAt = Date.now();
+      const evidence = readWorkspaceSeedOperationEvidence(cwd);
+      expect(Date.now() - startedAt).toBeLessThan(2000);
+      expect(evidence.verified).toBe(false);
+      expect(evidence.metadata.seedFailurePhase).toBe("seed_manifest_unreadable");
+      expect(evidence.metadata.seedSkippedNoSource).toBeUndefined();
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }

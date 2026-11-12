@@ -8924,8 +8924,9 @@ export function readWorkspaceSeedOperationEvidence(worktreePath: string): {
   metadata: Record<string, unknown>;
 } {
   const manifestPath = path.join(worktreePath, ".paperclip", "seed-manifest.json");
-  const noSourceSkip = hasNoSourceSeedSkip(worktreePath);
   const manifest = readLegacySeedManifestObject(manifestPath);
+  const manifestPresent = manifest !== null || lstatSync(manifestPath, { throwIfNoEntry: false }) !== undefined;
+  const noSourceSkip = !manifestPresent && hasNoSourceSeedSkip(worktreePath);
   if (manifest) {
     const state = typeof manifest.state === "string" ? manifest.state : "unknown";
     const phase = typeof manifest.phase === "string" ? manifest.phase : null;
@@ -8963,7 +8964,7 @@ export function readWorkspaceSeedOperationEvidence(worktreePath: string): {
     error: "Workspace seed command returned without a readable seed manifest.",
     metadata: {
       provisionKind: "workspace_seed",
-      seedState: existsSync(manifestPath) ? "unreadable" : "absent",
+      seedState: manifestPresent ? "unreadable" : "absent",
       seedPhase: null,
       seedFailurePhase: "seed_manifest_unreadable",
     },
