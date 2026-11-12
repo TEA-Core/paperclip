@@ -5531,4 +5531,55 @@ rl.on("line", (line) => {
       (error) => expectGatewayError(error, 403, "run_context_mismatch"),
     );
   });
+
+  it("returns the structured run-context denial without recording an invocation when the run snapshot drifts", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const remoteTool = await createRemoteMcpTool(db, company.id, {
+      applicationKey: "context-drift",
+      toolName: "kv_set",
+    });
+    const toolName = expectedConnectedToolName({
+      applicationKey: remoteTool.application.applicationKey,
+      connectionId: remoteTool.connection.id,
+      toolName: remoteTool.catalogEntry.toolName,
+    });
+    await allowToolsForAgent(db, company.id, agent.id, [toolName]);
+    const gateway = createTestToolGatewayService(db);
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+
+    // The session was created against the original issue context; simulate the
+    // heartbeat run snapshot moving to a different issue before tools/call.
+    const { issue: movedIssue, project: movedProject } = await createIssueAndRun(db, company.id, agent.id);
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId: movedIssue.id, projectId: movedProject.id } })
+      .where(eq(heartbeatRuns.id, run.id));
+
+    await gateway.executeTool({
+      sessionToken: session.token,
+      tool: toolName,
+      parameters: { key: "drifted", value: "1" },
+    }).then(
+      () => {
+        throw new Error("Expected drifted run context to deny the tool call");
+      },
+      (error) => {
+        expectGatewayError(error, 403, "deny_run_context_mismatch");
+        const gatewayError = error as ToolGatewayHttpError;
+        expect(gatewayError.message).toBe(
+          "Supplied run context does not match the stored heartbeat context.",
+        );
+        expect(gatewayError.details).toMatchObject({ tool: toolName });
+      },
+    );
+
+    expect(
+      await db.select().from(toolInvocations).where(eq(toolInvocations.companyId, company.id)),
+    ).toEqual([]);
+    expect(
+      await db.select().from(toolActionRequests).where(eq(toolActionRequests.companyId, company.id)),
+    ).toEqual([]);
+  });
 });

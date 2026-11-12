@@ -29,7 +29,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { toolAccessPolicyService } from "../services/tool-access-policy.js";
+import { isInvalidToolAccessContextDecision, toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
 
@@ -736,6 +736,35 @@ describeEmbeddedPostgres("tool access policy service", () => {
       allowed: false,
       reasonCode: "deny_run_context_mismatch",
     });
+  });
+
+  it("classifies context denials as unrecordable while policy denials stay recordable", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const canonicalIssue = await createIssue(db, company.id, "Canonical");
+    const escalatedIssue = await createIssue(db, company.id, "Escalated");
+    const { connection } = await createTool(db, company.id);
+    const run = await createRun(db, company.id, agent.id, { issueId: canonicalIssue.id });
+
+    const contextDenial = await toolAccessPolicyService(db).decide({
+      companyId: company.id,
+      actor: { actorType: "agent", actorId: agent.id, agentId: agent.id },
+      runContext: { heartbeatRunId: run.id, issueId: escalatedIssue.id },
+      request: { connectionId: connection.id, toolName: "send_email" },
+    });
+    const policyDenial = await toolAccessPolicyService(db).decide({
+      companyId: company.id,
+      actor: { actorType: "agent", actorId: agent.id, agentId: agent.id },
+      request: { connectionId: connection.id, toolName: "send_email" },
+    });
+
+    expect(contextDenial.reasonCode).toBe("deny_run_context_mismatch");
+    expect(contextDenial.explanation).toBe(
+      "Supplied run context does not match the stored heartbeat context.",
+    );
+    expect(isInvalidToolAccessContextDecision(contextDenial)).toBe(true);
+    expect(policyDenial.reasonCode).toBe("deny_default");
+    expect(isInvalidToolAccessContextDecision(policyDenial)).toBe(false);
   });
 
   it("audits denied calls without storing secret argument values", async () => {

@@ -308,6 +308,41 @@ function decision(
   };
 }
 
+/**
+ * Reason codes `loadContext()` emits when it cannot resolve a valid tool
+ * access context (actor, run/issue/project snapshot, routine, catalog,
+ * connection, application). `decide()` returns them before any policy
+ * evaluation, and `recordInvocation()` reloads the same context and refuses
+ * to persist through it. Callers that pair `decide()` with
+ * `recordInvocation()` must return these decisions to the caller directly —
+ * passing them to `recordInvocation()` throws a generic invalid-context
+ * error and loses the structured reasonCode and explanation.
+ */
+const INVALID_TOOL_ACCESS_CONTEXT_REASON_CODES = new Set<string>([
+  "deny_missing_agent",
+  "deny_run_context_mismatch",
+  "deny_company_boundary",
+  "deny_missing_tool",
+  "deny_disabled_connection",
+  "deny_disabled_application",
+  "deny_archived_application",
+]);
+
+/**
+ * True when a decision came from an invalid tool access context and therefore
+ * cannot be persisted via `recordInvocation()`. Policy denials evaluated over
+ * a valid context (deny_default, deny_policy_block, rate_limited, ...) remain
+ * recordable and keep their persisted audit/invocation behavior.
+ */
+export function isInvalidToolAccessContextDecision(
+  accessDecision: Pick<ToolAccessDecision, "decision" | "reasonCode">,
+): boolean {
+  return (
+    accessDecision.decision === "deny" &&
+    INVALID_TOOL_ACCESS_CONTEXT_REASON_CODES.has(accessDecision.reasonCode)
+  );
+}
+
 function listValues(value: unknown): string[] {
   if (typeof value === "string" && value.trim()) return [value.trim()];
   if (!Array.isArray(value)) return [];

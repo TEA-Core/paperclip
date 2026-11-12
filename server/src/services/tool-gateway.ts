@@ -127,7 +127,7 @@ import {
   REMOTE_URL_SECRET_CONFIG_PATH,
   remoteUrlCredentialMatchesPublicUrl,
 } from "./remote-url-credentials.js";
-import { toolAccessPolicyService } from "./tool-access-policy.js";
+import { isInvalidToolAccessContextDecision, toolAccessPolicyService } from "./tool-access-policy.js";
 import { commitToolActionReview } from "./tool-action-review.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
@@ -2736,6 +2736,31 @@ export function createToolGatewayService(
   function policyErrorStatus(decision: ToolAccessDecision) {
     if (decision.decision === "rate_limited") return 429;
     return 403;
+  }
+
+  /**
+   * `decide()` emits context denials (e.g. deny_run_context_mismatch when the
+   * heartbeat run snapshot drifted from the session) before any policy
+   * evaluation, and `recordInvocation()` refuses to persist through the same
+   * invalid context. Throw the already computed structured denial here so the
+   * caller sees the reasonCode and explanation instead of the generic
+   * invalid-context error, which the route would surface as a 500.
+   */
+  function assertRecordableAccessDecision(
+    accessDecision: ToolAccessDecision,
+    details: { tool: string },
+  ): void {
+    if (!isInvalidToolAccessContextDecision(accessDecision)) return;
+    throw new ToolGatewayHttpError(
+      policyErrorStatus(accessDecision),
+      accessDecision.explanation,
+      accessDecision.reasonCode,
+      {
+        tool: details.tool,
+        decision: accessDecision.decision,
+        matchedPolicyIds: accessDecision.matchedPolicyIds,
+      },
+    );
   }
 
   function findStaticTool(toolName: string, allowlist?: Set<string> | null): ToolGatewayDescriptor {
@@ -9245,6 +9270,7 @@ export function createToolGatewayService(
         consumeRateLimit: true,
       });
       const accessDecision = await policyService.decide(decisionInput);
+      assertRecordableAccessDecision(accessDecision, { tool: tool.name });
       const recorded = await policyService.recordInvocation(
         decisionInput,
         accessDecision,
@@ -10510,6 +10536,7 @@ export function createToolGatewayService(
         if (accessDecision.allowed && tool.providerType === "paperclip_slack_chat" && SLACK_TOOLS.some(t => t.name === tool.upstreamToolName && t.risk === "approval")) {
           accessDecision = { ...accessDecision, allowed: false, decision: "require_approval", reasonCode: "requires_approval_policy", explanation: "Slack destructive actions, channel creation and invitations require approval." };
         }
+        assertRecordableAccessDecision(accessDecision, { tool: tool.name });
         const recorded = await policyService.recordInvocation(
           decisionInput,
           accessDecision,
@@ -11008,6 +11035,7 @@ export function createToolGatewayService(
         consumeRateLimit: true,
       });
       const accessDecision = await policyService.decide(decisionInput);
+      assertRecordableAccessDecision(accessDecision, { tool: tool.name });
       const recorded = await policyService.recordInvocation(
         decisionInput,
         accessDecision,
