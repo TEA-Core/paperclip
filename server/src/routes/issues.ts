@@ -24188,8 +24188,8 @@ export function issueRoutes(
             },
             ...(escalationApproval ? {
               beforeResolveInTransaction: async (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => {
-                const [lockedIssue] = await tx.select().from(issues)
-                  .where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)))
+                  const [lockedIssue] = await tx.select().from(issueRows)
+                  .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)))
                   .for("update");
                 if (!lockedIssue) throw notFound("Issue not found");
                 if (lockedIssue.deliveryRequirement !== issue.deliveryRequirement) {
