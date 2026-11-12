@@ -683,7 +683,7 @@ export function summarySlotService(db: Db) {
       "",
       `Snapshot generated at ${new Date().toISOString()}. Recently done means updated since ${recentlyDoneSince.toISOString()}.`,
        "This bounded, company-scoped snapshot is an index, not proof of what a card still owes. Do not call issue-list endpoints for listing.",
-       "Before writing an action claim about a specific issue — including that it still owes work, never ran, nothing has been sent, or an equivalent claim — check `GET /api/companies/{companyId}/issues/{ref}/comments`.",
+       "Before writing an action claim about a specific issue — including that it still owes work, never ran, nothing has been sent, or an equivalent claim — read that issue's thread: `GET /api/issues/{identifier}/comments`, substituting the issue's identifier exactly as a snapshot row prints it (for example `SUP-19312`); the issue's UUID also resolves.",
        "The issue description, the card body, and the previous slot body returned with `latestRevisionId` are unsafe sources for an action claim: descriptions can carry dated amendments, and a false revision becomes the next run's input. `lastCommentAt` makes staleness visible; it does not make a stale body safe.",
       "",
       ...formatGroup("Blocked", blocked),
