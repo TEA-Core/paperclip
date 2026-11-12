@@ -1842,7 +1842,7 @@ describe("execute — SUP-14939 router admission refusal classification", () => 
     expect(result.errorMeta?.routerAbort).toBeUndefined();
   }, 15000);
 
-  it("keeps PAPERCLIP_WAKE_PAYLOAD_JSON under the env cap even when executionContinuation is huge", async () => {
+  it("keeps the launch env small even when executionContinuation is huge", async () => {
     let capturedEnv: Record<string, string> | undefined;
     runAdapterExecutionTargetProcessMock.mockImplementation(
       async (_runId, _target, _command, _args, options) => {
@@ -1889,16 +1889,10 @@ describe("execute — SUP-14939 router admission refusal classification", () => 
     await execute(makeCtx({ context: { paperclipWake: wake } }));
 
     expect(capturedEnv).toBeTruthy();
-    const envValue = capturedEnv!.PAPERCLIP_WAKE_PAYLOAD_JSON;
-    expect(typeof envValue).toBe("string");
-    expect(Buffer.byteLength(envValue, "utf8")).toBeLessThanOrEqual(32 * 1024);
-    const parsed = JSON.parse(envValue);
-    expect(parsed.executionContinuation).toMatchObject({
-      omitted: true,
-      reason: "delivered_in_prompt",
-    });
-    // the heavy history stays out of the env value
-    expect(envValue).not.toContain("e2big sentinel body 59");
+    // Wake context travels in the prompt; the retired env copy must not reappear.
+    expect(capturedEnv!.PAPERCLIP_WAKE_PAYLOAD_JSON).toBeUndefined();
+    const envBytes = Object.values(capturedEnv!).reduce((n, v) => n + Buffer.byteLength(String(v), "utf8"), 0);
+    expect(envBytes).toBeLessThan(64 * 1024);
   }, 15000);
 });
 
