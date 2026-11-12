@@ -24176,14 +24176,14 @@ export function issueRoutes(
                   ...escalationCertifiedDelivery,
                   decisionId: acceptedEscalationDecision.value.decisionId,
                 };
-                await tx.update(issues).set({
+                await tx.update(issueRows).set({
                   executionState: sql`jsonb_set(
-                    coalesce(${issues.executionState}, '{}'::jsonb),
+                    coalesce(${issueRows.executionState}, '{}'::jsonb),
                     '{approvalStatus}',
-                    coalesce(${issues.executionState} -> 'approvalStatus', '{}'::jsonb)
+                    coalesce(${issueRows.executionState} -> 'approvalStatus', '{}'::jsonb)
                       || jsonb_build_object('finalDelivery', ${JSON.stringify(finalDelivery)}::jsonb)
                   )`,
-                }).where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)));
+                }).where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)));
               }
             },
             ...(escalationApproval ? {
