@@ -16,11 +16,24 @@ describe("classifyAdapterFailureForRecovery", () => {
     expect(classifyContinuationFailure(run as never)).toMatchObject({ kind: "non_retryable", maxAttempts: 0 });
   });
 
-  it.each(["kimi_auth_required", "acpx_auth_required", "gemini_auth_required"])("preserves recovery when %s did not produce an inline repair card", (errorCode) => {
+  // FORK-DIVERGENCE(SUP-13716): upstream #14629 also lists acpx_auth_required
+  // here. The fork stops continuation recovery for acpx_auth_required even
+  // without a repair card: unrefreshable ACP lane OAuth credentials fail every
+  // retry identically, so the issue is blocked for an operator re-login.
+  it.each(["kimi_auth_required", "gemini_auth_required"])("preserves recovery when %s did not produce an inline repair card", (errorCode) => {
     const classification = classifyRunLiveness({ runStatus: "failed", issue: null, errorCode, authenticationRepairRequested: false });
     const run = { errorCode, ...classification };
     expect(isAiAuthenticationBlocked(run)).toBe(false);
     expect(classifyContinuationFailure(run as never).kind).toBe("default");
+  });
+
+  it("stops continuation recovery for acpx_auth_required without an inline repair card (SUP-13716)", () => {
+    const errorCode = "acpx_auth_required";
+    const classification = classifyRunLiveness({ runStatus: "failed", issue: null, errorCode, authenticationRepairRequested: false });
+    expect(classifyContinuationFailure({ errorCode, ...classification } as never)).toMatchObject({
+      kind: "non_retryable",
+      maxAttempts: 0,
+    });
   });
 
   it("uses a typed ACP quota reset without needing the provider's original message", () => {

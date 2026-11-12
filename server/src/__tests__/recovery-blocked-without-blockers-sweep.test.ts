@@ -205,22 +205,27 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
   // (follow-ups included, since they are registered before the parent settles),
   // so it is the deterministic primitive; the poll below only confirms the
   // database agrees, and fails loudly rather than silently timing out.
+  //
+  // A scheduled_retry run is deferred work, not a live execution. Upstream
+  // #13888's legacy disposition repair schedules its second attempt 60 s out
+  // (a scheduled_retry run plus the queued wake bound to it) after an owner run
+  // ends without a recorded disposition, so that pair does not hold the drain.
   async function drainAgentRuns(agentId: string, timeoutMs = 30_000) {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       await heartbeatService(db).drainActiveRunExecutions();
-      const [activeRuns, pendingWakes] = await Promise.all([
+      const [activeRuns, pendingWakes, scheduledRetries] = await Promise.all([
         db
           .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
           .from(heartbeatRuns)
           .where(
             and(
               eq(heartbeatRuns.agentId, agentId),
-              inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"] as const),
+              inArray(heartbeatRuns.status, ["queued", "running"] as const),
             ),
           ),
         db
-          .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+          .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
           .from(agentWakeupRequests)
           .where(
             and(
@@ -228,13 +233,19 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
               inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"] as const),
             ),
           ),
+        db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "scheduled_retry"))),
       ]);
-      if (activeRuns.length === 0 && pendingWakes.length === 0) return;
+      const scheduledRetryRunIds = new Set(scheduledRetries.map((run) => run.id));
+      const livePendingWakes = pendingWakes.filter((wake) => !wake.runId || !scheduledRetryRunIds.has(wake.runId));
+      if (activeRuns.length === 0 && livePendingWakes.length === 0) return;
       if (Date.now() >= deadline) {
         throw new Error(
           `drainAgentRuns timed out after ${timeoutMs}ms for agent ${agentId}: ` +
             `${activeRuns.length} active run(s) [${activeRuns.map((run) => run.status).join(", ")}], ` +
-            `${pendingWakes.length} pending wake(s) [${pendingWakes.map((wake) => wake.status).join(", ")}]`,
+            `${livePendingWakes.length} pending wake(s) [${livePendingWakes.map((wake) => wake.status).join(", ")}]`,
         );
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
