@@ -10590,7 +10590,16 @@ export function createToolGatewayService(
           ? await claimSlackRateLimitRetry(db, { companyId: session.companyId, agentId: session.agentId, runId: session.runId, issueId: session.issueId, endpointId: String(asRecord(tool.providerMetadata)?.endpointId ?? ""), identityContextId: session.identityContextId }, invocationId)
           : false;
         if (recorded.replayed && !retryingSlackRateLimit) {
-          if (isReplayableFailure(recorded.invocation)) {
+          // Slack connector replays ride the chat-action lifecycle (rate-limit
+          // retry windows, uncertain-delivery reconciliation) and must keep
+          // resolving with the stored outcome; every other replayed failure
+          // surfaces explicitly instead of a success-shaped result.
+          const slackConnectorReplay =
+            tool.providerType === "paperclip_slack_chat";
+          if (
+            isReplayableFailure(recorded.invocation)
+            && !slackConnectorReplay
+          ) {
             const replayFailure = replayedInvocationFailure(recorded.invocation);
             await writeAudit({
               session,
