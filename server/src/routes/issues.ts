@@ -14534,7 +14534,7 @@ export function issueRoutes(
           // raced close cannot leave an orphan close row behind.
           if (pendingRecoveryCloseRowAudits.length > 0 && issue.status === "done") {
             for (const audit of pendingRecoveryCloseRowAudits) {
-              await logActivityInTransaction(tx as unknown as Db, audit);
+              await logActivity(tx as unknown as Db, audit, postCommitActivityPublications);
             }
           }
           // SUP-21910: persist a structured done-tier declaration as an issue
@@ -21228,7 +21228,7 @@ export function issueRoutes(
           // cannot leave an orphan close row behind.
           if (pendingCloseRowAudits.length > 0 && updated.status === "done") {
             for (const audit of pendingCloseRowAudits) {
-              await logActivityInTransaction(tx as unknown as Db, audit);
+              await logActivity(tx as unknown as Db, audit, postCommitActivityPublications);
             }
           }
           if (commentAttachmentIds?.length) {
@@ -24168,7 +24168,7 @@ export function issueRoutes(
                 acceptedEscalationDecision.value?.issue.status === "done"
               ) {
                 for (const audit of pendingInteractionCloseRowAudits) {
-                  await logActivityInTransaction(tx as unknown as Db, audit);
+                  await logActivity(tx as unknown as Db, audit, postCommitActivityPublications);
                 }
               }
               if (acceptedEscalationDecision.value && escalationCertifiedDelivery) {
@@ -26115,7 +26115,7 @@ export function issueRoutes(
           // transaction, only after the terminal write landed.
           if (pendingAutoApproveCloseRowAudits.length > 0 && updated.status === "done") {
             for (const audit of pendingAutoApproveCloseRowAudits) {
-              await logActivityInTransaction(tx as unknown as Db, audit);
+              await logActivity(tx as unknown as Db, audit, postCommitActivityPublications);
             }
           }
 
