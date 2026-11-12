@@ -53,6 +53,27 @@ describe("paperclip MCP tools", () => {
     );
   });
 
+  it("forwards the top-level monitor alias on paperclipUpdateIssue verbatim (SUP-22840)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "PAP-1135", status: "in_progress" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const updateTool = getTool("paperclipUpdateIssue");
+    const monitor = { nextCheckAt: "2026-12-01T12:00:00.000Z" };
+    await updateTool.execute({ issueId: "PAP-1135", monitor });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(init.method).toBe("PATCH");
+    const body = JSON.parse(String(init.body));
+    expect(body.monitor).toMatchObject({
+      nextCheckAt: monitor.nextCheckAt,
+      scheduledBy: "assignee",
+    });
+    expect(body.executionPolicy).toBeUndefined();
+  });
+
   it("preserves returnAssigneeAgentId through create and update tool requests", async () => {
     const returnAssigneeAgentId = "38ca3dab-cdb5-4d90-84dd-c5f2eb15da5e";
     const reviewerAgentId = "d1982606-4c66-475f-af56-63c4b9d92f24";

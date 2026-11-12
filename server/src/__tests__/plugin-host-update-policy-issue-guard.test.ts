@@ -111,6 +111,46 @@ describeEmbeddedPostgres("plugin-host updatePolicy issue guard", () => {
     services.dispose();
   });
 
+  it("rejects a plugin-host issues.update that selects release-assurance authority and leaves the policy unchanged", async () => {
+    const company = await createCompany(db, "PRA");
+    const issue = await db
+      .insert(issues)
+      .values({
+        companyId: company.id,
+        title: "Release assurance authority",
+        status: "todo",
+        priority: "medium",
+        executionPolicy: null,
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
+
+    await expect(
+      services.issues.update({
+        issueId: issue.id,
+        companyId: company.id,
+        patch: {
+          executionPolicy: {
+            mode: "normal",
+            approvalAuthority: "release_assurance",
+            stages: [{
+              id: randomUUID(),
+              type: "approval",
+              approvalsNeeded: 1,
+              participants: [{ id: randomUUID(), type: "agent", agentId: randomUUID() }],
+            }],
+            monitor: null,
+          },
+        } as never,
+      }),
+    ).rejects.toMatchObject({ status: 422 });
+
+    const row = await db.query.issues.findFirst({ where: (i, { eq }) => eq(i.id, issue.id) });
+    expect(row!.executionPolicy).toBeNull();
+    services.dispose();
+  });
+
   it("accepts a satisfiable low-trust policy carrying a trustBoundary and writes it", async () => {
     const company = await createCompany(db, "PIG");
     const targetIssue = await db

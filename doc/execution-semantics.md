@@ -677,6 +677,8 @@ Monitor policy lives under `executionPolicy.monitor` and includes:
 - `externalRef`: optional external-service reference input; Paperclip treats it as secret-adjacent, redacts it before persistence/visibility, and omits it from activity and wake payloads
 - `timeoutAt`, `maxAttempts`, and `recoveryPolicy`: optional recovery hints for bounded waits
 
+`PATCH /api/issues/{id}` also accepts a top-level `monitor` alias for `executionPolicy.monitor`. The route normalizes it into a partial `executionPolicy` write that preserves the other stored policy fields, and it passes the same authorization gates as the nested spelling. A body that sends both `monitor` and `executionPolicy` (even `null`) is rejected with a validation error. The alias is update-only; issue creation uses `executionPolicy.monitor`.
+
 Monitors are not recurring intervals. When a monitor fires, Paperclip clears the scheduled monitor and queues an `issue_monitor_due` wake for the assignee. If the external service is still pending, the assignee must explicitly re-arm the monitor with a new `nextCheckAt`. If the issue moves to `done`, `cancelled`, an invalid status, or a human/unassigned owner, the monitor is cleared.
 
 The task's waiting banner and composer countdown also display automatic retries
