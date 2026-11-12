@@ -2240,8 +2240,103 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
 
       expect(result.kind).toBe("unresolvable");
       if (result.kind === "unresolvable") {
-        expect(result.reason).toContain("unreadable_mention");
+        expect(result.reason).toMatch(/^head_draft:/);
       }
+    });
+
+    // Release-assurance NO-GO c2: the revalidation must never admit a PR the
+    // card merely cites. The cached draft row's repo+branch must be the card's
+    // own delivery before a live-merged read can carry it.
+    it("refuses a foreign merged PR held as a stale cached open draft (SUP-24033 c2)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 77, state: "open", draft: true, headRefName: "SUP-99-foreign-branch" });
+      installRoutes([
+        { url: OPEN_PRS_LIST_URL, body: [] },
+        // The live read says merged and (hostile) reports the card's own branch.
+        { url: `https://api.github.com/repos/${OWNER}/${REPO}/pulls/77`, body: mergedMentionBody() },
+        { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+        { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+        expect(result.reason).toContain(`${OWNER}/${REPO}#77`);
+      }
+    });
+
+    // Release-assurance NO-GO cr1: a draft that LIVE workspace discovery finds
+    // on the delivery branch is a live draft; a merged cached mention must not
+    // mask it. Only cached-only draft bits are revalidated.
+    it("refuses a live-discovered draft even when a closed merged mention exists (SUP-24033 cr1)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, state: "closed" });
+      installRoutes([
+        { url: OPEN_PRS_LIST_URL, body: [openPrsListItem({ number: 455, draft: true })] },
+        { url: PR_URL, body: mergedMentionBody() },
+        { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+        { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+        expect(result.reason).toContain(`${OWNER}/${REPO}#455`);
+      }
+    });
+
+    // The revalidated carrier takes the same live verification as every other
+    // merged carrier: unproven containment and a live head that is not the
+    // card's delivery both stay refused (kills a mutant that skips the shared
+    // verification stage on this entry path).
+    it("refuses a stale-draft merged carrier whose merge commit is not on the base branch (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "open", draft: true });
+      installRoutes(mergedCarrierRoutes(mergedMentionBody(), { status: "ahead", ahead_by: 2 }));
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("head_merged_unproven");
+      }
+    });
+
+    it("refuses a stale-draft merged carrier whose live head branch is not the card's delivery (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "open", draft: true });
+      installRoutes(mergedCarrierRoutes(mergedMentionBody({
+        head: { ref: "SUP-99-other-branch", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+      })));
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("not_delivered");
+      }
+    });
+
+    it("refuses without fanning out when the card cites more mentions than the live-read cap (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, state: "open", draft: true });
+      for (let n = 50; n < 56; n++) {
+        await insertMention(issueId, { number: n, state: "closed", headRefName: `SUP-${n}-branch` });
+      }
+      installRoutes(mergedCarrierRoutes());
+      mockGhFetch.mockClear();
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+      }
+      expect(mockGhFetch.mock.calls.filter(([url]) => /\/pulls\/\d+$/.test(String(url)))).toHaveLength(0);
     });
 
     it("resolveApprovalDecisionHead stays open-PR-only for the same card (no carrier fallback)", async () => {

@@ -3405,6 +3405,20 @@ export type DecisionHeadResolution =
        * reasons, which have no branch to certify.
        */
       pendingCandidates?: Array<ApprovalCandidateAnchor | NoPrBranchAnchor>;
+      /**
+       * SUP-24033: set only on a `head_draft` refusal whose draft names ALL come
+       * from cached mentions (live workspace discovery found no draft). Those
+       * cached draft bits can be stale, so the final-delivery preflight alone
+       * revalidates them live. Never set when a live-discovered draft exists:
+       * a merged mention must not mask a draft the forge just reported.
+       */
+      cachedDraftMentions?: Array<{
+        owner: string;
+        repo: string;
+        number: number;
+        displayName: string;
+        headRefName: string | null;
+      }>;
     };
 
 /**
@@ -3623,6 +3637,17 @@ export async function resolveApprovalDecisionHead(
     return {
       kind: "unresolvable",
       reason: `head_draft: ${draftNames.join(", ")} ${verb}; a draft head cannot be armed (GitHub refuses auto-merge on a draft) — promote it out of draft, then republish`,
+      ...(draftMatched.length === 0
+        ? {
+            cachedDraftMentions: draftLinkedPRs.map((pr) => ({
+              owner: pr.owner,
+              repo: pr.repo,
+              number: pr.number,
+              displayName: pr.displayName,
+              headRefName: pr.headRefName,
+            })),
+          }
+        : {}),
     };
   }
 
@@ -3673,10 +3698,10 @@ const finalDeliveryLiveSchema = z.object({
  * only after the same live merged-state, base-branch merge-commit containment,
  * and branch/repo ownership checks as the ordinary path.
  *
- * SUP-24033: the same fallback also runs when the resolver returns head_draft
- * from a cached open+draft bit, because that bit may be stale; a mention that
- * is still a live open draft keeps the head_draft refusal. Every other
- * resolution path (approval publication, merge arming, reconciliation) stays
+ * SUP-24033: a head_draft refusal that came from cached open+draft mentions
+ * alone is revalidated live (resolveStaleDraftMergedCarrier); the base refusal
+ * stands unless exactly one card-owned draft mention is live-merged and passes
+ * the same verification. Every other resolution path (approval publication, merge arming, reconciliation) stays
  * open-PR-only.
  */
 export async function preflightFinalDelivery(
@@ -3686,17 +3711,17 @@ export async function preflightFinalDelivery(
   if (resolved.kind === "resolved") {
     return verifyLiveFinalDeliveryHead(db, companyId, issueId, resolved);
   }
-  // SUP-24033: a cached open+draft mention is a stale-able bit — the resolver
-  // returns head_draft from it before this fallback could run, so a PR merged
-  // since still blocked final delivery. Revalidate it live: the carrier
-  // resolution reads every mention live and, while any is a live open draft,
-  // keeps the original head_draft refusal; only a live-merged sole carrier
-  // reaches the verified merged path.
-  const staleDraft = resolved.reason.startsWith("head_draft:");
-  if (staleDraft || resolved.reason.startsWith("no-pr:")) {
-    const carrier = await resolveSingleMergedMentionCarrier(
-      db, companyId, issueId, staleDraft ? resolved.reason : null,
-    );
+  if (resolved.reason.startsWith("head_draft:")) {
+    // SUP-24033: a cached open+draft mention is a stale-able bit — the resolver
+    // returns head_draft from it before the no-pr fallback could run, so a PR
+    // merged since still blocked final delivery. Revalidate it live. Every
+    // outcome except one live-merged, card-owned carrier keeps the base
+    // head_draft refusal unchanged.
+    const carrier = await resolveStaleDraftMergedCarrier(db, companyId, issueId, resolved);
+    return carrier ? verifyLiveFinalDeliveryHead(db, companyId, issueId, carrier) : resolved;
+  }
+  if (resolved.reason.startsWith("no-pr:")) {
+    const carrier = await resolveSingleMergedMentionCarrier(db, companyId, issueId);
     if (carrier.kind === "resolved") {
       return verifyLiveFinalDeliveryHead(db, companyId, issueId, carrier);
     }
@@ -3769,6 +3794,39 @@ async function verifyLiveFinalDeliveryHead(
     return resolved;
   }
   return { kind: "unresolvable", reason: "head_unverifiable: no credential can verify the live delivery" };
+}
+
+/** SUP-24033: the stale-draft revalidation reads each mention live; above this many it refuses instead of fanning out. */
+const MAX_STALE_DRAFT_MENTION_READS = 5;
+
+/**
+ * SUP-24033: revalidate the cached open+draft mentions behind a `head_draft`
+ * refusal against live state. Returns a carrier ONLY when all of these hold;
+ * otherwise null and the caller keeps the base refusal:
+ *  - the refusal came from cached drafts alone (no live-discovered draft);
+ *  - every cached draft is the card's own delivery (cached repo+branch pass
+ *    narrowToDelivered), so a foreign PR the card merely cites cannot carry it;
+ *  - the card cites at most MAX_STALE_DRAFT_MENTION_READS PRs (bounded reads);
+ *  - every mention reads live (no unreadable), none is a live open draft, and
+ *    exactly one is live-merged;
+ *  - that merged PR is one of the revalidated cached drafts.
+ * The caller then runs the full verifyLiveFinalDeliveryHead on it.
+ */
+async function resolveStaleDraftMergedCarrier(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  refusal: Extract<DecisionHeadResolution, { kind: "unresolvable" }>,
+): Promise<{ kind: "resolved"; headSha: string; displayName: string; pr: { owner: string; repo: string; number: number } } | null> {
+  const drafts = refusal.cachedDraftMentions;
+  if (!drafts || drafts.length === 0) return null;
+  const mentioned = await resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts: true });
+  if (mentioned.length > MAX_STALE_DRAFT_MENTION_READS) return null;
+  const owned = await narrowToDelivered(db, companyId, issueId, drafts);
+  if (owned.outcome !== "narrowed" || owned.delivered.length !== drafts.length) return null;
+  const carrier = await resolveSingleMergedMentionCarrier(db, companyId, issueId, refusal.reason);
+  if (carrier.kind !== "resolved") return null;
+  return drafts.some((draft) => samePullRequest(draft, carrier.pr)) ? carrier : null;
 }
 
 /**
