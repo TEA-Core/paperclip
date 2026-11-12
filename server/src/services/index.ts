@@ -238,6 +238,7 @@ export {
 export {
   logActivity,
   logActivityInTransaction,
+  logActivityInTransactionBestEffort,
   persistActivity,
   publishActivity,
   type ActivityPublication,
