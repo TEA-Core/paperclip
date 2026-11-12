@@ -1028,6 +1028,32 @@ test("runtime provisioning refuses FIFO, directory and symlinked manifests witho
   }
 });
 
+test("runtime provisioning refuses a manifest behind a linked state directory", () => {
+  // Another instance's state directory holds a complete manifest. A worktree
+  // whose `.paperclip`, or whose `uid-<uid>` scoped directory, links to it must
+  // refuse that manifest rather than borrow it and skip provisioning.
+  const otherState = makeTempDir("paperclip-provision-runtime-other-state-");
+  fs.writeFileSync(path.join(otherState, "config.json"), "{}\n");
+  fs.writeFileSync(path.join(otherState, ".env"), "");
+  fs.writeFileSync(path.join(otherState, "seed-manifest.json"), completeSeedManifest("full"));
+
+  const linkedRoot = makeTempDir("paperclip-provision-runtime-linked-root-");
+  fs.symlinkSync(otherState, path.join(linkedRoot, ".paperclip"));
+  const linkedScoped = makeTempDir("paperclip-provision-runtime-linked-scoped-");
+  fs.mkdirSync(path.join(linkedScoped, ".paperclip"));
+  fs.writeFileSync(path.join(linkedScoped, ".paperclip", "config.json"), "{}\n");
+  fs.symlinkSync(otherState, path.join(linkedScoped, ".paperclip", `uid-${process.getuid()}`));
+
+  for (const worktreeCwd of [linkedRoot, linkedScoped]) {
+    const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+    const result = runRuntimeProvision(baseCwd, worktreeCwd);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /below its trusted state root is a symbolic link/);
+    assert.match(result.stderr, /not provisioning or reseeding this worktree/);
+    assert.deepEqual(readCliInvocations(baseCwd), [], "the seed CLI must not run");
+  }
+});
+
 /**
  * pnpm 9.15.4 calls the deprecated url.parse() once per `pnpm install`
  * (see toNerfDart in the pnpm bundle), which Node 24 reports as DEP0169.

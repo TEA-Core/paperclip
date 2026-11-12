@@ -45,7 +45,8 @@ import {
   type SharedGroupRepairOutcome,
 } from "./shared-group-ownership.js";
 import { isVerifiedWorktreeSeedManifest } from "@paperclipai/shared/worktree-initialization-manifest";
-import { hasVerifiedWorktreeSeedManifest, readLegacySeedManifestObject } from "../worktree-seed-manifest.js";
+import { resolveWorktreeStateDir } from "../dev-runner-worktree.js";
+import { readLegacySeedManifest, readWorktreeSeedManifestStatus } from "../worktree-seed-manifest.js";
 import {
   buildManagedWorkspaceGuestEnv,
   logManagedWorkspaceReadinessRejection,
@@ -8912,23 +8913,15 @@ const BUILTIN_WORKSPACE_SEED_COMMAND = "bash ./scripts/provision-worktree-runtim
 // skip as a durable marker instead of a verified seed manifest, which can never
 // exist without a source. The marker is accepted seed evidence exactly where a
 // verified manifest would be, and nowhere else.
+//
+// SUP-14087: the built-in seed command runs as this server's uid, and
+// provision-worktree-runtime.sh works in the state directory that uid resolves
+// (`.paperclip/uid-<uid>/` when it holds an `.env`, else `.paperclip/`).
+// `resolveWorktreeStateDir` applies the same rule, so the provisioning decision,
+// the provisioner and the seed evidence read one manifest and one skip marker
+// in one directory. Another uid's scoped state belongs to that uid and is never
+// evidence here.
 const NO_SOURCE_SEED_SKIP_MARKER = "seed-skip-no-source";
-
-function hasNoSourceSeedSkip(worktreePath: string): boolean {
-  const stateDir = path.join(worktreePath, ".paperclip");
-  if (existsSync(path.join(stateDir, NO_SOURCE_SEED_SKIP_MARKER))) return true;
-  let scopedDirs: string[] = [];
-  try {
-    scopedDirs = readdirSync(stateDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && /^uid-\d+$/.test(entry.name))
-      .map((entry) => path.join(stateDir, entry.name));
-  } catch {
-    scopedDirs = [];
-  }
-  return scopedDirs.some((scopedDir) =>
-    existsSync(path.join(scopedDir, NO_SOURCE_SEED_SKIP_MARKER)),
-  );
-}
 
 type RuntimeProvisionKind = "workspace_seed" | "runtime_dependencies";
 
@@ -8937,18 +8930,10 @@ export function readWorkspaceSeedOperationEvidence(worktreePath: string): {
   error: string | null;
   metadata: Record<string, unknown>;
 } {
-  const manifestPath = path.join(worktreePath, ".paperclip", "seed-manifest.json");
-  const manifest = readLegacySeedManifestObject(manifestPath);
-  let manifestPresent = manifest !== null;
-  if (!manifestPresent) {
-    try {
-      manifestPresent = lstatSync(manifestPath, { throwIfNoEntry: false }) !== undefined;
-    } catch {
-      manifestPresent = true;
-    }
-  }
-  const noSourceSkip = !manifestPresent && hasNoSourceSeedSkip(worktreePath);
-  if (manifest) {
+  const stateDir = resolveWorktreeStateDir(worktreePath);
+  const manifestRead = readLegacySeedManifest(path.join(stateDir, "seed-manifest.json"));
+  if (manifestRead.kind === "legacy-seed") {
+    const manifest = manifestRead.manifest;
     const state = typeof manifest.state === "string" ? manifest.state : "unknown";
     const phase = typeof manifest.phase === "string" ? manifest.phase : null;
     const verified = isVerifiedWorktreeSeedManifest(manifest);
@@ -8967,7 +8952,10 @@ export function readWorkspaceSeedOperationEvidence(worktreePath: string): {
       },
     };
   }
-  if (noSourceSkip) {
+  // A recorded no-source skip counts only when this directory holds no
+  // manifest at all. A refused manifest, or one behind a linked state
+  // directory, always wins over the marker.
+  if (manifestRead.kind === "absent" && existsSync(path.join(stateDir, NO_SOURCE_SEED_SKIP_MARKER))) {
     return {
       verified: true,
       error: null,
@@ -8982,10 +8970,12 @@ export function readWorkspaceSeedOperationEvidence(worktreePath: string): {
   }
   return {
     verified: false,
-    error: "Workspace seed command returned without a readable seed manifest.",
+    error: manifestRead.kind === "refused"
+      ? `Workspace seed command returned without a readable seed manifest. ${manifestRead.message}`
+      : "Workspace seed command returned without a readable seed manifest.",
     metadata: {
       provisionKind: "workspace_seed",
-      seedState: manifestPresent ? "unreadable" : "absent",
+      seedState: manifestRead.kind === "refused" ? "unreadable" : "absent",
       seedPhase: null,
       seedFailurePhase: "seed_manifest_unreadable",
     },
@@ -9001,8 +8991,6 @@ export function resolveRuntimeProvisionCommand(input: {
 
   if (input.workspace.strategy !== "git_worktree") return "";
 
-  const stateDir = path.join(input.workspace.cwd, ".paperclip");
-  const manifestPath = path.join(stateDir, "seed-manifest.json");
   const provisionScript = path.join(
     input.workspace.baseCwd,
     "scripts",
@@ -9012,47 +9000,32 @@ export function resolveRuntimeProvisionCommand(input: {
     return "";
   }
 
-  // SUP-14087: cross-uid worktrees keep per-uid state under .paperclip/uid-<uid>/.
-  // When any scoped dir exists, IT describes what still needs seeding and the
-  // canonical manifest does not: that manifest belongs to whichever uid owns the
-  // canonical dir and says nothing about this run. Scoped state is marker-based
-  // (the seed manifest is written per state dir, but a scoped dir provisioned
-  // before the manifest landed has markers only), so fall back to markers there.
-  let scopedStateDirs: string[] = [];
-  try {
-    scopedStateDirs = readdirSync(stateDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && /^uid-\d+$/.test(entry.name))
-      .map((entry) => path.join(stateDir, entry.name));
-  } catch {
-    scopedStateDirs = [];
-  }
+  // SUP-14087: only the state directory this server's uid resolves decides,
+  // because that is where the built-in seed command works (see
+  // NO_SOURCE_SEED_SKIP_MARKER). Another uid's scoped manifest or markers never
+  // select or skip the command, so a refusal there cannot start a seed command
+  // that checks a different directory.
+  const stateDir = resolveWorktreeStateDir(input.workspace.cwd);
+  const scoped = stateDir !== path.resolve(input.workspace.cwd, ".paperclip");
+  const manifest = readWorktreeSeedManifestStatus(path.join(stateDir, "seed-manifest.json"));
+  if (manifest.kind === "verified") return "";
+  // The provisioner reads this same manifest and fails fast on a refused one
+  // with the reason, without a reseed, so a skip marker never hides a refusal.
+  if (manifest.kind === "refused") return BUILTIN_WORKSPACE_SEED_COMMAND;
 
-  if (scopedStateDirs.length > 0) {
-    for (const scopedDir of scopedStateDirs) {
-      const scopedManifest = path.join(scopedDir, "seed-manifest.json");
-      if (existsSync(scopedManifest)) {
-        if (!hasVerifiedWorktreeSeedManifest(scopedManifest)) return BUILTIN_WORKSPACE_SEED_COMMAND;
-        continue;
-      }
-      // SUP-15609: a recorded no-source skip is the completion evidence for a
-      // scoped state dir that has no manifest to verify.
-      if (existsSync(path.join(scopedDir, NO_SOURCE_SEED_SKIP_MARKER))) {
-        continue;
-      }
-      const scopedPending = path.join(scopedDir, "seed-pending");
-      const scopedComplete = path.join(scopedDir, "seed-complete");
-      if (existsSync(scopedPending) && !existsSync(scopedComplete)) {
-        return BUILTIN_WORKSPACE_SEED_COMMAND;
-      }
-    }
-    return "";
-  }
+  // SUP-15609: a recorded no-source skip has no database to seed; the marker is
+  // the completion evidence of its state directory.
+  const skipRecorded = existsSync(path.join(stateDir, NO_SOURCE_SEED_SKIP_MARKER));
+  if (!scoped) return skipRecorded ? "" : BUILTIN_WORKSPACE_SEED_COMMAND;
 
-  // SUP-15609: an env-only worktree with a recorded no-source skip has no
-  // database to seed; the marker is its completion evidence.
-  const needsSeed = !hasNoSourceSeedSkip(input.workspace.cwd)
-    && (!existsSync(manifestPath) || !hasVerifiedWorktreeSeedManifest(manifestPath));
-  return needsSeed ? BUILTIN_WORKSPACE_SEED_COMMAND : "";
+  // Scoped state is marker-based (a scoped dir provisioned before the manifest
+  // landed has markers only): it needs seeding for an incomplete manifest, or
+  // while seed-pending has no sibling seed-complete.
+  if (manifest.kind === "incomplete") return BUILTIN_WORKSPACE_SEED_COMMAND;
+  if (skipRecorded) return "";
+  return existsSync(path.join(stateDir, "seed-pending")) && !existsSync(path.join(stateDir, "seed-complete"))
+    ? BUILTIN_WORKSPACE_SEED_COMMAND
+    : "";
 }
 
 function resolveRuntimeProvision(input: {

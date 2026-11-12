@@ -10,6 +10,7 @@ import {
   BoundedStateFileError,
   isSameFileIdentity,
   readBoundedStateFile,
+  resolveWorktreeStateRoot,
   STATE_FILE_MAX_BYTES,
   writeStateFileAtomic,
 } from "./bounded-state-file.js";
@@ -27,6 +28,21 @@ function makeRoot(): string {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-bounded-state-")));
   temporaryRoots.push(root);
   return root;
+}
+
+/**
+ * A worktree with no state directory yet next to another instance's state
+ * directory, which holds a manifest with random contents.
+ */
+function worktreeBesideOtherInstance() {
+  const root = makeRoot();
+  const otherState = path.join(root, "other-instance", ".paperclip");
+  fs.mkdirSync(otherState, { recursive: true });
+  const otherContents = randomBytes(16).toString("hex");
+  fs.writeFileSync(path.join(otherState, "seed-manifest.json"), otherContents);
+  const worktree = path.join(root, "worktree");
+  fs.mkdirSync(worktree);
+  return { root, worktree, otherState, otherContents };
 }
 
 function refusalCode(read: () => unknown): string {
@@ -62,24 +78,28 @@ describe("readBoundedStateFile", () => {
   it("reads a regular file and reports a missing one as absent", () => {
     const root = makeRoot();
     const filePath = path.join(root, "seed-manifest.json");
-    expect(readBoundedStateFile(filePath)).toBeNull();
-    expect(readBoundedStateFile(path.join(root, "missing-dir", "seed-manifest.json"))).toBeNull();
+    expect(readBoundedStateFile(filePath, { trustedRoot: root })).toBeNull();
+    expect(readBoundedStateFile(path.join(root, "missing-dir", "seed-manifest.json"), { trustedRoot: root })).toBeNull();
+    expect(readBoundedStateFile(path.join(root, "missing-root", "seed-manifest.json"), {
+      trustedRoot: path.join(root, "missing-root"),
+    })).toBeNull();
 
     const contents = randomBytes(32).toString("hex");
     fs.writeFileSync(filePath, contents);
-    expect(readBoundedStateFile(filePath)?.toString("utf8")).toBe(contents);
+    expect(readBoundedStateFile(filePath, { trustedRoot: root })?.toString("utf8")).toBe(contents);
 
     fs.writeFileSync(filePath, "");
-    expect(readBoundedStateFile(filePath)?.length).toBe(0);
+    expect(readBoundedStateFile(filePath, { trustedRoot: root })?.length).toBe(0);
   });
 
   it("reads exactly the size limit and refuses one byte more", () => {
-    const filePath = path.join(makeRoot(), "seed-manifest.json");
+    const root = makeRoot();
+    const filePath = path.join(root, "seed-manifest.json");
     fs.writeFileSync(filePath, Buffer.alloc(STATE_FILE_MAX_BYTES, 0x20));
-    expect(readBoundedStateFile(filePath)?.length).toBe(STATE_FILE_MAX_BYTES);
+    expect(readBoundedStateFile(filePath, { trustedRoot: root })?.length).toBe(STATE_FILE_MAX_BYTES);
 
     fs.writeFileSync(filePath, Buffer.alloc(STATE_FILE_MAX_BYTES + 1, 0x20));
-    expect(refusalCode(() => readBoundedStateFile(filePath))).toBe("oversize");
+    expect(refusalCode(() => readBoundedStateFile(filePath, { trustedRoot: root }))).toBe("oversize");
   });
 
   it("refuses a FIFO with no writer without blocking", () => {
@@ -88,7 +108,7 @@ describe("readBoundedStateFile", () => {
 
     const { stdout, elapsedMs } = readInChild(`
 try {
-  m.readBoundedStateFile(${JSON.stringify(fifoPath)});
+  m.readBoundedStateFile(${JSON.stringify(fifoPath)}, { trustedRoot: ${JSON.stringify(path.dirname(fifoPath))} });
   console.log("read");
 } catch (error) {
   console.log(error.code ?? "unexpected");
@@ -115,7 +135,7 @@ try {
     try {
       for (const candidate of [directory, symlink, dangling, socketPath, "/dev/null"]) {
         const started = performance.now();
-        expect(refusalCode(() => readBoundedStateFile(candidate))).toBe("not_regular");
+        expect(refusalCode(() => readBoundedStateFile(candidate, { trustedRoot: path.dirname(candidate) }))).toBe("not_regular");
         expect(performance.now() - started).toBeLessThan(STARTUP_BUDGET_MS);
       }
     } finally {
@@ -129,8 +149,8 @@ try {
     const filePath = path.join(root, "seed-manifest.json");
     fs.writeFileSync(filePath, "{}");
     fs.linkSync(filePath, path.join(root, "alias.json"));
-    expect(refusalCode(() => readBoundedStateFile(filePath))).toBe("hard_linked");
-    expect(refusalCode(() => readBoundedStateFile("seed-manifest.json"))).toBe("not_absolute");
+    expect(refusalCode(() => readBoundedStateFile(filePath, { trustedRoot: root }))).toBe("hard_linked");
+    expect(refusalCode(() => readBoundedStateFile("seed-manifest.json", { trustedRoot: root }))).toBe("not_absolute");
   });
 
   it("does not block when the file is swapped for a FIFO between the checks and the open", () => {
@@ -145,6 +165,7 @@ try {
 import fs from "node:fs";
 try {
   m.readBoundedStateFile(${JSON.stringify(filePath)}, {
+    trustedRoot: ${JSON.stringify(root)},
     hooks: { afterPathCheck: () => fs.renameSync(${JSON.stringify(fifoPath)}, ${JSON.stringify(filePath)}) },
   });
   console.log("read");
@@ -165,7 +186,7 @@ try {
     const swapThenRead = (swap: () => void) => {
       fs.rmSync(filePath, { recursive: true, force: true });
       fs.writeFileSync(filePath, "{}");
-      return refusalCode(() => readBoundedStateFile(filePath, { hooks: { afterPathCheck: swap } }));
+      return refusalCode(() => readBoundedStateFile(filePath, { trustedRoot: root, hooks: { afterPathCheck: swap } }));
     };
 
     expect(swapThenRead(() => {
@@ -188,7 +209,7 @@ try {
     const filePath = path.join(root, "seed-manifest.json");
     const readWith = (afterDescriptorCheck: () => void) => {
       fs.writeFileSync(filePath, "{\"version\":2}");
-      return refusalCode(() => readBoundedStateFile(filePath, { hooks: { afterDescriptorCheck } }));
+      return refusalCode(() => readBoundedStateFile(filePath, { trustedRoot: root, hooks: { afterDescriptorCheck } }));
     };
 
     expect(readWith(() => fs.appendFileSync(filePath, " "))).toBe("grown");
@@ -201,12 +222,78 @@ try {
     const canary = randomBytes(24).toString("hex");
     fs.writeFileSync(filePath, `${canary}${" ".repeat(STATE_FILE_MAX_BYTES)}`);
     try {
-      readBoundedStateFile(filePath);
+      readBoundedStateFile(filePath, { trustedRoot: path.dirname(filePath) });
       throw new Error("expected an oversize refusal");
     } catch (error) {
       expect((error as Error).message).toContain(filePath);
       expect((error as Error).message).not.toContain(canary);
     }
+  });
+
+  it("refuses a state directory below the trusted root that is a symbolic link", () => {
+    const { root, worktree, otherState } = worktreeBesideOtherInstance();
+    fs.symlinkSync(otherState, path.join(worktree, ".paperclip"));
+    const manifestPath = path.join(worktree, ".paperclip", "seed-manifest.json");
+    expect(refusalCode(() => readBoundedStateFile(manifestPath, { trustedRoot: worktree }))).toBe("parent_symlink");
+    // The link is refused before the entry is looked up, so a file missing in
+    // the link target never reads as absent either.
+    expect(refusalCode(() => readBoundedStateFile(path.join(worktree, ".paperclip", "missing.json"), {
+      trustedRoot: worktree,
+    }))).toBe("parent_symlink");
+
+    // SUP-14087 uid-scoped state: the canonical directory is real, the scoped one a link.
+    const scopedWorktree = path.join(root, "scoped-worktree");
+    fs.mkdirSync(path.join(scopedWorktree, ".paperclip"), { recursive: true });
+    fs.symlinkSync(otherState, path.join(scopedWorktree, ".paperclip", "uid-1000"));
+    const scopedPath = path.join(scopedWorktree, ".paperclip", "uid-1000", "seed-manifest.json");
+    expect(refusalCode(() => readBoundedStateFile(scopedPath, {
+      trustedRoot: resolveWorktreeStateRoot(scopedPath),
+    }))).toBe("parent_symlink");
+  });
+
+  it("follows links in the trusted root itself but refuses paths outside it", () => {
+    const root = makeRoot();
+    const realWorktree = path.join(root, "real-worktree");
+    fs.mkdirSync(path.join(realWorktree, ".paperclip"), { recursive: true });
+    const contents = randomBytes(16).toString("hex");
+    fs.writeFileSync(path.join(realWorktree, ".paperclip", "seed-manifest.json"), contents);
+    const linkedWorktree = path.join(root, "linked-worktree");
+    fs.symlinkSync(realWorktree, linkedWorktree);
+
+    const linkedPath = path.join(linkedWorktree, ".paperclip", "seed-manifest.json");
+    expect(readBoundedStateFile(linkedPath, { trustedRoot: linkedWorktree })?.toString("utf8")).toBe(contents);
+    expect(refusalCode(() => readBoundedStateFile(linkedPath, {
+      trustedRoot: path.join(root, "other-worktree"),
+    }))).toBe("parent_invalid");
+    expect(refusalCode(() => readBoundedStateFile(linkedPath, { trustedRoot: "linked-worktree" }))).toBe("not_absolute");
+
+    fs.writeFileSync(path.join(root, "file-worktree"), "");
+    expect(refusalCode(() => readBoundedStateFile(path.join(root, "file-worktree", ".paperclip", "seed-manifest.json"), {
+      trustedRoot: root,
+    }))).toBe("parent_invalid");
+  });
+
+  // Descriptor paths (/proc/self/fd) keep the walk inside the checked
+  // directory; other platforms only get the check before the open.
+  it.runIf(process.platform === "linux")("does not follow a state directory swapped for a link after its check", () => {
+    const { worktree, otherState, otherContents } = worktreeBesideOtherInstance();
+    const stateDirectory = path.join(worktree, ".paperclip");
+    fs.mkdirSync(stateDirectory);
+    const ownContents = randomBytes(16).toString("hex");
+    const manifestPath = path.join(stateDirectory, "seed-manifest.json");
+    fs.writeFileSync(manifestPath, ownContents);
+
+    const bytes = readBoundedStateFile(manifestPath, {
+      trustedRoot: worktree,
+      hooks: {
+        afterDirectoryCheck: () => {
+          fs.renameSync(stateDirectory, `${stateDirectory}-moved`);
+          fs.symlinkSync(otherState, stateDirectory);
+        },
+      },
+    });
+    expect(bytes?.toString("utf8")).not.toBe(otherContents);
+    expect(bytes?.toString("utf8")).toBe(ownContents);
   });
 
   it("compares file identities exactly beyond 2^53", () => {
@@ -229,12 +316,12 @@ describe("writeStateFileAtomic", () => {
       fs.writeFileSync(filePath, "old", { mode: 0o644 });
       const previousInode = fs.statSync(filePath, { bigint: true }).ino;
       const contents = randomBytes(16).toString("hex");
-      writeStateFileAtomic(filePath, contents);
+      writeStateFileAtomic(filePath, contents, { trustedRoot: root });
 
       const stat = fs.statSync(filePath, { bigint: true });
       expect(stat.mode & 0o777n).toBe(0o600n);
       expect(stat.ino).not.toBe(previousInode);
-      expect(readBoundedStateFile(filePath)?.toString("utf8")).toBe(contents);
+      expect(readBoundedStateFile(filePath, { trustedRoot: root })?.toString("utf8")).toBe(contents);
       expect(fs.readdirSync(root)).toEqual(["seed-manifest.json"]);
     } finally {
       process.umask(previousUmask);
@@ -247,15 +334,54 @@ describe("writeStateFileAtomic", () => {
     fs.mkdirSync(directoryTarget);
     fs.writeFileSync(path.join(directoryTarget, "keep"), "");
 
-    expect(() => writeStateFileAtomic(directoryTarget, "{}")).toThrow();
+    expect(() => writeStateFileAtomic(directoryTarget, "{}", { trustedRoot: root })).toThrow();
     expect(fs.readdirSync(root)).toEqual(["seed-manifest.json"]);
     expect(fs.readdirSync(directoryTarget)).toEqual(["keep"]);
   });
 
   it("refuses relative paths and a missing private directory", () => {
     const root = makeRoot();
-    expect(() => writeStateFileAtomic("seed-manifest.json", "{}")).toThrow(BoundedStateFileError);
-    expect(() => writeStateFileAtomic(path.join(root, "missing", "seed-manifest.json"), "{}")).toThrow();
+    expect(() => writeStateFileAtomic("seed-manifest.json", "{}", { trustedRoot: root })).toThrow(BoundedStateFileError);
+    expect(refusalCode(() => writeStateFileAtomic(path.join(root, "missing", "seed-manifest.json"), "{}", {
+      trustedRoot: root,
+    }))).toBe("parent_invalid");
     expect(fs.readdirSync(root)).toEqual([]);
+  });
+
+  it("refuses to write through a state directory below the trusted root that is a symbolic link", () => {
+    const { root, worktree, otherState, otherContents } = worktreeBesideOtherInstance();
+    fs.symlinkSync(otherState, path.join(worktree, ".paperclip"));
+    const manifestPath = path.join(worktree, ".paperclip", "seed-manifest.json");
+    expect(refusalCode(() => writeStateFileAtomic(manifestPath, "{}", { trustedRoot: worktree }))).toBe("parent_symlink");
+
+    const scopedWorktree = path.join(root, "scoped-worktree");
+    fs.mkdirSync(path.join(scopedWorktree, ".paperclip"), { recursive: true });
+    fs.symlinkSync(otherState, path.join(scopedWorktree, ".paperclip", "uid-1000"));
+    const scopedPath = path.join(scopedWorktree, ".paperclip", "uid-1000", "seed-manifest.json");
+    expect(refusalCode(() => writeStateFileAtomic(scopedPath, "{}", {
+      trustedRoot: resolveWorktreeStateRoot(scopedPath),
+    }))).toBe("parent_symlink");
+
+    // Nothing reached the other instance: no replacement and no temporary file.
+    expect(fs.readdirSync(otherState)).toEqual(["seed-manifest.json"]);
+    expect(fs.readFileSync(path.join(otherState, "seed-manifest.json"), "utf8")).toBe(otherContents);
+  });
+
+  it("refuses to write outside its trusted root", () => {
+    const root = makeRoot();
+    fs.mkdirSync(path.join(root, "worktree"));
+    expect(refusalCode(() => writeStateFileAtomic(path.join(root, "seed-manifest.json"), "{}", {
+      trustedRoot: path.join(root, "worktree"),
+    }))).toBe("parent_invalid");
+    expect(fs.readdirSync(root)).toEqual(["worktree"]);
+  });
+});
+
+describe("resolveWorktreeStateRoot", () => {
+  it("trusts the directory that holds .paperclip for canonical and uid-scoped state only", () => {
+    expect(resolveWorktreeStateRoot("/pool/tree/.paperclip/seed-manifest.json")).toBe("/pool/tree");
+    expect(resolveWorktreeStateRoot("/pool/tree/.paperclip/uid-1001/seed-manifest.json")).toBe("/pool/tree");
+    expect(resolveWorktreeStateRoot("/home/user/.paperclip/instances/default/seed-manifest.json"))
+      .toBe("/home/user/.paperclip/instances/default");
   });
 });

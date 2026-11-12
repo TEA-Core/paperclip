@@ -31,7 +31,7 @@ import {
   withWorktreePortRegistryLock,
   writeWorktreePortRegistry,
 } from "@paperclipai/shared/worktree-port-registry";
-import { readBoundedStateFile } from "@paperclipai/shared/bounded-state-file";
+import { readBoundedStateFile, resolveWorktreeStateRoot } from "@paperclipai/shared/bounded-state-file";
 import { classifyWorktreeStateManifest } from "@paperclipai/shared/worktree-initialization-manifest";
 import {
   applyPendingMigrations,
@@ -1853,9 +1853,10 @@ function writeNoSourceSeedSkipMarker(
 
 export function readWorktreeSeedManifest(configPath: string): WorktreeSeedManifest | null {
   const manifestPath = path.resolve(resolveWorktreeSeedMarkerPaths(configPath).manifest);
-  // The bounded reader refuses links, FIFOs, sockets, directories, devices and
+  // The bounded reader refuses links (including a linked `.paperclip` or
+  // `uid-<uid>` state directory), FIFOs, sockets, directories, devices and
   // oversized or torn files without blocking; its errors never echo content.
-  const bytes = readBoundedStateFile(manifestPath);
+  const bytes = readBoundedStateFile(manifestPath, { trustedRoot: resolveWorktreeStateRoot(manifestPath) });
   if (bytes === null) return null;
   // The legacy seed path never provisions a v3 initialization directory, so it
   // asserts no v3 expectation and every v3 manifest is refused.
