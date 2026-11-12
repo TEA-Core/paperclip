@@ -8419,6 +8419,13 @@ export function recoveryService(
           }
         }
 
+        // Canonical stable-key rows represent the FULL (dependent,
+        // blocker-set) ready state, so they count by idempotency key ALONE —
+        // the payload's resolved-blocker edge depends on which edge a producer
+        // happened to name for a multi-blocker set, and filtering on it would
+        // omit same-key rows and let wakes exceed the cap. Legacy per-edge keys
+        // keep edge-scoped matching: their key already embeds the resolved
+        // blocker, so an unrelated edge never counts for the current one.
         const legacyWakeKeys = idempotencyKeys.slice(1);
         const stateWakeKeys = idempotencyKeys.slice(0, 1);
         const wakeKeyPredicate = resolvedBlockerIssueId
@@ -8427,12 +8434,7 @@ export function recoveryService(
                 ? [inArray(agentWakeupRequests.idempotencyKey, legacyWakeKeys)]
                 : []),
               ...(stateWakeKeys.length > 0
-                ? [
-                    and(
-                      inArray(agentWakeupRequests.idempotencyKey, stateWakeKeys),
-                      sql`${agentWakeupRequests.payload} ->> 'resolvedBlockerIssueId' = ${resolvedBlockerIssueId}`,
-                    ),
-                  ]
+                ? [inArray(agentWakeupRequests.idempotencyKey, stateWakeKeys)]
                 : []),
             )
           : inArray(agentWakeupRequests.idempotencyKey, idempotencyKeys);
