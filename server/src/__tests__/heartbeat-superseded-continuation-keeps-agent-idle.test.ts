@@ -10,9 +10,10 @@ import {
 import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 
-// TEA-Core fork: a continuation wake that loses a race with a reassign or a close fails fast at
-// setup (`continuation_task_ownership_changed`). That is a benign precondition failure, not an agent
-// fault, so the agent must stay idle instead of flipping to `error` until fleet-watch repairs it.
+// TEA-Core fork: a continuation wake that loses a race with a reassign or a close stops before
+// dispatch (`continuation_task_ownership_changed`; upstream #13761 settles it as a cancellation).
+// That is a benign precondition failure, not an agent fault, so the agent must stay idle instead of
+// flipping to `error` until fleet-watch repairs it.
 
 const adapterExecute = vi.hoisted(() =>
   vi.fn(async (_ctx: AdapterExecutionContext) => ({
@@ -201,8 +202,10 @@ describeEmbeddedPostgres("heartbeat superseded continuation keeps the agent idle
 
       // Non-vacuity: the wrapped builder was reached, so the race really ran through the setup path.
       expect(buildContinuation).toHaveBeenCalledTimes(1);
-      expect(finished?.status).toBe("failed");
-      expect(finished?.errorCode).toBe("setup_failed");
+      // Upstream #13761 types this throw (StaleExecutionContinuationError) and settles the run
+      // as a cancellation before dispatch instead of a setup failure.
+      expect(finished?.status).toBe("cancelled");
+      expect(finished?.errorCode).toBe("continuation_task_ownership_changed");
       expect(finished?.error).toContain("continuation_task_ownership_changed");
       expect(adapterExecute).not.toHaveBeenCalled();
       // Precondition: a superseded run schedules no retry (the card is no longer this agent's), so this
