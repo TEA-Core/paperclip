@@ -306,6 +306,13 @@ platform-refused, and run-less wakes always count. At the cap, the recovery
 action asks the board to distinguish platform refusal, all blockers terminal
 without a valid continuation, and an unlinked real blocker.
 
+The zero-blocker heal does not wake a deliberate review-stage or approval-stage
+park. That park is `blocked` with no blocker edge, a usable `unblockDescriptor`
+that names the blocker, and an execution state that is still `pending` with a
+`currentStageId`. The stage holder parks this way on purpose, and a wake would
+only make it exit as a no-op. A descriptor with no pending stage, or a pending
+stage with no descriptor, is not this park and still heals.
+
 If a parent is truly waiting on a child, model that with blockers. Do not rely on the parent/child relationship alone.
 
 ### Child→Parent Reporting
