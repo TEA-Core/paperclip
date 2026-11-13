@@ -231,9 +231,14 @@ describe("redaction", () => {
     };
 
     expect(sanitizeRecord(details)).toEqual(details);
-    expect(sanitizeRecord({ reason: details.reason }).reason).toBe(REDACTED_EVENT_VALUE);
-    expect(sanitizeRecord({ ...details, reason: "aaa.bbb.ccc" }).reason).toBe(REDACTED_EVENT_VALUE);
-    expect(sanitizeRecord({ ...details, outcome: "error" }).reason).toBe(REDACTED_EVENT_VALUE);
+    // Upstream #14937: JWT detection now requires an encoded JSON header, so a dotted
+    // identifier is no longer credential-shaped and stays readable in any payload. A
+    // real JWT-shaped value in the same field is still redacted, inside the wake
+    // diagnostic shape (it is not a known skip reason) and outside it.
+    expect(sanitizeRecord({ reason: details.reason }).reason).toBe(details.reason);
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZ2VudCJ9.c2lnbmF0dXJlLXZhbHVl";
+    expect(sanitizeRecord({ ...details, reason: jwt }).reason).toBe(REDACTED_EVENT_VALUE);
+    expect(sanitizeRecord({ ...details, outcome: "error", reason: jwt }).reason).toBe(REDACTED_EVENT_VALUE);
   });
 
   it("preserves Paperclip protocol schema identifiers", () => {

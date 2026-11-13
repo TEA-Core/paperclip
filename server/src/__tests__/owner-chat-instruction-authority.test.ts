@@ -273,7 +273,9 @@ describe("owner-chat instruction authority", () => {
     const f = await seed();
     await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "agent",
       principalId: f.agentId, permissionKey: "agents:suggest-changes" });
-    await expect(authorize(f)).rejects.toMatchObject({ status: 403, details: { code: "reflection_coach_mutation_gate_required" } });
+    // Fork #1123 (decision K in fold-s3a): a consent refusal other than the adoption carrier is
+    // masked as the generic deny_missing_consent, so agents cannot read consent state from codes.
+    await expect(authorize(f)).rejects.toMatchObject({ status: 403, details: { reason: "deny_missing_consent" } });
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, f.agentId));
     await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "agent",
       principalId: f.agentId, permissionKey: "agents:configure", scope: { agentIds: [randomUUID()] } });
