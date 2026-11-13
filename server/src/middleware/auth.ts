@@ -510,7 +510,10 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
   };
   // Express 4 ignores async rejections: a throw (e.g. a run cancelled mid-auth) must reach the error handler, not crash the process.
   return (req, res, next) => {
-    authenticate(req, res, next).catch(next);
+    // Once a release request's clock has answered it, a failed lookup (the cancelled query) is not an error to report.
+    authenticate(req, res, next).catch((err) => {
+      if ((res.locals?.releaseClock as { expired?: boolean } | undefined)?.expired !== true) next(err);
+    });
   };
 }
 
