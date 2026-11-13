@@ -1132,6 +1132,24 @@ export function hasUsableUnblockDescriptor(descriptor: IssueUnblockDescriptor | 
   return typeof descriptor.action === "string" && descriptor.action.trim().length > 0;
 }
 
+// SUP-24126 — ADR-072 §6 review/approval-stage park. The stage holder parks
+// `blocked` with NO blockedByIssueIds edge (§6 forbids adding one), a usable
+// unblockDescriptor naming the blocker, and the execution stage still
+// `pending` with a `currentStageId`. A zero-blocker heal on this shape wakes the
+// holder, who must exit as a no-op (§6), and a succeeded no-op run is exempt
+// from the re-arm budget, so the wake repeats every re-arm window forever.
+// The park is deliberate and names its own unblock path; only the descriptor
+// plus a live pending stage qualifies. A descriptor with no pending stage, or
+// a pending stage with no descriptor, is NOT a stage park and still heals.
+export function isDescriptorOnlyStagePark(input: {
+  executionState: unknown;
+  unblockDescriptor: IssueUnblockDescriptor | null | undefined;
+}): boolean {
+  if (!hasUsableUnblockDescriptor(input.unblockDescriptor)) return false;
+  const state = parseIssueExecutionState(input.executionState);
+  return state != null && state.status === "pending" && Boolean(state.currentStageId);
+}
+
 // ---------------------------------------------------------------------------
 // SUP-17884 — the orphan / stranded sweep may only hand a card to an agent that
 // can actually START a run. Configuration-invokability (`isAgentInvokable`)
@@ -7875,6 +7893,8 @@ export function recoveryService(
             assigneeAgentId: issues.assigneeAgentId,
             blockedTransitionAt: issues.blockedTransitionAt,
             monitorNextCheckAt: issues.monitorNextCheckAt,
+            executionState: issues.executionState,
+            unblockDescriptor: issues.unblockDescriptor,
             totalCount: sql<number>`count(*) over()::int`,
           })
           .from(issueRelations)
@@ -7892,6 +7912,8 @@ export function recoveryService(
           assigneeAgentId: issues.assigneeAgentId,
           blockedTransitionAt: issues.blockedTransitionAt,
           monitorNextCheckAt: issues.monitorNextCheckAt,
+          executionState: issues.executionState,
+          unblockDescriptor: issues.unblockDescriptor,
           totalCount: sql<number>`count(*) over()::int`,
         })
         .from(issues)
@@ -7980,6 +8002,16 @@ export function recoveryService(
           !resolvedBlockerIssueId
         ) {
           result.notReadySkipped += 1;
+          continue;
+        }
+
+        // SUP-24126: a descriptor-only ADR-072 §6 stage park is a deliberate
+        // park with no blocker edge, so "zero blockers" is its steady state,
+        // not stranding. Leave it for its named unblock path. Applies only to
+        // the zero-blocker heal: a stage-parked card whose real blockers have
+        // all resolved still takes the normal blockers-resolved wake.
+        if (zeroBlockerHeal && isDescriptorOnlyStagePark(candidate)) {
+          result.livePathSkipped += 1;
           continue;
         }
 
