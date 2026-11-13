@@ -778,6 +778,129 @@ async function fetchPullRequestReviewDecision(
 }
 
 /**
+ * SUP-24135: live landability of a `landing-delegated` carrier PR, read once at
+ * close time. A declaration names the carrier; this is the only read of the
+ * carrier itself before the obligation transfers to the backstop.
+ */
+interface LandingCarrierHealth {
+  headSha: string | null;
+  mergeStateStatus: string | null;
+  /** Required check/status names whose every context on the head is terminal-failed. */
+  failedRequired: Array<{ name: string; conclusion: string }>;
+}
+
+// Terminal check-run conclusions and commit-status states that cannot satisfy a
+// required check. NEUTRAL/SKIPPED/SUCCESS satisfy it; STALE is not terminal-failed.
+const FAILED_CHECK_RUN_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
+const FAILED_STATUS_STATES = new Set(["FAILURE", "ERROR"]);
+
+/**
+ * Read-only GraphQL probe of the carrier's head required checks and merge state.
+ * Every unresolvable outcome returns null; callers fail open, as for
+ * fetchPullRequestReviewDecision (never fail closed on a GitHub outage).
+ */
+async function fetchLandingCarrierHealth(
+  pr: LinkedPullRequest,
+  token: string,
+): Promise<LandingCarrierHealth | null> {
+  const query =
+    "query landingCarrier($owner: String!, $name: String!, $number: Int!) { " +
+    "repository(owner: $owner, name: $name) { pullRequest(number: $number) { state mergeStateStatus " +
+    "commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 100) { nodes { __typename " +
+    "... on CheckRun { name status conclusion isRequired(pullRequestNumber: $number) } " +
+    "... on StatusContext { context state isRequired(pullRequestNumber: $number) } } } } } } } } } }";
+  try {
+    const response = await ghFetch(GITHUB_GRAPHQL_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "user-agent": "paperclip-done-transition-guard",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        query,
+        variables: { owner: pr.owner, name: pr.repo, number: pr.number },
+      }),
+    });
+    if (!response.ok) return null;
+    const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!body || (Array.isArray(body.errors) && body.errors.length > 0)) return null;
+    const repository = (body.data as Record<string, unknown> | null | undefined)?.repository as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    const pullRequest = repository?.pullRequest as Record<string, unknown> | null | undefined;
+    if (!pullRequest || pullRequest.state !== "OPEN") return null;
+    const commitNodes = (pullRequest.commits as { nodes?: unknown } | null | undefined)?.nodes;
+    const commit = Array.isArray(commitNodes)
+      ? (commitNodes[0] as { commit?: Record<string, unknown> } | undefined)?.commit
+      : undefined;
+    const rollup = commit?.statusCheckRollup as { contexts?: { nodes?: unknown } } | null | undefined;
+    const contexts = Array.isArray(rollup?.contexts?.nodes) ? rollup.contexts.nodes : [];
+    // A re-run leaves the failed run beside a newer one with the same name, so a
+    // required name counts as failed only when none of its contexts can still pass.
+    const byName = new Map<string, { failed: string | null; open: boolean }>();
+    for (const node of contexts) {
+      const ctx = node as Record<string, unknown> | null;
+      if (!ctx || ctx.isRequired !== true) continue;
+      let name: string | null = null;
+      let failed: string | null = null;
+      if (ctx.__typename === "CheckRun" && typeof ctx.name === "string") {
+        name = ctx.name;
+        const conclusion = typeof ctx.conclusion === "string" ? ctx.conclusion : null;
+        if (ctx.status === "COMPLETED" && conclusion && FAILED_CHECK_RUN_CONCLUSIONS.has(conclusion)) failed = conclusion;
+      } else if (ctx.__typename === "StatusContext" && typeof ctx.context === "string") {
+        name = ctx.context;
+        if (typeof ctx.state === "string" && FAILED_STATUS_STATES.has(ctx.state)) failed = ctx.state;
+      }
+      if (name === null) continue;
+      const entry = byName.get(name) ?? { failed: null, open: false };
+      if (failed) entry.failed = failed;
+      else entry.open = true;
+      byName.set(name, entry);
+    }
+    const failedRequired = [...byName.entries()]
+      .filter(([, entry]) => entry.failed !== null && !entry.open)
+      .map(([name, entry]) => ({ name, conclusion: entry.failed!.toLowerCase() }));
+    return {
+      headSha: typeof commit?.oid === "string" ? commit.oid : null,
+      mergeStateStatus: typeof pullRequest.mergeStateStatus === "string" ? pullRequest.mergeStateStatus : null,
+      failedRequired,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * SUP-24135: refuse a `landing-delegated` close whose carrier cannot land as it
+ * stands. `BLOCKED` alone is the normal delegated state (required checks still
+ * running, review pending) and `UNKNOWN` is GitHub still computing, so neither
+ * refuses; a terminal-failed required check or a merge conflict does.
+ */
+function landingCarrierRefusal(
+  prNumber: number,
+  health: LandingCarrierHealth | null,
+): DoneTierDeclarationResult | null {
+  if (!health) return null;
+  const head = health.headSha ? ` on head ${health.headSha.slice(0, 12)}` : "";
+  if (health.failedRequired.length > 0) {
+    const checks = health.failedRequired.map((check) => `${check.name} (${check.conclusion})`).join(", ");
+    return refuseTier1(
+      `carrier_required_check_failed: Tier 1 declaration using "landing-delegated" names PR #${prNumber}, but its required check ${checks} is terminal-failed${head}; the carrier cannot land, so the landing obligation cannot transfer to done-close-landing-backstop.`,
+      `Fix the failing required check on PR #${prNumber} (push a fix or re-run it) and close again once it is passing or running, or keep the card open until the carrier can land.`,
+    );
+  }
+  if (health.mergeStateStatus === "DIRTY") {
+    return refuseTier1(
+      `carrier_merge_conflict: Tier 1 declaration using "landing-delegated" names PR #${prNumber}, but it has merge conflicts with its base branch${head}; the carrier cannot land, so the landing obligation cannot transfer to done-close-landing-backstop.`,
+      `Resolve the merge conflicts on PR #${prNumber} and close again, or keep the card open until the carrier can land.`,
+    );
+  }
+  return null;
+}
+
+/**
  * Hydration result carries an explicit success flag. Callers must not infer
  * hydration success from object identity — every unresolvable outcome returns a
  * fresh object with the live-only fields cleared (SUP-21856) — nor from
@@ -932,7 +1055,8 @@ function parseTier1Declaration(body: string): Tier1Parse {
 //    AND belongs to this issue (a linked merged PR merge commit, or this issue's recorded
 //    delivery head / work-product commit — SUP-23031; ancestry alone is not possession).
 //  - `landing-delegated`: names a linked `PR #<N>` and `done-close-landing-backstop` as the
-//    post-merge carrier (the async worker itself is unchanged here).
+//    post-merge carrier, and a live open carrier has no terminal-failed required check and
+//    no merge conflict (SUP-24135; the async worker itself is unchanged here).
 // TIER1_FORM is token-bearing so every emitted accepted form reaches the landing-token pre-check.
 // Tier 2 is a separate live-probe concern and is not checked here; see proveTier2Live.
 const LANDED_AT_TIP_TOKEN = "landed-at-tip";
@@ -1252,6 +1376,15 @@ async function proveLandingDelegated(
               `Tier 1 declaration using "landing-delegated" names PR #${number}, but repository auto-merge is disabled and no merge queue covers the PR's base branch; enable auto-merge, enable a merge queue for the base branch, or use landed-at-tip evidence. The backstop arms merges via GitHub's enablePullRequestAutoMerge, which on a repository with auto-merge disabled and no merge queue has no landing carrier.`,
             );
           }
+        }
+        // SUP-24135: the carrier itself must still be able to land. Only a live
+        // open PR is probed; any unreadable probe fails open (null).
+        if (hydration.hydrated && live.cachedState === "open") {
+          const carrierRefusal = landingCarrierRefusal(
+            number,
+            await fetchLandingCarrierHealth(pr, candidate.token),
+          );
+          if (carrierRefusal) return carrierRefusal;
         }
         break;
       }

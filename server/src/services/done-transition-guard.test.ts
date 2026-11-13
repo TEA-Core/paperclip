@@ -7356,6 +7356,147 @@ describe("evaluateDoneTierDeclaration", () => {
       );
     });
 
+    describe("SUP-24135 landing-delegated carrier re-check at close", () => {
+      const HEAD_SHA = "cccccccccccccccccccccccccccccccccccccccc";
+      type CarrierContext =
+        | { __typename: "CheckRun"; name: string; status: string; conclusion: string | null; isRequired: boolean }
+        | { __typename: "StatusContext"; context: string; state: string; isRequired: boolean };
+
+      function carrierFetch(carrier: { mergeStateStatus: string; contexts: CarrierContext[] } | "errors") {
+        ghFetchMock.mockImplementation(async (url, init) => {
+          const u = String(url);
+          if (u.endsWith("/pulls/4103")) {
+            return new Response(JSON.stringify({
+              state: "open",
+              draft: false,
+              head: { ref: "SUP-4103-work", sha: HEAD_SHA, repo: { full_name: "TEA-Core/paperclip" } },
+              base: { ref: "main" },
+              auto_merge: { merge_method: "squash" },
+            }), { status: 200 });
+          }
+          if (u.endsWith("/repos/TEA-Core/paperclip")) {
+            return new Response(JSON.stringify({ allow_auto_merge: true }), { status: 200 });
+          }
+          if (u.includes("graphql")) {
+            const body = String((init as { body?: string } | undefined)?.body ?? "");
+            if (body.includes("statusCheckRollup")) {
+              if (carrier === "errors") {
+                return new Response(JSON.stringify({ errors: [{ message: "RATE_LIMITED" }] }), { status: 200 });
+              }
+              return new Response(JSON.stringify({
+                data: {
+                  repository: {
+                    pullRequest: {
+                      state: "OPEN",
+                      mergeStateStatus: carrier.mergeStateStatus,
+                      commits: {
+                        nodes: [{
+                          commit: {
+                            oid: HEAD_SHA,
+                            statusCheckRollup: { contexts: { nodes: carrier.contexts } },
+                          },
+                        }],
+                      },
+                    },
+                  },
+                },
+              }), { status: 200 });
+            }
+            return new Response(JSON.stringify({ data: { repository: { pullRequest: { reviewDecision: null } } } }), { status: 200 });
+          }
+          return new Response("{}", { status: 500 });
+        });
+      }
+
+      async function closeDelegated() {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr(4103, "open")]);
+        return evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line("landing-delegated PR #4103; landing obligation transferred to done-close-landing-backstop, not yet discharged; no live consumer yet."),
+          null,
+          () => Promise.resolve([]),
+        );
+      }
+
+      it("refuses when the carrier's required check is already terminal-failed (SUP-24120 / PR 4329 shape)", async () => {
+        carrierFetch({
+          mergeStateStatus: "BLOCKED",
+          contexts: [
+            { __typename: "CheckRun", name: "ci-required", status: "COMPLETED", conclusion: "FAILURE", isRequired: true },
+            { __typename: "CheckRun", name: "lint", status: "COMPLETED", conclusion: "SUCCESS", isRequired: false },
+          ],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toMatch(/^carrier_required_check_failed: /);
+        expect(result.reason).toContain("PR #4103");
+        expect(result.reason).toContain("ci-required (failure)");
+        expect(result.reason).toContain(HEAD_SHA.slice(0, 12));
+        expect(result.remedy).toContain("re-run");
+      });
+
+      it("refuses when a required commit status is terminal-failed", async () => {
+        carrierFetch({
+          mergeStateStatus: "BLOCKED",
+          contexts: [
+            { __typename: "StatusContext", context: "paperclip/approved", state: "ERROR", isRequired: true },
+          ],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toMatch(/^carrier_required_check_failed: /);
+        expect(result.reason).toContain("paperclip/approved (error)");
+      });
+
+      it("refuses when the carrier has merge conflicts", async () => {
+        carrierFetch({
+          mergeStateStatus: "DIRTY",
+          contexts: [
+            { __typename: "CheckRun", name: "ci-required", status: "COMPLETED", conclusion: "SUCCESS", isRequired: true },
+          ],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toMatch(/^carrier_merge_conflict: /);
+        expect(result.reason).toContain("PR #4103");
+      });
+
+      it("accepts a blocked carrier whose required check is still running (the normal delegated close)", async () => {
+        carrierFetch({
+          mergeStateStatus: "BLOCKED",
+          contexts: [
+            { __typename: "CheckRun", name: "ci-required", status: "IN_PROGRESS", conclusion: null, isRequired: true },
+            { __typename: "CheckRun", name: "optional-e2e", status: "COMPLETED", conclusion: "FAILURE", isRequired: false },
+          ],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+      });
+
+      it("accepts when a failed required check has a re-run in progress", async () => {
+        carrierFetch({
+          mergeStateStatus: "BLOCKED",
+          contexts: [
+            { __typename: "CheckRun", name: "ci-required", status: "COMPLETED", conclusion: "FAILURE", isRequired: true },
+            { __typename: "CheckRun", name: "ci-required", status: "QUEUED", conclusion: null, isRequired: true },
+          ],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+      });
+
+      it("fails open when the carrier probe cannot be read", async () => {
+        carrierFetch("errors");
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+      });
+    });
+
     it("refuses landing-delegated when the repository has auto-merge disabled and no merge queue", async () => {
       const pr = { ...linkedPr(4103, "open"), baseRefName: "main" };
       mockResolveLinkedPullRequestsWithState.mockResolvedValue([pr]);
