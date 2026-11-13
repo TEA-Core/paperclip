@@ -513,6 +513,7 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     ["adds itself beside the reviewer", (policy, seeded) => ({ executionPolicy: withArbiterBesideReviewer(policy, seeded) })],
     ["only changes baseRef", (policy) => ({ executionPolicy: { ...policy, baseRef: "release/r20" } })],
     ["writes the review policy", () => ({ reviewPolicy: "anyone" })],
+    ["sends the top-level monitor alias", () => ({ monitor: { nextCheckAt: "2099-01-01T00:00:00.000Z", notes: "alias" } })],
     // Malformed bodies get the same refusal, before body validation (no 400).
     ["sends a malformed policy with unknown and type-wrong keys", () => ({ executionPolicy: { stages: "not-a-list", bogus: true } })],
     ["sends an unknown key beside a valid policy", (policy) => ({ executionPolicy: { ...policy, unknownKey: 1 } })],
