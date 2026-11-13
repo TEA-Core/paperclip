@@ -30,7 +30,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { ONBOARDING_FIRST_TASK_ORIGIN_KIND, connectionIntentPayloadSchema } from "@paperclipai/shared";
+import { ONBOARDING_FIRST_TASK_ORIGIN_KIND, connectionIntentPayloadSchema, type CreateIssueThreadInteractionInput } from "@paperclipai/shared";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
@@ -4598,7 +4598,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         continuationPolicy: "wake_assignee",
         sourceRunId,
         payload,
-      }, {
+      } as CreateIssueThreadInteractionInput, {
         userId: "local-board",
       });
 
