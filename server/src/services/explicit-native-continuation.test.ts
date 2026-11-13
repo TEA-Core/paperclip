@@ -425,6 +425,10 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(scheduled.run.contextSnapshot?.explicitUserContinuation).toEqual({
       previousRunId: f.parent.id, commentId: f.commentId,
     });
+    // Fork lock model: scheduling releases the task execution lock and the retry
+    // takes it when it is claimed (stampClaimedExecution), so simulate that claim
+    // before dispatch. Upstream hands the lock to the scheduled run directly.
+    await db.update(issues).set({ executionRunId: scheduled.run.id }).where(eq(issues.id, f.issueId));
     // Dispatch validates the new run, not a borrowed parent receipt.
     await expect(dispatchExplicitRetry(f, scheduled.run)).resolves.toMatchObject({ interruptedRunId: f.parent.id });
     const receipts = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
@@ -465,6 +469,8 @@ const support = await getEmbeddedPostgresTestSupport();
     const first = await heartbeat.scheduleBoundedRetry(f.parent.id, { now: f.now });
     expect(first.outcome).toBe("scheduled");
     if (first.outcome !== "scheduled") return;
+    // Fork lock model (see above): the first retry holds the lock once claimed.
+    await db.update(issues).set({ executionRunId: first.run.id }).where(eq(issues.id, f.issueId));
     const nextNow = new Date(f.now.getTime() + 2000);
     await db.update(heartbeatRuns).set({ status: "timed_out", errorCode: "timeout", startedAt: f.now,
       finishedAt: nextNow }).where(eq(heartbeatRuns.id, first.run.id));
@@ -472,6 +478,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(second.outcome).toBe("scheduled");
     if (second.outcome !== "scheduled") return;
     expect(second.run).toMatchObject({ retryOfRunId: first.run.id, scheduledRetryAttempt: 2 });
+    await db.update(issues).set({ executionRunId: second.run.id }).where(eq(issues.id, f.issueId));
     await expect(dispatchExplicitRetry(f, second.run)).resolves.toMatchObject({ interruptedRunId: first.run.id });
     const receipts = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
     expect(receipts).toHaveLength(3);

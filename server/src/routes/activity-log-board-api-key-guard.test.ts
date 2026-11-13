@@ -120,6 +120,14 @@ const ALLOWLIST: AllowlistEntry[] = [
   // request-less: durable comment-delivery path (issue_comments carries no board
   // key, so the resuming comment's board provenance is not in scope here)
   { file: "agent-conversations.ts", action: "issue.tree_hold_released", actorType: '"user"', reason: "request-less comment-delivery path" },
+  // MCP OAuth principal (upstream #14846): the public MCP ingress authenticates only an
+  // MCP OAuth bearer token, never a board API key, so these rows can carry no board key.
+  { file: "capabilities.ts", action: "mcp.tool_called", actorType: '"user"', reason: "MCP OAuth bearer principal" },
+  { file: "events.ts", action: "mcp.event_subscribed", actorType: '"user"', reason: "MCP OAuth bearer principal" },
+  { file: "events.ts", action: "mcp.event_unsubscribed", actorType: '"user"', reason: "MCP OAuth bearer principal" },
+  // MCP connection management admits only session / cloud-tenant board users
+  // (routes/public-mcp.ts `realUser`), so a board API key cannot reach it.
+  { file: "oauth.ts", action: "mcp.connection_revoked", actorType: '"user"', reason: "session-only management route" },
 ];
 
 function isAllowlisted(allowlist: AllowlistEntry[], file: string, action: string, actorTypeExpr: string | undefined): boolean {

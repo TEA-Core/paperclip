@@ -1139,6 +1139,7 @@ export function connectionIntentService(db: Db) {
           connection: selectedConnection, agentId: payload.requestingAgentId, userId,
           tools: payload.accessRequest.tools, interactionId,
           context: { issueId: task.id, projectId: task.projectId },
+          boardApiKeyId: options.boardApiKeyId ?? null,
         });
       }
 

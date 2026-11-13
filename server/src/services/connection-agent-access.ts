@@ -16,8 +16,10 @@ export async function grantConnectionAgentTools(db: Db, input: {
   tools: AccessTools;
   interactionId?: string;
   context?: { issueId: string; projectId: string | null };
+  /** Fork: board API key attribution for the access-grant audit row. */
+  boardApiKeyId?: string | null;
 }) {
-  const { connection, agentId, userId, tools, interactionId, context } = input;
+  const { connection, agentId, userId, tools, interactionId, context, boardApiKeyId } = input;
   const catalog = await db.select().from(toolCatalogEntries).where(and(
     eq(toolCatalogEntries.companyId, connection.companyId), eq(toolCatalogEntries.connectionId, connection.id),
   )).for("update");
@@ -67,7 +69,7 @@ export async function grantConnectionAgentTools(db: Db, input: {
     targetType: "agent", targetId: agentId, priority: 100, createdByUserId: userId,
     metadata: { source: "connection_intent", connectionId: connection.id },
   }).onConflictDoNothing();
-  await logActivity(db, { companyId: connection.companyId, actorType: "user", actorId: userId,
+  await logActivity(db, { companyId: connection.companyId, actorType: "user", actorId: userId, boardApiKeyId: boardApiKeyId ?? null,
     action: "tool_connection.agent_access_granted", entityType: "tool_connection", entityId: connection.id,
     details: { ...(interactionId ? { interactionId } : {}), agentId, profileId: profile.id, tools: tools } });
 }

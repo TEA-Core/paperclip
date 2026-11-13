@@ -51,8 +51,12 @@ describe("AI pool session adoption", () => {
     const adoption = revision("revision-2", binding, pool);
     expect((await decision({ agentRuntimeConfig: { aiConnection: binding }, agentConfigRevision: aiConnectionRevisionMetadata(first) }, { agentRuntimeConfig: { aiConnection: pool, heartbeat: { enabled: false } }, agentConfigRevision: aiConnectionRevisionMetadata(adoption) }, { revisions: [adoption, first] })).reset).toBe(true);
   });
+  // FORK DIVERGENCE (SUP-13734): a configured-model change alone keeps the task session
+  // (model-portable transcript); upstream resets it. The other effective changes still reset.
+  it("keeps the session through a configured-model change (fork SUP-13734)", async () => {
+    expect((await decision({ agentRuntimeConfig: { aiConnection: binding } }, { effectiveAdapterConfig: { ...config, model: "gpt-5.6-terra" } })).reset).toBe(false);
+  });
   it.each([
-    { effectiveAdapterConfig: { ...config, model: "gpt-5.6-terra" } },
     { effectiveAdapterConfig: { ...config, provider: "acpx", acpxAgent: "codex" } },
     { effectiveAdapterConfig: { ...config, env: { ...config.env, OTHER: "changed" } } },
     { agentRuntimeConfig: { aiConnection: pool, heartbeat: { maxConcurrentRuns: 2 } } },

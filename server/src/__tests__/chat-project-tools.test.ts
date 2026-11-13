@@ -151,7 +151,10 @@ const support = await getEmbeddedPostgresTestSupport();
     for (const path of [`/api/issues/${task.id}/children`, `/api/companies/${f.companyId}/issues`]) {
       const response = await fetch(`${server.apiUrl}${path}`, {
         method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ title: `Self decomposition ${path}`, parentId: task.id, assigneeAgentId: f.agentId, status: "backlog" }),
+        // Fork create contract: the schemas are strict (the /children route takes no parentId)
+        // and an assigned parented backlog child must say parkDeliberately (backlog-blocking guard).
+        body: JSON.stringify({ title: `Self decomposition ${path}`, ...(path.endsWith("/children") ? {} : { parentId: task.id }),
+          assigneeAgentId: f.agentId, status: "backlog", parkDeliberately: true }),
       });
       const child = await response.json();
       expect(response.status, JSON.stringify(child)).toBe(201);
@@ -185,7 +188,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const create = async (path: string, fields: Record<string, unknown>) => {
       const response = await fetch(`${server.apiUrl}${path}`, {
         method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ title: `Boundary test ${randomUUID()}`, status: "backlog", assigneeAgentId: f.agentId, ...fields }),
+        body: JSON.stringify({ title: `Boundary test ${randomUUID()}`, status: "backlog", parkDeliberately: true, assigneeAgentId: f.agentId, ...fields }),
       });
       return { status: response.status, body: await response.json() };
     };
@@ -225,7 +228,8 @@ const support = await getEmbeddedPostgresTestSupport();
     for (const path of [`/api/companies/${f.companyId}/issues`, `/api/issues/${f.issueId}/children`]) {
       const response = await fetch(`${server.apiUrl}${path}`, {
         method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ title: `Root subtask ${randomUUID()}`, parentId: f.issueId, assigneeAgentId: f.agentId, status: "backlog" }),
+        body: JSON.stringify({ title: `Root subtask ${randomUUID()}`, ...(path.endsWith("/children") ? {} : { parentId: f.issueId }),
+          assigneeAgentId: f.agentId, status: "backlog", parkDeliberately: true }),
       });
       const child = await response.json();
       expect(response.status, JSON.stringify(child)).toBe(201);
@@ -238,8 +242,8 @@ const support = await getEmbeddedPostgresTestSupport();
     for (const path of [`/api/companies/${f.companyId}/issues`, `/api/issues/${f.issueId}/children`]) {
       const response = await fetch(`${server.apiUrl}${path}`, {
         method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ title: "Root cannot escape into another project", parentId: f.issueId,
-          projectId: outside.id, assigneeAgentId: f.agentId, status: "backlog" }),
+        body: JSON.stringify({ title: "Root cannot escape into another project", ...(path.endsWith("/children") ? {} : { parentId: f.issueId }),
+          projectId: outside.id, assigneeAgentId: f.agentId, status: "backlog", parkDeliberately: true }),
       });
       expect(response.status, JSON.stringify(await response.json())).toBe(403);
     }
@@ -270,8 +274,8 @@ const support = await getEmbeddedPostgresTestSupport();
       const create = async (path: string, selection: Record<string, string>) => {
         const response = await fetch(`${server.apiUrl}${path}`, {
           method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ title: `Workspace scope ${randomUUID()}`, parentId: f.issueId,
-            assigneeAgentId: f.agentId, status: "backlog", ...selection }),
+          body: JSON.stringify({ title: `Workspace scope ${randomUUID()}`, ...(path.endsWith("/children") ? {} : { parentId: f.issueId }),
+            assigneeAgentId: f.agentId, status: "backlog", parkDeliberately: true, ...selection }),
         });
         return { status: response.status, body: await response.json() };
       };
@@ -325,7 +329,7 @@ const support = await getEmbeddedPostgresTestSupport();
         for (const collision of [{ idempotencyKey: key, title: "Different proposed task" }, { title }]) {
           const response = await fetch(`${server.apiUrl}/api/companies/${f.companyId}/issues`, {
             method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ projectId: f.projectId, parentId, assigneeAgentId: f.agentId, status: "backlog", ...collision }),
+            body: JSON.stringify({ projectId: f.projectId, parentId, assigneeAgentId: f.agentId, status: "backlog", parkDeliberately: true, ...collision }),
           });
           const body = await response.json();
           expect(response.status, JSON.stringify(body)).toBe(allowed ? 200 : 403);

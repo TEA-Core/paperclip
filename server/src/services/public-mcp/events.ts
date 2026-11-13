@@ -4,7 +4,7 @@ import { z } from "zod";
 import { companies, activityLog, mcpEventAdmissions as admissions, mcpEventDeliveries as deliveries, mcpEventSubscriptions as subscriptions, type Db } from "@paperclipai/db";
 import { ISSUE_STATUSES } from "@paperclipai/shared";
 import { localEncryptedProvider } from "../../secrets/local-encrypted-provider.js";
-import { logActivity } from "../activity-log.js";
+import { logActivityInTransaction } from "../activity-log.js";
 import { logger } from "../../middleware/logger.js";
 import { type ApiDispatch } from "./capabilities.js";
 import { PublicMcpDisabledError, type McpPrincipal, type PublicMcpOAuth } from "./oauth.js";
@@ -157,7 +157,7 @@ export function createPublicMcpEvents(db: Db, oauth: PublicMcpOAuth, api: ApiDis
           arguments: input.arguments, deliveryMaterial: material, expiresAt, stoppedAt: null,
           verifiedAt: verify ? new Date(now()) : existing!.verifiedAt, startsAt: existing?.startsAt ?? requestedAt, scannedAt: new Date(now()) };
         await tx.insert(subscriptions).values({ id, ...value }).onConflictDoUpdate({ target: subscriptions.id, set: value });
-        await logActivity(tx as unknown as Db, { companyId: principal.grant.companyId, actorType: "user", actorId: principal.grant.userId,
+        await logActivityInTransaction(tx as unknown as Db, { companyId: principal.grant.companyId, actorType: "user", actorId: principal.grant.userId,
           action: "mcp.event_subscribed", entityType: "mcp_subscription", entityId: id, details: { name: input.name, taskId: input.arguments.taskId, expiresAt: expiresAt.toISOString() } });
         return { id, refreshBefore: expiresAt.toISOString(), cursor: null, truncated: false };
       });
@@ -172,7 +172,7 @@ export function createPublicMcpEvents(db: Db, oauth: PublicMcpOAuth, api: ApiDis
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${id}, 0))`);
       await tx.update(admissions).set({ finishedAt: new Date(now()) }).where(and(eq(admissions.subscriptionId, id), isNull(admissions.finishedAt)));
       await tx.delete(subscriptions).where(and(eq(subscriptions.id, id), eq(subscriptions.grantId, principal.grant.id)));
-      await logActivity(tx as unknown as Db, { companyId: principal.grant.companyId, actorType: "user", actorId: principal.grant.userId,
+      await logActivityInTransaction(tx as unknown as Db, { companyId: principal.grant.companyId, actorType: "user", actorId: principal.grant.userId,
         action: "mcp.event_unsubscribed", entityType: "mcp_subscription", entityId: id, details: { name: input.name, taskId: input.arguments.taskId } });
     });
     return {};

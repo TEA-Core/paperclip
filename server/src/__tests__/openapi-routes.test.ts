@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
-import { gitCommitShaSchema } from "@paperclipai/shared";
+import { gitCommitShaSchema, PUBLIC_MCP_PATH } from "@paperclipai/shared";
 import { errorHandler } from "../middleware/index.js";
 import { COMPANY_IMPORT_ROUTE_PATH } from "../routes/company-import-paths.js";
 import { OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH } from "../services/tool-access.js";
@@ -153,7 +153,7 @@ function normalizeExpressPath(routePath: string) {
 }
 
 function resolveMountedPath(file: string, prefix: string, routePath: string) {
-  if (file === "public-mcp.ts" && (routePath.startsWith("/mcp/oauth/") || routePath.startsWith("/.well-known/"))) return routePath;
+  if (file === "public-mcp.ts" && (routePath.startsWith("/mcp/oauth/") || routePath.startsWith("/.well-known/") || routePath === PUBLIC_MCP_PATH)) return routePath;
   if (
     (file === "chat-channels.ts" || file === "email.ts") &&
     routePath.startsWith("/api/chat-webhooks/")
@@ -1362,6 +1362,8 @@ const BARE_PATH_CONSTANTS: Record<string, string> = {
   // so mirror that strip rather than hardcoding the stripped literal.
   OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH:
     OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH.replace(/^\/api/, ""),
+  // Upstream #14846: the public MCP ingress (OAuth bearer, mounted outside /api).
+  PUBLIC_MCP_PATH: PUBLIC_MCP_PATH,
 };
 
 // Strip `if (req.actor.type !== "agent") { ... }` blocks: an assertBoard inside

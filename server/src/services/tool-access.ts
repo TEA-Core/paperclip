@@ -4015,7 +4015,7 @@ export function toolAccessService(
       const config = { ...connection.config, aggregatorDiscovery: { ...all, [actor.actorId!]: { userId: input.userId, secretId: secret.id } } };
       await tx.update(toolConnections).set({ config, transportConfig: config, updatedAt: new Date() }).where(eq(toolConnections.id, connectionId));
     });
-    await logActivity(db, { companyId, actorType: "user", actorId: actor.actorId!, action: "tool_connection.account_sync_configured", entityType: "tool_connection", entityId: connectionId, details: { provider: "arcade" } });
+    await logActivity(db, { companyId, actorType: "user", actorId: actor.actorId!, boardApiKeyId: actor.boardApiKeyId ?? null, action: "tool_connection.account_sync_configured", entityType: "tool_connection", entityId: connectionId, details: { provider: "arcade" } });
     return syncAggregatorApps(connectionId, true, actor);
   }
 
@@ -17181,7 +17181,7 @@ export function toolAccessService(
         if (!before?.some(account => account.id === input.accountId)) throw notFound("This account is no longer available in the selected Composio app");
       }
       const details = { toolkit, ...(input.action !== "add" ? { accountId: input.accountId } : {}) };
-      await logActivity(db, { companyId: connection.companyId, actorType: "user", actorId: actor.actorId!,
+      await logActivity(db, { companyId: connection.companyId, actorType: "user", actorId: actor.actorId!, boardApiKeyId: actor.boardApiKeyId ?? null,
         action: `tool_connection.upstream_account_${input.action}_requested`, entityType: "tool_connection", entityId: connectionId, details });
       let payload: unknown;
       try {
@@ -17201,7 +17201,7 @@ export function toolAccessService(
           throw conflict("Composio has not confirmed this change. Refresh the accounts before trying again.");
         }
       }
-      await logActivity(db, { companyId: connection.companyId, actorType: "user", actorId: actor.actorId!,
+      await logActivity(db, { companyId: connection.companyId, actorType: "user", actorId: actor.actorId!, boardApiKeyId: actor.boardApiKeyId ?? null,
         action: `tool_connection.upstream_account_${input.action}`, entityType: "tool_connection", entityId: connectionId,
         details: { toolkit, ...(input.action !== "add" ? { accountId: input.accountId } : {}) } });
       return { ...result, apps: await cachedComposioApps(connection, actor) };

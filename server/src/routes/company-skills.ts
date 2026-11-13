@@ -1266,7 +1266,7 @@ export function companySkillRoutes(db: Db) {
             afterUpdate: async (versionId) => {
               receipt = { skillId, path: input.path, versionId, studioPath: `/skills/studio/${encodeURIComponent(skillId)}` };
               const activity = await persistActivity(tx as unknown as Db, {
-                companyId, actorType: actor.actorType, actorId: actor.actorId, agentId: actor.agentId,
+                companyId, actorType: actor.actorType, boardApiKeyId: actor.boardApiKeyId, actorId: actor.actorId, agentId: actor.agentId,
                 runId: actor.runId, agentApiKeyId: actor.agentApiKeyId, issueId: runContext?.issue.id,
                 action: "company.skill_file_updated", entityType: "company_skill", entityId: skillId,
                 details: { path: input.path, markdown: input.path === "SKILL.md", versionId,

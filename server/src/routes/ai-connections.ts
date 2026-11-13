@@ -195,7 +195,8 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
     assertBoard(req); assertCompanyAccess(req, companyId);
     if (!(await canManageAiConnections(db, req, companyId))) throw forbidden("Manage connections permission is required");
     const body = z.object({ pluginKey: z.string().min(1).max(160), id: z.string().uuid().optional(), expectedRevision: z.number().int().positive().optional(), config: aiConnectionPoolConfigSchema }).strict().parse(req.body);
-    res.json(await pools.save(body.pluginKey, { ...body, companyId }, getActorInfo(req).actorId));
+    const actor = getActorInfo(req);
+    res.json(await pools.save(body.pluginKey, { ...body, companyId }, actor.actorId, actor.boardApiKeyId));
   });
   router.delete("/companies/:companyId/ai-connection-pools/:poolId", async (req, res) => {
     const companyId = req.params.companyId as string;
@@ -203,7 +204,8 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
     if (!(await canManageAiConnections(db, req, companyId))) throw forbidden("Manage connections permission is required");
     const poolId = z.string().uuid().parse(req.params.poolId);
     const { expectedRevision } = z.object({ expectedRevision: z.number().int().positive() }).strict().parse(req.body);
-    res.json(await pools.remove(companyId, poolId, expectedRevision, getActorInfo(req).actorId));
+    const actor = getActorInfo(req);
+    res.json(await pools.remove(companyId, poolId, expectedRevision, actor.actorId, actor.boardApiKeyId));
   });
   function assertLocalOperator(req: Request) {
     assertBoard(req);

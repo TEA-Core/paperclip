@@ -7,7 +7,7 @@ import { models as claudeModels, claudeLocalReasoningEffortsForModel } from "@pa
 import { models as grokModels, grokLocalReasoningEffortsForModel } from "@paperclipai/adapter-grok-local";
 import { aiConnectionService } from "./ai-connections.js";
 import { instanceSettingsService } from "./instance-settings.js";
-import { logActivity } from "./activity-log.js";
+import { logActivityInTransaction } from "./activity-log.js";
 import { forbidden, notFound, conflict, unprocessable } from "../errors.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { resolvePaperclipRunnerProviderProfile, resolvePaperclipRunnerNativeProviderInput } from "./native-runtime/provider-profile.js";
@@ -118,7 +118,7 @@ export function aiConnectionRouterService(db: Db, workerManager?: PluginWorkerMa
     }
     return result;
   }
-  async function save(pluginKey: string, input: AiConnectionPoolSaveInput, userId: string) {
+  async function save(pluginKey: string, input: AiConnectionPoolSaveInput, userId: string, boardApiKeyId: string | null = null) {
     await enabled();
     const plugin = await owner(pluginKey);
     const config = aiConnectionPoolConfigSchema.parse(input.config);
@@ -147,11 +147,11 @@ export function aiConnectionRouterService(db: Db, workerManager?: PluginWorkerMa
         await tx.insert(aiConnectionRouterCursors).values({ poolId: id, companyId: input.companyId });
         await tx.insert(toolConnectionInstalls).values({ companyId: input.companyId, connectionId: id, targetType: "company", targetId: input.companyId, createdByUserId: userId });
       }
-      await logActivity(tx as unknown as Db, { companyId: input.companyId, actorType: "user", actorId: userId, action: "ai_connection.pool_saved", entityType: "tool_connection", entityId: id, details: { enabled: config.enabled, memberCount: config.members.length, mode: config.mode } });
+      await logActivityInTransaction(tx as unknown as Db, { companyId: input.companyId, actorType: "user", actorId: userId, boardApiKeyId: boardApiKeyId, action: "ai_connection.pool_saved", entityType: "tool_connection", entityId: id, details: { enabled: config.enabled, memberCount: config.members.length, mode: config.mode } });
     });
     return (await list(input.companyId)).find((p) => p.id === id)!;
   }
-  async function remove(companyId: string, poolId: string, expectedRevision: number, userId: string) {
+  async function remove(companyId: string, poolId: string, expectedRevision: number, userId: string, boardApiKeyId: string | null = null) {
     // Archive the virtual connection; cascading deletion would erase task pins.
     // Cleanup remains available when the experimental flag or plugin is off.
     await db.transaction(async tx => {
@@ -162,7 +162,7 @@ export function aiConnectionRouterService(db: Db, workerManager?: PluginWorkerMa
       if (row.revision !== expectedRevision) throw conflict("Pool changed; reload before deleting");
       await tx.update(aiConnectionPools).set({ config: { ...row.config, enabled: false }, revision: row.revision + 1, updatedAt: new Date() }).where(eq(aiConnectionPools.id, poolId));
       await tx.update(toolConnections).set({ status: "archived", enabled: false, updatedAt: new Date() }).where(and(eq(toolConnections.id, poolId), eq(toolConnections.companyId, companyId)));
-      await logActivity(tx as unknown as Db, { companyId, actorType: "user", actorId: userId, action: "ai_connection.pool_deleted", entityType: "tool_connection", entityId: poolId, details: { retainedTaskPins: true } });
+      await logActivityInTransaction(tx as unknown as Db, { companyId, actorType: "user", actorId: userId, boardApiKeyId: boardApiKeyId, action: "ai_connection.pool_deleted", entityType: "tool_connection", entityId: poolId, details: { retainedTaskPins: true } });
     });
     return { ok: true };
   }
@@ -272,7 +272,7 @@ export function aiConnectionRouterService(db: Db, workerManager?: PluginWorkerMa
         await validateSelection(selected, tx as unknown as Db);
         await tx.insert(aiConnectionTaskPins).values({ companyId: input.companyId, poolId: row.id, agentId: input.agentId, taskKey: input.taskKey, selection: selected, member: candidate.member });
         await tx.update(aiConnectionRouterCursors).set({ lastMemberId: candidate.member.id, version: sql`${aiConnectionRouterCursors.version} + 1` }).where(eq(aiConnectionRouterCursors.poolId, row.id));
-        await logActivity(tx as unknown as Db, { companyId: input.companyId, actorType: "system", actorId: "system", agentId: input.agentId, action: "ai_connection.pool_selected", entityType: "tool_connection", entityId: row.id, details: { memberId: candidate.member.id, connectionId: candidate.member.binding.connectionId, taskKey: input.taskKey } });
+        await logActivityInTransaction(tx as unknown as Db, { companyId: input.companyId, actorType: "system", actorId: "system", agentId: input.agentId, action: "ai_connection.pool_selected", entityType: "tool_connection", entityId: row.id, details: { memberId: candidate.member.id, connectionId: candidate.member.binding.connectionId, taskKey: input.taskKey } });
         return { retry: false };
       });
       if (!committed.retry) return selected;
