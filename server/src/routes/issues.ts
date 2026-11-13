@@ -4724,6 +4724,22 @@ export function issueRoutes(
     };
   }
 
+  // SUP-24085: card completion, not stamp eligibility. `ladderIsTerminallyApproved`
+  // ignores post_merge stages so a pending post-merge stage cannot hold the merge
+  // stamp; an ADR-072 close ladder (pre_merge review, then post_merge stages) is
+  // therefore stamp-eligible after its first approve. A stage decision whose
+  // resulting state is pending on a stage that is neither completed nor skipped
+  // (post_merge included) redirects the requested close to that later stage: it
+  // does not complete the card and is not a delivery transition.
+  function leavesLadderPendingOnUndecidedStage(
+    policy: Parameters<typeof ladderIsTerminallyApproved>[0],
+    state: { status?: string | null; currentStageId?: string | null; completedStageIds?: string[]; skippedStageIds?: string[] } | undefined,
+  ): boolean {
+    if (state?.status !== "pending" || !state.currentStageId) return false;
+    const decided = new Set([...(state.completedStageIds ?? []), ...(state.skippedStageIds ?? [])]);
+    return (policy?.stages ?? []).some((stage) => stage.id === state.currentStageId && !decided.has(stage.id));
+  }
+
   async function preflightTerminalApproval(
     issue: FinalDeliveryIssue & { status?: string; updatedAt?: Date },
     patch: Record<string, unknown>,
@@ -4738,7 +4754,14 @@ export function issueRoutes(
       patch.executionState = { ...rawPatchState, approvalStatus: rest };
     }
     const state = patch.executionState as
-      | { completedStageIds?: string[]; lastDecisionOutcome?: string | null; lastDecisionId?: string | null }
+      | {
+          status?: string | null;
+          currentStageId?: string | null;
+          completedStageIds?: string[];
+          skippedStageIds?: string[];
+          lastDecisionOutcome?: string | null;
+          lastDecisionId?: string | null;
+        }
       | undefined;
     if (!shouldPublishApprovalStatus(decision) || !ladderIsTerminallyApproved(policy, state)) return;
     if (issue.deliveryRequirement === "record_only") {
@@ -4781,7 +4804,9 @@ export function issueRoutes(
     if (issue.deliveryRequirement === "record_only" || !resolution.repoBacked) return;
     const { verdict, deliveryOwnerIssueId } = resolution;
     if (verdict.kind !== "resolved") {
-      if (options.overrideAccepted) return;
+      // The resolved branch below still certifies the decision head for the merge
+      // stamp; only the refusal waits for the approval that completes the card.
+      if (options.overrideAccepted || leavesLadderPendingOnUndecidedStage(policy, state)) return;
       const remedy = `Delivery owner ${deliveryOwnerIssueId}: provide one OPEN, non-draft owned PR and a readable reviewed head, then submit the final verdict again. ${verdict.reason}`;
       throw conflict("Final repository delivery preflight refused; stage remains pending", {
         code: "approval_final_delivery_preflight", reason: verdict.reason, deliveryOwnerIssueId, remedy,

@@ -295,6 +295,10 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     deliveryRequirement,
     assigneeAgentId = null,
     mentionState,
+    adr072 = false,
+    atStage = 0,
+    laterStages,
+    projectionGap = false,
   }: {
     draft?: boolean;
     missing?: boolean;
@@ -307,6 +311,14 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     assigneeAgentId?: string | null;
     /** SUP-22346: cache the mentioned PR as merged/closed out-of-band ("merged" | "ambiguous") or closed-unmerged. */
     mentionState?: "merged" | "ambiguous" | "closed-unmerged";
+    /** SUP-24085: an ADR-072 close ladder — review (pre_merge), review (post_merge), approval (post_merge). */
+    adr072?: boolean;
+    /** Index of the pending stage; every earlier stage is completed. */
+    atStage?: number;
+    /** Record every stage after `atStage` as completed, as completed and skipped, or (legacy shape) skipped only. */
+    laterStages?: "completed" | "skipped" | "skipped-only";
+    /** Drop the stage before `atStage` from `completedStageIds` while its approved decision row stays (a lost projection). */
+    projectionGap?: boolean;
   } = {}) {
     const company = await seedCompany(db);
     if (mergeArmingEnabled) {
@@ -318,8 +330,17 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     const author = await seedAgent(db, company.id);
     const project = await seedProject(db, company.id, "Delivery");
     const stageId = randomUUID();
-    const stages = [{ id: stageId, type: "review", participants: [{ type: "user", userId: "board-user" }] }];
-    if (mid) stages.push({ id: randomUUID(), type: "approval", participants: [{ type: "user", userId: "board-user" }] });
+    const participants = [{ type: "user", userId: "board-user" }];
+    const stages: Array<{ id: string; type: string; phase?: string; participants: typeof participants }> = adr072
+      ? [
+          { id: stageId, type: "review", phase: "pre_merge", participants },
+          { id: randomUUID(), type: "review", phase: "post_merge", participants },
+          { id: randomUUID(), type: "approval", phase: "post_merge", participants },
+        ]
+      : [{ id: stageId, type: "review", participants }];
+    if (mid) stages.push({ id: randomUUID(), type: "approval", participants });
+    const stageIds = stages.map((stage) => stage.id);
+    const laterStageIds = laterStages ? stageIds.slice(atStage + 1) : [];
     const issue = await seedIssue(db, {
       companyId: company.id,
       projectId: project.id,
@@ -345,12 +366,26 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       identifier, issueNumber: 1, createdByAgentId: author.id, assigneeUserId: "board-user",
       executionWorkspaceId: workspaceId,
       executionState: {
-        status: "pending", currentStageId: stageId, currentStageIndex: 0,
-        currentStageType: "review", currentParticipant: { type: "user", userId: "board-user" },
-        returnAssignee: { type: "agent", agentId: author.id }, completedStageIds: [],
-        skippedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+        status: "pending", currentStageId: stageIds[atStage], currentStageIndex: atStage,
+        currentStageType: stages[atStage]!.type, currentParticipant: { type: "user", userId: "board-user" },
+        returnAssignee: { type: "agent", agentId: author.id },
+        completedStageIds: [
+          ...stageIds.slice(0, atStage).filter((id) => !(projectionGap && id === stageIds[atStage - 1])),
+          ...(laterStages === "skipped-only" ? [] : laterStageIds),
+        ],
+        skippedStageIds: laterStages === "skipped" || laterStages === "skipped-only" ? laterStageIds : [],
+        lastDecisionId: null, lastDecisionOutcome: null,
       },
     }).where(eq(issues.id, issue.id));
+    // Completed stages carry their approved decision rows, as a real ladder does.
+    const decidedStageIds = [...stageIds.slice(0, atStage), ...(laterStages === "completed" ? laterStageIds : [])];
+    for (const [index, decidedStageId] of decidedStageIds.entries()) {
+      await seedDecision(db, {
+        companyId: company.id, issueId: issue.id, stageId: decidedStageId,
+        stageType: stages.find((stage) => stage.id === decidedStageId)!.type, actorUserId: "board-user",
+        outcome: "approved", body: "Earlier stage approved.", createdAt: new Date(Date.now() - 120_000 + index * 1_000),
+      });
+    }
     // SUP-22346: mentionState models the out-of-band-merged carrier — the
     // cached mention is closed, so every open-PR resolver sees nothing and the
     // live open-PR list is empty.
@@ -453,7 +488,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       throw new Error(`Unexpected sandbox request: ${url}`);
     });
     return {
-      company, issue, stageId, writes, armCalls, pr,
+      company, issue, stageId, stageIds, writes, armCalls, pr,
       pullReached, releasePull,
       moveHead: () => { moveAfterPreflight = true; },
       approve: (extra: Record<string, unknown> = {}) => request(createApp(db, boardActor(company))).patch(`/api/issues/${issue.id}`)
@@ -1715,6 +1750,305 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       if (previous === undefined) delete process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
       else process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = previous;
     }
+  });
+
+  describe("SUP-24085: an ADR-072 close ladder refuses on its delivery verdict only when the approval completes the card", () => {
+    const stageDoors = ["PATCH", "comment", "board"] as const;
+    const allDoors = [...stageDoors, "escalation", "recovery"] as const;
+    type Door = (typeof allDoors)[number];
+    type Fixture = Awaited<ReturnType<typeof pendingDelivery>>;
+    const accepted: Record<Door, number> = { PATCH: 200, comment: 201, board: 200, escalation: 200, recovery: 200 };
+
+    async function approveAtDoor(fixture: Fixture, door: Door): Promise<request.Response> {
+      const app = createApp(db, boardActor(fixture.company));
+      if (door === "PATCH") return fixture.approve();
+      if (door === "comment") {
+        return request(app).post(`/api/issues/${fixture.issue.id}/comments`)
+          .send({ body: "## Review: APPROVED\n\nIndependent stage review." });
+      }
+      if (door === "escalation") {
+        const interaction = await seedEscalation(fixture);
+        return request(app).post(`/api/issues/${fixture.issue.id}/interactions/${interaction.id}/accept`).send({});
+      }
+      if (door === "recovery") return recoverFinalReview(fixture);
+      return boardDecision(fixture, "approved");
+    }
+
+    async function boardDecision(fixture: Fixture, decision: "approved" | "changes_requested") {
+      const previous = process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+      process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "true";
+      try {
+        return await request(createApp(db, boardActor(fixture.company)))
+          .post(`/api/issues/${fixture.issue.id}/execution-stage/board-decision`)
+          .send({ decision, comment: "Independent stage decision." });
+      } finally {
+        if (previous === undefined) delete process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+        else process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = previous;
+      }
+    }
+
+    async function decisionsOf(fixture: Fixture) {
+      return db.select({ stageId: issueExecutionDecisions.stageId, outcome: issueExecutionDecisions.outcome })
+        .from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, fixture.issue.id));
+    }
+
+    function approvalStatusOf(stored: { executionState: unknown }) {
+      return ((stored.executionState ?? {}) as { approvalStatus?: Record<string, unknown> }).approvalStatus ?? {};
+    }
+
+    async function expectAdvanced(fixture: Fixture, response: request.Response, door: Door, from: number) {
+      expect(response.status, JSON.stringify(response.body)).toBe(accepted[door]);
+      const stored = await fixture.read();
+      expect(stored.status).toBe("in_review");
+      expect(stored.executionState).toMatchObject({
+        status: "pending",
+        currentStageId: fixture.stageIds[from + 1],
+        completedStageIds: fixture.stageIds.slice(0, from + 1),
+        lastDecisionOutcome: "approved",
+      });
+      const approvedStageIds = (await decisionsOf(fixture)).filter((row) => row.outcome === "approved").map((row) => row.stageId);
+      expect(approvedStageIds.sort()).toEqual(fixture.stageIds.slice(0, from + 1).sort());
+      return stored;
+    }
+
+    async function expectRefusedUnchanged(
+      fixture: Fixture,
+      response: request.Response,
+      before: typeof issues.$inferSelect,
+      code: "approval_final_delivery_preflight" | "approval_final_delivery_preflight_stale",
+      reason: string,
+    ) {
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(response.body.details ?? response.body).toMatchObject({ code, reason: expect.stringContaining(reason) });
+      const stored = await fixture.read();
+      expect(stored.status).toBe(before.status);
+      expect(stored.executionState).toEqual(before.executionState);
+      expect((await decisionsOf(fixture)).filter((row) => row.stageId === before.executionState?.currentStageId)).toEqual([]);
+      expect(fixture.writes).toEqual([]);
+    }
+
+    // Base refuses each of these with 409 approval_final_delivery_preflight; the
+    // approval leaves later stages undecided, so it does not complete the card.
+    it.each(stageDoors)("%s: records a stage-1 approve over a card with no own PR and advances to the post_merge stage", async (door) => {
+      const fixture = await pendingDelivery({ adr072: true, missing: true });
+      const stored = await expectAdvanced(fixture, await approveAtDoor(fixture, door), door, 0);
+      const approvalStatus = approvalStatusOf(stored);
+      expect(approvalStatus.finalDelivery).toBeUndefined();
+      expect(approvalStatus.approvedHeadSha).toBeUndefined();
+      // No delivery-branch certification: a stage approval is not a closing transition.
+      expect(approvalStatus.pendingCandidates).toBeUndefined();
+      expect(fixture.writes).toEqual([]);
+    });
+
+    // Unchanged from base: the escalation door already projects card completion
+    // (approvingCurrentStageCompletesLadder) and runs no preflight mid-ladder.
+    it("escalation: records a stage-1 accept over a card with no own PR and advances to the post_merge stage", async () => {
+      const fixture = await pendingDelivery({ adr072: true, missing: true });
+      const stored = await expectAdvanced(fixture, await approveAtDoor(fixture, "escalation"), "escalation", 0);
+      expect(approvalStatusOf(stored).finalDelivery).toBeUndefined();
+      expect(fixture.writes).toEqual([]);
+    });
+
+    // Unchanged from base: a recovery restore to `done` mid-ladder is a close, and
+    // done-guard mechanism C refuses it before any delivery verdict.
+    it("recovery: refuses a stage-1 restore to done on the unsatisfied ladder before any delivery verdict", async () => {
+      const fixture = await pendingDelivery({ adr072: true, missing: true });
+      const before = await fixture.read();
+      const response = await approveAtDoor(fixture, "recovery");
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(response.body.details ?? response.body).toMatchObject({ mechanism: "C" });
+      const stored = await fixture.read();
+      expect(stored.status).toBe(before.status);
+      expect(stored.executionState).toEqual(before.executionState);
+      expect(await decisionsOf(fixture)).toEqual([]);
+      expect(fixture.writes).toEqual([]);
+    });
+
+    it.each(stageDoors)("%s: records a stage-2 (post_merge) approve over a card with no own PR and advances to the final stage", async (door) => {
+      const fixture = await pendingDelivery({ adr072: true, missing: true, atStage: 1 });
+      const stored = await expectAdvanced(fixture, await approveAtDoor(fixture, door), door, 1);
+      expect(approvalStatusOf(stored).finalDelivery).toBeUndefined();
+      expect(fixture.writes).toEqual([]);
+    });
+
+    it.each(stageDoors)("%s: records a stage-1 approve over a draft delivery without certifying or stamping it", async (door) => {
+      const fixture = await pendingDelivery({ adr072: true, draft: true });
+      const stored = await expectAdvanced(fixture, await approveAtDoor(fixture, door), door, 0);
+      expect(approvalStatusOf(stored).finalDelivery).toBeUndefined();
+      expect(approvalStatusOf(stored).approvedHeadSha).toBeUndefined();
+      expect(fixture.writes).toEqual([]);
+      expect(fixture.armCalls).toEqual([]);
+    });
+
+    it.each(["PATCH", "board"] as const)("%s: records a stage-1 approve when a later stage's latest decision is changes_requested", async (door) => {
+      const fixture = await pendingDelivery({ adr072: true, missing: true });
+      await seedDecision(db, {
+        companyId: fixture.company.id, issueId: fixture.issue.id, stageId: fixture.stageIds[1]!, stageType: "review",
+        actorUserId: "board-user", outcome: "changes_requested", body: "Earlier cycle: changes requested.",
+        createdAt: new Date(Date.now() - 60_000),
+      });
+      await expectAdvanced(fixture, await approveAtDoor(fixture, door), door, 0);
+      expect(fixture.writes).toEqual([]);
+    });
+
+    // Unchanged from base: the final approve completes the card and keeps the probe and its refusal.
+    it.each(stageDoors)("%s: still refuses the final-stage approve over a card with no own PR", async (door) => {
+      const fixture = await pendingDelivery({ adr072: true, missing: true, atStage: 2 });
+      const before = await fixture.read();
+      await expectRefusedUnchanged(fixture, await approveAtDoor(fixture, door), before, "approval_final_delivery_preflight", "no-pr");
+    });
+
+    it.each(stageDoors)("%s: still refuses the final-stage approve over a draft delivery", async (door) => {
+      const fixture = await pendingDelivery({ adr072: true, draft: true, atStage: 2 });
+      const before = await fixture.read();
+      await expectRefusedUnchanged(fixture, await approveAtDoor(fixture, door), before, "approval_final_delivery_preflight", "head_draft");
+    });
+
+    it.each(stageDoors)("%s: certifies and stamps the exact delivery head on the final-stage approve", async (door) => {
+      const fixture = await pendingDelivery({ adr072: true, atStage: 2 });
+      const response = await approveAtDoor(fixture, door);
+      expect(response.status, JSON.stringify(response.body)).toBe(accepted[door]);
+      const stored = await fixture.read();
+      expect(stored.status).toBe(door === "board" ? "in_progress" : "done");
+      expect(stored.executionState).toMatchObject({ completedStageIds: fixture.stageIds, lastDecisionOutcome: "approved" });
+      expect(approvalStatusOf(stored).finalDelivery).toMatchObject({
+        owner: "TEA-Core", repo: "paperclip", number: fixture.pr.number, headSha: fixture.pr.head.sha,
+        decisionId: (stored.executionState as Record<string, unknown>).lastDecisionId,
+      });
+      expect(fixture.writes).toEqual([{
+        url: `https://api.github.com/repos/TEA-Core/paperclip/statuses/${fixture.pr.head.sha}`,
+        body: expect.objectContaining({ state: "success", context: "paperclip/approved" }),
+      }]);
+    });
+
+    it("certifies the no-pr delivery branch head on a closing final-stage approve with an accepted override", async () => {
+      const fixture = await pendingDelivery({ adr072: true, missing: true, atStage: 2 });
+      const response = await fixture.approve({
+        doneTransitionOverride: {
+          disposition: "merged-elsewhere",
+          reason: "Deliverable merged elsewhere; this card has no deliverable head of its own.",
+        },
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      const stored = await fixture.read();
+      expect(stored.status).toBe("done");
+      expect(approvalStatusOf(stored).pendingCandidates).toEqual([
+        expect.objectContaining({ source: "no-pr-branch", headSha: fixture.pr.head.sha }),
+      ]);
+      expect(fixture.writes).toEqual([]);
+    });
+
+    it.each(["completed", "skipped"] as const)("still refuses a stage-1 approve that completes the card because later stages are %s", async (laterStages) => {
+      for (const door of stageDoors) {
+        const fixture = await pendingDelivery({ adr072: true, missing: true, laterStages });
+        const before = await fixture.read();
+        await expectRefusedUnchanged(fixture, await approveAtDoor(fixture, door), before, "approval_final_delivery_preflight", "no-pr");
+      }
+    });
+
+    it.each(stageDoors)("%s: still refuses a stage-1 approve that re-pends a later stage recorded skipped but not completed", async (door) => {
+      const fixture = await pendingDelivery({ adr072: true, missing: true, laterStages: "skipped-only" });
+      const before = await fixture.read();
+      await expectRefusedUnchanged(fixture, await approveAtDoor(fixture, door), before, "approval_final_delivery_preflight", "no-pr");
+    });
+
+    // A final approve that closes the ladder while an earlier post_merge stage is
+    // missing from completedStageIds (its approved decision row survives) completes
+    // the card: the gate reads the pending pointer, not every policy stage, so it
+    // keeps the base refusal.
+    it.each(stageDoors)("%s: still refuses a final-stage approve whose earlier post_merge stage is missing from the projection", async (door) => {
+      const fixture = await pendingDelivery({ adr072: true, missing: true, atStage: 2, projectionGap: true });
+      const before = await fixture.read();
+      expect(before.executionState?.completedStageIds).toEqual([fixture.stageIds[0]]);
+      await expectRefusedUnchanged(fixture, await approveAtDoor(fixture, door), before, "approval_final_delivery_preflight", "no-pr");
+    });
+
+    it.each(stageDoors)("%s: certifies and stamps the exact delivery head on a stage-1 approve (pre_merge stamp)", async (door) => {
+      const fixture = await pendingDelivery({ adr072: true });
+      const stored = await expectAdvanced(fixture, await approveAtDoor(fixture, door), door, 0);
+      expect(approvalStatusOf(stored)).toMatchObject({
+        approvedHeadSha: fixture.pr.head.sha,
+        publishedHeadSha: fixture.pr.head.sha,
+        finalDelivery: {
+          owner: "TEA-Core", repo: "paperclip", number: fixture.pr.number, headSha: fixture.pr.head.sha,
+          decisionId: (stored.executionState as Record<string, unknown>).lastDecisionId,
+        },
+      });
+      expect(fixture.writes).toEqual([{
+        url: `https://api.github.com/repos/TEA-Core/paperclip/statuses/${fixture.pr.head.sha}`,
+        body: expect.objectContaining({ state: "success", context: "paperclip/approved" }),
+      }]);
+    });
+
+    it("keeps the reviewed anchor and stamps nothing when a stage-1 approve races a content push", async () => {
+      const fixture = await pendingDelivery({ adr072: true });
+      fixture.moveHead();
+      const stored = await expectAdvanced(fixture, await fixture.approve(), "PATCH", 0);
+      expect(approvalStatusOf(stored)).toMatchObject({
+        approvedHeadSha: fixture.pr.head.sha,
+        publishSkipped: expect.objectContaining({ reason: expect.stringContaining("head_moved") }),
+      });
+      expect(fixture.writes).toEqual([]);
+    });
+
+    it("still refuses a stage-1 board approve when the delivery binding changes during the preflight", async () => {
+      const fixture = await pendingDelivery({ adr072: true, holdPull: true });
+      const before = await fixture.read();
+      const decision = boardDecision(fixture, "approved");
+      await fixture.pullReached;
+      await db.update(executionWorkspaces).set({ branchName: "SUP-1-rebound-delivery" })
+        .where(eq(executionWorkspaces.id, before.executionWorkspaceId!));
+      fixture.releasePull();
+      await expectRefusedUnchanged(fixture, await decision, before, "approval_final_delivery_preflight_stale", "head_moved");
+    });
+
+    it.each(stageDoors)("%s: advances an all-pre_merge ladder's stage-1 approve over a card with no own PR", async (door) => {
+      const fixture = await pendingDelivery({ mid: true, missing: true });
+      const stored = await expectAdvanced(fixture, await approveAtDoor(fixture, door), door, 0);
+      expect(approvalStatusOf(stored).finalDelivery).toBeUndefined();
+      expect(fixture.writes).toEqual([]);
+    });
+
+    it("still refuses an all-pre_merge ladder's final-stage approve over a card with no own PR", async () => {
+      const fixture = await pendingDelivery({ mid: true, missing: true, atStage: 1 });
+      const before = await fixture.read();
+      await expectRefusedUnchanged(fixture, await fixture.approve(), before, "approval_final_delivery_preflight", "no-pr");
+    });
+
+    it.each(["PATCH", "board"] as const)("%s: records a changes_requested decision on the post_merge stage without a delivery verdict", async (door) => {
+      const fixture = await pendingDelivery({ adr072: true, missing: true, atStage: 1 });
+      const response = door === "PATCH"
+        ? await request(createApp(db, boardActor(fixture.company))).patch(`/api/issues/${fixture.issue.id}`)
+          .send({ status: "in_progress", comment: "Post-merge check failed; changes requested." })
+        : await boardDecision(fixture, "changes_requested");
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect((await decisionsOf(fixture)).filter((row) => row.outcome === "changes_requested"))
+        .toEqual([{ stageId: fixture.stageIds[1], outcome: "changes_requested" }]);
+      expect((await fixture.read()).executionState).toMatchObject({
+        status: "changes_requested", currentStageId: fixture.stageIds[1], lastDecisionOutcome: "changes_requested",
+      });
+      expect(fixture.writes).toEqual([]);
+    });
+
+    it("records nothing when an agent that is not the current participant approves stage 1", async () => {
+      const fixture = await pendingDelivery({ adr072: true, missing: true });
+      const outsider = await seedAgent(db, fixture.company.id);
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId: fixture.company.id, agentId: outsider.id, status: "running", contextSnapshot: { issueId: fixture.issue.id },
+      }).returning();
+      const before = await fixture.read();
+      const response = await request(createApp(db, agentActor(fixture.company, outsider, run!.id)))
+        .patch(`/api/issues/${fixture.issue.id}`)
+        .send({ status: "done", comment: "Approved.\n\nkind: review\ndecision: approved" });
+      expect(response.status, JSON.stringify(response.body)).toBeGreaterThanOrEqual(400);
+      expect(response.status).toBeLessThan(500);
+      expect(response.body.details?.code).not.toBe("approval_final_delivery_preflight");
+      const stored = await fixture.read();
+      expect(stored.status).toBe(before.status);
+      expect(stored.executionState).toEqual(before.executionState);
+      expect(await decisionsOf(fixture)).toEqual([]);
+      expect(fixture.writes).toEqual([]);
+    });
   });
 
   it("returns every decision for a 3-stage ladder, ordered createdAt ascending, with the ten contract fields", async () => {
