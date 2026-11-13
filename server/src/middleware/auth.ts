@@ -221,7 +221,7 @@ const publicMcpGatewayProtocolPath = /^\/mcp\/gateways\/gw_[a-f0-9]{32}\/?$/i;
 
 export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
   const boardAuth = boardAuthService(db);
-  return async (req, res, rawNext) => {
+  const authenticate = async (req: Parameters<RequestHandler>[0], res: Parameters<RequestHandler>[1], rawNext: Parameters<RequestHandler>[2]) => {
     // A release request whose clock ran out has been answered (see releaseRequestClock): authentication that
     // is still running must neither write anything (the key's usage stamp) nor hand the request on.
     const clockExpired = () => (res.locals?.releaseClock as { expired?: boolean } | undefined)?.expired === true;
@@ -507,6 +507,10 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
     };
 
     next();
+  };
+  // Express 4 ignores async rejections: a throw (e.g. a run cancelled mid-auth) must reach the error handler, not crash the process.
+  return (req, res, next) => {
+    authenticate(req, res, next).catch(next);
   };
 }
 
