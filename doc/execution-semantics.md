@@ -679,6 +679,12 @@ Monitor policy lives under `executionPolicy.monitor` and includes:
 
 `PATCH /api/issues/{id}` also accepts a top-level `monitor` alias for `executionPolicy.monitor`. The route normalizes it into a partial `executionPolicy` write that preserves the other stored policy fields, and it passes the same authorization gates as the nested spelling. A body that sends both `monitor` and `executionPolicy` (even `null`) is rejected with a validation error. The alias is update-only; issue creation uses `executionPolicy.monitor`.
 
+The alias does not grant access to release-assurance policies: those cards reject
+monitor PATCHes with `422`, including nested `{ executionPolicy: { monitor: null } }`.
+Monitor changes compare the stored policy and agent assignee again under the issue
+row lock. A concurrent policy change or reassignment returns `409` instead of
+letting the former assignee change the monitor.
+
 Monitors are not recurring intervals. When a monitor fires, Paperclip clears the scheduled monitor and queues an `issue_monitor_due` wake for the assignee. If the external service is still pending, the assignee must explicitly re-arm the monitor with a new `nextCheckAt`. If the issue moves to `done`, `cancelled`, an invalid status, or a human/unassigned owner, the monitor is cleared.
 
 The task's waiting banner and composer countdown also display automatic retries

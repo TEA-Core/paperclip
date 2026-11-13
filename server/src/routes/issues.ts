@@ -19427,18 +19427,21 @@ export function issueRoutes(
       preserveEmptyPolicy: storedExecutionPolicyStagesExplicitEmpty,
     });
     const monitorAliasTranslation = monitorAliasRaw !== undefined && req.body.executionPolicy === undefined;
-    const aliasPolicySnapshot = monitorAliasTranslation
-      ? JSON.stringify(existing.executionPolicy ?? null)
-      : null;
-    // SUP-22840: use the same policy payload as the canonical nested
-    // `{ executionPolicy: { monitor } }` PATCH. The absent stages key carries
-    // the existing ladder forward; all other policy-field semantics stay
-    // identical to the nested spelling.
+    // Use the canonical nested monitor payload and preserve the existing ladder.
+    // This does not grant release-assurance authority: those stored policies
+    // are refused with 422 above, before either spelling can change the issue.
     if (monitorAliasTranslation) {
       const { stages: _preservedStages, ...storedPolicyFields } = previousExecutionPolicy ?? {};
       req.body.executionPolicy = { ...storedPolicyFields, monitor: monitorAliasRaw };
       (req as unknown as Record<string, unknown>).executionPolicyStagesKeyAbsent = true;
     }
+    // An explicit monitor key (either spelling) is locked even when its value
+    // equals the pre-lock snapshot, so a no-op null write cannot clobber a
+    // concurrent policy change or outlive a reassignment.
+    const monitorKeyExplicit =
+      typeof req.body.executionPolicy === "object"
+      && req.body.executionPolicy !== null
+      && Object.prototype.hasOwnProperty.call(req.body.executionPolicy, "monitor");
     // SUP-16525: set when this PATCH writes an executionPolicy that must satisfy
     // INV-LADDER-1 against the *live* pointer. The assert in the block below
     // reads `existing.executionState`; the pointer can move between that
@@ -20898,8 +20901,9 @@ export function issueRoutes(
       // SUP-16525: a policy write that must satisfy INV-LADDER-1 is re-asserted
       // against the locked row, so it has to run on the transactional path.
       || invariantPolicyToRecheck !== null
-      // Compare a preserved alias policy under the issue row lock.
-      || monitorAliasTranslation
+      // Both monitor spellings must recheck policy and ownership under the lock.
+      || monitorKeyExplicit
+      || monitorChanged
       // SUP-22570: a record_only no-repository close re-probes inside the write.
       || noRepositoryLandingCloser !== null
       || (
@@ -21029,11 +21033,14 @@ export function issueRoutes(
           // compare. The lock read uses `tx`; do not call a service on the
           // outer pool from inside this transaction.
           await assertPatchExecutionDecisionLock(tx);
-          if (aliasPolicySnapshot !== null) {
+          if (monitorKeyExplicit || monitorChanged) {
             const lockedIssue = await svc.getByIdForUpdate(id, tx);
             if (!lockedIssue) return null;
-            if (JSON.stringify(lockedIssue.executionPolicy ?? null) !== aliasPolicySnapshot) {
-              throw conflict("Execution policy changed before the monitor alias was applied; retry the update", {
+            if (
+              !isDeepStrictEqual(lockedIssue.executionPolicy ?? null, storedExecutionPolicyRaw)
+              || lockedIssue.assigneeAgentId !== existing.assigneeAgentId
+            ) {
+              throw conflict("Execution policy or assignee changed before the monitor update; retry the update", {
                 code: "issue_execution_policy_conflict",
                 issueId: existing.id,
               });

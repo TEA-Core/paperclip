@@ -113,6 +113,13 @@ describeEmbeddedPostgres("plugin-host updatePolicy issue guard", () => {
 
   it("rejects a plugin-host issues.update that selects release-assurance authority and leaves the policy unchanged", async () => {
     const company = await createCompany(db, "PRA");
+    const [approver] = await db.insert(agents).values({
+      companyId: company.id,
+      name: "Approval participant",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+    }).returning();
     const issue = await db
       .insert(issues)
       .values({
@@ -138,7 +145,7 @@ describeEmbeddedPostgres("plugin-host updatePolicy issue guard", () => {
               id: randomUUID(),
               type: "approval",
               approvalsNeeded: 1,
-              participants: [{ id: randomUUID(), type: "agent", agentId: randomUUID() }],
+              participants: [{ id: randomUUID(), type: "agent", agentId: approver!.id }],
             }],
             monitor: null,
           },
@@ -147,7 +154,8 @@ describeEmbeddedPostgres("plugin-host updatePolicy issue guard", () => {
     ).rejects.toMatchObject({ status: 422 });
 
     const row = await db.query.issues.findFirst({ where: (i, { eq }) => eq(i.id, issue.id) });
-    expect(row!.executionPolicy).toBeNull();
+    expect(row).toEqual(issue);
+    expect(await db.select().from(activityLog)).toEqual([]);
     services.dispose();
   });
 
