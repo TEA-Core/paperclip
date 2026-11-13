@@ -35,6 +35,10 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getActiveRunForAgent: vi.fn(async () => null as unknown),
   cancelRun: vi.fn(async () => null as unknown),
 }));
+const mockExecutionWorkspaceService = vi.hoisted(() => ({
+  getById: vi.fn(async () => null as unknown),
+  reopenClosedIsolatedExecutionWorkspaceForIssue: vi.fn(),
+}));
 const mockIssueRecoveryActionService = vi.hoisted(() => ({
   getActiveForIssue: vi.fn(async () => null as unknown),
   resolveActiveForIssue: vi.fn(async () => null as unknown),
@@ -204,7 +208,7 @@ function registerModuleMocks() {
     documentService: () => ({
       getIssueDocumentPayload: vi.fn(async () => ({})),
     }),
-    executionWorkspaceService: () => ({}),
+    executionWorkspaceService: () => mockExecutionWorkspaceService,
     feedbackService: () => ({
       listIssueVotesForUser: vi.fn(async () => []),
       saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
@@ -368,6 +372,7 @@ describe("issue execution policy routes", () => {
     mockResolveSummaryGenerationReturnAssignee.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
+    mockExecutionWorkspaceService.getById.mockResolvedValue(null);
     mockIssueService.addComment.mockImplementation(async (_id: string, body: string) => ({
       id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
       body,
@@ -1025,6 +1030,39 @@ describe("issue execution policy routes", () => {
         maxReviewRounds: 3,
       });
       expect(patch).toMatchObject({ monitorNextCheckAt: null });
+    });
+
+    it("requires a closed workspace to reopen before an alias-only agent PATCH can commit", async () => {
+      const workspaceId = "78787878-7878-4787-8787-787878787878";
+      const issue = {
+        ...seededIssue(null, "Alias on closed workspace"),
+        executionWorkspaceId: workspaceId,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue, ...patch,
+      }));
+      mockExecutionWorkspaceService.getById.mockResolvedValue({
+        id: workspaceId,
+        mode: "isolated_workspace",
+        status: "archived",
+        closedAt: new Date("2026-01-01T00:00:00.000Z"),
+      });
+      mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue.mockResolvedValue({
+        ok: false,
+        code: "rebuild_failed",
+        message: "Failed to rebuild the execution workspace",
+      });
+
+      const res = await request(await agentApp())
+        .patch(`/api/issues/${issue.id}`)
+        .send({ monitor: aliasMonitor });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(503);
+      expect(mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue).toHaveBeenCalledWith(
+        expect.objectContaining({ workspaceId, issue: expect.objectContaining({ id: issue.id }) }),
+      );
+      expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
     it("refuses a body carrying both the alias and an executionPolicy key before any write", async () => {
