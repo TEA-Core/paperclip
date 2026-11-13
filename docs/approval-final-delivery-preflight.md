@@ -34,7 +34,7 @@ For older cards already closed `done` over a draft, the hourly done-close landin
 
 A Tier-1 `landing-delegated` close re-reads the named carrier PR before the guard accepts it (SUP-24135). The guard sends one read-only GitHub GraphQL query with the token that already serves the auto-merge and merge-queue probes. The query reads the head commit's required checks (`isRequired` for this PR) and `mergeStateStatus`. The guard refuses the close in two cases:
 
-- `carrier_required_check_failed`: a required check run concluded `failure`, `timed_out`, `cancelled`, `action_required` or `startup_failure`, or a required commit status is `failure` or `error`, and no other run of the same check can still pass (a re-run in progress keeps the close allowed).
+- `carrier_required_check_failed`: a required check run concluded `failure`, `timed_out`, `cancelled` or `startup_failure`, or a required commit status is `failure` or `error`, and no other run of the same check can still pass (a re-run in progress keeps the close allowed).
 - `carrier_merge_conflict`: `mergeStateStatus` is `DIRTY`.
 
 `BLOCKED` alone does not refuse: it is the normal state while required checks run or a review is pending. `UNKNOWN` does not refuse: GitHub is still computing it. A merged or closed PR, a failed hydration, or an unreadable probe (non-2xx, GraphQL errors, no token) also does not refuse, because a refusal must rest on live proof. The probe runs only at close time. A carrier that fails after the close stays with the hourly done-close landing backstop and its 24-hour landing verdict.

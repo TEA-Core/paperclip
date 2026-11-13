@@ -7463,6 +7463,18 @@ describe("evaluateDoneTierDeclaration", () => {
         expect(result.reason).toContain("PR #4103");
       });
 
+      it("accepts a blocked carrier whose required check awaits manual approval (ACTION_REQUIRED is not terminal-failed)", async () => {
+        carrierFetch({
+          mergeStateStatus: "BLOCKED",
+          contexts: [
+            { __typename: "CheckRun", name: "ci-required", status: "COMPLETED", conclusion: "ACTION_REQUIRED", isRequired: true },
+          ],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+      });
+
       it("accepts a blocked carrier whose required check is still running (the normal delegated close)", async () => {
         carrierFetch({
           mergeStateStatus: "BLOCKED",

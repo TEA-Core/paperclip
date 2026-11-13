@@ -791,7 +791,8 @@ interface LandingCarrierHealth {
 
 // Terminal check-run conclusions and commit-status states that cannot satisfy a
 // required check. NEUTRAL/SKIPPED/SUCCESS satisfy it; STALE is not terminal-failed.
-const FAILED_CHECK_RUN_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
+// ACTION_REQUIRED awaits manual approval and is not terminal-failed.
+const FAILED_CHECK_RUN_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE"]);
 const FAILED_STATUS_STATES = new Set(["FAILURE", "ERROR"]);
 
 /**
