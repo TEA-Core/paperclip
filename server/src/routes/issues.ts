@@ -19435,6 +19435,13 @@ export function issueRoutes(
       req.body.executionPolicy = { ...storedPolicyFields, monitor: monitorAliasRaw };
       (req as unknown as Record<string, unknown>).executionPolicyStagesKeyAbsent = true;
     }
+    // An explicit monitor key (either spelling) is locked even when its value
+    // equals the pre-lock snapshot, so a no-op null write cannot clobber a
+    // concurrent policy change or outlive a reassignment.
+    const monitorKeyExplicit =
+      typeof req.body.executionPolicy === "object"
+      && req.body.executionPolicy !== null
+      && Object.prototype.hasOwnProperty.call(req.body.executionPolicy, "monitor");
     // SUP-16525: set when this PATCH writes an executionPolicy that must satisfy
     // INV-LADDER-1 against the *live* pointer. The assert in the block below
     // reads `existing.executionState`; the pointer can move between that
@@ -20895,7 +20902,7 @@ export function issueRoutes(
       // against the locked row, so it has to run on the transactional path.
       || invariantPolicyToRecheck !== null
       // Both monitor spellings must recheck policy and ownership under the lock.
-      || monitorAliasTranslation
+      || monitorKeyExplicit
       || monitorChanged
       // SUP-22570: a record_only no-repository close re-probes inside the write.
       || noRepositoryLandingCloser !== null
@@ -21026,7 +21033,7 @@ export function issueRoutes(
           // compare. The lock read uses `tx`; do not call a service on the
           // outer pool from inside this transaction.
           await assertPatchExecutionDecisionLock(tx);
-          if (monitorAliasTranslation || monitorChanged) {
+          if (monitorKeyExplicit || monitorChanged) {
             const lockedIssue = await svc.getByIdForUpdate(id, tx);
             if (!lockedIssue) return null;
             if (

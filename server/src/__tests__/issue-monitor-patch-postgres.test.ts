@@ -151,6 +151,22 @@ describePostgres("monitor PATCH persisted authorization", () => {
     await assertNoIssueSideEffects(issue.id);
   });
 
+  it("locks an explicit nested monitor:null that equals the pre-lock snapshot", async () => {
+    const { issue, successor, actor } = await seed();
+    let reassigned: typeof issues.$inferSelect | undefined;
+    interleave.afterRead = async () => {
+      [reassigned] = await db.update(issues).set({ assigneeAgentId: successor.id })
+        .where(eq(issues.id, issue.id)).returning();
+    };
+    const res = await request(await appFor(actor)).patch(`/api/issues/${issue.id}`)
+      .send({ executionPolicy: { monitor: null } });
+    expect(reassigned?.assigneeAgentId).toBe(successor.id);
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details.code).toBe("issue_execution_policy_conflict");
+    expect(await stored(issue.id)).toEqual(reassigned);
+    await assertNoIssueSideEffects(issue.id);
+  });
+
   it.each(["alias", "nested"])("allows the unchanged assignee to arm through %s", async (spelling) => {
     const { issue, actor } = await seed();
     const res = await request(await appFor(actor)).patch(`/api/issues/${issue.id}`)
