@@ -352,8 +352,17 @@ export async function reapStrandedSummaryGenerationIssues(
     .where(
       and(
         eq(issues.assigneeAgentId, SUMMARIZER_AGENT_ID),
-        notInArray(issues.status, ["done", "cancelled"]),
+        notInArray(issues.status, ["done", "cancelled", "blocked"]),
         isNull(issues.monitorNextCheckAt),
+        sql`not exists (
+          select 1
+          from ${activityLog}
+          where ${activityLog.companyId} = ${issues.companyId}
+            and ${activityLog.entityType} = 'issue'
+            and ${activityLog.entityId} = ${issues.id}::text
+            and ${activityLog.action} = 'issue.done_transition_ladder_refused'
+            and ${activityLog.createdAt} >= ${issues.updatedAt}
+        )`,
         sql`not exists (
           select 1
           from ${issueThreadInteractions}
@@ -440,7 +449,7 @@ export async function reapStrandedSummaryGenerationIssues(
             // went terminal, changed assignee, or gained a continuation path
             // since the scan belongs to its own owner.
             if (!issue) return false;
-            if (issue.status === "done" || issue.status === "cancelled") return false;
+            if (issue.status === "done" || issue.status === "cancelled" || issue.status === "blocked") return false;
             if (issue.assigneeAgentId !== SUMMARIZER_AGENT_ID) return false;
             // Amended-contract continuation path: an armed monitor.
             if (issue.monitorNextCheckAt) return false;

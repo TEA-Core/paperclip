@@ -610,6 +610,31 @@ describe("evaluateDoneTransitionGuard", () => {
       );
     });
 
+    it("keeps refusal identity stable and records the calling reaper and run as provenance", async () => {
+      const result = await evaluateDoneTransitionGuardForBackstopClose({
+        db: mockDb,
+        issue: { ...issue, executionPolicy: ladderPolicy, executionState: {} },
+        actorId: "system:execution-control-reconciliation",
+        runId: "reaper-run-1",
+        closeComment: null,
+      });
+
+      expect(result.allowed).toBe(false);
+      expect(logActivity).toHaveBeenCalledWith(
+        mockDb,
+        expect.objectContaining({
+          action: "issue.done_transition_ladder_refused",
+          actorType: "system",
+          actorId: "done-transition-guard",
+          runId: null,
+          details: expect.objectContaining({
+            callingActor: "system:execution-control-reconciliation",
+            callingRunId: "reaper-run-1",
+          }),
+        }),
+      );
+    });
+
     it("refuses done for the literal SUP-8098 shape: parked pending on stage 1 with zero decisions (AC2)", async () => {
       // The state as it landed on SUP-8098: pending at stage index 0, no
       // completedStageIds. It does not round-trip the state schema (the
@@ -6505,6 +6530,7 @@ describe("evaluateDoneTierDeclaration", () => {
         db: mockDb,
         issue: { ...recordOnlyTierIssue(), projectId: null, projectWorkspaceId: null, executionWorkspaceId: null },
         actorId: "execution-control-reconciliation",
+        runId: "backstop-run-1",
         closeComment: null,
         structuredDoneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
       });
@@ -6516,6 +6542,8 @@ describe("evaluateDoneTierDeclaration", () => {
         mockDb,
         expect.objectContaining({
           action: "issue.done_transition_tier2_close",
+          actorId: "execution-control-reconciliation",
+          runId: "backstop-run-1",
           entityType: "issue",
           entityId: "issue-1",
           details: {
