@@ -22,6 +22,7 @@ import {
   DONE_TIER_TIER1_DELEGATED_JSON,
   DONE_TIER_TIER1_LANDED_JSON,
   DONE_TIER_TIER2_JSON,
+  DONE_TIER_RECORD_ONLY_PROBE_EVIDENCE_NOTE,
   DONE_TIER_TIER2_RECORD_ONLY_JSON,
   renderDoneTierDeclaration,
   TIER1_FORM,
@@ -6043,6 +6044,73 @@ describe("evaluateDoneTierDeclaration", () => {
       vi.mocked(logActivity).mockClear();
     });
 
+    // SUP-24079: the examples the 422 remedy advertises must be executable inputs
+    // to the real parser. Examples are extracted from the remedy text itself.
+    describe("advertised remedy examples (SUP-24079)", () => {
+      const INSTANT_PLACEHOLDER = "<UTC ISO-8601 timestamp>";
+      const FIRST_INSTANT = "2026-11-06T21:02:39Z";
+      const SECOND_INSTANT = "2026-11-06T21:04:24Z";
+      const PREFIX = "Closed at Tier 2 (live): ";
+
+      function advertisedForms(): string[] {
+        const forms = [...TIER2_RECORD_ONLY_FORM.matchAll(/"(Closed at Tier 2 \(live\): [^"]+)"/g)].map((m) => m[1]!);
+        expect(forms.length).toBe(2);
+        return forms;
+      }
+
+      function fill(form: string): string {
+        return form
+          .replace("<probe command>", "curl -fsS https://ops.example.com/healthz")
+          .replace("<observed target>", "https://ops.example.com")
+          .replace("<pass predicate and observed result>", "endpoint healthy")
+          .replace(INSTANT_PLACEHOLDER, FIRST_INSTANT)
+          .replace(INSTANT_PLACEHOLDER, SECOND_INSTANT);
+      }
+
+      it("advertises the range and single-instant forms with no square brackets", () => {
+        const [range, single] = advertisedForms();
+        expect(range).toContain(`observed ${INSTANT_PLACEHOLDER}-${INSTANT_PLACEHOLDER} result:`);
+        expect(single).toContain(`observed ${INSTANT_PLACEHOLDER} result:`);
+        expect(TIER2_RECORD_ONLY_FORM).not.toMatch(/[[\]]/);
+        expect(DONE_TIER_TIER2_RECORD_ONLY_JSON).not.toMatch(/[[\]]/);
+        expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).not.toMatch(/[[\]]/);
+      });
+
+      it("accepts every comment-form example the remedy advertises", async () => {
+        for (const form of advertisedForms()) {
+          const comment = fill(form);
+          expect(comment.startsWith(PREFIX)).toBe(true);
+          const result = await evaluateDoneTierDeclaration(
+            mockDb,
+            recordOnlyTierIssue(),
+            tier2Line(comment.slice(PREFIX.length)),
+            null,
+            () => Promise.resolve([]),
+          );
+          expect(result.allowed, comment).toBe(true);
+          expect(result.tier).toBe("tier2");
+        }
+      });
+
+      it("accepts the structured probeEvidence example and states the prefix is excluded", async () => {
+        const evidence = /"probeEvidence": "([^"]+)"/.exec(DONE_TIER_TIER2_RECORD_ONLY_JSON)![1]!;
+        expect(evidence.startsWith(PREFIX.trim())).toBe(false);
+        expect(DONE_TIER_RECORD_ONLY_PROBE_EVIDENCE_NOTE).toContain(`excludes the "${PREFIX}" prefix`);
+        expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_RECORD_ONLY_PROBE_EVIDENCE_NOTE);
+        const single = evidence.replace(`${INSTANT_PLACEHOLDER}-${INSTANT_PLACEHOLDER}`, INSTANT_PLACEHOLDER);
+        for (const form of [evidence, single]) {
+          const result = await evaluateDoneTierDeclaration(
+            mockDb,
+            recordOnlyTierIssue(),
+            tier2Line(fill(form)),
+            null,
+            () => Promise.resolve([]),
+          );
+          expect(result.allowed, form).toBe(true);
+        }
+      });
+    });
+
     it("accepts a valid record-only declaration on a record_only card with no repo and no merged work product", async () => {
       const result = await evaluateDoneTierDeclaration(
         mockDb,
@@ -6647,7 +6715,7 @@ describe("evaluateDoneTierDeclaration", () => {
       // its Tier 2 entry carries the record-only grammar, never a merge head,
       // and Tier 1 entries are carried over unchanged.
       expect(DONE_TIER_TIER2_RECORD_ONLY_JSON).toBe(
-        '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>" }',
+        '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }',
       );
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER2_RECORD_ONLY_JSON);
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_LANDED_JSON);

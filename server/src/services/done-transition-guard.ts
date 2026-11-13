@@ -124,7 +124,8 @@ export const TIER2_FORM =
 // message (SUP-15787 invariant). Accepted ONLY on record_only cards; a
 // repository_delivery card keeps the merge-head form above unchanged.
 export const TIER2_RECORD_ONLY_FORM =
-  '"Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>"';
+  '"Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>"' +
+  ' or, for a single instant, "Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>"';
 export const TIER1_FORM =
   '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."' +
   ' or "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
@@ -151,9 +152,13 @@ export const DONE_TIER_STRUCTURED_FORMS =
 // set by noRepositoryStructuredFormSuffix, never listed in it, so a
 // repository_delivery remedy stays byte-identical.
 export const DONE_TIER_TIER2_RECORD_ONLY_JSON =
-  '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>" }';
+  '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }';
+// Structured probeEvidence carries the grammar WITHOUT the Tier 2 prefix: the guard
+// composes the prefix itself (SUP-24079).
+export const DONE_TIER_RECORD_ONLY_PROBE_EVIDENCE_NOTE =
+  'probeEvidence excludes the "Closed at Tier 2 (live): " prefix because the guard composes that prefix; for a single instant, write "observed <UTC ISO-8601 timestamp>" in place of the range';
 export const DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS =
-  `${DONE_TIER_TIER2_RECORD_ONLY_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
+  `${DONE_TIER_TIER2_RECORD_ONLY_JSON} (${DONE_TIER_RECORD_ONLY_PROBE_EVIDENCE_NOTE}); ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
 // SUP-22570: the record_only close form. Advertised only on record_only issues,
 // so the repository_delivery remedies stay byte-identical.
 export const TIER1_NO_REPOSITORY_FORM =
