@@ -1,6 +1,7 @@
 import path from "node:path";
-import { and, eq, inArray, isNotNull, ne } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, ne, sql } from "drizzle-orm";
 import {
+  activityLog,
   agents,
   documentRevisions,
   documents,
@@ -647,6 +648,79 @@ async function writeAuditLog(
     });
   } catch (err) {
     logger.warn({ err, issueId: issue.id, action }, "failed to write done-transition audit log");
+  }
+}
+
+/**
+ * SUP-24136: a mechanism C refusal is deterministic — the same unsatisfied
+ * stage refuses the same way until a decision lands — yet the 15 s
+ * stranded-summary sweep (execution-control-reconciliation.ts) re-evaluates
+ * the guard on every tick for a Summarizer-assigned card. SUP-24118 got 54
+ * identical rows in 13 minutes, SUP-24121 47, SUP-23420 several hundred.
+ * Bound the audit trail per (company, issue, reason): while fewer than
+ * LADDER_REFUSAL_REPEAT_LIMIT identical refusal rows exist inside the window,
+ * the refusal is recorded unchanged; the next one records a single
+ * `issue.done_transition_ladder_refusal_repeated` escalation row; further
+ * identical refusals inside the window record nothing.
+ *
+ * One clock only: the window test compares `activity_log.created_at` (stamped
+ * by the database default `now()`) with the database `now()` in the same SQL
+ * statement. The application clock is never read, so app/database skew cannot
+ * widen or shrink the window.
+ *
+ * Only the audit row is bounded. The caller computes the refusal verdict
+ * before this runs and returns it unchanged; nothing on the close path reads
+ * these rows. A failed count read records the refusal row, as before the cap.
+ * Two concurrent refusals can both read the same count, so the bound is
+ * approximate under concurrency, never below the pre-cap behaviour.
+ */
+export const LADDER_REFUSAL_REPEAT_LIMIT = 3;
+export const LADDER_REFUSAL_REPEAT_WINDOW_SECONDS = 60 * 60;
+const LADDER_REFUSED_ACTION = "issue.done_transition_ladder_refused";
+const LADDER_REFUSAL_REPEATED_ACTION = "issue.done_transition_ladder_refusal_repeated";
+
+async function writeLadderRefusalAuditLog(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  details: Record<string, unknown> & { reason: string },
+): Promise<void> {
+  let priorRefusals = 0;
+  let priorEscalations = 0;
+  try {
+    const [counts] = await db
+      .select({
+        refused: sql<number>`count(*) filter (where ${activityLog.action} = ${LADDER_REFUSED_ACTION})`,
+        escalated: sql<number>`count(*) filter (where ${activityLog.action} = ${LADDER_REFUSAL_REPEATED_ACTION})`,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, issue.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issue.id),
+          inArray(activityLog.action, [LADDER_REFUSED_ACTION, LADDER_REFUSAL_REPEATED_ACTION]),
+          sql`${activityLog.details} ->> 'reason' = ${details.reason}`,
+          sql`${activityLog.createdAt} > now() - make_interval(secs => ${LADDER_REFUSAL_REPEAT_WINDOW_SECONDS})`,
+        ),
+      );
+    const refused = Number(counts?.refused);
+    const escalated = Number(counts?.escalated);
+    if (Number.isFinite(refused)) priorRefusals = refused;
+    if (Number.isFinite(escalated)) priorEscalations = escalated;
+  } catch (err) {
+    logger.warn({ err, issueId: issue.id }, "failed to count prior ladder refusals; recording the refusal");
+  }
+  if (priorRefusals < LADDER_REFUSAL_REPEAT_LIMIT) {
+    await writeAuditLog(db, issue, LADDER_REFUSED_ACTION, details);
+    return;
+  }
+  if (priorEscalations === 0) {
+    await writeAuditLog(db, issue, LADDER_REFUSAL_REPEATED_ACTION, {
+      ...details,
+      refusalCount: priorRefusals + 1,
+      repeatLimit: LADDER_REFUSAL_REPEAT_LIMIT,
+      windowSeconds: LADDER_REFUSAL_REPEAT_WINDOW_SECONDS,
+    });
   }
 }
 
@@ -4501,7 +4575,7 @@ async function evaluateDoneTransitionGuardCore(
   // waved through by a credential-less or network-fail-open configuration.
   if (reviewLadder !== null && !reviewLadder.satisfied) {
     const first = reviewLadder.firstUnsatisfiedStage;
-    void writeAuditLog(db, issue, "issue.done_transition_ladder_refused", {
+    await writeLadderRefusalAuditLog(db, issue, {
       reason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
       skipReason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
       stageIndex: reviewLadder.firstUnsatisfiedIndex,
