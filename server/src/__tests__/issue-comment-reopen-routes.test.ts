@@ -4891,7 +4891,7 @@ describe.sequential("issue comment reopen routes", () => {
       expect(res.status).toBe(200);
       expect(mockIssueService.update).toHaveBeenCalledWith(
         issueId,
-        expect.objectContaining({ status: "in_progress" }),
+        expect.objectContaining({ status: "in_progress" }), expect.anything(),
       );
     });
 
