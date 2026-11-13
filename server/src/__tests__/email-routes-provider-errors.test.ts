@@ -7,6 +7,7 @@ import { errorHandler } from "../middleware/error-handler.js";
 import { emailRoutes } from "../routes/email.js";
 import { agentmailApi } from "../services/agentmail-api.js";
 import type { EmailChannelService } from "../services/email-channels.js";
+import { makeRouteDbStub } from "./helpers/route-db-stub.js";
 
 const companyId = "11111111-1111-4111-8111-111111111111";
 const agentId = "22222222-2222-4222-8222-222222222222";
@@ -26,7 +27,7 @@ function app(setup: () => Promise<unknown>) {
     req.actor = { type: "board", source: "local_implicit", userId: "board" };
     next();
   });
-  instance.use("/api", emailRoutes({} as Db, { setup, inspect: setup } as unknown as EmailChannelService));
+  instance.use("/api", emailRoutes(makeRouteDbStub() as unknown as Db, { setup, inspect: setup } as unknown as EmailChannelService));
   instance.use(errorHandler);
   return instance;
 }

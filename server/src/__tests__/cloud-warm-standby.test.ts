@@ -9,6 +9,7 @@ import { emailChannelService } from "../services/email-channels.js";
 import { createPluginJobScheduler } from "../services/plugin-job-scheduler.js";
 import { createPublicMcpEvents } from "../services/public-mcp/events.js";
 import type { PublicMcpOAuth } from "../services/public-mcp/oauth.js";
+import { makeRouteDbStub } from "./helpers/route-db-stub.js";
 
 const healthOptions = {
   deploymentMode: "authenticated" as const,
@@ -67,7 +68,7 @@ describe("unclaimed Cloud background work", () => {
   it("rejects every WebSocket upgrade before auth and admits upgrades after claim", async () => {
     let standby = true;
     const app = express();
-    const health = healthRoutes({} as Db, { ...healthOptions, isWarmStandby: () => standby });
+    const health = healthRoutes(makeRouteDbStub() as unknown as Db, { ...healthOptions, isWarmStandby: () => standby });
     const authenticate = vi.fn();
     app.use(cloudWarmStandbyMiddleware(() => standby, health));
     const server = createServer(cloudWarmStandbyServerOptions(() => standby), app);

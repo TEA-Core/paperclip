@@ -6,6 +6,7 @@ import { forbidden } from "../errors.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { emailRoutes } from "../routes/email.js";
 import type { EmailChannelService } from "../services/email-channels.js";
+import { makeRouteDbStub } from "./helpers/route-db-stub.js";
 
 const mocks = vi.hoisted(() => ({ credential: vi.fn(), listCredentials: vi.fn(), permission: vi.fn() }));
 vi.mock("../services/email-connections.js", () => ({ emailConnectionService: () => ({ credential: mocks.credential, listCredentials: mocks.listCredentials }) }));
@@ -18,7 +19,7 @@ function app(actor = { type: "board", source: "local_implicit", userId: "board" 
   const instance = express();
   instance.use(express.json());
   instance.use((req, _res, next) => { req.actor = actor; next(); });
-  instance.use("/api", emailRoutes({} as Db, {} as EmailChannelService));
+  instance.use("/api", emailRoutes(makeRouteDbStub() as unknown as Db, {} as EmailChannelService));
   instance.use(errorHandler);
   return instance;
 }

@@ -11072,19 +11072,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ));
         const agent = source ? await getAgent(source.agentId) : null;
         if (source && agent && agent.companyId === source.companyId) {
-          const retry = await scheduleBoundedRetryForRun(source, agent, effect.reviewParticipant ? {
+          // Upstream #14987 also releases an explicit-continuation claim here, through the
+          // module's releaseIssueExecution. That release stays dormant in the fork (D9 guard
+          // above); the live path settles the claim through the in-file release instead
+          // (recovery `settleExplicitContinuationRetry` and the post-cleanup settle in executeRun).
+          await scheduleBoundedRetryForRun(source, agent, effect.reviewParticipant ? {
             retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
             wakeReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON,
           } : undefined);
-          const issueId = readNonEmptyString(source.contextSnapshot?.issueId);
-          if (retry.outcome !== "scheduled" && source.contextSnapshot?.explicitUserContinuation && issueId &&
-              !adapterExecutionControls.has(source.id) && !(await getExecutionBlocker(db, source.companyId, issueId))) {
-            // Cleanup has settled, so exhaustion or revoked/missing authority
-            // must not retain a terminal claim. Do not request another retry.
-            const settled = await wakeQueue.releaseIssueExecution({ companyId: source.companyId,
-              runId: source.id, now: new Date(), suppressImmediateRecovery: true });
-            await applyWakeQueuePostCommitEffects(settled.postCommitEffects);
-          }
         }
       } else if (effect.kind === "run_queued") {
         publishLiveEvent({

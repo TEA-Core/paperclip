@@ -1,7 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { Readable } from "node:stream";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockAgentService = vi.hoisted(() => ({
@@ -226,6 +226,15 @@ function makeReflectionCoachAgent(overrides: Record<string, unknown> = {}) {
 }
 
 describe("agent instructions bundle routes", () => {
+  // `beforeEach` resets modules, so each test re-imports routes/agents.js, and the first one also
+  // pays the cold transform of its import graph (larger since the s3b fold: AI pool routing, MCP,
+  // connection access). On a loaded host that alone exceeds the 15 s test timeout and the late
+  // request then leaks a call into the next test. Warm the transform cache once here (hooks get
+  // 30 s, see server/vitest.config.ts); every test still imports a fresh module instance.
+  beforeAll(async () => {
+    await vi.importActual("../routes/agents.js");
+    await vi.importActual("../middleware/index.js");
+  });
   beforeEach(() => {
     vi.resetModules();
     vi.doUnmock("../routes/agents.js");
