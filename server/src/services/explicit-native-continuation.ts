@@ -393,6 +393,13 @@ export async function admitExplicitContinuationRetry(input: {
       inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"])),
   )).limit(1);
   if (superseding) return null;
+  // The fork parks newer input as a deferred wake, not a run; it supersedes the retry too.
+  const [pendingInput] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
+    eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+  )).limit(1);
+  if (pendingInput) return null;
   // Reuse dispatch's complete source/actor/receipt validation on the parent.
   // It proves only the parent; the new receipt below authorizes the successor.
   try {

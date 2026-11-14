@@ -129,7 +129,8 @@ describe.each([
   it("rebuilds the base lookup and enriches only the successful result", async () => {
     const test = fixture({ failures: { issues: [disconnected(), disconnected("CONNECT_TIMEOUT")] } });
     await expect(read(test.db)).resolves.toEqual({ ...test.row,
-      labels: [{ id: "label-1", name: "Ready" }], labelIds: ["label-1"], watchdog: null });
+      labels: [{ id: "label-1", name: "Ready" }], labelIds: ["label-1"], watchdog: null,
+      ...(test.row.parentId ? {} : { parentLinkKind: null }) });
     expect(test.select).toHaveBeenCalledTimes(5);
     expect(test.attempts.map((attempt) => attempt.table))
       .toEqual(["issues", "issues", "issues", "issue_labels", "issue_watchdogs"]);

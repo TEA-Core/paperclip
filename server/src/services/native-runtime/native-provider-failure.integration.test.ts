@@ -25,7 +25,6 @@ import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./
 import { claimQueuedNativeReviewRun } from "./native-review-dispatch.js";
 import { commitNativeStatusDecision, NativeStatusRaceError } from "./status-decision-committer.js";
 import { NATIVE_STATUS_ARBITER_POLICY_VERSION } from "./status-arbiter.js";
-import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { createReleaseIssueExecution } from "../../modules/wake-queue/application/use-cases.js";
 import { createPostgresWakeQueueAdapter } from "../../modules/wake-queue/adapters/postgres.js";
 
@@ -245,15 +244,12 @@ describe("native completed failure diagnostics", () => {
           const retryRunId = retryRun!.id;
           await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, occupiedRunId));
           expect(await claimQueuedNativeReviewRun(db, { run: retryRun!, agentNameKey: "reviewer", claimedAt: new Date(), claimValues: { nativeIssueId: issueId, runtimeMode: "native" } }))
-            .toMatchObject({ id: retryRunId, status: "running" });
-          expect(await getNativeReviewAssignment(db, { companyId, issueId, agentId, contextSnapshot: reviewContext, actingRunId: retryRunId, issueExecutionRunId: retryRunId })).not.toBeNull();
-          await issueThreadInteractionService(db).acceptInteraction(
-            { id: issueId, companyId, projectId: null, goalId: null, status: "in_review" },
-            reviewContext.nativeReviewInteractionId, {}, { agentId, runId: retryRunId },
-          );
-          const [resolved] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, reviewContext.nativeReviewInteractionId));
-          expect(resolved).toMatchObject({ status: "accepted", resolvedByAgentId: agentId, resolvedByRunId: retryRunId });
-          expect(await db.select().from(issues).where(eq(issues.id, issueId))).toMatchObject([{ status: "done", assigneeAgentId: workerId }]);
+            .toBeNull();
+          // Fork guard: a review run is claimable only when bound to the committer wake. An
+          // operator retry wake must not claim the review lock or resolve the pending review.
+          expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryRunId)))[0]).toMatchObject({ status: "queued" });
+          expect((await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, reviewContext.nativeReviewInteractionId)))[0]).toMatchObject({ status: "pending" });
+          expect(await db.select().from(issues).where(eq(issues.id, issueId))).toMatchObject([{ status: "in_review", assigneeAgentId: workerId }]);
           expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, runId))).toEqual(acceptedBefore);
           expect(provider.execute).toHaveBeenCalledTimes(1);
           await db.update(agents).set({ adapterConfig: { provider: "codex", model } }).where(eq(agents.id, agentId));

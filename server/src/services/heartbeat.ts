@@ -17806,9 +17806,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           await tx
             .update(issues)
             .set({
-              executionRunId: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionRunId} end`,
-              executionAgentNameKey: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionAgentNameKey} end`,
-              executionLockedAt: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionLockedAt} end`,
+              // Upstream #14987: an explicit-continuation retry keeps the task claim by
+              // handing it to the scheduled run. Every other retry claims on promotion.
+              ...(contextSnapshot.explicitUserContinuation
+                ? {
+                    executionRunId: scheduledRun.id,
+                    executionAgentNameKey: normalizeAgentNameKey(agent.name),
+                    executionLockedAt: now,
+                  }
+                : {
+                    executionRunId: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionRunId} end`,
+                    executionAgentNameKey: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionAgentNameKey} end`,
+                    executionLockedAt: sql`case when ${issues.executionRunId} = ${run.id} then null else ${issues.executionLockedAt} end`,
+                  }),
               checkoutRunId: sql`case when ${issues.checkoutRunId} = ${run.id} then null else ${issues.checkoutRunId} end`,
               ...(detachWorkspaceFromIssue
                 ? {
@@ -30824,6 +30834,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ? await resolveSessionBeforeForWakeup(recoveryAgent, deriveTaskKeyWithHeartbeatFallback(runContext, null))
       : null;
     const recoveryAgentNameKey = normalizeAgentNameKey(recoveryAgent?.name);
+
+    // Upstream #14987, applied to the fork's in-file release: a legacy run that carries an
+    // explicit user continuation never gets generic immediate recovery, because a generic
+    // continuation run would skip revalidating the user's authorization (stop, reassignment,
+    // newer input and a lost claim must all end the continuation). A failed run that still holds
+    // its task claim queues the bounded retry first (it revalidates the receipt); while the
+    // controller or lease still owns the run it keeps the claim for the post-cleanup settle
+    // in executeRun.
+    if (
+      !promotionOnly && !options.suppressImmediateRecovery && contextIssueId && recoveryAgent &&
+      run.runtimeMode === "legacy" && runContext.explicitUserContinuation
+    ) {
+      const holdsClaim = ["failed", "timed_out"].includes(run.status) &&
+        (await db.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.companyId, run.companyId), eq(issues.id, contextIssueId), eq(issues.executionRunId, run.id),
+        )).then((rows) => rows.length > 0));
+      if (holdsClaim) {
+        const retry = await scheduleBoundedRetryForRun(run, recoveryAgent);
+        if (retry.outcome === "scheduled") return;
+        if (adapterExecutionControls.has(run.id) || await getExecutionBlocker(db, run.companyId, contextIssueId)) return;
+      }
+      options = { ...options, suppressImmediateRecovery: true };
+    }
 
     // SUP-15589: bound the same pre-adapter setup failure loop from the
     // immediate-recovery side. The entry path the 869-run incident took is the

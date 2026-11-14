@@ -68,7 +68,8 @@ function fixture(options: {
   const updateWhere = vi.fn(async () => { if (options.writeFailure) throw options.writeFailure; });
   const update = vi.fn(() => ({ set: () => ({ where: updateWhere }) }));
   const transaction = vi.fn(() => { throw new Error("Must not start or replay a transaction"); });
-  const db = { select, update, transaction } as unknown as Db;
+  const execute = vi.fn(async () => []);
+  const db = { select, update, transaction, execute } as unknown as Db;
   return { db, attempts, select, update, updateWhere, transaction,
     count: (key: string) => attempts.filter((read) => read.key === key).length };
 }
@@ -138,11 +139,13 @@ describe("execution projection read retries", () => {
     const result = await activityService(test.db).runsForIssue(companyId, issueId);
     expect(result).toMatchObject([{ runId, execution: { phase: "waiting_for_answer" } }]);
     expect(test.count("issue_thread_interactions")).toBe(3);
-    for (const key of ["run_list", "liveness_backfill", "heartbeat_runs", "native_run_finalizations", "environment_leases", "issue_recovery_actions"]) {
+    for (const key of ["run_list", "liveness_backfill", "native_run_finalizations", "environment_leases", "issue_recovery_actions"]) {
       expect(test.count(key)).toBe(1);
     }
-    // One retry-exhaustion lookup plus the independent backfill's event count.
-    expect(test.count("heartbeat_run_events")).toBe(2);
+    // Fork issueRunIds selects candidate runs for the list and for the independent backfill, plus one projection read.
+    expect(test.count("heartbeat_runs")).toBe(3);
+    // Fork backfill counts events in raw SQL (db.execute); only the retry-exhaustion lookup is a select.
+    expect(test.count("heartbeat_run_events")).toBe(1);
     expect(test.update).toHaveBeenCalledTimes(1);
     expect(test.updateWhere).toHaveBeenCalledTimes(1);
     expect(test.transaction).not.toHaveBeenCalled();
