@@ -124,7 +124,11 @@ import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { authorizationService } from "../authorization.js";
 import { unadmittedChatWakeupCondition } from "../durable-chat-wakeup.js";
-import { DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS, issueRecoveryActionService } from "../issue-recovery-actions.js";
+import {
+  DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS,
+  OWNER_LIVE_HOLD_RECOVERY_KINDS,
+  issueRecoveryActionService,
+} from "../issue-recovery-actions.js";
 import {
   legacyExecutionNeedsReconciliation,
   terminalizeLegacyExecution,
@@ -11512,6 +11516,32 @@ export function recoveryService(
     return readNonEmptyString(parseObject(action.wakePolicy).type);
   }
 
+  // SUP-24251 (redo of SUP-22273): bound on the live-owner hold below. A held
+  // row is never written, so its `updatedAt` stays fixed and the hold lapses
+  // two live windows after it even when the owner keeps running elsewhere.
+  const OWNER_LIVE_HOLD_MAX_MS = 2 * REVIEW_PARTICIPANT_LIVE_WINDOW_MS;
+
+  // SUP-24251 (redo of SUP-22273): a live owner is not a wedge. True when the
+  // action is a stranded-participant kind and its owner agent (or, on a
+  // board-owned row, the pending participant it was minted for) has a run that
+  // started or finished after `lastAttemptAt` inside the participant live
+  // window, and the hold bound has not lapsed.
+  async function recoveryOwnerRanSinceLastAttempt(
+    action: typeof issueRecoveryActions.$inferSelect,
+    now: Date,
+  ) {
+    const agentId = action.ownerAgentId ?? action.previousOwnerAgentId;
+    if (!agentId || !OWNER_LIVE_HOLD_RECOVERY_KINDS.has(action.kind)) return false;
+    if (action.updatedAt.getTime() + OWNER_LIVE_HOLD_MAX_MS <= now.getTime()) return false;
+    return participantRanSince(
+      db,
+      action.companyId,
+      agentId,
+      action.lastAttemptAt?.getTime() ?? 0,
+      REVIEW_PARTICIPANT_LIVE_WINDOW_MS,
+    );
+  }
+
   // Level-triggered backstop for stranded recovery actions.
   //
   // The owner wake fires exactly once, at action creation
@@ -11525,6 +11555,10 @@ export function recoveryService(
   //   - terminal/missing source issues are dropped (nothing left to recover)
   //   - `monitor_only` / `manual_repair_required` policies and non-wakeable
   //     causes are skipped without burning an attempt
+  //   - SUP-24251: stranded-participant kinds whose owner (or pending
+  //     participant) ran after `lastAttemptAt` are held: no attempt burn, no
+  //     reroute, no ceiling escalation, until the live window or hold bound
+  //     lapses
   //   - ordinary `board_escalation` actions may be rerouted to an invokable
   //     owner; pending-participant board repairs stay manual across sweeps
   //   - attemptCount/lastAttemptAt are bumped under a compare-and-swap on the
@@ -11546,6 +11580,7 @@ export function recoveryService(
       skippedTerminalSource: 0,
       skippedBackoff: 0,
       skippedPauseHold: 0,
+      skippedOwnerLive: 0,
       enqueueFailed: 0,
       issueIds: [] as string[],
       actionIds: [] as string[],
@@ -11570,20 +11605,27 @@ export function recoveryService(
       await runRecoverySweepIssue({ id: candidate.sourceIssueId, identifier: null }, "recovery.reconcile_stale_recovery_action_wakes", async () => {
       const effectiveMaxAttempts = candidate.maxAttempts ?? MAX_RECOVERY_ACTION_SWEEP_ATTEMPTS;
 
-      if (candidate.attemptCount >= effectiveMaxAttempts) {
-        result.maxAttemptsReached += 1;
-        await escalateExhaustedRecoveryAction(candidate, effectiveMaxAttempts, now);
-        return;
-      }
-
       const sourceIssue = await db
         .select()
         .from(issues)
         .where(eq(issues.id, candidate.sourceIssueId))
         .then((rows) => rows[0] ?? null);
-
       // Nothing left to recover: the source issue is gone or already terminal.
-      if (!sourceIssue || sourceIssue.status === "done" || sourceIssue.status === "cancelled") {
+      const sourceTerminal = !sourceIssue || sourceIssue.status === "done" || sourceIssue.status === "cancelled";
+
+      if (candidate.attemptCount >= effectiveMaxAttempts) {
+        // SUP-24251: a live owner holds the ceiling instead of walking the
+        // action to the board. A terminal source has nothing to hold for.
+        if (!sourceTerminal && (await recoveryOwnerRanSinceLastAttempt(candidate, now))) {
+          result.skippedOwnerLive += 1;
+          return;
+        }
+        result.maxAttemptsReached += 1;
+        await escalateExhaustedRecoveryAction(candidate, effectiveMaxAttempts, now);
+        return;
+      }
+
+      if (sourceTerminal) {
         result.skippedTerminalSource += 1;
         return;
       }
@@ -11651,6 +11693,14 @@ export function recoveryService(
           result.skippedBackoff += 1;
           return;
         }
+      }
+
+      // SUP-24251: checked last, so every guard above keeps its precedence,
+      // and before both attempt-burning writes below (the no-owner reroute burn
+      // and the compare-and-swap re-fire).
+      if (await recoveryOwnerRanSinceLastAttempt(candidate, now)) {
+        result.skippedOwnerLive += 1;
+        return;
       }
 
       // `board_escalation` means action creation could not find an invokable

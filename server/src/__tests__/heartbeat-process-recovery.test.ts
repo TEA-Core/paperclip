@@ -648,6 +648,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await db.delete(documents);
       await db.delete(companySecretBindings);
       await db.delete(companySecrets);
+      // A late background write can add an activity_log row after the earlier
+      // clear; re-clear it each attempt so it cannot hold the companies FK.
+      await db.delete(activityLog);
       try {
         await db.delete(companies);
         break;
