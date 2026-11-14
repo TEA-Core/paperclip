@@ -246,8 +246,8 @@ server/src/__tests__/chat-channels.integration.test.ts(7042,46): TS18047
 server/src/__tests__/chat-channels.integration.test.ts(7249,33): TS2339
 server/src/__tests__/chat-channels.integration.test.ts(7250,35): TS2339
 server/src/__tests__/chat-channels.integration.test.ts(8715,7): TS2353
-server/src/__tests__/chat-project-tools.test.ts(285,47): TS2345
-server/src/__tests__/chat-project-tools.test.ts(297,47): TS2345
+server/src/__tests__/chat-project-tools.test.ts(295,47): TS2345
+server/src/__tests__/chat-project-tools.test.ts(308,47): TS2345
 server/src/__tests__/claude-local-execute.test.ts(1346,49): TS2339
 server/src/__tests__/claude-local-execute.test.ts(1348,25): TS2339
 server/src/__tests__/claude-local-execute.test.ts(1349,25): TS2339
@@ -871,10 +871,10 @@ server/src/__tests__/legacy-runtime-tool-refresh.test.ts(11,44): TS2339
 server/src/__tests__/local-service-supervisor.test.ts(46,9): TS2741
 server/src/__tests__/logger-tz.test.ts(71,23): TS2352
 server/src/__tests__/logger-tz.test.ts(71,51): TS2493
-server/src/__tests__/low-trust-red-team-routes.test.ts(1493,43): TS2322
-server/src/__tests__/low-trust-red-team-routes.test.ts(1971,25): TS2353
-server/src/__tests__/low-trust-red-team-routes.test.ts(1972,29): TS2353
-server/src/__tests__/low-trust-red-team-routes.test.ts(2001,13): TS2769
+server/src/__tests__/low-trust-red-team-routes.test.ts(1556,43): TS2322
+server/src/__tests__/low-trust-red-team-routes.test.ts(2034,25): TS2353
+server/src/__tests__/low-trust-red-team-routes.test.ts(2035,29): TS2353
+server/src/__tests__/low-trust-red-team-routes.test.ts(2064,13): TS2769
 server/src/__tests__/merged-pr-confirmation-sweep.test.ts(111,9): TS2322
 server/src/__tests__/merged-pr-confirmation-sweep.test.ts(216,7): TS2769
 server/src/__tests__/merged-pr-confirmation-sweep.test.ts(226,9): TS2769

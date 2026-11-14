@@ -63,6 +63,9 @@ control-plane surface" (`assertLowTrustControlPlaneDenied`) on both
 so the folded head admits nothing the base refuses. The create route also keeps
 the root-create guard (an agent without `company_scope:read` gets 403
 "Low-trust agents must create child issues inside their assigned boundary").
+The MCP `create_task` tool calls these routes, so it is refused too. The native
+runner `create_task` tool does not use them; before #14870 it had no create
+authorization, so it keeps the #14870 `tasks:assign` and containment checks.
 A captain call may reconsider adopting #14870 later.
 
 Permission denials must identify the rejected action and specific restriction.

@@ -1033,7 +1033,10 @@ describeEmbeddedPostgres(
       expect((await request(pluginWorker).get(`/api/issues/${created.body.id}`)).status).toBe(200);
     });
 
-    it("refuses a parentless low-trust root create even with tasks:assign while in-boundary child creates still work", async () => {
+    // Fork-only (fold-s3b, captain ruling): upstream #14870 scoped low-trust task creation is
+    // not taken. Every low-trust agent create is refused on both create routes, as before the
+    // fold, even with tasks:assign; agents that are not low-trust still create tasks.
+    it("refuses every low-trust agent create on both create routes even with tasks:assign", async () => {
       const fixture = await seedLowTrustFixture(db);
       await db.insert(principalPermissionGrants).values({
         companyId: fixture.company.id,
@@ -1043,28 +1046,54 @@ describeEmbeddedPostgres(
         grantedByUserId: null,
       });
       const app = createApp(db, agentActor(fixture));
+      const titlePrefix = `Low-trust create ${randomUUID()}`;
+      const attempts = [
+        {
+          path: `/api/companies/${fixture.company.id}/issues`,
+          body: { title: `${titlePrefix} root`, assigneeAgentId: fixture.agents.lowTrust.id },
+        },
+        {
+          path: `/api/companies/${fixture.company.id}/issues`,
+          body: { title: `${titlePrefix} root in allowed project`, projectId: fixture.projects.allowed.id },
+        },
+        {
+          path: `/api/companies/${fixture.company.id}/issues`,
+          body: {
+            title: `${titlePrefix} in-boundary child`,
+            parentId: fixture.issues.assignedReview.id,
+            assigneeAgentId: fixture.agents.lowTrust.id,
+          },
+        },
+        {
+          path: `/api/issues/${fixture.issues.assignedReview.id}/children`,
+          body: { title: `${titlePrefix} children route self-assigned`, assigneeAgentId: fixture.agents.lowTrust.id },
+        },
+        {
+          path: `/api/issues/${fixture.issues.assignedReview.id}/children`,
+          body: { title: `${titlePrefix} children route unassigned` },
+        },
+      ];
+      for (const attempt of attempts) {
+        const res = await request(app).post(attempt.path).send(attempt.body);
+        expect(res.status, `${attempt.body.title}: ${JSON.stringify(res.body)}`).toBe(403);
+        expect(res.body.error).toBe("Low-trust actors cannot use this control-plane surface");
+      }
+      const created = await db
+        .select({ title: issues.title })
+        .from(issues)
+        .where(eq(issues.companyId, fixture.company.id));
+      expect(created.filter((row) => row.title.startsWith(titlePrefix))).toEqual([]);
 
-      const root = await request(app)
+      const standardApp = createApp(db, agentActor(fixture, fixture.agents.standard.id));
+      const standardRoot = await request(standardApp)
         .post(`/api/companies/${fixture.company.id}/issues`)
-        .send({ title: "Parentless root create", assigneeAgentId: fixture.agents.lowTrust.id });
-      expect(root.status, JSON.stringify(root.body)).toBe(403);
-      expect(root.body.error).toBe(
-        "Low-trust agents must create child issues inside their assigned boundary",
-      );
-
-      const child = await request(app)
-        .post(`/api/companies/${fixture.company.id}/issues`)
-        .send({
-          title: "In-boundary child",
-          parentId: fixture.issues.assignedReview.id,
-          assigneeAgentId: fixture.agents.lowTrust.id,
-        });
-      expect(child.status, JSON.stringify(child.body)).toBe(201);
-
-      const viaChildren = await request(app)
-        .post(`/api/issues/${fixture.issues.assignedReview.id}/children`)
-        .send({ title: "In-boundary child via children route", assigneeAgentId: fixture.agents.lowTrust.id });
-      expect(viaChildren.status, JSON.stringify(viaChildren.body)).toBe(201);
+        .send({ title: `${titlePrefix} standard root`, projectId: fixture.projects.allowed.id });
+      expect(standardRoot.status, JSON.stringify(standardRoot.body)).toBe(201);
+      const standardChild = await request(standardApp)
+        .post(`/api/issues/${standardRoot.body.id}/children`)
+        .send({ title: `${titlePrefix} standard child` });
+      expect(standardChild.status, JSON.stringify(standardChild.body)).toBe(201);
+      expect(standardChild.body.parentId).toBe(standardRoot.body.id);
     });
 
     it("allows bounded same-issue reads and writes while quarantining low-trust output", async () => {

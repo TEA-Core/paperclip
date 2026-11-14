@@ -17007,6 +17007,12 @@ export function issueRoutes(
         });
         return;
       }
+      // Fork-only (fold-s3b, captain ruling): upstream #14870 removed this
+      // blanket low-trust create denial to allow scoped low-trust task
+      // creation. The fork keeps the base refusal on this route and on
+      // POST /issues/:id/children; see doc/LOW-TRUST-PRESETS.md.
+      if (await assertLowTrustControlPlaneDenied(req, res, companyId, null))
+        return;
       const statusDefault = res.locals.createIssueStatusDefault as
         | { status: string; reason: string; defaulted: boolean }
         | undefined;
@@ -18044,6 +18050,18 @@ export function issueRoutes(
           parent.companyId,
           parent,
         ))
+      )
+        return;
+      // Fork-only (fold-s3b, captain ruling): the base blanket low-trust
+      // create denial stays (upstream #14870 not taken); see the company
+      // create route above.
+      if (
+        await assertLowTrustControlPlaneDenied(
+          req,
+          res,
+          parent.companyId,
+          parent,
+        )
       )
         return;
       const statusDefault = res.locals.createIssueStatusDefault as
