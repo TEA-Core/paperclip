@@ -2277,7 +2277,7 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
  * foreign lock (SUP-16052). Returns null for issue-less (legacy) runs, which
  * stay on their existing adoption paths.
  */
-function readRunContextIssueId(contextSnapshot: unknown): string | null {
+export function readRunContextIssueId(contextSnapshot: unknown): string | null {
   const issueId = parseObject(contextSnapshot).issueId;
   return typeof issueId === "string" && issueId.trim().length > 0
     ? issueId.trim()

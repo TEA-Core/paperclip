@@ -401,6 +401,7 @@ import {
   ORPHANED_DUPLICATE_RUN_CONFLICT_CODE,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   isTerminalOrMissingHeartbeatRun,
+  readRunContextIssueId,
   expectedUpdatedAtUnsupportedWithSideEffects,
   issueVersionConflict,
   workspaceReopenRequired,
@@ -4549,6 +4550,10 @@ export function issueRoutes(
     companyId: string,
     actor: ReturnType<typeof getActorInfo>,
     assigneeAgentId: string | null | undefined,
+    // SUP-24209: the update door names the claimed issue. A run whose context
+    // names another issue cannot adopt this one (SUP-16052), so it is not the
+    // run that would be woken and the claim still dispatches.
+    claimedIssueId?: string,
   ) => {
     if (
       actor.actorType !== "agent" ||
@@ -4564,6 +4569,7 @@ export function issueRoutes(
           companyId: heartbeatRuns.companyId,
           agentId: heartbeatRuns.agentId,
           status: heartbeatRuns.status,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
         })
         .from(heartbeatRuns)
         .where(
@@ -4575,7 +4581,10 @@ export function issueRoutes(
           ),
         )
         .then((rows) => rows[0] ?? null);
-      return run !== null;
+      if (run === null) return false;
+      if (claimedIssueId === undefined) return true;
+      const runIssueId = readRunContextIssueId(run.contextSnapshot);
+      return runIssueId === null || runIssueId === claimedIssueId;
     } catch {
       return false;
     }
@@ -22715,7 +22724,21 @@ export function issueRoutes(
         // Restoring an assignee on completed work is not a reopen request.
         // Explicit reopen/resume transitions are already reflected in issue.status.
         !isClosedIssueStatus(issue.status) &&
-        deferWakeForGoal !== true
+        deferWakeForGoal !== true &&
+        // SUP-24209: a live run of the assignee that claims the issue for
+        // itself is the run that would be woken. Waking it again dispatched a
+        // second live session that took the checkout and fenced the claiming
+        // run out of its own issue; the claiming run takes the checkout
+        // itself instead.
+        !(
+          issue.status === "in_progress" &&
+          (await shouldSuppressCreatorSelfAssignmentWake(
+            issue.companyId,
+            actor,
+            issue.assigneeAgentId,
+            issue.id,
+          ))
+        )
       ) {
         addWakeup(issue.assigneeAgentId, {
           source: "assignment",
