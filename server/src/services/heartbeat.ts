@@ -13088,7 +13088,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             lastAttemptAt: input.now,
           });
 
-      await db
+      // Guard the clear with the claimed schedule: the awaits above leave a
+      // window in which a re-arm can install a new monitorNextCheckAt, policy
+      // and state. A stale clear would delete that schedule and write back the
+      // old snapshot (SUP-24186). Zero rows means the re-arm won; leave it.
+      const cleared = await db
         .update(issues)
         .set({
           ...buildIssueMonitorClearedPatch({
@@ -13099,7 +13103,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }),
           updatedAt: new Date(),
         })
-        .where(eq(issues.id, claimed.id));
+        .where(
+          and(
+            eq(issues.id, claimed.id),
+            eq(issues.monitorNextCheckAt, claimed.monitorNextCheckAt),
+          ),
+        )
+        .returning({ id: issues.id });
+
+      if (cleared.length === 0) {
+        return { outcome: "skipped" as const, reason: "monitor_rearmed" };
+      }
 
       await logActivity(db, {
         companyId: claimed.companyId,
