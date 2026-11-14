@@ -10,6 +10,7 @@ import {
   createApprovalObjectSchema,
   createIssueInputSchema,
   issueThreadInteractionContinuationPolicySchema,
+  refineIssueUpdateMonitorAliasConflict,
   requestCheckboxConfirmationPayloadSchema,
   requestConfirmationPayloadSchema,
   suggestTasksPayloadSchema,
@@ -134,12 +135,16 @@ const createIssueToolSchema = z.object({
 
 // Attribution stays off the advertised tool surface — it is create-only, so offering it would
 // invite callers to attempt a mutation the server discards.
+// SUP-21447: fail closed on the same top-level monitor alias conflict the
+// PATCH route enforces, so the adapter and the route agree: `monitor` alone
+// is forwarded as the alias, `executionPolicy` alone passes through, and a
+// body carrying both never leaves the adapter.
 const updateIssueToolSchema = z.object({
   issueId: issueIdSchema,
 }).merge(updateIssueObjectSchema.omit({
   createdByUserId: true,
   responsibleUserId: true,
-}));
+})).superRefine(refineIssueUpdateMonitorAliasConflict);
 
 const checkoutIssueToolSchema = z.object({
   issueId: issueIdSchema,
