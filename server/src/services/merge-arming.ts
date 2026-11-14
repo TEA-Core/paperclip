@@ -584,6 +584,13 @@ export interface WorkspaceDiscoveryFailure {
 export interface WorkspaceDiscoveryResult {
   matched: WorkspacePullRequestMatch[];
   terminalFailure: WorkspaceDiscoveryFailure | null;
+  /**
+   * SUP-24033: lower-cased `owner/repo` of every repo whose open-PR list was
+   * read successfully. A cached draft mention whose repo is absent here was never
+   * live-checked by this discovery (drafts do not contribute repo pairs), so its
+   * draft bit cannot be called stale.
+   */
+  scannedRepos: string[];
 }
 
 /**
@@ -706,6 +713,7 @@ async function discoverCardPullRequestByWorkspace(
       : null;
   const deliveryBranchIsOwn = deliveryOwnership.branchIsOwn;
   const matched: WorkspacePullRequestMatch[] = [];
+  const scannedRepos: string[] = [];
   let terminalFailure: WorkspaceDiscoveryFailure | null = null;
 
   for (const pair of pairs) {
@@ -770,6 +778,7 @@ async function discoverCardPullRequestByWorkspace(
         break;
       }
 
+      scannedRepos.push(`${pair.owner}/${pair.repo}`.toLowerCase());
       for (const item of listResult.items) {
         if (!includeDrafts && item.draft === true) continue;
         const headRef = (item.headRef ?? "").toLowerCase();
@@ -800,7 +809,7 @@ async function discoverCardPullRequestByWorkspace(
     if (terminalFailure) break;
   }
 
-  return { matched, terminalFailure };
+  return { matched, terminalFailure, scannedRepos };
 }
 
 /**
@@ -3405,6 +3414,21 @@ export type DecisionHeadResolution =
        * reasons, which have no branch to certify.
        */
       pendingCandidates?: Array<ApprovalCandidateAnchor | NoPrBranchAnchor>;
+      /**
+       * SUP-24033: set only on a `head_draft` refusal whose draft names ALL come
+       * from cached mentions, live workspace discovery found no draft, AND that
+       * discovery actually listed every cached draft's repo. Those
+       * cached draft bits can be stale, so the final-delivery preflight alone
+       * revalidates them live. Never set when a live-discovered draft exists:
+       * a merged mention must not mask a draft the forge just reported.
+       */
+      cachedDraftMentions?: Array<{
+        owner: string;
+        repo: string;
+        number: number;
+        displayName: string;
+        headRefName: string | null;
+      }>;
     };
 
 /**
@@ -3623,6 +3647,18 @@ export async function resolveApprovalDecisionHead(
     return {
       kind: "unresolvable",
       reason: `head_draft: ${draftNames.join(", ")} ${verb}; a draft head cannot be armed (GitHub refuses auto-merge on a draft) — promote it out of draft, then republish`,
+      ...(draftMatched.length === 0 &&
+        draftLinkedPRs.every((pr) => discovery.scannedRepos.includes(`${pr.owner}/${pr.repo}`.toLowerCase()))
+        ? {
+            cachedDraftMentions: draftLinkedPRs.map((pr) => ({
+              owner: pr.owner,
+              repo: pr.repo,
+              number: pr.number,
+              displayName: pr.displayName,
+              headRefName: pr.headRefName,
+            })),
+          }
+        : {}),
     };
   }
 
@@ -3671,8 +3707,12 @@ const finalDeliveryLiveSchema = z.object({
  * open-PR resolver (cached mentions, live workspace discovery) legitimately
  * returns nothing. Exactly one LIVE-merged mentioned carrier is accepted, and
  * only after the same live merged-state, base-branch merge-commit containment,
- * and branch/repo ownership checks as the ordinary path. Every other
- * resolution path (approval publication, merge arming, reconciliation) stays
+ * and branch/repo ownership checks as the ordinary path.
+ *
+ * SUP-24033: a head_draft refusal that came from cached open+draft mentions
+ * alone is revalidated live (resolveStaleDraftMergedCarrier); the base refusal
+ * stands unless exactly one card-owned draft mention is live-merged and passes
+ * the same verification. Every other resolution path (approval publication, merge arming, reconciliation) stays
  * open-PR-only.
  */
 export async function preflightFinalDelivery(
@@ -3681,6 +3721,15 @@ export async function preflightFinalDelivery(
   const resolved = await resolveApprovalDecisionHead(db, companyId, issueId, identifier, true);
   if (resolved.kind === "resolved") {
     return verifyLiveFinalDeliveryHead(db, companyId, issueId, resolved);
+  }
+  if (resolved.reason.startsWith("head_draft:")) {
+    // SUP-24033: a cached open+draft mention is a stale-able bit — the resolver
+    // returns head_draft from it before the no-pr fallback could run, so a PR
+    // merged since still blocked final delivery. Revalidate it live. Every
+    // outcome except one live-merged, card-owned carrier keeps the base
+    // head_draft refusal unchanged.
+    const carrier = await resolveStaleDraftMergedCarrier(db, companyId, issueId, resolved);
+    return carrier ? verifyLiveFinalDeliveryHead(db, companyId, issueId, carrier) : resolved;
   }
   if (resolved.reason.startsWith("no-pr:")) {
     const carrier = await resolveSingleMergedMentionCarrier(db, companyId, issueId);
@@ -3758,6 +3807,39 @@ async function verifyLiveFinalDeliveryHead(
   return { kind: "unresolvable", reason: "head_unverifiable: no credential can verify the live delivery" };
 }
 
+/** SUP-24033: the stale-draft revalidation reads each mention live; above this many it refuses instead of fanning out. */
+const MAX_STALE_DRAFT_MENTION_READS = 5;
+
+/**
+ * SUP-24033: revalidate the cached open+draft mentions behind a `head_draft`
+ * refusal against live state. Returns a carrier ONLY when all of these hold;
+ * otherwise null and the caller keeps the base refusal:
+ *  - the refusal came from cached drafts alone (no live-discovered draft);
+ *  - every cached draft is the card's own delivery (cached repo+branch pass
+ *    narrowToDelivered), so a foreign PR the card merely cites cannot carry it;
+ *  - the card cites at most MAX_STALE_DRAFT_MENTION_READS PRs (bounded reads);
+ *  - every mention reads live (no unreadable), none is a live open draft, and
+ *    exactly one is live-merged;
+ *  - that merged PR is one of the revalidated cached drafts.
+ * The caller then runs the full verifyLiveFinalDeliveryHead on it.
+ */
+async function resolveStaleDraftMergedCarrier(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  refusal: Extract<DecisionHeadResolution, { kind: "unresolvable" }>,
+): Promise<{ kind: "resolved"; headSha: string; displayName: string; pr: { owner: string; repo: string; number: number } } | null> {
+  const drafts = refusal.cachedDraftMentions;
+  if (!drafts || drafts.length === 0) return null;
+  const mentioned = await resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts: true });
+  if (mentioned.length > MAX_STALE_DRAFT_MENTION_READS) return null;
+  const owned = await narrowToDelivered(db, companyId, issueId, drafts);
+  if (owned.outcome !== "narrowed" || owned.delivered.length !== drafts.length) return null;
+  const carrier = await resolveSingleMergedMentionCarrier(db, companyId, issueId, refusal.reason, mentioned);
+  if (carrier.kind !== "resolved") return null;
+  return drafts.some((draft) => samePullRequest(draft, carrier.pr)) ? carrier : null;
+}
+
 /**
  * SUP-22346: among the issue's explicitly mentioned PRs (cached state is
  * irrelevant — a PR merged out-of-band is cached closed), resolve the single
@@ -3778,18 +3860,24 @@ async function resolveSingleMergedMentionCarrier(
   db: Db,
   companyId: string,
   issueId: string,
+  liveDraftRefusal: string | null = null,
+  // SUP-24033: the stale-draft path passes the list it already cap-checked so the
+  // live reads cannot run over a second, uncapped read of the mentions.
+  checkedMentions?: LinkedPullRequest[],
 ): Promise<
   | { kind: "none" }
   | { kind: "resolved"; headSha: string; displayName: string; pr: { owner: string; repo: string; number: number } }
   | { kind: "unresolvable"; reason: string }
 > {
-  const mentioned = await resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts: true });
+  const mentioned =
+    checkedMentions ?? (await resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts: true }));
   const mergedCarriers: Array<{
     kind: "resolved";
     headSha: string;
     displayName: string;
     pr: { owner: string; repo: string; number: number };
   }> = [];
+  let liveDraft = false;
   for (const pr of mentioned) {
     const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
     // SUP-22355: a mention no credential can even attempt is unreadable —
@@ -3799,6 +3887,9 @@ async function resolveSingleMergedMentionCarrier(
       const live = await fetchPullRequestHeadSha(candidates[i]!.token, pr.owner, pr.repo, pr.number);
       if (live.ok) {
         unreadable = null;
+        if (liveDraftRefusal !== null && live.merged !== true && live.open === true && live.draft === true) {
+          liveDraft = true;
+        }
         if (live.merged === true && live.headSha) {
           mergedCarriers.push({
             kind: "resolved",
@@ -3820,6 +3911,9 @@ async function resolveSingleMergedMentionCarrier(
       };
     }
   }
+  // SUP-24033: a genuine live draft keeps its head_draft refusal even beside a
+  // merged mention; the merged carrier must not mask an open draft.
+  if (liveDraft && liveDraftRefusal !== null) return { kind: "unresolvable", reason: liveDraftRefusal };
   if (mergedCarriers.length === 0) return { kind: "none" };
   if (mergedCarriers.length > 1) {
     const names = mergedCarriers.map((carrier) => carrier.displayName).join(", ");

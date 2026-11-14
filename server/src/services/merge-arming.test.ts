@@ -2176,6 +2176,370 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       }
     });
 
+    // SUP-24033: a cached open+draft mention is a stale-able bit. The ordinary
+    // resolver returns head_draft from it before the merged-carrier fallback can
+    // run, so a PR that merged since still blocked final delivery. The cached
+    // draft bit is trusted only after the live read confirms a live draft.
+    it("accepts a cached open draft mention when the live read proves it merged (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "open", draft: true });
+      installRoutes(mergedCarrierRoutes());
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") {
+        expect(result.headSha).toBe(APPROVED_HEAD);
+        expect(result.displayName).toBe(`${OWNER}/${REPO}#42`);
+        expect(result.pr).toEqual({ owner: OWNER, repo: REPO, number: 42 });
+      }
+      expect(postStatusShas()).toEqual([]);
+    });
+
+    it("still refuses a cached open draft mention that is a live draft as head_draft (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "open", draft: true });
+      installRoutes(mergedCarrierRoutes(mergedMentionBody({ state: "open", draft: true, merged: false })));
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+        expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
+      }
+    });
+
+    it("refuses a live draft as head_draft even when another mentioned PR is a verified merged carrier (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, state: "open", draft: true });
+      await insertMention(issueId, { number: 43, state: "closed", headRefName: "SUP-43-other-branch" });
+      installRoutes([
+        ...mergedCarrierRoutes(mergedMentionBody({ state: "open", draft: true, merged: false })),
+        { url: PR_43_URL, body: mergedMentionBody() },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+        expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
+      }
+    });
+
+    it("refuses a stale cached open draft whose live read is unreadable (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "open", draft: true });
+      installRoutes([
+        { url: OPEN_PRS_LIST_URL, body: [] },
+        { url: PR_URL, body: { message: "rate limited" }, ok: false, status: 429 },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+      }
+    });
+
+    // Release-assurance NO-GO c2: the revalidation must never admit a PR the
+    // card merely cites. The cached draft row's repo+branch must be the card's
+    // own delivery before a live-merged read can carry it.
+    it("refuses a foreign merged PR held as a stale cached open draft (SUP-24033 c2)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 77, state: "open", draft: true, headRefName: "SUP-99-foreign-branch" });
+      installRoutes([
+        { url: OPEN_PRS_LIST_URL, body: [] },
+        // The live read says merged and (hostile) reports the card's own branch.
+        { url: `https://api.github.com/repos/${OWNER}/${REPO}/pulls/77`, body: mergedMentionBody() },
+        { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+        { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+        expect(result.reason).toContain(`${OWNER}/${REPO}#77`);
+      }
+    });
+
+    // Release-assurance NO-GO cr1: a draft that LIVE workspace discovery finds
+    // on the delivery branch is a live draft; a merged cached mention must not
+    // mask it. Only cached-only draft bits are revalidated.
+    it("refuses a live-discovered draft even when a closed merged mention exists (SUP-24033 cr1)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, state: "closed" });
+      installRoutes([
+        { url: OPEN_PRS_LIST_URL, body: [openPrsListItem({ number: 455, draft: true })] },
+        { url: PR_URL, body: mergedMentionBody() },
+        { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+        { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+        expect(result.reason).toContain(`${OWNER}/${REPO}#455`);
+      }
+    });
+
+    // The revalidated carrier takes the same live verification as every other
+    // merged carrier: unproven containment and a live head that is not the
+    // card's delivery both stay refused (kills a mutant that skips the shared
+    // verification stage on this entry path).
+    it("refuses a stale-draft merged carrier whose merge commit is not on the base branch (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "open", draft: true });
+      installRoutes(mergedCarrierRoutes(mergedMentionBody(), { status: "ahead", ahead_by: 2 }));
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("head_merged_unproven");
+      }
+    });
+
+    it("refuses a stale-draft merged carrier whose live head branch is not the card's delivery (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "open", draft: true });
+      installRoutes(mergedCarrierRoutes(mergedMentionBody({
+        head: { ref: "SUP-99-other-branch", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+      })));
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toContain("not_delivered");
+      }
+    });
+
+    // CodeRabbit minor: the cap must bound the list the live reads actually use.
+    // Mentions added AFTER the cap check (here: right before a second mention
+    // query would start) must not widen the live-read set.
+    it("keeps live reads inside the checked mention list when mentions are added after the cap check (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, state: "open", draft: true });
+      await insertMention(issueId, { number: 50, state: "closed", headRefName: "SUP-50-branch" });
+      installRoutes(mergedCarrierRoutes());
+      mockGhFetch.mockClear();
+      installRoutes(mergedCarrierRoutes());
+
+      let mentionQueries = 0;
+      let injected = false;
+      const injectMentions = async () => {
+        if (injected) return;
+        injected = true;
+        for (let n = 60; n < 66; n++) {
+          await insertMention(issueId, { number: n, state: "closed", headRefName: `SUP-${n}-branch` });
+        }
+      };
+      const wrapBuilder = (builder: any): any =>
+        new Proxy(builder, {
+          get(target, prop) {
+            if (prop === "then") {
+              return (resolve: any, reject: any) => injectMentions().then(() => target.then(resolve, reject));
+            }
+            const value = target[prop];
+            return typeof value === "function" ? (...args: unknown[]) => wrapBuilder(value.apply(target, args)) : value;
+          },
+        });
+      // Every mention query is db.select(...).from(externalObjectMentions)...; the
+      // preflight issues the first two before the cap check. Any later one is
+      // preceded by the injected rows, so a second read of the list sees 8 PRs.
+      const racingDb = new Proxy(db, {
+        get(target, prop) {
+          const value = (target as any)[prop];
+          if (prop !== "select") return typeof value === "function" ? value.bind(target) : value;
+          return (...args: unknown[]) => {
+            const builder = value.apply(target, args);
+            return new Proxy(builder, {
+              get(b, p) {
+                const member = b[p];
+                if (p !== "from" || typeof member !== "function") {
+                  return typeof member === "function" ? member.bind(b) : member;
+                }
+                return (...fromArgs: unknown[]) => {
+                  const next = member.apply(b, fromArgs);
+                  if (fromArgs[0] !== externalObjectMentions) return next;
+                  mentionQueries += 1;
+                  return mentionQueries >= 4 ? wrapBuilder(next) : next;
+                };
+              },
+            });
+          };
+        },
+      }) as typeof db;
+
+      const result = await preflightFinalDelivery(racingDb, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("resolved");
+      const injectedReads = mockGhFetch.mock.calls.filter(([url]) => /\/pulls\/6\d$/.test(String(url)));
+      expect(injectedReads).toHaveLength(0);
+    });
+
+    // Release-assurance NO-GO N1: drafts never contribute repo pairs to the live
+    // workspace discovery. When the only scanned repo is ANOTHER repo, the card's
+    // own repo was never listed, so an owned live draft there is unseen; the
+    // cached draft bit cannot be called stale and the base refusal must stand.
+    describe("stale-draft revalidation pins (SUP-24033)", () => {
+      const OTHER_OWNER = "other-org";
+      const OTHER_REPO = "other-repo";
+      const pr = (n: number, owner = OWNER, repo = REPO) => `https://api.github.com/repos/${owner}/${repo}/pulls/${n}`;
+      const closedUnmerged = (overrides: Record<string, unknown> = {}) => ({
+        state: "closed",
+        draft: false,
+        merged: false,
+        title: "Fix thing (SUP-42)",
+        head: { ref: "SUP-42-branch", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+        ...overrides,
+      });
+
+      it("refuses when the card's own repo was not scanned by discovery (N1)", async () => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        await insertMention(issueId, {
+          number: 9, state: "closed", owner: OTHER_OWNER, repo: OTHER_REPO, headRefName: "SUP-9-branch",
+        });
+        installRoutes([
+          { url: `https://api.github.com/repos/${OTHER_OWNER}/${OTHER_REPO}/pulls?state=open&per_page=100`, body: [] },
+          { url: pr(9, OTHER_OWNER, OTHER_REPO), body: closedUnmerged({ head: { ref: "SUP-9-branch", sha: "other00000000000000000000000000000000001", repo: { full_name: `${OTHER_OWNER}/${OTHER_REPO}` } } }) },
+          { url: PR_URL, body: mergedMentionBody() },
+          { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+          { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+        ]);
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe("unresolvable");
+        if (result.kind === "unresolvable") {
+          expect(result.reason).toMatch(/^head_draft:/);
+          expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
+        }
+      });
+
+      // F1: a draft that live discovery DOES list beside a cached stale draft is a
+      // live draft; the merged cached draft must not mask it.
+      it("refuses a live-discovered draft beside a merged cached draft mention (F1)", async () => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        await insertMention(issueId, { number: 50, state: "closed", headRefName: "SUP-50-branch" });
+        installRoutes([
+          { url: OPEN_PRS_LIST_URL, body: [openPrsListItem({ number: 455, draft: true })] },
+          { url: PR_URL, body: mergedMentionBody() },
+          { url: pr(50), body: closedUnmerged() },
+          { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+          { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+        ]);
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe("unresolvable");
+        if (result.kind === "unresolvable") {
+          expect(result.reason).toMatch(/^head_draft:/);
+          expect(result.reason).toContain(`${OWNER}/${REPO}#455`);
+        }
+      });
+
+      it("refuses when another mention is a live open draft beside the merged cached draft", async () => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        await insertMention(issueId, { number: 44, state: "closed", headRefName: "SUP-44-branch" });
+        installRoutes([
+          { url: OPEN_PRS_LIST_URL, body: [] },
+          { url: PR_URL, body: mergedMentionBody() },
+          { url: pr(44), body: closedUnmerged({ state: "open", draft: true }) },
+          { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+          { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+        ]);
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe("unresolvable");
+        if (result.kind === "unresolvable") expect(result.reason).toMatch(/^head_draft:/);
+      });
+
+      it("ignores a CLOSED unmerged mention that still reads draft (only live OPEN drafts block)", async () => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        await insertMention(issueId, { number: 44, state: "closed", headRefName: "SUP-44-branch" });
+        installRoutes([
+          { url: OPEN_PRS_LIST_URL, body: [] },
+          { url: PR_URL, body: mergedMentionBody() },
+          { url: pr(44), body: closedUnmerged({ draft: true }) },
+          { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+          { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+        ]);
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe("resolved");
+      });
+
+      it("refuses when only some cached drafts are the card's own delivery", async () => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        await insertMention(issueId, { number: 43, state: "open", draft: true, headRefName: "SUP-99-foreign-branch" });
+        await insertMention(issueId, { number: 44, state: "closed", headRefName: "SUP-44-branch" });
+        installRoutes([
+          { url: OPEN_PRS_LIST_URL, body: [] },
+          { url: PR_URL, body: mergedMentionBody() },
+          { url: pr(43), body: closedUnmerged() },
+          { url: pr(44), body: closedUnmerged() },
+          { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+          { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+        ]);
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe("unresolvable");
+        if (result.kind === "unresolvable") expect(result.reason).toMatch(/^head_draft:/);
+      });
+
+      it("refuses when the merged mention is not one of the revalidated cached drafts", async () => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        await insertMention(issueId, { number: 43, state: "closed", headRefName: "SUP-43-branch" });
+        installRoutes([
+          { url: OPEN_PRS_LIST_URL, body: [] },
+          { url: PR_URL, body: closedUnmerged() },
+          { url: pr(43), body: mergedMentionBody() },
+          { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+          { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+        ]);
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe("unresolvable");
+        if (result.kind === "unresolvable") expect(result.reason).toMatch(/^head_draft:/);
+      });
+    });
+
+    it("refuses without fanning out when the card cites more mentions than the live-read cap (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { number: 42, state: "open", draft: true });
+      for (let n = 50; n < 56; n++) {
+        await insertMention(issueId, { number: n, state: "closed", headRefName: `SUP-${n}-branch` });
+      }
+      installRoutes(mergedCarrierRoutes());
+      mockGhFetch.mockClear();
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+      }
+      expect(mockGhFetch.mock.calls.filter(([url]) => /\/pulls\/\d+$/.test(String(url)))).toHaveLength(0);
+    });
+
     it("resolveApprovalDecisionHead stays open-PR-only for the same card (no carrier fallback)", async () => {
       const issueId = await insertMentionOnlyCard();
       installRoutes(mergedCarrierRoutes());
