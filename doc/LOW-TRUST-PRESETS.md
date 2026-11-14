@@ -54,10 +54,16 @@ scope does not implicitly authorize new descendants, and a permitted parent does
 not grant access to an unrelated project. An explicit root-task scope includes
 its descendants. Self-assigned decomposition is not a delegation cycle.
 
-Fork constraint: an agent without `company_scope:read` cannot create a
-parentless (root) issue, even with `tasks:assign`; it gets 403 "Low-trust agents
-must create child issues inside their assigned boundary" and must create
-children of its assigned tasks instead.
+Fork-only patch (fold-s3b ledger): the paragraph above describes upstream
+#14870 scoped task creation, which this fork does NOT take in this slice. A
+low-trust agent is refused with 403 "Low-trust actors cannot use this
+control-plane surface" (`assertLowTrustControlPlaneDenied`) on both
+`POST /companies/:companyId/issues` (parentless, or in-boundary child via
+`parentId`) and `POST /issues/:id/children`, even when `tasks:assign` is granted,
+so the folded head admits nothing the base refuses. The create route also keeps
+the root-create guard (an agent without `company_scope:read` gets 403
+"Low-trust agents must create child issues inside their assigned boundary").
+A captain call may reconsider adopting #14870 later.
 
 Permission denials must identify the rejected action and specific restriction.
 Agents must surface failed instruction-save receipts and explain when the current
