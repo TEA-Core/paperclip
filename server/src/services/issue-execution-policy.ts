@@ -14,7 +14,7 @@ import type {
 } from "@paperclipai/shared";
 import { gitCommitShaSchema, issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
 import { conflict, unprocessable } from "../errors.js";
-import { resolveSelfApprovalPrincipals } from "./approval-status-reconciler.js";
+import { latestDecisionPerStage, resolveSelfApprovalPrincipals } from "./approval-status-reconciler.js";
 import { resolveCallerSeat, seatAuthorityNextAction } from "./seat-authority-refusal.js";
 
 type AssigneeLike = {
@@ -99,6 +99,16 @@ type TransitionInput = {
    * through to the ordinary ceiling behaviour instead.
    */
   stallArbiterAvailable?: boolean;
+  /**
+   * SUP-24054: current-policy stage ids whose durable approval still holds
+   * (`listCurrentPolicyApprovedStageIds`). Read only when a `done` request
+   * starts the workflow (no active stage). A reopen nulls the executionState
+   * projection while the decision rows survive; when every stage is in this set
+   * nothing is re-armed and the requested `done` reaches the done-transition
+   * guard, which recovers the ladder from the same rows (SUP-14912). Absent
+   * counts as empty.
+   */
+  decidedStageIds?: readonly string[];
 };
 
 export type ReviewEscalationSignal = {
@@ -1850,8 +1860,17 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
   // non-in_review status or an assignee/unassign change dissolves the stuck
   // executionState. A requested in_review cannot be honoured — it would strand
   // the issue in_review with no active participant — so it fails loud instead
-  // of the silent empty patch.
-  if (!activeStage && input.allowBoardOverride && existingState?.status === COMPLETED_STATUS) {
+  // of the silent empty patch. A board `done`/`cancelled` is a close, not an
+  // escape hatch: the done guard reads the pre-patch row either way, so the
+  // close skips this branch, reaches the #7893 terminal no-op and keeps the
+  // completed ladder record (completedStageIds, approvalStatus) (SUP-24054).
+  const boardTerminalClose = requestedStatus === "done" || requestedStatus === "cancelled";
+  if (
+    !activeStage &&
+    input.allowBoardOverride &&
+    existingState?.status === COMPLETED_STATUS &&
+    !boardTerminalClose
+  ) {
     const attemptedBoardAdvance =
       requestedAssigneePatchProvided ||
       (requestedStatus !== undefined && requestedStatus !== "in_review");
@@ -2316,6 +2335,17 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     return { patch };
   }
 
+  // SUP-24054: durable approvals survive a reopen. When every stage has a current
+  // approved decision row, nothing is re-armed and the requested `done` reaches
+  // the done-transition guard, which recovers the ladder from the same rows
+  // (SUP-14912). A partial ladder re-arms from the start as before.
+  if (
+    requestedStatus === "done" &&
+    input.policy.stages.length > 0 &&
+    input.policy.stages.every((stage) => (input.decidedStageIds ?? []).includes(stage.id))
+  ) {
+    return { patch };
+  }
   let pendingStage =
     existingState?.status === CHANGES_REQUESTED_STATUS && currentStage
       ? currentStage
@@ -2668,6 +2698,98 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
 
 export function applyIssueMonitorPolicyTransition(input: TransitionInput): TransitionResult {
   return { patch: applyMonitorTransition(input, {}) };
+}
+
+/**
+ * SUP-24054: one `issue_execution_decisions` row, as the durable-approval check
+ * for a `done` request reads it.
+ */
+export type DurableApprovalDecisionRow = {
+  id: string;
+  stageId: string;
+  stageType: string;
+  outcome: string;
+  actorAgentId: string | null;
+  actorUserId: string | null;
+  createdAt: Date;
+};
+
+/** SUP-24054: the issue fields the durable-approval check reads. */
+export type DurableApprovalIssue = AssigneeLike & {
+  createdByAgentId?: string | null;
+  executionState?: IssueExecutionState | Record<string, unknown> | null;
+};
+
+/**
+ * SUP-24054 (release-assurance B1/B2): the current-policy stages whose durable
+ * approval still holds, for the all-stages-approved skip of a `done` workflow
+ * start (`decidedStageIds`). A stage counts only when its LATEST decision row
+ * is `approved` and the current policy would still accept that row. Anything
+ * else leaves the stage undecided, so the start re-arms review exactly as it
+ * does without durable approvals:
+ * - a row for a stage the current policy no longer carries proves the policy
+ *   was edited after that decision, so no approval counts;
+ * - the row's stage type differs from the current stage type;
+ * - the row's actor is not a current participant of the stage. A board
+ *   stage-decision row (SUP-15805) is checked through the participant it was
+ *   recorded for (`boardDecisionParticipants`, keyed by decision id); a user row
+ *   that is neither a participant nor a board stage decision does not count;
+ * - the row's actor, or the participant a board stage decision was recorded
+ *   for, is a self-approval principal: `resolveSelfApprovalPrincipals`, the
+ *   current assignee (the delivery author of the `done`) and the `closer` (the
+ *   principal requesting the `done`).
+ * A shrink that removed a stage with no decision row leaves the rows and the
+ * policy identical to a legit shorter ladder; this check cannot tell them apart.
+ */
+export function listCurrentPolicyApprovedStageIds(input: {
+  issue: DurableApprovalIssue;
+  policy: IssueExecutionPolicy;
+  decisions: readonly DurableApprovalDecisionRow[];
+  boardDecisionParticipants: ReadonlyMap<string, IssueExecutionStagePrincipal | null>;
+  closer: IssueExecutionStagePrincipal | null;
+}): string[] {
+  const stagesById = new Map(input.policy.stages.map((stage) => [stage.id, stage]));
+  if (input.decisions.some((decision) => !stagesById.has(decision.stageId))) return [];
+
+  const selfPrincipals = resolveSelfApprovalPrincipals(
+    input.policy as unknown as Record<string, unknown>,
+    (parseIssueExecutionState(input.issue.executionState) ?? {}) as Record<string, unknown>,
+    input.issue.createdByAgentId ?? null,
+  );
+  for (const principal of [assigneePrincipal(input.issue), input.closer]) {
+    if (principal?.type === "agent" && principal.agentId) selfPrincipals.agentIds.add(principal.agentId);
+    if (principal?.type === "user" && principal.userId) selfPrincipals.userIds.add(principal.userId);
+  }
+  const isSelf = (principal: IssueExecutionStagePrincipal | null) =>
+    principal !== null &&
+    (principal.type === "agent"
+      ? [...selfPrincipals.agentIds].some((agentId) => sameAgentId(agentId, principal.agentId))
+      : selfPrincipals.userIds.has(principal.userId ?? ""));
+  const isCurrentParticipant = (stage: IssueExecutionStage, principal: IssueExecutionStagePrincipal | null) =>
+    principal !== null &&
+    stage.participants.some((participant) =>
+      principal.type === "agent"
+        ? principalIsAgent(participant, principal.agentId ?? "")
+        : participant.type === "user" && participant.userId === principal.userId,
+    );
+
+  const approved: string[] = [];
+  for (const [stageId, latest] of latestDecisionPerStage(input.decisions)) {
+    const stage = stagesById.get(stageId)!;
+    if (latest.outcome !== "approved" || latest.stageType !== stage.type) continue;
+    const decider: IssueExecutionStagePrincipal | null = latest.actorAgentId
+      ? { type: "agent", agentId: latest.actorAgentId, userId: null }
+      : latest.actorUserId
+        ? { type: "user", userId: latest.actorUserId, agentId: null }
+        : null;
+    if (isSelf(decider)) continue;
+    const decidedFor = input.boardDecisionParticipants.has(latest.id)
+      ? input.boardDecisionParticipants.get(latest.id) ?? null
+      : decider;
+    if (isSelf(decidedFor) || !isCurrentParticipant(stage, decidedFor)) continue;
+    approved.push(stageId);
+  }
+  return approved;
 }
 
 export type BoardStageDecision = "approved" | "changes_requested";

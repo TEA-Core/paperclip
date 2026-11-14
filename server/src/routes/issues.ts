@@ -155,6 +155,7 @@ import {
   type IssueWakeDiagnosticsResponse,
   type IssueRelationIssueSummary,
   type IssueReviewPolicy,
+  type IssueExecutionStagePrincipal,
   type IssueUnblockDescriptor,
   type IssueThreadInteractionCanonicalResolverPolicy,
   type IssueComment,
@@ -248,7 +249,7 @@ import { evaluateApprovingLadder, evaluateCertificateProvenance } from "../servi
 import {
   evaluateStageIntegrity,
   resolveSelfApprovalPrincipals,
-  latestDecisionPerStage,
+  listDurablyApprovedStageIds,
   readApprovalHeadDelta,
   readApprovalPullRequest,
   type CandidateRow,
@@ -434,6 +435,8 @@ import {
   BoardStageNoUndecidedStageError,
   BoardStageSelfApprovalError,
   diagnoseMissingApprovalStage,
+  listCurrentPolicyApprovedStageIds,
+  type DurableApprovalIssue,
   isReviewChangesRequestedTransition,
   MISSING_APPROVAL_STAGE_ERROR_CODE,
   normalizeIssueExecutionPolicy,
@@ -6025,6 +6028,98 @@ export function issueRoutes(
         agent.status !== "terminated" &&
         agent.status !== "pending_approval",
     );
+  };
+  // SUP-24054: durable approvals survive a reopen. A reopen (or any write that
+  // nulls the projection) leaves the `issue_execution_decisions` rows in place,
+  // and the done-transition guard already counts them (SUP-14912). The engine's
+  // workflow start runs before the guard, so a `done` door passes it the stage
+  // ids whose durable approval still holds under the current policy
+  // (`listCurrentPolicyApprovedStageIds`, release-assurance B1/B2). Only a `done`
+  // request with no active stage starts the workflow; a pending or completed
+  // state never reads the set, so it pays no query.
+  const loadDurablyApprovedStageIdsForDone = async (
+    executor: Db,
+    input: {
+      issue: DurableApprovalIssue & { id: string; companyId: string };
+      policy: NormalizedExecutionPolicy | null;
+      requestedStatus: string | undefined;
+      /** The actor requesting the `done`; its own approvals never count. */
+      closer: { agentId: string | null; userId: string | null };
+    },
+  ): Promise<string[] | undefined> => {
+    if (input.requestedStatus !== "done" || !input.policy || input.policy.stages.length === 0) {
+      return undefined;
+    }
+    const stateStatus = parseIssueExecutionState(input.issue.executionState)?.status;
+    if (stateStatus === "pending" || stateStatus === "completed") return undefined;
+    const decisions = await executor
+      .select({
+        id: issueExecutionDecisions.id,
+        stageId: issueExecutionDecisions.stageId,
+        stageType: issueExecutionDecisions.stageType,
+        outcome: issueExecutionDecisions.outcome,
+        actorAgentId: issueExecutionDecisions.actorAgentId,
+        actorUserId: issueExecutionDecisions.actorUserId,
+        createdAt: issueExecutionDecisions.createdAt,
+      })
+      .from(issueExecutionDecisions)
+      .where(
+        and(
+          eq(issueExecutionDecisions.companyId, input.issue.companyId),
+          eq(issueExecutionDecisions.issueId, input.issue.id),
+        ),
+      );
+    // A board stage decision (SUP-15805) is recorded by the board user on a
+    // participant's behalf. The route writes the decision row and its
+    // `issue.board_stage_override` activity row in one transaction, so both carry
+    // the transaction's `created_at`; the activity row names the participant the
+    // board decided for, which the current-participant check compares.
+    const boardDecisionParticipants = new Map<string, IssueExecutionStagePrincipal | null>();
+    if (decisions.some((decision) => !decision.actorAgentId && decision.actorUserId)) {
+      const overrides = await executor
+        .select({ createdAt: activityLog.createdAt, details: activityLog.details })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, input.issue.companyId),
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, input.issue.id),
+            eq(activityLog.action, "issue.board_stage_override"),
+          ),
+        );
+      for (const decision of decisions) {
+        if (decision.actorAgentId || !decision.actorUserId) continue;
+        const override = overrides.find(
+          (row) =>
+            row.createdAt.getTime() === decision.createdAt.getTime() &&
+            (row.details as Record<string, unknown> | null)?.stageId === decision.stageId,
+        );
+        if (!override) continue;
+        const displaced = (override.details as Record<string, unknown>).displacedParticipant as
+          | { type?: unknown; agentId?: unknown; userId?: unknown }
+          | null
+          | undefined;
+        boardDecisionParticipants.set(
+          decision.id,
+          displaced?.type === "agent" && typeof displaced.agentId === "string"
+            ? { type: "agent", agentId: displaced.agentId, userId: null }
+            : displaced?.type === "user" && typeof displaced.userId === "string"
+              ? { type: "user", userId: displaced.userId, agentId: null }
+              : null,
+        );
+      }
+    }
+    return listCurrentPolicyApprovedStageIds({
+      issue: input.issue,
+      policy: input.policy,
+      decisions,
+      boardDecisionParticipants,
+      closer: input.closer.agentId
+        ? { type: "agent", agentId: input.closer.agentId, userId: null }
+        : input.closer.userId
+          ? { type: "user", userId: input.closer.userId, agentId: null }
+          : null,
+    });
   };
   const projectsSvc = projectService(db);
   const goalsSvc = goalService(db);
@@ -12663,10 +12758,7 @@ export function issueRoutes(
               eq(issueExecutionDecisions.issueId, id),
             ),
           );
-        const decidedStageIds = Array.from(latestDecisionPerStage(decidedRows).values())
-          .filter((decision) => decision.outcome === "approved")
-          .filter((decision) => policyStageIdSet.has(decision.stageId))
-          .map((decision) => decision.stageId);
+        const decidedStageIds = listDurablyApprovedStageIds(decidedRows, policyStageIdSet);
 
         let result: ReturnType<typeof applyBoardStageDecision>;
         try {
@@ -14434,6 +14526,15 @@ export function issueRoutes(
                 policy: executionPolicy,
                 executionState: lockedIssue.executionState,
                 requestedStatus: sourceIssueStatus,
+              }),
+              decidedStageIds: await loadDurablyApprovedStageIdsForDone(tx as unknown as Db, {
+                issue: lockedIssue,
+                policy: executionPolicy,
+                requestedStatus: sourceIssueStatus,
+                closer: {
+                  agentId: actor.agentId ?? null,
+                  userId: actor.actorType === "user" ? actor.actorId : null,
+                },
               }),
             });
             const recoveryDecisionId = transition.decision ? randomUUID() : null;
@@ -19786,6 +19887,16 @@ export function issueRoutes(
     })
       ? await resolveSummaryGenerationReturnAssignee(db, existing)
       : null;
+    const doneCloser = {
+      agentId: actor.agentId ?? null,
+      userId: actor.actorType === "user" ? actor.actorId : null,
+    };
+    const durablyApprovedStageIds = await loadDurablyApprovedStageIdsForDone(db, {
+      issue: existing,
+      policy: nextExecutionPolicy,
+      requestedStatus: requestedTransitionStatus,
+      closer: doneCloser,
+    });
     const transition = applyIssueExecutionPolicyTransition({
       issue: existing,
       policy: nextExecutionPolicy,
@@ -19815,6 +19926,7 @@ export function issueRoutes(
         executionState: existing.executionState,
         requestedStatus: requestedTransitionStatus,
       }),
+      decidedStageIds: durablyApprovedStageIds,
     });
     const decisionId = transition.decision ? randomUUID() : null;
     if (decisionId) {
@@ -20408,6 +20520,12 @@ export function issueRoutes(
       return;
     }
     const isDoneRequest = effectiveStatus === "done" && existing.status !== "done";
+    // SUP-24054: this `done` skips review because every policy stage holds a
+    // durable approval (no active stage, so the engine left `done` in place).
+    const durableApprovalClose =
+      isDoneRequest &&
+      Boolean(nextExecutionPolicy?.stages.length) &&
+      nextExecutionPolicy!.stages.every((stage) => durablyApprovedStageIds?.includes(stage.id));
     // SUP-15878: a card with open children and no approval stage in its
     // executionPolicy can never reach a recorded approval decision. Diagnose the
     // gap once, up front: a `done` request is refused with a typed 409 inside the
@@ -20576,8 +20694,34 @@ export function issueRoutes(
             nextExecutionPolicy?.stallEscalation ||
             readState?.stallHandoff,
           ));
-      if (!stallLockRequired && !recordsDecision) return;
+      if (!stallLockRequired && !recordsDecision && !durableApprovalClose) return;
       const locked = await svc.getByIdForUpdate(id, tx);
+      // SUP-24054 (release-assurance B3): the durable approvals were read
+      // without the row lock. Re-read the policy, the execution state and the
+      // decision rows under it, so a board re-arm, a reviewer's changes_requested
+      // or a policy edit that committed first refuses this close instead of
+      // being overwritten by it. A `done` PATCH always takes the transactional
+      // write path (`reviewPolicySensitiveMutationRequested`), which runs this.
+      if (durableApprovalClose) {
+        const lockedApprovedStageIds = locked
+          ? await loadDurablyApprovedStageIdsForDone(tx as unknown as Db, {
+              issue: locked,
+              policy: nextExecutionPolicy,
+              requestedStatus: "done",
+              closer: doneCloser,
+            })
+          : undefined;
+        if (
+          !isDeepStrictEqual(locked?.executionPolicy ?? null, existing.executionPolicy ?? null) ||
+          !nextExecutionPolicy!.stages.every((stage) => lockedApprovedStageIds?.includes(stage.id))
+        ) {
+          throw conflict(
+            "The execution policy, the execution state or the stage decisions changed while this close was in flight; the card was not closed. Re-read the issue before closing it.",
+            { code: "durable_approval_close_conflict", issueId: existing.id },
+          );
+        }
+      }
+      if (!stallLockRequired && !recordsDecision) return;
       const lockedState = parseIssueExecutionState(locked?.executionState ?? null);
       if (
         stallLockRequired && (
@@ -26097,6 +26241,15 @@ export function issueRoutes(
           userId: actor.actorType === "user" ? actor.actorId : null,
         },
         commentBody,
+        decidedStageIds: await loadDurablyApprovedStageIdsForDone(db, {
+          issue: currentIssue,
+          policy: currentExecutionPolicy,
+          requestedStatus: "done",
+          closer: {
+            agentId: actor.agentId ?? null,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+        }),
       });
 
       // This route is a second door onto `done` and used to run neither done-guard, so

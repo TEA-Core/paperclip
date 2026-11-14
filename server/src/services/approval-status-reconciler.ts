@@ -1263,6 +1263,23 @@ export function latestDecisionPerStage<T extends { stageId: string; createdAt: D
 }
 
 /**
+ * SUP-24054: the stage ids of `policyStageIds` whose LATEST durable decision
+ * ({@link latestDecisionPerStage}) is `approved`. This is the decision-table view
+ * of ladder satisfaction that survives a reopen nulling the executionState
+ * projection (SUP-14912). A later `changes_requested` supersedes an earlier
+ * approval, and a stage with no decision row is absent, so both stay undecided
+ * (fail closed). A row for a stage outside the current policy is ignored.
+ */
+export function listDurablyApprovedStageIds<
+  T extends { stageId: string; createdAt: Date; id: string; outcome: string },
+>(decisions: readonly T[], policyStageIds: Iterable<string>): string[] {
+  const policyStageIdSet = new Set(policyStageIds);
+  return Array.from(latestDecisionPerStage(decisions).values())
+    .filter((decision) => decision.outcome === "approved" && policyStageIdSet.has(decision.stageId))
+    .map((decision) => decision.stageId);
+}
+
+/**
  * ADR-073 / ADR-092 stage-integrity audit of the recorded approval. Returns a
  * skip verdict when the "approved" record is not backed by a real, non-self
  * decision: an auto-skipped review stage writes no decision row and lands in
