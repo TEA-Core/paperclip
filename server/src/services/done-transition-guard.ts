@@ -2025,21 +2025,22 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
 // accepted as fresh proof. The guard now loads the closing run's
 // `heartbeat_runs` row and refuses an observation that predates the run's
 // start (`startedAt ?? createdAt` — both precede any probe the run itself can
-// make) or that postdates the evaluation by more than a clock-skew allowance,
-// with the reason naming the run and its start. Fail-closed: a closing run
+// make) or that postdates the evaluation (SUP-24266: no clock-skew allowance —
+// the evaluation precedes the close write that carries the declaration, so an
+// observed instant later than it is later than the close), with the reason
+// naming the run and its start. Fail-closed: a closing run
 // whose row cannot be resolved has no verifiable lifetime, so the observation
 // cannot be attributed to it. The merge-head grammar has no `observed`
 // component and its origin predicate (probe head == delivery merge head) is
 // unchanged: it is stamped with the closing run id but never lifetime-gated.
 // Doors without a run id (human closes, the system backstop) have no lifetime
-// to compare against; they keep the pre-existing grammar checks only, and the
+// to compare against; they keep the pre-existing grammar checks plus the
+// future-observed refusal (SUP-24266, applied to every closer), and the
 // audit row's null `closingRunId` says so. Every accepted result — both forms —
 // is stamped with `closingRunId`/`closingRunStartedAt` so the
 // `issue.done_transition_tier2_close` activity row carries the closing run
 // identity beside the cited observation (SUP-23366's machine record).
 // ───────────────────────────────────────────────────────────────────────
-const TIER2_OBSERVED_CLOCK_SKEW_MS = 5 * 60 * 1000;
-
 async function loadClosingRunStart(
   db: Db,
   companyId: string,
@@ -2076,6 +2077,17 @@ async function attributeTier2EvidenceToClosingRun(
   // no observation instant to place inside the run's lifetime.
   if (audit.tierForm !== "record-only") {
     return { ...result, tier2Audit: audit };
+  }
+  const latestObserved = audit.observedRangeEnd ?? audit.observed;
+  const latestObservedMs = latestObserved ? Date.parse(latestObserved) : Number.NaN;
+  if (!Number.isNaN(latestObservedMs) && latestObservedMs > Date.now()) {
+    return refuseTier2(
+      `record-only close Tier 2 probe evidence names observed instant ${latestObserved}, which postdates this ` +
+        "close; an observation cannot be made after the close that cites it, and it must fall inside the " +
+        "closing run, at or before the close write. Re-probe from this run and close with the fresh observed " +
+        "timestamp. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
   }
   if (!runId) {
     // An agent closer has no excuse: every agent request can carry the run id
@@ -2122,16 +2134,6 @@ async function attributeTier2EvidenceToClosingRun(
         `closing run (run ${runId}, started ${runStart.toISOString()}); an observation made before this run began ` +
         "is another run's observation restated, not this run's live proof. Re-probe from this run and close " +
         "with the fresh observed timestamp. " +
-        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
-    );
-  }
-  const latestObserved = audit.observedRangeEnd ?? audit.observed;
-  const latestObservedMs = latestObserved ? Date.parse(latestObserved) : Number.NaN;
-  if (!Number.isNaN(latestObservedMs) && latestObservedMs > Date.now() + TIER2_OBSERVED_CLOCK_SKEW_MS) {
-    return refuseTier2(
-      `record-only close Tier 2 probe evidence names observed instant ${latestObserved}, which postdates this ` +
-        "evaluation by more than the allowed clock skew; an observation cannot be made after the close that " +
-        "cites it. " +
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }

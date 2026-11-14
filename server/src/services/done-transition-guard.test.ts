@@ -6498,7 +6498,7 @@ describe("evaluateDoneTierDeclaration", () => {
         expect(result.reason).toContain("run run-1");
       });
 
-      it("refuses an observation postdating the evaluation beyond the clock-skew allowance", async () => {
+      it("refuses an observation postdating the evaluation", async () => {
         setupDbMock({ heartbeatRuns: [seededRun("2026-11-04T08:00:00Z")] });
         const future = new Date(Date.now() + 30 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
         const result = await evaluateDoneTierDeclaration(
@@ -6509,8 +6509,127 @@ describe("evaluateDoneTierDeclaration", () => {
           () => Promise.resolve([]),
         );
         expect(result.allowed).toBe(false);
-        expect(result.reason).toContain("postdates this evaluation");
+        expect(result.reason).toContain("postdates this close");
         expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+      });
+
+      // SUP-24266: SUP-24211's close write completed at 08:19:28.726Z, yet the
+      // accepted declaration said `observed 2026-11-14T08:20:00Z` — an
+      // observation 31 s after the close. The old guard allowed 5 minutes of
+      // "clock skew" past the evaluation and accepted it as guard-accepted.
+      describe("observation must not postdate the close write (SUP-24266)", () => {
+        const CLOSE_WRITE_AT = "2026-11-14T08:19:28.726Z";
+
+        function probeEvidenceObservedAt(observation: string) {
+          return `record-only probe \`git status --porcelain=v1 && git diff --exit-code\` target SUP-24211 execution workspace observed ${observation} result: pass clean worktree with no tracked changes`;
+        }
+
+        async function closeAt(observation: string, runStartedAt = "2026-11-14T08:00:00Z") {
+          setupDbMock({ heartbeatRuns: [seededRun(runStartedAt)] });
+          vi.useFakeTimers({ toFake: ["Date"] });
+          vi.setSystemTime(new Date(CLOSE_WRITE_AT));
+          try {
+            return await evaluateDoneTierDeclaration(
+              mockDb,
+              recordOnlyTierIssue(),
+              tier2Line(probeEvidenceObservedAt(observation)),
+              "run-1",
+              () => Promise.resolve([]),
+            );
+          } finally {
+            vi.useRealTimers();
+          }
+        }
+
+        it("refuses the SUP-24211 shape: observed 31 s after the close write", async () => {
+          const result = await closeAt("2026-11-14T08:20:00Z");
+          expect(result.allowed).toBe(false);
+          expect(result.tier).toBe(null);
+          expect(result.reason).toContain("observed instant 2026-11-14T08:20:00Z");
+          expect(result.reason).toContain("postdates this close");
+          expect(result.reason).toContain("at or before the close write");
+          expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+          expect(result.tier2Audit).toBeUndefined();
+        });
+
+        it("refuses a range whose end postdates the close write even when its start is lawful", async () => {
+          const result = await closeAt("2026-11-14T08:19:00Z-2026-11-14T08:20:00Z");
+          expect(result.allowed).toBe(false);
+          expect(result.reason).toContain("observed instant 2026-11-14T08:20:00Z");
+          expect(result.reason).toContain("postdates this close");
+        });
+
+        it("refuses an observation one millisecond after the close write", async () => {
+          const result = await closeAt("2026-11-14T08:19:28.727Z");
+          expect(result.allowed).toBe(false);
+          expect(result.reason).toContain("postdates this close");
+        });
+
+        it("positive control: accepts an observation exactly at the close write", async () => {
+          const result = await closeAt(CLOSE_WRITE_AT);
+          expect(result.allowed).toBe(true);
+          expect(result.tier).toBe("tier2");
+          expect(result.tier2Audit).toMatchObject({ observed: CLOSE_WRITE_AT, closingRunId: "run-1" });
+        });
+
+        it("positive control: accepts a same-run observation before the close write, single instant and range", async () => {
+          const single = await closeAt("2026-11-14T08:19:20Z");
+          expect(single.allowed).toBe(true);
+          expect(single.tier).toBe("tier2");
+          expect(single.tier2Audit).toMatchObject({
+            observed: "2026-11-14T08:19:20Z",
+            closingRunId: "run-1",
+            closingRunStartedAt: "2026-11-14T08:00:00.000Z",
+          });
+          const range = await closeAt("2026-11-14T08:19:10Z-2026-11-14T08:19:28Z");
+          expect(range.allowed).toBe(true);
+          expect(range.tier2Audit).toMatchObject({ observed: "2026-11-14T08:19:10Z", observedRangeEnd: "2026-11-14T08:19:28Z" });
+        });
+
+        it("pins unchanged behavior for an observation far in the past: refused only when it predates the run, accepted inside the run", async () => {
+          const predating = await closeAt("2026-11-01T00:00:00Z");
+          expect(predating.allowed).toBe(false);
+          expect(predating.reason).toContain("predates the closing run");
+          const insideLongRun = await closeAt("2026-11-01T00:00:00Z", "2026-10-31T00:00:00Z");
+          expect(insideLongRun.allowed).toBe(true);
+          expect(insideLongRun.tier2Audit).toMatchObject({ observed: "2026-11-01T00:00:00Z" });
+        });
+
+        async function closeWithNoRunAt(observation: string) {
+          setupDbMock({ heartbeatRuns: [] });
+          vi.useFakeTimers({ toFake: ["Date"] });
+          vi.setSystemTime(new Date(CLOSE_WRITE_AT));
+          try {
+            return await evaluateDoneTierDeclaration(
+              mockDb,
+              recordOnlyTierIssue(),
+              tier2Line(probeEvidenceObservedAt(observation)),
+              null,
+              () => Promise.resolve([]),
+            );
+          } finally {
+            vi.useRealTimers();
+          }
+        }
+
+        it("refuses the SUP-24211 shape from a no-run (human/system) closer too", async () => {
+          const result = await closeWithNoRunAt("2026-11-14T08:20:00Z");
+          expect(result.allowed).toBe(false);
+          expect(result.tier).toBe(null);
+          expect(result.reason).toContain("postdates this close");
+          expect(result.tier2Audit).toBeUndefined();
+        });
+
+        it("positive control: a no-run closer with a lawful observed instant still closes, grammar-only", async () => {
+          const result = await closeWithNoRunAt("2026-11-14T08:19:20Z");
+          expect(result.allowed).toBe(true);
+          expect(result.tier).toBe("tier2");
+          expect(result.tier2Audit).toMatchObject({
+            observed: "2026-11-14T08:19:20Z",
+            closingRunId: null,
+            closingRunStartedAt: null,
+          });
+        });
       });
 
       it("keeps doors without a run id on the grammar checks alone and records the absent closing run", async () => {
