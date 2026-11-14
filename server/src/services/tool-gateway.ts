@@ -7627,6 +7627,43 @@ export function createToolGatewayService(
     }
   }
 
+  /**
+   * Replay of a persisted invocation that did NOT succeed must never come back
+   * as a success-shaped response with a null result: the caller would mistake
+   * "replayed" for "executed fine". Surface the persisted failure explicitly
+   * (reasonCode/message recorded at failure time) and flag it as a replay.
+   */
+  function replayedInvocationFailure(
+    invocation: typeof toolInvocations.$inferSelect,
+  ): ToolGatewayHttpError {
+    const status =
+      invocation.status === "timed_out" ? 504
+        : invocation.status === "rate_limited" ? 429
+          : invocation.status === "denied" ? 403
+            : 502;
+    const reasonCode = invocation.errorCode ?? "tool_execution_failed";
+    const message =
+      invocation.errorMessage
+      ?? `Tool invocation replayed with terminal status ${invocation.status}`;
+    return new ToolGatewayHttpError(status, message, reasonCode, {
+      invocationId: invocation.id,
+      replayed: true,
+      originalStatus: invocation.status,
+    });
+  }
+
+  function isReplayableFailure(
+    invocation: typeof toolInvocations.$inferSelect,
+  ): boolean {
+    return (
+      invocation.status === "failed"
+      || invocation.status === "timed_out"
+      || invocation.status === "cancelled"
+      || invocation.status === "denied"
+      || invocation.status === "rate_limited"
+    );
+  }
+
   async function actionRequestResolution(
     actionRequest: typeof toolActionRequests.$inferSelect,
   ) {
@@ -8354,6 +8391,12 @@ export function createToolGatewayService(
       );
     }
     if (actionRequest.status === "executed") {
+      // An approved action request can only reach "executed" after the
+      // invocation completed; if that invocation nonetheless failed, surface
+      // the persisted failure instead of replaying a success-shaped null.
+      if (isReplayableFailure(invocation)) {
+        throw replayedInvocationFailure(invocation);
+      }
       return {
         matched: true as const,
         result: storedInvocationResult(invocation),
@@ -10547,6 +10590,36 @@ export function createToolGatewayService(
           ? await claimSlackRateLimitRetry(db, { companyId: session.companyId, agentId: session.agentId, runId: session.runId, issueId: session.issueId, endpointId: String(asRecord(tool.providerMetadata)?.endpointId ?? ""), identityContextId: session.identityContextId }, invocationId)
           : false;
         if (recorded.replayed && !retryingSlackRateLimit) {
+          // Slack connector replays ride the chat-action lifecycle (rate-limit
+          // retry windows, uncertain-delivery reconciliation) and must keep
+          // resolving with the stored outcome; every other replayed failure
+          // surfaces explicitly instead of a success-shaped result.
+          const slackConnectorReplay =
+            tool.providerType === "paperclip_slack_chat";
+          if (
+            isReplayableFailure(recorded.invocation)
+            && !slackConnectorReplay
+          ) {
+            const replayFailure = replayedInvocationFailure(recorded.invocation);
+            await writeAudit({
+              session,
+              companyId: session.companyId,
+              agentId: session.agentId,
+              runId: session.runId,
+              issueId: session.issueId,
+              action: "tool_gateway.call_failed",
+              details: {
+                invocationId,
+                decision: "deny",
+                reasonCode: replayFailure.reasonCode,
+                tool: tool.name,
+                ...toolAuditMetadata(tool),
+                replayed: true,
+                originalStatus: recorded.invocation.status,
+              },
+            });
+            throw replayFailure;
+          }
           await writeAudit({
             session,
             companyId: session.companyId,
@@ -11044,6 +11117,27 @@ export function createToolGatewayService(
       invocationId = recorded.invocation.id;
 
       if (recorded.replayed) {
+        if (isReplayableFailure(recorded.invocation)) {
+          const replayFailure = replayedInvocationFailure(recorded.invocation);
+          await writeAudit({
+            session: sessionLike,
+            companyId: input.runContext.companyId,
+            agentId: input.runContext.agentId,
+            runId: input.runContext.runId,
+            issueId: context.issueId,
+            action: "tool_gateway.call_failed",
+            details: {
+              invocationId,
+              decision: "deny",
+              reasonCode: replayFailure.reasonCode,
+              tool: input.tool,
+              ...toolAuditMetadata(tool),
+              replayed: true,
+              originalStatus: recorded.invocation.status,
+            },
+          });
+          throw replayFailure;
+        }
         // Same projection as the first execution ({pluginId, toolName,
         // result}): the persisted payload parsed from its summary, not the
         // summary wrapper row itself.
