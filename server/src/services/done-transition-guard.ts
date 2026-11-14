@@ -2025,8 +2025,10 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
 // accepted as fresh proof. The guard now loads the closing run's
 // `heartbeat_runs` row and refuses an observation that predates the run's
 // start (`startedAt ?? createdAt` — both precede any probe the run itself can
-// make) or that postdates the evaluation by more than a clock-skew allowance,
-// with the reason naming the run and its start. Fail-closed: a closing run
+// make) or that postdates the evaluation (SUP-24266: no clock-skew allowance —
+// the evaluation precedes the close write that carries the declaration, so an
+// observed instant later than it is later than the close), with the reason
+// naming the run and its start. Fail-closed: a closing run
 // whose row cannot be resolved has no verifiable lifetime, so the observation
 // cannot be attributed to it. The merge-head grammar has no `observed`
 // component and its origin predicate (probe head == delivery merge head) is
@@ -2038,8 +2040,6 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
 // `issue.done_transition_tier2_close` activity row carries the closing run
 // identity beside the cited observation (SUP-23366's machine record).
 // ───────────────────────────────────────────────────────────────────────
-const TIER2_OBSERVED_CLOCK_SKEW_MS = 5 * 60 * 1000;
-
 async function loadClosingRunStart(
   db: Db,
   companyId: string,
@@ -2127,11 +2127,12 @@ async function attributeTier2EvidenceToClosingRun(
   }
   const latestObserved = audit.observedRangeEnd ?? audit.observed;
   const latestObservedMs = latestObserved ? Date.parse(latestObserved) : Number.NaN;
-  if (!Number.isNaN(latestObservedMs) && latestObservedMs > Date.now() + TIER2_OBSERVED_CLOCK_SKEW_MS) {
+  if (!Number.isNaN(latestObservedMs) && latestObservedMs > Date.now()) {
     return refuseTier2(
       `record-only close Tier 2 probe evidence names observed instant ${latestObserved}, which postdates this ` +
-        "evaluation by more than the allowed clock skew; an observation cannot be made after the close that " +
-        "cites it. " +
+        "close; an observation cannot be made after the close that cites it, and it must fall inside the " +
+        "closing run, at or before the close write. Re-probe from this run and close with the fresh observed " +
+        "timestamp. " +
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
