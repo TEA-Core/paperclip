@@ -1033,6 +1033,40 @@ describeEmbeddedPostgres(
       expect((await request(pluginWorker).get(`/api/issues/${created.body.id}`)).status).toBe(200);
     });
 
+    it("refuses a parentless low-trust root create even with tasks:assign while in-boundary child creates still work", async () => {
+      const fixture = await seedLowTrustFixture(db);
+      await db.insert(principalPermissionGrants).values({
+        companyId: fixture.company.id,
+        principalType: "agent",
+        principalId: fixture.agents.lowTrust.id,
+        permissionKey: "tasks:assign",
+        grantedByUserId: null,
+      });
+      const app = createApp(db, agentActor(fixture));
+
+      const root = await request(app)
+        .post(`/api/companies/${fixture.company.id}/issues`)
+        .send({ title: "Parentless root create", assigneeAgentId: fixture.agents.lowTrust.id });
+      expect(root.status, JSON.stringify(root.body)).toBe(403);
+      expect(root.body.error).toBe(
+        "Low-trust agents must create child issues inside their assigned boundary",
+      );
+
+      const child = await request(app)
+        .post(`/api/companies/${fixture.company.id}/issues`)
+        .send({
+          title: "In-boundary child",
+          parentId: fixture.issues.assignedReview.id,
+          assigneeAgentId: fixture.agents.lowTrust.id,
+        });
+      expect(child.status, JSON.stringify(child.body)).toBe(201);
+
+      const viaChildren = await request(app)
+        .post(`/api/issues/${fixture.issues.assignedReview.id}/children`)
+        .send({ title: "In-boundary child via children route", assigneeAgentId: fixture.agents.lowTrust.id });
+      expect(viaChildren.status, JSON.stringify(viaChildren.body)).toBe(201);
+    });
+
     it("allows bounded same-issue reads and writes while quarantining low-trust output", async () => {
       const fixture = await seedLowTrustFixture(db);
       const app = createApp(db, agentActor(fixture));

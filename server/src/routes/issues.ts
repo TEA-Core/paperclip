@@ -17078,6 +17078,25 @@ export function issueRoutes(
         ? null
         : rawCreateBody.parentId;
       let createParent: Awaited<ReturnType<typeof svc.getById>> | null = null;
+      if (
+        req.actor.type === "agent" &&
+        !effectiveParentId &&
+        !watchdogProductBugFollowUp &&
+        !isTaskBridgeKeyActor(req)
+      ) {
+        const companyScopeDecision = await access.decide({
+          actor: req.actor,
+          action: "company_scope:read",
+          resource: { type: "company", companyId },
+        });
+        if (!companyScopeDecision.allowed) {
+          res.status(403).json({
+            error:
+              "Low-trust agents must create child issues inside their assigned boundary",
+          });
+          return;
+        }
+      }
       if (req.actor.type === "agent" && effectiveParentId) {
         createParent = await svc.getById(effectiveParentId);
         if (!createParent || createParent.companyId !== companyId) {
