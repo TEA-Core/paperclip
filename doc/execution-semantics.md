@@ -194,6 +194,16 @@ The active-lock lifecycle is part of the checkout contract:
 
 Stale-lock recovery is crash recovery, not a retry loop. Paperclip must not clear or adopt locks held by non-terminal runs. After stale cleanup, a checkout `409` should mean a real live owner, status/assignee mismatch, unresolved blocker, or active gate still prevents checkout. Agents must treat that `409` as an ownership conflict and stop rather than retrying the same checkout.
 
+An agent run can claim an issue for its own agent with one PATCH that sets
+`status: "in_progress"` and sets `assigneeAgentId` to that agent. When the
+writing run is `running` and its run context names no issue or this issue, that
+PATCH does not enqueue an `issue_assigned` wake for the agent. The claiming run
+executes the claim and takes the checkout itself. A wake would dispatch a second
+live run of the same agent on the issue, and that run would take the checkout
+from the claiming run. A board or user claim, a claim for a different agent, an
+assignment that does not set `in_progress`, and a claim from a run scoped to a
+different issue still wake the assignee.
+
 A non-final workflow handoff may change the assignee while its issuing run is
 still running. Only an issuer whose run context names this issue is exempt from
 its own handoff PATCH's cancellation. For any other issuer, the handoff is saved
