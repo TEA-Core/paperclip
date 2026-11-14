@@ -6594,6 +6594,42 @@ describe("evaluateDoneTierDeclaration", () => {
           expect(insideLongRun.allowed).toBe(true);
           expect(insideLongRun.tier2Audit).toMatchObject({ observed: "2026-11-01T00:00:00Z" });
         });
+
+        async function closeWithNoRunAt(observation: string) {
+          setupDbMock({ heartbeatRuns: [] });
+          vi.useFakeTimers({ toFake: ["Date"] });
+          vi.setSystemTime(new Date(CLOSE_WRITE_AT));
+          try {
+            return await evaluateDoneTierDeclaration(
+              mockDb,
+              recordOnlyTierIssue(),
+              tier2Line(probeEvidenceObservedAt(observation)),
+              null,
+              () => Promise.resolve([]),
+            );
+          } finally {
+            vi.useRealTimers();
+          }
+        }
+
+        it("refuses the SUP-24211 shape from a no-run (human/system) closer too", async () => {
+          const result = await closeWithNoRunAt("2026-11-14T08:20:00Z");
+          expect(result.allowed).toBe(false);
+          expect(result.tier).toBe(null);
+          expect(result.reason).toContain("postdates this close");
+          expect(result.tier2Audit).toBeUndefined();
+        });
+
+        it("positive control: a no-run closer with a lawful observed instant still closes, grammar-only", async () => {
+          const result = await closeWithNoRunAt("2026-11-14T08:19:20Z");
+          expect(result.allowed).toBe(true);
+          expect(result.tier).toBe("tier2");
+          expect(result.tier2Audit).toMatchObject({
+            observed: "2026-11-14T08:19:20Z",
+            closingRunId: null,
+            closingRunStartedAt: null,
+          });
+        });
       });
 
       it("keeps doors without a run id on the grammar checks alone and records the absent closing run", async () => {

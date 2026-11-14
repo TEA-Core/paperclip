@@ -2077,6 +2077,17 @@ async function attributeTier2EvidenceToClosingRun(
   if (audit.tierForm !== "record-only") {
     return { ...result, tier2Audit: audit };
   }
+  const latestObserved = audit.observedRangeEnd ?? audit.observed;
+  const latestObservedMs = latestObserved ? Date.parse(latestObserved) : Number.NaN;
+  if (!Number.isNaN(latestObservedMs) && latestObservedMs > Date.now()) {
+    return refuseTier2(
+      `record-only close Tier 2 probe evidence names observed instant ${latestObserved}, which postdates this ` +
+        "close; an observation cannot be made after the close that cites it, and it must fall inside the " +
+        "closing run, at or before the close write. Re-probe from this run and close with the fresh observed " +
+        "timestamp. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
+  }
   if (!runId) {
     // An agent closer has no excuse: every agent request can carry the run id
     // header (or close from the issue's own checkout run), so an agent
@@ -2122,17 +2133,6 @@ async function attributeTier2EvidenceToClosingRun(
         `closing run (run ${runId}, started ${runStart.toISOString()}); an observation made before this run began ` +
         "is another run's observation restated, not this run's live proof. Re-probe from this run and close " +
         "with the fresh observed timestamp. " +
-        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
-    );
-  }
-  const latestObserved = audit.observedRangeEnd ?? audit.observed;
-  const latestObservedMs = latestObserved ? Date.parse(latestObserved) : Number.NaN;
-  if (!Number.isNaN(latestObservedMs) && latestObservedMs > Date.now()) {
-    return refuseTier2(
-      `record-only close Tier 2 probe evidence names observed instant ${latestObserved}, which postdates this ` +
-        "close; an observation cannot be made after the close that cites it, and it must fall inside the " +
-        "closing run, at or before the close write. Re-probe from this run and close with the fresh observed " +
-        "timestamp. " +
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
