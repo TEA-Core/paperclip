@@ -14,6 +14,8 @@ import { logActivity } from "../services/activity-log.js";
 import { secretService } from "../services/secrets.js";
 import {
   BROKER_GITHUB_APP_ENV,
+  GITHUB_CANONICAL_HOST,
+  canonicalGitHubRepoRef,
   normalizeRepoUrl,
   resolveAppInstallationToken,
   resolveBrokerGitHubApp,
@@ -22,7 +24,21 @@ import {
   type GitHubTokenResolution,
 } from "../services/github-credential.js";
 
+const WRITER_AUDITOR_AGENT_ID = "d051c75c-b20f-4efb-87cf-76f73e349a29";
+
 type InstallationTokenBody = z.infer<typeof agentInstallationTokenRequestSchema>;
+
+/**
+ * What `assertRepoReachable` authorized: the assurance flag plus the owner/repo
+ * the mint must use. On the writer-Auditor assurance path these are the
+ * registered workspace's canonical GitHub strings; on every other path they are
+ * the request's own values.
+ */
+type RepoAuthorization = {
+  useAssurancePermissions: boolean;
+  owner: string;
+  repo: string;
+};
 
 type AgentGitHubTokenRoutesDeps = {
   secrets?: AppInstallationTokenSecrets;
@@ -72,7 +88,12 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
   // actually assigned to (issues assigned to it in this company), not just any
   // company project workspace — so an agent cannot mint a token for a project it
   // has no business touching.
-  async function assertRepoReachable(companyId: string, agentId: string, owner: string, repo: string) {
+  async function assertRepoReachable(
+    companyId: string,
+    agentId: string,
+    owner: string,
+    repo: string,
+  ): Promise<RepoAuthorization> {
     const normalizedRepo = normalizeRepoUrl(`${owner}/${repo}`);
 
     const assignedIssueRows = await db
@@ -82,7 +103,8 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
     const assignedProjectIds = new Set(
       assignedIssueRows.map((row) => row.projectId).filter((id): id is string => typeof id === "string"),
     );
-    if (assignedProjectIds.size === 0) {
+    const isWriterAuditor = agentId === WRITER_AUDITOR_AGENT_ID;
+    if (assignedProjectIds.size === 0 && !isWriterAuditor) {
       // This is an assignment gate, not a missing-workspace one: the agent holds no
       // assigned issue anywhere in this company, so it can reach no project. Do NOT
       // claim a workspace is missing — the requested repo may well be registered.
@@ -95,6 +117,49 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
       .select({ projectId: projectWorkspaces.projectId, repoUrl: projectWorkspaces.repoUrl })
       .from(projectWorkspaces)
       .where(eq(projectWorkspaces.companyId, companyId));
+    const registeredForRepo = workspaceRows.some(
+      (row) => typeof row.repoUrl === "string" && normalizeRepoUrl(row.repoUrl) === normalizedRepo,
+    );
+    if (isWriterAuditor) {
+      // SUP-23880: the writer-Auditor exception authorizes exactly one
+      // company-registered GitHub repository, matched against that registration's
+      // CANONICAL owner/repo strings with its host intact. `normalizeRepoUrl`
+      // erases the host and the casing, so a same-named non-GitHub registration
+      // and every alias spelling (different case, trailing `.git`, URL-form
+      // owner, trailing whitespace) would otherwise normalize into an
+      // authorization match. Both must refuse, fail closed.
+      const canonicalGitHubRows = workspaceRows.flatMap((row) =>
+        typeof row.repoUrl === "string" ? [canonicalGitHubRepoRef(row.repoUrl)] : [],
+      );
+      const exact = canonicalGitHubRows.find(
+        (ref) => ref !== null && ref.owner === owner && ref.repo === repo,
+      );
+      if (exact) {
+        return { useAssurancePermissions: true, owner: exact.owner, repo: exact.repo };
+      }
+      // Alias detection normalizes each segment separately: a trailing-space owner
+      // stops matching once the segments are joined (`TEA-Core /paperclip`), yet it
+      // is still an alias of the registered `TEA-Core` and must refuse by naming
+      // the canonical form, not as an unregistered repo.
+      const aliasGitHub = canonicalGitHubRows.find(
+        (ref) =>
+          ref !== null &&
+          normalizeRepoUrl(ref.owner) === normalizeRepoUrl(owner) &&
+          normalizeRepoUrl(ref.repo) === normalizeRepoUrl(repo),
+      );
+      if (aliasGitHub) {
+        throw notFound(
+          `Assurance GitHub mint requires the registered canonical repository exactly (requested ${owner}/${repo}, registered ${aliasGitHub.owner}/${aliasGitHub.repo})`,
+        );
+      }
+      if (registeredForRepo) {
+        // The repo IS registered under this name — but only on a non-GitHub host
+        // (or as a hostless bare form), which cannot authorize a GitHub mint.
+        throw notFound(
+          `Assurance GitHub mint requires a workspace registered on ${GITHUB_CANONICAL_HOST} (requested ${owner}/${repo} matches only a non-GitHub registration)`,
+        );
+      }
+    }
     const reachable = workspaceRows.some(
       (row) =>
         typeof row.projectId === "string" &&
@@ -107,15 +172,13 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
       // them by matching the repo against ALL company workspace rows (not just the
       // assigned subset): a row for this repo owned by no assigned project means the
       // repo is registered but gated off; no such row means it is unregistered.
-      const registeredForRepo = workspaceRows.some(
-        (row) => typeof row.repoUrl === "string" && normalizeRepoUrl(row.repoUrl) === normalizedRepo,
-      );
       throw notFound(
         registeredForRepo
           ? `Project workspace for ${owner}/${repo} is registered, but belongs to a project the agent holds no assigned issue in`
           : `No project workspace is registered for ${owner}/${repo} in this company`,
       );
     }
+    return { useAssurancePermissions: false, owner, repo };
   }
 
   router.post(
@@ -134,7 +197,7 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
       assertCompanyAccess(req, companyId);
 
       const { owner, repo, permissions } = req.body as InstallationTokenBody;
-      await assertRepoReachable(companyId, req.actor.agentId, owner, repo);
+      const authorization = await assertRepoReachable(companyId, req.actor.agentId, owner, repo);
 
       // Distinguish "App not configured" (404) from "configured but mint failed" (502).
       const secret = await secrets.getByName(companyId, app.privateKeySecretName);
@@ -144,7 +207,15 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
         });
       }
 
-      const result = await resolveToken(companyId, secrets, owner, repo, undefined, app, permissions);
+      const result = await resolveToken(
+        companyId,
+        secrets,
+        authorization.owner,
+        authorization.repo,
+        undefined,
+        app,
+        authorization.useAssurancePermissions ? { contents: "read", metadata: "read" } : permissions,
+      );
 
       if (!result) {
         throw new HttpError(502, "Failed to mint GitHub installation token", {
@@ -162,8 +233,8 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
         agentId: req.actor.agentId,
         runId: req.actor.runId,
         details: {
-          owner,
-          repo,
+          owner: authorization.owner,
+          repo: authorization.repo,
           appId: app.appId,
           installationId: result.installationId ?? null,
           token: "<redacted>",

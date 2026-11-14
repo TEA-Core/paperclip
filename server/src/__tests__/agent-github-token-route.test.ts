@@ -31,6 +31,7 @@ const { privateKey: FIXTURE_PRIVATE_KEY_PEM } = generateKeyPairSync("rsa", { mod
 const FIXTURE_PRIVATE_KEY = FIXTURE_PRIVATE_KEY_PEM.export({ type: "pkcs1", format: "pem" }) as string;
 const FIXTURE_TOKEN = "ghs_test_installation_token_for_agent_route_tests_only";
 const FIXTURE_INSTALLATION_ID = "12345678";
+const WRITER_AUDITOR_AGENT_ID = "d051c75c-b20f-4efb-87cf-76f73e349a29";
 
 type IssueRow = { projectId: string | null };
 type WorkspaceRow = { projectId: string; repoUrl: string | null };
@@ -180,6 +181,181 @@ describe("POST /api/agents/me/github/installation-tokens", () => {
       "Project workspace for owner/repo is registered, but belongs to a project the agent holds no assigned issue in",
     );
     expect(resolveToken).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: "omits permissions", body: { owner: "owner", repo: "repo" } },
+    {
+      name: "requests contents write",
+      body: { owner: "owner", repo: "repo", permissions: { contents: "write" } },
+    },
+  ])("mints contents-read for writer-Auditor on a registered but unassigned repo when it $name", async ({ body }) => {
+    const { deps, resolveToken } = fakeDeps();
+    const app = createApp(agentActor({ agentId: WRITER_AUDITOR_AGENT_ID }), deps, {
+      issues: [{ projectId: "project-x" }],
+      workspaces: [{ projectId: "project-y", repoUrl: "https://github.com/owner/repo" }],
+    });
+    const res = await request(app).post("/api/agents/me/github/installation-tokens").send(body);
+    expect(res.status).toBe(200);
+    expect(resolveToken).toHaveBeenCalledWith(
+      "company-1",
+      expect.anything(),
+      "owner",
+      "repo",
+      undefined,
+      DEFAULT_GITHUB_APP,
+      { contents: "read", metadata: "read" },
+    );
+  });
+
+  it("reports an unregistered repo for writer-Auditor without minting even with no assigned issues", async () => {
+    const { deps, resolveToken } = fakeDeps();
+    const app = createApp(agentActor({ agentId: WRITER_AUDITOR_AGENT_ID }), deps, {
+      issues: [],
+      workspaces: [],
+    });
+    const res = await request(app)
+      .post("/api/agents/me/github/installation-tokens")
+      .send({ owner: "owner", repo: "repo" });
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("No project workspace is registered for owner/repo in this company");
+    expect(resolveToken).not.toHaveBeenCalled();
+  });
+
+  // SUP-23880: the writer-Auditor assurance exception authorizes exactly one
+  // company-registered GitHub repository against its CANONICAL owner/repo
+  // strings, host-aware. An alias spelling that merely normalizes to the
+  // registered repo must refuse; a same-named non-GitHub registration must not
+  // authorize a GitHub mint.
+  describe("writer-Auditor assurance mint — canonical repo identity and GitHub host (SUP-23880)", () => {
+    const assuranceRows: FakeRows = {
+      issues: [{ projectId: "project-x" }],
+      workspaces: [{ projectId: "project-y", repoUrl: "https://github.com/TEA-Core/paperclip" }],
+    };
+
+    it.each([
+      { name: "different-case owner", body: { owner: "tea-core", repo: "paperclip" } },
+      { name: "different-case repo", body: { owner: "TEA-Core", repo: "Paperclip" } },
+      { name: "repo with trailing .git", body: { owner: "TEA-Core", repo: "paperclip.git" } },
+      { name: "URL-form owner", body: { owner: "https://github.com/TEA-Core", repo: "paperclip" } },
+      { name: "owner with trailing whitespace", body: { owner: "TEA-Core ", repo: "paperclip" } },
+      { name: "repo with trailing whitespace", body: { owner: "TEA-Core", repo: "paperclip " } },
+    ])("refuses the $name alias of a registered repo without minting", async ({ body }) => {
+      const { deps, resolveToken } = fakeDeps();
+      const app = createApp(agentActor({ agentId: WRITER_AUDITOR_AGENT_ID }), deps, assuranceRows);
+      const res = await request(app).post("/api/agents/me/github/installation-tokens").send(body);
+      expect(res.status).toBe(404);
+      // The refusal names the canonical registration, so the caller can retry exactly.
+      expect(res.body.error).toBe(
+        "Assurance GitHub mint requires the registered canonical repository exactly (requested " +
+          `${body.owner}/${body.repo}, registered TEA-Core/paperclip)`,
+      );
+      expect(resolveToken).not.toHaveBeenCalled();
+    });
+
+    it("refuses a non-GitHub workspace URL with the same owner/repo without minting", async () => {
+      const { deps, resolveToken } = fakeDeps();
+      const app = createApp(agentActor({ agentId: WRITER_AUDITOR_AGENT_ID }), deps, {
+        issues: [{ projectId: "project-x" }],
+        workspaces: [{ projectId: "project-y", repoUrl: "https://gitlab.example.com/TEA-Core/paperclip" }],
+      });
+      const res = await request(app)
+        .post("/api/agents/me/github/installation-tokens")
+        .send({ owner: "TEA-Core", repo: "paperclip" });
+      expect(res.status).toBe(404);
+      expect(res.body.error).toBe(
+        "Assurance GitHub mint requires a workspace registered on github.com " +
+          "(requested TEA-Core/paperclip matches only a non-GitHub registration)",
+      );
+      expect(resolveToken).not.toHaveBeenCalled();
+    });
+
+    it("refuses a file:// registration impersonating github.com with 404 and without minting (SUP-23892)", async () => {
+      const { deps, resolveToken } = fakeDeps();
+      const app = createApp(agentActor({ agentId: WRITER_AUDITOR_AGENT_ID }), deps, {
+        issues: [{ projectId: "project-x" }],
+        workspaces: [{ projectId: "project-y", repoUrl: "file://github.com/TEA-Core/paperclip" }],
+      });
+      const res = await request(app)
+        .post("/api/agents/me/github/installation-tokens")
+        .send({ owner: "TEA-Core", repo: "paperclip" });
+      expect(res.status).toBe(404);
+      // normalizeRepoUrl still matches the repo name (it erases the transport and
+      // host), so the refusal is the non-GitHub-registration gate: file:// is not
+      // a GitHub transport and must fail closed before resolveToken.
+      expect(res.body.error).toBe(
+        "Assurance GitHub mint requires a workspace registered on github.com " +
+          "(requested TEA-Core/paperclip matches only a non-GitHub registration)",
+      );
+      expect(resolveToken).not.toHaveBeenCalled();
+    });
+
+    it("mints with the canonical registered owner/repo and exactly contents+metadata read on an exact match", async () => {
+      const { deps, resolveToken } = fakeDeps();
+      const app = createApp(agentActor({ agentId: WRITER_AUDITOR_AGENT_ID }), deps, assuranceRows);
+      // Requested permissions are ignored on the assurance path: the mint is
+      // pinned to contents-read + metadata-read regardless.
+      const res = await request(app)
+        .post("/api/agents/me/github/installation-tokens")
+        .send({ owner: "TEA-Core", repo: "paperclip", permissions: { contents: "write" } });
+      expect(res.status).toBe(200);
+      expect(resolveToken).toHaveBeenCalledTimes(1);
+      expect(resolveToken).toHaveBeenCalledWith(
+        "company-1",
+        expect.anything(),
+        "TEA-Core",
+        "paperclip",
+        undefined,
+        DEFAULT_GITHUB_APP,
+        { contents: "read", metadata: "read" },
+      );
+    });
+
+    it("canonicalizes a .git-suffixed GitHub registration to the stripped registered values", async () => {
+      const { deps, resolveToken } = fakeDeps();
+      const app = createApp(agentActor({ agentId: WRITER_AUDITOR_AGENT_ID }), deps, {
+        issues: [{ projectId: "project-x" }],
+        workspaces: [{ projectId: "project-y", repoUrl: "https://github.com/TEA-Core/paperclip.git" }],
+      });
+      const res = await request(app)
+        .post("/api/agents/me/github/installation-tokens")
+        .send({ owner: "TEA-Core", repo: "paperclip" });
+      expect(res.status).toBe(200);
+      // The mint uses the registration's canonical (`.git`-stripped) strings,
+      // not the raw clone-URL spelling.
+      expect(resolveToken).toHaveBeenCalledWith(
+        "company-1",
+        expect.anything(),
+        "TEA-Core",
+        "paperclip",
+        undefined,
+        DEFAULT_GITHUB_APP,
+        { contents: "read", metadata: "read" },
+      );
+    });
+
+    it("keeps the case-insensitive normalized mint for every other agent (assignment gate preserved)", async () => {
+      const { deps, resolveToken } = fakeDeps();
+      const app = createApp(agentActor(), deps, {
+        issues: [{ projectId: "project-x" }],
+        workspaces: [{ projectId: "project-x", repoUrl: "https://github.com/TEA-Core/paperclip" }],
+      });
+      const res = await request(app)
+        .post("/api/agents/me/github/installation-tokens")
+        .send({ owner: "tea-core", repo: "paperclip" });
+      expect(res.status).toBe(200);
+      // The non-assurance path is unchanged: normalized comparison still matches
+      // casing differences, and the mint uses the caller's own owner/repo.
+      expect(resolveToken).toHaveBeenCalledWith(
+        "company-1",
+        expect.anything(),
+        "tea-core",
+        "paperclip",
+        undefined,
+        DEFAULT_GITHUB_APP,
+        undefined,
+      );
+    });
   });
 
   it("allows an agent to mint for a project it is assigned to", async () => {
