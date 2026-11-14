@@ -20639,6 +20639,7 @@ export function issueRoutes(
             "Cancelled before issue reassignment",
             {
               errorCode: "issue_reassigned",
+              suppressImmediateRecovery: true,
               resultJson: { reassignmentStopConfirmed: true, issueMutationStopId },
               eventMessage: "run cancelled before issue reassignment",
               eventPayload: { issueId: existing.id },
@@ -21610,6 +21611,7 @@ export function issueRoutes(
           "Cancelled before issue reassignment",
           {
             errorCode: "issue_reassigned",
+            suppressImmediateRecovery: true,
             resultJson: { reassignmentStopConfirmed: true },
             eventMessage: "run cancelled before issue reassignment",
             eventPayload: { issueId: existing.id },
