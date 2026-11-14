@@ -30,7 +30,7 @@ function fixture(options: {
     order: string[];
     limit: number | undefined;
   }> = [];
-  const row = { id: issueId, companyId, identifier: "TEST-1", externalConversationState: "waiting" };
+  const row = { id: issueId, companyId, identifier: "TEST-1", externalConversationState: "waiting", parentId: null as string | null };
   const select = vi.fn((fields: Record<string, unknown> = {}) => ({
     from(table: Parameters<typeof getTableName>[0]) {
       const name = getTableName(table);

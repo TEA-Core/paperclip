@@ -8526,10 +8526,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const factory = vi.spyOn(instructionWorkingCopies, "agentInstructionWorkingCopyService").mockImplementation((...args) => ({
       ...originalFactory(...args), release,
     }));
-    const originalAppend = runEvents.appendHeartbeatRunEvent;
-    const append = vi.spyOn(runEvents, "appendHeartbeatRunEvent").mockImplementation((db, event) => {
-      if (warningFails && event.eventType === "instruction_cleanup") throw new Error("Fixture warning persistence failed");
-      return originalAppend(db, event);
+    // The fork writes non-exhaustion run events with a direct insert after allocating a
+    // sequence, so fail the first allocation that follows the rejected cleanup release.
+    let cleanupRejected = false;
+    release.mockImplementation(async () => {
+      cleanupRejected = true;
+      throw Object.assign(new Error("Timed out waiting for workspace restore lock at /private/agent-files.lock"), {
+        code: "ERR_WORKSPACE_RESTORE_LOCK_TIMEOUT",
+      });
+    });
+    const originalAllocate = runEvents.allocateHeartbeatRunEventSeq;
+    const append = vi.spyOn(runEvents, "allocateHeartbeatRunEventSeq").mockImplementation((db, runId) => {
+      if (warningFails && cleanupRejected) {
+        cleanupRejected = false;
+        throw new Error("Fixture warning persistence failed");
+      }
+      return originalAllocate(db, runId);
     });
     mockAdapterExecute.mockImplementationOnce((async () => {
       await db.insert(issueThreadInteractions).values({ id: interactionId, companyId, issueId, sourceRunId: runId,
