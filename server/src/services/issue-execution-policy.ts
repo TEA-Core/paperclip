@@ -2734,8 +2734,10 @@ export type DurableApprovalIssue = AssigneeLike & {
  *   stage-decision row (SUP-15805) is checked through the participant it was
  *   recorded for (`boardDecisionParticipants`, keyed by decision id); a user row
  *   that is neither a participant nor a board stage decision does not count;
- * - the row's actor is a self-approval principal: `resolveSelfApprovalPrincipals`
- *   plus the current assignee, who is the delivery author of the `done`.
+ * - the row's actor, or the participant a board stage decision was recorded
+ *   for, is a self-approval principal: `resolveSelfApprovalPrincipals`, the
+ *   current assignee (the delivery author of the `done`) and the `closer` (the
+ *   principal requesting the `done`).
  * A shrink that removed a stage with no decision row leaves the rows and the
  * policy identical to a legit shorter ladder; this check cannot tell them apart.
  */
@@ -2744,6 +2746,7 @@ export function listCurrentPolicyApprovedStageIds(input: {
   policy: IssueExecutionPolicy;
   decisions: readonly DurableApprovalDecisionRow[];
   boardDecisionParticipants: ReadonlyMap<string, IssueExecutionStagePrincipal | null>;
+  closer: IssueExecutionStagePrincipal | null;
 }): string[] {
   const stagesById = new Map(input.policy.stages.map((stage) => [stage.id, stage]));
   if (input.decisions.some((decision) => !stagesById.has(decision.stageId))) return [];
@@ -2753,10 +2756,15 @@ export function listCurrentPolicyApprovedStageIds(input: {
     (parseIssueExecutionState(input.issue.executionState) ?? {}) as Record<string, unknown>,
     input.issue.createdByAgentId ?? null,
   );
-  const deliveryAuthor = assigneePrincipal(input.issue);
-  if (deliveryAuthor?.type === "agent" && deliveryAuthor.agentId) selfPrincipals.agentIds.add(deliveryAuthor.agentId);
-  if (deliveryAuthor?.type === "user" && deliveryAuthor.userId) selfPrincipals.userIds.add(deliveryAuthor.userId);
-
+  for (const principal of [assigneePrincipal(input.issue), input.closer]) {
+    if (principal?.type === "agent" && principal.agentId) selfPrincipals.agentIds.add(principal.agentId);
+    if (principal?.type === "user" && principal.userId) selfPrincipals.userIds.add(principal.userId);
+  }
+  const isSelf = (principal: IssueExecutionStagePrincipal | null) =>
+    principal !== null &&
+    (principal.type === "agent"
+      ? [...selfPrincipals.agentIds].some((agentId) => sameAgentId(agentId, principal.agentId))
+      : selfPrincipals.userIds.has(principal.userId ?? ""));
   const isCurrentParticipant = (stage: IssueExecutionStage, principal: IssueExecutionStagePrincipal | null) =>
     principal !== null &&
     stage.participants.some((participant) =>
@@ -2769,20 +2777,16 @@ export function listCurrentPolicyApprovedStageIds(input: {
   for (const [stageId, latest] of latestDecisionPerStage(input.decisions)) {
     const stage = stagesById.get(stageId)!;
     if (latest.outcome !== "approved" || latest.stageType !== stage.type) continue;
-    if (latest.actorAgentId) {
-      const selfApproval = [...selfPrincipals.agentIds].some((agentId) => sameAgentId(agentId, latest.actorAgentId));
-      if (selfApproval || !isCurrentParticipant(stage, { type: "agent", agentId: latest.actorAgentId, userId: null })) {
-        continue;
-      }
-    } else if (latest.actorUserId) {
-      if (selfPrincipals.userIds.has(latest.actorUserId)) continue;
-      const decidedFor = input.boardDecisionParticipants.has(latest.id)
-        ? input.boardDecisionParticipants.get(latest.id) ?? null
-        : { type: "user" as const, userId: latest.actorUserId, agentId: null };
-      if (!isCurrentParticipant(stage, decidedFor)) continue;
-    } else {
-      continue;
-    }
+    const decider: IssueExecutionStagePrincipal | null = latest.actorAgentId
+      ? { type: "agent", agentId: latest.actorAgentId, userId: null }
+      : latest.actorUserId
+        ? { type: "user", userId: latest.actorUserId, agentId: null }
+        : null;
+    if (isSelf(decider)) continue;
+    const decidedFor = input.boardDecisionParticipants.has(latest.id)
+      ? input.boardDecisionParticipants.get(latest.id) ?? null
+      : decider;
+    if (isSelf(decidedFor) || !isCurrentParticipant(stage, decidedFor)) continue;
     approved.push(stageId);
   }
   return approved;

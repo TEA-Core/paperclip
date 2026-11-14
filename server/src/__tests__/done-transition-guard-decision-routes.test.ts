@@ -2702,7 +2702,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       firstStageId: string;
       secondStageId: string;
     };
-    type PolicyStage = { id: string; type: "review" | "approval"; participants: string[] };
+    type PolicyStage = { id: string; type: "review" | "approval"; participants: Array<string | { userId: string }> };
 
     async function writePolicy(seeded: SeededCard, stages: PolicyStage[]) {
       await db
@@ -2716,7 +2716,11 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
               id: stage.id,
               type: stage.type,
               approvalsNeeded: 1,
-              participants: stage.participants.map((agentId) => ({ type: "agent", agentId, userId: null })),
+              participants: stage.participants.map((participant) =>
+                typeof participant === "string"
+                  ? { type: "agent", agentId: participant, userId: null }
+                  : { type: "user", agentId: null, userId: participant.userId },
+              ),
             })),
           },
         })
@@ -2739,21 +2743,82 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       });
     }
 
-    /** Reopen with a null projection, back to the return assignee in_progress, then its Tier 2 `done`. */
-    async function reopenAndClose(seeded: SeededCard) {
+    /** Reopen with a null projection, back in_progress to `assigneeAgentId` (null: unassigned). */
+    async function reopenWithNullState(seeded: SeededCard, assigneeAgentId: string | null) {
       await db
         .update(issues)
-        .set({ status: "in_progress", assigneeAgentId: seeded.implementerAgentId, executionState: null })
+        .set({ status: "in_progress", assigneeAgentId, executionState: null })
         .where(eq(issues.id, seeded.issueId));
+    }
+
+    /** Reopen with a null projection, back to the return assignee in_progress, then its Tier 2 `done`. */
+    async function reopenAndClose(seeded: SeededCard, mockGitHub: () => void = mockMergedBranch) {
+      await reopenWithNullState(seeded, seeded.implementerAgentId);
       currentActor = agentActor(
         seeded.companyId,
         seeded.implementerAgentId,
         await seedRun(seeded.companyId, seeded.implementerAgentId, seeded.issueId),
       );
-      mockMergedBranch();
+      mockGitHub();
       return request(app)
         .patch(`/api/issues/${seeded.identifier}`)
         .send({ status: "done", comment: "Closing after the approved delivery.", doneTier: TIER2_DONE });
+    }
+
+    /**
+     * `mockMergedBranch`, plus one write that lands on the first GitHub call. The
+     * done guard makes that call after the transition was computed from the
+     * unlocked read and before the write transaction takes the row lock, so the
+     * write models a concurrent change that commits in that window.
+     */
+    function mockMergedBranchWithConcurrentWrite(write: () => Promise<void>) {
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
+      let written = false;
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (!written) {
+          written = true;
+          await write();
+        }
+        if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        if (url.includes("/commits/")) return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+    }
+
+    async function seedRecoveryAction(seeded: SeededCard, ownerAgentId: string, runId: string) {
+      const now = new Date();
+      await db.insert(issueRecoveryActions).values({
+        companyId: seeded.companyId,
+        sourceIssueId: seeded.issueId,
+        recoveryIssueId: null,
+        kind: "missing_disposition",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId,
+        ownerUserId: null,
+        previousOwnerAgentId: null,
+        returnOwnerAgentId: null,
+        cause: "successful_run_missing_issue_disposition",
+        fingerprint: `missing-disposition:${seeded.issueId}`,
+        evidence: { runId },
+        nextAction: "Choose a valid issue disposition.",
+        attemptCount: 1,
+        lastAttemptAt: now,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
+    function resolveRecoveryAsDone(seeded: SeededCard) {
+      return request(app)
+        .post(`/api/issues/${seeded.issueId}/recovery-actions/resolve`)
+        .send({
+          outcome: "restored",
+          sourceIssueStatus: "done",
+          resolutionNote: "Closing after the approved delivery.",
+          doneTier: TIER2_DONE,
+        });
     }
 
     async function expectReviewReArmed(
@@ -2882,6 +2947,173 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(await statusOf(seeded.issueId)).toBe("done");
+    });
+
+    // Release-assurance B3: a durable-approval close re-reads the decision rows
+    // and the execution state under the issue row lock, so a change that commits
+    // between the unlocked read and the write is never overwritten by the close.
+    async function seedParticipantApprovedCard(issuePrefix: string) {
+      const seeded = await seedIssueAwaitingReview(issuePrefix);
+      await recordAgentDecision(seeded, {
+        stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.reviewerAgentId, outcome: "approved", createdAt: APPROVED_AT,
+      });
+      return seeded;
+    }
+
+    async function expectCloseRefusedAsStale(seeded: SeededCard, res: request.Response, expectedStatus: string) {
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.details?.code ?? res.body.code).toBe("durable_approval_close_conflict");
+      expect(await statusOf(seeded.issueId)).toBe(expectedStatus);
+    }
+
+    it("PATCH: a durable-approval close does not overwrite a board re-arm that commits first", async () => {
+      const seeded = await seedParticipantApprovedCard("S24054L");
+
+      const res = await reopenAndClose(seeded, () =>
+        mockMergedBranchWithConcurrentWrite(async () => {
+          await db
+            .update(issues)
+            .set({
+              status: "in_review",
+              assigneeAgentId: seeded.reviewerAgentId,
+              executionState: {
+                status: "pending",
+                currentStageId: seeded.firstStageId,
+                currentStageIndex: 0,
+                currentStageType: "review",
+                currentParticipant: { type: "agent", agentId: seeded.reviewerAgentId, userId: null },
+                returnAssignee: { type: "agent", agentId: seeded.implementerAgentId, userId: null },
+                reviewRequest: null,
+                completedStageIds: [],
+                lastDecisionId: null,
+                lastDecisionOutcome: null,
+                monitor: null,
+                changesRequestedCount: 0,
+              },
+            })
+            .where(eq(issues.id, seeded.issueId));
+        }),
+      );
+
+      await expectCloseRefusedAsStale(seeded, res, "in_review");
+    });
+
+    it("PATCH: a durable-approval close does not overwrite a reviewer changes_requested that commits first", async () => {
+      const seeded = await seedParticipantApprovedCard("S24054M");
+
+      const res = await reopenAndClose(seeded, () =>
+        mockMergedBranchWithConcurrentWrite(() =>
+          recordAgentDecision(seeded, {
+            stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.reviewerAgentId, outcome: "changes_requested",
+            createdAt: new Date(),
+          }),
+        ),
+      );
+
+      await expectCloseRefusedAsStale(seeded, res, "in_progress");
+    });
+
+    it("PATCH: a durable-approval close does not overwrite a policy edit that commits first", async () => {
+      const seeded = await seedParticipantApprovedCard("S24054N");
+
+      const res = await reopenAndClose(seeded, () =>
+        mockMergedBranchWithConcurrentWrite(() =>
+          writePolicy(seeded, [{ id: seeded.firstStageId, type: "review", participants: [seeded.reviewerAgentId, seeded.secondReviewerAgentId] }]),
+        ),
+      );
+
+      await expectCloseRefusedAsStale(seeded, res, "in_progress");
+    });
+
+    // Release-assurance B2: the closer of the `done` is a self-approval
+    // principal too, and a board stage decision recorded for the return
+    // assignee's seat is the return assignee's own approval.
+    async function closeAsBoard(seeded: SeededCard) {
+      await reopenWithNullState(seeded, seeded.implementerAgentId);
+      currentActor = boardOwner(seeded.companyId);
+      mockMergedBranch();
+      return request(app).patch(`/api/issues/${seeded.identifier}`).send({ status: "done", comment: "Board close." });
+    }
+
+    it("PATCH: a board user's done does not count its own board stage decision", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054O");
+      await recordBoardDecision(seeded, "approved", APPROVED_AT);
+
+      const res = await closeAsBoard(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.reviewerAgentId });
+    });
+
+    it("PATCH: a board user's done does not count its own approval as a user participant", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054P");
+      await writePolicy(seeded, [{ id: seeded.firstStageId, type: "review", participants: [{ userId: "cloud-user-1" }] }]);
+      await db.insert(issueExecutionDecisions).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        stageId: seeded.firstStageId,
+        stageType: "review",
+        actorUserId: "cloud-user-1",
+        outcome: "approved",
+        body: "approved",
+        createdAt: APPROVED_AT,
+      });
+
+      const res = await closeAsBoard(seeded);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const row = await issueRow(seeded.issueId);
+      expect(row?.status).toBe("in_review");
+      expect(row?.executionState).toMatchObject({ status: "pending", currentStageId: seeded.firstStageId });
+    });
+
+    it("recovery resolve: a board user's done does not count its own board stage decision", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054Q");
+      await recordBoardDecision(seeded, "approved", APPROVED_AT);
+      await reopenWithNullState(seeded, seeded.implementerAgentId);
+      await seedRecoveryAction(
+        seeded,
+        seeded.implementerAgentId,
+        await seedRun(seeded.companyId, seeded.implementerAgentId, seeded.issueId),
+      );
+      currentActor = boardOwner(seeded.companyId);
+      mockMergedBranch();
+
+      const res = await resolveRecoveryAsDone(seeded);
+
+      expect(await statusOf(seeded.issueId), JSON.stringify(res.body)).not.toBe("done");
+    });
+
+    it("recovery resolve: the owner of an unassigned card's recovery action does not close on its own approval", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054R");
+      await writePolicy(seeded, [
+        { id: seeded.firstStageId, type: "review", participants: [seeded.reviewerAgentId, seeded.secondReviewerAgentId] },
+      ]);
+      await recordAgentDecision(seeded, {
+        stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.secondReviewerAgentId, outcome: "approved", createdAt: APPROVED_AT,
+      });
+      await reopenWithNullState(seeded, null);
+      const runId = await seedRun(seeded.companyId, seeded.secondReviewerAgentId, seeded.issueId);
+      await seedRecoveryAction(seeded, seeded.secondReviewerAgentId, runId);
+      currentActor = agentActor(seeded.companyId, seeded.secondReviewerAgentId, runId);
+      mockMergedBranch();
+
+      const res = await resolveRecoveryAsDone(seeded);
+
+      expect(await statusOf(seeded.issueId), JSON.stringify(res.body)).not.toBe("done");
+    });
+
+    it("PATCH: a board stage decision recorded for the return assignee's seat does not count", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054S");
+      await writePolicy(seeded, [
+        { id: seeded.firstStageId, type: "review", participants: [seeded.reviewerAgentId, seeded.implementerAgentId] },
+      ]);
+      await recordBoardDecisions(seeded, "approved", APPROVED_AT, [
+        { stageId: seeded.firstStageId, decidedForAgentId: seeded.implementerAgentId },
+      ]);
+
+      const res = await reopenAndClose(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.reviewerAgentId });
     });
   });
 });

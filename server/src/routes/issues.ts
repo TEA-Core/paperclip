@@ -6043,6 +6043,8 @@ export function issueRoutes(
       issue: DurableApprovalIssue & { id: string; companyId: string };
       policy: NormalizedExecutionPolicy | null;
       requestedStatus: string | undefined;
+      /** The actor requesting the `done`; its own approvals never count. */
+      closer: { agentId: string | null; userId: string | null };
     },
   ): Promise<string[] | undefined> => {
     if (input.requestedStatus !== "done" || !input.policy || input.policy.stages.length === 0) {
@@ -6112,6 +6114,11 @@ export function issueRoutes(
       policy: input.policy,
       decisions,
       boardDecisionParticipants,
+      closer: input.closer.agentId
+        ? { type: "agent", agentId: input.closer.agentId, userId: null }
+        : input.closer.userId
+          ? { type: "user", userId: input.closer.userId, agentId: null }
+          : null,
     });
   };
   const projectsSvc = projectService(db);
@@ -14524,6 +14531,10 @@ export function issueRoutes(
                 issue: lockedIssue,
                 policy: executionPolicy,
                 requestedStatus: sourceIssueStatus,
+                closer: {
+                  agentId: actor.agentId ?? null,
+                  userId: actor.actorType === "user" ? actor.actorId : null,
+                },
               }),
             });
             const recoveryDecisionId = transition.decision ? randomUUID() : null;
@@ -19876,6 +19887,16 @@ export function issueRoutes(
     })
       ? await resolveSummaryGenerationReturnAssignee(db, existing)
       : null;
+    const doneCloser = {
+      agentId: actor.agentId ?? null,
+      userId: actor.actorType === "user" ? actor.actorId : null,
+    };
+    const durablyApprovedStageIds = await loadDurablyApprovedStageIdsForDone(db, {
+      issue: existing,
+      policy: nextExecutionPolicy,
+      requestedStatus: requestedTransitionStatus,
+      closer: doneCloser,
+    });
     const transition = applyIssueExecutionPolicyTransition({
       issue: existing,
       policy: nextExecutionPolicy,
@@ -19905,11 +19926,7 @@ export function issueRoutes(
         executionState: existing.executionState,
         requestedStatus: requestedTransitionStatus,
       }),
-      decidedStageIds: await loadDurablyApprovedStageIdsForDone(db, {
-        issue: existing,
-        policy: nextExecutionPolicy,
-        requestedStatus: requestedTransitionStatus,
-      }),
+      decidedStageIds: durablyApprovedStageIds,
     });
     const decisionId = transition.decision ? randomUUID() : null;
     if (decisionId) {
@@ -20503,6 +20520,12 @@ export function issueRoutes(
       return;
     }
     const isDoneRequest = effectiveStatus === "done" && existing.status !== "done";
+    // SUP-24054: this `done` skips review because every policy stage holds a
+    // durable approval (no active stage, so the engine left `done` in place).
+    const durableApprovalClose =
+      isDoneRequest &&
+      Boolean(nextExecutionPolicy?.stages.length) &&
+      nextExecutionPolicy!.stages.every((stage) => durablyApprovedStageIds?.includes(stage.id));
     // SUP-15878: a card with open children and no approval stage in its
     // executionPolicy can never reach a recorded approval decision. Diagnose the
     // gap once, up front: a `done` request is refused with a typed 409 inside the
@@ -20671,8 +20694,34 @@ export function issueRoutes(
             nextExecutionPolicy?.stallEscalation ||
             readState?.stallHandoff,
           ));
-      if (!stallLockRequired && !recordsDecision) return;
+      if (!stallLockRequired && !recordsDecision && !durableApprovalClose) return;
       const locked = await svc.getByIdForUpdate(id, tx);
+      // SUP-24054 (release-assurance B3): the durable approvals were read
+      // without the row lock. Re-read the policy, the execution state and the
+      // decision rows under it, so a board re-arm, a reviewer's changes_requested
+      // or a policy edit that committed first refuses this close instead of
+      // being overwritten by it. A `done` PATCH always takes the transactional
+      // write path (`reviewPolicySensitiveMutationRequested`), which runs this.
+      if (durableApprovalClose) {
+        const lockedApprovedStageIds = locked
+          ? await loadDurablyApprovedStageIdsForDone(tx as unknown as Db, {
+              issue: locked,
+              policy: nextExecutionPolicy,
+              requestedStatus: "done",
+              closer: doneCloser,
+            })
+          : undefined;
+        if (
+          !isDeepStrictEqual(locked?.executionPolicy ?? null, existing.executionPolicy ?? null) ||
+          !nextExecutionPolicy!.stages.every((stage) => lockedApprovedStageIds?.includes(stage.id))
+        ) {
+          throw conflict(
+            "The execution policy, the execution state or the stage decisions changed while this close was in flight; the card was not closed. Re-read the issue before closing it.",
+            { code: "durable_approval_close_conflict", issueId: existing.id },
+          );
+        }
+      }
+      if (!stallLockRequired && !recordsDecision) return;
       const lockedState = parseIssueExecutionState(locked?.executionState ?? null);
       if (
         stallLockRequired && (
@@ -26196,6 +26245,10 @@ export function issueRoutes(
           issue: currentIssue,
           policy: currentExecutionPolicy,
           requestedStatus: "done",
+          closer: {
+            agentId: actor.agentId ?? null,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
         }),
       });
 

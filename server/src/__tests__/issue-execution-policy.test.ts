@@ -2068,6 +2068,7 @@ describe("issue execution policy transitions", () => {
           { id: "d-2", stageId, stageType: "review", outcome: "changes_requested", actorAgentId: qaAgentId, actorUserId: null, createdAt: new Date("2026-11-12T19:30:00Z") },
         ],
         boardDecisionParticipants: new Map(),
+        closer: { type: "agent", agentId: coderAgentId, userId: null },
       });
       expect(decidedStageIds).toEqual([]);
 
@@ -2110,6 +2111,7 @@ describe("issue execution policy transitions", () => {
       decisions: DurableApprovalDecisionRow[];
       board?: Array<[string, { type: "agent"; agentId: string } | { type: "user"; userId: string } | null]>;
       issue?: { assigneeAgentId?: string | null; assigneeUserId?: string | null; createdByAgentId?: string | null };
+      closer?: { type: "agent"; agentId: string } | { type: "user"; userId: string };
     }) {
       return listCurrentPolicyApprovedStageIds({
         issue: { assigneeAgentId: coderAgentId, assigneeUserId: null, executionState: null, ...input.issue },
@@ -2121,6 +2123,7 @@ describe("issue execution policy transitions", () => {
             principal === null ? null : { agentId: null, userId: null, ...principal },
           ]),
         ),
+        closer: input.closer ? { agentId: null, userId: null, ...input.closer } : null,
       });
     }
 
@@ -2249,6 +2252,53 @@ describe("issue execution policy transitions", () => {
       const policy = ladder();
       const [review] = policy.stages;
       expect(approvedIds({ policy, decisions: [row({ stageId: review.id })] })).toEqual([]);
+    });
+
+    it("drops an approval by the closer of the done", () => {
+      const policy = ladder();
+      const [review, approval] = policy.stages;
+      expect(
+        approvedIds({
+          policy,
+          decisions: [row({ stageId: review.id, actorAgentId: qaAgentId.toUpperCase() })],
+          closer: { type: "agent", agentId: qaAgentId },
+        }),
+      ).toEqual([]);
+      expect(
+        approvedIds({
+          policy,
+          decisions: [row({ stageId: approval.id, stageType: "approval", actorUserId: ctoUserId })],
+          closer: { type: "user", userId: ctoUserId },
+        }),
+      ).toEqual([]);
+    });
+
+    it("drops a board user's own board stage decision when that user closes", () => {
+      const policy = ladder();
+      const [review] = policy.stages;
+      const boardReview = row({ id: "board-review", stageId: review.id, actorUserId: boardDeciderUserId });
+      const board: Array<[string, { type: "agent"; agentId: string }]> = [["board-review", { type: "agent", agentId: qaAgentId }]];
+      expect(approvedIds({ policy, decisions: [boardReview], board })).toEqual([review.id]);
+      expect(
+        approvedIds({ policy, decisions: [boardReview], board, closer: { type: "user", userId: boardDeciderUserId } }),
+      ).toEqual([]);
+    });
+
+    it("drops a board stage decision recorded for a self-approval principal's seat", () => {
+      const policy = ladder([
+        { type: "agent", agentId: qaAgentId },
+        { type: "agent", agentId: coderAgentId },
+      ]);
+      const [review] = policy.stages;
+      const boardReview = row({ id: "board-review", stageId: review.id, actorUserId: boardDeciderUserId });
+      expect(
+        approvedIds({
+          policy,
+          decisions: [boardReview],
+          board: [["board-review", { type: "agent", agentId: coderAgentId }]],
+          issue: { assigneeAgentId: otherAgentId },
+        }),
+      ).toEqual([]);
     });
 
     it("keeps re-arm-review behaviour when an approval no longer holds", () => {

@@ -130,16 +130,18 @@ interface IssueExecutionDecision {
 
 ### Durable Approvals Across a Reopen
 
-Each stage decision is also stored as a row in `issue_execution_decisions`. A reopen (`done` or `cancelled` back to an open status) sets `executionState` to `null`, but the decision rows stay. A stage is decided when its latest decision row is `approved` and that row still holds under the current policy:
+Each stage decision is also stored as a row in `issue_execution_decisions`. A reopen (`done` or `cancelled` back to an open status) sets `executionState` to `null`, but the decision rows stay. A `done` request on a card with no active stage (`PATCH /api/issues/:id`, or a recovery-action resolve to `done`) reads these rows. For that request, a stage is decided when its latest decision row is `approved` and that row still holds under the current policy:
 
 - The row's stage type is the stage's current type.
 - The decider is a current participant of the stage. For a board stage decision, the participant that the board decided for must still be a participant of the stage.
-- The decider is not the return assignee, the delivery author, the creator agent, or the current assignee.
+- The decider is not the return assignee, the delivery author, the creator agent, the current assignee, or the user or agent that requests the `done`. For a board stage decision, the participant that the board decided for must not be one of these principals either.
 - No decision row exists for a stage that the policy no longer has. One such row cancels every approval.
 
-A later `changes_requested` row cancels the approval. If a row does not hold, the stage is not decided, and a `done` request arms review again.
+A later `changes_requested` row cancels the approval. If a row does not hold, the stage is not decided, and the `done` request arms review again.
 
 - When every stage is decided, the runtime does not change the status to `in_review`. The `done` request goes to the done-transition guard. The guard reads the same decision rows and writes an `issue.done_transition_ladder_recovered_from_decisions` activity row, or it refuses the close for its own reason (for example a missing tier declaration or an unlanded delivery).
+- For `PATCH /api/issues/:id`, the runtime reads the policy, the execution state and the decision rows again under the issue row lock before it writes the close. If a change was committed after the first read (for example a review that was armed again, a `changes_requested` decision, or a policy edit), the runtime refuses the close with `409 durable_approval_close_conflict` and keeps that change. A recovery-action resolve makes this decision under the issue row lock from the start.
+- The rules above apply only to that `done` request. The done-transition guard's own recovery from decision rows does not apply them: it counts every stage whose latest decision row is `approved`. The backstop sweep that closes cards, and a board `done` on a card whose `executionState` is still `pending`, close through that recovery. These two paths have the same behavior as before the rules were added.
 - A decision row records no head SHA. So an approval given before a reopen also counts after the reopen, even when new commits were pushed. The guard's delivery checks still apply.
 - The rows and the current policy cannot show two policy edits: removing a stage that had no decision, and changing the order of approved stages. After these edits, the approvals that remain still count.
 - A board `done` or `cancelled` on a completed workflow keeps `executionState` (`completedStageIds` and `approvalStatus`). A board `blocked`, `in_progress` or `todo`, or a board assignee change, on a completed workflow still clears it.
