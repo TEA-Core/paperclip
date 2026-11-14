@@ -1792,6 +1792,11 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         .from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, fixture.issue.id));
     }
 
+    async function receiptsOf(fixture: Fixture) {
+      return db.select({ id: issueDeliveryReceipts.id, state: issueDeliveryReceipts.state, headSha: issueDeliveryReceipts.headSha })
+        .from(issueDeliveryReceipts).where(eq(issueDeliveryReceipts.sourceIssueId, fixture.issue.id));
+    }
+
     function approvalStatusOf(stored: { executionState: unknown }) {
       return ((stored.executionState ?? {}) as { approvalStatus?: Record<string, unknown> }).approvalStatus ?? {};
     }
@@ -1827,6 +1832,58 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       expect(fixture.writes).toEqual([]);
     }
 
+    // Links a ready owned PR, with its board delivery receipt, the moment the stage
+    // decision commits: after the final-delivery preflight, before the post-commit hook.
+    function linkReadyPrAfterDecisionCommit(fixture: Fixture) {
+      const transact = db.transaction.bind(db);
+      let linked = false;
+      const spy = vi.spyOn(db, "transaction").mockImplementation((async (...args: Parameters<typeof db.transaction>) => {
+        const result = await transact(...args);
+        if (!linked && (await fixture.read()).executionState?.lastDecisionOutcome === "approved") {
+          linked = true;
+          const [object] = await db.insert(externalObjects).values({
+            companyId: fixture.company.id, providerKey: "github", objectType: "pull_request",
+            externalId: "TEA-Core/paperclip#pull/42", displayKey: "42", displayTitle: fixture.pr.title,
+            sanitizedCanonicalUrl: "https://github.com/TEA-Core/paperclip/pull/42",
+            canonicalIdentityHash: randomUUID(), data: fixture.pr,
+          }).returning();
+          await db.insert(externalObjectMentions).values({
+            companyId: fixture.company.id, sourceIssueId: fixture.issue.id, sourceKind: "description",
+            objectId: object!.id, providerKey: "github", detectorKey: "github_pr", objectType: "pull_request",
+            matchedTextRedacted: "delivery", sanitizedDisplayUrl: object!.sanitizedCanonicalUrl,
+            canonicalIdentityHash: randomUUID(), canonicalIdentity: {},
+          });
+          const [receipt] = await db.insert(issueDeliveryReceipts).values({
+            companyId: fixture.company.id, sourceIssueId: fixture.issue.id, provider: "github",
+            owner: "tea-core", repo: "paperclip", pullRequestNumber: fixture.pr.number,
+            headSha: fixture.pr.head.sha, branchName: fixture.pr.head.ref, sourceDeliveryRecord: { fixture: true },
+            recoveryReason: "authorized test publication", authorizedByActorType: "user",
+            authorizedByActorId: "board-user", idempotencyKey: `late-${fixture.issue.id}`, state: "ready",
+          }).returning();
+          await db.insert(issueDeliveryReceiptLinks).values({
+            companyId: fixture.company.id, receiptId: receipt!.id, sourceIssueId: fixture.issue.id,
+            externalObjectId: object!.id, provider: "github", owner: "tea-core", repo: "paperclip",
+            pullRequestNumber: fixture.pr.number, headSha: fixture.pr.head.sha,
+          });
+        }
+        return result;
+      }) as typeof db.transaction);
+      return { restore: () => spy.mockRestore(), linked: () => linked };
+    }
+
+    // Serves the delivery PR's first head read at the fixture head and every later
+    // read at a new head, so the preflight's live check sees the head move.
+    function moveHeadDuringPreflight(fixture: Fixture) {
+      const served = github.getMockImplementation()!;
+      let pullReads = 0;
+      github.mockImplementation(async (input, init) => {
+        if (/\/pulls\/42$/.test(String(input)) && (pullReads += 1) > 1) {
+          return Response.json({ ...fixture.pr, head: { ...fixture.pr.head, sha: "b".repeat(40) } });
+        }
+        return served(input, init);
+      });
+    }
+
     // Base refuses each of these with 409 approval_final_delivery_preflight; the
     // approval leaves later stages undecided, so it does not complete the card.
     it.each(stageDoors)("%s: records a stage-1 approve over a card with no own PR and advances to the post_merge stage", async (door) => {
@@ -1837,7 +1894,29 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       expect(approvalStatus.approvedHeadSha).toBeUndefined();
       // No delivery-branch certification: a stage approval is not a closing transition.
       expect(approvalStatus.pendingCandidates).toBeUndefined();
+      // The decision certified no head, so the post-commit hook stamps nothing.
+      expect(approvalStatus.publishSkipped).toMatchObject({ reason: expect.stringContaining("head_uncertified"), headSha: null });
       expect(fixture.writes).toEqual([]);
+    });
+
+    it.each(stageDoors)("%s: never stamps a PR linked between a no-pr preflight and the post-commit hook", async (door) => {
+      const fixture = await pendingDelivery({ adr072: true, missing: true, mergeArmingEnabled: true });
+      const late = linkReadyPrAfterDecisionCommit(fixture);
+      let response: request.Response;
+      try {
+        response = await approveAtDoor(fixture, door);
+      } finally {
+        late.restore();
+      }
+      expect(late.linked()).toBe(true);
+      const stored = await expectAdvanced(fixture, response, door, 0);
+      expect(fixture.writes).toEqual([]);
+      expect(fixture.armCalls).toEqual([]);
+      expect((await receiptsOf(fixture)).map((receipt) => receipt.state)).toEqual(["ready"]);
+      const approvalStatus = approvalStatusOf(stored);
+      expect(approvalStatus.approvedHeadSha).toBeUndefined();
+      expect(approvalStatus.publishedHeadSha).toBeUndefined();
+      expect(approvalStatus.publishSkipped).toMatchObject({ reason: expect.stringContaining("head_uncertified"), headSha: null });
     });
 
     // Unchanged from base: the escalation door already projects card completion
@@ -1847,6 +1926,27 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       const stored = await expectAdvanced(fixture, await approveAtDoor(fixture, "escalation"), "escalation", 0);
       expect(approvalStatusOf(stored).finalDelivery).toBeUndefined();
       expect(fixture.writes).toEqual([]);
+    });
+
+    // Unchanged from base: the hook's head_uncertified skip belongs to the decision
+    // that wrote the tag; a later decision stamps its live head as before.
+    it("escalation: an uncertified tag left by an earlier decision does not block the stage-1 stamp", async () => {
+      const fixture = await pendingDelivery({ adr072: true });
+      const seeded = await fixture.read();
+      await db.update(issues).set({
+        executionState: {
+          ...(seeded.executionState as Record<string, unknown>),
+          approvalStatus: {
+            finalDeliveryUncertified: { decisionId: randomUUID(), reason: "no-pr: no open linked PR resolvable at decision time" },
+          },
+        } as typeof seeded.executionState,
+      }).where(eq(issues.id, fixture.issue.id));
+      const stored = await expectAdvanced(fixture, await approveAtDoor(fixture, "escalation"), "escalation", 0);
+      expect(approvalStatusOf(stored)).toMatchObject({ approvedHeadSha: fixture.pr.head.sha, publishedHeadSha: fixture.pr.head.sha });
+      expect(fixture.writes).toEqual([{
+        url: `https://api.github.com/repos/TEA-Core/paperclip/statuses/${fixture.pr.head.sha}`,
+        body: expect.objectContaining({ state: "success", context: "paperclip/approved" }),
+      }]);
     });
 
     // Unchanged from base: a recovery restore to `done` mid-ladder is a close, and
@@ -1871,12 +1971,23 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       expect(fixture.writes).toEqual([]);
     });
 
-    it.each(stageDoors)("%s: records a stage-1 approve over a draft delivery without certifying or stamping it", async (door) => {
+    it.each(stageDoors)("%s: still refuses a stage-1 approve over a draft delivery", async (door) => {
       const fixture = await pendingDelivery({ adr072: true, draft: true });
-      const stored = await expectAdvanced(fixture, await approveAtDoor(fixture, door), door, 0);
-      expect(approvalStatusOf(stored).finalDelivery).toBeUndefined();
-      expect(approvalStatusOf(stored).approvedHeadSha).toBeUndefined();
-      expect(fixture.writes).toEqual([]);
+      const before = await fixture.read();
+      await expectRefusedUnchanged(fixture, await approveAtDoor(fixture, door), before, "approval_final_delivery_preflight", "head_draft");
+      expect(fixture.armCalls).toEqual([]);
+    });
+
+    it.each(stageDoors)("%s: still refuses a stage-1 approve whose delivery head moves during the preflight and keeps its ready receipt", async (door) => {
+      const fixture = await pendingDelivery({ adr072: true, mergeArmingEnabled: true });
+      moveHeadDuringPreflight(fixture);
+      const receiptsBefore = await receiptsOf(fixture);
+      expect(receiptsBefore.map((receipt) => receipt.state)).toEqual(["ready"]);
+      const before = await fixture.read();
+      const response = await approveAtDoor(fixture, door);
+      // A non-certifying approve must not re-resolve the moved head and invalidate the ready receipt.
+      expect(await receiptsOf(fixture)).toEqual(receiptsBefore);
+      await expectRefusedUnchanged(fixture, response, before, "approval_final_delivery_preflight", "head_moved");
       expect(fixture.armCalls).toEqual([]);
     });
 

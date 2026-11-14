@@ -4803,18 +4803,28 @@ export function issueRoutes(
     }
     if (issue.deliveryRequirement === "record_only" || !resolution.repoBacked) return;
     const { verdict, deliveryOwnerIssueId } = resolution;
+    const rawState = patch.executionState as Record<string, unknown>;
+    const prior = rawState.approvalStatus as Record<string, unknown> | undefined;
+    const decisionId = state?.lastDecisionId;
     if (verdict.kind !== "resolved") {
-      // The resolved branch below still certifies the decision head for the merge
-      // stamp; only the refusal waits for the approval that completes the card.
-      if (options.overrideAccepted || leavesLadderPendingOnUndecidedStage(policy, state)) return;
+      if (options.overrideAccepted) return;
+      // SUP-24085: a stage approval that leaves the ladder pending on a later stage
+      // does not complete the card, so a card that owns no open PR is not refused.
+      // The decision certifies no head: the tag stops the post-commit hook from
+      // stamping a live head the preflight never saw. Every other unresolved
+      // verdict (draft, unreadable or moved head, ambiguous, ...) still refuses.
+      if (decisionId && verdict.reason.startsWith("no-pr:") && leavesLadderPendingOnUndecidedStage(policy, state)) {
+        patch.executionState = {
+          ...rawState,
+          approvalStatus: { ...prior, finalDeliveryUncertified: { decisionId, reason: verdict.reason } },
+        };
+        return;
+      }
       const remedy = `Delivery owner ${deliveryOwnerIssueId}: provide one OPEN, non-draft owned PR and a readable reviewed head, then submit the final verdict again. ${verdict.reason}`;
       throw conflict("Final repository delivery preflight refused; stage remains pending", {
         code: "approval_final_delivery_preflight", reason: verdict.reason, deliveryOwnerIssueId, remedy,
       });
     }
-    const rawState = patch.executionState as Record<string, unknown>;
-    const prior = rawState.approvalStatus as Record<string, unknown> | undefined;
-    const decisionId = state?.lastDecisionId;
     patch.executionState = {
       ...rawState,
       approvalStatus: {
@@ -4824,6 +4834,17 @@ export function issueRoutes(
           : {}),
       },
     };
+  }
+
+  // SUP-24085: the reason the current decision's final-delivery preflight left no
+  // certified head, when it admitted a stage approval over a card with no open PR.
+  function readUncertifiedFinalDelivery(executionState: Record<string, unknown> | null | undefined): string | undefined {
+    const approvalStatus = executionState?.approvalStatus;
+    if (!approvalStatus || typeof approvalStatus !== "object" || !("finalDeliveryUncertified" in approvalStatus)) return undefined;
+    const uncertified = approvalStatus.finalDeliveryUncertified;
+    if (!uncertified || typeof uncertified !== "object" || !("decisionId" in uncertified) || !("reason" in uncertified)) return undefined;
+    if (typeof executionState.lastDecisionId !== "string" || uncertified.decisionId !== executionState.lastDecisionId) return undefined;
+    return typeof uncertified.reason === "string" ? uncertified.reason : "no certified head";
   }
 
   // SUP-13904 / SUP-17163: shared post-transition merge-arming hook, run by every
@@ -4994,6 +5015,23 @@ export function issueRoutes(
         );
       }
       // SUP-16081 fix #2: record the refusal before returning (total outcome).
+      await recordGuardOutcome("skipped", msg);
+      return;
+    }
+    // SUP-24085: the final-delivery preflight admitted this stage approval over a
+    // card with no open PR and certified no head. Re-resolving here would stamp
+    // (and claim or invalidate receipts for) a live head the preflight never saw.
+    const uncertifiedReason = readUncertifiedFinalDelivery(candidate.executionState);
+    if (uncertifiedReason !== undefined) {
+      const msg = `status:skipped:head_uncertified: the final-delivery preflight certified no head for this decision (${uncertifiedReason})`;
+      try {
+        await svc.addComment(issue.id, `[Merge-arming] ${msg}`, {}, { authorType: "system" });
+      } catch (commentErr) {
+        logger.warn(
+          { err: commentErr, issueId: issue.id },
+          "head_uncertified refusal comment write failed; still refusing to stamp/arm",
+        );
+      }
       await recordGuardOutcome("skipped", msg);
       return;
     }
