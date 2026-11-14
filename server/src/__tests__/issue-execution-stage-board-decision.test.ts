@@ -20,7 +20,11 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
-import { issueRoutes } from "../routes/issues.js";
+import {
+  BOARD_STAGE_OVERRIDE_ECHO_WINDOW_SECONDS,
+  findBoardStageOverrideEchoComment,
+  issueRoutes,
+} from "../routes/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
@@ -624,12 +628,19 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
       expect(approved.status, JSON.stringify(approved.body)).toBe(200);
       // Seeded directly: the comments route wakes the return assignee, and the real
       // heartbeat service would leave agent_runtime_state rows behind for cleanup.
+      // The timestamp is explicit and later than the decision comment, so the
+      // newest-comment order never depends on a createdAt tie broken by a random id.
+      const [decisionComment] = await db
+        .select({ createdAt: issueComments.createdAt })
+        .from(issueComments)
+        .where(eq(issueComments.id, approved.body.commentId as string));
       await db.insert(issueComments).values({
         companyId,
         issueId,
         authorUserId: USER_ID,
         authorType: "user",
         body: "an intervening board remark",
+        createdAt: new Date(decisionComment!.createdAt.getTime() + 1_000),
       });
 
       const closed = await request(app)
@@ -640,6 +651,260 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
 
       const rows = await userComments(issueId);
       expect(rows.filter((r) => r.body === note)).toHaveLength(2);
+    });
+
+    it("an old stage decision note does not suppress a later identical close note", async () => {
+      const { companyId, issueId } = await seedIssue();
+      currentActor = boardActor(companyId);
+
+      const approved = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: note });
+      expect(approved.status, JSON.stringify(approved.body)).toBe(200);
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      await db
+        .update(issueComments)
+        .set({ createdAt: sevenDaysAgo })
+        .where(eq(issueComments.id, approved.body.commentId as string));
+      await db
+        .update(activityLog)
+        .set({ createdAt: sevenDaysAgo })
+        .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.board_stage_override")));
+
+      const closed = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", ...override, comment: note });
+      expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+      expect(closed.body.commentDeduplicated).toBe(false);
+      expect(closed.body.comment).not.toBeNull();
+
+      const rows = await userComments(issueId);
+      expect(rows.filter((r) => r.body === note)).toHaveLength(2);
+    });
+
+    describe("skip conditions of findBoardStageOverrideEchoComment", () => {
+      type EchoSeed = {
+        body?: string;
+        authorUserId?: string;
+        commentAgeSeconds?: number;
+        activityAgeSeconds?: number;
+        action?: string;
+        activityIssueId?: string;
+        entityType?: string;
+      };
+
+      async function seedOverrideNote(companyId: string, issueId: string, opts: EchoSeed = {}) {
+        const [comment] = await db
+          .insert(issueComments)
+          .values({
+            companyId,
+            issueId,
+            authorUserId: opts.authorUserId ?? USER_ID,
+            authorType: "user",
+            body: opts.body ?? note,
+            createdAt: new Date(Date.now() - (opts.commentAgeSeconds ?? 10) * 1000),
+          })
+          .returning();
+        await db.insert(activityLog).values({
+          companyId,
+          actorType: "user",
+          actorId: USER_ID,
+          action: opts.action ?? "issue.board_stage_override",
+          entityType: opts.entityType ?? "issue",
+          entityId: opts.activityIssueId ?? issueId,
+          details: { commentId: comment!.id },
+          createdAt: new Date(Date.now() - (opts.activityAgeSeconds ?? 10) * 1000),
+        });
+        return comment!;
+      }
+
+      async function seedOtherIssue(companyId: string) {
+        const otherIssueId = "77777777-7777-4777-8777-777777777777";
+        await db.insert(issues).values({
+          id: otherIssueId,
+          companyId,
+          identifier: "SUP-15805-2",
+          issueNumber: 2,
+          title: "Another issue in the same company",
+          status: "in_review",
+          priority: "medium",
+        });
+        return otherIssueId;
+      }
+
+      const echoInput = (issueId: string, over: Record<string, unknown> = {}) => ({
+        issueId,
+        wasClosed: false,
+        nextStatus: "done" as string | null | undefined,
+        actorType: "user",
+        actorId: USER_ID,
+        commentBody: note,
+        ...over,
+      });
+
+      it("returns the stage decision comment for a closing user request that repeats it", async () => {
+        const { companyId, issueId } = await seedIssue();
+        const comment = await seedOverrideNote(companyId, issueId);
+        expect(await findBoardStageOverrideEchoComment(db, echoInput(issueId))).toEqual({ id: comment.id });
+        expect(await findBoardStageOverrideEchoComment(db, echoInput(issueId, { nextStatus: "cancelled" }))).toEqual({
+          id: comment.id,
+        });
+        expect(await findBoardStageOverrideEchoComment(db, echoInput(issueId, { commentBody: `  ${note}\n` }))).toEqual({
+          id: comment.id,
+        });
+      });
+
+      it("skips nothing when the issue was already closed before this request", async () => {
+        const { companyId, issueId } = await seedIssue();
+        await seedOverrideNote(companyId, issueId);
+        expect(await findBoardStageOverrideEchoComment(db, echoInput(issueId, { wasClosed: true }))).toBeNull();
+      });
+
+      it("skips nothing when the request does not close the issue", async () => {
+        const { companyId, issueId } = await seedIssue();
+        await seedOverrideNote(companyId, issueId);
+        for (const nextStatus of ["in_progress", "in_review", "blocked", "todo", null, undefined]) {
+          expect(await findBoardStageOverrideEchoComment(db, echoInput(issueId, { nextStatus }))).toBeNull();
+        }
+      });
+
+      it("skips nothing for an agent caller", async () => {
+        const { companyId, issueId } = await seedIssue();
+        await seedOverrideNote(companyId, issueId);
+        expect(await findBoardStageOverrideEchoComment(db, echoInput(issueId, { actorType: "agent" }))).toBeNull();
+      });
+
+      it("skips nothing when another user wrote the stage decision comment", async () => {
+        const { companyId, issueId } = await seedIssue();
+        await seedOverrideNote(companyId, issueId, { authorUserId: "someone-else" });
+        expect(await findBoardStageOverrideEchoComment(db, echoInput(issueId))).toBeNull();
+      });
+
+      it("skips nothing when the close note differs from the stage decision note", async () => {
+        const { companyId, issueId } = await seedIssue();
+        await seedOverrideNote(companyId, issueId);
+        expect(
+          await findBoardStageOverrideEchoComment(db, echoInput(issueId, { commentBody: `${note} Extra.` })),
+        ).toBeNull();
+      });
+
+      it("skips nothing when no override row records the newest comment", async () => {
+        const { companyId, issueId } = await seedIssue();
+        await db.insert(issueComments).values({
+          companyId,
+          issueId,
+          authorUserId: USER_ID,
+          authorType: "user",
+          body: note,
+        });
+        expect(await findBoardStageOverrideEchoComment(db, echoInput(issueId))).toBeNull();
+      });
+
+      it("skips nothing when the override row records an older comment, not the newest one", async () => {
+        const { companyId, issueId } = await seedIssue();
+        await seedOverrideNote(companyId, issueId, { commentAgeSeconds: 20 });
+        await db.insert(issueComments).values({
+          companyId,
+          issueId,
+          authorUserId: USER_ID,
+          authorType: "user",
+          body: note,
+          createdAt: new Date(Date.now() - 5_000),
+        });
+        expect(await findBoardStageOverrideEchoComment(db, echoInput(issueId))).toBeNull();
+      });
+
+      it("skips nothing when the override row is for another entity type with the same id", async () => {
+        const { companyId, issueId } = await seedIssue();
+        await seedOverrideNote(companyId, issueId, { entityType: "agent" });
+        expect(await findBoardStageOverrideEchoComment(db, echoInput(issueId))).toBeNull();
+      });
+
+      it("skips nothing when the activity row is not a board stage override", async () => {
+        const { companyId, issueId } = await seedIssue();
+        await seedOverrideNote(companyId, issueId, { action: "issue.comment_added" });
+        expect(await findBoardStageOverrideEchoComment(db, echoInput(issueId))).toBeNull();
+      });
+
+      it("skips nothing when the override row belongs to another issue", async () => {
+        const { companyId, issueId } = await seedIssue();
+        const otherIssueId = await seedOtherIssue(companyId);
+        await seedOverrideNote(companyId, issueId, { activityIssueId: otherIssueId });
+        expect(await findBoardStageOverrideEchoComment(db, echoInput(issueId))).toBeNull();
+      });
+
+      it("reads only the comments of the closing issue", async () => {
+        const { companyId, issueId } = await seedIssue();
+        const otherIssueId = await seedOtherIssue(companyId);
+        const comment = await seedOverrideNote(companyId, issueId, { commentAgeSeconds: 20 });
+        await db.insert(issueComments).values({
+          companyId,
+          issueId: otherIssueId,
+          authorUserId: USER_ID,
+          authorType: "user",
+          body: "a newer comment on another issue",
+          createdAt: new Date(Date.now() - 1_000),
+        });
+        expect(await findBoardStageOverrideEchoComment(db, echoInput(issueId))).toEqual({ id: comment.id });
+      });
+
+      it("skips nothing when a user comment is newer than the stage decision comment", async () => {
+        const { companyId, issueId } = await seedIssue();
+        await seedOverrideNote(companyId, issueId, { commentAgeSeconds: 20 });
+        await db.insert(issueComments).values({
+          companyId,
+          issueId,
+          authorUserId: USER_ID,
+          authorType: "user",
+          body: "an intervening board remark",
+          createdAt: new Date(Date.now() - 5_000),
+        });
+        expect(await findBoardStageOverrideEchoComment(db, echoInput(issueId))).toBeNull();
+      });
+
+      it("ignores newer system comments and newer deleted comments", async () => {
+        const { companyId, issueId } = await seedIssue();
+        const comment = await seedOverrideNote(companyId, issueId, { commentAgeSeconds: 20 });
+        await db.insert(issueComments).values([
+          {
+            companyId,
+            issueId,
+            authorType: "system",
+            body: "[Merge-arming] a system note",
+            createdAt: new Date(Date.now() - 5_000),
+          },
+          {
+            companyId,
+            issueId,
+            authorUserId: USER_ID,
+            authorType: "user",
+            body: "a removed remark",
+            deletedAt: new Date(),
+            createdAt: new Date(Date.now() - 4_000),
+          },
+        ]);
+        expect(await findBoardStageOverrideEchoComment(db, echoInput(issueId))).toEqual({ id: comment.id });
+      });
+
+      it("matches only a stage decision recorded inside the echo window", async () => {
+        const { companyId, issueId } = await seedIssue();
+        const comment = await seedOverrideNote(companyId, issueId, {
+          activityAgeSeconds: BOARD_STAGE_OVERRIDE_ECHO_WINDOW_SECONDS - 30,
+        });
+        expect(await findBoardStageOverrideEchoComment(db, echoInput(issueId))).toEqual({ id: comment.id });
+        await db.delete(activityLog);
+        await db.insert(activityLog).values({
+          companyId,
+          actorType: "user",
+          actorId: USER_ID,
+          action: "issue.board_stage_override",
+          entityType: "issue",
+          entityId: issueId,
+          details: { commentId: comment.id },
+          createdAt: new Date(Date.now() - (BOARD_STAGE_OVERRIDE_ECHO_WINDOW_SECONDS + 30) * 1000),
+        });
+        expect(await findBoardStageOverrideEchoComment(db, echoInput(issueId))).toBeNull();
+      });
     });
   });
 

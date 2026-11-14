@@ -2999,20 +2999,37 @@ async function findSuppressibleDuplicateCloseComment(
  * `findSuppressibleDuplicateCloseComment` cannot fire: the first close is never "already
  * terminal", and it only reads agent-authored comments. That ruling stays untouched.
  *
+ * The relay sends the two requests back to back, so the stage decision of THIS close is
+ * the one recorded within `BOARD_STAGE_OVERRIDE_ECHO_WINDOW_SECONDS`. An older stage
+ * decision note never suppresses a later, identical close note.
+ *
  * Returns the stage-decision comment the closing note repeats when ALL hold, else null
  * (the caller then appends, unchanged):
- *   1. the newest non-system, non-deleted comment on the thread is the comment a
- *      `issue.board_stage_override` activity row recorded (`details.commentId`) — a durable
- *      link, not a time window, so any comment posted since keeps the close note visible;
- *   2. that comment was authored by the same user as the closing request; and
- *   3. the closing note — trimmed and redacted exactly as `addComment` stores it — is
+ *   1. this PATCH closes the issue: it was not terminal before (`wasClosed` false), the new
+ *      status is done/cancelled, and the caller is a user;
+ *   2. the newest non-system, non-deleted comment on the thread is the comment an
+ *      `issue.board_stage_override` activity row of this issue recorded (`details.commentId`),
+ *      and that row is inside the window — a comment posted since keeps the close note visible;
+ *   3. that comment was authored by the same user as the closing request; and
+ *   4. the closing note — trimmed and redacted exactly as `addComment` stores it — is
  *      byte-identical to it.
- * The caller additionally requires that this PATCH is the one that closes the issue.
  */
-async function findBoardStageOverrideEchoComment(
+export const BOARD_STAGE_OVERRIDE_ECHO_WINDOW_SECONDS = 60;
+
+export async function findBoardStageOverrideEchoComment(
   db: Db,
-  input: { issueId: string; actorUserId: string; commentBody: string },
+  input: {
+    issueId: string;
+    wasClosed: boolean;
+    nextStatus: string | null | undefined;
+    actorType: string;
+    actorId: string;
+    commentBody: string;
+  },
 ): Promise<{ id: string } | null> {
+  if (input.wasClosed || !isClosedIssueStatus(input.nextStatus) || input.actorType !== "user") {
+    return null;
+  }
   const { censorUsernameInLogs } = await instanceSettingsService(db).getGeneral();
   const normalizedIncoming = redactIssueCommentBody(input.commentBody.trim(), {
     enabled: censorUsernameInLogs,
@@ -3034,7 +3051,7 @@ async function findBoardStageOverrideEchoComment(
     .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
     .limit(1);
   if (!latest) return null;
-  if (latest.authorUserId !== input.actorUserId || latest.body !== normalizedIncoming) return null;
+  if (latest.authorUserId !== input.actorId || latest.body !== normalizedIncoming) return null;
   const [override] = await db
     .select({ id: activityLog.id })
     .from(activityLog)
@@ -3044,6 +3061,7 @@ async function findBoardStageOverrideEchoComment(
         eq(activityLog.entityId, input.issueId),
         eq(activityLog.action, "issue.board_stage_override"),
         sql`${activityLog.details} ->> 'commentId' = ${latest.id}`,
+        sql`${activityLog.createdAt} > now() - (${BOARD_STAGE_OVERRIDE_ECHO_WINDOW_SECONDS}::int * interval '1 second')`,
       ),
     )
     .limit(1);
@@ -21346,16 +21364,14 @@ export function issueRoutes(
               ) ||
               // SUP-24193: this PATCH is the close, and the board stage decision
               // that preceded it already wrote the same note.
-              (
-                !isClosed &&
-                isClosedIssueStatus(updated.status) &&
-                actor.actorType === "user" &&
-                await findBoardStageOverrideEchoComment(tx as unknown as Db, {
-                  issueId: updated.id,
-                  actorUserId: actor.actorId,
-                  commentBody,
-                })
-              );
+              await findBoardStageOverrideEchoComment(tx as unknown as Db, {
+                issueId: updated.id,
+                wasClosed: isClosed,
+                nextStatus: updated.status,
+                actorType: actor.actorType,
+                actorId: actor.actorId,
+                commentBody,
+              });
             if (duplicate) {
               commentDeduplicated = true;
               deduplicatedFromCommentId = duplicate.id;
@@ -22177,16 +22193,14 @@ export function issueRoutes(
             resumeRequested !== true &&
             await findSuppressibleDuplicateCloseComment(db, issue.id, commentBody)
           ) ||
-          (
-            !isClosed &&
-            isClosedIssueStatus(issue.status) &&
-            actor.actorType === "user" &&
-            await findBoardStageOverrideEchoComment(db, {
-              issueId: issue.id,
-              actorUserId: actor.actorId,
-              commentBody,
-            })
-          ) ||
+          await findBoardStageOverrideEchoComment(db, {
+            issueId: issue.id,
+            wasClosed: isClosed,
+            nextStatus: issue.status,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            commentBody,
+          }) ||
           null
         : null;
     if (commentBody && commentHandledInTransaction && comment) {
