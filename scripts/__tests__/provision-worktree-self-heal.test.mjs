@@ -252,7 +252,9 @@ test("uses the base CLI when its import graph boots", () => {
 // absent source instead; "provisions a self-contained worktree when no seed source
 // config exists on disk" and "runtime provisioning exits 0 when no seed source
 // config exists on disk" below pin that behavior. Present-but-malformed sources are
-// still refused (the symlink and non-regular cases that follow).
+// still refused (the symlink and non-regular cases that follow). Upstream #14810
+// later changed the absent-default-source case to a config-less "plain checkout";
+// its tests encode that upstream contract and are not carried for the same reason.
 
 test("rejects a dangling base workspace config symlink instead of falling back", () => {
   const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });

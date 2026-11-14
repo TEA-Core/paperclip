@@ -19,7 +19,8 @@ export interface ExecutionRetryAccounting {
 // scheduledRetryAttempt counts deferrals for its own eight-deferral bound, not
 // failed attempts, so it never spends (or overwrites) the failure budget.
 const WORKSPACE_WAIT_REASONS = ["workspace_busy", "execution_workspace_occupied"];
-const RESOURCE_WAIT_REASONS = [...WORKSPACE_WAIT_REASONS, "ai_connection_busy"];
+// Upstream #14967: a task-pinned AI pool wait is the same kind of resource wait.
+const RESOURCE_WAIT_REASONS = [...WORKSPACE_WAIT_REASONS, "ai_connection_busy", "ai_connection_pool_wait"];
 
 function count(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
@@ -39,7 +40,7 @@ function historicalFailureCount(run: RetryRun): number {
   if (run.scheduledRetryReason === "max_turns_continuation" || run.scheduledRetryReason === "issue_disposition_repair") return 0;
   // Upstream #13438: a subscription wait is a resource wait too, and its
   // scheduler carries the predecessor's durable count in its own field.
-  if (run.scheduledRetryReason === "ai_connection_busy") {
+  if (run.scheduledRetryReason === "ai_connection_busy" || run.scheduledRetryReason === "ai_connection_pool_wait") {
     const saved = count(run.contextSnapshot?.failureRetriesBeforeAiConnectionWait);
     if (saved !== null) return saved;
   }

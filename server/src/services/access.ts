@@ -1137,6 +1137,7 @@ export function accessService(db: Db) {
     isInstanceAdmin,
     decide,
     isManagerOf,
+    projectDiscoveryCandidateIds: authorization.projectDiscoveryCandidateIds,
     canUser,
     hasPermission,
     getMembership,

@@ -29,6 +29,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
@@ -197,21 +198,12 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       model: "test-model",
     }));
     runningProcesses.clear();
-    let idlePolls = 0;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const runs = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns);
-      const hasActiveRun = runs.some((run) => run.status === "queued" || run.status === "running");
-      if (!hasActiveRun) {
-        idlePolls += 1;
-        if (idlePolls >= 3) break;
-      } else {
-        idlePolls = 0;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // A table poll for "queued" or "running" rows cannot see a wakeup promise
+    // that has not yet written its run row. The shared drain helper awaits
+    // both in-flight wakeup promises and in-flight run executions first, then
+    // re-checks the run table, so a late writer cannot still be in flight when
+    // the TRUNCATE below runs.
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
     await cleanupHeartbeatInvalidationFixture(db, heartbeat);
   });
 

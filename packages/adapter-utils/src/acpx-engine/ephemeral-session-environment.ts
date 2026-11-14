@@ -1,5 +1,6 @@
 import type { AcpSessionStore } from "acpx/runtime";
 
+/** Keep the current run's environment in memory, outside persisted conversation state. */
 export function createEphemeralSessionEnvironmentStore(
   persistedStore: AcpSessionStore,
   currentEnvironment: Readonly<Record<string, string>>,

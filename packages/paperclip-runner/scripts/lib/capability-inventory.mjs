@@ -235,16 +235,16 @@ export async function buildInventories({ repoRoot, evalRoot }) {
 }
 
 export async function buildSkillInventory(repoRoot) {
-  const skillRoot = resolve(repoRoot, "skills/paperclip");
-  const skillFiles = ["SKILL.md", "references/artifacts.md", "references/cases.md", "references/company-skills.md", "references/issue-workspaces.md", "references/routines.md", "references/workflows.md", "references/api-reference.md"];
+  const { skillSources: skillFiles } = JSON.parse(await readFile(resolve(repoRoot,
+    "packages/paperclip-runner/spec/capability/source-contract.json"), "utf8"));
   const rows = (await Promise.all(skillFiles.map(async (file) => parseSkillHeadings(
-    await readFile(resolve(skillRoot, file), "utf8"),
-    `skills/paperclip/${file}`,
+    await readFile(resolve(repoRoot, file), "utf8"),
+    file,
   )))).flat();
   return {
     schemaVersion: 2,
     inventoryRole: "normative",
-    generatedFrom: skillFiles.map((file) => `skills/paperclip/${file}`),
+    generatedFrom: skillFiles,
     rows,
   };
 }
@@ -267,8 +267,9 @@ export function validateInventories(inventories) {
   // capabilities stays upstream's literal and moves with upstream: 153 came from #13038
   // ("server-verified external chat turns"), then slice 2d took it to 155 — #13284
   // (experimental persistent agent chat) and #13317 (chief-of-staff hiring) each added one
-  // skill/reference heading — and #14613 (conversational confirmation answers) took it to 157.
-  const expectedCounts = { capabilities: 157, evaluations: 106, legacyMcpAliases: LEGACY_MCP_ALIAS_COUNT };
+  // skill/reference heading — #14613 (conversational confirmation answers) took it to 157,
+  // and fold-s3b took it to upstream's 161.
+  const expectedCounts = { capabilities: 161, evaluations: 106, legacyMcpAliases: LEGACY_MCP_ALIAS_COUNT };
   const normativeNames = ["capabilities", "evaluations"];
   const normativeRows = new Map();
   const globalNormativeIds = new Set();

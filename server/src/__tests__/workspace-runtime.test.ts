@@ -1944,6 +1944,43 @@ describe("realizeExecutionWorkspace", () => {
     }
   });
 
+  it.each([false, true])("realizes a plain Paperclip checkout without a local seed instance (image default env: %s)", async (defaultConfigInEnv) => {
+    const repoRoot = await createTempRepo();
+    const paperclipHome = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-env-only-home-")));
+    const previousEnv = {
+      PAPERCLIP_HOME: process.env.PAPERCLIP_HOME,
+      PAPERCLIP_CONFIG: process.env.PAPERCLIP_CONFIG,
+      PAPERCLIP_INSTANCE_ID: process.env.PAPERCLIP_INSTANCE_ID,
+    };
+    try {
+      await fs.mkdir(path.join(repoRoot, "scripts"));
+      await fs.copyFile(provisionWorktreeScriptPath, path.join(repoRoot, "scripts", "provision-worktree.sh"));
+      await runGit(repoRoot, ["add", "scripts/provision-worktree.sh"]);
+      await runGit(repoRoot, ["commit", "-m", "Add Paperclip worktree provisioner"]);
+      process.env.PAPERCLIP_HOME = paperclipHome;
+      process.env.PAPERCLIP_INSTANCE_ID = "default";
+      if (defaultConfigInEnv) process.env.PAPERCLIP_CONFIG = path.join(paperclipHome, "instances", "default", "config.json");
+      else delete process.env.PAPERCLIP_CONFIG;
+
+      const workspace = await realizeWorktreeForTest(repoRoot, "HEAD");
+
+      expect(workspace.strategy).toBe("git_worktree");
+      expect(workspace.created).toBe(true);
+      expect(await readGit(workspace.cwd, ["branch", "--show-current"])).toBe(workspace.branchName);
+      for (const file of ["config.json", ".env", "seed-manifest.json", "seed-pending", "seed-complete"]) {
+        expect(existsSync(path.join(workspace.cwd, ".paperclip", file))).toBe(false);
+      }
+      expect(await fs.readdir(paperclipHome)).toEqual([]);
+    } finally {
+      for (const [key, value] of Object.entries(previousEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await fs.rm(repoRoot, { recursive: true, force: true });
+      await fs.rm(paperclipHome, { recursive: true, force: true });
+    }
+  });
+
   it("defaults the repo-provided worktree provisioner for git worktree strategies", async () => {
     const repoRoot = await createTempRepo();
     await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
@@ -10270,35 +10307,44 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
         executionWorkspaceId,
         serviceName: "web",
         status: "provisioning",
+        healthStatus: "unknown",
         providerRef: null,
       });
       expect(existsSync(markerPath)).toBe(false);
 
       await waitForMarker(markerPath);
-      const startingRow = await waitForPersistedStatus("starting");
-      expect(startingRow).toMatchObject({
+      // Readiness begins before the PID-bearing transaction commits. Keep the
+      // listener independent of DB reads and verify the completed records.
+      const services = await startPromise;
+      expect(services).toHaveLength(1);
+      expect(services[0]).toMatchObject({
+        id: provisioningRow.id,
         companyId,
         projectId,
         projectWorkspaceId,
         executionWorkspaceId,
         issueId,
         serviceName: "web",
-        status: "starting",
-        healthStatus: "unknown",
-      });
-      expect(startingRow.providerRef).toMatch(/^\d+$/);
-      expect(startingRow.port).toEqual(expect.any(Number));
-
-      const services = await startPromise;
-      expect(services).toHaveLength(1);
-      expect(services[0]).toMatchObject({
-        id: startingRow.id,
         status: "running",
         healthStatus: "healthy",
       });
+      expect(services[0]!.providerRef).toMatch(/^\d+$/);
+      expect(services[0]!.port).toEqual(expect.any(Number));
 
       const runningRow = await waitForPersistedStatus("running");
-      expect(runningRow.id).toBe(startingRow.id);
+      expect(runningRow).toMatchObject({
+        id: provisioningRow.id,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        executionWorkspaceId,
+        issueId,
+        serviceName: "web",
+        status: "running",
+        healthStatus: "healthy",
+        providerRef: services[0]!.providerRef,
+        port: services[0]!.port,
+      });
       await expect(fetch(services[0]!.url!)).resolves.toMatchObject({ ok: true });
       const runtimeProvisionOperations = await db
         .select()

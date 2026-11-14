@@ -36,6 +36,7 @@ import {
   readPaperclipIssueWorkModeFromContext,
   readPaperclipRuntimeSkillEntries,
   renderTemplate,
+  hydrateFreshSessionHandoff,
   selectPaperclipPromptSections,
   selectInitialCommunicationGuidance,
   isPaperclipRecoveryWakePayload,
@@ -571,6 +572,7 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
     };
 
     const runAttempt = async (resumeSessionId: string | null) => {
+    await hydrateFreshSessionHandoff(ctx, { resumedSession: Boolean(resumeSessionId) });
       ctx.signal?.throwIfAborted();
       const attemptSections = selectPaperclipPromptSections(context, {
         resumedSession: Boolean(resumeSessionId),

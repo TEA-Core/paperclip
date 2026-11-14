@@ -192,7 +192,7 @@ function makeComment(overrides: Record<string, unknown> = {}) {
   };
 }
 
-describe.sequential("issue comment cancel routes", () => {
+describe("issue comment cancel routes", () => {
   const routeModules = hoistModuleGraph(registerModuleMocks, async () => {
     // Await one module graph at a time: a concurrent Promise.all drains vitest's
     // pending mock queue twice and can drop the services/index mock (see
