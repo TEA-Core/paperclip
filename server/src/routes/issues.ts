@@ -155,6 +155,7 @@ import {
   type IssueWakeDiagnosticsResponse,
   type IssueRelationIssueSummary,
   type IssueReviewPolicy,
+  type IssueExecutionStagePrincipal,
   type IssueUnblockDescriptor,
   type IssueThreadInteractionCanonicalResolverPolicy,
   type IssueComment,
@@ -434,6 +435,8 @@ import {
   BoardStageNoUndecidedStageError,
   BoardStageSelfApprovalError,
   diagnoseMissingApprovalStage,
+  listCurrentPolicyApprovedStageIds,
+  type DurableApprovalIssue,
   isReviewChangesRequestedTransition,
   MISSING_APPROVAL_STAGE_ERROR_CODE,
   normalizeIssueExecutionPolicy,
@@ -6030,43 +6033,86 @@ export function issueRoutes(
   // nulls the projection) leaves the `issue_execution_decisions` rows in place,
   // and the done-transition guard already counts them (SUP-14912). The engine's
   // workflow start runs before the guard, so a `done` door passes it the stage
-  // ids whose LATEST decision is `approved`, scoped to the current policy, the
-  // same set the board stage-decision door uses. Only a `done` request with no
-  // active stage starts the workflow; a pending or completed state never reads
-  // the set, so it pays no query.
+  // ids whose durable approval still holds under the current policy
+  // (`listCurrentPolicyApprovedStageIds`, release-assurance B1/B2). Only a `done`
+  // request with no active stage starts the workflow; a pending or completed
+  // state never reads the set, so it pays no query.
   const loadDurablyApprovedStageIdsForDone = async (
     executor: Db,
     input: {
-      companyId: string;
-      issueId: string;
+      issue: DurableApprovalIssue & { id: string; companyId: string };
       policy: NormalizedExecutionPolicy | null;
-      executionState: unknown;
       requestedStatus: string | undefined;
     },
   ): Promise<string[] | undefined> => {
     if (input.requestedStatus !== "done" || !input.policy || input.policy.stages.length === 0) {
       return undefined;
     }
-    const stateStatus = parseIssueExecutionState(input.executionState)?.status;
+    const stateStatus = parseIssueExecutionState(input.issue.executionState)?.status;
     if (stateStatus === "pending" || stateStatus === "completed") return undefined;
-    const decisionRows = await executor
+    const decisions = await executor
       .select({
         id: issueExecutionDecisions.id,
         stageId: issueExecutionDecisions.stageId,
+        stageType: issueExecutionDecisions.stageType,
         outcome: issueExecutionDecisions.outcome,
+        actorAgentId: issueExecutionDecisions.actorAgentId,
+        actorUserId: issueExecutionDecisions.actorUserId,
         createdAt: issueExecutionDecisions.createdAt,
       })
       .from(issueExecutionDecisions)
       .where(
         and(
-          eq(issueExecutionDecisions.companyId, input.companyId),
-          eq(issueExecutionDecisions.issueId, input.issueId),
+          eq(issueExecutionDecisions.companyId, input.issue.companyId),
+          eq(issueExecutionDecisions.issueId, input.issue.id),
         ),
       );
-    return listDurablyApprovedStageIds(
-      decisionRows,
-      input.policy.stages.map((stage) => stage.id),
-    );
+    // A board stage decision (SUP-15805) is recorded by the board user on a
+    // participant's behalf. The route writes the decision row and its
+    // `issue.board_stage_override` activity row in one transaction, so both carry
+    // the transaction's `created_at`; the activity row names the participant the
+    // board decided for, which the current-participant check compares.
+    const boardDecisionParticipants = new Map<string, IssueExecutionStagePrincipal | null>();
+    if (decisions.some((decision) => !decision.actorAgentId && decision.actorUserId)) {
+      const overrides = await executor
+        .select({ createdAt: activityLog.createdAt, details: activityLog.details })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, input.issue.companyId),
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, input.issue.id),
+            eq(activityLog.action, "issue.board_stage_override"),
+          ),
+        );
+      for (const decision of decisions) {
+        if (decision.actorAgentId || !decision.actorUserId) continue;
+        const override = overrides.find(
+          (row) =>
+            row.createdAt.getTime() === decision.createdAt.getTime() &&
+            (row.details as Record<string, unknown> | null)?.stageId === decision.stageId,
+        );
+        if (!override) continue;
+        const displaced = (override.details as Record<string, unknown>).displacedParticipant as
+          | { type?: unknown; agentId?: unknown; userId?: unknown }
+          | null
+          | undefined;
+        boardDecisionParticipants.set(
+          decision.id,
+          displaced?.type === "agent" && typeof displaced.agentId === "string"
+            ? { type: "agent", agentId: displaced.agentId, userId: null }
+            : displaced?.type === "user" && typeof displaced.userId === "string"
+              ? { type: "user", userId: displaced.userId, agentId: null }
+              : null,
+        );
+      }
+    }
+    return listCurrentPolicyApprovedStageIds({
+      issue: input.issue,
+      policy: input.policy,
+      decisions,
+      boardDecisionParticipants,
+    });
   };
   const projectsSvc = projectService(db);
   const goalsSvc = goalService(db);
@@ -14475,10 +14521,8 @@ export function issueRoutes(
                 requestedStatus: sourceIssueStatus,
               }),
               decidedStageIds: await loadDurablyApprovedStageIdsForDone(tx as unknown as Db, {
-                companyId: lockedIssue.companyId,
-                issueId: lockedIssue.id,
+                issue: lockedIssue,
                 policy: executionPolicy,
-                executionState: lockedIssue.executionState,
                 requestedStatus: sourceIssueStatus,
               }),
             });
@@ -19862,10 +19906,8 @@ export function issueRoutes(
         requestedStatus: requestedTransitionStatus,
       }),
       decidedStageIds: await loadDurablyApprovedStageIdsForDone(db, {
-        companyId: existing.companyId,
-        issueId: existing.id,
+        issue: existing,
         policy: nextExecutionPolicy,
-        executionState: existing.executionState,
         requestedStatus: requestedTransitionStatus,
       }),
     });
@@ -26151,10 +26193,8 @@ export function issueRoutes(
         },
         commentBody,
         decidedStageIds: await loadDurablyApprovedStageIdsForDone(db, {
-          companyId: currentIssue.companyId,
-          issueId: currentIssue.id,
+          issue: currentIssue,
           policy: currentExecutionPolicy,
-          executionState: currentIssue.executionState,
           requestedStatus: "done",
         }),
       });

@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BASE_MAX_REVIEW_ROUNDS, DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertExecutionDecisionSnapshotCurrent, assertPatchableExecutionPolicyWrite, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, foldExecutionPolicyAgentIds, foldExecutionStateAgentIds, isReviewChangesRequestedTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
-import { listDurablyApprovedStageIds } from "../services/approval-status-reconciler.ts";
+import { BASE_MAX_REVIEW_ROUNDS, DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertExecutionDecisionSnapshotCurrent, assertPatchableExecutionPolicyWrite, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, foldExecutionPolicyAgentIds, foldExecutionStateAgentIds, isReviewChangesRequestedTransition, listCurrentPolicyApprovedStageIds, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stripMonitorFromExecutionPolicy, type DurableApprovalDecisionRow } from "../services/issue-execution-policy.ts";
 import { HttpError } from "../errors.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
@@ -1994,7 +1993,7 @@ describe("issue execution policy transitions", () => {
     // The SUP-24036 shape: the policy returns to the delivering agent, the
     // review stage has another participant, a reopen nulled the projection,
     // and the stage's latest decision row is `approved`. The route resolves
-    // `decidedStageIds` from those rows with listDurablyApprovedStageIds.
+    // `decidedStageIds` from those rows with listCurrentPolicyApprovedStageIds.
     function reviewPolicyReturningToCoder() {
       return normalizeIssueExecutionPolicy({
         returnAssigneeAgentId: coderAgentId,
@@ -2061,19 +2060,218 @@ describe("issue execution policy transitions", () => {
     it("arms a stage whose latest decision is changes_requested (fail closed)", () => {
       const policy = reviewPolicyReturningToCoder();
       const stageId = policy.stages[0].id;
-      const decidedStageIds = listDurablyApprovedStageIds(
-        [
-          { id: "d-1", stageId, outcome: "approved", createdAt: new Date("2026-11-12T19:09:34Z") },
-          { id: "d-2", stageId, outcome: "changes_requested", createdAt: new Date("2026-11-12T19:30:00Z") },
+      const decidedStageIds = listCurrentPolicyApprovedStageIds({
+        issue: { assigneeAgentId: coderAgentId, assigneeUserId: null, executionState: null },
+        policy,
+        decisions: [
+          { id: "d-1", stageId, stageType: "review", outcome: "approved", actorAgentId: qaAgentId, actorUserId: null, createdAt: new Date("2026-11-12T19:09:34Z") },
+          { id: "d-2", stageId, stageType: "review", outcome: "changes_requested", actorAgentId: qaAgentId, actorUserId: null, createdAt: new Date("2026-11-12T19:30:00Z") },
         ],
-        policy.stages.map((stage) => stage.id),
-      );
+        boardDecisionParticipants: new Map(),
+      });
       expect(decidedStageIds).toEqual([]);
 
       const result = coderDoneOnNullState(policy, decidedStageIds);
       expect(result.patch.status).toBe("in_review");
       expect(result.patch.assigneeAgentId).toBe(qaAgentId);
       expect(result.patch.executionState).toMatchObject({ status: "pending", currentStageId: stageId });
+    });
+  });
+
+  describe("durable approvals must hold under the current policy (SUP-24054 release-assurance B1/B2)", () => {
+    const otherAgentId = "44444444-4444-4444-8444-444444444444";
+    const boardDeciderUserId = "board-decider";
+    const approvedAt = new Date("2026-11-12T19:09:34Z");
+
+    function ladder(reviewParticipants: Array<{ type: "agent"; agentId: string }> = [{ type: "agent", agentId: qaAgentId }]) {
+      return normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: coderAgentId,
+        stages: [
+          { type: "review", participants: reviewParticipants },
+          { type: "approval", participants: [{ type: "user", userId: ctoUserId }] },
+        ],
+      })!;
+    }
+
+    function row(overrides: Partial<DurableApprovalDecisionRow> & { stageId: string }): DurableApprovalDecisionRow {
+      return {
+        id: `d-${overrides.stageId}-${overrides.actorAgentId ?? overrides.actorUserId ?? "none"}`,
+        stageType: "review",
+        outcome: "approved",
+        actorAgentId: null,
+        actorUserId: null,
+        createdAt: approvedAt,
+        ...overrides,
+      };
+    }
+
+    function approvedIds(input: {
+      policy: IssueExecutionPolicy;
+      decisions: DurableApprovalDecisionRow[];
+      board?: Array<[string, { type: "agent"; agentId: string } | { type: "user"; userId: string } | null]>;
+      issue?: { assigneeAgentId?: string | null; assigneeUserId?: string | null; createdByAgentId?: string | null };
+    }) {
+      return listCurrentPolicyApprovedStageIds({
+        issue: { assigneeAgentId: coderAgentId, assigneeUserId: null, executionState: null, ...input.issue },
+        policy: input.policy,
+        decisions: input.decisions,
+        boardDecisionParticipants: new Map(
+          (input.board ?? []).map(([id, principal]) => [
+            id,
+            principal === null ? null : { agentId: null, userId: null, ...principal },
+          ]),
+        ),
+      });
+    }
+
+    it("counts approvals by current agent and user participants", () => {
+      const policy = ladder();
+      const [review, approval] = policy.stages;
+      expect(
+        approvedIds({
+          policy,
+          decisions: [
+            row({ stageId: review.id, actorAgentId: qaAgentId }),
+            row({ stageId: approval.id, stageType: "approval", actorUserId: ctoUserId }),
+          ],
+        }),
+      ).toEqual([review.id, approval.id]);
+    });
+
+    it("counts a board stage decision recorded for a current participant", () => {
+      const policy = ladder();
+      const [review, approval] = policy.stages;
+      const boardReview = row({ id: "board-review", stageId: review.id, actorUserId: boardDeciderUserId });
+      const boardApproval = row({ id: "board-approval", stageId: approval.id, stageType: "approval", actorUserId: boardDeciderUserId });
+      expect(
+        approvedIds({
+          policy,
+          decisions: [boardReview, boardApproval],
+          board: [
+            ["board-review", { type: "agent", agentId: qaAgentId }],
+            ["board-approval", { type: "user", userId: ctoUserId }],
+          ],
+        }),
+      ).toEqual([review.id, approval.id]);
+    });
+
+    it("drops an approval whose agent is no longer a participant of the stage", () => {
+      const policy = ladder([{ type: "agent", agentId: otherAgentId }]);
+      const [review] = policy.stages;
+      expect(approvedIds({ policy, decisions: [row({ stageId: review.id, actorAgentId: qaAgentId })] })).toEqual([]);
+    });
+
+    it("drops a board stage decision whose participant was replaced, or that names none", () => {
+      const policy = ladder([{ type: "agent", agentId: otherAgentId }]);
+      const [review] = policy.stages;
+      const boardReview = row({ id: "board-review", stageId: review.id, actorUserId: boardDeciderUserId });
+      expect(approvedIds({ policy, decisions: [boardReview], board: [["board-review", { type: "agent", agentId: qaAgentId }]] })).toEqual([]);
+      expect(approvedIds({ policy, decisions: [boardReview], board: [["board-review", null]] })).toEqual([]);
+    });
+
+    it("drops a user approval that is neither a participant's nor a board stage decision", () => {
+      const policy = ladder();
+      const [, approval] = policy.stages;
+      expect(
+        approvedIds({ policy, decisions: [row({ stageId: approval.id, stageType: "approval", actorUserId: boardDeciderUserId })] }),
+      ).toEqual([]);
+    });
+
+    it("drops an approval after the stage type was flipped", () => {
+      const policy = ladder();
+      const [review] = policy.stages;
+      expect(
+        approvedIds({ policy, decisions: [row({ stageId: review.id, stageType: "approval", actorAgentId: qaAgentId })] }),
+      ).toEqual([]);
+    });
+
+    it("drops every approval once any decision row names a stage the policy no longer carries", () => {
+      const policy = ladder();
+      const [review, approval] = policy.stages;
+      const removedStageId = "99999999-9999-4999-8999-999999999999";
+      expect(
+        approvedIds({
+          policy,
+          decisions: [
+            row({ stageId: review.id, actorAgentId: qaAgentId }),
+            row({ stageId: approval.id, stageType: "approval", actorUserId: ctoUserId }),
+            row({ stageId: removedStageId, outcome: "changes_requested", actorAgentId: otherAgentId }),
+          ],
+        }),
+      ).toEqual([]);
+    });
+
+    it("drops a self-approval by the return assignee, matched case-insensitively", () => {
+      const returnAgentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const policy = normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: returnAgentId,
+        stages: [
+          {
+            type: "review",
+            participants: [
+              { type: "agent", agentId: qaAgentId },
+              { type: "agent", agentId: returnAgentId },
+            ],
+          },
+        ],
+      })!;
+      const [review] = policy.stages;
+      expect(
+        approvedIds({
+          policy,
+          decisions: [row({ stageId: review.id, actorAgentId: returnAgentId.toUpperCase() })],
+          issue: { assigneeAgentId: otherAgentId },
+        }),
+      ).toEqual([]);
+    });
+
+    it("drops a self-approval by the current assignee, the delivery author of the done", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [
+          { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+          { type: "approval", participants: [{ type: "user", userId: ctoUserId }] },
+        ],
+      })!;
+      const [review, approval] = policy.stages;
+      expect(
+        approvedIds({ policy, decisions: [row({ stageId: review.id, actorAgentId: qaAgentId })], issue: { assigneeAgentId: qaAgentId } }),
+      ).toEqual([]);
+      expect(
+        approvedIds({
+          policy,
+          decisions: [row({ stageId: approval.id, stageType: "approval", actorUserId: ctoUserId })],
+          issue: { assigneeAgentId: null, assigneeUserId: ctoUserId },
+        }),
+      ).toEqual([]);
+    });
+
+    it("drops a row with no recorded actor", () => {
+      const policy = ladder();
+      const [review] = policy.stages;
+      expect(approvedIds({ policy, decisions: [row({ stageId: review.id })] })).toEqual([]);
+    });
+
+    it("keeps re-arm-review behaviour when an approval no longer holds", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: coderAgentId,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      })!;
+      const [review] = policy.stages;
+      const decidedStageIds = approvedIds({
+        policy,
+        decisions: [row({ stageId: review.id, stageType: "approval", actorAgentId: qaAgentId })],
+      });
+      const result = applyIssueExecutionPolicyTransition({
+        issue: { status: "in_progress", assigneeAgentId: coderAgentId, assigneeUserId: null, executionPolicy: policy, executionState: null },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: "Closing after the approved delivery",
+        decidedStageIds,
+      });
+      expect(result.patch.status).toBe("in_review");
+      expect(result.patch.executionState).toMatchObject({ status: "pending", currentStageId: review.id });
     });
   });
 
