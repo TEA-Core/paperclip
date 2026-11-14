@@ -10,6 +10,7 @@ import type {
   IssueRecoveryActionStatus,
 } from "@paperclipai/shared";
 import { isTerminalRecoveryAction } from "./issue-continuation-path.js";
+import { REVIEW_PARTICIPANT_LIVE_WINDOW_MS, participantRanSince } from "./recovery/participant-liveness.js";
 
 import { isNativeWorkspaceFinalizationOperationActive } from "./workspace-operations.js";
 
@@ -27,6 +28,21 @@ const MAX_UPSERT_RETRIES = 3;
  * source of truth instead of drifting apart.
  */
 export const DEFAULT_RECOVERY_ACTION_MAX_ATTEMPTS = 5;
+
+/**
+ * SUP-24251 (redo of SUP-22273): the stranded-participant recovery kinds whose
+ * attempt accounting stands down while the action's owner agent (or, on a
+ * board-owned row, the pending participant it was minted for) is live. For
+ * these kinds the stale-wake sweep neither burns an attempt nor escalates
+ * while that agent ran after `lastAttemptAt`, and a re-mint caps its inherited
+ * depth one below the ceiling while that agent ran after the predecessor's
+ * last update. A live agent that cannot clear the card is not a wedge; an idle
+ * one still walks the action to exhaustion exactly as before.
+ */
+export const OWNER_LIVE_HOLD_RECOVERY_KINDS: ReadonlySet<string> = new Set<IssueRecoveryActionKind>([
+  "stranded_assigned_issue",
+  "review_stage_unarmed",
+]);
 
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -894,7 +910,34 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
       // (`predecessorBudgetExhausted` true) keeps `runAgnosticRepark` false and
       // still wins — the SUP-13698 reset to attempt 1.
       const effectivePredecessorExhausted = predecessorBudgetExhausted && !runAgnosticRepark;
-      const carriedAttemptCount = effectivePredecessorExhausted ? 1 : cumulativeDepth + 1;
+      // SUP-24251 (redo of SUP-22273): for a stranded-participant kind whose
+      // owner (or, on a board-owned mint, the pending participant) ran after
+      // the predecessor's last update, the agent is live, not wedged. Cap the
+      // inherited depth one below the ceiling so the successor is neither born
+      // at the ceiling for the next sweep to escalate nor minted terminal by the
+      // run-agnostic gate below. An explicit `attemptCount` and a board budget
+      // reset stay authoritative; an owner idle since the predecessor keeps the
+      // uncapped carry-forward.
+      const liveOwnerAgentId =
+        input.ownerAgentId ?? prev?.ownerAgentId ?? input.previousOwnerAgentId ?? prev?.previousOwnerAgentId ?? null;
+      const ownerLiveDepthCap =
+        input.attemptCount === undefined &&
+        !effectivePredecessorExhausted &&
+        prev != null &&
+        liveOwnerAgentId != null &&
+        OWNER_LIVE_HOLD_RECOVERY_KINDS.has(input.kind) &&
+        (await participantRanSince(
+          db,
+          input.companyId,
+          liveOwnerAgentId,
+          new Date(prev.updatedAt).getTime(),
+          REVIEW_PARTICIPANT_LIVE_WINDOW_MS,
+        ));
+      const carriedAttemptCount = effectivePredecessorExhausted
+        ? 1
+        : ownerLiveDepthCap
+          ? Math.min(cumulativeDepth + 1, Math.max(1, effectiveMaxAttempts - 1))
+          : cumulativeDepth + 1;
       // SUP-14151: clamp the carried count to the effective ceiling. The
       // predecessor-budget reset above only fires when the predecessor carries
       // a non-null maxAttempts; where it was null the count carried forward
@@ -1027,7 +1070,19 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
       }
       const [created] = await db
         .insert(issueRecoveryActions)
-        .values(buildInsertValues(input, ownerType, now, nextAttemptCount, insertEvidenceExtra))
+        .values(buildInsertValues(
+          // A capped successor's wake clock starts at the predecessor's last
+          // update, so the stale-wake sweep's live-owner hold sees the same
+          // owner run that justified the cap instead of burning the reserved
+          // attempt on its first pass.
+          ownerLiveDepthCap
+            ? { ...input, lastAttemptAt: input.lastAttemptAt ?? asDatabaseDate(prev.updatedAt) }
+            : input,
+          ownerType,
+          now,
+          nextAttemptCount,
+          insertEvidenceExtra,
+        ))
         .returning();
       return toReadModel(created!);
     } catch (error) {
