@@ -7362,12 +7362,26 @@ describe("evaluateDoneTierDeclaration", () => {
         | { __typename: "CheckRun"; name: string; status: string; conclusion: string | null; isRequired: boolean }
         | { __typename: "StatusContext"; context: string; state: string; isRequired: boolean };
 
-      function carrierFetch(carrier: { mergeStateStatus: string; contexts: CarrierContext[] } | "errors") {
+      type CarrierShape = {
+        mergeStateStatus: string;
+        contexts: CarrierContext[];
+        /** Rollup page boundary; defaults to a complete (single-page) list. */
+        hasNextPage?: boolean | null;
+        /** GraphQL PR state; defaults to OPEN. */
+        state?: string;
+      };
+
+      function carrierFetch(
+        carrier: CarrierShape | "errors" | "hang",
+        live: { state?: string; merged?: boolean; status?: number } = {},
+      ) {
         ghFetchMock.mockImplementation(async (url, init) => {
           const u = String(url);
           if (u.endsWith("/pulls/4103")) {
+            if (live.status) return new Response("provider unavailable", { status: live.status });
             return new Response(JSON.stringify({
-              state: "open",
+              state: live.state ?? "open",
+              merged: live.merged ?? false,
               draft: false,
               head: { ref: "SUP-4103-work", sha: HEAD_SHA, repo: { full_name: "TEA-Core/paperclip" } },
               base: { ref: "main" },
@@ -7381,19 +7395,41 @@ describe("evaluateDoneTierDeclaration", () => {
             const body = String((init as { body?: string } | undefined)?.body ?? "");
             if (body.includes("statusCheckRollup")) {
               if (carrier === "errors") {
-                return new Response(JSON.stringify({ errors: [{ message: "RATE_LIMITED" }] }), { status: 200 });
+                // GraphQL can return partial data beside errors; an errored read is never proof.
+                return new Response(JSON.stringify({
+                  errors: [{ message: "RATE_LIMITED" }],
+                  data: {
+                    repository: {
+                      pullRequest: {
+                        state: "OPEN",
+                        mergeStateStatus: "DIRTY",
+                        commits: { nodes: [{ commit: { oid: HEAD_SHA, statusCheckRollup: null } }] },
+                      },
+                    },
+                  },
+                }), { status: 200 });
               }
+              if (carrier === "hang") {
+                // Never answers on its own; only the request's abort signal ends it.
+                const signal = (init as RequestInit | undefined)?.signal;
+                return new Promise<Response>((_resolve, reject) => {
+                  if (signal?.aborted) reject(signal.reason);
+                  signal?.addEventListener("abort", () => reject(signal.reason));
+                });
+              }
+              const contexts: Record<string, unknown> = { nodes: carrier.contexts };
+              if (carrier.hasNextPage !== null) contexts.pageInfo = { hasNextPage: carrier.hasNextPage ?? false };
               return new Response(JSON.stringify({
                 data: {
                   repository: {
                     pullRequest: {
-                      state: "OPEN",
+                      state: carrier.state ?? "OPEN",
                       mergeStateStatus: carrier.mergeStateStatus,
                       commits: {
                         nodes: [{
                           commit: {
                             oid: HEAD_SHA,
-                            statusCheckRollup: { contexts: { nodes: carrier.contexts } },
+                            statusCheckRollup: { contexts },
                           },
                         }],
                       },
@@ -7407,6 +7443,10 @@ describe("evaluateDoneTierDeclaration", () => {
           return new Response("{}", { status: 500 });
         });
       }
+
+      const failedRun = (name: string, conclusion = "FAILURE"): CarrierContext => (
+        { __typename: "CheckRun", name, status: "COMPLETED", conclusion, isRequired: true }
+      );
 
       async function closeDelegated() {
         mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr(4103, "open")]);
@@ -7506,6 +7546,112 @@ describe("evaluateDoneTierDeclaration", () => {
         const result = await closeDelegated();
         expect(result.allowed).toBe(true);
         expect(result.tier).toBe("tier1");
+      });
+
+      it.each(["TIMED_OUT", "CANCELLED", "STARTUP_FAILURE"])(
+        "refuses when the required check run concluded %s",
+        async (conclusion) => {
+          carrierFetch({ mergeStateStatus: "BLOCKED", contexts: [failedRun("ci-required", conclusion)] });
+          const result = await closeDelegated();
+          expect(result.allowed).toBe(false);
+          expect(result.reason).toMatch(/^carrier_required_check_failed: /);
+          expect(result.reason).toContain(`ci-required (${conclusion.toLowerCase()})`);
+        },
+      );
+
+      it("refuses when a required commit status is FAILURE", async () => {
+        carrierFetch({
+          mergeStateStatus: "BLOCKED",
+          contexts: [{ __typename: "StatusContext", context: "paperclip/approved", state: "FAILURE", isRequired: true }],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toContain("paperclip/approved (failure)");
+      });
+
+      it("does not let a passing commit status hide a failed check run of the same name", async () => {
+        carrierFetch({
+          mergeStateStatus: "BLOCKED",
+          contexts: [
+            failedRun("build"),
+            { __typename: "StatusContext", context: "build", state: "SUCCESS", isRequired: true },
+          ],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toContain("build (failure)");
+      });
+
+      it("does not refuse on checks when the context list continues on a later page", async () => {
+        // The failed run is on page 1; its rerun may sit past context 100.
+        carrierFetch({ mergeStateStatus: "BLOCKED", contexts: [failedRun("ci-required")], hasNextPage: true });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+      });
+
+      it("does not refuse on checks when the page boundary is unknown", async () => {
+        carrierFetch({ mergeStateStatus: "BLOCKED", contexts: [failedRun("ci-required")], hasNextPage: null });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+      });
+
+      it("still refuses a merge conflict when the context list is partial", async () => {
+        carrierFetch({ mergeStateStatus: "DIRTY", contexts: [failedRun("ci-required")], hasNextPage: true });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toMatch(/^carrier_merge_conflict: /);
+      });
+
+      it("does not refuse a carrier that GitHub no longer reports open", async () => {
+        carrierFetch({ mergeStateStatus: "DIRTY", contexts: [failedRun("ci-required")], state: "MERGED" });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+      });
+
+      it.each([
+        ["merged", { state: "closed", merged: true }],
+        ["closed", { state: "closed", merged: false }],
+      ])("does not refuse a %s carrier on a stale failed check", async (_label, live) => {
+        carrierFetch({ mergeStateStatus: "DIRTY", contexts: [failedRun("ci-required")] }, live);
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+      });
+
+      it("does not refuse when live hydration of the carrier fails", async () => {
+        carrierFetch({ mergeStateStatus: "DIRTY", contexts: [failedRun("ci-required")] }, { status: 503 });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+      });
+
+      it("bounds a hung carrier read with a timeout and fails open", async () => {
+        const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(
+          () => AbortSignal.abort(new DOMException("The operation timed out.", "TimeoutError")),
+        );
+        try {
+          carrierFetch("hang");
+          const result = await closeDelegated();
+          expect(result.allowed).toBe(true);
+          expect(timeout).toHaveBeenCalledWith(10_000);
+        } finally {
+          timeout.mockRestore();
+        }
+      });
+
+      it("caps the failed-check list in the refusal text", async () => {
+        const longName = `matrix-${"x".repeat(200)}`;
+        carrierFetch({
+          mergeStateStatus: "BLOCKED",
+          contexts: [failedRun(longName), failedRun("two"), failedRun("three"), failedRun("four"), failedRun("five")],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toContain(`${longName.slice(0, 80)}… (failure)`);
+        expect(result.reason).not.toContain(longName.slice(0, 81));
+        expect(result.reason).toContain("two (failure), three (failure) and 2 more");
+        expect(result.reason).not.toContain("four");
+        expect(result.reason.length).toBeLessThan(600);
       });
     });
 

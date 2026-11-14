@@ -785,7 +785,11 @@ async function fetchPullRequestReviewDecision(
 interface LandingCarrierHealth {
   headSha: string | null;
   mergeStateStatus: string | null;
-  /** Required check/status names whose every context on the head is terminal-failed. */
+  /**
+   * Required checks whose every same-type, same-name context on the head is
+   * terminal-failed. Empty when the context list was cut at a page boundary:
+   * a rerun on a later page could still pass, so a partial read never refuses.
+   */
   failedRequired: Array<{ name: string; conclusion: string }>;
 }
 
@@ -794,6 +798,11 @@ interface LandingCarrierHealth {
 // ACTION_REQUIRED awaits manual approval and is not terminal-failed.
 const FAILED_CHECK_RUN_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE"]);
 const FAILED_STATUS_STATES = new Set(["FAILURE", "ERROR"]);
+// A hung carrier read must not hold the close; an aborted read fails open.
+const LANDING_CARRIER_PROBE_TIMEOUT_MS = 10_000;
+// The refusal names at most this many failed checks, each cut to a bounded length.
+const LANDING_CARRIER_REFUSAL_MAX_CHECKS = 3;
+const LANDING_CARRIER_REFUSAL_MAX_NAME_CHARS = 80;
 
 /**
  * Read-only GraphQL probe of the carrier's head required checks and merge state.
@@ -807,7 +816,7 @@ async function fetchLandingCarrierHealth(
   const query =
     "query landingCarrier($owner: String!, $name: String!, $number: Int!) { " +
     "repository(owner: $owner, name: $name) { pullRequest(number: $number) { state mergeStateStatus " +
-    "commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 100) { nodes { __typename " +
+    "commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 100) { pageInfo { hasNextPage } nodes { __typename " +
     "... on CheckRun { name status conclusion isRequired(pullRequestNumber: $number) } " +
     "... on StatusContext { context state isRequired(pullRequestNumber: $number) } } } } } } } } } }";
   try {
@@ -822,6 +831,7 @@ async function fetchLandingCarrierHealth(
         query,
         variables: { owner: pr.owner, name: pr.repo, number: pr.number },
       }),
+      signal: AbortSignal.timeout(LANDING_CARRIER_PROBE_TIMEOUT_MS),
     });
     if (!response.ok) return null;
     const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
@@ -836,11 +846,16 @@ async function fetchLandingCarrierHealth(
     const commit = Array.isArray(commitNodes)
       ? (commitNodes[0] as { commit?: Record<string, unknown> } | undefined)?.commit
       : undefined;
-    const rollup = commit?.statusCheckRollup as { contexts?: { nodes?: unknown } } | null | undefined;
+    const rollup = commit?.statusCheckRollup as
+      | { contexts?: { nodes?: unknown; pageInfo?: { hasNextPage?: unknown } | null } }
+      | null
+      | undefined;
     const contexts = Array.isArray(rollup?.contexts?.nodes) ? rollup.contexts.nodes : [];
     // A re-run leaves the failed run beside a newer one with the same name, so a
-    // required name counts as failed only when none of its contexts can still pass.
-    const byName = new Map<string, { failed: string | null; open: boolean }>();
+    // required check counts as failed only when none of its contexts can still pass.
+    // Check runs and commit statuses are separate requirements on GitHub, so one
+    // type never satisfies (or hides) the other: group by type plus name.
+    const byCheck = new Map<string, { name: string; failed: string | null; open: boolean }>();
     for (const node of contexts) {
       const ctx = node as Record<string, unknown> | null;
       if (!ctx || ctx.isRequired !== true) continue;
@@ -855,14 +870,18 @@ async function fetchLandingCarrierHealth(
         if (typeof ctx.state === "string" && FAILED_STATUS_STATES.has(ctx.state)) failed = ctx.state;
       }
       if (name === null) continue;
-      const entry = byName.get(name) ?? { failed: null, open: false };
+      const key = `${ctx.__typename}\u0000${name}`;
+      const entry = byCheck.get(key) ?? { name, failed: null, open: false };
       if (failed) entry.failed = failed;
       else entry.open = true;
-      byName.set(name, entry);
+      byCheck.set(key, entry);
     }
-    const failedRequired = [...byName.entries()]
-      .filter(([, entry]) => entry.failed !== null && !entry.open)
-      .map(([name, entry]) => ({ name, conclusion: entry.failed!.toLowerCase() }));
+    const partial = rollup?.contexts?.pageInfo?.hasNextPage !== false;
+    const failedRequired = partial
+      ? []
+      : [...byCheck.values()]
+        .filter((entry) => entry.failed !== null && !entry.open)
+        .map((entry) => ({ name: entry.name, conclusion: entry.failed!.toLowerCase() }));
     return {
       headSha: typeof commit?.oid === "string" ? commit.oid : null,
       mergeStateStatus: typeof pullRequest.mergeStateStatus === "string" ? pullRequest.mergeStateStatus : null,
@@ -886,7 +905,14 @@ function landingCarrierRefusal(
   if (!health) return null;
   const head = health.headSha ? ` on head ${health.headSha.slice(0, 12)}` : "";
   if (health.failedRequired.length > 0) {
-    const checks = health.failedRequired.map((check) => `${check.name} (${check.conclusion})`).join(", ");
+    const named = health.failedRequired.slice(0, LANDING_CARRIER_REFUSAL_MAX_CHECKS).map((check) => {
+      const name = check.name.length > LANDING_CARRIER_REFUSAL_MAX_NAME_CHARS
+        ? `${check.name.slice(0, LANDING_CARRIER_REFUSAL_MAX_NAME_CHARS)}…`
+        : check.name;
+      return `${name} (${check.conclusion})`;
+    });
+    const more = health.failedRequired.length - named.length;
+    const checks = more > 0 ? `${named.join(", ")} and ${more} more` : named.join(", ");
     return refuseTier1(
       `carrier_required_check_failed: Tier 1 declaration using "landing-delegated" names PR #${prNumber}, but its required check ${checks} is terminal-failed${head}; the carrier cannot land, so the landing obligation cannot transfer to done-close-landing-backstop.`,
       `Fix the failing required check on PR #${prNumber} (push a fix or re-run it) and close again once it is passing or running, or keep the card open until the carrier can land.`,
