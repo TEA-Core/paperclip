@@ -2045,22 +2045,17 @@ describe("issue execution policy transitions", () => {
       expect(result.workflowControlledAssignment).toBe(true);
     });
 
-    it("arms the first undecided stage and records the approved one as completed", () => {
+    it("re-arms from the first stage when only some stages are approved", () => {
       const policy = twoStagePolicy();
-      const [reviewStage, approvalStage] = policy.stages;
-      const result = coderDoneOnNullState(policy, [reviewStage.id]);
+      const [reviewStage] = policy.stages;
+      const result = coderDoneOnNullState(policy, [policy.stages[1].id]);
 
       expect(result.patch.status).toBe("in_review");
-      expect(result.patch.assigneeUserId).toBe(ctoUserId);
       expect(result.patch.executionState).toMatchObject({
         status: "pending",
-        currentStageId: approvalStage.id,
-        currentStageType: "approval",
-        completedStageIds: [reviewStage.id],
-        // An approved stage is decided, not auto-skipped: skippedStageIds stays empty.
-        skippedStageIds: [],
+        currentStageId: reviewStage.id,
+        completedStageIds: [],
       });
-      expect(result.workflowControlledAssignment).toBe(true);
     });
 
     it("arms a stage whose latest decision is changes_requested (fail closed)", () => {

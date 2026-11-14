@@ -2335,23 +2335,21 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     return { patch };
   }
 
-  // SUP-24054: durable approvals survive a reopen. A reopen nulls the projection
-  // while the decision rows survive, so on a `done` request a stage whose latest
-  // decision is `approved` stays decided: the start arms the first undecided
-  // stage (the board stage-decision target rule) and restores the decided ones
-  // into completedStageIds. With every stage decided nothing is re-armed, and
-  // the requested `done` reaches the done-transition guard, which recovers the
-  // ladder from the same rows (SUP-14912).
-  const decidedStageIdSet = new Set(requestedStatus === "done" ? input.decidedStageIds ?? [] : []);
-  const durablyDecidedStageIds = input.policy.stages
-    .map((stage) => stage.id)
-    .filter((stageId) => decidedStageIdSet.has(stageId));
+  // SUP-24054: durable approvals survive a reopen. When every stage has a current
+  // approved decision row, nothing is re-armed and the requested `done` reaches
+  // the done-transition guard, which recovers the ladder from the same rows
+  // (SUP-14912). A partial ladder re-arms from the start as before.
+  if (
+    requestedStatus === "done" &&
+    input.policy.stages.length > 0 &&
+    input.policy.stages.every((stage) => (input.decidedStageIds ?? []).includes(stage.id))
+  ) {
+    return { patch };
+  }
   let pendingStage =
-    durablyDecidedStageIds.length > 0
-      ? resolveBoardTargetStage(input.policy, existingState, durablyDecidedStageIds)
-      : existingState?.status === CHANGES_REQUESTED_STATUS && currentStage
-        ? currentStage
-        : nextPendingStage(input.policy, existingState);
+    existingState?.status === CHANGES_REQUESTED_STATUS && currentStage
+      ? currentStage
+      : nextPendingStage(input.policy, existingState);
   if (!pendingStage) return { patch };
 
   const returnAssignee = resolveReturnAssignee({
@@ -2359,9 +2357,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     existingState,
     currentAssignee,
   });
-  const skippedStageIds = Array.from(
-    new Set([...(existingState?.completedStageIds ?? []), ...durablyDecidedStageIds]),
-  );
+  const skippedStageIds = [...(existingState?.completedStageIds ?? [])];
   const newlySkippedStageIds: string[] = [];
   let participant = selectStageParticipant(pendingStage, {
     preferred:
