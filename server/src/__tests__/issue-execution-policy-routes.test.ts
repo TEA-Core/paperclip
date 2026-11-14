@@ -35,6 +35,15 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getActiveRunForAgent: vi.fn(async () => null as unknown),
   cancelRun: vi.fn(async () => null as unknown),
 }));
+const mockExecutionWorkspaceService = vi.hoisted(() => ({
+  getById: vi.fn(async () => null as unknown),
+  reopenClosedIsolatedExecutionWorkspaceForIssue: vi.fn(),
+}));
+const mockIssueRecoveryActionService = vi.hoisted(() => ({
+  getActiveForIssue: vi.fn(async () => null as unknown),
+  resolveActiveForIssue: vi.fn(async () => null as unknown),
+  listActiveForIssues: vi.fn(async () => new Map()),
+}));
 
 const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(async () => false),
@@ -199,7 +208,7 @@ function registerModuleMocks() {
     documentService: () => ({
       getIssueDocumentPayload: vi.fn(async () => ({})),
     }),
-    executionWorkspaceService: () => ({}),
+    executionWorkspaceService: () => mockExecutionWorkspaceService,
     feedbackService: () => ({
       listIssueVotesForUser: vi.fn(async () => []),
       saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
@@ -236,10 +245,7 @@ function registerModuleMocks() {
       syncDocument: async () => undefined,
       syncIssue: async () => undefined,
     }),
-    issueRecoveryActionService: () => ({
-      getActiveForIssue: vi.fn(async () => null),
-      listActiveForIssues: vi.fn(async () => new Map()),
-    }),
+    issueRecoveryActionService: () => mockIssueRecoveryActionService,
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     logActivity: mockLogActivity,
@@ -361,9 +367,12 @@ describe("issue execution policy routes", () => {
     vi.doUnmock("../services/external-objects.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
+    mockIssueRecoveryActionService.resolveActiveForIssue.mockResolvedValue(null);
     mockResolveSummaryGenerationReturnAssignee.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
+    mockExecutionWorkspaceService.getById.mockResolvedValue(null);
     mockIssueService.addComment.mockImplementation(async (_id: string, body: string) => ({
       id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
       body,
@@ -874,6 +883,333 @@ describe("issue execution policy routes", () => {
       }),
       expect.anything(),
     );
+  });
+
+  describe("SUP-22840 top-level monitor alias", () => {
+    const REVIEWER_AGENT_ID = "44444444-4444-4444-8444-444444444444";
+    const RETURN_ASSIGNEE_AGENT_ID = "66666666-6666-4666-8666-666666666666";
+    const aliasMonitor = { nextCheckAt: "2026-12-01T12:00:00.000Z" };
+
+    function agentApp() {
+      return createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "55555555-5555-4555-8555-555555555555",
+      });
+    }
+
+    function seededIssue(executionPolicy: unknown, title: string) {
+      return {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-2284",
+        title,
+        executionPolicy,
+        executionState: null,
+        monitorAttemptCount: 0,
+        monitorNextCheckAt: null,
+        monitorLastTriggeredAt: null,
+        monitorNotes: null,
+        monitorScheduledBy: null,
+      };
+    }
+
+    const storedLadderRaw = {
+      mode: "normal",
+      commentRequired: true,
+      returnAssigneeAgentId: RETURN_ASSIGNEE_AGENT_ID,
+      maxReviewRounds: 3,
+      baseRef: "main",
+      stages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          type: "review",
+          participants: [
+            { id: "22222222-2222-4222-8222-222222222222", type: "agent", agentId: REVIEWER_AGENT_ID },
+          ],
+        },
+      ],
+    };
+
+    it("translates the alias into the same monitor-only policy write as the nested spelling", async () => {
+      const issue = seededIssue(storedLadderRaw, "Alias arm over live ladder");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitor: aliasMonitor });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(patch).not.toHaveProperty("monitor");
+      expect(patch.executionPolicy).toEqual(
+        normalizeIssueExecutionPolicy({ ...storedLadderRaw, monitor: aliasMonitor }),
+      );
+      expect(patch.executionPolicy).toMatchObject({
+        baseRef: "main",
+        returnAssigneeAgentId: RETURN_ASSIGNEE_AGENT_ID,
+        maxReviewRounds: 3,
+      });
+      expect(patch).toMatchObject({
+        monitorNextCheckAt: new Date("2026-12-01T12:00:00.000Z"),
+      });
+    });
+    it("rejects a monitor alias when the stored policy changed before the locked write", async () => {
+      const issue = seededIssue(storedLadderRaw, "Concurrent policy update");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.getByIdForUpdate.mockResolvedValue({
+        ...issue,
+        executionPolicy: { ...storedLadderRaw, maxReviewRounds: 5 },
+      });
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitor: aliasMonitor });
+
+      expect(res.status).toBe(409);
+      expect(res.body.details).toMatchObject({ code: "issue_execution_policy_conflict" });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("arms a fresh policy when the stored executionPolicy is null", async () => {
+      const issue = seededIssue(null, "Alias arm on null policy");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitor: aliasMonitor });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(patch).not.toHaveProperty("monitor");
+      expect(patch.executionPolicy).toEqual(normalizeIssueExecutionPolicy({ monitor: aliasMonitor }));
+      expect(patch).toMatchObject({
+        monitorNextCheckAt: new Date("2026-12-01T12:00:00.000Z"),
+      });
+    });
+
+    it("treats alias null as disarm while keeping the stored ladder", async () => {
+      const issue = seededIssue(
+        { ...storedLadderRaw, monitor: { nextCheckAt: "2026-11-01T00:00:00.000Z" } },
+        "Alias disarm",
+      );
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitor: null });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(patch.executionPolicy).toEqual(
+        normalizeIssueExecutionPolicy({ ...storedLadderRaw, monitor: null }),
+      );
+      expect(patch.executionPolicy).toMatchObject({
+        baseRef: "main",
+        returnAssigneeAgentId: RETURN_ASSIGNEE_AGENT_ID,
+        maxReviewRounds: 3,
+      });
+      expect(patch).toMatchObject({ monitorNextCheckAt: null });
+    });
+
+    it("requires a closed workspace to reopen before an alias-only agent PATCH can commit", async () => {
+      const workspaceId = "78787878-7878-4787-8787-787878787878";
+      const issue = {
+        ...seededIssue(null, "Alias on closed workspace"),
+        executionWorkspaceId: workspaceId,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue, ...patch,
+      }));
+      mockExecutionWorkspaceService.getById.mockResolvedValue({
+        id: workspaceId,
+        mode: "isolated_workspace",
+        status: "archived",
+        closedAt: new Date("2026-01-01T00:00:00.000Z"),
+      });
+      mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue.mockResolvedValue({
+        ok: false,
+        code: "rebuild_failed",
+        message: "Failed to rebuild the execution workspace",
+      });
+
+      const res = await request(await agentApp())
+        .patch(`/api/issues/${issue.id}`)
+        .send({ monitor: aliasMonitor });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(503);
+      expect(mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue).toHaveBeenCalledWith(
+        expect.objectContaining({ workspaceId, issue: expect.objectContaining({ id: issue.id }) }),
+      );
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("refuses a body carrying both the alias and an executionPolicy key before any write", async () => {
+      const issue = seededIssue(storedLadderRaw, "Alias conflict");
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({
+          monitor: aliasMonitor,
+          executionPolicy: { monitor: { nextCheckAt: "2027-01-01T00:00:00.000Z" } },
+        });
+
+      expect(res.status).toBe(400);
+      // The refusal rides the zod issue in `details`, pinned at ["monitor"].
+      expect(res.body.details).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: ["monitor"],
+            message: expect.stringContaining("monitor cannot be combined with executionPolicy"),
+          }),
+        ]),
+      );
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("keeps unknown top-level keys a strict 400 that commits nothing", async () => {
+      const issue = seededIssue(storedLadderRaw, "Strict around the alias");
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitorr: aliasMonitor, comment: "co-sent side effect", status: "todo" });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("monitorr");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+    it("checks recovery-action authority for monitor:null alias disarms", async () => {
+      const issue = {
+        ...seededIssue(null, "Recovery-owned card"),
+        status: "in_progress",
+        assigneeAgentId: null,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+        id: "88888888-8888-4888-8888-888888888888",
+        kind: "monitor_timeout",
+        ownerAgentId: RA_SEAT_AGENT_ID,
+      } as never);
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitor: null });
+
+      expect(res.status).toBe(403);
+      expect(mockIssueRecoveryActionService.getActiveForIssue).toHaveBeenCalledWith(
+        "company-1",
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      );
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    const RA_SEAT_AGENT_ID = "99999999-9999-4999-8999-999999999999";
+    const storedReleaseAssuranceRaw = {
+      mode: "normal",
+      commentRequired: true,
+      approvalAuthority: "release_assurance",
+      stages: [
+        {
+          id: "12121212-1212-4121-8121-121212121212",
+          type: "approval",
+          approvalsNeeded: 1,
+          participants: [
+            { id: "23232323-2323-4232-8232-232323232323", type: "agent", agentId: RA_SEAT_AGENT_ID },
+          ],
+        },
+      ],
+    };
+
+    it.each([
+      { actor: "board", monitor: aliasMonitor },
+      { actor: "board", monitor: null },
+      { actor: "agent", monitor: aliasMonitor },
+      { actor: "agent", monitor: null },
+    ])("refuses $actor monitor updates on a release-assurance card", async ({ actor, monitor }) => {
+      const issue = seededIssue(storedReleaseAssuranceRaw, "Release-assurance card");
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const app = actor === "agent" ? await agentApp() : await createApp();
+      const res = await request(app)
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ title: "Must not change", monitor });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain("release_assurance");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("still refuses a caller-supplied executionPolicy that selects release-assurance authority", async () => {
+      const issue = seededIssue(storedReleaseAssuranceRaw, "Nested selection refused");
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await createApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ executionPolicy: { ...storedReleaseAssuranceRaw, monitor: aliasMonitor } });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain("release_assurance");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+    it("revalidates a stranded recovery action against a stored RA monitor without throwing", async () => {
+      const issue = {
+        ...seededIssue(
+          { ...storedReleaseAssuranceRaw, monitor: aliasMonitor },
+          "RA recovery projection",
+        ),
+        status: "todo",
+        assigneeAgentId: null,
+        monitorNextCheckAt: new Date(aliasMonitor.nextCheckAt),
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+        id: "88888888-8888-4888-8888-888888888888",
+        kind: "stranded_assigned_issue",
+        ownerAgentId: null,
+        createdAt: new Date("2026-10-01T00:00:00.000Z"),
+      } as never);
+      mockIssueRecoveryActionService.resolveActiveForIssue.mockResolvedValue({
+        id: "88888888-8888-4888-8888-888888888888",
+        status: "cancelled",
+        outcome: "cancelled",
+        resolutionNote: "Recovery action became stale because the source issue now has a scheduled monitor.",
+      } as never);
+
+      const res = await request(await createApp())
+        .get("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+
+      expect(res.status).toBe(200);
+      expect(mockIssueRecoveryActionService.resolveActiveForIssue).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sourceIssueId: issue.id,
+          resolutionNote: expect.stringContaining("scheduled monitor"),
+        }),
+      );
+    });
   });
 
   it("rejects board-authored in_review transitions without a review path", async () => {

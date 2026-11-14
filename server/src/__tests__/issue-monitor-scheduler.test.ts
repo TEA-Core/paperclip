@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import type * as IssueRecoveryActionsModule from "../services/issue-recovery-actions.ts";
 import { PROVIDER_QUOTA_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
 import {
   activityLog,
@@ -27,7 +28,32 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { dispatchQuiesce } from "../services/dispatch-quiesce.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { issueRecoveryActionService } from "../services/issue-recovery-actions.ts";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+
+const recoveryActionHook = vi.hoisted(() => ({
+  afterUpsert: null as null | (() => Promise<void>),
+}));
+
+// Lets a test run work between the recovery-action upsert and the monitor
+// clear, which is where a concurrent re-arm can land in production.
+vi.mock("../services/issue-recovery-actions.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof IssueRecoveryActionsModule>();
+  return {
+    ...actual,
+    issueRecoveryActionService: (...args: Parameters<typeof actual.issueRecoveryActionService>) => {
+      const service = actual.issueRecoveryActionService(...args);
+      return {
+        ...service,
+        upsertSourceScoped: async (...upsertArgs: Parameters<typeof service.upsertSourceScoped>) => {
+          const result = await service.upsertSourceScoped(...upsertArgs);
+          await recoveryActionHook.afterUpsert?.();
+          return result;
+        },
+      };
+    },
+  };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -134,6 +160,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   async function seedFixture(input?: {
     agentStatus?: "active" | "paused";
     issueStatus?: "in_progress" | "in_review" | "blocked";
+    unassigned?: boolean;
     monitorAttemptCount?: number;
     monitor?: Record<string, unknown>;
   }) {
@@ -187,7 +214,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       title: "Watch external deploy",
       status: input?.issueStatus ?? "in_progress",
       priority: "medium",
-      assigneeAgentId: agentId,
+      assigneeAgentId: input?.unassigned ? null : agentId,
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
       executionPolicy: {
@@ -577,5 +604,231 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .where(eq(activityLog.entityId, issueId))
       .then((rows) => rows.map((row) => row.action));
     expect(activity).toContain("issue.monitor_triggered");
+  });
+
+  describe("due monitor on an unassigned issue", () => {
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    async function readIssue(issueId: string) {
+      return db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    }
+
+    async function activityActions(issueId: string) {
+      return db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.entityId, issueId))
+        .then((rows) => rows.map((row) => row.action));
+    }
+
+    it.each([
+      ["an explicit wake_owner policy", { recoveryPolicy: "wake_owner" }],
+      ["no recovery policy (the wake_owner default)", {}],
+    ])("raises one board recovery action for %s and stays idempotent", async (_label, monitor) => {
+      const { companyId, issueId } = await seedFixture({
+        issueStatus: "blocked",
+        unassigned: true,
+        monitor,
+      });
+      const heartbeat = heartbeatService(db);
+
+      const first = await heartbeat.tickTimers(tickAt);
+      expect(first.skipped).toBe(1);
+      expect(first.enqueued).toBe(0);
+
+      const issue = await readIssue(issueId);
+      expect(issue.monitorNextCheckAt).toBeNull();
+      expect(issue.monitorWakeRequestedAt).toBeNull();
+      // The monitor never fired: no attempt and no trigger timestamp are recorded.
+      expect(issue.monitorAttemptCount).toBe(0);
+      expect(issue.monitorLastTriggeredAt).toBeNull();
+      expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+        status: "cleared",
+        clearReason: "invalid_assignee",
+        attemptCount: 0,
+      });
+
+      const actions = await db.select().from(issueRecoveryActions);
+      expect(actions).toHaveLength(1);
+      expect(actions[0]).toMatchObject({
+        companyId,
+        sourceIssueId: issueId,
+        kind: "no_live_path_unowned",
+        status: "active",
+        ownerType: "board",
+        ownerAgentId: null,
+        fingerprint: `no_live_path_unowned:${companyId}:${issueId}`,
+      });
+      expect(actions[0]?.evidence).toMatchObject({
+        source: "issue_monitor_unassigned_due",
+        monitorNextCheckAt: "2026-04-11T12:30:00.000Z",
+      });
+      expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+
+      const second = await heartbeat.tickTimers(new Date(tickAt.getTime() + 60_000));
+      expect(second.checked).toBe(0);
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(1);
+
+      const actionsLogged = await activityActions(issueId);
+      expect(actionsLogged.filter((action) => action === "issue.monitor_skipped")).toHaveLength(1);
+      expect(actionsLogged.filter((action) => action === "issue.no_live_path_unowned_escalated")).toHaveLength(1);
+      expect(actionsLogged).not.toContain("issue.monitor_triggered");
+    });
+
+    it("keeps a monitor re-armed between the claim and the clear scheduled", async () => {
+      const { companyId, issueId } = await seedFixture({
+        issueStatus: "blocked",
+        unassigned: true,
+        monitor: { recoveryPolicy: "wake_owner" },
+      });
+      const rearmedAt = new Date("2026-04-11T13:30:00.000Z");
+      const rearmedMonitor = {
+        nextCheckAt: rearmedAt.toISOString(),
+        notes: "Re-armed check",
+        scheduledBy: "assignee",
+        recoveryPolicy: "wake_owner",
+      };
+      // A re-arm lands while the recovery-action awaits are still running, after
+      // the tick claimed the old schedule and before it clears it.
+      recoveryActionHook.afterUpsert = async () => {
+        await db
+          .update(issues)
+          .set({
+            monitorNextCheckAt: rearmedAt,
+            monitorNotes: "Re-armed check",
+            monitorWakeRequestedAt: null,
+            executionPolicy: { mode: "normal", commentRequired: true, stages: [], monitor: rearmedMonitor },
+            executionState: {
+              status: "idle",
+              currentStageId: null,
+              currentStageIndex: null,
+              currentStageType: null,
+              currentParticipant: null,
+              returnAssignee: null,
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+              monitor: {
+                status: "scheduled",
+                nextCheckAt: rearmedAt.toISOString(),
+                lastTriggeredAt: null,
+                attemptCount: 0,
+                notes: "Re-armed check",
+                scheduledBy: "assignee",
+                serviceName: null,
+                externalRef: null,
+                timeoutAt: null,
+                maxAttempts: null,
+                recoveryPolicy: "wake_owner",
+                clearedAt: null,
+                clearReason: null,
+              },
+            },
+          })
+          .where(eq(issues.id, issueId));
+      };
+      const heartbeat = heartbeatService(db);
+
+      const first = await heartbeat.tickTimers(tickAt);
+      expect(first.skipped).toBe(1);
+
+      const issue = await readIssue(issueId);
+      expect(issue.monitorNextCheckAt?.toISOString()).toBe(rearmedAt.toISOString());
+      expect(issue.monitorNotes).toBe("Re-armed check");
+      expect(normalizeIssueExecutionPolicy(issue.executionPolicy)?.monitor?.notes).toBe("Re-armed check");
+      expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+        status: "scheduled",
+        nextCheckAt: rearmedAt.toISOString(),
+        clearReason: null,
+      });
+      // The lost race writes neither a skip record nor a second recovery action.
+      expect(await activityActions(issueId)).not.toContain("issue.monitor_skipped");
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(1);
+
+      // The surviving schedule still fires, and the active action is reused.
+      recoveryActionHook.afterUpsert = null;
+      const second = await heartbeat.tickTimers(new Date(rearmedAt.getTime() + 60_000));
+      expect(second.skipped).toBe(1);
+      expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
+      const actions = await db.select().from(issueRecoveryActions);
+      expect(actions).toHaveLength(1);
+      expect(actions[0]).toMatchObject({
+        companyId,
+        sourceIssueId: issueId,
+        kind: "no_live_path_unowned",
+        status: "active",
+      });
+    });
+
+    it("keeps an existing active recovery action of another kind and still consumes the monitor", async () => {
+      const { companyId, issueId } = await seedFixture({
+        issueStatus: "blocked",
+        unassigned: true,
+        monitor: { recoveryPolicy: "wake_owner" },
+      });
+      await issueRecoveryActionService(db).upsertSourceScoped({
+        companyId,
+        sourceIssueId: issueId,
+        kind: "blocked_without_blockers",
+        ownerType: "board",
+        cause: "blocked_without_blockers",
+        fingerprint: `blocked_without_blockers:${companyId}:${issueId}`,
+        evidence: {},
+        nextAction: "Name the blocker.",
+        wakePolicy: null,
+        monitorPolicy: null,
+        maxAttempts: null,
+      });
+
+      await heartbeatService(db).tickTimers(tickAt);
+
+      const actions = await db.select().from(issueRecoveryActions);
+      expect(actions).toHaveLength(1);
+      expect(actions[0]).toMatchObject({ kind: "blocked_without_blockers", status: "active" });
+      expect((await readIssue(issueId)).monitorNextCheckAt).toBeNull();
+      expect(await activityActions(issueId)).not.toContain("issue.no_live_path_unowned_escalated");
+    });
+
+    it.each(["create_recovery_issue", "escalate_to_board"] as const)(
+      "leaves a %s monitor untouched",
+      async (recoveryPolicy) => {
+        const { issueId, nextCheckAt } = await seedFixture({
+          issueStatus: "blocked",
+          unassigned: true,
+          monitor: { recoveryPolicy },
+        });
+        const heartbeat = heartbeatService(db);
+
+        const result = await heartbeat.tickTimers(tickAt);
+
+        expect(result.checked).toBe(0);
+        const issue = await readIssue(issueId);
+        expect(issue.monitorNextCheckAt?.toISOString()).toBe(nextCheckAt.toISOString());
+        expect(issue.monitorWakeRequestedAt).toBeNull();
+        expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+        expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+        expect(await activityActions(issueId)).toEqual([]);
+      },
+    );
+
+    it("does not raise a recovery action for an assigned wake_owner monitor", async () => {
+      const { issueId, agentId } = await seedFixture({
+        issueStatus: "blocked",
+        monitor: { recoveryPolicy: "wake_owner" },
+      });
+
+      const result = await heartbeatService(db).tickTimers(tickAt);
+
+      expect(result.enqueued).toBe(1);
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+      const wakeup = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId))
+        .then((rows) => rows[0] ?? null);
+      expect(wakeup?.reason).toBe("issue_monitor_due");
+      expect((await readIssue(issueId)).monitorAttemptCount).toBe(1);
+      expect(await activityActions(issueId)).toContain("issue.monitor_triggered");
+    });
   });
 });

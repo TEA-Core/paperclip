@@ -1150,6 +1150,96 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(healEvents).toHaveLength(0);
   });
 
+  // SUP-24126: ADR-072 §6 review-stage park — blocked, no blocker edge, a
+  // descriptor naming the blocker, execution stage pending, no monitor.
+  const stageParkExecutionState = (participantAgentId: string) => ({
+    status: "pending",
+    currentStageId: randomUUID(),
+    currentStageIndex: 0,
+    currentStageType: "review",
+    currentParticipant: { type: "agent", agentId: participantAgentId },
+    returnAssignee: { type: "agent", agentId: participantAgentId },
+    completedStageIds: [],
+    lastDecisionId: null,
+    lastDecisionOutcome: null,
+  });
+  const stageParkDescriptor = { owner: "board", action: "Board action on the first-class blocker" } as const;
+
+  it("skips a zero-blocker heal for a descriptor-only review-stage park and does not re-admit it after the re-arm window", async () => {
+    const { companyId, agentId, blockedIssueId } = await seedZeroBlockerBackstopFixture();
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt: null,
+        unblockDescriptor: stageParkDescriptor,
+        executionState: stageParkExecutionState(agentId),
+      })
+      .where(eq(issues.id, blockedIssueId));
+    const now = new Date();
+    const windowMs = 6 * 60 * 60 * 1000;
+    const consumedAt = new Date(now.getTime() - windowMs - 2 * 60 * 1000);
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: { issueId: blockedIssueId, zeroBlockerHeal: true },
+      status: "completed",
+      idempotencyKey: `issue_blockers_resolved:${blockedIssueId}:zero_blocker`,
+      createdAt: consumedAt,
+      updatedAt: consumedAt,
+      finishedAt: consumedAt,
+    });
+
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const result = await recoveryServiceWithMocks({ enqueueWakeup }).reconcileResolvedDependencyWakeBackstop({
+      companyId,
+      now,
+    });
+
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(result.zeroBlockerObserved).toBe(1);
+    expect(result.livePathSkipped).toBe(1);
+    expect(result.zeroBlockerHealed).toBe(0);
+    expect(result.healed).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const healEvents = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "issue.blockers_resolved_wake_emitted")));
+    expect(healEvents).toHaveLength(0);
+  });
+
+  it("still heals a zero-blocker issue that has only a descriptor or only a pending stage", async () => {
+    // Descriptor but no execution stage: a self-parked card, not a stage park.
+    const descriptorOnly = await seedZeroBlockerBackstopFixture();
+    await db
+      .update(issues)
+      .set({ unblockDescriptor: stageParkDescriptor })
+      .where(eq(issues.id, descriptorOnly.blockedIssueId));
+    const descriptorOnlyEnqueue = vi.fn(async () => ({ id: randomUUID() }));
+    const descriptorOnlyResult = await recoveryServiceWithMocks({
+      enqueueWakeup: descriptorOnlyEnqueue,
+    }).reconcileResolvedDependencyWakeBackstop({ companyId: descriptorOnly.companyId });
+    expect(descriptorOnlyEnqueue).toHaveBeenCalledTimes(1);
+    expect(descriptorOnlyResult.zeroBlockerHealed).toBe(1);
+
+    // Pending stage but no descriptor: no declared park, so it is stranded.
+    const stageOnly = await seedZeroBlockerBackstopFixture();
+    await db
+      .update(issues)
+      .set({ executionState: stageParkExecutionState(stageOnly.agentId) })
+      .where(eq(issues.id, stageOnly.blockedIssueId));
+    const stageOnlyEnqueue = vi.fn(async () => ({ id: randomUUID() }));
+    const stageOnlyResult = await recoveryServiceWithMocks({
+      enqueueWakeup: stageOnlyEnqueue,
+    }).reconcileResolvedDependencyWakeBackstop({ companyId: stageOnly.companyId });
+    expect(stageOnlyEnqueue).toHaveBeenCalledTimes(1);
+    expect(stageOnlyResult.zeroBlockerHealed).toBe(1);
+  });
+
   it("skips re-arm cap escalation while a future monitor owns the next execution check", async () => {
     const { companyId, agentId, blockedIssueId } = await seedZeroBlockerBackstopFixture();
     const now = new Date();

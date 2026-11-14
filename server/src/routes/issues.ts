@@ -128,6 +128,7 @@ import {
   gitCommitShaSchema,
   updateIssueSchema,
   stripCreateOnlyIssueAttribution,
+  refineIssueUpdateMonitorAliasConflict,
   isClosedIsolatedExecutionWorkspace,
   isMarkdownArtifactWorkProduct,
   isMarkdownAttachmentContent,
@@ -543,7 +544,10 @@ const updateIssueRouteSchema = stripCreateOnlyIssueAttribution(updateIssueObject
   // Request-level compare-and-set token, not an issue column. Stripped before
   // the column update. Absent leaves the write unconditional.
   expectedUpdatedAt: z.string().datetime({ offset: true }).optional(),
-}));
+  // SUP-22840: `monitor` (inherited from updateIssueObjectSchema) is the
+  // top-level alias for `executionPolicy.monitor`; a body carrying both
+  // spellings is refused here so the handler below never has to pick a winner.
+}).superRefine(refineIssueUpdateMonitorAliasConflict));
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
   revision: z.string().min(1),
@@ -6754,9 +6758,13 @@ export function issueRoutes(
       }
     }
 
+    // This read-only projection must inspect an already-stored RA policy
+    // without granting write authority; alias writes still fail closed earlier.
     const monitor = summarizeIssueMonitor(
       issue,
-      normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
+      normalizeIssueExecutionPolicy(issue.executionPolicy ?? null, {
+        allowReleaseAssuranceAuthority: true,
+      }),
     );
     if (monitor.nextCheckAt && Date.parse(monitor.nextCheckAt) > Date.now()) {
       return "Recovery action became stale because the source issue now has a scheduled monitor.";
@@ -18871,7 +18879,7 @@ export function issueRoutes(
     // before body validation so a malformed policy body gets the same refusal.
     async (req, _res, next) => {
       const body = req.body as Record<string, unknown> | undefined;
-      if (req.actor.type === "agent" && body && (body.executionPolicy !== undefined || body.reviewPolicy !== undefined)) {
+      if (req.actor.type === "agent" && body && (body.executionPolicy !== undefined || body.monitor !== undefined || body.reviewPolicy !== undefined)) {
         const issue = await svc.getById(req.params.id as string);
         if (
           issue &&
@@ -19084,6 +19092,10 @@ export function issueRoutes(
       // `updateFields` so it never reaches svc.update as a spurious write.
       rearmExecutionPolicy: rearmExecutionPolicyRaw,
       expectedUpdatedAt: expectedUpdatedAtRaw,
+      // SUP-22840: top-level alias for `executionPolicy.monitor`, not an issue
+      // column — keep it out of `updateFields`; it is translated into the
+      // canonical partial policy write after `previousExecutionPolicy` loads.
+      monitor: monitorAliasRaw,
       ...updateFields
     } = req.body;
     if (
@@ -19178,6 +19190,7 @@ export function issueRoutes(
       req.body.assigneeUserId !== undefined ||
       Array.isArray(req.body.blockedByIssueIds) ||
       req.body.executionPolicy !== undefined ||
+      req.body.monitor !== undefined ||
       explicitMoveToTodoRequested;
     const activeRecoveryActionBeforeUpdate = recoveryRelevantSourceMutationRequested
       ? await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id)
@@ -19265,7 +19278,10 @@ export function issueRoutes(
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(existing);
     const isAgentWorkUpdate =
       req.actor.type === "agent" &&
-      (Object.keys(updateFields).length > 0 || reviewRequest !== undefined || hiddenAtRaw !== undefined);
+      (Object.keys(updateFields).length > 0 ||
+        reviewRequest !== undefined ||
+        hiddenAtRaw !== undefined ||
+        monitorAliasRaw !== undefined);
     if (
       expectedUpdatedAtRaw !== undefined &&
       closedExecutionWorkspace &&
@@ -19406,6 +19422,22 @@ export function issueRoutes(
     const previousExecutionPolicy = normalizeIssueExecutionPolicy(storedExecutionPolicyRaw, {
       preserveEmptyPolicy: storedExecutionPolicyStagesExplicitEmpty,
     });
+    const monitorAliasTranslation = monitorAliasRaw !== undefined && req.body.executionPolicy === undefined;
+    // Use the canonical nested monitor payload and preserve the existing ladder.
+    // This does not grant release-assurance authority: those stored policies
+    // are refused with 422 above, before either spelling can change the issue.
+    if (monitorAliasTranslation) {
+      const { stages: _preservedStages, ...storedPolicyFields } = previousExecutionPolicy ?? {};
+      req.body.executionPolicy = { ...storedPolicyFields, monitor: monitorAliasRaw };
+      (req as unknown as Record<string, unknown>).executionPolicyStagesKeyAbsent = true;
+    }
+    // An explicit monitor key (either spelling) is locked even when its value
+    // equals the pre-lock snapshot, so a no-op null write cannot clobber a
+    // concurrent policy change or outlive a reassignment.
+    const monitorKeyExplicit =
+      typeof req.body.executionPolicy === "object"
+      && req.body.executionPolicy !== null
+      && Object.prototype.hasOwnProperty.call(req.body.executionPolicy, "monitor");
     // SUP-16525: set when this PATCH writes an executionPolicy that must satisfy
     // INV-LADDER-1 against the *live* pointer. The assert in the block below
     // reads `existing.executionState`; the pointer can move between that
@@ -20870,6 +20902,9 @@ export function issueRoutes(
       // SUP-16525: a policy write that must satisfy INV-LADDER-1 is re-asserted
       // against the locked row, so it has to run on the transactional path.
       || invariantPolicyToRecheck !== null
+      // Both monitor spellings must recheck policy and ownership under the lock.
+      || monitorKeyExplicit
+      || monitorChanged
       // SUP-22570: a record_only no-repository close re-probes inside the write.
       || noRepositoryLandingCloser !== null
       || (
@@ -20999,6 +21034,19 @@ export function issueRoutes(
           // compare. The lock read uses `tx`; do not call a service on the
           // outer pool from inside this transaction.
           await assertPatchExecutionDecisionLock(tx);
+          if (monitorKeyExplicit || monitorChanged) {
+            const lockedIssue = await svc.getByIdForUpdate(id, tx);
+            if (!lockedIssue) return null;
+            if (
+              !isDeepStrictEqual(lockedIssue.executionPolicy ?? null, storedExecutionPolicyRaw)
+              || lockedIssue.assigneeAgentId !== existing.assigneeAgentId
+            ) {
+              throw conflict("Execution policy or assignee changed before the monitor update; retry the update", {
+                code: "issue_execution_policy_conflict",
+                issueId: existing.id,
+              });
+            }
+          }
           // SUP-15878: refuse the close under the update lock (after the review
           // policy reauthorization above) with a typed diagnosis instead of
           // letting the transition silently coerce the card back to in_review.

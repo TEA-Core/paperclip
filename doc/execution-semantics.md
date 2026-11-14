@@ -306,6 +306,13 @@ platform-refused, and run-less wakes always count. At the cap, the recovery
 action asks the board to distinguish platform refusal, all blockers terminal
 without a valid continuation, and an unlinked real blocker.
 
+The zero-blocker heal does not wake a deliberate review-stage or approval-stage
+park. That park is `blocked` with no blocker edge, a usable `unblockDescriptor`
+that names the blocker, and an execution state that is still `pending` with a
+`currentStageId`. The stage holder parks this way on purpose, and a wake would
+only make it exit as a no-op. A descriptor with no pending stage, or a pending
+stage with no descriptor, is not this park and still heals.
+
 If a parent is truly waiting on a child, model that with blockers. Do not rely on the parent/child relationship alone.
 
 ### Child→Parent Reporting
@@ -669,6 +676,14 @@ Monitor policy lives under `executionPolicy.monitor` and includes:
 - `externalRef`: optional external-service reference input; Paperclip treats it as secret-adjacent, redacts it before persistence/visibility, and omits it from activity and wake payloads
 - `timeoutAt`, `maxAttempts`, and `recoveryPolicy`: optional recovery hints for bounded waits
 
+`PATCH /api/issues/{id}` also accepts a top-level `monitor` alias for `executionPolicy.monitor`. The route normalizes it into a partial `executionPolicy` write that preserves the other stored policy fields, and it passes the same authorization gates as the nested spelling. A body that sends both `monitor` and `executionPolicy` (even `null`) is rejected with a validation error. The alias is update-only; issue creation uses `executionPolicy.monitor`.
+
+The alias does not grant access to release-assurance policies: those cards reject
+monitor PATCHes with `422`, including nested `{ executionPolicy: { monitor: null } }`.
+Monitor changes compare the stored policy and agent assignee again under the issue
+row lock. A concurrent policy change or reassignment returns `409` instead of
+letting the former assignee change the monitor.
+
 Monitors are not recurring intervals. When a monitor fires, Paperclip clears the scheduled monitor and queues an `issue_monitor_due` wake for the assignee. If the external service is still pending, the assignee must explicitly re-arm the monitor with a new `nextCheckAt`. If the issue moves to `done`, `cancelled`, an invalid status, or a human/unassigned owner, the monitor is cleared.
 
 The task's waiting banner and composer countdown also display automatic retries
@@ -680,6 +695,8 @@ tasks hide both waiting surfaces even if a stale schedule remains in the respons
 Because `serviceName` and `notes` remain visible in issue activity and wake context, operators should keep them short and non-secret. Put enough context for the assignee to know what to inspect, but do not include signed URLs, bearer tokens, customer secrets, tenant-private identifiers, or provider links with embedded credentials.
 
 Monitor bounds are enforced. Paperclip rejects attempts to re-arm a monitor whose `timeoutAt` or `maxAttempts` is already exhausted. When a scheduled monitor reaches an exhausted bound at trigger time, Paperclip clears it and follows `recoveryPolicy`: `wake_owner` queues a bounded recovery wake for the assignee, `create_recovery_issue` opens visible issue-backed recovery work, and `escalate_to_board` records a board-visible escalation comment/activity.
+
+A due monitor on an issue with no assignee has no agent to wake. When its `recoveryPolicy` is `wake_owner` (the default), Paperclip clears the monitor with `clearReason: invalid_assignee` and raises one board-owned `no_live_path_unowned` recovery action for the issue, unless the issue already has an active recovery action. The monitor does not count as an attempt and does not set `lastTriggeredAt`. The clear is guarded by the claimed `monitorNextCheckAt`; if the monitor was re-armed concurrently, the new schedule is left untouched and the clear is skipped. Monitors with `create_recovery_issue` or `escalate_to_board` on an unassigned issue are not selected and stay armed.
 
 Use `blocked` instead of a monitor when no Paperclip assignee owns a responsible polling path. In that case, name the external owner/action or create first-class recovery/blocker work.
 
