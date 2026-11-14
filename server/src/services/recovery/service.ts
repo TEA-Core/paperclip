@@ -8067,7 +8067,12 @@ export function recoveryService(
               dependentIssueId: candidate.id,
               blockerIssueIds: readiness?.blockerIssueIds ?? [],
               blockedTransitionAt: candidate.blockedTransitionAt,
-              completedRearmCutoff: cutoff,
+              // Generation cutoff, not the re-arm window: a COMPLETED canonical
+              // wake only covers the ready state of the blocked cycle it ran in
+              // (updatedAt >= blockedTransitionAt), so a later done → unresolved
+              // → done generation gets its fresh wake. The re-arm-age `cutoff`
+              // stays reserved for recovery eligibility and cap accounting.
+              completedRearmCutoff: candidate.blockedTransitionAt,
             });
         if (existingWake) {
           result.existingWakeSkipped += 1;
@@ -8336,7 +8341,11 @@ export function recoveryService(
               ...(zeroBlockerHeal ? { zeroBlockerHeal: true } : {}),
             },
             idempotencyKey,
-            completedRearmCutoff: cutoff,
+            // Heartbeat preserves an explicitly supplied completedRearmCutoff
+            // for its own canonical ready-state lookup instead of deriving the
+            // dependent's blockedTransitionAt, so hand it the same generation
+            // cutoff the producer lookup used — never the re-arm-age cutoff.
+            completedRearmCutoff: candidate.blockedTransitionAt,
             requestedByActorType: "system",
             requestedByActorId,
             contextSnapshot: {

@@ -32365,6 +32365,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 ))
                 .limit(1)
                 .then((rows) => rows[0]?.blockedTransitionAt ?? null));
+            let dependencyCompletedRearmCutoff = opts.completedRearmCutoff ?? null;
+            if (!dependencyCompletedRearmCutoff) {
+              dependencyCompletedRearmCutoff = dependencyBlockedTransitionAt instanceof Date
+                ? dependencyBlockedTransitionAt
+                : dependencyBlockedTransitionAt
+                  ? new Date(dependencyBlockedTransitionAt)
+                  : null;
+              if (
+                dependencyCompletedRearmCutoff &&
+                Number.isNaN(dependencyCompletedRearmCutoff.getTime())
+              ) {
+                dependencyCompletedRearmCutoff = null;
+              }
+            }
             const existingDependencyWake = await findExistingIssueBlockersResolvedWakeForReadyState(
               tx as unknown as Db,
               {
@@ -32372,7 +32386,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 dependentIssueId: issueId,
                 blockerIssueIds: dependencyBlockerIds,
                 blockedTransitionAt: dependencyBlockedTransitionAt,
-                completedRearmCutoff: opts.completedRearmCutoff,
+                completedRearmCutoff: dependencyCompletedRearmCutoff,
                 excludeWakeupRequestIds: [nativeStatusWakeIntentId, executionWaitRequestId]
                   .filter((id): id is string => Boolean(id)),
               },

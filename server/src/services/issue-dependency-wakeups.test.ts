@@ -138,6 +138,46 @@ describe("findExistingIssueBlockersResolvedWakeForReadyState", () => {
     expect(existing?.id).toBe("wake-earlier-producer");
   });
 
+  it("does not let a completed canonical wake from a previous generation suppress a later cutoff", async () => {
+    const stateKey = buildIssueBlockersResolvedWakeStateKey(readyState);
+    const existing = await findExistingIssueBlockersResolvedWakeForReadyState(
+      dbWithWakes([
+        {
+          id: "wake-cycle",
+          status: "completed",
+          idempotencyKey: stateKey,
+          requestedAt: firstCycle,
+          updatedAt: firstCycle,
+        },
+      ]),
+      {
+        ...readyState,
+        completedRearmCutoff: secondCycle,
+      },
+    );
+    expect(existing).toBeNull();
+  });
+
+  it("keeps a completed canonical wake covering repeats within the same generation", async () => {
+    const stateKey = buildIssueBlockersResolvedWakeStateKey(readyState);
+    const existing = await findExistingIssueBlockersResolvedWakeForReadyState(
+      dbWithWakes([
+        {
+          id: "wake-current-cycle",
+          status: "completed",
+          idempotencyKey: stateKey,
+          requestedAt: secondCycle,
+          updatedAt: secondCycle,
+        },
+      ]),
+      {
+        ...readyState,
+        completedRearmCutoff: secondCycle,
+      },
+    );
+    expect(existing?.id).toBe("wake-current-cycle");
+  });
+
   it("does not let a completed old-key wake from a previous blocked cycle suppress", async () => {
     const oldKey = buildIssueBlockersResolvedWakeStateKeyWithoutCycle({
       dependentIssueId,
