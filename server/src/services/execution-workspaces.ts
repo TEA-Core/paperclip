@@ -609,6 +609,9 @@ async function runExpensiveGitStatus(input: {
     // Status is an inspection. With optional locks on it rewrites the index,
     // which would make a dry-run sweep change the worktree it reports on.
     env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+    // Nested task worktrees can exceed the scheduler's 1 MiB default.
+    // Keep exact file counts for readiness and reconciliation checks.
+    maxStdoutBytes: 32 * 1024 * 1024,
   });
 }
 

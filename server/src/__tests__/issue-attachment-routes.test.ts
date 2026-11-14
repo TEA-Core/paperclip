@@ -145,7 +145,7 @@ function createStorageService(body = Buffer.from("test")): TestStorageService {
       provider: "local_disk",
       objectKey: `${input.namespace}/${input.originalFilename ?? "upload"}`,
       contentType: input.contentType,
-      byteSize: input.body.length,
+      byteSize: (input.body as Buffer).length,
       sha256: "sha256-sample",
       originalFilename: input.originalFilename,
       };

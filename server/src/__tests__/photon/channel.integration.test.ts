@@ -214,13 +214,13 @@ describe.sequential("iMessage Photon channel control plane", () => {
       provider: "local_disk",
       putFile: async (input) => {
         const objectKey = `${input.namespace}/${randomUUID()}`;
-        objects.set(objectKey, input.body);
+        objects.set(objectKey, input.body as Buffer);
         return {
           provider: "local_disk",
           objectKey,
           contentType: input.contentType,
-          byteSize: input.body.length,
-          sha256: createHash("sha256").update(input.body).digest("hex"),
+          byteSize: (input.body as Buffer).length,
+          sha256: createHash("sha256").update(input.body as Buffer).digest("hex"),
           originalFilename: input.originalFilename,
         };
       },

@@ -1,5 +1,6 @@
 export {
   createDb,
+  withDedicatedDbConnection,
   closeRegisteredClients,
   createRequestScopedDb,
   type RequestScopedDb,

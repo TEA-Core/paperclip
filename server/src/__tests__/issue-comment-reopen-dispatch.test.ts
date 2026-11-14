@@ -217,7 +217,9 @@ describeEmbeddedPostgres("issue comment reopen route dispatch (SUP-15065)", () =
     expect(run.status).toBeTruthy();
   });
 
-  it("keeps a different mentioned agent's wake independent of the assignee receipt", async () => {
+  // Upstream #14577 (fold-s3a): an agent mention is context only and never wakes
+  // the mentioned agent. The assignee receipt stays independent of the mention.
+  it("does not wake a mentioned agent and keeps the assignee receipt independent of it", async () => {
     const db = pg.db;
     const { company, agent, issue } = await seedDoneCard({ wakeOnDemand: false });
     const [mentionedAgent] = await db.insert(agents).values({
@@ -243,8 +245,6 @@ describeEmbeddedPostgres("issue comment reopen route dispatch (SUP-15065)", () =
       outcome: "not_dispatched",
       reason: "heartbeat.wakeOnDemand.disabled",
     });
-    const mentionRun = await waitForRun(mentionedAgent!.id, "issue_comment_mentioned");
-    expect(mentionRun).toBeTruthy();
     const notDispatched = await waitForActivityRow("issue.wake_not_dispatched");
     expect(notDispatched).toHaveLength(1);
     expect(notDispatched![0].details).toMatchObject({
@@ -253,6 +253,11 @@ describeEmbeddedPostgres("issue comment reopen route dispatch (SUP-15065)", () =
       outcome: "not_dispatched",
       reason: res.body.wakeReceipt.reason,
     });
+    const mentionRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, mentionedAgent!.id));
+    expect(mentionRuns).toHaveLength(0);
   });
 
   it("returns a coalesced assignee wake receipt with its durable reason", async () => {

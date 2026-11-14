@@ -1,4 +1,11 @@
-import type { ActivityEvent } from "@paperclipai/shared";
+import {
+  ISSUE_DETAIL_CONTENT_PAINT_MARK,
+  ISSUE_DETAIL_CONTENT_MEASURE,
+  scheduleIssueDetailPaintMeasure,
+} from "@/lib/issue-detail-performance";
+import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { workspaceRestoreMarkerDetail } from "@/lib/workspace-restore-marker";
+import type { ActivityEvent, TaskBrowser } from "@paperclipai/shared";
 import { useProjectCreatedItems } from "@/hooks/useProjectCreatedItems";
 import { skillCreatedItems } from "@/components/task-chat/skill-created-items";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
@@ -86,6 +93,7 @@ import {
   taskChatContentKey,
 } from "@/components/task-chat/TaskChatThreadView";
 import { TaskChatComposer } from "@/components/task-chat/TaskChatComposer";
+import { TaskChatComposerDock } from "@/components/task-chat/TaskChatComposerDock";
 import {
   RunnerGoalWidget,
   useRunnerGoalControl,
@@ -117,6 +125,8 @@ import { issuesApi } from "@/api/issues";
 import { queryKeys } from "@/lib/queryKeys";
 import { useQueryClient } from "@tanstack/react-query";
 import { TaskChatPresentationProvider } from "@/components/task-chat/presentation-mode";
+
+const EMPTY_BROWSERS: TaskBrowser[] = [];
 
 function toMs(value: Date | string | null | undefined): number {
   if (!value) return 0;
@@ -512,6 +522,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     conversationMode,
     reassignOptions,
     currentAssigneeValue,
+    assigneeAdapterOverrides,
     issueStatus,
     issueAssigneeAgentId = null,
     onAcceptInteraction,
@@ -522,6 +533,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     onSubmitInteractionVerdicts,
     externalReferences,
     threadHeader,
+    browsers = EMPTY_BROWSERS,
+    onOpenBrowser,
+    hasOlderComments = false,
     issueBrief,
     feedbackVotes,
     feedbackDataSharingPreference = "prompt",
@@ -879,25 +893,28 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     [runs],
   );
   const {
-    transcriptByRun: logTranscriptByRun,
-    isInitialHydrating: logsAreInitiallyHydrating,
-    hydratedRunIds: hydratedLogRunIds,
-    errorsByRun: logErrorsByRun,
-    retry: retryLogs,
-  } = useLiveRunTranscripts({
-    // Native events are authoritative, but the persisted/live log remains a
-    // compatibility source when an upgraded server has no event history or
-    // the native event endpoint is temporarily unavailable.
-    runs,
-    companyId,
-  });
-  const {
     transcriptByRun: nativeTranscriptByRun,
     errorsByRun: nativeTranscriptErrorsByRun,
     isInitialHydrating: nativeEventsAreInitiallyHydrating,
     hydratedRunIds: hydratedNativeRunIds,
     retry: retryNativeEvents,
   } = useNativeRunTranscripts(nativeRuns);
+  const logRuns = useMemo(() => runs.filter((run) =>
+    run.runtimeMode !== "native" ||
+    // Active runs still need the websocket log stream. Only settled native
+    // history can skip the legacy transport when event history is available.
+    run.status === "running" || run.status === "queued" ||
+    nativeTranscriptErrorsByRun.has(run.id) ||
+    (hydratedNativeRunIds?.has(run.id) &&
+      (nativeTranscriptByRun.get(run.id)?.length ?? 0) === 0)
+  ), [runs, nativeTranscriptErrorsByRun, hydratedNativeRunIds, nativeTranscriptByRun]);
+  const {
+    transcriptByRun: logTranscriptByRun,
+    isInitialHydrating: logsAreInitiallyHydrating,
+    hydratedRunIds: hydratedLogRunIds,
+    errorsByRun: logErrorsByRun,
+    retry: retryLogs,
+  } = useLiveRunTranscripts({ runs: logRuns, companyId });
   const fallbackByRunRef = useRef(
     new Map<string, NonNullable<ReturnType<typeof logTranscriptByRun.get>>>(),
   );
@@ -1319,12 +1336,35 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     for (const item of createdSkillItems) {
       entries.push({ id: item.id, item, ms: toMs(item.timestamp), order: 2 });
     }
+    // Older sessions arrive with their surrounding messages when history is
+    // paged in; otherwise they would collect above the loaded conversation.
+    const historyStart = hasOlderComments
+      ? Math.min(...visibleComments.map((comment) => toMs(comment.conversationAnchorAt ?? comment.createdAt)))
+      : -Infinity;
+    for (const [index, browser] of browsers.entries()) {
+      if (toMs(browser.createdAt) < historyStart) continue;
+      const id = `browser:${browser.sessionId}`;
+      entries.push({
+        id,
+        ms: toMs(browser.createdAt),
+        order: 2,
+        item: {
+          id,
+          kind: "browser",
+          browser,
+          label: browsers.length > 1 ? `Browser ${index + 1}` : "Browser",
+          timestamp: browser.createdAt,
+        },
+      });
+    }
     return entries.sort(
       (a, b) => a.ms - b.ms || a.order - b.order || a.id.localeCompare(b.id),
     );
   }, [
     createdProjectItems,
     createdSkillItems,
+    browsers,
+    hasOlderComments,
     comments,
     projectedComments,
     commentItems,
@@ -1582,13 +1622,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                   ? "Run timed out"
                   : "Run failed";
         const responseBoundary = sourceHasNativeResponse
-          ? "after returning a final response"
-          : "before returning an answer";
+          ? " after returning a final response"
+          : "";
         const detail =
           source.status === "cancelled"
-            ? `The run was cancelled ${responseBoundary}.`
+            ? `The run was cancelled${responseBoundary}.`
             : source.status === "interrupted"
-              ? `The run was interrupted ${responseBoundary}.`
+              ? `The run was interrupted${responseBoundary}.`
               : code === "native_provider_approval_required"
                 ? "This operation requires approval, but this runner has no interactive approval handler. Review the operation and update the agent's permission setting before retrying."
                 : code === "native_provider_model_rejected"
@@ -1599,8 +1639,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                   : code === "provider_frame_too_large"
                     ? "Provider output exceeded the safe limit."
                     : source.status === "timed_out"
-                      ? `The runner timed out ${responseBoundary} (${code}).`
-                      : `The runner stopped ${responseBoundary} (${code}).`;
+                      ? `The runner timed out${responseBoundary} (${code}).`
+                      : `The runner stopped${responseBoundary} (${code}).`;
         const id = `${source.id}:failure`;
         const runAgent = meta?.agentId
           ? agentMap?.get(meta.agentId)
@@ -1644,20 +1684,26 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           : canRetryFailedRun
             ? "You can retry this message now."
             : "Your message is preserved.";
+        const restoreFailed = hasWorkspaceRestoreFailure(meta?.resultJson);
+        const savedPlan = Boolean(planDocument && (meta?.resultJson?.savedPlanRevisionId === planDocument.latestRevisionId || interactions?.some((interaction) =>
+          interaction.sourceRunId === source.id && interactionTargetsPlanRevision(interaction, planDocument),
+        )));
         const aiRequest = interactions?.find((interaction) => interaction.kind === "connection_intent" && interaction.payload.purpose === "ai" && interaction.sourceRunId === source.id);
-        const detail = aiRequest
+        const detail = restoreFailed
+          ? workspaceRestoreMarkerDetail({ result: meta?.resultJson, savedPlan, hasResponse: sourceHasPresentationComment || Boolean(acceptedSummary) })
+          : aiRequest
           ? aiRequest.status === "pending"
             ? "The selected AI account is unavailable. Fix it in the connection card."
             : "This run stopped because its AI account was unavailable."
           : source.status === "cancelled"
             ? code === "execution_reconciliation_required"
               ? "The previous execution must be checked before this task can continue. Your message is preserved. View the stopped run for details."
-              : "Execution was stopped before returning an answer."
+              : "Execution was stopped."
             : code === "provider_frame_too_large"
             ? `Provider output exceeded the safe limit. ${retryDetail}`
             : code.startsWith("workspace_git_scan_")
             ? `Workspace setup failed before the agent started. ${retryDetail}`
-            : `The runner stopped before returning an answer (${code}). ${retryDetail}`;
+            : `The run failed (${code}). ${retryDetail}`;
         const id = `${source.id}:failure`;
         entriesWithFailures.push({
           ms: toMs(meta?.finishedAt ?? meta?.startedAt ?? meta?.createdAt),
@@ -1667,8 +1713,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             id,
             kind: "marker",
             variant: "interrupted",
-            label: source.status === "cancelled" ? (meta?.startedAt ? "Stopped" : "Couldn't start") : "Run failed",
+            label: restoreFailed ? "Workspace restore failed" : source.status === "cancelled" ? (meta?.startedAt ? "Stopped" : "Couldn't start") : "Run failed",
             runId: source.status === "cancelled" ? undefined : source.id,
+            ...(restoreFailed ? {
+              retryable: meta?.resultJson?.workspaceRestoreFailure !== "restore_unsafe_archive",
+              collapsible: true,
+              runHref: meta?.agentId ? `/agents/${encodeURIComponent(agentMap?.get(meta.agentId)?.urlKey ?? meta.agentId)}/runs/${encodeURIComponent(source.id)}` : undefined,
+              planHref: savedPlan ? "#document-plan" : undefined,
+            } : {}),
             tone: source.status === "cancelled" ? "neutral" : "error",
             detail,
           },
@@ -2053,6 +2105,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     steeringAnchorsByRun,
     legacyTimelineAnchorsByRun,
     hasBrief,
+    planDocument,
     planDocumentSourceRunId,
     planTurnItem,
     agentMap,
@@ -2392,46 +2445,70 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     }
     return result;
   }, [interactions, pendingRuntimeRequest]);
+  // Agent Chat questions already have an answerable history card, including
+  // when the user dismisses a fresh form without sending another message.
+  const pendingReminderInputs = useMemo(() => pendingComposerInputs.filter(input =>
+    !(conversationMode && input.kind === "durable" && input.interaction.kind === "ask_user_questions")),
+  [pendingComposerInputs, conversationMode]);
+  const latestUserComment = useMemo(() => comments
+    .filter(comment => !comment.deletedAt && comment.authorUserId && !comment.authorAgentId && !comment.createdByRunId)
+    .reduce<(typeof comments)[number] | null>((latest, comment) =>
+      !latest || toMs(comment.createdAt) >= toMs(latest.createdAt) ? comment : latest, null), [comments]);
+  const latestUserCommentId = latestUserComment?.id ?? null;
+  // A later message leaves a question answerable in history, without reopening
+  // its form on every render or reload. Explicit selection can still reopen it.
+  const currentPendingInputs = useMemo(() => pendingComposerInputs.filter(input =>
+    !(conversationMode && input.kind === "durable"
+      && input.interaction.kind === "ask_user_questions" && latestUserComment
+      && toMs(input.interaction.createdAt) < toMs(latestUserComment.createdAt))),
+  [pendingComposerInputs, conversationMode, latestUserComment]);
+  const currentPendingKeys = useMemo(() => new Set(currentPendingInputs.map(input => input.key)), [currentPendingInputs]);
   const [takeoverMode, setTakeoverMode] = useState<"open" | "normal">("open");
   const [selectedPendingKey, setSelectedPendingKey] = useState<string | null>(
     null,
   );
   const knownPendingKeysRef = useRef<Set<string>>(new Set());
+  const lastInputUserCommentRef = useRef(latestUserCommentId);
   useEffect(() => {
     const currentKeys = new Set(
       pendingComposerInputs.map((input) => input.key),
     );
     const hasNewInput = pendingComposerInputs.some(
-      (input) => !knownPendingKeysRef.current.has(input.key),
+      (input) => currentPendingKeys.has(input.key) && !knownPendingKeysRef.current.has(input.key),
     );
+    const movedOn = lastInputUserCommentRef.current !== latestUserCommentId;
+    lastInputUserCommentRef.current = latestUserCommentId;
     knownPendingKeysRef.current = currentKeys;
     setSelectedPendingKey((current) =>
-      current && currentKeys.has(current)
+      current && currentKeys.has(current) && !(movedOn && !currentPendingKeys.has(current))
         ? current
-        : (pendingComposerInputs[0]?.key ?? null),
+        : (currentPendingInputs[0]?.key ?? null),
     );
     if (hasNewInput) setTakeoverMode("open");
-  }, [pendingComposerInputs]);
+  }, [pendingComposerInputs, latestUserCommentId, currentPendingInputs, currentPendingKeys]);
   const selectedPendingInput =
     pendingComposerInputs.find((input) => input.key === selectedPendingKey) ??
-    pendingComposerInputs[0] ??
+    currentPendingInputs[0] ??
     null;
   const interactionDraftKey = selectedPendingInput
     ? `paperclip:task-input:${issueId ?? "unknown"}:${selectedPendingInput.key}`
     : undefined;
   const openPendingTakeover = useCallback(() => {
+    if (!pendingReminderInputs.some(input => input.key === selectedPendingInput?.key)) {
+      setSelectedPendingKey(pendingReminderInputs[0]?.key ?? null);
+    }
     setTakeoverMode("open");
-  }, []);
+  }, [pendingReminderInputs, selectedPendingInput]);
   const showNextPendingInput = useCallback(() => {
-    if (pendingComposerInputs.length < 2) return;
-    const currentIndex = pendingComposerInputs.findIndex(
+    if (pendingReminderInputs.length < 2) return;
+    const currentIndex = pendingReminderInputs.findIndex(
       (input) => input.key === selectedPendingInput?.key,
     );
     setSelectedPendingKey(
-      pendingComposerInputs[(currentIndex + 1) % pendingComposerInputs.length]
+      pendingReminderInputs[(currentIndex + 1) % pendingReminderInputs.length]
         ?.key ?? null,
     );
-  }, [pendingComposerInputs, selectedPendingInput?.key]);
+  }, [pendingReminderInputs, selectedPendingInput?.key]);
   const skipPendingInput = useCallback(
     async (input: PendingComposerInput) => {
       if (input.kind === "runtime") {
@@ -2467,12 +2544,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       if (assigneeUsesPaperclipRunner) setRunnerSubmissionPending(true);
       try {
         await onAdd(...args);
+        if (conversationMode && selectedPendingInput?.kind === "durable" && selectedPendingInput.interaction.kind === "ask_user_questions") {
+          setSelectedPendingKey(null);
+          setTakeoverMode("normal");
+        }
       } catch (error) {
         setRunnerSubmissionPending(false);
         throw error;
       }
     },
-    [assigneeUsesPaperclipRunner, onAdd],
+    [assigneeUsesPaperclipRunner, onAdd, conversationMode, selectedPendingInput],
   );
   const optimisticRunnerStartup =
     assigneeUsesPaperclipRunner &&
@@ -2550,15 +2631,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   );
 
   const reopenToolReview = useCallback((interactionId: string) => {
-    setSelectedPendingKey(`interaction:${interactionId}`);
+    setSelectedPendingKey(pendingComposerInputs.find(input => input.kind === "durable" && input.interaction.id === interactionId)?.key ?? `interaction:${interactionId}`);
     setTakeoverMode("open");
-  }, []);
+  }, [pendingComposerInputs]);
 
   const renderInteraction = useCallback(
     (item: TaskChatInteractionItem) => (
       <TaskChatInteractionCard
         item={item}
         onReviewRequest={reopenToolReview}
+        showUnansweredQuestion={conversationMode}
         planDocument={planDocument}
         showPlanPreview={
           !threadOwnsPlanPreview(
@@ -2599,6 +2681,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       settledRunIds,
       tailRunId,
       reopenToolReview,
+      conversationMode,
     ],
   );
 
@@ -2655,7 +2738,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             selectedPendingInput.kind === "durable" &&
             selectedPendingInput.interaction.kind === "request_confirmation" &&
             Boolean(selectedPendingInput.interaction.payload.toolAction),
-          pendingCount: pendingComposerInputs.length,
+          pendingCount: Math.max(1, pendingReminderInputs.length),
           content: takeoverContent,
           onDismiss: () => setTakeoverMode("normal"),
           onSkip: () => skipPendingInput(selectedPendingInput),
@@ -2719,28 +2802,31 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         initialCommentWindow.current.oldestAt
     );
   });
-  const historyPending =
-    initialHistoryPending ||
-    planLoading ||
-    initialRuns.some((run) => {
-      // A scheduled retry has not started and has no log to hydrate yet.
-      if (run.status === "scheduled_retry") return false;
-      if (
-        run.runtimeMode === "native" &&
-        (hydratedNativeRunIds
-          ? !hydratedNativeRunIds.has(run.id)
-          : nativeEventsAreInitiallyHydrating)
-      )
-        return true;
-      if (
-        run.runtimeMode === "native" &&
-        (nativeTranscriptByRun.get(run.id)?.length ?? 0) > 0
-      )
-        return false;
-      return run.status !== "queued" && hydratedLogRunIds
-        ? !hydratedLogRunIds.has(run.id)
-        : logsAreInitiallyHydrating;
-    });
+  const transcriptHistoryPending = initialRuns.some((run) => {
+    // A scheduled retry has not started and has no log to hydrate yet.
+    if (run.status === "scheduled_retry") return false;
+    if (
+      run.runtimeMode === "native" &&
+      (hydratedNativeRunIds
+        ? !hydratedNativeRunIds.has(run.id)
+        : nativeEventsAreInitiallyHydrating)
+    )
+      return true;
+    if (
+      run.runtimeMode === "native" &&
+      (nativeTranscriptByRun.get(run.id)?.length ?? 0) > 0
+    )
+      return false;
+    return run.status !== "queued" && hydratedLogRunIds
+      ? !hydratedLogRunIds.has(run.id)
+      : logsAreInitiallyHydrating;
+  });
+  // Durable messages are useful immediately. Tool history can fill in around
+  // their stable anchors without concealing already-loaded replies. A thread
+  // with only runtime output still waits for that output before showing empty.
+  const historyPending = initialHistoryPending || (
+    comments.length === 0 && !issueBrief?.description && (planLoading || transcriptHistoryPending)
+  );
   const historyError =
     initialHistoryError ||
     planError ||
@@ -2762,6 +2848,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     const frame = requestAnimationFrame(() => setRevealedIssue(issueId));
     return () => cancelAnimationFrame(frame);
   }, [historyPending, historyRevealed, issueId]);
+  useEffect(() => {
+    if (!historyRevealed || !issueId) return;
+    scheduleIssueDetailPaintMeasure(ISSUE_DETAIL_CONTENT_PAINT_MARK, ISSUE_DETAIL_CONTENT_MEASURE);
+  }, [historyRevealed, issueId]);
   const retryHistory = () => {
     onRetryInitialHistory?.();
     retryLogs?.();
@@ -2882,6 +2972,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                     onRetryFailedRun={retryFailedRunHandler}
                     retryFailedRunId={retryFailedRunId}
                     onOpenSkill={onOpenSkill}
+                    onOpenBrowser={onOpenBrowser}
                     tail={
                       tailRunId ||
                       optimisticRunnerStartup ||
@@ -2993,28 +3084,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               </div>
             ) : null}
             {showComposer ? (
-              <div
-                data-testid="task-chat-composer-dock"
-                className={cn(
-                  "sticky",
-                  // Mobile mirrors the flag-off thread's dock: lifted above the
-                  // safe-area inset and clear of the auto-hiding bottom nav, above
-                  // page content in the document-flow stacking context. The bottom
-                  // offset (--tc-composer-bottom) tracks the nav: Layout raises it to
-                  // the nav height while the nav is visible so the composer's action
-                  // row is never occluded, and drops it back to the safe-area dock
-                  // when the nav auto-hides (PAP-495). transition-[bottom] rides the
-                  // nav's own 200ms slide; the offset only changes on nav toggles, so
-                  // it never animates mid-scroll.
-                  isMobile
-                    ? "bottom-(--tc-composer-bottom) z-20 transition-[bottom] duration-200 ease-out"
-                    : "bottom-0 z-10",
-                  "mx-auto flex w-full max-w-(--tc-shell-max-w) flex-col gap-2 px-1 pb-1 md:px-4 md:pb-2",
-                  streamlinedUiEnabled && "md:px-0 md:pb-0",
-                  (!streamlinedUiEnabled || isMobile) &&
-                    "bg-background/80 pt-1 backdrop-blur supports-[backdrop-filter]:bg-background/60 dark:bg-transparent dark:backdrop-blur-none dark:supports-[backdrop-filter]:bg-transparent",
-                )}
-              >
+              <TaskChatComposerDock mobile={isMobile} streamlined={streamlinedUiEnabled}>
                 {composerAccessory}
                 {tailTurnStatus ? (
                   <TaskChatTurnStatusIsland model={tailTurnStatus} />
@@ -3087,8 +3157,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                       conversationMode={conversationMode}
                       reassignOptions={reassignOptions}
                       agentMap={agentMap}
+                      modelAgents={agentMap}
                       userProfileMap={userProfileMap}
                       currentAssigneeValue={currentAssigneeValue}
+                      companyId={companyId}
+                      assigneeAdapterOverrides={assigneeAdapterOverrides}
                       onPendingAssigneeChange={setPendingComposerAssignee}
                       issueStatus={issueStatus}
                       mobile={isMobile}
@@ -3102,10 +3175,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                       onRunnerGoalCommand={runnerGoal.executeComposerCommand}
                       onRunnerGoalReassign={reassignForRunnerGoal}
                       pendingTakeover={
-                        pendingComposerInputs.length > 0
+                        pendingReminderInputs.length > 0
                           ? {
-                              count: pendingComposerInputs.length,
-                              label: `${pendingComposerInputs.length} pending input${pendingComposerInputs.length === 1 ? "" : "s"}`,
+                              count: pendingReminderInputs.length,
+                              label: `${pendingReminderInputs.length} pending input${pendingReminderInputs.length === 1 ? "" : "s"}`,
                               onOpen: openPendingTakeover,
                             }
                           : null
@@ -3114,7 +3187,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                   </div>
                 </div>
                 {footer}
-              </div>
+              </TaskChatComposerDock>
             ) : null}
           </div>
         </TaskChatPresentationProvider>

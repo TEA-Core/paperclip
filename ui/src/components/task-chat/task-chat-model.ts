@@ -13,6 +13,7 @@
  * CSS motion tokens in ui/src/index.css.
  */
 import type {
+  TaskBrowser,
   IssueAttachment,
   IssueCommentMetadata,
   IssueCommentPresentation,
@@ -255,6 +256,7 @@ export interface TaskChatMarkerItem {
   runId?: string;
   createdAtIso?: string;
   runHref?: string;
+  planHref?: string;
 }
 
 /** A second-tier live token/cost readout (ACP UsageUpdate). */
@@ -557,7 +559,16 @@ export interface TaskChatSkillCreatedItem {
   timestamp: string;
 }
 
+export interface TaskChatBrowserItem {
+  id: string;
+  kind: "browser";
+  browser: TaskBrowser;
+  label: string;
+  timestamp: string;
+}
+
 export type TaskChatItem =
+  | TaskChatBrowserItem
   | TaskChatProjectCreatedItem
   | TaskChatSkillCreatedItem
   | TaskChatMessageItem

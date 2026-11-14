@@ -71,6 +71,18 @@ if (!task.conversationAgentId) {
   process.exit(0);
 }
 const comments = await api(`/issues/${task.id}/comments?order=asc`);
+// FORK DIVERGENCE (fold s3a, upstream #14408 completion turn): a delegated task that
+// reaches done wakes its conversation with a completion reporting turn
+// (wakeReason chat_task_completed) that names no comment. Upstream's fixture answers it by
+// falling back to the latest user comment, which the D9 rule below forbids, so the fork
+// fixture answers the completion turn directly from the server-supplied task links.
+if (ctx.wakeReason === "chat_task_completed" && Array.isArray(ctx.chatCompletionUpdates)) {
+  const finished = ctx.chatCompletionUpdates
+    .map((update) => update.identifier ?? update.id)
+    .join(", ");
+  await comment(`Delegated work completed: ${finished}.`);
+  process.exit(0);
+}
 // FORK DIVERGENCE (D9/SUP-16581, slice 2d): the fork still runs the in-file
 // releaseIssueExecutionAndPromote (server/src/services/heartbeat.ts), which
 // re-promotes a stopped turn's deferred wake. A wake with no wakeCommentId is

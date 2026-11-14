@@ -1119,7 +1119,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       // services a second time and re-run its company cleanup — turning one
       // failure into a cascade across the remaining 380-odd cases.
       try {
-        if (fixtureCompanies.size > 0) {
+        const companyIds = [...fixtureCompanies];
+        if (companyIds.length > 0) {
           // Instrumented full-file runs showed the global receipt-reaction
           // sweep (processPendingDeliveries without a delivery id, called from
           // the first waitFor in qualifySetupRoundTrip) blocked on a leaked
@@ -1131,15 +1132,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           // Attributing CI failure #2 (the second waitFor, which passes a
           // delivery id and skips the global sweeps) to this cleanup alone is
           // not proven.
+          // Pausing an endpoint does not remove its rows from global recovery
+          // selectors either. After every assertion and worker shutdown, settle
+          // every leftover fixture action, delivery and publication so later
+          // cases cannot claim its leases or retry its I/O.
           await db.update(chatActions).set({ status: "cancelled" })
-            .where(and(
-              inArray(chatActions.companyId, [...fixtureCompanies]),
-              or(
-                inArray(chatActions.status, ["received", "processing"]),
-                and(eq(chatActions.status, "failed"), sql`coalesce(${chatActions.result}->>'retryable', 'false') = 'true'`),
-              ),
-            ));
-          await retireFixtureState([...fixtureCompanies]);
+            .where(and(inArray(chatActions.companyId, companyIds), notInArray(chatActions.status, ["processed", "cancelled"])));
+          await db.update(chatDeliveries).set({ state: "failed", nextAttemptAt: null })
+            .where(and(inArray(chatDeliveries.companyId, companyIds), inArray(chatDeliveries.state, ["received", "processing", "retry"])));
+          await db.update(chatPublications).set({ state: "cancelled", nextAttemptAt: null })
+            .where(and(inArray(chatPublications.companyId, companyIds), inArray(chatPublications.state, ["pending", "awaiting_consent", "streaming", "retry"])));
+          await retireFixtureState(companyIds);
         }
       } finally {
         fixtureServices.clear();
@@ -1384,13 +1387,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const objects = new Map<string, Buffer>();
     const putFile = vi.fn<StorageService["putFile"]>(async (input) => {
       const objectKey = `${input.namespace}/${randomUUID()}-${input.originalFilename ?? "attachment"}`;
-      objects.set(objectKey, input.body);
+      objects.set(objectKey, input.body as Buffer);
       return {
         provider: "local_disk",
         objectKey,
         contentType: input.contentType,
-        byteSize: input.body.length,
-        sha256: createHash("sha256").update(input.body).digest("hex"),
+        byteSize: (input.body as Buffer).length,
+        sha256: createHash("sha256").update(input.body as Buffer).digest("hex"),
         originalFilename: input.originalFilename,
       };
     });
@@ -56490,9 +56493,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     "leased",
     "wrong_thread",
     "source_edited",
-  ])(
-    "retries only the original pre-provider Telegram request after exact cleanup: %s",
-    async (mode) => {
+    "different_error",
+  ].flatMap((mode) => [
+    "runner_state_identity_mismatch",
+    "runner_state_identity_mismatch: prior_owner_active",
+  ].map((errorMessage) => ({ mode, errorMessage }))))(
+    "retries only the original pre-provider Telegram request after exact cleanup: $mode ($errorMessage)",
+    async ({ mode, errorMessage }) => {
       const context = await committedChatResponseRecoveryFixture("telegram");
       const providerAccount =
         mode === "null_account"
@@ -56619,7 +56626,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           agentId: context.fixture.assignedAgentId,
           status: "failed",
           errorCode: "adapter_failed",
-          error: "runner_state_identity_mismatch",
+          error: mode === "different_error"
+            ? errorMessage.replace("runner_state_identity_mismatch", "runner_state_identity_mismatch_other")
+            : errorMessage,
           finishedAt: new Date(),
           wakeupRequestId: action.id,
           runtimeMode: "native",
@@ -69401,7 +69410,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       },
     );
 
-    it("retries an unknown subscription mutation after restart using freshly observed options, not a recovered confirmation flag", async () => {
+    it("retries an unknown subscription mutation after restart using freshly observed options, not a recovered confirmation flag", async ({ onTestFailed }) => {
+      let phase = "create fixture";
+      onTestFailed(() => {
+        console.error(`Telegram subscription recovery failed during: ${phase}`);
+      });
       const lane = await draftFixture();
       try {
         await db
@@ -69418,6 +69431,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             throw new Error("Synthetic unknown subscription response");
           return undefined;
         });
+        phase = "first subscription attempt";
         await lane.processSubscriptionAttempt();
         const [action] = await db
           .select()
@@ -69433,17 +69447,28 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           status: "failed",
           result: { retryable: true, providerConfirmed: false },
         });
+        // Keep the retry pending until the explicit post-restart transition below.
+        // A busy runner can otherwise exhaust the real one-second backoff here.
+        await db
+          .update(chatActions)
+          .set({
+            result: { ...action!.result, retryAt: "2099-01-01T00:00:00.000Z" },
+          })
+          .where(eq(chatActions.id, action!.id));
+        phase = "ordinary publication before restart";
         expect((await lane.send("unknown-subscription"))?.state).toBe(
           "published",
         );
         expect(lane.requests).toHaveLength(1);
         expect(lane.requests[0]!.method.endsWith("Draft")).toBe(false);
+        phase = "pending recovery before restart";
         await lane.context.service.processPendingDeliveries();
         expect(
           lane.maintenanceRequests.filter(
             ({ method }) => method === "setWebhook",
           ),
         ).toHaveLength(1);
+        phase = "restart";
         await lane.restart();
         lane.setSubscriptionInfo({
           allowed_updates: ["message", "chat_member"],
@@ -69459,10 +69484,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             },
           })
           .where(eq(chatActions.id, action!.id));
+        phase = "concurrent recovery after restart";
         await Promise.all([
           lane.context.service.processPendingDeliveries(),
           lane.context.service.processPendingDeliveries(),
         ]);
+        phase = "verify recovered subscription";
         const mutations = lane.maintenanceRequests.filter(
           ({ method }) => method === "setWebhook",
         );
@@ -69492,9 +69519,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               200,
             );
         });
+        phase = "publication after subscription recovery";
         expect((await lane.send("repaired-after-unknown"))?.state).toBe(
           "cancelled",
         );
+        phase = "close fixture";
       } finally {
         await lane.close();
       }
@@ -72527,7 +72556,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           expect(
             storage.putFile.mock.calls.some(
               ([input]) =>
-                input.body.equals(bytes) &&
+                (input.body as Buffer).equals(bytes) &&
                 input.contentType ===
                   (mode === "voice" ? "audio/ogg" : "video/mp4"),
             ),
@@ -72536,7 +72565,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             expect(
               storage.putFile.mock.calls.some(
                 ([input]) =>
-                  input.body.equals(photo) &&
+                  (input.body as Buffer).equals(photo) &&
                   input.contentType === "image/jpeg",
               ),
             ).toBe(true);

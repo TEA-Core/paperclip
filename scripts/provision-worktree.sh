@@ -48,26 +48,33 @@ if [[ -L "$canonical_base_cwd/.paperclip" && ! -d "$canonical_base_cwd/.papercli
   exit 1
 fi
 source_config_path="$canonical_base_cwd/.paperclip/config.json"
+source_config_origin="base project workspace"
 if [[ ! -e "$source_config_path" && ! -L "$source_config_path" ]]; then
   # A base workspace that is a plain checkout carries no instance config of its own.
   # Fall back to the control plane's own registered instance config, which is process
   # state this workspace cannot rewrite.
   source_config_path="${PAPERCLIP_CONFIG:-$paperclip_home/instances/$paperclip_instance_id/config.json}"
+  source_config_origin="control-plane instance"
 fi
 # A deployment may be configured entirely from process state (for example, a shared
 # DATABASE_URL in the environment) and have no on-disk instance config anywhere. That
 # is not an error: there is simply no seed source to clone from, so provision a
 # self-contained isolated worktree config instead of hard-failing. A source that is
 # present but malformed (a symlink or a non-canonical alias) is still refused.
+# FORK DIVERGENCE (SUP-15582): upstream #14795 fails an absent source with setup
+# guidance; this fork keeps the self-contained provisioning path below and takes only
+# upstream's origin-labelled diagnostics for a present-but-malformed source.
 have_source_config=0
 source_env_path=""
 if [[ -L "$source_config_path" ]]; then
-  echo "Registered Paperclip seed source config is a symlink: $source_config_path" >&2
+  echo "Registered Paperclip seed source config is a symlink, so it is not a canonical file ($source_config_origin): $source_config_path" >&2
+  echo "Repair the registered source path; symlinks and non-regular files are not accepted." >&2
   exit 1
 fi
 if [[ -e "$source_config_path" ]]; then
   if [[ ! -f "$source_config_path" ]]; then
-    echo "Registered Paperclip seed source config is not a regular file: $source_config_path" >&2
+    echo "Registered Paperclip seed source config is not a regular file, so it is not a canonical file ($source_config_origin): $source_config_path" >&2
+    echo "Repair the registered source path; symlinks and non-regular files are not accepted." >&2
     exit 1
   fi
   have_source_config=1

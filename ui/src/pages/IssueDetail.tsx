@@ -1,4 +1,9 @@
+import { TextAttachmentContext } from "../context/TextAttachmentContext";
+import { useTaskBrowsers, useBrowserArrivals } from "@/hooks/useTaskBrowsers";
+import { WorkspaceExportRecovery } from "../components/WorkspaceExportRecovery";
+import { DispositionRecoveryProvider } from "../components/DispositionRecoveryNotice";
 import { AgentAvatar } from "@/components/AgentAvatar";
+import { mergeComposerRunSettings, type ComposerRunSettings } from "@/components/task-chat/composer-run-settings";
 import { AgentIdentity } from "@/components/AgentIdentity";
 import { clearLegacyChatMessageRequests } from "@/lib/chat-message-request";
 import { agentChatDraft } from "@/lib/agent-chat-draft";
@@ -107,6 +112,7 @@ import {
   resolveIssueActiveRun,
   shouldTrackIssueActiveRun,
 } from "../lib/issueActiveRun";
+import { prefetchIssueThread } from "../lib/issue-thread-queries";
 import { getIssueDetailQueryOptions } from "../lib/issueDetailCache";
 import {
   beginIssueDetailNavigation,
@@ -1178,6 +1184,9 @@ function InboxMobileToolbar({
 }
 
 type IssueDetailChatTabProps = {
+  queryIssueId?: string;
+  browsers?: import("@paperclipai/shared").TaskBrowser[];
+  onOpenBrowser?: (browserId: string) => void;
   onOpenSkill?: (skillId: string, name: string) => void;
   issueId: string;
   companyId: string;
@@ -1215,6 +1224,7 @@ type IssueDetailChatTabProps = {
   comments: IssueDetailComment[];
   commentsInitialLoading?: boolean;
   initialHistoryPending?: boolean;
+  initialMetadataPending?: boolean;
   initialHistoryError?: boolean;
   onRetryInitialHistory?: () => void;
   locallyQueuedCommentRunIds: ReadonlyMap<string, string>;
@@ -1255,6 +1265,7 @@ type IssueDetailChatTabProps = {
   draftKey: string;
   reassignOptions: Array<{ id: string; label: string; searchText?: string }>;
   currentAssigneeValue: string;
+  assigneeAdapterOverrides?: Issue["assigneeAdapterOverrides"];
   suggestedAssigneeValue: string;
   mentions: MentionOption[];
   conversationMode?: boolean;
@@ -1273,6 +1284,7 @@ type IssueDetailChatTabProps = {
     reassignment?: CommentReassignment,
     attachmentIds?: string[],
     clientRequestId?: string,
+    runSettings?: ComposerRunSettings,
   ) => Promise<void>;
   onReviewConversation: () => Promise<void>;
   onImageUpload: (file: File) => Promise<string>;
@@ -1327,6 +1339,9 @@ type IssueDetailChatTabProps = {
 };
 
 const IssueDetailChatTab = memo(function IssueDetailChatTab({
+  queryIssueId,
+  browsers,
+  onOpenBrowser,
   onOpenSkill,
   issueId,
   companyId,
@@ -1355,6 +1370,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   comments,
   commentsInitialLoading = false,
   initialHistoryPending = false,
+  initialMetadataPending = false,
   initialHistoryError = false,
   onRetryInitialHistory,
   locallyQueuedCommentRunIds,
@@ -1382,6 +1398,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   draftKey,
   reassignOptions,
   currentAssigneeValue,
+  assigneeAdapterOverrides,
   suggestedAssigneeValue,
   mentions,
   conversationMode,
@@ -1430,6 +1447,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     ? IssueChatThread
     : TaskChatThread;
   const queryClient = useQueryClient();
+  const issueQueryRef = queryIssueId ?? issueId;
   const scrollLocation = useLocation();
   const scrollNavigationType = useNavigationType();
   const { pushToast } = useToastActions();
@@ -1439,10 +1457,10 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     isError: activityError,
     refetch: refetchActivity,
   } = useQuery({
-    queryKey: queryKeys.issues.activity(issueId),
-    queryFn: () => activityApi.forIssue(issueId),
+    queryKey: queryKeys.issues.activity(issueQueryRef),
+    queryFn: () => activityApi.forIssue(issueQueryRef),
     enabled: !!issueId,
-    placeholderData: keepPreviousDataForSameQueryTail<ActivityEvent[]>(issueId),
+    placeholderData: keepPreviousDataForSameQueryTail<ActivityEvent[]>(issueQueryRef),
   });
   const {
     data: liveRuns,
@@ -1450,12 +1468,12 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     isError: liveRunsError,
     refetch: refetchLiveRuns,
   } = useQuery({
-    queryKey: queryKeys.issues.liveRuns(issueId),
-    queryFn: () => heartbeatsApi.liveRunsForIssue(issueId),
+    queryKey: queryKeys.issues.liveRuns(issueQueryRef),
+    queryFn: () => heartbeatsApi.liveRunsForIssue(issueQueryRef),
     enabled: !!issueId,
     refetchInterval: 1000,
     placeholderData:
-      keepPreviousDataForSameQueryTail<LiveRunForIssue[]>(issueId),
+      keepPreviousDataForSameQueryTail<LiveRunForIssue[]>(issueQueryRef),
   });
   const resolvedLiveRuns = liveRuns ?? [];
   const liveRunCount = resolvedLiveRuns.length;
@@ -1467,12 +1485,12 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     isError: activeRunError,
     refetch: refetchActiveRun,
   } = useQuery({
-    queryKey: queryKeys.issues.activeRun(issueId),
-    queryFn: () => heartbeatsApi.activeRunForIssue(issueId),
+    queryKey: queryKeys.issues.activeRun(issueQueryRef),
+    queryFn: () => heartbeatsApi.activeRunForIssue(issueQueryRef),
     enabled: activeRunQueryEnabled,
     refetchInterval: liveRunCount > 0 ? false : 1000,
     placeholderData: keepPreviousDataForSameQueryTail<ActiveRunForIssue | null>(
-      issueId,
+      issueQueryRef,
     ),
   });
   const resolvedActiveRun = useMemo(
@@ -1537,12 +1555,12 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     isError: linkedRunsError,
     refetch: refetchLinkedRuns,
   } = useQuery({
-    queryKey: queryKeys.issues.runs(issueId),
-    queryFn: () => activityApi.runsForIssue(issueId),
+    queryKey: queryKeys.issues.runs(issueQueryRef),
+    queryFn: () => activityApi.runsForIssue(issueQueryRef),
     enabled: !!issueId,
     refetchInterval:
       hasLiveRuns || issueStatus === "in_progress" ? 1000 : false,
-    placeholderData: keepPreviousDataForSameQueryTail<RunForIssue[]>(issueId),
+    placeholderData: keepPreviousDataForSameQueryTail<RunForIssue[]>(issueQueryRef),
   });
   const resolvedActivity = activity ?? [];
   const resolvedLinkedRuns = linkedRuns ?? [];
@@ -1567,13 +1585,13 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     },
     onSettled: () => {
       queryClient.invalidateQueries({
-        queryKey: queryKeys.issues.runs(issueId),
+        queryKey: queryKeys.issues.runs(issueQueryRef),
       });
       queryClient.invalidateQueries({
-        queryKey: queryKeys.issues.liveRuns(issueId),
+        queryKey: queryKeys.issues.liveRuns(issueQueryRef),
       });
       queryClient.invalidateQueries({
-        queryKey: queryKeys.issues.activeRun(issueId),
+        queryKey: queryKeys.issues.activeRun(issueQueryRef),
       });
     },
     onError: (error) => {
@@ -2161,7 +2179,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             queryKey: queryKeys.issues.comments(issueId),
           }),
           queryClient.invalidateQueries({
-            queryKey: queryKeys.issues.activity(issueId),
+            queryKey: queryKeys.issues.activity(issueQueryRef),
           }),
         ]);
         storeQueuedCommentQueue(nextQueue);
@@ -2183,6 +2201,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       effectiveQueuedCommentQueue?.queueId,
       effectiveQueuedCommentQueue?.targetRunId,
       issueId,
+      issueQueryRef,
       queryClient,
       refreshQueueAfterConflict,
       storeQueuedCommentQueue,
@@ -2317,12 +2336,21 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             key={conversationMode ? draftKey : issueId}
             {...(!classicTaskInterfaceEnabled ? { creationActivity: resolvedActivity } : {})}
             onOpenSkill={onOpenSkill}
+            browsers={browsers}
+            onOpenBrowser={onOpenBrowser}
+            hasOlderComments={hasOlderComments}
             initialHistoryPending={!!issueId && (
               initialHistoryPending ||
               commentsInitialLoading ||
-              activityPending ||
-              linkedRunsPending ||
-              !runtimeSelectionKnown)
+              // Saved replies and the description can render while supporting
+              // history loads. Only an otherwise empty thread needs that data
+              // before deciding whether it has anything to show.
+              ((classicTaskInterfaceEnabled || (commentsForThread.length === 0 && !issueBrief?.description)) && (
+                initialMetadataPending ||
+                activityPending ||
+                linkedRunsPending ||
+                !runtimeSelectionKnown
+              )))
             }
             initialHistoryError={
               initialHistoryError ||
@@ -2408,6 +2436,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
             enableReassign={!conversationMode}
             reassignOptions={reassignOptions}
             currentAssigneeValue={currentAssigneeValue}
+            assigneeAdapterOverrides={assigneeAdapterOverrides}
             suggestedAssigneeValue={suggestedAssigneeValue}
             mentions={mentions}
             composerPause={composerPause}
@@ -2899,6 +2928,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     requestId: number;
     handled?: boolean;
   } | null>(null);
+  const [openAttachment, setOpenAttachment] = useState<{ issueId: string; id: string; title: string; requestId: number } | null>(null);
   const [openSkill, setOpenSkill] = useState<{ id: string; name: string } | null>(null);
   const handleSkillOpened = useCallback((skillId: string) => {
     setOpenSkill((current) => current?.id === skillId ? null : current);
@@ -2989,6 +3019,9 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     }),
     enabled: !!issueId,
   });
+  useEffect(() => {
+    if (issueId) void prefetchIssueThread(queryClient, issueId);
+  }, [issueId, queryClient]);
   const issue = queriedIssue ?? conversation?.issue ?? draftIssue;
   const resolveWritableIssueId = async () => {
     if (!conversation) return issueId!;
@@ -3081,12 +3114,12 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   }, [issue?.id]);
 
   useEffect(() => {
-    if (!issue || commentsLoading) return;
+    if (!classicTaskInterfaceEnabled || !issue || commentsLoading) return;
     scheduleIssueDetailPaintMeasure(
       ISSUE_DETAIL_CONTENT_PAINT_MARK,
       ISSUE_DETAIL_CONTENT_MEASURE,
     );
-  }, [commentsLoading, issue?.id]);
+  }, [classicTaskInterfaceEnabled, commentsLoading, issue?.id]);
   const linkedCommentId = location.hash.startsWith("#comment-")
     ? location.hash.slice("#comment-".length)
     : null;
@@ -3383,8 +3416,6 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     enabled: !!issueId,
     retry: false,
   });
-  const keyboardShortcutsEnabled =
-    instanceGeneralSettings?.keyboardShortcuts === true;
   // Experimental Cases: linkify `PAP-C7` chips in this issue's comment bodies.
   const casesChipsEnabled = instanceExperimentalSettings?.enableCases === true;
   const feedbackDataSharingPreference =
@@ -3597,6 +3628,21 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     }
     setPanelVisible(true);
   }, [issue?.id, setPanelVisible, suppressPanelUntilPlan]);
+  const handleAttachmentOpened = useCallback(() => setOpenAttachment(null), []);
+  const handleOpenTextAttachment = useCallback((id: string, title: string) => {
+    if (!issue?.id) return;
+    setOpenAttachment({ issueId: issue.id, id, title, requestId: Date.now() });
+    openTaskSidePanel();
+    if (isMobile) setMobilePropsOpen(true);
+  }, [issue?.id, openTaskSidePanel, isMobile]);
+  const browserQuery = useTaskBrowsers(issue?.id);
+  const { openBrowserId, openBrowser: setOpenBrowserId, acknowledgeBrowserOpened: handleBrowserOpened } =
+    useBrowserArrivals(currentUserId ?? "anonymous", issue?.id, browserQuery.data);
+  useEffect(() => {
+    if (!openBrowserId) return;
+    openTaskSidePanel();
+    if (isMobile) setMobilePropsOpen(true);
+  }, [openBrowserId, openTaskSidePanel, isMobile]);
   const handleOpenSkill = useCallback((skillId: string, name: string) => {
     const next = openSkillPanelState(
       { panelBeforePlanOverrideIssueId },
@@ -3607,16 +3653,13 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     setPanelVisible(true);
     if (isMobile) setMobilePropsOpen(true);
   }, [isMobile, issue?.id, panelBeforePlanOverrideIssueId, setPanelVisible, suppressPanelUntilPlan]);
-  const revealNewArtifact = useCallback(() => {
+  const registerArtifactTab = useCallback(() => {
     if (!issue?.id) return;
-    setDocumentDeepLink(null);
     setArtifactsOpenRequest((previous) => ({
       issueId: issue.id,
       requestId: (previous?.requestId ?? 0) + 1,
     }));
-    if (isMobile) setMobilePropsOpen(true);
-    else openTaskSidePanel();
-  }, [issue?.id, isMobile, openTaskSidePanel]);
+  }, [issue?.id]);
   const handleArtifactsOpened = useCallback((requestId: number) => {
     setArtifactsOpenRequest((request) => request?.requestId === requestId
       ? { ...request, handled: true } : request);
@@ -3626,7 +3669,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     attachments,
     workProducts,
     documents: issue?.documentSummaries,
-    onArrival: revealNewArtifact,
+    onArrival: registerArtifactTab,
   });
   const toggleTaskSidePanel = useCallback(() => {
     if (!panelVisible || suppressPanelUntilPlan) {
@@ -4101,6 +4144,39 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         queryClient.invalidateQueries({
           queryKey: queryKeys.issues.list(selectedCompanyId),
         });
+      }
+    },
+  });
+  // The inline notice owns feedback; do not also emit a global error toast.
+  const retryDispositionRecovery = useMutation({
+    mutationFn: async (actionId: string) => {
+      const result = await issuesApi.resolveRecoveryAction(issueId!, {
+        actionId,
+        outcome: "restored",
+        sourceIssueStatus: "todo",
+      });
+      if (
+        result.issue.status !== "todo" ||
+        result.issue.assigneeAgentId !== result.recoveryAction.returnOwnerAgentId
+      ) {
+        throw new Error("The task’s state has changed. Refresh to see its current state.");
+      }
+      return result;
+    },
+    onSuccess: ({ issue: nextIssue }) => {
+      const issueRefs = new Set<string>([issueId!, nextIssue.id]);
+      if (nextIssue.identifier) issueRefs.add(nextIssue.identifier);
+      mergeIssueResponseIntoCaches(issueRefs, nextIssue);
+      invalidateIssueCollections();
+    },
+    onSettled: () => {
+      for (const queryKey of [
+        queryKeys.issues.detail(issueId!),
+        queryKeys.issues.activity(issueId!),
+        queryKeys.issues.runs(issueId!),
+        queryKeys.issues.liveRuns(issueId!),
+      ]) {
+        void queryClient.invalidateQueries({ queryKey });
       }
     },
   });
@@ -4841,20 +4917,34 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       reassignment,
       attachmentIds,
       clientRequestId,
+      runSettings,
     }: {
       body: string;
       reopen?: boolean;
       interrupt?: boolean;
-      reassignment: CommentReassignment;
+      reassignment?: CommentReassignment;
       attachmentIds?: string[];
       clientRequestId?: string;
+      runSettings?: ComposerRunSettings;
     }) =>
       issuesApi.update(issueId!, {
         comment: body,
         commentClientRequestId: clientRequestId,
         ...(attachmentIds?.length ? { attachmentIds } : {}),
-        assigneeAgentId: reassignment.assigneeAgentId,
-        assigneeUserId: reassignment.assigneeUserId,
+        ...(reassignment ? {
+          assigneeAgentId: reassignment.assigneeAgentId,
+          assigneeUserId: reassignment.assigneeUserId,
+        } : {}),
+        ...(runSettings || reassignment ? {
+          assigneeAdapterOverrides: runSettings
+            ? mergeComposerRunSettings(
+                issue?.assigneeAdapterOverrides,
+                agentMap.get(reassignment?.assigneeAgentId ?? issue?.assigneeAgentId ?? "")?.adapterType,
+                runSettings,
+                Boolean(reassignment),
+              )
+            : null,
+        } : {}),
         ...(reopen ? { status: "todo" } : {}),
         ...(interrupt ? { interrupt } : {}),
       }),
@@ -5627,6 +5717,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       checkingMonitorNow: checkIssueMonitorNow.isPending,
       documentDeepLink:
         documentDeepLink?.issueId === panelIssue.id ? documentDeepLink : null,
+      onAttachmentOpened: handleAttachmentOpened,
+      openAttachment: !isMobile && openAttachment?.issueId === panelIssue.id ? openAttachment : null,
       openSkillId: openSkill?.id ?? null,
       openSkillName: openSkill?.name ?? null,
       onSkillOpened: handleSkillOpened,
@@ -5635,6 +5727,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       openPanel(
         <IssueGalleryContext.Provider value={openIssueGallery}>
           <TaskSidePanel
+            openBrowserId={openBrowserId}
+            onBrowserOpened={handleBrowserOpened}
             key={panelIssue.id}
             {...sharedProps}
             accountScope={currentUserId ?? "anonymous"}
@@ -5658,12 +5752,16 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     }
     return () => closePanel();
   }, [
+    openBrowserId,
+    handleBrowserOpened,
     closePanel,
     openIssueGallery,
     handleIssuePropertiesUpdate,
     issuePanelKey,
     openNewSubIssue,
     openPanel,
+    openAttachment,
+    handleAttachmentOpened,
     openSkill,
     handleSkillOpened,
     panelChildIssues,
@@ -5691,8 +5789,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
 
   const goToInboxShortcutArmedRef = useRef(false);
   const goToInboxShortcutTimeoutRef = useRef<number | null>(null);
-  const canQuickArchiveFromInbox =
-    keyboardShortcutsEnabled && !issue?.hiddenAt;
+  const canQuickArchiveFromInbox = !issue?.hiddenAt;
 
   useEffect(() => {
     if (!issue?.id || !canQuickArchiveFromInbox) return;
@@ -5723,15 +5820,6 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   }, [archiveFromInbox, canQuickArchiveFromInbox, issue?.id]);
 
   useEffect(() => {
-    if (!keyboardShortcutsEnabled) {
-      goToInboxShortcutArmedRef.current = false;
-      if (goToInboxShortcutTimeoutRef.current !== null) {
-        window.clearTimeout(goToInboxShortcutTimeoutRef.current);
-        goToInboxShortcutTimeoutRef.current = null;
-      }
-      return;
-    }
-
     const clearArmTimeout = () => {
       if (goToInboxShortcutTimeoutRef.current !== null) {
         window.clearTimeout(goToInboxShortcutTimeoutRef.current);
@@ -5820,7 +5908,6 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     };
   }, [
     fileViewerEnabled,
-    keyboardShortcutsEnabled,
     navigate,
     sourceBreadcrumb.href,
   ]);
@@ -6200,14 +6287,16 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       reassignment?: CommentReassignment,
       attachmentIds?: string[],
       clientRequestId?: string,
+      runSettings?: ComposerRunSettings,
     ) => {
-      if (reassignment) {
+      if (reassignment || runSettings) {
         await addCommentAndReassign.mutateAsync({
           body,
           reopen,
           reassignment,
           attachmentIds,
           clientRequestId,
+          runSettings,
         });
         return;
       }
@@ -7364,7 +7453,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
 
   return (
     <FileViewerProvider issueId={conversation && !conversation.issue ? "" : issue.id} enabled={fileViewerEnabled}>
-      <IssueGalleryContext.Provider value={openIssueGallery}>
+      <TextAttachmentContext.Provider value={taskChatShellEnabled ? handleOpenTextAttachment : null}><IssueGalleryContext.Provider value={openIssueGallery}>
         <div
           data-task-chat-shell={taskChatShellEnabled ? "" : undefined}
           className={
@@ -7696,12 +7785,32 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   : undefined
               }
             >
+              <WorkspaceExportRecovery key={issue.activeRecoveryAction?.id ?? issue.id} issueId={issue.id}
+                action={issue.activeRecoveryAction ?? null} canManage={canManageBoardRuntime} onQueued={invalidateIssueDetail} />
               {issue.executionBlocker && (
                 <ExecutionBlockerNotice companyId={issue.companyId} issueId={issue.id} blocker={issue.executionBlocker} onRetried={invalidateIssueDetail} />
               )}
               {resolvedDetailTab === "chat" ? (
+                <DispositionRecoveryProvider value={{
+                  issue,
+                  agentMap,
+                  hasPendingInteraction: interactions.some((interaction) => interaction.status === "pending"),
+                  unavailableReason: boardAccess && !canResolveBoardRecoveryAction
+                    ? "You don’t have permission to retry this recovery action."
+                    : treeControlStateError
+                    ? "Couldn’t check whether this task is paused. Refresh to try again."
+                    : activePauseHold
+                      ? "The task is paused. Resume it before retrying."
+                      : issue.project?.pausedAt
+                        ? "The project is paused. Resume it before retrying."
+                        : null,
+                  onRetry: (actionId) => retryDispositionRecovery.mutateAsync(actionId).then(() => undefined),
+                }}>
                 <IssueDetailChatTab
+                  queryIssueId={issueId ?? issue.id}
                   onOpenSkill={handleOpenSkill}
+                  browsers={browserQuery.data}
+                  onOpenBrowser={(id) => { setOpenBrowserId(id); if (isMobile) setMobilePropsOpen(true); else openTaskSidePanel(); }}
                   threadHeader={<>{taskChatThreadHeader}{instanceExperimentalSettings?.enableChatConnectors && <EmailTaskActivity key={issue.id} companyId={issue.companyId} issueId={issue.id} />}</>}
                   issueBrief={
                     // Suppress the seeded-description bubble for the onboarding first
@@ -7743,6 +7852,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   projectId={issue.projectId ?? null}
                   issueStatus={issue.status}
                   issueAssigneeAgentId={issue.assigneeAgentId}
+                  assigneeAdapterOverrides={issue.assigneeAdapterOverrides}
                   issueWorkMode={issue.workMode ?? "standard"}
                   executionRunId={issue.executionRunId ?? null}
                   blockedBy={issue.blockedBy ?? []}
@@ -7778,8 +7888,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   legacyRecoverySourceIssue={legacyRecoverySourceIssue}
                   comments={threadComments}
                   commentsInitialLoading={commentsLoading}
-                  initialHistoryPending={
-                    linkedCommentPending ||
+                  initialHistoryPending={linkedCommentPending}
+                  initialMetadataPending={
                     interactionsLoading ||
                     attachmentsLoading ||
                     workProductsLoading
@@ -7949,6 +8059,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   }
                   linkCaseReferences={casesChipsEnabled}
                 />
+                </DispositionRecoveryProvider>
               ) : null}
             </TabsContent>
 
@@ -8092,6 +8203,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     <SheetTitle>Task side panel</SheetTitle>
                   </SheetHeader>
                   <TaskSidePanel
+                    openBrowserId={openBrowserId}
+                    onBrowserOpened={handleBrowserOpened}
                     key={`${issue.id}:mobile`}
                     issue={issue}
                     accountScope={currentUserId ?? "anonymous"}
@@ -8134,6 +8247,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     artifactsOpenRequestId={isMobile && !artifactsOpenRequest?.handled && artifactsOpenRequest?.issueId === issue.id
                       ? artifactsOpenRequest.requestId : undefined}
                     onArtifactsOpened={handleArtifactsOpened}
+                    onAttachmentOpened={handleAttachmentOpened}
+                    openAttachment={openAttachment?.issueId === issue.id ? openAttachment : null}
                     openSkillId={openSkill?.id ?? null}
                     openSkillName={openSkill?.name ?? null}
                     onSkillOpened={handleSkillOpened}
@@ -8213,7 +8328,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           ) : null}
           <ScrollToBottom />
         </div>
-      </IssueGalleryContext.Provider>
+      </IssueGalleryContext.Provider></TextAttachmentContext.Provider>
     </FileViewerProvider>
   );
 }
