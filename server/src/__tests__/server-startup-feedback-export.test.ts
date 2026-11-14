@@ -44,7 +44,10 @@ const {
   const completionSweepMock = vi.fn(async () => undefined);
   const createAppMock = vi.fn(async () => Object.assign((_: unknown, __: unknown) => {}, {
     locals: {
-      toolGateway: { sweepActionReviews: vi.fn(async () => ({ scanned: 0 })) },
+      toolGateway: {
+        sweepActionReviews: vi.fn(async () => ({ scanned: 0 })),
+        cleanupExpiredSessions: vi.fn(async () => ({ deletedCount: 0 })),
+      },
       toolActionDeliveries: { sweepPending: vi.fn(async () => ({ scanned: 0, delivered: 0 })) },
     },
   }) as never);
@@ -894,12 +897,15 @@ describe("startServer feedback export wiring", () => {
             .catch(() => { response.writeHead(503); response.end("database closed"); });
         },
         { locals: {
-          toolGateway: { sweepActionReviews: vi.fn(async () => ({ scanned: 0 })) },
+          toolGateway: {
+            sweepActionReviews: vi.fn(async () => ({ scanned: 0 })),
+            cleanupExpiredSessions: vi.fn(async () => ({ deletedCount: 0 })),
+          },
           toolActionDeliveries: { sweepPending: vi.fn(async () => ({ scanned: 0, delivered: 0 })) },
         } },
       ) as never);
-      vi.mocked(createServer).mockImplementationOnce((app) => {
-        listener = realCreateServer(app);
+      vi.mocked(createServer).mockImplementationOnce((options, app) => {
+        listener = realCreateServer(options as never, app as never);
         return listener;
       });
       vi.mocked(bootstrapExecutionPolicyFromEnv).mockImplementationOnce(async () => {

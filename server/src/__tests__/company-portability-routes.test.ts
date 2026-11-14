@@ -333,7 +333,7 @@ const importMeta = {
   collisionStrategy: importRequest.collisionStrategy,
 };
 
-describe.sequential("company portability routes", () => {
+describe("company portability routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockAgentService.getById.mockImplementation(async (id: string) => ({

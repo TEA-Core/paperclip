@@ -5,6 +5,11 @@ import { trustAuthorizationPolicySchema } from "./trust-policy.js";
 import { issueExecutionPolicySchema } from "./issue.js";
 import { objectWithoutDefaults } from "./partial.js";
 
+export const projectDiscoverySchema = z.object({
+  limit: z.number().int().min(1).max(50).default(50),
+  cursor: z.string().uuid().transform(value => value.toLowerCase()).optional(),
+}).strict();
+
 const executionWorkspaceStrategySchema = z
   .object({
     type: z.enum(["project_primary", "git_worktree", "adapter_managed", "cloud_sandbox"]).optional(),

@@ -328,7 +328,7 @@ describeEmbeddedPostgres("activity service", () => {
     ]);
   });
 
-  it("returns compact usage and result summaries for issue runs", async () => {
+  it.each([null, "native_provider_model_rejected", "adapter_failed"])("returns compact issue runs with bounded model rejection details: %s", async (errorCode) => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -358,7 +358,9 @@ describeEmbeddedPostgres("activity service", () => {
       companyId,
       agentId,
       invocationSource: "assignment",
-      status: "succeeded",
+      status: errorCode ? "failed" : "succeeded",
+      errorCode,
+      error: "provider-error".repeat(200),
       contextSnapshot: { issueId },
       usageJson: {
         inputTokens: 11,
@@ -393,6 +395,7 @@ describeEmbeddedPostgres("activity service", () => {
       agentId,
       invocationSource: "assignment",
       contextIssueId: issueId,
+      error: errorCode === "native_provider_model_rejected" ? "provider-error".repeat(200).slice(0, 2000) : null,
     });
     expect(runs[0]?.usageJson).toEqual({
       inputTokens: 11,

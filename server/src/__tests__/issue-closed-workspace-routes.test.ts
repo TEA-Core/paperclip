@@ -213,7 +213,7 @@ async function assertNoBackgroundClearWithinRetryWindow() {
   expect(mockExecutionWorkspaceService.clearReopenPendingConsumptionForUnconsumedReopen).not.toHaveBeenCalled();
 }
 
-describe.sequential("closed isolated workspace issue routes", () => {
+describe("closed isolated workspace issue routes", () => {
   const routeModules = hoistModuleGraph(registerServiceMocks, async () => {
     const { issueRoutes } = await vi.importActual<typeof import("../routes/issues.js")>(
       "../routes/issues.js",

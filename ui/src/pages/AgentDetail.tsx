@@ -1,3 +1,5 @@
+import { AiConnectionPoolRunDetails } from "@/components/ai-connections/AiConnectionPoolRunDetails";
+import { AgentConnectionInstructions } from "@/features/connections/ConnectionInstructions";
 import type { AgentInstructionCandidate, AgentInstructionsBundle } from "@paperclipai/shared";
 import { InstructionHistory } from "../components/InstructionHistory";
 import { AgentCharacter } from "../components/AgentCharacter";
@@ -63,7 +65,8 @@ import { buildSameOriginWebSocketUrl } from "../lib/websocket-url";
 import { tryCreateWebSocket } from "../lib/websocket";
 import { formatDate, relativeTime, formatTokens, visibleRunCostUsd } from "../lib/utils";
 import { cn } from "../lib/utils";
-import { describeRunRetryState, isResumableLostRun } from "../lib/runRetryState";
+import { isResumableLostRun } from "../lib/runRetryState";
+import { RunRetryDetails } from "../components/RunRetryDetails";
 import { Button } from "@/components/ui/button";
 import { Tabs } from "@/components/ui/tabs";
 import { PageTabBar } from "../components/PageTabBar";
@@ -96,7 +99,6 @@ import { Input } from "@/components/ui/input";
 import { RunTranscriptView, type TranscriptMode } from "../components/transcript/RunTranscriptView";
 import { AgentToolsTab } from "./AgentToolsTab";
 import { AgentChannelsPanel } from "../components/chat/AgentChannelsPanel";
-import { useChatConnectorsEnabled } from "@/hooks/useChatConnectorsEnabled";
 import {
   appendCapped,
   LIVE_TRANSCRIPT_RENDER_LIMIT,
@@ -772,11 +774,10 @@ export function AgentDetail() {
   const { setBreadcrumbs } = useBreadcrumbs();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
-  const { enabled: chatConnectorsEnabled, loaded: chatConnectorsLoaded } = useChatConnectorsEnabled();
   const [actionError, setActionError] = useState<string | null>(null);
   const [dismissedLeftAgentIds, setDismissedLeftAgentIds] = useState<Set<string>>(() => new Set());
   const activeView: AgentDetailView = urlRunId ? "run-detail"
-    : urlTab === "channels" && !chatConnectorsEnabled ? "overview" : parseAgentDetailView(urlTab ?? null);
+    : parseAgentDetailView(urlTab ?? null);
   const legacyAuditSection = !urlRunId ? agentLegacyAuditSection(urlTab ?? null) : null;
   const legacyView = urlRunId
     ? "runs"
@@ -992,13 +993,6 @@ export function AgentDetail() {
 
   useEffect(() => {
     if (!agent) return;
-    if (!urlRunId && urlTab === "channels") {
-      if (!chatConnectorsLoaded) return;
-      if (!chatConnectorsEnabled) {
-        navigate(agentDetailHref(canonicalAgentRef, "overview"), { replace: true });
-        return;
-      }
-    }
     if (urlRunId) {
       if (routeAgentRef !== canonicalAgentRef) {
         navigate(`/agents/${canonicalAgentRef}/runs/${urlRunId}`, { replace: true });
@@ -1011,7 +1005,7 @@ export function AgentDetail() {
       navigate(agentDetailHref(canonicalAgentRef, canonicalTab), { replace: true });
       return;
     }
-  }, [agent, routeAgentRef, canonicalAgentRef, urlRunId, urlTab, activeView, legacyAuditSection, navigate, chatConnectorsEnabled, chatConnectorsLoaded]);
+  }, [agent, routeAgentRef, canonicalAgentRef, urlRunId, urlTab, activeView, legacyAuditSection, navigate]);
 
   useEffect(() => {
     if (!agent?.companyId || agent.companyId === selectedCompanyId) return;
@@ -1445,7 +1439,7 @@ export function AgentDetail() {
       )}
 
       {activeView === "instructions" && (
-        <PromptsTab
+        <div><PromptsTab
           agent={agent}
           companyId={resolvedCompanyId ?? undefined}
           showSaveNotice={false}
@@ -1454,6 +1448,8 @@ export function AgentDetail() {
           onCancelActionChange={setCancelConfigAction}
           onSavingChange={setConfigSaving}
         />
+        {resolvedCompanyId && <AgentConnectionInstructions companyId={resolvedCompanyId} agentId={agent.id} />}
+        </div>
       )}
 
       {activeView === "runtime" && (
@@ -3626,7 +3622,6 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
   const sessionChanged = run.sessionIdBefore && run.sessionIdAfter && run.sessionIdBefore !== run.sessionIdAfter;
   const sessionId = run.sessionIdAfter || run.sessionIdBefore;
   const hasNonZeroExit = run.exitCode !== null && run.exitCode !== 0;
-  const retryState = describeRunRetryState(run);
 
   return (
     <div className="space-y-4 min-w-0">
@@ -3634,6 +3629,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
           git workspace it could not validate, wired to the same reconcile / repair / re-issue /
           break-glass handlers as the task detail page. */}
       <RunWorkspaceRecoverySurface run={run} />
+      <AiConnectionPoolRunDetails context={run.contextSnapshot} />
       {/* Run summary card */}
       <div className="border border-border rounded-lg overflow-hidden">
         <div className="flex flex-col sm:flex-row">
@@ -3856,30 +3852,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 {run.signal && <span className="text-muted-foreground ml-1">(signal: {run.signal})</span>}
               </div>
             )}
-            {retryState && (
-              <div className="rounded-md border border-border/70 bg-accent/20 px-3 py-2 text-xs leading-5">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span
-                    className={cn(
-                      "rounded-md border px-1.5 py-0.5 text-(length:--text-micro) font-medium",
-                      retryState.tone,
-                    )}
-                  >
-                    {retryState.badgeLabel}
-                  </span>
-                  {retryState.retryOfRunId ? (
-                    <Link
-                      to={`/agents/${agentRouteId}/runs/${retryState.retryOfRunId}`}
-                      className="font-mono text-foreground hover:underline"
-                    >
-                      {retryState.retryOfRunId.slice(0, 8)}
-                    </Link>
-                  ) : null}
-                </div>
-                {retryState.detail ? <p className="mt-2 text-muted-foreground">{retryState.detail}</p> : null}
-                {retryState.secondary ? <p className="text-muted-foreground">{retryState.secondary}</p> : null}
-              </div>
-            )}
+            <RunRetryDetails run={run} agentRouteId={agentRouteId} />
           </div>
 
           {/* Right column: metrics */}
