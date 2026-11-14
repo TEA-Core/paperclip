@@ -2991,6 +2991,8 @@ async function findSuppressibleDuplicateCloseComment(
   return latestAgentComment.body === normalizedIncoming ? { id: latestAgentComment.id } : null;
 }
 
+export const BOARD_STAGE_OVERRIDE_ECHO_WINDOW_SECONDS = 60;
+
 /**
  * SUP-24193: a board force-close arrives as two requests — the stage decision
  * (`POST /issues/:id/execution-stage/board-decision`, whose `comment` is required) and the
@@ -3014,8 +3016,6 @@ async function findSuppressibleDuplicateCloseComment(
  *   4. the closing note — trimmed and redacted exactly as `addComment` stores it — is
  *      byte-identical to it.
  */
-export const BOARD_STAGE_OVERRIDE_ECHO_WINDOW_SECONDS = 60;
-
 export async function findBoardStageOverrideEchoComment(
   db: Db,
   input: {
