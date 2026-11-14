@@ -584,6 +584,13 @@ export interface WorkspaceDiscoveryFailure {
 export interface WorkspaceDiscoveryResult {
   matched: WorkspacePullRequestMatch[];
   terminalFailure: WorkspaceDiscoveryFailure | null;
+  /**
+   * SUP-24033: lower-cased `owner/repo` of every repo whose open-PR list was
+   * read successfully. A cached draft mention whose repo is absent here was never
+   * live-checked by this discovery (drafts do not contribute repo pairs), so its
+   * draft bit cannot be called stale.
+   */
+  scannedRepos: string[];
 }
 
 /**
@@ -706,6 +713,7 @@ async function discoverCardPullRequestByWorkspace(
       : null;
   const deliveryBranchIsOwn = deliveryOwnership.branchIsOwn;
   const matched: WorkspacePullRequestMatch[] = [];
+  const scannedRepos: string[] = [];
   let terminalFailure: WorkspaceDiscoveryFailure | null = null;
 
   for (const pair of pairs) {
@@ -770,6 +778,7 @@ async function discoverCardPullRequestByWorkspace(
         break;
       }
 
+      scannedRepos.push(`${pair.owner}/${pair.repo}`.toLowerCase());
       for (const item of listResult.items) {
         if (!includeDrafts && item.draft === true) continue;
         const headRef = (item.headRef ?? "").toLowerCase();
@@ -800,7 +809,7 @@ async function discoverCardPullRequestByWorkspace(
     if (terminalFailure) break;
   }
 
-  return { matched, terminalFailure };
+  return { matched, terminalFailure, scannedRepos };
 }
 
 /**
@@ -3407,7 +3416,8 @@ export type DecisionHeadResolution =
       pendingCandidates?: Array<ApprovalCandidateAnchor | NoPrBranchAnchor>;
       /**
        * SUP-24033: set only on a `head_draft` refusal whose draft names ALL come
-       * from cached mentions (live workspace discovery found no draft). Those
+       * from cached mentions, live workspace discovery found no draft, AND that
+       * discovery actually listed every cached draft's repo. Those
        * cached draft bits can be stale, so the final-delivery preflight alone
        * revalidates them live. Never set when a live-discovered draft exists:
        * a merged mention must not mask a draft the forge just reported.
@@ -3637,7 +3647,8 @@ export async function resolveApprovalDecisionHead(
     return {
       kind: "unresolvable",
       reason: `head_draft: ${draftNames.join(", ")} ${verb}; a draft head cannot be armed (GitHub refuses auto-merge on a draft) — promote it out of draft, then republish`,
-      ...(draftMatched.length === 0
+      ...(draftMatched.length === 0 &&
+        draftLinkedPRs.every((pr) => discovery.scannedRepos.includes(`${pr.owner}/${pr.repo}`.toLowerCase()))
         ? {
             cachedDraftMentions: draftLinkedPRs.map((pr) => ({
               owner: pr.owner,
