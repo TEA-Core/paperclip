@@ -19881,6 +19881,15 @@ export function issueRoutes(
           normalizedAssigneeAgentId === actor.agentId &&
           normalizedAssigneeAgentId === existing.assigneeAgentId
         )),
+      cancellation: {
+        requestedStatus: updateFields.status,
+        // updateFields carries the request's assignee keys plus any assignee
+        // the workflow transition adds.
+        assigneeFieldWritten:
+          updateFields.assigneeAgentId !== undefined ||
+          updateFields.assigneeUserId !== undefined,
+        currentAssigneeUserId: existing.assigneeUserId,
+      },
       refusalContext:
         req.actor.type === "board"
           ? undefined

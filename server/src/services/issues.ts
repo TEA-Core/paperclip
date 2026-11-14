@@ -12423,6 +12423,13 @@ export function issueService(db: Db) {
             currentAssigneeAgentId: receiptExisting.assigneeAgentId,
             checkReviewStage: false,
             workflowControlledAssignment,
+            cancellation: {
+              requestedStatus: issueData.status,
+              assigneeFieldWritten:
+                issueData.assigneeAgentId !== undefined ||
+                issueData.assigneeUserId !== undefined,
+              currentAssigneeUserId: receiptExisting.assigneeUserId,
+            },
           });
         }
         if (
