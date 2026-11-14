@@ -6580,30 +6580,35 @@ describe("evaluateDoneTierDeclaration", () => {
       if (!verdict.allowed) return;
       expect(verdict.closeComment).toContain("Closed at Tier 2 (live): record-only probe");
       expect(ghFetchMock).not.toHaveBeenCalled();
-      expect(logActivity).toHaveBeenCalledWith(
+      // SUP-23925: the tier close row is RETURNED for the caller's close
+      // transaction, not written here — a caller whose close later refused or
+      // lost the race can never leave an orphan close row behind.
+      expect(verdict.closeRowAudits).toHaveLength(1);
+      expect(verdict.closeRowAudits[0]).toMatchObject({
+        action: "issue.done_transition_tier2_close",
+        entityType: "issue",
+        entityId: "issue-1",
+        details: {
+          identifier: "SUP-12345",
+          reason: expect.stringContaining("Tier 2 declaration found:"),
+          systemBackstopActor: "execution-control-reconciliation",
+          probeEvidence: RECORD_ONLY_EVIDENCE,
+          probeCommand: "curl -fsS https://ops.example.com/api/sweep/healthz",
+          probeTarget: "https://ops.example.com",
+          observed: "2026-11-04T09:15:00Z",
+          observedRangeEnd: null,
+          tierForm: "record-only",
+          probeHead: null,
+          mergeCommit: null,
+          // SUP-23490: the backstop door carries no run id, so the machine
+          // record says so instead of inventing a closing run.
+          closingRunId: null,
+          closingRunStartedAt: null,
+        },
+      });
+      expect(logActivity).not.toHaveBeenCalledWith(
         mockDb,
-        expect.objectContaining({
-          action: "issue.done_transition_tier2_close",
-          entityType: "issue",
-          entityId: "issue-1",
-          details: {
-            identifier: "SUP-12345",
-            reason: expect.stringContaining("Tier 2 declaration found:"),
-            systemBackstopActor: "execution-control-reconciliation",
-            probeEvidence: RECORD_ONLY_EVIDENCE,
-            probeCommand: "curl -fsS https://ops.example.com/api/sweep/healthz",
-            probeTarget: "https://ops.example.com",
-            observed: "2026-11-04T09:15:00Z",
-            observedRangeEnd: null,
-            tierForm: "record-only",
-            probeHead: null,
-            mergeCommit: null,
-            // SUP-23490: the backstop door carries no run id, so the machine
-            // record says so instead of inventing a closing run.
-            closingRunId: null,
-            closingRunStartedAt: null,
-          },
-        }),
+        expect.objectContaining({ action: "issue.done_transition_tier2_close" }),
       );
     });
   });

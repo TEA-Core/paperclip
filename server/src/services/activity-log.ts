@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
+import { PgTransaction } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agentApiKeys, companies, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, PLUGIN_EVENT_TYPES, type PluginEventType } from "@paperclipai/shared";
@@ -281,7 +282,7 @@ export async function logActivity(
   postCommitPublications?: ActivityPublication[],
 ) {
   try {
-    const { activity, publication } = await persistActivity(db, input);
+    const { activity, publication } = await persistBestEffortActivity(db, input);
     if (postCommitPublications) {
       postCommitPublications.push(publication);
     } else {
@@ -307,6 +308,11 @@ export async function logActivity(
   }
 }
 
+async function persistBestEffortActivity(db: Db, input: LogActivityInput) {
+  if (!(db instanceof PgTransaction)) return persistActivity(db, input);
+  return db.transaction(async (savepoint) => persistActivity(savepoint as unknown as Db, input));
+}
+
 /**
  * Transaction-scoped variant that propagates failures. Swallowing an error inside a
  * transaction is not an option: Postgres marks the transaction aborted, so every later
@@ -325,4 +331,45 @@ export async function logActivityInTransaction(
     publishActivity(publication);
   }
   return activity;
+}
+
+/**
+ * Transaction-scoped best-effort variant (SUP-23956). The audit row is written on the
+ * caller's transaction — it commits with the mutation — but the insert runs inside a
+ * savepoint, so a failing audit write rolls back only to the savepoint and cannot
+ * abort the transaction the way a bare best-effort `logActivity` call would. That is
+ * why the static guard in `activity-log-transaction-guard.test.ts` rejects a bare
+ * `logActivity` on a transaction handle: in-transaction callers that need best-effort
+ * semantics must use this entry point instead.
+ */
+export async function logActivityInTransactionBestEffort(
+  tx: Db,
+  input: LogActivityInput,
+  postCommitPublications?: ActivityPublication[],
+) {
+  try {
+    const { activity, publication } = await persistBestEffortActivity(tx, input);
+    if (postCommitPublications) {
+      postCommitPublications.push(publication);
+    } else {
+      publishActivity(publication);
+    }
+    return activity;
+  } catch (err) {
+    logger.error(
+      {
+        err,
+        companyId: input.companyId,
+        action: input.action,
+        entityType: input.entityType,
+        entityId: input.entityId,
+        issueId: input.issueId ?? null,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId ?? null,
+        runId: input.runId ?? null,
+      },
+      "activity log write failed; the audited mutation is unaffected",
+    );
+  }
 }

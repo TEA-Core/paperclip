@@ -3473,11 +3473,20 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
   structuredDoneTier?: DoneTierDeclaration | null;
   listComments?: (issueId: string) => Promise<IssueComment[]>;
 }): Promise<
-  | { allowed: true; closeComment: string | null; doneTierSkipAudit: null }
+  | {
+      allowed: true;
+      closeComment: string | null;
+      doneTierSkipAudit: null;
+      // SUP-23925: the tier close rows are returned, not written. The backstop
+      // caller persists them on the SAME transaction as its terminal write, so
+      // a refused or raced sweep close can never leave an orphan close row.
+      closeRowAudits: Array<Parameters<typeof logActivity>[1]>;
+    }
   | {
       allowed: true;
       closeComment: string | null;
       doneTierSkipAudit: Parameters<typeof logActivity>[1];
+      closeRowAudits: Array<Parameters<typeof logActivity>[1]>;
     }
   | {
       allowed: false;
@@ -3510,20 +3519,51 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
         reason: tierResult.reason,
       };
     }
+    // SUP-23925: the tier close rows are deferred to the caller's close
+    // transaction (they used to be fire-and-forget writes here, before and
+    // outside it, so a caller whose close later refused or lost the race left
+    // an orphan close row on a card that never wrote status→done).
+    const closeRowAudits: Array<Parameters<typeof logActivity>[1]> = [];
     if (tierResult.tier === "tier1") {
-      void writeAuditLog(db, issue, "issue.done_transition_tier1_close", {
-        reason: tierResult.reason,
-        systemBackstopActor: actorId,
+      closeRowAudits.push({
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "done-transition-guard",
+        agentId: null,
+        runId: null,
+        agentApiKeyId: null,
+        action: "issue.done_transition_tier1_close",
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          identifier: issue.identifier ?? null,
+          reason: tierResult.reason,
+          systemBackstopActor: actorId,
+        },
       });
     }
     if (tierResult.tier === "tier2" && tierResult.tier2Audit) {
-      void writeAuditLog(db, issue, "issue.done_transition_tier2_close", {
-        reason: tierResult.reason,
-        systemBackstopActor: actorId,
-        ...tierResult.tier2Audit,
+      closeRowAudits.push({
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "done-transition-guard",
+        agentId: null,
+        runId: null,
+        agentApiKeyId: null,
+        action: "issue.done_transition_tier2_close",
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          identifier: issue.identifier ?? null,
+          reason: tierResult.reason,
+          systemBackstopActor: actorId,
+          ...tierResult.tier2Audit,
+        },
       });
     }
-    return { allowed: true, closeComment: renderedComment, doneTierSkipAudit: null };
+    return { allowed: true, closeComment: renderedComment, doneTierSkipAudit: null, closeRowAudits };
   }
   return {
     allowed: true,
@@ -3546,6 +3586,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
         systemBackstopActor: actorId,
       },
     },
+    closeRowAudits: [],
   };
 }
 
