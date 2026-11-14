@@ -54,6 +54,11 @@ scope does not implicitly authorize new descendants, and a permitted parent does
 not grant access to an unrelated project. An explicit root-task scope includes
 its descendants. Self-assigned decomposition is not a delegation cycle.
 
+Fork constraint: an agent without `company_scope:read` cannot create a
+parentless (root) issue, even with `tasks:assign`; it gets 403 "Low-trust agents
+must create child issues inside their assigned boundary" and must create
+children of its assigned tasks instead.
+
 Permission denials must identify the rejected action and specific restriction.
 Agents must surface failed instruction-save receipts and explain when the current
 run lacks direct-chat authority or the user lacks editing permission. The user
