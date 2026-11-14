@@ -2991,6 +2991,65 @@ async function findSuppressibleDuplicateCloseComment(
   return latestAgentComment.body === normalizedIncoming ? { id: latestAgentComment.id } : null;
 }
 
+/**
+ * SUP-24193: a board force-close arrives as two requests — the stage decision
+ * (`POST /issues/:id/execution-stage/board-decision`, whose `comment` is required) and the
+ * closing `PATCH /issues/:id` — and the relay repeats the same note on both. Each request
+ * writes a comment, so the thread carried the note twice, byte-identical, ~91 ms apart.
+ * `findSuppressibleDuplicateCloseComment` cannot fire: the first close is never "already
+ * terminal", and it only reads agent-authored comments. That ruling stays untouched.
+ *
+ * Returns the stage-decision comment the closing note repeats when ALL hold, else null
+ * (the caller then appends, unchanged):
+ *   1. the newest non-system, non-deleted comment on the thread is the comment a
+ *      `issue.board_stage_override` activity row recorded (`details.commentId`) — a durable
+ *      link, not a time window, so any comment posted since keeps the close note visible;
+ *   2. that comment was authored by the same user as the closing request; and
+ *   3. the closing note — trimmed and redacted exactly as `addComment` stores it — is
+ *      byte-identical to it.
+ * The caller additionally requires that this PATCH is the one that closes the issue.
+ */
+async function findBoardStageOverrideEchoComment(
+  db: Db,
+  input: { issueId: string; actorUserId: string; commentBody: string },
+): Promise<{ id: string } | null> {
+  const { censorUsernameInLogs } = await instanceSettingsService(db).getGeneral();
+  const normalizedIncoming = redactIssueCommentBody(input.commentBody.trim(), {
+    enabled: censorUsernameInLogs,
+  });
+  const [latest] = await db
+    .select({
+      id: issueComments.id,
+      body: issueComments.body,
+      authorUserId: issueComments.authorUserId,
+    })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.issueId, input.issueId),
+        isNull(issueComments.deletedAt),
+        or(isNull(issueComments.authorType), not(eq(issueComments.authorType, "system"))),
+      ),
+    )
+    .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+    .limit(1);
+  if (!latest) return null;
+  if (latest.authorUserId !== input.actorUserId || latest.body !== normalizedIncoming) return null;
+  const [override] = await db
+    .select({ id: activityLog.id })
+    .from(activityLog)
+    .where(
+      and(
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, input.issueId),
+        eq(activityLog.action, "issue.board_stage_override"),
+        sql`${activityLog.details} ->> 'commentId' = ${latest.id}`,
+      ),
+    )
+    .limit(1);
+  return override ? { id: latest.id } : null;
+}
+
 function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   issueStatus: string | null | undefined;
   assigneeAgentId: string | null | undefined;
@@ -21274,14 +21333,28 @@ export function issueRoutes(
             // reopen/resume/move-to-todo guards keep implicit and explicit reopens
             // appending, exactly as the fallback path does.
             const duplicate =
-              isClosed &&
-              !effectiveMoveToTodoRequested &&
-              !reopenRequested &&
-              resumeRequested !== true &&
-              await findSuppressibleDuplicateCloseComment(
-                tx as unknown as Db,
-                updated.id,
-                commentBody,
+              (
+                isClosed &&
+                !effectiveMoveToTodoRequested &&
+                !reopenRequested &&
+                resumeRequested !== true &&
+                await findSuppressibleDuplicateCloseComment(
+                  tx as unknown as Db,
+                  updated.id,
+                  commentBody,
+                )
+              ) ||
+              // SUP-24193: this PATCH is the close, and the board stage decision
+              // that preceded it already wrote the same note.
+              (
+                !isClosed &&
+                isClosedIssueStatus(updated.status) &&
+                actor.actorType === "user" &&
+                await findBoardStageOverrideEchoComment(tx as unknown as Db, {
+                  issueId: updated.id,
+                  actorUserId: actor.actorId,
+                  commentBody,
+                })
               );
             if (duplicate) {
               commentDeduplicated = true;
@@ -22095,13 +22168,26 @@ export function issueRoutes(
     let lostReviewPathRef: string | null = null;
     const suppressibleDuplicateComment =
       !commentHandledInTransaction &&
-      isClosed &&
-      !effectiveMoveToTodoRequested &&
-      !reopenRequested &&
-      resumeRequested !== true &&
       commentBody &&
       !attachmentComment
-        ? await findSuppressibleDuplicateCloseComment(db, issue.id, commentBody)
+        ? (
+            isClosed &&
+            !effectiveMoveToTodoRequested &&
+            !reopenRequested &&
+            resumeRequested !== true &&
+            await findSuppressibleDuplicateCloseComment(db, issue.id, commentBody)
+          ) ||
+          (
+            !isClosed &&
+            isClosedIssueStatus(issue.status) &&
+            actor.actorType === "user" &&
+            await findBoardStageOverrideEchoComment(db, {
+              issueId: issue.id,
+              actorUserId: actor.actorId,
+              commentBody,
+            })
+          ) ||
+          null
         : null;
     if (commentBody && commentHandledInTransaction && comment) {
       // The created comment is assigned inside the `db.transaction` callback

@@ -552,6 +552,97 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
     expect(row!.status).toBe("done");
   });
 
+  describe("board force-close note lands once (SUP-24193)", () => {
+    const override = {
+      doneTransitionOverride: {
+        disposition: "upstream-equivalent-fix-no-deliverable-head",
+        reason: "Tier 1",
+      },
+    };
+    const note = "Closed as done: the work this card asks for has landed (PR merged).";
+
+    async function userComments(issueId: string) {
+      return db
+        .select()
+        .from(issueComments)
+        .where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "user")));
+    }
+
+    it("a stage decision and the closing PATCH carrying the same note write one comment", async () => {
+      const { companyId, issueId } = await seedIssue();
+      currentActor = boardActor(companyId);
+
+      const approved = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: note });
+      expect(approved.status, JSON.stringify(approved.body)).toBe(200);
+
+      const closed = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", ...override, comment: note });
+      expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+      expect(closed.body.commentDeduplicated).toBe(true);
+      expect(closed.body.deduplicatedFromCommentId).toBe(approved.body.commentId);
+      expect(closed.body.comment).toBeNull();
+
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(row!.status).toBe("done");
+      const rows = await userComments(issueId);
+      expect(rows.map((r) => r.body)).toEqual([note]);
+      expect(rows[0]!.id).toBe(approved.body.commentId);
+    });
+
+    it("a closing PATCH with a different note still appends beside the stage decision note", async () => {
+      const { companyId, issueId } = await seedIssue();
+      currentActor = boardActor(companyId);
+
+      const approved = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: note });
+      expect(approved.status, JSON.stringify(approved.body)).toBe(200);
+
+      const closed = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", ...override, comment: "Closed as done: a different, second close note." });
+      expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+      expect(closed.body.commentDeduplicated).toBe(false);
+      expect(closed.body.comment).not.toBeNull();
+
+      const rows = await userComments(issueId);
+      expect(rows.map((r) => r.body).sort()).toEqual(
+        [note, "Closed as done: a different, second close note."].sort(),
+      );
+    });
+
+    it("a comment posted between the stage decision and the close keeps the repeated note visible", async () => {
+      const { companyId, issueId } = await seedIssue();
+      currentActor = boardActor(companyId);
+
+      const approved = await request(app)
+        .post(`/api/issues/${issueId}/execution-stage/board-decision`)
+        .send({ decision: "approved", comment: note });
+      expect(approved.status, JSON.stringify(approved.body)).toBe(200);
+      // Seeded directly: the comments route wakes the return assignee, and the real
+      // heartbeat service would leave agent_runtime_state rows behind for cleanup.
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorUserId: USER_ID,
+        authorType: "user",
+        body: "an intervening board remark",
+      });
+
+      const closed = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", ...override, comment: note });
+      expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+      expect(closed.body.commentDeduplicated).toBe(false);
+
+      const rows = await userComments(issueId);
+      expect(rows.filter((r) => r.body === note)).toHaveLength(2);
+    });
+  });
+
   it("does not bypass the approval-status publish guard when the decision head is unresolvable", async () => {
     // No linked PR: the delivery identity cannot resolve, so the shared
     // post-decision hook must refuse to stamp publication. Existing
