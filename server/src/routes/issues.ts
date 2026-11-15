@@ -19361,6 +19361,24 @@ export function issueRoutes(
     }
     let interruptedRunId: string | null = null;
     let pendingReassignmentStopRunId: string | null = null;
+    // A pre-commit reassignment cancel is suppressed only because the update
+    // is expected to commit. If the update fails first, the card is unchanged
+    // and the participant must be re-woken through the unsuppressed release,
+    // exactly as the unsuppressed cancel did on the base.
+    let suppressedReassignmentCancelledRun: Awaited<ReturnType<typeof heartbeat.cancelRun>> | null = null;
+    const rewakeSuppressedReassignmentRun = async () => {
+      const run = suppressedReassignmentCancelledRun;
+      if (!run) return;
+      suppressedReassignmentCancelledRun = null;
+      try {
+        await heartbeat.releaseIssueExecutionAndPromote(run);
+      } catch (err) {
+        logger.warn(
+          { err, issueId: existing.id, runId: run.id },
+          "failed to re-wake participant after failed reassignment update",
+        );
+      }
+    };
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(existing);
     const isAgentWorkUpdate =
       req.actor.type === "agent" &&
@@ -20655,6 +20673,7 @@ export function issueRoutes(
             );
           }
           interruptedRunId = cancelled.id;
+          suppressedReassignmentCancelledRun = cancelled;
         } else {
           pendingReassignmentStopRunId = runToStopForReassignment.id;
         }
@@ -21499,6 +21518,7 @@ export function issueRoutes(
         issue = await updateIssue();
       }
     } catch (err) {
+      await rewakeSuppressedReassignmentRun();
       if (err instanceof HttpError && err.status === 422) {
         logger.warn(
           {
@@ -21599,6 +21619,7 @@ export function issueRoutes(
       throw err;
     }
     if (!issue) {
+      await rewakeSuppressedReassignmentRun();
       res.status(404).json({ error: "Issue not found" });
       return;
     }

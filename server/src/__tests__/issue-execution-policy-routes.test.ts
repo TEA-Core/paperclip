@@ -34,6 +34,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRun: vi.fn(async () => null as unknown),
   getActiveRunForAgent: vi.fn(async () => null as unknown),
   cancelRun: vi.fn(async () => null as unknown),
+  releaseIssueExecutionAndPromote: vi.fn(async () => undefined),
 }));
 const mockExecutionWorkspaceService = vi.hoisted(() => ({
   getById: vi.fn(async () => null as unknown),
@@ -4981,6 +4982,62 @@ describe("issue execution policy routes", () => {
           errorCode: "issue_reassigned",
           suppressImmediateRecovery: true,
         }),
+      );
+    });
+
+    // RA NO-GO on PR 1196: the pre-commit cancel is suppressed because the
+    // reassignment is expected to commit. When the update then fails before
+    // commit, the card is unchanged and the participant must be re-woken
+    // through the unsuppressed release, exactly as the base cancel did.
+    it("re-wakes the participant when the update fails after a suppressed pre-commit reassignment cancel", async () => {
+      const { stage1Id } = mockStageHandoff();
+      const issue = await mockIssueService.getById();
+      mockIssueService.getById.mockResolvedValue({
+        ...issue,
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [{
+            id: stage1Id,
+            type: "approval",
+            participants: [{ type: "agent", agentId: reviewerAgentId }],
+          }],
+        }),
+        executionState: {
+          ...issue.executionState,
+          currentStageType: "approval",
+          returnAssignee: { type: "agent", agentId: nextAgentId },
+        },
+      });
+      mockIssueService.update.mockRejectedValue(new Error("simulated update failure"));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId,
+      }))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "done",
+          assigneeAgentId: nextAgentId,
+          comment: "Final approval passed.",
+          doneTier: {
+            tier: "tier2",
+            probeEvidence: "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records",
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(500);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+        runId,
+        "Cancelled before issue reassignment",
+        expect.objectContaining({
+          errorCode: "issue_reassigned",
+          suppressImmediateRecovery: true,
+        }),
+      );
+      expect(mockHeartbeatService.releaseIssueExecutionAndPromote).toHaveBeenCalledTimes(1);
+      expect(mockHeartbeatService.releaseIssueExecutionAndPromote).toHaveBeenCalledWith(
+        expect.objectContaining({ id: runId, status: "cancelled" }),
       );
     });
 
