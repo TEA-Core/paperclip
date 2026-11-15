@@ -112,7 +112,10 @@ export const TERMINAL_CLEANUP_RETRY_BACKOFF_BASE_MS = 10 * 60 * 1000;
 // calls no cleanup, removal, release or return path.
 export const TERMINAL_CLEANUP_ESCALATED_ACTION = "execution_workspace.issue_terminal_cleanup_escalated";
 export const TERMINAL_CLEANUP_ESCALATION_MARKER = "[Terminal workspace cleanup escalation]";
-const TERMINAL_CLEANUP_ESCALATION_BATCH_LIMIT = 100;
+// One escalation pass handles at most this many stranded rows; the next sweep
+// continues. Rows that already have an escalation are excluded by the query, so
+// they never fill the batch and starve a newly stranded row.
+export const TERMINAL_CLEANUP_ESCALATION_BATCH_LIMIT = 100;
 const TERMINAL_CLEANUP_ACTOR_ID = "workspace_terminality_reaper";
 
 // The row's lifecycle generation as jsonb, read the same way as
