@@ -88,6 +88,20 @@ const WORKSPACE_BRANCH_INCOHERENCE_REASON = "git_worktree_branch_incoherence";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 export const ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON = "issue_terminal";
 const TERMINAL_CLEAN_NOTHING_UNIQUE_ARCHIVE_REASON = "terminal, clean, nothing unique";
+// A determinate refusal: the worktree no longer matches the delivery the sweep
+// verified. Only a change to the worktree or to the recorded workspace state can
+// clear it, so the sweep records it once and does not retry it.
+const TERMINAL_CLEANUP_WORKTREE_CHANGED_REFUSAL =
+  "Refusing terminal workspace cleanup because the git worktree changed after delivery was verified";
+const TERMINAL_CLEANUP_WORKTREE_CHANGED_REASON =
+  `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${TERMINAL_CLEANUP_WORKTREE_CHANGED_REFUSAL}`;
+
+function terminalCleanupFailedActivityDetails(sourceIssueId: string | null, failure: string) {
+  return failure === TERMINAL_CLEANUP_WORKTREE_CHANGED_REFUSAL
+    ? { sourceIssueId, failure, retrySuspended: true }
+    : { sourceIssueId, failure };
+}
+
 const SHARED_SESSION_RECORD_ARCHIVE_REASON = "shared session record";
 const WORKSPACE_REAPER_DRY_RUN_ENV = "PAPERCLIP_WORKSPACE_REAPER_DRY_RUN";
 const WORKSPACE_REAPER_RECLAIM_CLEAN_ENV = "PAPERCLIP_WORKSPACE_REAPER_RECLAIM_CLEAN_WORKTREES";
@@ -1944,7 +1958,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       || currentHeadSha !== expectedHeadSha
       || (workspace.branchName && currentBranchName !== workspace.branchName)
     ) {
-      throw new Error("Refusing terminal workspace cleanup because the git worktree changed after delivery was verified");
+      throw new Error(TERMINAL_CLEANUP_WORKTREE_CHANGED_REFUSAL);
     }
   }
 
@@ -3219,11 +3233,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         isNull(executionWorkspaces.closedAt),
         sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
       );
-      // Refusals are transient: a holder, lock, dirty file or remote can clear.
-      // Re-evaluate all terminal cleanup failures under the same safety gates.
+      // Retry terminal cleanup failures under the same safety gates: a holder,
+      // lock, unverified status or remote can clear. A determinate refusal does
+      // not clear by itself, so it is not retried. Any write that changes the
+      // recorded status or reason makes the row eligible again.
       const terminalCleanupRetryFilter = and(
         eq(executionWorkspaces.status, "cleanup_failed"),
         sql<boolean>`${executionWorkspaces.cleanupReason} LIKE 'issue_terminal | %'`,
+        ne(executionWorkspaces.cleanupReason, TERMINAL_CLEANUP_WORKTREE_CHANGED_REASON),
         sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
       );
       const baseCandidateFilter = or(openCandidateFilter, terminalCleanupRetryFilter);
@@ -3639,7 +3656,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               action: "execution_workspace.issue_terminal_cleanup_failed",
               entityType: "execution_workspace",
               entityId: workspace.id,
-              details: { sourceIssueId: workspace.sourceIssueId, failure },
+              details: terminalCleanupFailedActivityDetails(workspace.sourceIssueId, failure),
             });
           }
           continue;
@@ -3827,7 +3844,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             action: "execution_workspace.issue_terminal_cleanup_failed",
             entityType: "execution_workspace",
             entityId: archived.id,
-            details: { sourceIssueId: archived.sourceIssueId, failure },
+            details: terminalCleanupFailedActivityDetails(archived.sourceIssueId, failure),
           });
         }
       }

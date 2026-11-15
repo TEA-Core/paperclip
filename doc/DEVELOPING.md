@@ -1571,7 +1571,10 @@ Environment overrides:
   Opt-in removal briefly blocks issue/workspace writes; these locks do not fence
   arbitrary host file writes.
   Terminal `cleanup_failed` refusals are reconsidered on later sweep rotations
-  under the same gates. Services remain running while deletion is refused.
+  under the same gates, except a refusal because the git worktree changed after
+  delivery was verified: the sweep records it once and reconsiders it only after
+  the row's status or cleanup reason changes. Services remain running while
+  deletion is refused.
   Turning the flag off prevents further widened deletion; it cannot restore
   directories or runtime-owned branches already removed.
 - `PAPERCLIP_WORKSPACE_REAPER_DRY_RUN=1` (or `true`, `yes`) runs the reaper

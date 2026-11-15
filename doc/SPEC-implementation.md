@@ -1365,7 +1365,10 @@ The current app also exposes V1-supporting surfaces for:
   archived checkout is still on disk. A worktree directory that is already gone counts as removed:
   cleanup prunes the leftover git admin entry from the repo root and archives the workspace instead
   of leaving it in `cleanup_failed`. The sweep also retries terminal
-  `cleanup_failed` refusals under the same safety gates. Reopening the source issue
+  `cleanup_failed` refusals under the same safety gates, except the determinate refusal that the
+  git worktree changed after delivery was verified: the sweep records it once, with one
+  `execution_workspace.issue_terminal_cleanup_failed` row that carries `retrySuspended: true`, and
+  retries it only after the row's status or cleanup reason changes. Reopening the source issue
   records activity but does not restore that workspace.
   The default-off `PAPERCLIP_WORKSPACE_REAPER_RECLAIM_CLEAN_WORKTREES` flag widens
   deletion only to isolated, attached, clean no-PR Git worktrees inside the
