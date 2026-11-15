@@ -1199,6 +1199,30 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(await statusOf(issueId)).toBe("in_review");
   });
 
+  it("PATCH: record_only close whose Tier 2 evidence ends in the Tier 1 marker is refused with done_transition_tier_conflict, structured and comment forms (SUP-24299)", async () => {
+    // Same card and evidence as the accepted close in the SUP-22801 test above;
+    // only the trailing Tier 1 marker differs, so only the conflict refusal can stop it.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D24299A", { deliveryRequirement: "record_only" });
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockNoOpenPulls();
+    const conflicted = `${RECORD_ONLY_EVIDENCE}. Liveness unverified.`;
+
+    for (const body of [
+      { status: "done", comment: "Closing.", doneTier: { tier: "tier2", probeEvidence: conflicted } },
+      { status: "done", comment: `Closing.\n\nClosed at Tier 2 (live): ${conflicted}` },
+    ]) {
+      const res = await request(app).patch(`/api/issues/${identifier}`).send(body);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_tier_conflict");
+      expect(String(res.body.error)).toContain("mutually exclusive");
+      expect(String(res.body.details?.remedy)).toContain('remove "Liveness unverified." from the Tier 2 line');
+      expect(await statusOf(issueId)).toBe("in_review");
+    }
+    expect(await auditRows(companyId, issueId, "issue.done_transition_tier2_close")).toHaveLength(0);
+  });
+
   it("PATCH: the record_only missing-tier 422 remedy names both record-only forms and no merge head (SUP-22801)", async () => {
     // Round-1 repair (record-only-remedy-omits-structured-form): the 422
     // remedy is classification-aware. A record_only card is steered to the

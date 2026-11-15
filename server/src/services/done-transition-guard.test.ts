@@ -26,7 +26,9 @@ import {
   DONE_TIER_TIER2_RECORD_ONLY_JSON,
   renderDoneTierDeclaration,
   TIER1_FORM,
+  TIER2_FORM,
   TIER2_RECORD_ONLY_FORM,
+  DONE_TRANSITION_TIER_CONFLICT_CODE,
   GitHubAuthError,
   type DoneTransitionOverride,
 } from "./done-transition-guard.js";
@@ -6019,6 +6021,29 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.allowed).toBe(false);
       expect(result.tier).toBe(null);
     });
+
+    it("SUP-24299: refuses a merge-head Tier 2 declaration that also carries the Tier 1 marker, even when the probe head would resolve", async () => {
+      // Every provider mock would accept this evidence without the marker (see
+      // the acceptance test above), so only the tier-conflict refusal can stop it.
+      mockRefHeadResolutions([
+        { ref: T2_PROBE_HEAD, sha: T2_MERGE_SHA },
+        { ref: T2_DEFAULT_REF, sha: T2_MERGE_SHA },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        repoBackedTierIssue(),
+        tier2Line(`${validTier2Evidence()}. Liveness unverified.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.tier).toBe(null);
+      expect(result.code).toBe("done_transition_tier_conflict");
+      expect(result.reason).toContain("mutually exclusive");
+      expect(result.reason).toContain(TIER2_FORM);
+      expect(result.remedy).toContain(TIER1_FORM);
+      expect(ghFetchMock).not.toHaveBeenCalled();
+    });
   });
 
   // SUP-22801: a record_only card owes no repository landing, so the shared
@@ -6125,6 +6150,109 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.reason).toContain("record-only probe");
       expect(ghFetchMock).not.toHaveBeenCalled();
       expect(mockResolveGitHubToken).not.toHaveBeenCalled();
+    });
+
+    // SUP-24299: "Liveness unverified." is the Tier 1 suffix. The record-only
+    // matcher ends in a catch-all predicate, so it used to accept the suffix as
+    // predicate text and the close landed as both live and unverified.
+    describe("Tier 1 marker on a record-only Tier 2 declaration (SUP-24299)", () => {
+      const MARKER = "Liveness unverified.";
+
+      it("refuses a record-only Tier 2 declaration whose body ends in the Tier 1 marker, with the tier-conflict code", async () => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(`${RECORD_ONLY_EVIDENCE}. ${MARKER}`),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.tier2Audit).toBeUndefined();
+        expect(result.code).toBe(DONE_TRANSITION_TIER_CONFLICT_CODE);
+        expect(result.code).toBe("done_transition_tier_conflict");
+        expect(result.reason).toContain(MARKER);
+        expect(result.reason).toContain("mutually exclusive");
+        expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+        expect(result.remedy).toContain(`remove "${MARKER}" from the Tier 2 line`);
+        expect(result.remedy).toContain(TIER2_RECORD_ONLY_FORM);
+        expect(result.remedy).toContain(TIER1_FORM);
+        expect(ghFetchMock).not.toHaveBeenCalled();
+      });
+
+      it("refuses the marker on the same-run comment path with the same code", async () => {
+        // Same seeded run as the accepted same-run record-only test, so without
+        // the marker this comment would close.
+        setupDbMock({
+          heartbeatRuns: [
+            { id: "run-1", companyId: "company-1", startedAt: new Date("2026-11-04T09:00:00Z"), createdAt: new Date("2026-11-04T08:58:00Z") },
+          ],
+        });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          null,
+          "run-1",
+          () => Promise.resolve([mockComment(tier2Line(`${RECORD_ONLY_EVIDENCE} ${MARKER}`), "run-1")]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.code).toBe("done_transition_tier_conflict");
+      });
+
+      it("refuses the marker when the evidence sits on the line after the prefix, in any letter case", async () => {
+        for (const marker of [MARKER, MARKER.toLowerCase(), MARKER.toUpperCase()]) {
+          const result = await evaluateDoneTierDeclaration(
+            mockDb,
+            recordOnlyTierIssue(),
+            `Closed at Tier 2 (live):\n${RECORD_ONLY_EVIDENCE} ${marker}`,
+            null,
+            () => Promise.resolve([]),
+          );
+          expect(result.allowed, marker).toBe(false);
+          expect(result.code, marker).toBe("done_transition_tier_conflict");
+        }
+      });
+
+      it("refuses the marker on a structured doneTier rendering of the record-only form", async () => {
+        const rendered = renderDoneTierDeclaration("Closing.", {
+          tier: "tier2",
+          probeEvidence: `${RECORD_ONLY_EVIDENCE} ${MARKER}`,
+        });
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          rendered,
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.code).toBe("done_transition_tier_conflict");
+      });
+
+      it("positive control: the same record-only declaration without the marker is still accepted", async () => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line(RECORD_ONLY_EVIDENCE),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier2");
+        expect(result.code).toBeUndefined();
+      });
+
+      it("other Tier 2 refusals keep no tier-conflict code", async () => {
+        const result = await evaluateDoneTierDeclaration(
+          mockDb,
+          recordOnlyTierIssue(),
+          tier2Line("the sweep consumed everything on schedule."),
+          null,
+          () => Promise.resolve([]),
+        );
+        expect(result.allowed).toBe(false);
+        expect(result.code).toBeUndefined();
+      });
     });
 
     async function evaluateObservation(observation: string, verdict: "pass" | "fail" = "pass") {
@@ -6606,6 +6734,20 @@ describe("evaluateDoneTierDeclaration", () => {
         }),
       );
     });
+
+    it("SUP-24299 backstop close: a structured record-only doneTier carrying the Tier 1 marker is refused with the tier-conflict code", async () => {
+      const verdict = await evaluateDoneTransitionGuardForBackstopClose({
+        db: mockDb,
+        issue: { ...recordOnlyTierIssue(), projectId: null, projectWorkspaceId: null, executionWorkspaceId: null },
+        actorId: "execution-control-reconciliation",
+        closeComment: null,
+        structuredDoneTier: { tier: "tier2", probeEvidence: `${RECORD_ONLY_EVIDENCE}. Liveness unverified.` },
+      });
+      expect(verdict.allowed).toBe(false);
+      if (verdict.allowed) return;
+      expect(verdict.code).toBe("done_transition_tier_conflict");
+      expect(logActivity).not.toHaveBeenCalled();
+    });
   });
 
   describe("Tier 1 via accompanying comment", () => {
@@ -6936,6 +7078,27 @@ describe("evaluateDoneTierDeclaration", () => {
       // The cached MERGED row corroborates on its own: no live /pulls probe.
       const urls = ghFetchMock.mock.calls.map(([url]) => String(url));
       expect(urls.some((u) => u.includes("/pulls/4103"))).toBe(false);
+    });
+
+    it("SUP-24299 positive control: a lawful Tier 1 declaration that ends in the required suffix still closes, with no tier-conflict code", async () => {
+      compareAhead(0);
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        {
+          ...linkedPr(4105, "closed"),
+          merged: true,
+          mergeCommitSha: MERGE_SHA,
+        },
+      ]);
+      const result = await evaluateDoneTierDeclaration(
+        mockDb,
+        landedIssue(),
+        tier1Line(`landed-at-tip merge commit ${MERGE_SHA}.`),
+        null,
+        () => Promise.resolve([]),
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe("tier1");
+      expect(result.code).toBeUndefined();
     });
 
     it("SUP-23031: accepts landed-at-tip on a short named sha that prefixes the linked merged PR's merge_commit_sha", async () => {

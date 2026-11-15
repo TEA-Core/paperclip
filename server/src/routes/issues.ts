@@ -5692,7 +5692,7 @@ export function issueRoutes(
       if (persistRefusalComment) {
         await postTerminalStatusRefusalComment(svc, issue.id, {
           httpStatus: 422,
-          code: "done_transition_missing_tier_declaration",
+          code: tierResult.code ?? "done_transition_missing_tier_declaration",
           error: tierResult.reason,
           remedy,
           runId,
@@ -5703,7 +5703,7 @@ export function issueRoutes(
         status: 422,
         body: {
           error: tierResult.reason,
-          code: "done_transition_missing_tier_declaration",
+          code: tierResult.code ?? "done_transition_missing_tier_declaration",
           details: {
             issueId: issue.id,
             identifier: issue.identifier ?? null,
