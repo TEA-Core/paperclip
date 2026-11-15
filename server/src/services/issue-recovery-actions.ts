@@ -917,9 +917,12 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
       // at the ceiling for the next sweep to escalate nor minted terminal by the
       // run-agnostic gate below. An explicit `attemptCount` and a board budget
       // reset stay authoritative; an owner idle since the predecessor keeps the
-      // uncapped carry-forward.
+      // uncapped carry-forward. The successor's own agents come before the
+      // predecessor's: a board-owned mint for a pending participant names that
+      // participant in `previousOwnerAgentId`, and the predecessor's former
+      // owner is not the agent the successor waits on.
       const liveOwnerAgentId =
-        input.ownerAgentId ?? prev?.ownerAgentId ?? input.previousOwnerAgentId ?? prev?.previousOwnerAgentId ?? null;
+        input.ownerAgentId ?? input.previousOwnerAgentId ?? prev?.ownerAgentId ?? prev?.previousOwnerAgentId ?? null;
       const ownerLiveDepthCap =
         input.attemptCount === undefined &&
         !effectivePredecessorExhausted &&
@@ -1074,9 +1077,12 @@ function createIssueRecoveryActionService(db: Db, issueRowLocked: boolean) {
           // A capped successor's wake clock starts at the predecessor's last
           // update, so the stale-wake sweep's live-owner hold sees the same
           // owner run that justified the cap instead of burning the reserved
-          // attempt on its first pass.
+          // attempt on its first pass. This overrides the caller's
+          // `lastAttemptAt`: the escalation path stamps the mint time there,
+          // which is after that run, so a lost initial wake would otherwise
+          // let the sweep burn the reserved attempt and escalate.
           ownerLiveDepthCap
-            ? { ...input, lastAttemptAt: input.lastAttemptAt ?? asDatabaseDate(prev.updatedAt) }
+            ? { ...input, lastAttemptAt: asDatabaseDate(prev.updatedAt) }
             : input,
           ownerType,
           now,

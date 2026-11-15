@@ -5933,6 +5933,114 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     }
   });
 
+  // The production escalation path: the first execution_review_participant_recovery
+  // action, routed to the coder's manager, walked to the ceiling and resolved
+  // `restored` by the recovery owner at minute 0. The coder's failed review run
+  // stays the issue's latest run, so every re-park below cites it again.
+  async function seedRestoredReviewParticipantEscalation() {
+    const fixture = await seedCompany();
+    const { companyId, managerId, coderId, sourceIssue } = fixture;
+    const svc = issueRecoveryActionService(db);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, sourceIssue.id));
+    const [reviewIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssue.id, status: "failed" });
+    const escalate = (opts: { boardEscalation?: boolean } = {}) =>
+      recovery.escalateStrandedAssignedIssue({
+        issue: reviewIssue!,
+        previousStatus: "in_review",
+        latestRun: {
+          id: runId,
+          agentId: coderId,
+          status: "failed",
+          error: "adapter failed",
+          errorCode: "adapter_failed",
+          contextSnapshot: { issueId: sourceIssue.id },
+          livenessState: "needs_followup",
+        },
+        recoveryCause: "execution_review_participant_recovery",
+        ...opts,
+      });
+
+    await escalate();
+    const first = await svc.getActiveForIssue(companyId, sourceIssue.id);
+    expect(first).toMatchObject({ status: "active", ownerAgentId: managerId, attemptCount: 1 });
+    await db.update(issueRecoveryActions).set({ attemptCount: 5 }).where(eq(issueRecoveryActions.id, first!.id));
+    const restored = await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId: sourceIssue.id,
+      actionId: first!.id,
+      status: "resolved",
+      outcome: "restored",
+      resolutionNote: "Recovery owner restored the review participant.",
+    });
+    expect(restored?.id).toBe(first!.id);
+    const [predecessor] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, first!.id));
+    return { ...fixture, svc, recovery, escalate, predecessorUpdatedAt: predecessor!.updatedAt };
+  }
+
+  it("SUP-24251: a capped escalation re-mint starts its wake clock at the predecessor, so a lost wake does not burn the reserved attempt", async () => {
+    const at = startRemintClock();
+    try {
+      const { companyId, managerId, sourceIssueId, svc, recovery, escalate, predecessorUpdatedAt } =
+        await seedRestoredReviewParticipantEscalation();
+      await seedOwnerRun(companyId, managerId, at(10));
+
+      // The escalation path passes `lastAttemptAt: now`; its wake is lost (no run).
+      vi.setSystemTime(at(20));
+      await escalate();
+      const successor = await svc.getActiveForIssue(companyId, sourceIssueId);
+      expect(successor).toMatchObject({ status: "active", ownerAgentId: managerId, attemptCount: 4 });
+      expect(successor!.lastAttemptAt ? new Date(successor!.lastAttemptAt).toISOString() : null)
+        .toBe(predecessorUpdatedAt.toISOString());
+
+      // Past the 4 x 5 min backoff each time: only the live-owner hold stops a burn.
+      const sweeps = [];
+      for (const minute of [51, 82]) {
+        vi.setSystemTime(at(minute));
+        sweeps.push(await recovery.reconcileStaleRecoveryActionWakes({ intervalMs: 5 * 60_000 }));
+      }
+      expect(sweeps.map(({ skippedOwnerLive, reFired, maxAttemptsReached }) => ({ skippedOwnerLive, reFired, maxAttemptsReached })))
+        .toEqual([
+          { skippedOwnerLive: 1, reFired: 0, maxAttemptsReached: 0 },
+          { skippedOwnerLive: 1, reFired: 0, maxAttemptsReached: 0 },
+        ]);
+      const [afterSweeps] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, successor!.id));
+      expect(afterSweeps).toMatchObject({ status: "active", outcome: null, attemptCount: 4 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("SUP-24251: a board-owned escalation re-mint caps on its live pending participant, not the predecessor's idle owner", async () => {
+    const at = startRemintClock();
+    try {
+      const { companyId, coderId, sourceIssueId, svc, escalate, predecessorUpdatedAt } =
+        await seedRestoredReviewParticipantEscalation();
+      // The pending participant runs (on another card); the predecessor's owner does not.
+      await seedOwnerRun(companyId, coderId, at(10));
+
+      vi.setSystemTime(at(20));
+      await escalate({ boardEscalation: true });
+      const successor = await svc.getActiveForIssue(companyId, sourceIssueId);
+
+      // Without the participant-first check this mints escalated, exhausted, 5/5.
+      expect(successor).toMatchObject({
+        status: "active",
+        outcome: null,
+        ownerType: "board",
+        ownerAgentId: null,
+        previousOwnerAgentId: coderId,
+        attemptCount: 4,
+      });
+      expect(successor!.lastAttemptAt ? new Date(successor!.lastAttemptAt).toISOString() : null)
+        .toBe(predecessorUpdatedAt.toISOString());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not reset an exhausted escalated action to active on re-mint", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     const svc = issueRecoveryActionService(db);
