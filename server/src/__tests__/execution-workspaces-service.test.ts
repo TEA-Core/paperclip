@@ -42,6 +42,8 @@ import {
   metadataHasReopenPendingConsumption,
   readExecutionWorkspaceConfig,
   readMetadataReopenPendingConsumptionSince,
+  TERMINAL_CLEANUP_MAX_ATTEMPTS,
+  TERMINAL_CLEANUP_RETRY_BACKOFF_BASE_MS,
 } from "../services/execution-workspaces.ts";
 import { issueService } from "../services/issues.ts";
 import {
@@ -1371,11 +1373,39 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     const rows = await db
       .select({ action: activityLog.action, details: activityLog.details })
       .from(activityLog)
-      .where(eq(activityLog.entityId, executionWorkspaceId));
+      .where(eq(activityLog.entityId, executionWorkspaceId))
+      .orderBy(activityLog.createdAt);
     return rows.filter((row) => row.action === "execution_workspace.issue_terminal_cleanup_failed");
   }
 
-  it("records a determinate cleanup refusal once and does not retry it on later sweeps", async () => {
+  async function terminalCleanupEscalations(executionWorkspaceId: string) {
+    const rows = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, executionWorkspaceId));
+    return rows.filter((row) => row.action === "execution_workspace.issue_terminal_cleanup_escalated");
+  }
+
+  async function sourceIssueComments(issueId: string) {
+    return db
+      .select({ id: issueComments.id, body: issueComments.body, authorType: issueComments.authorType })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+  }
+
+  // A service clock the test moves forward, so retry backoff windows elapse
+  // without waiting.
+  function testClock() {
+    let current = Date.now();
+    return {
+      now: () => new Date(current),
+      advance: (ms: number) => {
+        current += ms;
+      },
+    };
+  }
+
+  it("records and escalates a determinate cleanup refusal once and does not retry it on later sweeps", async () => {
     const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
     const lateWorkPath = path.join(seeded.worktreePath, "late-work.txt");
     let cleanupAttempts = 0;
@@ -1399,9 +1429,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       .from(executionWorkspaces)
       .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
 
-    expect(sweeps[0]).toMatchObject({ cleanupFailed: 1 });
-    expect(sweeps[1]).toMatchObject({ checked: 0, cleanupFailed: 0 });
-    expect(sweeps[2]).toMatchObject({ checked: 0, cleanupFailed: 0 });
+    expect(sweeps[0]).toMatchObject({ cleanupFailed: 1, escalated: 1 });
+    expect(sweeps[1]).toMatchObject({ checked: 0, cleanupFailed: 0, escalated: 0 });
+    expect(sweeps[2]).toMatchObject({ checked: 0, cleanupFailed: 0, escalated: 0 });
     expect(cleanupAttempts).toBe(1);
     expect(await terminalCleanupFailedActivity(seeded.executionWorkspaceId)).toEqual([
       {
@@ -1409,7 +1439,26 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         details: {
           sourceIssueId: seeded.sourceIssueId,
           failure: "Refusing terminal workspace cleanup because the git worktree changed after delivery was verified",
+          lifecycleGeneration: 1,
           retrySuspended: true,
+        },
+      },
+    ]);
+    const comments = await sourceIssueComments(seeded.sourceIssueId);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.authorType).toBe("system");
+    expect(comments[0]?.body).toContain("[Terminal workspace cleanup escalation]");
+    expect(comments[0]?.body).toContain(seeded.executionWorkspaceId);
+    expect(comments[0]?.body).toContain("the git worktree changed after delivery was verified");
+    expect(await terminalCleanupEscalations(seeded.executionWorkspaceId)).toEqual([
+      {
+        action: "execution_workspace.issue_terminal_cleanup_escalated",
+        details: {
+          sourceIssueId: seeded.sourceIssueId,
+          failure: "Refusing terminal workspace cleanup because the git worktree changed after delivery was verified",
+          cause: "determinate_refusal",
+          lifecycleGeneration: 1,
+          commentId: comments[0]?.id,
         },
       },
     ]);
@@ -1420,44 +1469,217 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   });
 
-  it("keeps retrying a transient terminal cleanup failure on every sweep", async () => {
+  it("retries a transient terminal cleanup failure after its backoff", async () => {
     const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
     const failure = "Refusing terminal workspace cleanup because the git status could not be verified";
     let cleanupAttempts = 0;
+    const clock = testClock();
     const failingService = executionWorkspaceService(db, {
       beforeTerminalWorkspaceCleanup: async () => {
         cleanupAttempts += 1;
         throw new Error(failure);
       },
       workspaceReaperCooldownDays: 0,
+      now: clock.now,
     });
 
     const first = await failingService.sweepTerminalWorkspaces();
+    clock.advance(TERMINAL_CLEANUP_RETRY_BACKOFF_BASE_MS);
     const second = await failingService.sweepTerminalWorkspaces();
     const [workspace] = await db
       .select({ status: executionWorkspaces.status, cleanupReason: executionWorkspaces.cleanupReason })
       .from(executionWorkspaces)
       .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
 
-    expect(first).toMatchObject({ cleanupFailed: 1 });
-    expect(second).toMatchObject({ checked: 1, cleanupFailed: 1 });
+    expect(first).toMatchObject({ cleanupFailed: 1, escalated: 0 });
+    expect(second).toMatchObject({ checked: 1, cleanupFailed: 1, escalated: 0 });
     expect(cleanupAttempts).toBe(2);
     expect((await terminalCleanupFailedActivity(seeded.executionWorkspaceId)).map((row) => row.details)).toEqual([
-      { sourceIssueId: seeded.sourceIssueId, failure },
-      { sourceIssueId: seeded.sourceIssueId, failure },
+      { sourceIssueId: seeded.sourceIssueId, failure, lifecycleGeneration: 1 },
+      { sourceIssueId: seeded.sourceIssueId, failure, lifecycleGeneration: 1 },
     ]);
     expect(workspace).toEqual({ status: "cleanup_failed", cleanupReason: `issue_terminal | ${failure}` });
+    expect(await terminalCleanupEscalations(seeded.executionWorkspaceId)).toEqual([]);
+    expect(await sourceIssueComments(seeded.sourceIssueId)).toEqual([]);
+  });
+
+  it("stops retrying another cleanup refusal at the attempt ceiling after backoff and escalates it once", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
+    const failure = "git worktree cleanup lock is already held";
+    let cleanupAttempts = 0;
+    const clock = testClock();
+    const failingService = executionWorkspaceService(db, {
+      beforeTerminalWorkspaceCleanup: async () => {
+        cleanupAttempts += 1;
+        throw new Error(failure);
+      },
+      workspaceReaperCooldownDays: 0,
+      now: clock.now,
+    });
+
+    expect(await failingService.sweepTerminalWorkspaces()).toMatchObject({ cleanupFailed: 1, escalated: 0 });
+    for (let attempt = 2; attempt <= TERMINAL_CLEANUP_MAX_ATTEMPTS; attempt += 1) {
+      // The wait before attempt N doubles with each failed attempt.
+      const backoff = TERMINAL_CLEANUP_RETRY_BACKOFF_BASE_MS * 2 ** (attempt - 2);
+      clock.advance(backoff - 1_000);
+      expect(await failingService.sweepTerminalWorkspaces()).toMatchObject({ checked: 0, cleanupFailed: 0 });
+      clock.advance(1_000);
+      expect(await failingService.sweepTerminalWorkspaces()).toMatchObject({
+        checked: 1,
+        cleanupFailed: 1,
+        escalated: attempt === TERMINAL_CLEANUP_MAX_ATTEMPTS ? 1 : 0,
+      });
+    }
+    // At the ceiling the row is not selected again, however long it waits.
+    clock.advance(365 * 24 * 60 * 60 * 1000);
+    expect(await failingService.sweepTerminalWorkspaces()).toMatchObject({ checked: 0, cleanupFailed: 0, escalated: 0 });
+
+    const [workspace] = await db
+      .select({ status: executionWorkspaces.status, cleanupReason: executionWorkspaces.cleanupReason })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    const failures = await terminalCleanupFailedActivity(seeded.executionWorkspaceId);
+    const comments = await sourceIssueComments(seeded.sourceIssueId);
+    expect(cleanupAttempts).toBe(TERMINAL_CLEANUP_MAX_ATTEMPTS);
+    expect(failures).toHaveLength(TERMINAL_CLEANUP_MAX_ATTEMPTS);
+    expect(failures.map((row) => row.details?.retrySuspended ?? false)).toEqual([
+      ...Array.from({ length: TERMINAL_CLEANUP_MAX_ATTEMPTS - 1 }, () => false),
+      true,
+    ]);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain(failure);
+    expect((await terminalCleanupEscalations(seeded.executionWorkspaceId)).map((row) => row.details)).toEqual([
+      {
+        sourceIssueId: seeded.sourceIssueId,
+        failure,
+        cause: "attempt_ceiling",
+        lifecycleGeneration: 1,
+        commentId: comments[0]?.id,
+      },
+    ]);
+    expect(workspace).toEqual({ status: "cleanup_failed", cleanupReason: `issue_terminal | ${failure}` });
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  });
+
+  it("backfills the escalation of an already-stranded workspace once without touching the row or the worktree", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
+    const failure = "Refusing terminal workspace cleanup because the git worktree changed after delivery was verified";
+    // A row stranded before this change: the determinate reason is recorded and
+    // its old activity row carries no lifecycle generation.
+    await db
+      .update(executionWorkspaces)
+      .set({
+        status: "cleanup_failed",
+        closedAt: new Date("2026-01-02T00:00:00Z"),
+        updatedAt: new Date("2026-01-02T00:00:00Z"),
+        cleanupReason: `issue_terminal | ${failure}`,
+        metadata: { [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 1 },
+      })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    await db.insert(activityLog).values({
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "workspace_terminality_reaper",
+      action: "execution_workspace.issue_terminal_cleanup_failed",
+      entityType: "execution_workspace",
+      entityId: seeded.executionWorkspaceId,
+      details: { sourceIssueId: seeded.sourceIssueId, failure },
+    });
+    const readWorkspaceRow = async () =>
+      (await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId)))[0];
+    const readWorktree = async () => ({
+      head: await readGit(seeded.worktreePath, ["rev-parse", "HEAD"]),
+      branch: await readGit(seeded.worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"]),
+      status: await readGit(seeded.worktreePath, ["status", "--porcelain", "--untracked-files=all"]),
+      files: (await fs.readdir(seeded.worktreePath)).sort(),
+    });
+    const rowBefore = await readWorkspaceRow();
+    const worktreeBefore = await readWorktree();
+    let cleanupAttempts = 0;
+    const backfillService = executionWorkspaceService(db, {
+      beforeTerminalWorkspaceCleanup: async () => {
+        cleanupAttempts += 1;
+      },
+      workspaceReaperCooldownDays: 0,
+    });
+    const dryRunService = executionWorkspaceService(db, { workspaceReaperCooldownDays: 0, dryRun: true });
+
+    // A dry run writes nothing, and a reopened source issue is not escalated.
+    const dryRun = await dryRunService.sweepTerminalWorkspaces();
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, seeded.sourceIssueId));
+    const whileReopened = await backfillService.escalateStrandedTerminalCleanups();
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.sourceIssueId));
+    // Two concurrent backfills serialize on the lifecycle lock: one escalates.
+    const concurrent = await Promise.all([
+      backfillService.escalateStrandedTerminalCleanups(),
+      backfillService.escalateStrandedTerminalCleanups(),
+    ]);
+    const second = await backfillService.escalateStrandedTerminalCleanups();
+    const sweep = await backfillService.sweepTerminalWorkspaces();
+
+    expect(dryRun).toMatchObject({ escalated: 0 });
+    expect(whileReopened).toEqual({ escalated: 0, failed: 0 });
+    expect(concurrent.map((run) => run.escalated).sort()).toEqual([0, 1]);
+    expect(second).toEqual({ escalated: 0, failed: 0 });
+    expect(sweep).toMatchObject({ checked: 0, escalated: 0 });
+    expect(cleanupAttempts).toBe(0);
+    expect(await readWorkspaceRow()).toEqual(rowBefore);
+    expect(await readWorktree()).toEqual(worktreeBefore);
+    const comments = await sourceIssueComments(seeded.sourceIssueId);
+    expect(comments).toHaveLength(1);
+    expect((await terminalCleanupEscalations(seeded.executionWorkspaceId)).map((row) => row.details)).toEqual([
+      {
+        sourceIssueId: seeded.sourceIssueId,
+        failure,
+        cause: "determinate_refusal",
+        lifecycleGeneration: 1,
+        commentId: comments[0]?.id,
+      },
+    ]);
+    expect(await terminalCleanupFailedActivity(seeded.executionWorkspaceId)).toHaveLength(1);
+    const [sourceIssue] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, seeded.sourceIssueId));
+    expect(sourceIssue?.status).toBe("done");
+  });
+
+  it("counts a cleanup that refuses without throwing as one attempt", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
+    // A runtime-created local_fs path that is a git worktree: cleanup refuses
+    // with a warning and keeps the directory instead of throwing.
+    await db
+      .update(executionWorkspaces)
+      .set({ providerType: "local_fs", metadata: { createdByRuntime: true } })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    const clock = testClock();
+    const refusingService = executionWorkspaceService(db, { workspaceReaperCooldownDays: 0, now: clock.now });
+
+    const first = await refusingService.sweepTerminalWorkspaces();
+    clock.advance(TERMINAL_CLEANUP_RETRY_BACKOFF_BASE_MS);
+    const second = await refusingService.sweepTerminalWorkspaces();
+    const failures = await terminalCleanupFailedActivity(seeded.executionWorkspaceId);
+
+    expect(first).toMatchObject({ cleanupFailed: 1 });
+    expect(second).toMatchObject({ checked: 1, cleanupFailed: 1 });
+    expect(failures.map((row) => row.details)).toEqual([
+      expect.objectContaining({ failure: expect.stringContaining("because it is a git repository"), lifecycleGeneration: 1 }),
+      expect.objectContaining({ failure: expect.stringContaining("because it is a git repository"), lifecycleGeneration: 1 }),
+    ]);
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   });
 
   it("retries a determinate refusal again after the recorded cleanup state changes", async () => {
     const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
     const lateWorkPath = path.join(seeded.worktreePath, "late-work.txt");
     let refuse = true;
+    const clock = testClock();
     const racingService = executionWorkspaceService(db, {
       beforeTerminalWorkspaceCleanup: async () => {
         if (refuse) await fs.writeFile(lateWorkPath, "not delivered\n", "utf8");
       },
       workspaceReaperCooldownDays: 0,
+      now: clock.now,
     });
 
     expect(await racingService.sweepTerminalWorkspaces()).toMatchObject({ cleanupFailed: 1 });
@@ -1470,6 +1692,8 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       .update(executionWorkspaces)
       .set({ cleanupReason: "issue_terminal | git worktree cleanup lock is already held" })
       .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    // The changed row is still one attempt into its backoff.
+    clock.advance(TERMINAL_CLEANUP_RETRY_BACKOFF_BASE_MS);
     const retried = await racingService.sweepTerminalWorkspaces();
     const [workspace] = await db
       .select({ status: executionWorkspaces.status })
@@ -6434,7 +6658,11 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect(first).toMatchObject({ cleanupFailed: 1, archived: 0 });
       expect((await workspaceStatus(seeded.executionWorkspaceId))?.status).toBe("cleanup_failed");
       await db.update(executionWorkspaces).set({ status: "archived" }).where(eq(executionWorkspaces.id, holderId));
-      const retry = await freshSweep(0, true).sweepTerminalWorkspaces();
+      // The retry runs after the first attempt's backoff.
+      const retry = await executionWorkspaceService(db, {
+        workspaceReaperCooldownDays: 0, reclaimCleanWorktrees: true,
+        now: () => new Date(Date.now() + 60_000 + TERMINAL_CLEANUP_RETRY_BACKOFF_BASE_MS),
+      }).sweepTerminalWorkspaces();
       expect(retry).toMatchObject({ checked: 1, archived: 1, cleanupFailed: 0 });
       const [service] = await db.select().from(workspaceRuntimeServices).where(eq(workspaceRuntimeServices.id, serviceId));
       expect(service?.status).toBe("stopped");

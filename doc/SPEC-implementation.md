@@ -1368,7 +1368,15 @@ The current app also exposes V1-supporting surfaces for:
   `cleanup_failed` refusals under the same safety gates, except the determinate refusal that the
   git worktree changed after delivery was verified: the sweep records it once, with one
   `execution_workspace.issue_terminal_cleanup_failed` row that carries `retrySuspended: true`, and
-  retries it only after the row's status or cleanup reason changes. Reopening the source issue
+  retries it only after the row's status or cleanup reason changes. Every other refusal is retried
+  at most 5 times per archive lifecycle; the wait after attempt N is 10 minutes times 2^(N-1), and the
+  attempt that reaches the ceiling carries `retrySuspended: true`. Each failure row records the
+  lifecycle generation it counts against. A stranded row (the determinate refusal, or another refusal
+  at the ceiling) is escalated once per lifecycle generation: a system comment on the source issue
+  asks a person or agent to keep, deliver again or discard the worktree, and an
+  `execution_workspace.issue_terminal_cleanup_escalated` row marks it. Each live sweep runs this
+  escalation, so rows stranded before it shipped are escalated too. The escalation never changes the
+  workspace row or its worktree. Reopening the source issue
   records activity but does not restore that workspace.
   The default-off `PAPERCLIP_WORKSPACE_REAPER_RECLAIM_CLEAN_WORKTREES` flag widens
   deletion only to isolated, attached, clean no-PR Git worktrees inside the

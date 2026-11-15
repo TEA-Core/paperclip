@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, lt, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  activityLog,
   executionWorkspaces,
   heartbeatRuns,
   issueComments,
@@ -96,10 +97,94 @@ const TERMINAL_CLEANUP_WORKTREE_CHANGED_REFUSAL =
 const TERMINAL_CLEANUP_WORKTREE_CHANGED_REASON =
   `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${TERMINAL_CLEANUP_WORKTREE_CHANGED_REFUSAL}`;
 
-function terminalCleanupFailedActivityDetails(sourceIssueId: string | null, failure: string) {
-  return failure === TERMINAL_CLEANUP_WORKTREE_CHANGED_REFUSAL
-    ? { sourceIssueId, failure, retrySuspended: true }
-    : { sourceIssueId, failure };
+const TERMINAL_CLEANUP_FAILED_ACTION = "execution_workspace.issue_terminal_cleanup_failed";
+// SUP-24302: every other terminal cleanup refusal is retried a bounded number
+// of times per archive lifecycle, and the wait before each retry doubles. The
+// attempt count is the number of cleanup-failure activity rows that carry the
+// row's current lifecycle generation, so counting needs no workspace write. A
+// new archive lifecycle (a reopen and a later archive) starts a new count.
+export const TERMINAL_CLEANUP_MAX_ATTEMPTS = 5;
+export const TERMINAL_CLEANUP_RETRY_BACKOFF_BASE_MS = 10 * 60 * 1000;
+// A stranded terminal workspace (a determinate refusal, or another refusal at
+// the attempt ceiling) is surfaced once per lifecycle generation: a system
+// comment on the source issue plus this activity row, which is also the
+// idempotency marker. The escalation writes nothing to the workspace row and
+// calls no cleanup, removal, release or return path.
+export const TERMINAL_CLEANUP_ESCALATED_ACTION = "execution_workspace.issue_terminal_cleanup_escalated";
+export const TERMINAL_CLEANUP_ESCALATION_MARKER = "[Terminal workspace cleanup escalation]";
+const TERMINAL_CLEANUP_ESCALATION_BATCH_LIMIT = 100;
+const TERMINAL_CLEANUP_ACTOR_ID = "workspace_terminality_reaper";
+
+// The row's lifecycle generation as jsonb, read the same way as
+// readExecutionWorkspaceLifecycleGeneration: a missing or non-number value is 0.
+function currentLifecycleGenerationJsonbSql() {
+  return sql`CASE
+    WHEN jsonb_typeof(${executionWorkspaces.metadata} -> ${EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY}) = 'number'
+      THEN ${executionWorkspaces.metadata} -> ${EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY}
+    ELSE '0'::jsonb
+  END`;
+}
+
+// Count, capped at the ceiling, of this lifecycle's activity rows with the given
+// action for the outer execution_workspaces row.
+function terminalCleanupActivityCountSql(action: string) {
+  return sql<number>`(
+    SELECT count(*)::int FROM (
+      SELECT 1 FROM ${activityLog} cleanup_activity
+      WHERE cleanup_activity.company_id = ${executionWorkspaces.companyId}
+        AND cleanup_activity.entity_type = 'execution_workspace'
+        AND cleanup_activity.entity_id = ${executionWorkspaces.id}::text
+        AND cleanup_activity.action = ${action}
+        AND cleanup_activity.details -> 'lifecycleGeneration' = ${currentLifecycleGenerationJsonbSql()}
+      LIMIT ${TERMINAL_CLEANUP_MAX_ATTEMPTS}
+    ) capped_activity
+  )`;
+}
+
+async function countTerminalCleanupActivity(
+  dbOrTx: Db,
+  input: { companyId: string; workspaceId: string; action: string; lifecycleGeneration: number },
+): Promise<number> {
+  const [row] = await dbOrTx
+    .select({ count: sql<number>`count(*)::int` })
+    .from(activityLog)
+    .where(and(
+      eq(activityLog.companyId, input.companyId),
+      eq(activityLog.entityType, "execution_workspace"),
+      eq(activityLog.entityId, input.workspaceId),
+      eq(activityLog.action, input.action),
+      sql<boolean>`${activityLog.details} -> 'lifecycleGeneration' = to_jsonb(${input.lifecycleGeneration}::int)`,
+    ));
+  return row?.count ?? 0;
+}
+
+function buildTerminalCleanupEscalationComment(input: {
+  workspaceId: string;
+  workspaceName: string | null;
+  path: string | null;
+  branchName: string | null;
+  failure: string;
+  cause: "determinate_refusal" | "attempt_ceiling";
+}): string {
+  const lines = [
+    TERMINAL_CLEANUP_ESCALATION_MARKER,
+    "",
+    `The terminal workspace sweep stopped the cleanup of execution workspace ${input.workspaceId}`
+      + `${input.workspaceName ? ` (${input.workspaceName})` : ""}.`,
+    input.cause === "determinate_refusal"
+      ? "The refusal does not clear by itself, so the sweep does not retry it."
+      : `The cleanup failed ${TERMINAL_CLEANUP_MAX_ATTEMPTS} times, so the sweep does not retry it.`,
+    "",
+    `Refusal: ${input.failure}`,
+  ];
+  if (input.path) lines.push(`Path: ${input.path}`);
+  if (input.branchName) lines.push(`Branch: ${input.branchName}`);
+  lines.push(
+    "",
+    "A person or agent must decide if the worktree is kept, delivered again, or discarded.",
+    "Paperclip did not change, clean, remove, return or discard the workspace or its worktree.",
+  );
+  return lines.join("\n");
 }
 
 const SHARED_SESSION_RECORD_ARCHIVE_REASON = "shared session record";
@@ -236,6 +321,7 @@ function emptyTerminalSweepResult() {
     skippedReopened: 0,
     skippedCooldown: 0,
     clearedStaleReopenPending: 0,
+    escalated: 0,
   };
 }
 
@@ -2314,6 +2400,186 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     });
   }
 
+  // Record one failed terminal cleanup attempt. The row carries the lifecycle
+  // generation the attempt captured, so the retry filter can count this
+  // lifecycle's attempts. The determinate refusal and the attempt that reaches
+  // the ceiling carry retrySuspended: the sweep does not select the row again.
+  async function logTerminalCleanupFailure(
+    workspace: Pick<ExecutionWorkspaceRow, "id" | "companyId" | "sourceIssueId">,
+    failure: string,
+    lifecycleGeneration: number,
+  ) {
+    const priorAttempts = await countTerminalCleanupActivity(db, {
+      companyId: workspace.companyId,
+      workspaceId: workspace.id,
+      action: TERMINAL_CLEANUP_FAILED_ACTION,
+      lifecycleGeneration,
+    });
+    const retrySuspended = failure === TERMINAL_CLEANUP_WORKTREE_CHANGED_REFUSAL
+      || priorAttempts + 1 >= TERMINAL_CLEANUP_MAX_ATTEMPTS;
+    await logActivity(db, {
+      companyId: workspace.companyId,
+      actorType: "system",
+      actorId: TERMINAL_CLEANUP_ACTOR_ID,
+      action: TERMINAL_CLEANUP_FAILED_ACTION,
+      entityType: "execution_workspace",
+      entityId: workspace.id,
+      details: {
+        sourceIssueId: workspace.sourceIssueId,
+        failure,
+        lifecycleGeneration,
+        ...(retrySuspended ? { retrySuspended: true } : {}),
+      },
+    });
+  }
+
+  // Surface one stranded terminal workspace on its source issue. Read-only with
+  // respect to the workspace: the transaction takes the lifecycle advisory lock
+  // to serialize concurrent escalations, re-reads the row, and writes only the
+  // issue comment and the activity marker. Returns true when it escalated.
+  async function escalateStrandedTerminalCleanup(candidate: {
+    id: string;
+    companyId: string;
+    sourceIssueId: string;
+    cleanupReason: string;
+    lifecycleGeneration: number;
+  }): Promise<boolean> {
+    // issues.ts imports this module, so a static import would form a cycle.
+    const { issueService } = await import("./issues.js");
+    const prefix = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | `;
+    const failure = candidate.cleanupReason.slice(prefix.length);
+    const cause = candidate.cleanupReason === TERMINAL_CLEANUP_WORKTREE_CHANGED_REASON
+      ? "determinate_refusal" as const
+      : "attempt_ceiling" as const;
+    return db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await acquireExecutionWorkspaceLifecycleLock(tx, candidate.id);
+      const [fresh] = await tx
+        .select({
+          status: executionWorkspaces.status,
+          cleanupReason: executionWorkspaces.cleanupReason,
+          metadata: executionWorkspaces.metadata,
+          name: executionWorkspaces.name,
+          cwd: executionWorkspaces.cwd,
+          providerRef: executionWorkspaces.providerRef,
+          branchName: executionWorkspaces.branchName,
+        })
+        .from(executionWorkspaces)
+        .where(and(
+          eq(executionWorkspaces.id, candidate.id),
+          eq(executionWorkspaces.companyId, candidate.companyId),
+        ));
+      if (
+        !fresh
+        || fresh.status !== "cleanup_failed"
+        || fresh.cleanupReason !== candidate.cleanupReason
+        || readExecutionWorkspaceLifecycleGeneration(fresh.metadata) !== candidate.lifecycleGeneration
+      ) {
+        return false;
+      }
+      const escalations = await countTerminalCleanupActivity(txDb, {
+        companyId: candidate.companyId,
+        workspaceId: candidate.id,
+        action: TERMINAL_CLEANUP_ESCALATED_ACTION,
+        lifecycleGeneration: candidate.lifecycleGeneration,
+      });
+      if (escalations > 0) return false;
+      const comment = await issueService(txDb).addComment(
+        candidate.sourceIssueId,
+        buildTerminalCleanupEscalationComment({
+          workspaceId: candidate.id,
+          workspaceName: fresh.name,
+          path: readNullableString(fresh.providerRef) ?? readNullableString(fresh.cwd),
+          branchName: fresh.branchName,
+          failure,
+          cause,
+        }),
+        {},
+        { authorType: "system" },
+        txDb,
+      );
+      await logActivityInTransaction(txDb, {
+        companyId: candidate.companyId,
+        actorType: "system",
+        actorId: TERMINAL_CLEANUP_ACTOR_ID,
+        action: TERMINAL_CLEANUP_ESCALATED_ACTION,
+        entityType: "execution_workspace",
+        entityId: candidate.id,
+        details: {
+          sourceIssueId: candidate.sourceIssueId,
+          failure,
+          cause,
+          lifecycleGeneration: candidate.lifecycleGeneration,
+          commentId: comment.id,
+        },
+      });
+      return true;
+    });
+  }
+
+  // Escalate every stranded terminal workspace that has no escalation for its
+  // current lifecycle generation. Stranded means cleanup_failed under a terminal
+  // reason with a terminal source issue, and either the determinate refusal or
+  // another refusal at the attempt ceiling. Idempotent: the sweep runs it after
+  // each live pass, so it is also the backfill for rows stranded before this
+  // change. Read-only with respect to workspace state.
+  async function escalateStrandedTerminalCleanups(): Promise<{ escalated: number; failed: number }> {
+    const result = { escalated: 0, failed: 0 };
+    const stranded = await db
+      .select({
+        id: executionWorkspaces.id,
+        companyId: executionWorkspaces.companyId,
+        sourceIssueId: executionWorkspaces.sourceIssueId,
+        cleanupReason: executionWorkspaces.cleanupReason,
+        metadata: executionWorkspaces.metadata,
+      })
+      .from(executionWorkspaces)
+      .innerJoin(issues, and(
+        eq(issues.id, executionWorkspaces.sourceIssueId),
+        eq(issues.companyId, executionWorkspaces.companyId),
+      ))
+      .where(and(
+        eq(executionWorkspaces.status, "cleanup_failed"),
+        sql<boolean>`${executionWorkspaces.cleanupReason} LIKE 'issue_terminal | %'`,
+        inArray(issues.status, ["done", "cancelled"]),
+        or(
+          eq(executionWorkspaces.cleanupReason, TERMINAL_CLEANUP_WORKTREE_CHANGED_REASON),
+          sql<boolean>`${terminalCleanupActivityCountSql(TERMINAL_CLEANUP_FAILED_ACTION)} >= ${TERMINAL_CLEANUP_MAX_ATTEMPTS}`,
+        ),
+        sql<boolean>`${terminalCleanupActivityCountSql(TERMINAL_CLEANUP_ESCALATED_ACTION)} = 0`,
+      ))
+      .orderBy(asc(executionWorkspaces.updatedAt), asc(executionWorkspaces.id))
+      .limit(TERMINAL_CLEANUP_ESCALATION_BATCH_LIMIT);
+    for (const row of stranded) {
+      try {
+        const escalated = await escalateStrandedTerminalCleanup({
+          id: row.id,
+          companyId: row.companyId,
+          sourceIssueId: row.sourceIssueId!,
+          cleanupReason: row.cleanupReason!,
+          lifecycleGeneration: readExecutionWorkspaceLifecycleGeneration(row.metadata),
+        });
+        if (!escalated) continue;
+        result.escalated += 1;
+        logger.info(
+          {
+            event: TERMINAL_CLEANUP_ESCALATED_ACTION,
+            executionWorkspaceId: row.id,
+            sourceIssueId: row.sourceIssueId,
+          },
+          "escalated a stranded terminal workspace cleanup to its source issue",
+        );
+      } catch (err) {
+        result.failed += 1;
+        logger.warn(
+          { err, executionWorkspaceId: row.id },
+          "terminal workspace cleanup escalation failed; a later sweep retries it",
+        );
+      }
+    }
+    return result;
+  }
+
   // A failed terminal cleanup is already closed. The retry must not raise the
   // lifecycle generation: the fence above belongs to the failed archive. Promote
   // back to archived only while that generation and cleanup_failed are current.
@@ -3236,12 +3502,27 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       // Retry terminal cleanup failures under the same safety gates: a holder,
       // lock, unverified status or remote can clear. A determinate refusal does
       // not clear by itself, so it is not retried. Any write that changes the
-      // recorded status or reason makes the row eligible again.
+      // recorded status or reason makes the row eligible again. Every other
+      // refusal is retried at most TERMINAL_CLEANUP_MAX_ATTEMPTS times in one
+      // lifecycle, and the wait after attempt N is the base backoff times 2^(N-1),
+      // measured from the row's last write.
+      const retryDueAt = now().toISOString();
       const terminalCleanupRetryFilter = and(
         eq(executionWorkspaces.status, "cleanup_failed"),
         sql<boolean>`${executionWorkspaces.cleanupReason} LIKE 'issue_terminal | %'`,
         ne(executionWorkspaces.cleanupReason, TERMINAL_CLEANUP_WORKTREE_CHANGED_REASON),
         sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
+        sql<boolean>`EXISTS (
+          SELECT 1
+          FROM (SELECT ${terminalCleanupActivityCountSql(TERMINAL_CLEANUP_FAILED_ACTION)} AS attempts) cleanup_attempts
+          WHERE cleanup_attempts.attempts < ${TERMINAL_CLEANUP_MAX_ATTEMPTS}
+            AND (
+              cleanup_attempts.attempts = 0
+              OR ${executionWorkspaces.updatedAt} <= ${retryDueAt}::timestamptz
+                - interval '1 millisecond'
+                  * (${TERMINAL_CLEANUP_RETRY_BACKOFF_BASE_MS}::double precision * power(2, cleanup_attempts.attempts - 1))
+            )
+        )`,
       );
       const baseCandidateFilter = or(openCandidateFilter, terminalCleanupRetryFilter);
       // Continue the scan after the previous sweep's last row. The keyset
@@ -3613,6 +3894,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             }
             if (!cleanup.cleaned) {
               result.cleanupFailed += 1;
+              await logTerminalCleanupFailure(
+                workspace,
+                cleanup.warnings.join(" | ") || "cleanup did not complete",
+                capturedGeneration,
+              );
               continue;
             }
             const promoted = await markTerminalCleanupArchived({
@@ -3649,15 +3935,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               capturedGeneration,
               cleanupReason: `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${failure}`,
             });
-            await logActivity(db, {
-              companyId: workspace.companyId,
-              actorType: "system",
-              actorId: "workspace_terminality_reaper",
-              action: "execution_workspace.issue_terminal_cleanup_failed",
-              entityType: "execution_workspace",
-              entityId: workspace.id,
-              details: terminalCleanupFailedActivityDetails(workspace.sourceIssueId, failure),
-            });
+            await logTerminalCleanupFailure(workspace, failure, capturedGeneration);
           }
           continue;
         }
@@ -3822,8 +4100,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         try {
           const cleanup = await cleanupTerminalWorkspace(archived, assessment.workspaceHeadSha, capturedGeneration, cleanupRecordOnly);
           if (cleanup.skippedReopened) result.skippedReopened += 1;
-          else if (!cleanup.cleaned) result.cleanupFailed += 1;
-          else result.archived += 1;
+          else if (cleanup.cleaned) result.archived += 1;
+          else {
+            result.cleanupFailed += 1;
+            await logTerminalCleanupFailure(
+              archived,
+              cleanup.warnings.join(" | ") || "cleanup did not complete",
+              capturedGeneration,
+            );
+          }
         } catch (error) {
           result.cleanupFailed += 1;
           const failure = error instanceof Error ? error.message : String(error);
@@ -3837,23 +4122,28 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             capturedGeneration,
             cleanupReason: `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${failure}`,
           });
-          await logActivity(db, {
-            companyId: archived.companyId,
-            actorType: "system",
-            actorId: "workspace_terminality_reaper",
-            action: "execution_workspace.issue_terminal_cleanup_failed",
-            entityType: "execution_workspace",
-            entityId: archived.id,
-            details: terminalCleanupFailedActivityDetails(archived.sourceIssueId, failure),
-          });
+          await logTerminalCleanupFailure(archived, failure, capturedGeneration);
         }
       }
-      if (dryRun) logger.info(result, "terminal issue workspace reaper dry run summary");
+      if (dryRun) {
+        logger.info(result, "terminal issue workspace reaper dry run summary");
+        return result;
+      }
+      // Surface stranded rows, including rows stranded before this sweep or
+      // before this code shipped. Read-only with respect to workspace state; a
+      // failed escalation is retried on a later sweep.
+      try {
+        result.escalated = (await escalateStrandedTerminalCleanups()).escalated;
+      } catch (err) {
+        logger.warn({ err }, "terminal workspace cleanup escalation pass failed; a later sweep retries it");
+      }
       return result;
       } finally {
         terminalSweepInProgress = false;
       }
     },
+
+    escalateStrandedTerminalCleanups,
 
     create: async (data: typeof executionWorkspaces.$inferInsert) => {
       // The path-exclusivity check is a read; the insert that follows is a write.

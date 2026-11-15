@@ -1573,8 +1573,12 @@ Environment overrides:
   Terminal `cleanup_failed` refusals are reconsidered on later sweep rotations
   under the same gates, except a refusal because the git worktree changed after
   delivery was verified: the sweep records it once and reconsiders it only after
-  the row's status or cleanup reason changes. Services remain running while
-  deletion is refused.
+  the row's status or cleanup reason changes. Other refusals are retried at most
+  5 times per archive lifecycle, with a backoff of 10 minutes doubling after each
+  attempt. A stranded row gets one system comment on its source issue and one
+  `execution_workspace.issue_terminal_cleanup_escalated` activity row; nothing
+  cleans, removes or returns it. Services remain running while deletion is
+  refused.
   Turning the flag off prevents further widened deletion; it cannot restore
   directories or runtime-owned branches already removed.
 - `PAPERCLIP_WORKSPACE_REAPER_DRY_RUN=1` (or `true`, `yes`) runs the reaper
