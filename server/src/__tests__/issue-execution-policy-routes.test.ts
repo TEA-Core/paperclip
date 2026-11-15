@@ -4128,6 +4128,57 @@ describe("issue execution policy routes", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
+    // SUP-24280: the SUP-24090 shape — an unassigned, half-emitted Wiki
+    // handoff stub. Only a status-only cancellation passes the route guard.
+    function unassignedStub(overrides: Record<string, unknown> = {}) {
+      return {
+        ...issueWithParticipants([maintainerId]),
+        status: "backlog",
+        assigneeAgentId: null,
+        executionPolicy: null,
+        ...overrides,
+      };
+    }
+
+    it("cancels an unassigned stub on a status-only PATCH without writing an assignee (SUP-24280)", async () => {
+      const stub = unassignedStub();
+      mockIssueService.getById.mockResolvedValue(stub);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...stub,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp()).patch(`/api/issues/${issueId}`).send({ status: "cancelled" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(patch.status).toBe("cancelled");
+      expect(patch.assigneeAgentId).toBeUndefined();
+      expect(patch.assigneeUserId).toBeUndefined();
+    });
+
+    it.each([
+      ["a status-only todo write", {}, { status: "todo" }, "wiki_handoff_unassigned"],
+      ["a status-only done write", {}, { status: "done" }, "wiki_handoff_unassigned"],
+      ["a cancellation with an explicit null agent assignee", {}, { status: "cancelled", assigneeAgentId: null }, "wiki_handoff_unassigned"],
+      ["a cancellation with an explicit null user assignee", {}, { status: "cancelled", assigneeUserId: null }, "wiki_handoff_unassigned"],
+      ["a cancellation that assigns a non-canonical agent", {}, { status: "cancelled", assigneeAgentId: otherId }, "wiki_handoff_non_canonical_assignee"],
+      ["a cancellation of a user-owned handoff", { assigneeUserId: "board-owner" }, { status: "cancelled" }, "wiki_handoff_unassigned"],
+    ])("keeps refusing %s on an unassigned stub (SUP-24280)", async (_name, issueOverrides, body, reason) => {
+      mockIssueService.getById.mockResolvedValue(unassignedStub(issueOverrides));
+
+      const res = await request(await createApp()).patch(`/api/issues/${issueId}`).send(body);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details).toMatchObject({
+        guard: "assignee_review_gate",
+        subGuard: "wiki_handoff",
+        reason,
+      });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
     // SUP-23890 / SUP-23886: canonical in_progress handoff with an ACTIVE
     // issuing run entering a user-only review stage. The route must project
     // the workflow-controlled user seating into the update patch (so the
