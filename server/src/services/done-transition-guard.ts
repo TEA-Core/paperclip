@@ -684,6 +684,34 @@ export const LADDER_REFUSAL_REPEAT_WINDOW_SECONDS = 60 * 60;
 const LADDER_REFUSED_ACTION = "issue.done_transition_ladder_refused";
 const LADDER_REFUSAL_REPEATED_ACTION = "issue.done_transition_ladder_refusal_repeated";
 
+/**
+ * SUP-24298: a done write refused with 422 `done_transition_missing_tier_declaration`
+ * leaves its own refusal-class row, countable like `LADDER_REFUSED_ACTION`. The row
+ * is written per refused write: the thread remedy comment is deduped per guard code
+ * (`postTerminalStatusRefusalComment`), so a repeated refusal posts no second
+ * comment and this row is the only per-write machine trace. Never throws, so the
+ * HTTP result of the refusal is unchanged by a failed audit write.
+ */
+export const DONE_TRANSITION_REFUSED_ACTION = "issue.done_transition_refused";
+
+export async function writeDoneTransitionRefusedAuditLog(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  details: {
+    code: "done_transition_missing_tier_declaration";
+    httpStatus: 422;
+    reason: string;
+    decisionCarried: boolean;
+    runId: string | null;
+    stage?: string;
+  },
+): Promise<void> {
+  await writeAuditLog(db, issue, DONE_TRANSITION_REFUSED_ACTION, {
+    ...details,
+    source: "done_transition_guard",
+  });
+}
+
 async function writeLadderRefusalAuditLog(
   db: Db,
   issue: { id: string; companyId: string; identifier: string | null },

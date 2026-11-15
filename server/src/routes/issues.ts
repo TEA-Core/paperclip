@@ -296,6 +296,7 @@ import {
   TIER1_FORM,
   verifyNoRepositoryLandingAtTransition,
   writeAuditLog,
+  writeDoneTransitionRefusedAuditLog,
   type DoneTierClosingActor,
   type DoneTransitionOverride,
   type NoRepositoryLandingCloseRequest,
@@ -5514,12 +5515,28 @@ export function issueRoutes(
     const guardResult = await evaluateDoneTransitionGuard(db, issue, override, decisionCarried);
     const overrideAccepted =
       !!override && guardResult.allowed && guardResult.reason === `Override accepted: ${override.disposition}`;
+    // SUP-24298: `issue.done_transition_guard_skipped` is the guard's "transition
+    // allowed" disposition, so it is written only once this function has decided
+    // to allow the close (see recordGuardSkipDisposition below). A later tier or
+    // cited-SHA refusal must not leave an allowed disposition on the thread.
+    // The guard's own refusal (409) is not an allowed disposition either, but a
+    // skipped result is allowed by construction, so that branch needs no extra row.
+    const recordGuardSkipDisposition = () => {
+      if (!guardResult.skipped) return;
+      void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+        reason: guardResult.reason,
+        skipReason: guardResult.skipReason,
+        branch: guardResult.branch,
+        defaultRef: guardResult.defaultRef,
+        owner: guardResult.owner,
+        repo: guardResult.repo,
+        decisionCarried,
+        source: "done_transition_guard",
+      });
+    };
     if (guardResult.skipped || guardResult.skipReason) {
-      void writeAuditLog(
-        db,
-        issue,
-        guardResult.skipped ? "issue.done_transition_guard_skipped" : "issue.done_transition_guard_note",
-        {
+      if (!guardResult.skipped) {
+        void writeAuditLog(db, issue, "issue.done_transition_guard_note", {
           reason: guardResult.reason,
           skipReason: guardResult.skipReason,
           branch: guardResult.branch,
@@ -5528,8 +5545,8 @@ export function issueRoutes(
           repo: guardResult.repo,
           decisionCarried,
           source: "done_transition_guard",
-        },
-      );
+        });
+      }
       if (
         persistRefusalComment &&
         guardResult.skipped &&
@@ -5627,6 +5644,7 @@ export function issueRoutes(
       // SUP-13939: board closes are exempt from the tier-evidence requirement, but the
       // bypass itself is recorded so board closes stay countable in the ghost-PASS
       // census (an unexplained "skip" would look exactly like the old silent gap).
+      recordGuardSkipDisposition();
       void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
         reason: "Board actor bypassed the done-tier close-evidence requirement",
         skipReason: "board_actor_bypass",
@@ -5686,6 +5704,16 @@ export function issueRoutes(
           ` or ${TIER1_FORM}` +
           noRepositoryTier1FormSuffix(issue) +
           ` — per SUP-12693.`);
+      // SUP-24298: one refusal row per refused write, written before the deduped
+      // thread comment (a coalesced remedy comment must not erase the write's own
+      // trace) and whether or not this door persists the comment.
+      await writeDoneTransitionRefusedAuditLog(db, issue, {
+        code: "done_transition_missing_tier_declaration",
+        httpStatus: 422,
+        reason: tierResult.reason,
+        decisionCarried,
+        runId,
+      });
       // SUP-17125: leave a thread-readable refusal record before responding. Fail-closed:
       // a record-write failure propagates to the route's error handler (5xx) rather than
       // returning a 422 with no thread-readable code/remedy (SUP-15878 precedent).
@@ -5789,6 +5817,8 @@ export function issueRoutes(
         "cited-SHA resolution failed; done transition allowed (fail open)",
       );
     }
+    // The close is allowed on every check above, including the cited-SHA refusal.
+    recordGuardSkipDisposition();
     return { ok: true, overrideAccepted, noRepositoryLanding: tierResult.landing === "noRepositoryLanding" };
   }
 
@@ -21583,6 +21613,14 @@ export function issueRoutes(
         // SUP-22570 / SUP-17125: the transactional re-probe refused and the
         // update rolled back; leave the same thread-readable refusal record the
         // pre-transaction tier refusal leaves, fail-closed.
+        await writeDoneTransitionRefusedAuditLog(db, existing, {
+          code: "done_transition_missing_tier_declaration",
+          httpStatus: 422,
+          reason: err.message,
+          decisionCarried: !!transition.decision,
+          runId: actor.runId ?? null,
+          stage: "no_repository_landing_transition_recheck",
+        });
         await postTerminalStatusRefusalComment(svc, existing.id, {
           httpStatus: 422,
           code: "done_transition_missing_tier_declaration",
