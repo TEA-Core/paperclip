@@ -1735,6 +1735,56 @@ describeEmbeddedPostgres("attention service", () => {
     expect(visibleApproval).toBeTruthy();
   });
 
+  // SUP-24337: agents cannot set `decideBy`, so a pending confirmation that
+  // arrived on an earlier day must still count toward the desk badge.
+  it("keeps a pending interaction in the desk badge after its arrival day, and nothing else", async () => {
+    const { companyId, workerId } = await seedCompany("ADB");
+    // Clock 30 days ahead so rows seeded at real time (e.g. the errored agent
+    // from seedCompany) are also from an earlier day and do not mask the result.
+    const now = Date.now() + 30 * 24 * 60 * 60_000;
+    const yesterday = new Date(now - 24 * 60 * 60_000);
+    const interactionRow = (issueId: string, status: string, title: string) => ({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status,
+      continuationPolicy: "wake_assignee",
+      createdByAgentId: workerId,
+      title,
+      payload: { version: 1, prompt: title },
+      createdAt: yesterday,
+      updatedAt: yesterday,
+    });
+    const pendingIssueId = await insertIssue({ companyId, identifier: "ADB-1", title: "Pending", status: "in_progress" });
+    const decidedIssueId = await insertIssue({ companyId, identifier: "ADB-2", title: "Decided", status: "in_progress" });
+    await db.insert(issueThreadInteractions).values([
+      interactionRow(pendingIssueId, "pending", "Still pending"),
+      interactionRow(decidedIssueId, "accepted", "Accepted"),
+      interactionRow(decidedIssueId, "rejected", "Rejected"),
+      interactionRow(decidedIssueId, "cancelled", "Cancelled"),
+      interactionRow(decidedIssueId, "expired", "Expired"),
+    ]);
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "hire_agent",
+      status: "pending",
+      payload: { title: "Yesterday approval" },
+      createdAt: yesterday,
+      updatedAt: yesterday,
+    });
+
+    const feed = await attentionService(db, { now: () => now }).list(companyId, { userId: "board-user" });
+
+    // Both sources are visible but neither arrived today nor carries decideBy.
+    expect(feed.items.map((item) => item.subject.id)).toContain(approvalId);
+    expect(feed.items.filter((item) => item.sourceKind === "issue_thread_interaction").map((item) => item.subject.title))
+      .toEqual(["Still pending"]);
+    expect(feed.deskBadgeCount).toBe(1);
+  });
+
   it("enriches, filters, paginates, snoozes, and ranks the decide-now feed", async () => {
     const { companyId, workerId, errorAgentId } = await seedCompany("ATP");
     const now = Date.now();
