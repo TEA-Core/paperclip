@@ -28,6 +28,7 @@ import {
   assertWikiHandoffWriteIntegrity,
   findSelfSatisfyingReviewStage,
   resolveCanonicalWikiMaintainerAgentId,
+  isUnassignedWikiHandoffCancellation,
   wikiHandoffWriteWouldViolate,
 } from "../services/issue-assignee-review-gate.js";
 import { recoveryService } from "../services/recovery/service.js";
@@ -663,6 +664,31 @@ describe("wiki handoff write integrity (SUP-21752, pure helpers)", () => {
       keptAssigneeAgentId: CANONICAL,
     });
   });
+
+  describe("unassigned-stub cancellation exemption (SUP-24280)", () => {
+    const stubCancel = {
+      requestedStatus: "cancelled",
+      assigneeFieldWritten: false,
+      currentAssigneeAgentId: null,
+      currentAssigneeUserId: null,
+    } as const;
+
+    it("admits a status-only cancellation of an unowned stub", () => {
+      expect(isUnassignedWikiHandoffCancellation(stubCancel)).toBe(true);
+    });
+
+    it.each([
+      ["a status other than cancelled", { requestedStatus: "done" }],
+      ["no requested status", { requestedStatus: undefined }],
+      ["an explicit assignee field write", { assigneeFieldWritten: true }],
+      ["a stored agent assignee", { currentAssigneeAgentId: CANONICAL }],
+      ["an unknown stored agent assignee", { currentAssigneeAgentId: undefined }],
+      ["a stored user assignee", { currentAssigneeUserId: USER_ID }],
+      ["an unknown stored user assignee", { currentAssigneeUserId: undefined }],
+    ])("refuses %s", (_name, override) => {
+      expect(isUnassignedWikiHandoffCancellation({ ...stubCancel, ...override })).toBe(false);
+    });
+  });
 });
 
 describeEmbeddedPostgres("wiki handoff canonical resolution (SUP-21752)", () => {
@@ -854,6 +880,50 @@ describeEmbeddedPostgres("wiki handoff canonical resolution (SUP-21752)", () => 
         incomingAssigneeAgentId: maintainerId,
       }),
     ).resolves.toBeUndefined();
+  });
+
+  it("admits the unassigned-stub cancellation only when the door supplies the cancellation shape (SUP-24280)", async () => {
+    const { companyId, intruderId } = await seedHandoffCompany();
+    const write = {
+      db,
+      companyId,
+      issue: {
+        title: "[PPC ER] Weekly Report — handoff to Wiki Maintainer",
+        description: null,
+        executionPolicy: null,
+        executionState: null,
+      },
+      incomingAssigneeAgentId: null,
+      currentAssigneeAgentId: null,
+      checkReviewStage: false,
+    };
+    const cancellation = {
+      requestedStatus: "cancelled",
+      assigneeFieldWritten: false,
+      currentAssigneeUserId: null,
+    };
+
+    await expect(assertWikiHandoffWriteIntegrity({ ...write, cancellation })).resolves.toBeUndefined();
+    await expect(assertWikiHandoffWriteIntegrity(write)).rejects.toMatchObject({
+      status: 422,
+      details: { subGuard: "wiki_handoff", reason: "wiki_handoff_unassigned" },
+    });
+    await expect(
+      assertWikiHandoffWriteIntegrity({ ...write, cancellation: { ...cancellation, requestedStatus: "todo" } }),
+    ).rejects.toMatchObject({ status: 422, details: { reason: "wiki_handoff_unassigned" } });
+    // A cancellation of a handoff held by a non-canonical agent stays refused.
+    await expect(
+      assertWikiHandoffWriteIntegrity({
+        ...write,
+        incomingAssigneeAgentId: intruderId,
+        currentAssigneeAgentId: intruderId,
+        cancellation,
+      }),
+    ).rejects.toMatchObject({ status: 422, details: { reason: "wiki_handoff_non_canonical_assignee" } });
+    // A door that does not name the stored agent assignee gets no exemption.
+    await expect(
+      assertWikiHandoffWriteIntegrity({ ...write, currentAssigneeAgentId: undefined, cancellation }),
+    ).rejects.toMatchObject({ status: 422, details: { reason: "wiki_handoff_unassigned" } });
   });
 
   it("recovery keeps the canonical maintainer when the recovery owner is not canonical", async () => {
