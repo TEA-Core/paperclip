@@ -5040,6 +5040,57 @@ describe("issue execution policy routes", () => {
       );
     });
 
+    it("re-wakes the participant when the deferred preflight finds the card changed after the suppressed cancel", async () => {
+      const { stage1Id } = mockStageHandoff();
+      const issue = await mockIssueService.getById();
+      const approvedIssue = {
+        ...issue,
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [{
+            id: stage1Id,
+            type: "approval",
+            participants: [{ type: "agent", agentId: reviewerAgentId }],
+          }],
+        }),
+        executionState: {
+          ...issue.executionState,
+          currentStageType: "approval",
+          returnAssignee: { type: "agent", agentId: nextAgentId },
+        },
+      };
+      // Once the cancel has landed, the post-stop re-read sees a card that
+      // moved during the stop, so the deferred preflight refuses with 409.
+      mockIssueService.getById.mockImplementation(async () =>
+        mockHeartbeatService.cancelRun.mock.calls.length > 0
+          ? { ...approvedIssue, title: "Changed during the stop" }
+          : approvedIssue);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId,
+      }))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "done",
+          assigneeAgentId: nextAgentId,
+          comment: "Final approval passed.",
+          doneTier: {
+            tier: "tier2",
+            probeEvidence: "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records",
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.releaseIssueExecutionAndPromote).toHaveBeenCalledTimes(1);
+      expect(mockHeartbeatService.releaseIssueExecutionAndPromote).toHaveBeenCalledWith(
+        expect.objectContaining({ id: runId, status: "cancelled" }),
+      );
+    });
+
     it("still recovers after a terminalizing PATCH that changes neither assignee nor stage", async () => {
       const issue = {
         id: issueId,
