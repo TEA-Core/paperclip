@@ -1752,7 +1752,7 @@ describeEmbeddedPostgres("attention service", () => {
       continuationPolicy: "wake_assignee",
       createdByAgentId: workerId,
       title,
-      payload: { version: 1, prompt: title },
+      payload: { version: 1, prompt: title } as typeof issueThreadInteractions.$inferInsert.payload,
       createdAt: yesterday,
       updatedAt: yesterday,
     });
