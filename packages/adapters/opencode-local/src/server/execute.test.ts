@@ -59,14 +59,14 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
 
 // These suites mock the process runner. A bare `opencode` command would still be
 // probed for `--version` with a real child process and resolve to whatever the
-// host has on PATH (a V2 build changes argv and config), so treat it as undetected.
+// host has on PATH (a V2 build changes argv and config), so report a fixed V1.
 vi.mock("./version.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./version.js")>();
   return {
     ...actual,
     probeOpenCodeCliVersion: (input: Parameters<typeof actual.probeOpenCodeCliVersion>[0]) =>
       input.target?.kind !== "remote" && input.command === "opencode"
-        ? Promise.resolve(null)
+        ? Promise.resolve({ ok: true as const, version: { version: "1.17.9", major: 1, supported: true } })
         : actual.probeOpenCodeCliVersion(input),
   };
 });
@@ -523,7 +523,7 @@ describe("OpenCode local chat policy", () => {
 
   it.each([false, true])("keeps chat policy with a legacy OpenCode prompt (custom=%s)", async (custom) => {
     const commandPath = path.join(configHome, "fake-opencode");
-    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '1.17.9\\n'; fi\nexit 0\n", { mode: 0o755 });
     runAdapterExecutionTargetProcessMock.mockReset();
     runAdapterExecutionTargetProcessMock.mockResolvedValue(probeResult({ stdout: JSON.stringify({
       type: "text", sessionID: "chat-session", part: { text: "Reply" },
@@ -561,7 +561,7 @@ describe("OpenCode local chat policy", () => {
   // carries the session's cwd to keep the first attempt a resume.
   it("delivers assignment context on an ordinary task turn and rebuilds it after resume fallback", async () => {
     const commandPath = path.join(configHome, "fake-opencode-context");
-    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '1.17.9\\n'; fi\nexit 0\n", { mode: 0o755 });
     const prompts: string[] = [];
     runAdapterExecutionTargetProcessMock
       .mockReset()
@@ -687,7 +687,7 @@ describe("execute — OpenRouter credentials", () => {
     const apiKey = "openrouter-test-secret";
     const model = "openrouter/anthropic/claude-sonnet-4.5";
     await fs.mkdir(workspace, { recursive: true });
-    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", "utf8");
+    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '1.17.9\\n'; fi\nexit 0\n", "utf8");
     await fs.chmod(commandPath, 0o755);
     runAdapterExecutionTargetProcessMock.mockReset();
     runAdapterExecutionTargetProcessMock.mockImplementation(async (_runId: string, _target: unknown, _command: string, args: string[]) => {
@@ -2388,7 +2388,7 @@ describe("execute — GitHub App run-env gates (SUP-14869)", () => {
     scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gh-scratch-"));
     fakeGhDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gh-bin-"));
     const fakeGh = path.join(fakeGhDir, "gh");
-    await fs.writeFile(fakeGh, "#!/bin/sh\nexit 0\n", "utf8");
+    await fs.writeFile(fakeGh, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '1.17.9\\n'; fi\nexit 0\n", "utf8");
     await fs.chmod(fakeGh, 0o755);
     savedPath = process.env.PATH;
     process.env.PATH = `${fakeGhDir}${path.delimiter}${savedPath ?? ""}`;

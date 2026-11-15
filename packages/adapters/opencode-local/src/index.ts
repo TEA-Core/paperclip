@@ -99,7 +99,7 @@ Core fields:
 - dangerouslySkipPermissions (boolean, optional): inject a runtime OpenCode config with \`permission=allow\` for all tools and connections; defaults to true for unattended Paperclip runs
 - promptTemplate (string, optional): run prompt template
 - command (string, optional): defaults to "opencode"
-- cliVersion (string, optional): exact OpenCode CLI version; only ${OPENCODE_V2_CLI_VERSION} is accepted and it enables V2 arguments and standalone execution. When omitted, the adapter probes \`command --version\`: a 1.x binary runs as V1, a detected 2.x binary other than ${OPENCODE_V2_CLI_VERSION} is refused, and a version that cannot be determined (probe failed, timed out, or empty or unparseable output) is treated as V1
+- cliVersion (string, optional): exact OpenCode CLI version; only ${OPENCODE_V2_CLI_VERSION} is accepted and it enables V2 arguments and standalone execution. When omitted, the adapter probes \`command --version\`: a 1.x binary runs as V1, a detected 2.x binary other than ${OPENCODE_V2_CLI_VERSION} is refused, and a version that cannot be determined (probe failed, timed out, or empty, unparseable or prerelease output) is refused rather than run as V1
 - extraArgs (string[], optional): additional CLI args
 - env (object, optional): KEY=VALUE environment variables
 - skillIsolation (string, optional): "shared" (default) or "desired-only". "shared"

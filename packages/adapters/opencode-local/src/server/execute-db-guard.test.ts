@@ -50,7 +50,7 @@ vi.mock("./version.js", async (importOriginal) => {
     ...actual,
     probeOpenCodeCliVersion: (input: Parameters<typeof actual.probeOpenCodeCliVersion>[0]) =>
       input.target?.kind !== "remote" && input.command === "opencode"
-        ? Promise.resolve(null)
+        ? Promise.resolve({ ok: true as const, version: { version: "1.17.9", major: 1, supported: true } })
         : actual.probeOpenCodeCliVersion(input),
   };
 });

@@ -110,6 +110,7 @@ import {
 import { formatOpenCodeSkillExposureLine } from "./exposure-line.js";
 import {
   isOpenCodeV2CliVersion,
+  openCodeVersionProbeRefusal,
   probeOpenCodeCliVersion,
   unsupportedDetectedOpenCodeV2CliVersionMessage,
   unsupportedOpenCodeV2CliVersionMessage,
@@ -983,27 +984,39 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     installCommand: SANDBOX_INSTALL_COMMAND,
     timeoutSec,
   });
-  const detectedCliVersion = await probeOpenCodeCliVersion({
-    runId: `${runId}:opencode-version`,
-    command,
-    target: executionTarget,
-    cwd: effectiveExecutionCwd,
-    env: initialRuntimeEnv,
-    timeoutSec,
-    graceSec,
-  });
-  // Only a detected 2.x version other than the pin is refused. A version that
-  // cannot be determined (probe failed, timed out, or empty or unparseable
-  // output) leaves cliVersion undefined and is treated as V1.
-  const cliVersion = configuredCliVersion || detectedCliVersion?.version;
-  if (cliVersion && isOpenCodeV2CliVersion(cliVersion) && cliVersion !== OPENCODE_V2_CLI_VERSION) {
+  // A configured cliVersion (already checked against the pin above) is verified
+  // against the binary later. Otherwise the version comes from the binary, and a
+  // version that cannot be determined is refused, never run as V1.
+  let cliVersion: string | undefined = configuredCliVersion || undefined;
+  let versionRefusal: string | null = null;
+  if (!configuredCliVersion) {
+    const probe = await probeOpenCodeCliVersion({
+      runId: `${runId}:opencode-version`,
+      command,
+      target: executionTarget,
+      cwd: effectiveExecutionCwd,
+      env: initialRuntimeEnv,
+      timeoutSec,
+      graceSec,
+    });
+    if (!probe.ok) {
+      versionRefusal = openCodeVersionProbeRefusal(command, probe).message;
+    } else {
+      cliVersion = probe.version.version;
+      // Only a detected 2.x version other than the pin is refused.
+      if (isOpenCodeV2CliVersion(cliVersion) && cliVersion !== OPENCODE_V2_CLI_VERSION) {
+        versionRefusal = unsupportedDetectedOpenCodeV2CliVersionMessage(command, cliVersion);
+      }
+    }
+  }
+  if (versionRefusal) {
     // The per-run skills dirs were staged above and the try/finally that
     // removes them starts later, so remove them before refusing the version.
     await Promise.all([
       localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
       isolatedSkillsHome ? fs.rm(isolatedSkillsHome, { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
     ]);
-    throw new Error(unsupportedDetectedOpenCodeV2CliVersionMessage(command, cliVersion));
+    throw new Error(versionRefusal);
   }
   const openCodeV2 = isOpenCodeV2CliVersion(cliVersion);
   const runtimeMcpServers = openCodeV2 ? await ctx.runtimeMcp?.getServers() ?? [] : [];
