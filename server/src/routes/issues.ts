@@ -5451,7 +5451,12 @@ export function issueRoutes(
   }
 
   type DoneTransitionGuardOutcome =
-    | { ok: true; overrideAccepted?: boolean; noRepositoryLanding?: boolean }
+    | {
+        ok: true;
+        overrideAccepted?: boolean;
+        noRepositoryLanding?: boolean;
+        recordGuardSkipDisposition?: () => void;
+      }
     | { ok: false; status: number; body: Record<string, unknown> };
 
   // Single evaluator for BOTH done-transition guards, shared by every route that can
@@ -5817,9 +5822,13 @@ export function issueRoutes(
         "cited-SHA resolution failed; done transition allowed (fail open)",
       );
     }
-    // The close is allowed on every check above, including the cited-SHA refusal.
+    // A no-repository close is still re-probed inside the write transaction, so
+    // its skip row is handed to the caller to write once that close commits.
+    if (tierResult.landing === "noRepositoryLanding") {
+      return { ok: true, overrideAccepted, noRepositoryLanding: true, recordGuardSkipDisposition };
+    }
     recordGuardSkipDisposition();
-    return { ok: true, overrideAccepted, noRepositoryLanding: tierResult.landing === "noRepositoryLanding" };
+    return { ok: true, overrideAccepted, noRepositoryLanding: false };
   }
 
   // Every route that can resolve a blocker routes its dependent wake through these
@@ -20511,6 +20520,7 @@ export function issueRoutes(
     // SUP-22570: the closer of an accepted record_only no-repository close; the
     // same checks re-run inside the update transaction below.
     let noRepositoryLandingCloser: DoneTierClosingActor | null = null;
+    let recordDeferredGuardSkipDisposition: (() => void) | undefined;
     let originalDeliveryBinding: string | null = null;
     // Refuse before evaluateDoneTransitionGuards. That guard writes
     // issue.done_tier_declaration_skipped, and the later side-effect reject
@@ -20555,7 +20565,10 @@ export function issueRoutes(
         return;
       }
       doneOverrideAccepted = outcome.overrideAccepted === true;
-      if (outcome.noRepositoryLanding === true) noRepositoryLandingCloser = closingActor;
+      if (outcome.noRepositoryLanding === true) {
+        noRepositoryLandingCloser = closingActor;
+        recordDeferredGuardSkipDisposition = outcome.recordGuardSkipDisposition;
+      }
       if (terminalApprovalNeedsClassificationCheck) {
         finalDeliveryPrefetch = await prefetchFinalDelivery(finalDeliveryIssue);
         deferFinalDeliveryPrefetch = Boolean(existing.assigneeAgentId && (assigneeWillChange || terminalizingIssue));
@@ -21639,6 +21652,7 @@ export function issueRoutes(
       res.status(404).json({ error: "Issue not found" });
       return;
     }
+    recordDeferredGuardSkipDisposition?.();
     if (pendingReassignmentStopRunId) {
       let cancellationFailed = false;
       let cancellationError: unknown;

@@ -1216,6 +1216,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       httpStatus: 422,
       runId: fixture.actor.runId,
     });
+    expect(await activityCount(fixture.issueId, "issue.done_transition_guard_skipped")).toBe(0);
   });
 
   // A terminal status is the one mismatch that leaves the row changed by someone
