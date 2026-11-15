@@ -33,8 +33,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   reportRunActivity: vi.fn(async () => undefined),
   getRun: vi.fn(async () => null as unknown),
   getActiveRunForAgent: vi.fn(async () => null as unknown),
-  cancelRun: vi.fn(async () => null as unknown),
-  releaseIssueExecutionAndPromote: vi.fn(async () => undefined),
+  cancelRun: vi.fn(async () => null as unknown), releaseIssueExecutionAndPromote: vi.fn(async () => undefined),
 }));
 const mockExecutionWorkspaceService = vi.hoisted(() => ({
   getById: vi.fn(async () => null as unknown),
