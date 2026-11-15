@@ -9,6 +9,8 @@ Approval delivery is bound to one verified pull request, not to a title, branch 
 - `headSha`: the reviewed pull request head commit
 - `sourceIssueId`: the authorizing issue when present
 
+A record made by `deliver.sh --bind-existing-pr` (AS-05) carries two branches: `branch` is the verified pull request head branch, and `cardBranch` — stamped by the server from the control plane, never client-supplied — is the card's own execution-workspace (or legitimate ADR-083 carrier) branch. Such a record is marked `kind: "as05_bound_pr"`; `kind` and `cardBranch` are server-owned, and the write schema rejects them if a client sends them. The two halves validate differently: ADR-091 D1 branch ownership applies to `cardBranch`; pull-request identity applies to `branch`. On an isolated-workspace card the pull request head is intentionally not the card's worktree branch, which is exactly why the two are recorded separately.
+
 ## Verification
 
 Before approval status is published or merge arming proceeds, the server validates the binding against the live GitHub pull request:
@@ -19,7 +21,10 @@ Before approval status is published or merge arming proceeds, the server validat
 4. Its live head branch must equal `branch`.
 5. Its live head SHA must equal `headSha`.
 6. The pull request repository must equal the project's delivery repository, and so must its head repository: a fork-head PR is refused, and a merged-only binding also refuses an absent head repository.
-7. Cached linked-PR metadata is used only to preserve the GraphQL node ID; it does not replace live verification.
+7. For an AS-05 record, `cardBranch` must equal the card's control-plane delivery branch and that branch must be one the card may lawfully deliver on (ADR-091 D1); the same ownership gate runs at write time, where the server — not the client — derives it.
+8. Cached linked-PR metadata is used only to preserve the GraphQL node ID; it does not replace live verification.
+
+The write-time check (PATCH `/issues/:id` with `deliveryIdentity` carrying both `prNumber` and `prUrl`) runs the same shared verifiers — the static source-issue/canonical-URL validation and the exact live pull-request verification — so what is recorded is exactly what approval time will re-verify. A partial binding (exactly one of `prNumber`/`prUrl`), a non-canonical URL, a client `sourceIssueId` naming another issue, an illegitimate `cardBranch`, or any live mismatch (head branch, head SHA, draft, closed-unmerged) is refused with no write.
 
 The exact pull request is selected by number and repository. Title text, issue-reference mentions, branch-only matches, PR URL prefixes, and the first or only same-branch candidate are not authoritative.
 

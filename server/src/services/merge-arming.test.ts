@@ -22,6 +22,7 @@ import {
   issueExecutionDecisions,
   issueThreadInteractions,
   issues,
+  heartbeatRuns,
   projectWorkspaces,
   projects,
   type Db,
@@ -63,6 +64,7 @@ import {
   resolveApprovalDecisionHead,
   resolveCardDeliveryBranchOwnership,
   resolveCardPullRequest,
+  resolveDeliveryIdentity,
   resolveLinkedPullRequests,
   resolveLinkedPullRequestsWithState,
   writeCommitStatusWithRetry,
@@ -76,6 +78,9 @@ import {
 // harness. These imports are used only by that suite.
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+// SUP-23026: the AS-05 write-path regressions assert the GENERATED OpenAPI
+// schema advertises the paired optional PR binding fields on PATCH /issues/:id.
+import { buildOpenApiSpec } from "../routes/openapi.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -3402,6 +3407,136 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     });
   });
 
+  // SUP-23026 (AS-05 bind-existing-pr, ADR-091 D1): a bound-PR delivery record
+  // carries the verified PR HEAD branch in `branch` and the card's control-plane
+  // delivery branch in `cardBranch`. D1 ownership validates `cardBranch`; the PR
+  // identity validates `branch`. The bug being repaired: resolveDeliveryIdentity
+  // ran the D1 exact-branch comparison against the PR head branch, so every
+  // bind-existing-pr card on an isolated workspace (PR head != card branch) was
+  // recordedUnusable and its verified PR was refused at every approval-time
+  // consumer (the SUP-22287 #1030 shape).
+  describe("SUP-23026: AS-05 bound-pr delivery identity (kind as05_bound_pr)", () => {
+    const PR_HEAD = "SUP-23026-bound-pr-head"; // deliberately != the card branch
+    const PR_SHA = "5e6a2f1c0b3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f";
+    const PR_HTML_URL = `https://github.com/${OWNER}/${REPO}/pull/42`;
+
+    function as05Delivery(overrides: Record<string, unknown> = {}) {
+      return {
+        kind: "as05_bound_pr",
+        repo: { owner: OWNER, repo: REPO },
+        branch: PR_HEAD,
+        cardBranch: "SUP-42-branch",
+        headSha: PR_SHA,
+        prNumber: 42,
+        prUrl: PR_HTML_URL,
+        ...overrides,
+      };
+    }
+
+    it("resolveDeliveryIdentity returns the PR head + binding while D1 validates cardBranch", async () => {
+      const issueId = await insertIssue({ delivery: as05Delivery() });
+      installRoutes([{ url: PR_URL, body: prHeadBody(PR_SHA, PR_HEAD) }]);
+
+      const identity = await resolveDeliveryIdentity(db, companyId, issueId);
+
+      expect(identity.branch).toBe(PR_HEAD);
+      expect(identity.binding).toMatchObject({
+        branch: PR_HEAD,
+        prNumber: 42,
+        prUrl: PR_HTML_URL,
+        headSha: PR_SHA,
+      });
+      expect(identity.branchIsOwn).toBe(true);
+      expect(identity.recordedUnusable).toBeUndefined();
+    });
+
+    it("fails closed when the AS-05 cardBranch is not the control-plane branch", async () => {
+      const issueId = await insertIssue({
+        branchName: "SUP-23026-other-card-branch",
+        delivery: as05Delivery(),
+      });
+
+      const identity = await resolveDeliveryIdentity(db, companyId, issueId);
+
+      expect(identity.branch).toBeNull();
+      expect(identity.binding).toBeUndefined();
+      expect(identity.recordedUnusable).toContain("card");
+    });
+
+    it("fails closed when an AS-05 record has no cardBranch or incomplete PR fields", async () => {
+      const noCardBranch = await insertIssue({
+        identifier: "SUP-23026-a",
+        delivery: as05Delivery({ cardBranch: undefined }),
+      });
+      const noPrNumber = await insertIssue({
+        identifier: "SUP-23026-b",
+        delivery: as05Delivery({ prNumber: undefined }),
+      });
+      const noPrUrl = await insertIssue({
+        identifier: "SUP-23026-c",
+        delivery: as05Delivery({ prUrl: undefined }),
+      });
+
+      for (const issueId of [noCardBranch, noPrNumber, noPrUrl]) {
+        const identity = await resolveDeliveryIdentity(db, companyId, issueId);
+        expect(identity.branch).toBeNull();
+        expect(identity.recordedUnusable).toBeTruthy();
+      }
+    });
+
+    it("narrowToDelivered narrows to the exact bound PR although its head is not the card branch (SUP-22287)", async () => {
+      const issueId = await insertIssue({ delivery: as05Delivery() });
+      installRoutes([{ url: PR_URL, body: prHeadBody(PR_SHA, PR_HEAD) }]);
+      const candidates = [
+        {
+          number: 43,
+          owner: OWNER,
+          repo: REPO,
+          headRefName: "SUP-42-branch",
+          displayName: `${OWNER}/${REPO}#43`,
+        },
+      ];
+
+      const narrowed = await narrowToDelivered(db, companyId, issueId, candidates);
+
+      expect(narrowed.outcome).toBe("narrowed");
+      if (narrowed.outcome !== "narrowed") throw new Error("expected narrowed");
+      expect(narrowed.delivered).toHaveLength(1);
+      expect(narrowed.delivered[0]!.number).toBe(42);
+      expect(narrowed.deliveryBranch).toBe(PR_HEAD);
+    });
+
+    it("publishApprovalStatus stamps the bound PR on an AS-05 record with zero mentions", async () => {
+      const issueId = await insertIssue({ delivery: as05Delivery() });
+      installRoutes([
+        { url: PR_URL, body: prHeadBody(PR_SHA, PR_HEAD) },
+        { url: POST_STATUS_URL(PR_SHA), body: {} },
+      ]);
+
+      const outcome = await publishApprovalStatus(db, companyId, issueId, "SUP-42", {
+        closingTransition: true,
+        enforceDeliveryIdentity: true,
+      });
+
+      expect(outcome.kind).toBe("armed");
+      expect(outcome.headSha).toBe(PR_SHA);
+      expect(postStatusShas()).toEqual([PR_SHA]);
+    });
+
+    it("fails closed (never falls back to discovery) when the bound PR's live head moved", async () => {
+      const issueId = await insertIssue({ delivery: as05Delivery() });
+      // A mention of a PR on the CARD branch would satisfy discovery resolution;
+      // the binding must still win and still fail closed on the stale pin.
+      await insertMention(issueId, { headRefName: "SUP-42-branch" });
+      installRoutes([{ url: PR_URL, body: prHeadBody(LIVE_HEAD, PR_HEAD) }]);
+
+      const decisionHead = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(decisionHead.kind).toBe("unresolvable");
+      if (decisionHead.kind !== "unresolvable") throw new Error("expected unresolvable decision head");
+      expect(decisionHead.reason).toContain("head SHA");
+    });
+  });
+
   // SUP-15394 (root SUP-15393): on the zero-mention card, publishApprovalStatus
   // resolves a PR via live workspace discovery, stamps it, and hands the actuator
   // the EXACT PR it certified. The actuator must arm THAT PR instead of running a
@@ -6469,5 +6604,467 @@ describe("disableAutoMerge (SUP-20772 round 10)", () => {
     const merged = await disableAutoMerge("t", NODE);
     expect(merged.success).toBe(false);
     expect(merged.error).toContain("already merged");
+  });
+});
+
+// SUP-23026 (AS-05 bind-existing-pr, ADR-091 D1): the PATCH /issues/:id
+// delivery-identity write path for a bound PR. deliver.sh --bind-existing-pr
+// sends branch = the VERIFIED PR HEAD branch, which on an isolated-workspace
+// card is never the card's own worktree branch — so the D1 exact-branch
+// equality that guards generic records cannot be applied to the PR head. The
+// repair: when the client binds a PR (both prNumber and prUrl), the route
+// verifies the exact PR with the SAME shared verifier approval time uses,
+// derives the card branch from the control plane, and stamps
+// kind=as05_bound_pr + cardBranch server-side. The client can never assert the
+// representation: the strict schema rejects kind/cardBranch outright.
+describeEmbeddedPostgres("PATCH /issues/:id AS-05 bound-pr delivery identity (SUP-23026)", () => {
+  let db: Db;
+  let app: express.Express;
+  let currentActor: Express.Request["actor"];
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let previousSchedulingSuppression: string | undefined;
+
+  const PATCH_USER_ID = "as05-patch-user-1";
+  const CARD_BRANCH = "SUP-23026-card-branch";
+  const PR_HEAD = "SUP-23026-bound-pr-head";
+  const PR_SHA = "9f8e7d6c5b4a392817655443322110ffeeddccbba";
+  const PR_HTML_URL = `https://github.com/${OWNER}/${REPO}/pull/42`;
+
+  beforeAll(async () => {
+    previousSchedulingSuppression = process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+    process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = "true";
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-as05-delivery-write-");
+    db = createDb(tempDb.connectionString);
+    app = createApp();
+  }, 60_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+    if (previousSchedulingSuppression === undefined) {
+      delete process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+    } else {
+      process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = previousSchedulingSuppression;
+    }
+  });
+
+  beforeEach(async () => {
+    vi.resetAllMocks();
+    // Same secret resolution as the d2a suite: no app-installation key, a
+    // company-scope GITHUB_TOKEN the verifier can use.
+    mockGetByName.mockImplementation(async (_companyId: string, name: string) => {
+      if (name === GITHUB_APP_PRIVATE_KEY_SECRET_NAME) return null;
+      if ((GITHUB_TOKEN_SECRET_NAMES as readonly string[]).includes(name)) {
+        return { id: "secret-1", name };
+      }
+      return null;
+    });
+    mockResolveSecretValue.mockResolvedValue(GITHUB_TOKEN);
+    mockGhFetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({}) } as unknown as Response);
+
+    await db.delete(issueExecutionDecisions);
+    await db.delete(agentWakeupRequests);
+    await db.delete(issues);
+    await db.delete(activityLog);
+    await db.delete(heartbeatRuns);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(agents);
+    await db.delete(companyMemberships);
+    await db.delete(companies);
+  });
+
+  function createApp() {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = currentActor;
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as never));
+    app.use(errorHandler);
+    return app;
+  }
+
+  function agentActor(companyId: string, agentId: string, runId: string): Express.Request["actor"] {
+    return {
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId,
+    } as unknown as Express.Request["actor"];
+  }
+
+  interface SeedOpts {
+    executionRunId?: string | null;
+    strategyType?: "project_primary" | "git_worktree";
+    deliveryBranch?: string | null;
+    sharedWorkspaceOwnerBranch?: string;
+    unrelatedOwner?: boolean;
+    /** Unique per seeded company: issue_prefix has a UNIQUE index. */
+    issuePrefix?: string;
+  }
+
+  async function seedIssue(opts: SeedOpts = {}) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const now = new Date();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "AS-05 Delivery Co",
+      issuePrefix: opts.issuePrefix ?? "SUP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: PATCH_USER_ID,
+      status: "active",
+      membershipRole: "owner",
+      updatedAt: now,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: `${OWNER}/${REPO}`,
+      status: "in_progress",
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      cwd: "/tmp/test",
+      isPrimary: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    if (opts.executionRunId) {
+      await db.insert(heartbeatRuns).values({
+        id: opts.executionRunId,
+        companyId,
+        agentId,
+        status: "running",
+      });
+    }
+    let carrierOwnerIssueId: string | null = null;
+    if (opts.sharedWorkspaceOwnerBranch) {
+      carrierOwnerIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: carrierOwnerIssueId,
+        companyId,
+        identifier: "SUP-23025-1",
+        issueNumber: 2,
+        title: "Carrier owner card",
+        status: "in_progress",
+        priority: "medium",
+        assigneeUserId: PATCH_USER_ID,
+        createdByUserId: PATCH_USER_ID,
+        projectId,
+        projectWorkspaceId,
+      });
+    }
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      ...(carrierOwnerIssueId
+        ? { mode: "shared_workspace", sourceIssueId: carrierOwnerIssueId }
+        : { mode: "isolated" }),
+      strategyType: opts.strategyType ?? "git_worktree",
+      name: "card-ws",
+      status: "active",
+      branchName: opts.strategyType === "project_primary"
+        ? opts.deliveryBranch ?? null
+        : opts.sharedWorkspaceOwnerBranch ?? CARD_BRANCH,
+      repoUrl: `https://github.com/${OWNER}/${REPO}`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      identifier: `${opts.issuePrefix ?? "SUP"}-23026-1`,
+      issueNumber: 1,
+      title: "AS-05 bound-pr delivery test card",
+      status: "in_progress",
+      priority: "medium",
+      assigneeUserId: PATCH_USER_ID,
+      createdByUserId: PATCH_USER_ID,
+      projectId,
+      projectWorkspaceId,
+      executionWorkspaceId,
+      executionRunId: opts.executionRunId ?? null,
+      ...(carrierOwnerIssueId && !opts.unrelatedOwner ? { parentId: carrierOwnerIssueId } : {}),
+    });
+
+    return { companyId, issueId, agentId };
+  }
+
+  async function readDelivery(issueId: string) {
+    const [row] = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    return ((row?.executionState ?? {}) as Record<string, unknown>).delivery as Record<string, unknown> | undefined;
+  }
+
+  function patchDelivery(extra: Record<string, unknown> = {}) {
+    return {
+      repo: { owner: OWNER, repo: REPO },
+      branch: PR_HEAD,
+      headSha: PR_SHA,
+      prNumber: 42,
+      prUrl: PR_HTML_URL,
+      ...extra,
+    };
+  }
+
+  function livePr(overrides: Record<string, unknown> = {}) {
+    return { state: "open", merged: false, draft: false, head: { ref: PR_HEAD, sha: PR_SHA }, ...overrides };
+  }
+
+  it("accepts a complete AS-05 binding with PR head != card branch and stamps the server-owned record", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId });
+    currentActor = agentActor(companyId, agentId, runId);
+    installRoutes([{ url: PR_URL, body: livePr() }]);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_review", deliveryIdentity: patchDelivery() });
+
+    expect(res.status).toBe(200);
+    const delivery = await readDelivery(issueId);
+    expect(delivery).toBeDefined();
+    expect(delivery!.kind).toBe("as05_bound_pr");
+    expect(delivery!.branch).toBe(PR_HEAD);
+    expect(delivery!.cardBranch).toBe(CARD_BRANCH);
+    expect(delivery!.repo).toEqual({ owner: OWNER, repo: REPO });
+    expect(delivery!.headSha).toBe(PR_SHA);
+    expect(delivery!.prNumber).toBe(42);
+    expect(delivery!.prUrl).toBe(PR_HTML_URL);
+    expect(delivery!.sourceIssueId).toBe(issueId);
+    expect(delivery!.recordedByRunId).toBe(runId);
+    expect(typeof delivery!.recordedAt).toBe("string");
+  });
+
+  it("rejects a partial binding (exactly one of prNumber/prUrl) with no write", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId });
+    currentActor = agentActor(companyId, agentId, runId);
+
+    const prNumberOnly = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_review", deliveryIdentity: patchDelivery({ prUrl: undefined }) });
+    expect(prNumberOnly.status).toBe(422);
+    expect(prNumberOnly.body.code).toBe("delivery_identity_write_rejected");
+
+    const prUrlOnly = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_review", deliveryIdentity: patchDelivery({ prNumber: undefined }) });
+    expect(prUrlOnly.status).toBe(422);
+    expect(prUrlOnly.body.code).toBe("delivery_identity_write_rejected");
+
+    expect(await readDelivery(issueId)).toBeUndefined();
+  });
+
+  it("still rejects a generic foreign branch with no PR binding (ADR-091 D1 unchanged)", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId });
+    currentActor = agentActor(companyId, agentId, runId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        deliveryIdentity: {
+          repo: { owner: OWNER, repo: REPO },
+          branch: "someone-elses-branch",
+          headSha: PR_SHA,
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_branch_write_rejected");
+    expect(await readDelivery(issueId)).toBeUndefined();
+  });
+
+  it("rejects an AS-05 binding on an unrelated shared-workspace owner's branch", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({
+      executionRunId: runId,
+      sharedWorkspaceOwnerBranch: "SUP-23025-owner-branch",
+      unrelatedOwner: true,
+    });
+    currentActor = agentActor(companyId, agentId, runId);
+    installRoutes([{ url: PR_URL, body: livePr() }]);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_review", deliveryIdentity: patchDelivery() });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_branch_write_rejected");
+    expect(await readDelivery(issueId)).toBeUndefined();
+  });
+
+  it("rejects an AS-05 binding on a project_primary workspace with no branch (no carve-out)", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({
+      executionRunId: runId,
+      strategyType: "project_primary",
+      deliveryBranch: null,
+    });
+    currentActor = agentActor(companyId, agentId, runId);
+    installRoutes([{ url: PR_URL, body: livePr() }]);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_review", deliveryIdentity: patchDelivery() });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_branch_write_rejected");
+    expect(await readDelivery(issueId)).toBeUndefined();
+  });
+
+  it("rejects the write when the live PR does not match the binding (shared verifier)", async () => {
+    const cases: Array<{ name: string; body: Record<string, unknown>; expectReason: RegExp }> = [
+      {
+        name: "live head branch moved",
+        body: livePr({ head: { ref: "renamed-head", sha: PR_SHA } }),
+        expectReason: /branch .*does not match the bound PR/,
+      },
+      {
+        name: "live head SHA moved",
+        body: livePr({ head: { ref: PR_HEAD, sha: LIVE_HEAD } }),
+        expectReason: /head SHA .*does not match the bound PR/,
+      },
+      { name: "draft", body: livePr({ draft: true }), expectReason: /draft/ },
+      { name: "closed unmerged", body: livePr({ state: "closed" }), expectReason: /not open/ },
+    ];
+    for (const [index, testCase] of cases.entries()) {
+      const runId = randomUUID();
+      const { companyId, issueId, agentId } = await seedIssue({
+        executionRunId: runId,
+        issuePrefix: `SU${String.fromCharCode(65 + index)}`,
+      });
+      currentActor = agentActor(companyId, agentId, runId);
+      installRoutes([{ url: PR_URL, body: testCase.body }]);
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review", deliveryIdentity: patchDelivery() });
+
+      expect(res.status, testCase.name).toBe(422);
+      expect(res.body.code, testCase.name).toBe("delivery_identity_write_rejected");
+      expect(String((res.body.details as Record<string, unknown>)?.reason), testCase.name)
+        .toMatch(testCase.expectReason);
+      expect(await readDelivery(issueId), testCase.name).toBeUndefined();
+    }
+  });
+
+  it("rejects a non-canonical PR URL", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId });
+    currentActor = agentActor(companyId, agentId, runId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        deliveryIdentity: patchDelivery({ prUrl: `https://github.com/${OWNER}/${REPO}/pull/43` }),
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_write_rejected");
+    expect(await readDelivery(issueId)).toBeUndefined();
+  });
+
+  it("rejects a client sourceIssueId naming another issue", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId });
+    currentActor = agentActor(companyId, agentId, runId);
+    installRoutes([{ url: PR_URL, body: livePr() }]);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        deliveryIdentity: patchDelivery({ sourceIssueId: randomUUID() }),
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_write_rejected");
+    expect(await readDelivery(issueId)).toBeUndefined();
+  });
+
+  it("rejects client-supplied kind/cardBranch (the representation is server-owned)", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId });
+    currentActor = agentActor(companyId, agentId, runId);
+    installRoutes([{ url: PR_URL, body: livePr() }]);
+
+    for (const extra of [{ kind: "as05_bound_pr" }, { cardBranch: CARD_BRANCH }]) {
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review", deliveryIdentity: patchDelivery(extra) });
+      expect(res.status, JSON.stringify(extra)).toBe(400);
+      expect(await readDelivery(issueId)).toBeUndefined();
+    }
+  });
+
+  it("fails closed when no usable GitHub token exists to verify the PR", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId });
+    currentActor = agentActor(companyId, agentId, runId);
+    mockGetByName.mockResolvedValue(null);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_review", deliveryIdentity: patchDelivery() });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_write_rejected");
+    expect(String((res.body.details as Record<string, unknown>)?.reason)).toContain("token");
+    expect(await readDelivery(issueId)).toBeUndefined();
+  });
+
+  it("advertises the paired optional PR binding fields in the generated OpenAPI schema", () => {
+    const spec = buildOpenApiSpec() as {
+      paths: Record<string, Record<string, { requestBody?: { content: Record<string, { schema: unknown }> } }>>;
+    };
+    const patch = spec.paths["/api/issues/{id}"]?.patch;
+    expect(patch).toBeDefined();
+    const schema = patch!.requestBody!.content["application/json"]!.schema as {
+      properties?: { deliveryIdentity?: { properties?: Record<string, unknown> } };
+    };
+    const deliveryIdentity = schema.properties?.deliveryIdentity as
+      | { properties?: Record<string, { type?: string }>; description?: string }
+      | undefined;
+    expect(deliveryIdentity).toBeDefined();
+    expect(deliveryIdentity!.properties!.prNumber).toBeDefined();
+    expect(deliveryIdentity!.properties!.prUrl).toBeDefined();
+    expect(deliveryIdentity!.description).toContain("prNumber");
+    expect(deliveryIdentity!.description).toContain("cardBranch");
   });
 });

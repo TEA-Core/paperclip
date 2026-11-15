@@ -230,6 +230,11 @@ import {
   type DecisionHeadResolution,
   resolveIssueRepoContext,
   resolveCardDeliveryBranchOwnership,
+  // SUP-23026 (AS-05): the write path shares the approval-time verifiers so a
+  // recorded bound-PR identity is proven by the exact same checks that will
+  // re-verify it at publish/arming time.
+  deliveryBindingValidationError,
+  resolveExactBoundPullRequest,
   resolveLinkedPullRequestsWithState,
   publishHeadBoundRelease,
   DEFAULT_RELEASE_DEADLINES,
@@ -20565,59 +20570,194 @@ export function issueRoutes(
         && requestedDeliveryIdentity.prUrl !== undefined
         && branchOwnership.branch !== null
         && requestedDeliveryIdentity.branch === branchOwnership.branch;
-      const recordedBranchMismatch =
-        (!canRecordProjectPrimaryBranch && !boardOrphanDeliveryRecord && !boardTerminalCarrierRecord && branchOwnership.branch === null)
-        || (branchOwnership.branch !== null
-          // Git refs are case-sensitive: the recorded branch must equal the control-plane branch exactly.
-          && requestedDeliveryIdentity.branch !== branchOwnership.branch);
-      if (
-        !canRecordProjectPrimaryBranch
-        && !boardOrphanDeliveryRecord
-        && !boardTerminalCarrierRecord
-        && (!branchOwnership.legitimate || recordedBranchMismatch)
-      ) {
-        const branchReason =
-          branchOwnership.branch === null
-            ? "card has no execution-workspace delivery branch to validate the recorded branch against"
-            : !branchOwnership.legitimate
-              ? branchOwnership.refusalReason ?? "recorded branch is owned by an unrelated issue"
-              : "recorded branch does not match this card's control-plane delivery branch";
-        res.status(422).json({
-          error: "deliveryIdentity.branch must be this card's own branch or a legitimate ADR-083 carrier owner's branch",
-          code: "delivery_identity_branch_write_rejected",
-          details: {
-            issueId: existing.id,
-            identifier: existing.identifier ?? null,
-            holdsLease,
-            enteringReview,
-            recordedBranch: requestedDeliveryIdentity.branch,
-            controlPlaneBranch: branchOwnership.branch,
-            ownerIssueId: branchOwnership.ownerIssueId,
-            reason: branchReason,
-          },
-        });
-        return;
-      }
       // SUP-14824 F2: base the delivery write on the STORED execution state (not
       // just the patch) so a patch that omits executionState cannot drop stored
       // fields — same pattern as the execution-state patch paths.
       const currentExecState = (updateFields.executionState ?? existing.executionState ?? {}) as Record<string, unknown>;
-      updateFields.executionState = {
-        ...currentExecState,
-        delivery: {
-          ...requestedDeliveryIdentity,
-          recordedByRunId: actor.runId,
-          recordedAt: new Date().toISOString(),
-        },
-        // R20: the structured head of this review round, compared by the
-        // review-stall trigger against the head the last bounce rejected.
-        // Written only for a policy that names a stall arbiter, so a policy
-        // without one keeps its persisted state unchanged.
-        ...(nextExecutionPolicy?.stallEscalation
-          ? { deliveredHeadSha: requestedDeliveryIdentity.headSha }
-          : {}),
-      };
-      deliveryIdentityWorkspaceBranchWrite = canRecordProjectPrimaryBranch;
+      // SUP-23026 (AS-05 bind-existing-pr): when the client binds a PR (both
+      // prNumber and prUrl), `branch` is the PR HEAD branch, which on an
+      // isolated-workspace card is never the card's own worktree branch — so the
+      // D1 exact-branch equality below cannot be applied to it. Instead the route
+      // derives the card branch from the control plane, proves the exact PR with
+      // the SAME shared verifier approval time uses, and stamps
+      // kind=as05_bound_pr + cardBranch server-side. The client never asserts the
+      // representation: the strict schema rejects kind/cardBranch outright.
+      // The board merged-only refresh shapes (no execution workspace at all, or a
+      // terminal ADR-083 carrier) keep their pre-AS-05 both-fields record shape:
+      // they are stamped WITHOUT the AS-05 kind and stay subject to the
+      // approval-time requireMerged merged-on-base proof.
+      const boundPrRequested =
+        requestedDeliveryIdentity.prNumber !== undefined || requestedDeliveryIdentity.prUrl !== undefined;
+      if (boundPrRequested) {
+        if (requestedDeliveryIdentity.prNumber === undefined || requestedDeliveryIdentity.prUrl === undefined) {
+          res.status(422).json({
+            error: "deliveryIdentity PR binding requires both prNumber and prUrl",
+            code: "delivery_identity_write_rejected",
+            details: {
+              issueId: existing.id,
+              identifier: existing.identifier ?? null,
+              holdsLease,
+              enteringReview,
+              reason: "prNumber and prUrl must be sent together to bind an existing pull request",
+            },
+          });
+          return;
+        }
+        if (requestedDeliveryIdentity.sourceIssueId !== undefined && requestedDeliveryIdentity.sourceIssueId !== existing.id) {
+          res.status(422).json({
+            error: "deliveryIdentity.sourceIssueId must name this card",
+            code: "delivery_identity_write_rejected",
+            details: {
+              issueId: existing.id,
+              identifier: existing.identifier ?? null,
+              holdsLease,
+              enteringReview,
+              reason: "recorded delivery identity source issue does not match this card",
+            },
+          });
+          return;
+        }
+      }
+      const boardMergedOnlyRecord = boardOrphanDeliveryRecord || boardTerminalCarrierRecord;
+      if (boundPrRequested && !boardMergedOnlyRecord) {
+        // The card boundary first (no network): a bound-PR record still needs a
+        // control-plane branch this card may lawfully deliver on. The
+        // project_primary null-branch carve-out does NOT apply here — an AS-05
+        // record names its card branch explicitly (cardBranch), so there is no
+        // null branch to record.
+        if (!branchOwnership.legitimate || branchOwnership.branch === null) {
+          const branchReason = !branchOwnership.legitimate
+            ? branchOwnership.refusalReason ?? "card branch is owned by an unrelated issue"
+            : "card has no execution-workspace delivery branch to bind the pull request on";
+          res.status(422).json({
+            error: "deliveryIdentity bound-PR branch must be this card's own branch or a legitimate ADR-083 carrier owner's branch",
+            code: "delivery_identity_branch_write_rejected",
+            details: {
+              issueId: existing.id,
+              identifier: existing.identifier ?? null,
+              holdsLease,
+              enteringReview,
+              recordedBranch: requestedDeliveryIdentity.branch,
+              controlPlaneBranch: branchOwnership.branch,
+              ownerIssueId: branchOwnership.ownerIssueId,
+              reason: branchReason,
+            },
+          });
+          return;
+        }
+        // Then the exact-PR proof with the shared approval-time verifiers: static
+        // binding validation plus the live open-state/head-branch/head-SHA check.
+        // What is recorded is exactly what publish/arming time will re-verify.
+        const binding = {
+          branch: requestedDeliveryIdentity.branch,
+          prNumber: requestedDeliveryIdentity.prNumber,
+          prUrl: requestedDeliveryIdentity.prUrl,
+          headSha: requestedDeliveryIdentity.headSha,
+          sourceIssueId: existing.id,
+        };
+        const bindingError = deliveryBindingValidationError(binding, recordedRepo, existing.id);
+        if (bindingError) {
+          res.status(422).json({
+            error: bindingError,
+            code: "delivery_identity_write_rejected",
+            details: {
+              issueId: existing.id,
+              identifier: existing.identifier ?? null,
+              holdsLease,
+              enteringReview,
+              reason: bindingError,
+            },
+          });
+          return;
+        }
+        const exact = await resolveExactBoundPullRequest(db, existing.companyId, existing.id, binding, recordedRepo);
+        if (!exact.pr) {
+          const reason = exact.reason ?? "recorded delivery identity PR cannot be verified";
+          res.status(422).json({
+            error: "deliveryIdentity bound PR failed live verification",
+            code: "delivery_identity_write_rejected",
+            details: {
+              issueId: existing.id,
+              identifier: existing.identifier ?? null,
+              holdsLease,
+              enteringReview,
+              reason,
+            },
+          });
+          return;
+        }
+        updateFields.executionState = {
+          ...currentExecState,
+          delivery: {
+            ...requestedDeliveryIdentity,
+            kind: "as05_bound_pr",
+            cardBranch: branchOwnership.branch,
+            sourceIssueId: existing.id,
+            recordedByRunId: actor.runId,
+            recordedAt: new Date().toISOString(),
+          },
+          // R20: the structured head of this review round, compared by the
+          // review-stall trigger against the head the last bounce rejected.
+          // Written only for a policy that names a stall arbiter, so a policy
+          // without one keeps its persisted state unchanged.
+          ...(nextExecutionPolicy?.stallEscalation
+            ? { deliveredHeadSha: requestedDeliveryIdentity.headSha }
+            : {}),
+        };
+        // deliveryIdentityWorkspaceBranchWrite stays false: a bound-PR record
+        // names its card branch explicitly (cardBranch), so the generic
+        // project-primary branch-write carve-out never applies.
+      } else {
+        const recordedBranchMismatch =
+          (!canRecordProjectPrimaryBranch && !boardOrphanDeliveryRecord && !boardTerminalCarrierRecord && branchOwnership.branch === null)
+          || (branchOwnership.branch !== null
+            // Git refs are case-sensitive: the recorded branch must equal the control-plane branch exactly.
+            && requestedDeliveryIdentity.branch !== branchOwnership.branch);
+        if (
+          !canRecordProjectPrimaryBranch
+          && !boardOrphanDeliveryRecord
+          && !boardTerminalCarrierRecord
+          && (!branchOwnership.legitimate || recordedBranchMismatch)
+        ) {
+          const branchReason =
+            branchOwnership.branch === null
+              ? "card has no execution-workspace delivery branch to validate the recorded branch against"
+              : !branchOwnership.legitimate
+                ? branchOwnership.refusalReason ?? "recorded branch is owned by an unrelated issue"
+                : "recorded branch does not match this card's control-plane delivery branch";
+          res.status(422).json({
+            error: "deliveryIdentity.branch must be this card's own branch or a legitimate ADR-083 carrier owner's branch",
+            code: "delivery_identity_branch_write_rejected",
+            details: {
+              issueId: existing.id,
+              identifier: existing.identifier ?? null,
+              holdsLease,
+              enteringReview,
+              recordedBranch: requestedDeliveryIdentity.branch,
+              controlPlaneBranch: branchOwnership.branch,
+              ownerIssueId: branchOwnership.ownerIssueId,
+              reason: branchReason,
+            },
+          });
+          return;
+        }
+        updateFields.executionState = {
+          ...currentExecState,
+          delivery: {
+            ...requestedDeliveryIdentity,
+            recordedByRunId: actor.runId,
+            recordedAt: new Date().toISOString(),
+          },
+          // R20: the structured head of this review round, compared by the
+          // review-stall trigger against the head the last bounce rejected.
+          // Written only for a policy that names a stall arbiter, so a policy
+          // without one keeps its persisted state unchanged.
+          ...(nextExecutionPolicy?.stallEscalation
+            ? { deliveredHeadSha: requestedDeliveryIdentity.headSha }
+            : {}),
+        };
+        deliveryIdentityWorkspaceBranchWrite = canRecordProjectPrimaryBranch;
+      }
     }
 
     const nextStatus = updateFields.status ?? existing.status;
