@@ -655,6 +655,12 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "cancelled",
 ] as const;
 
+export const retryWorkspaceExportSchema = z.object({
+  actionId: z.string().guid(),
+  runId: z.string().guid(),
+  repairNote: z.string().trim().min(20).max(12000),
+}).strict();
+
 export const resolveIssueRecoveryActionSchema = z
   .object({
     executionReconciliation: z
@@ -663,6 +669,7 @@ export const resolveIssueRecoveryActionSchema = z
         providerStopped: z.literal(true),
         actionOutcome: z.enum(["completed", "not_performed", "mixed"]),
         outcomeEvidence: z.string().trim().min(20).max(12000),
+        workspaceRepairEvidence: z.string().trim().min(20).max(12000).optional(),
       })
       .strict()
       .optional(),
@@ -961,17 +968,36 @@ const onboardingFirstTaskMarkerSchema = {
 };
 
 export const createIssueInputSchema = createIssueBaseSchema.extend({
+  title: z.string().optional(),
   status: createIssueBaseSchema.shape.status.optional(),
   ...createIssueDuplicateGuardSchema,
   ...onboardingFirstTaskMarkerSchema,
 });
 
+function requireTitleOrDescription(
+  value: { title?: string; description?: string | null },
+  ctx: z.RefinementCtx,
+) {
+  if (!value.title?.trim() && !value.description?.trim()) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["title"], message: "Provide a title or task description" });
+  }
+}
+
 export const createIssueSchema = withCreateIssueStatusDefault(
   createIssueBaseSchema.extend({
+    title: z.string().optional(),
     ...createIssueDuplicateGuardSchema,
     ...onboardingFirstTaskMarkerSchema,
   }),
-).superRefine(requireBlockedStatusForUnblockDescriptor);
+).superRefine(requireBlockedStatusForUnblockDescriptor).superRefine(requireTitleOrDescription);
+
+export const setIssueTitleSchema = z.object({
+  title: z.string().trim().min(1).max(240),
+  onlyIfProvisional: z.boolean().optional().default(false),
+  idempotencyKey: z.string().trim().min(1).max(240).optional(),
+}).strict();
+
+export type SetIssueTitle = z.input<typeof setIssueTitleSchema>;
 
 export type CreateIssue = z.infer<typeof createIssueSchema>;
 
@@ -1015,8 +1041,13 @@ const createChildIssueObjectSchema = createIssueBaseSchema
   });
 
 export const createChildIssueSchema = withCreateIssueStatusDefault(
-  createChildIssueObjectSchema,
-).superRefine(requireBlockedStatusForUnblockDescriptor);
+  // Upstream #14761: a child task may be prompt-only (title optional when a
+  // description is present). Kept off createChildIssueObjectSchema so the
+  // accepted-plan decomposition children below still require a title.
+  createChildIssueObjectSchema.extend({
+    title: z.string().optional(),
+  }),
+).superRefine(requireBlockedStatusForUnblockDescriptor).superRefine(requireTitleOrDescription);
 
 export type CreateChildIssue = z.infer<typeof createChildIssueSchema>;
 
@@ -1077,9 +1108,9 @@ export const ISSUE_CREATE_ONLY_ATTRIBUTION_KEYS = ["createdByUserId", "responsib
  * key left present — zod keeps a key whose validator yields `undefined` when the key was supplied —
  * would reach the write path. Deleting it keeps attribution unmutable exactly as `.omit()` did.
  */
-export function stripCreateOnlyIssueAttribution<Schema extends z.ZodObject<z.ZodRawShape>>(schema: Schema) {
+export function stripCreateOnlyIssueAttribution<Schema extends z.ZodTypeAny>(schema: Schema) {
   return schema.transform((value) => {
-    const next: Record<string, unknown> = { ...value };
+    const next: Record<string, unknown> = { ...(value as Record<string, unknown>) };
     for (const key of ISSUE_CREATE_ONLY_ATTRIBUTION_KEYS) delete next[key];
     return next as Omit<z.infer<Schema>, (typeof ISSUE_CREATE_ONLY_ATTRIBUTION_KEYS)[number]>;
   });
@@ -1165,6 +1196,15 @@ export const updateIssueObjectSchema = objectWithoutDefaults(
     /** Assignment-only handoff; the following structured goal action owns the wake. */
     deferWakeForGoal: z.boolean().optional(),
     hiddenAt: z.string().datetime().nullable().optional(),
+    // SUP-22840: top-level convenience alias for `executionPolicy.monitor` on
+    // UPDATE bodies only. Some generated MCP surfaces advertise `monitor` at
+    // the top level of the update payload; the canonical home stays
+    // `executionPolicy.monitor`. The PATCH route translates the alias into the
+    // canonical partial policy write after validation, preserving every other
+    // stored policy field. A body carrying BOTH the alias and an
+    // `executionPolicy` key (even `null`) fails closed via the refinement
+    // below rather than guessing which spelling wins.
+    monitor: issueExecutionMonitorPolicySchema.optional().nullable(),
     // `objectWithoutDefaults` rebuilds the shape with a bare `z.object()`, which
     // drops the base schema's `.strict()`. Re-assert it here: the fork keeps the
     // create-only attribution keys IN the shape (they are removed by the
@@ -1174,8 +1214,30 @@ export const updateIssueObjectSchema = objectWithoutDefaults(
   })
   .strict();
 
+/**
+ * SUP-22840: the update payload accepts `monitor` as a top-level alias for
+ * `executionPolicy.monitor`. A body carrying both spellings has no single
+ * correct reading (they may disagree), so it is refused here — on every
+ * surface that parses an update body (shared `updateIssueSchema`, the PATCH
+ * route schema) — with the issue pinned at `["monitor"]`, the surprising key.
+ */
+export const ISSUE_UPDATE_MONITOR_ALIAS_CONFLICT_MESSAGE =
+  "monitor cannot be combined with executionPolicy in the same update: send the top-level monitor alias alone, or nest the monitor inside executionPolicy.monitor";
+
+export function refineIssueUpdateMonitorAliasConflict(
+  body: { monitor?: unknown; executionPolicy?: unknown },
+  ctx: z.RefinementCtx,
+): void {
+  if (body.monitor === undefined || body.executionPolicy === undefined) return;
+  ctx.addIssue({
+    code: z.ZodIssueCode.custom,
+    message: ISSUE_UPDATE_MONITOR_ALIAS_CONFLICT_MESSAGE,
+    path: ["monitor"],
+  });
+}
+
 export const updateIssueSchema = stripCreateOnlyIssueAttribution(
-  updateIssueObjectSchema,
+  updateIssueObjectSchema.superRefine(refineIssueUpdateMonitorAliasConflict),
 );
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;
@@ -1390,6 +1452,14 @@ export const issueCommentMetadataSchema = z
       .max(160)
       .nullable()
       .optional(),
+    recovery: z.object({
+      kind: z.literal("disposition_repair_escalated"),
+      actionId: z.string().guid(),
+      attemptCount: z.number().int().nonnegative(),
+      maxAttempts: z.number().int().positive(),
+      reason: z.string().trim().min(1).max(160),
+      assigneeAgentId: z.string().guid().nullable(),
+    }).strict().optional(),
     sections: z.array(issueCommentMetadataSectionSchema).min(1).max(20),
   })
   .strict();
@@ -1712,7 +1782,7 @@ export const paperclipQuestionSetPayloadSchema = z
   .object({
     schema: z.literal("paperclip.question_set.v1"),
     title: z.string().max(1000).optional(),
-    description: z.string().max(4000).optional(),
+    description: z.string().max(100_000).optional(),
     submitLabel: z.string().max(200).optional(),
     questions: z.array(paperclipQuestionSchema).min(1).max(64),
   })
@@ -2454,6 +2524,23 @@ export const acceptIssueThreadInteractionSchema = z
 export type AcceptIssueThreadInteraction = z.infer<
   typeof acceptIssueThreadInteractionSchema
 >;
+
+/** Records an agent's interpretation of a real user reply without widening resolver permissions. */
+export const resolveConfirmationFromCommentSchema = z.object({
+  commentId: z.string().guid(),
+  decision: z.enum(["accept", "reject"]),
+  selectedOptionIds: z.array(z.string().trim().min(1).max(120))
+    .max(REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT).optional(),
+  reason: z.string().trim().max(4000).optional(),
+}).strict().superRefine((value, ctx) => {
+  if (value.decision === "reject" && value.selectedOptionIds !== undefined) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["selectedOptionIds"], message: "Selections apply only to acceptance" });
+  }
+  if (value.selectedOptionIds && new Set(value.selectedOptionIds).size !== value.selectedOptionIds.length) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["selectedOptionIds"], message: "Selections must be unique" });
+  }
+});
+export type ResolveConfirmationFromComment = z.infer<typeof resolveConfirmationFromCommentSchema>;
 
 export const rejectIssueThreadInteractionSchema = z.object({
   reason: z.string().trim().max(4000).optional(),

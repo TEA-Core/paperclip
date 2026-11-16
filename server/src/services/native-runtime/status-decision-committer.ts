@@ -1645,10 +1645,13 @@ export async function commitNativeStatusDecision(input: {
         throw new NativeStatusRaceError();
       }
     }
+    const passiveBoardResponseWait =
+      reasonCode === "board_response_waiting" ||
+      reasonCode === "board_response_wait_superseded";
     let boardResponseWaitOrigin: NativeBoardResponseWaitOrigin | null = null;
     if (
-      reasonCode === "board_response_waiting" ||
-      reasonCode === "board_response_wait_superseded"
+      passiveBoardResponseWait ||
+      input.requireBoardResponseWaitOrigin
     ) {
       const expected = input.requireBoardResponseWaitOrigin;
       if (
@@ -1656,7 +1659,7 @@ export async function commitNativeStatusDecision(input: {
         expected.companyId !== input.companyId ||
         expected.issueId !== input.issueId ||
         expected.runId !== input.runId ||
-        input.decision.effects.length !== 0
+        (passiveBoardResponseWait && input.decision.effects.length !== 0)
       )
         throw new NativeStatusRaceError();
       try {
@@ -1684,11 +1687,13 @@ export async function commitNativeStatusDecision(input: {
     let boardResponseWait: Awaited<
       ReturnType<typeof readNativeBoardResponseWaitSource>
     > = null;
-    if (reasonCode === "board_response_waiting") {
+    // Corrective continuations also carry this precondition. Revalidate it
+    // under the same locks before any decision effects can restart old work.
+    if (reasonCode === "board_response_waiting" || input.requireBoardResponseWaitSource) {
       const expected = input.requireBoardResponseWaitSource;
       if (
         !expected ||
-        input.decision.effects.length !== 0 ||
+        (passiveBoardResponseWait && input.decision.effects.length !== 0) ||
         expected.companyId !== input.companyId ||
         expected.issueId !== input.issueId ||
         expected.runId !== input.runId
@@ -1826,7 +1831,7 @@ export async function commitNativeStatusDecision(input: {
     }
     if (!decisionRow) throw new Error("native_status_decision_not_persisted");
 
-    if (boardResponseWait) {
+    if (boardResponseWait && reasonCode === "board_response_waiting") {
       // The answer and passive-wait receipt commit together. In particular,
       // no chat presentation authorization is supplied: this is Board-only.
       await issueService(tx as unknown as Db).addComment(
@@ -1994,6 +1999,7 @@ export async function commitNativeStatusDecision(input: {
                 completedChildIssueId: input.issueId,
                 childIssueIds: parent.childIssueIds,
                 childIssueSummaries: parent.childIssueSummaries,
+                onboardingCompletion: parent.onboardingCompletion,
                 childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
               }
             : null;
@@ -2038,12 +2044,14 @@ export async function commitNativeStatusDecision(input: {
             completedChildIssueId: input.issueId,
             childIssueIds: parent.childIssueIds,
             childIssueSummaries: parent.childIssueSummaries,
+            onboardingCompletion: parent.onboardingCompletion,
             childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
           },
           contextSnapshot: {
             completedChildIssueId: input.issueId,
             childIssueIds: parent.childIssueIds,
             childIssueSummaries: parent.childIssueSummaries,
+            onboardingCompletion: parent.onboardingCompletion,
             childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
           },
         });
@@ -2055,6 +2063,7 @@ export async function commitNativeStatusDecision(input: {
             parentIssueId: parent.id,
             completedChildIssueId: input.issueId,
             childIssueSummaries: parent.childIssueSummaries,
+            onboardingCompletion: parent.onboardingCompletion,
             childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
           },
         });

@@ -440,6 +440,7 @@ describeEmbeddedPostgres("issueThreadInteractionService telemetry", () => {
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
+        supersedeOnUserComment: true,
         questions: [
           {
             id: "scope",
@@ -565,6 +566,7 @@ describeEmbeddedPostgres("issueThreadInteractionService telemetry", () => {
       payload: {
         version: 1,
         prompt: "Approve this plan?",
+        supersedeOnUserComment: true,
       },
     }, {
       userId: "local-board",

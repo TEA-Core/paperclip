@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { PassThrough } from "node:stream";
 import express from "express";
 import request from "supertest";
@@ -378,6 +379,49 @@ describe.sequential("execution workspace runtime control conflict and failure re
       fs.rmSync(workspaceCwd, { recursive: true, force: true });
     }
   });
+
+  it.each(["fifo", "minimal_no_secrets"] as const)(
+    "refuses a %s repair manifest with the stable 422 and does not block",
+    async (variant) => {
+      const fixture = createRegisteredRepairFixture(`paperclip-route-repair-refused-${variant}-`);
+      try {
+        const manifestPath = path.join(fixture.configDir, "seed-manifest.json");
+        fs.rmSync(manifestPath);
+        fs.writeFileSync(path.join(fixture.configDir, "seed-skip-no-source"), "{}\n");
+        if (variant === "fifo") {
+          expect(spawnSync("mkfifo", [manifestPath]).status).toBe(0);
+        } else {
+          fs.writeFileSync(manifestPath, JSON.stringify({
+            version: 2,
+            seedMode: "minimal-no-secrets",
+            source: { instanceId: "repair-source", configPath: fixture.sourceConfigPath },
+            targetInstanceId: fixture.targetInstanceId,
+            state: "verified",
+            phase: "validation",
+            attemptId: "previous",
+            diagnostics: [{ phase: "validation", status: "verified", at: "2026-09-10T00:00:00.000Z" }],
+          }));
+        }
+
+        const app = await createApp();
+        const startedAt = Date.now();
+        const res = await request(app)
+          .post(`/api/execution-workspaces/${executionWorkspaceId}/runtime-commands/repair`)
+          .send({});
+
+        expect(Date.now() - startedAt).toBeLessThan(2000);
+        expect(res.status).toBe(422);
+        expect(res.body).toMatchObject({
+          code: "workspace_repair_precondition_failed",
+          reason: "seed_manifest_malformed",
+          repairPhase: "precondition_validation",
+        });
+        expect(mockSpawn).not.toHaveBeenCalled();
+      } finally {
+        removeRegisteredRepairFixture(fixture);
+      }
+    },
+  );
 
   it.each(["sibling", "foreign_instance", "symlink", "instance_mismatch"] as const)(
     "rejects a %s repair manifest source before spawn or runtime mutation",

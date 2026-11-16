@@ -12052,7 +12052,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       run.nativeIssueId === issueId &&
       run.status === "failed" &&
       run.errorCode === "adapter_failed" &&
-      run.error === "runner_state_identity_mismatch" &&
+      // A diagnostic reason does not change this failure category. The exact
+      // checkpoint, cleanup receipt, and no-provider-work proofs below still
+      // decide whether the original request can be retried.
+      (run.error === "runner_state_identity_mismatch" ||
+        run.error?.startsWith("runner_state_identity_mismatch: ")) &&
       run.nativePhase === "observed" &&
       coordinator.phase === "observed" &&
       coordinator.attempt === 0 &&
@@ -30784,7 +30788,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         const [issue] = await tx.select().from(issues).where(and(eq(issues.id, conversation.issueId), eq(issues.companyId, conversation.companyId)));
         if (!issue) throw notFound("Task not found");
         await assertSlackBoardWorkAllowed(tx as unknown as Db, issue);
-        await mirrorSlackBoardComment(tx, comment, { publicationKey: idempotencyKey, wakeAgent: true, endpointId, conversationId, attachmentIds });
+        await mirrorSlackBoardComment(tx, comment, { publicationKey: idempotencyKey, wakeAgent: true, endpointId, conversationId, attachmentIds, boardApiKeyId });
         const [created] = await tx.select().from(chatPublications).where(and(eq(chatPublications.companyId, conversation.companyId), eq(chatPublications.idempotencyKey, idempotencyKey)));
         if (!created) throw conflict("This Slack task is no longer assigned to the connected agent");
         return created;

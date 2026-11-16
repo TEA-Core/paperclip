@@ -227,6 +227,27 @@ describe("redaction", () => {
     });
   });
 
+  it("preserves native execution v5 and model envelope v3 schema identifiers", () => {
+    const input = {
+      schema: "paperclip.native-execution-input.v5",
+      nested: {
+        runtimeSchema: "paperclip.native-model-envelope.v3",
+        providerValue: "paperclip.native-execution-input.v5",
+      },
+    };
+    expect(sanitizeRecord(input)).toEqual({
+      schema: input.schema,
+      nested: {
+        runtimeSchema: input.nested.runtimeSchema,
+        providerValue: REDACTED_EVENT_VALUE,
+      },
+    });
+    expect(sanitizeRecord({ schema: "paperclip.native-execution-input.v4", runtimeSchema: "paperclip.native-model-envelope.v2" })).toEqual({
+      schema: "paperclip.native-execution-input.v4",
+      runtimeSchema: "paperclip.native-model-envelope.v2",
+    });
+  });
+
   it("preserves only known PRP v1 event discriminators inside validated envelopes", () => {
     const payload = {
       prpEvent: {
@@ -791,5 +812,16 @@ second-line\" status=401`,
       command: "pnpm agent:run",
       apiKey: REDACTED_EVENT_VALUE,
     });
+  });
+
+  // SUP-23998 (mutant C-m5): `bearer` is its own alternative in the secret-name rule. A
+  // field called just `bearer` matches no other alternative, so dropping it leaks the value.
+  it("redacts a field named bearer and a bearer value in text", () => {
+    expect(sanitizeRecord({ bearer: "synthetic-bearer-value", note: "kept" })).toEqual({
+      bearer: REDACTED_EVENT_VALUE,
+      note: "kept",
+    });
+    expect(redactSensitiveText('{"bearer": "synthetic-bearer-value"}')).not.toContain("synthetic-bearer-value");
+    expect(redactSensitiveText("--bearer=synthetic-bearer-value")).not.toContain("synthetic-bearer-value");
   });
 });

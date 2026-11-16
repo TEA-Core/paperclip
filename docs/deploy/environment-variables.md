@@ -95,13 +95,20 @@ Daytona snapshot for future leases.
   their management endpoints with `403 settings_operator_managed`; hiding
   `instance.experimental` floors every experimental toggle write.
 - Any Instance → General section: `instance.general.censorUsernameInLogs`,
-  `instance.general.keyboardShortcuts`, `instance.general.backupRetention`,
+  `instance.general.backupRetention`,
   `instance.general.feedbackDataSharingPreference` (each also rejects
   value-changing writes via `PATCH /api/instance/settings/general`), plus the
   UI-only `instance.general.deploymentStatus` and `instance.general.signOut`.
 - Any experimental toggle: `instance.experimental.<flagKey>` (e.g.
   `instance.experimental.enableSmokeLab`) — the card disappears and
   value-changing writes are rejected.
+- All current and future experimental toggles: `instance.experimental.*`.
+  Add `!instance.experimental.<flagKey>` entries to leave specific controls
+  available. The server expands this policy against its own feature catalog,
+  so new toggles stay hidden without an environment change. The Experimental
+  page remains available. Exceptions only apply to the wildcard; an explicit
+  hidden toggle or `instance.experimental` page restriction always wins,
+  regardless of entry order. Unknown exceptions are logged and ignored.
 - Any top-level company settings page: `company.members`, `company.invites`,
   `company.secrets`, `company.export`, `company.import` — removed from the
   settings sidebar, tab bar, and routing (the company General page is the
@@ -133,6 +140,24 @@ newer releases. With the variable unset nothing is hidden and behavior
 is identical to earlier releases. Hiding a toggle does not change its value;
 pair hiding with the desired default where it matters (for general settings,
 see [Operator setting defaults](#operator-setting-defaults)).
+
+For example, this allows only the Environments control and keeps the Plugins
+settings page hidden:
+
+```sh
+PAPERCLIP_HIDDEN_SETTINGS='instance.plugins,instance.experimental.*,!instance.experimental.enableEnvironments'
+```
+
+`GET /api/health` returns the expanded concrete keys in `hiddenSettings`.
+The UI and settings API use the same restrictions. Reads and same-value
+echoes remain allowed; changing a hidden value returns
+`403 settings_operator_managed`.
+
+Older images that predate wildcard support ignore the wildcard and exceptions.
+Keep their explicit hidden-toggle entries during an upgrade, or upgrade all
+images before replacing an explicit list. Once every image supports this
+syntax, the wildcard and its exceptions are sufficient. A recognized exception
+without a wildcard has no effect.
 
 ### Operator setting defaults
 

@@ -22,6 +22,7 @@ import {
   DONE_TIER_TIER1_DELEGATED_JSON,
   DONE_TIER_TIER1_LANDED_JSON,
   DONE_TIER_TIER2_JSON,
+  DONE_TIER_RECORD_ONLY_PROBE_EVIDENCE_NOTE,
   DONE_TIER_TIER2_RECORD_ONLY_JSON,
   renderDoneTierDeclaration,
   TIER1_FORM,
@@ -6043,6 +6044,73 @@ describe("evaluateDoneTierDeclaration", () => {
       vi.mocked(logActivity).mockClear();
     });
 
+    // SUP-24079: the examples the 422 remedy advertises must be executable inputs
+    // to the real parser. Examples are extracted from the remedy text itself.
+    describe("advertised remedy examples (SUP-24079)", () => {
+      const INSTANT_PLACEHOLDER = "<UTC ISO-8601 timestamp>";
+      const FIRST_INSTANT = "2026-11-06T21:02:39Z";
+      const SECOND_INSTANT = "2026-11-06T21:04:24Z";
+      const PREFIX = "Closed at Tier 2 (live): ";
+
+      function advertisedForms(): string[] {
+        const forms = [...TIER2_RECORD_ONLY_FORM.matchAll(/"(Closed at Tier 2 \(live\): [^"]+)"/g)].map((m) => m[1]!);
+        expect(forms.length).toBe(2);
+        return forms;
+      }
+
+      function fill(form: string): string {
+        return form
+          .replace("<probe command>", "curl -fsS https://ops.example.com/healthz")
+          .replace("<observed target>", "https://ops.example.com")
+          .replace("<pass predicate and observed result>", "endpoint healthy")
+          .replace(INSTANT_PLACEHOLDER, FIRST_INSTANT)
+          .replace(INSTANT_PLACEHOLDER, SECOND_INSTANT);
+      }
+
+      it("advertises the range and single-instant forms with no square brackets", () => {
+        const [range, single] = advertisedForms();
+        expect(range).toContain(`observed ${INSTANT_PLACEHOLDER}-${INSTANT_PLACEHOLDER} result:`);
+        expect(single).toContain(`observed ${INSTANT_PLACEHOLDER} result:`);
+        expect(TIER2_RECORD_ONLY_FORM).not.toMatch(/[[\]]/);
+        expect(DONE_TIER_TIER2_RECORD_ONLY_JSON).not.toMatch(/[[\]]/);
+        expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).not.toMatch(/[[\]]/);
+      });
+
+      it("accepts every comment-form example the remedy advertises", async () => {
+        for (const form of advertisedForms()) {
+          const comment = fill(form);
+          expect(comment.startsWith(PREFIX)).toBe(true);
+          const result = await evaluateDoneTierDeclaration(
+            mockDb,
+            recordOnlyTierIssue(),
+            tier2Line(comment.slice(PREFIX.length)),
+            null,
+            () => Promise.resolve([]),
+          );
+          expect(result.allowed, comment).toBe(true);
+          expect(result.tier).toBe("tier2");
+        }
+      });
+
+      it("accepts the structured probeEvidence example and states the prefix is excluded", async () => {
+        const evidence = /"probeEvidence": "([^"]+)"/.exec(DONE_TIER_TIER2_RECORD_ONLY_JSON)![1]!;
+        expect(evidence.startsWith(PREFIX.trim())).toBe(false);
+        expect(DONE_TIER_RECORD_ONLY_PROBE_EVIDENCE_NOTE).toContain(`excludes the "${PREFIX}" prefix`);
+        expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_RECORD_ONLY_PROBE_EVIDENCE_NOTE);
+        const single = evidence.replace(`${INSTANT_PLACEHOLDER}-${INSTANT_PLACEHOLDER}`, INSTANT_PLACEHOLDER);
+        for (const form of [evidence, single]) {
+          const result = await evaluateDoneTierDeclaration(
+            mockDb,
+            recordOnlyTierIssue(),
+            tier2Line(fill(form)),
+            null,
+            () => Promise.resolve([]),
+          );
+          expect(result.allowed, form).toBe(true);
+        }
+      });
+    });
+
     it("accepts a valid record-only declaration on a record_only card with no repo and no merged work product", async () => {
       const result = await evaluateDoneTierDeclaration(
         mockDb,
@@ -6430,7 +6498,7 @@ describe("evaluateDoneTierDeclaration", () => {
         expect(result.reason).toContain("run run-1");
       });
 
-      it("refuses an observation postdating the evaluation beyond the clock-skew allowance", async () => {
+      it("refuses an observation postdating the evaluation", async () => {
         setupDbMock({ heartbeatRuns: [seededRun("2026-11-04T08:00:00Z")] });
         const future = new Date(Date.now() + 30 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
         const result = await evaluateDoneTierDeclaration(
@@ -6441,8 +6509,157 @@ describe("evaluateDoneTierDeclaration", () => {
           () => Promise.resolve([]),
         );
         expect(result.allowed).toBe(false);
-        expect(result.reason).toContain("postdates this evaluation");
+        expect(result.reason).toContain("postdates this close");
         expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+      });
+
+      // SUP-24266: SUP-24211's close write completed at 08:19:28.726Z, yet the
+      // accepted declaration said `observed 2026-11-14T08:20:00Z` — an
+      // observation 31 s after the close. The old guard allowed 5 minutes of
+      // "clock skew" past the evaluation and accepted it as guard-accepted.
+      describe("observation must not postdate the close write (SUP-24266)", () => {
+        const CLOSE_WRITE_AT = "2026-11-14T08:19:28.726Z";
+
+        function probeEvidenceObservedAt(observation: string) {
+          return `record-only probe \`git status --porcelain=v1 && git diff --exit-code\` target SUP-24211 execution workspace observed ${observation} result: pass clean worktree with no tracked changes`;
+        }
+
+        async function closeAt(observation: string, runStartedAt = "2026-11-14T08:00:00Z") {
+          setupDbMock({ heartbeatRuns: [seededRun(runStartedAt)] });
+          vi.useFakeTimers({ toFake: ["Date"] });
+          vi.setSystemTime(new Date(CLOSE_WRITE_AT));
+          try {
+            return await evaluateDoneTierDeclaration(
+              mockDb,
+              recordOnlyTierIssue(),
+              tier2Line(probeEvidenceObservedAt(observation)),
+              "run-1",
+              () => Promise.resolve([]),
+            );
+          } finally {
+            vi.useRealTimers();
+          }
+        }
+
+        it("refuses the SUP-24211 shape: observed 31 s after the close write", async () => {
+          const result = await closeAt("2026-11-14T08:20:00Z");
+          expect(result.allowed).toBe(false);
+          expect(result.tier).toBe(null);
+          expect(result.reason).toContain("observed instant 2026-11-14T08:20:00Z");
+          expect(result.reason).toContain("postdates this close");
+          expect(result.reason).toContain("at or before the close write");
+          expect(result.reason).toContain(TIER2_RECORD_ONLY_FORM);
+          expect(result.tier2Audit).toBeUndefined();
+        });
+
+        it("refuses a range whose end postdates the close write even when its start is lawful", async () => {
+          const result = await closeAt("2026-11-14T08:19:00Z-2026-11-14T08:20:00Z");
+          expect(result.allowed).toBe(false);
+          expect(result.reason).toContain("observed instant 2026-11-14T08:20:00Z");
+          expect(result.reason).toContain("postdates this close");
+        });
+
+        it("refuses an observation one millisecond after the close write", async () => {
+          const result = await closeAt("2026-11-14T08:19:28.727Z");
+          expect(result.allowed).toBe(false);
+          expect(result.reason).toContain("postdates this close");
+        });
+
+        // The grammar accepts 1-6 fractional digits; `Date.parse` truncates to
+        // milliseconds, so these used to tie the close write and pass.
+        it.each(["2026-11-14T08:19:28.7261Z", "2026-11-14T08:19:28.7269Z", "2026-11-14T08:19:28.726001Z"])(
+          "refuses a sub-millisecond observation %s after the close write: single instant, range end, no-run closer",
+          async (observation) => {
+            const single = await closeAt(observation);
+            expect(single.allowed).toBe(false);
+            expect(single.reason).toContain(`observed instant ${observation}`);
+            expect(single.reason).toContain("postdates this close");
+            const range = await closeAt(`2026-11-14T08:19:00Z-${observation}`);
+            expect(range.allowed).toBe(false);
+            expect(range.reason).toContain(`observed instant ${observation}`);
+            const noRun = await closeWithNoRunAt(observation);
+            expect(noRun.allowed).toBe(false);
+            expect(noRun.reason).toContain("postdates this close");
+          },
+        );
+
+        it.each(["2026-11-14T08:19:28.726000Z", "2026-11-14T08:19:28.7260Z", "2026-11-14T08:19:28.725999Z", "2026-11-14T08:19:28.7259Z"])(
+          "positive control: accepts %s at or one tick before the close write at full precision",
+          async (observation) => {
+            const single = await closeAt(observation);
+            expect(single.allowed).toBe(true);
+            const range = await closeAt(`2026-11-14T08:19:00Z-${observation}`);
+            expect(range.allowed).toBe(true);
+            const noRun = await closeWithNoRunAt(observation);
+            expect(noRun.allowed).toBe(true);
+          },
+        );
+
+        it("positive control: accepts an observation exactly at the close write", async () => {
+          const result = await closeAt(CLOSE_WRITE_AT);
+          expect(result.allowed).toBe(true);
+          expect(result.tier).toBe("tier2");
+          expect(result.tier2Audit).toMatchObject({ observed: CLOSE_WRITE_AT, closingRunId: "run-1" });
+        });
+
+        it("positive control: accepts a same-run observation before the close write, single instant and range", async () => {
+          const single = await closeAt("2026-11-14T08:19:20Z");
+          expect(single.allowed).toBe(true);
+          expect(single.tier).toBe("tier2");
+          expect(single.tier2Audit).toMatchObject({
+            observed: "2026-11-14T08:19:20Z",
+            closingRunId: "run-1",
+            closingRunStartedAt: "2026-11-14T08:00:00.000Z",
+          });
+          const range = await closeAt("2026-11-14T08:19:10Z-2026-11-14T08:19:28Z");
+          expect(range.allowed).toBe(true);
+          expect(range.tier2Audit).toMatchObject({ observed: "2026-11-14T08:19:10Z", observedRangeEnd: "2026-11-14T08:19:28Z" });
+        });
+
+        it("pins unchanged behavior for an observation far in the past: refused only when it predates the run, accepted inside the run", async () => {
+          const predating = await closeAt("2026-11-01T00:00:00Z");
+          expect(predating.allowed).toBe(false);
+          expect(predating.reason).toContain("predates the closing run");
+          const insideLongRun = await closeAt("2026-11-01T00:00:00Z", "2026-10-31T00:00:00Z");
+          expect(insideLongRun.allowed).toBe(true);
+          expect(insideLongRun.tier2Audit).toMatchObject({ observed: "2026-11-01T00:00:00Z" });
+        });
+
+        async function closeWithNoRunAt(observation: string) {
+          setupDbMock({ heartbeatRuns: [] });
+          vi.useFakeTimers({ toFake: ["Date"] });
+          vi.setSystemTime(new Date(CLOSE_WRITE_AT));
+          try {
+            return await evaluateDoneTierDeclaration(
+              mockDb,
+              recordOnlyTierIssue(),
+              tier2Line(probeEvidenceObservedAt(observation)),
+              null,
+              () => Promise.resolve([]),
+            );
+          } finally {
+            vi.useRealTimers();
+          }
+        }
+
+        it("refuses the SUP-24211 shape from a no-run (human/system) closer too", async () => {
+          const result = await closeWithNoRunAt("2026-11-14T08:20:00Z");
+          expect(result.allowed).toBe(false);
+          expect(result.tier).toBe(null);
+          expect(result.reason).toContain("postdates this close");
+          expect(result.tier2Audit).toBeUndefined();
+        });
+
+        it("positive control: a no-run closer with a lawful observed instant still closes, grammar-only", async () => {
+          const result = await closeWithNoRunAt("2026-11-14T08:19:20Z");
+          expect(result.allowed).toBe(true);
+          expect(result.tier).toBe("tier2");
+          expect(result.tier2Audit).toMatchObject({
+            observed: "2026-11-14T08:19:20Z",
+            closingRunId: null,
+            closingRunStartedAt: null,
+          });
+        });
       });
 
       it("keeps doors without a run id on the grammar checks alone and records the absent closing run", async () => {
@@ -6647,7 +6864,7 @@ describe("evaluateDoneTierDeclaration", () => {
       // its Tier 2 entry carries the record-only grammar, never a merge head,
       // and Tier 1 entries are carried over unchanged.
       expect(DONE_TIER_TIER2_RECORD_ONLY_JSON).toBe(
-        '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>" }',
+        '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }',
       );
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER2_RECORD_ONLY_JSON);
       expect(DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS).toContain(DONE_TIER_TIER1_LANDED_JSON);
@@ -7286,6 +7503,305 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalledWith(
         mockDb, "company-1", "issue-1", { includeDrafts: true },
       );
+    });
+
+    describe("SUP-24135 landing-delegated carrier re-check at close", () => {
+      const HEAD_SHA = "cccccccccccccccccccccccccccccccccccccccc";
+      type CarrierContext =
+        | { __typename: "CheckRun"; name: string; status: string; conclusion: string | null; isRequired: boolean }
+        | { __typename: "StatusContext"; context: string; state: string; isRequired: boolean };
+
+      type CarrierShape = {
+        mergeStateStatus: string;
+        contexts: CarrierContext[];
+        /** Rollup page boundary; defaults to a complete (single-page) list. */
+        hasNextPage?: boolean | null;
+        /** GraphQL PR state; defaults to OPEN. */
+        state?: string;
+      };
+
+      function carrierFetch(
+        carrier: CarrierShape | "errors" | "hang",
+        live: { state?: string; merged?: boolean; status?: number } = {},
+      ) {
+        ghFetchMock.mockImplementation(async (url, init) => {
+          const u = String(url);
+          if (u.endsWith("/pulls/4103")) {
+            if (live.status) return new Response("provider unavailable", { status: live.status });
+            return new Response(JSON.stringify({
+              state: live.state ?? "open",
+              merged: live.merged ?? false,
+              draft: false,
+              head: { ref: "SUP-4103-work", sha: HEAD_SHA, repo: { full_name: "TEA-Core/paperclip" } },
+              base: { ref: "main" },
+              auto_merge: { merge_method: "squash" },
+            }), { status: 200 });
+          }
+          if (u.endsWith("/repos/TEA-Core/paperclip")) {
+            return new Response(JSON.stringify({ allow_auto_merge: true }), { status: 200 });
+          }
+          if (u.includes("graphql")) {
+            const body = String((init as { body?: string } | undefined)?.body ?? "");
+            if (body.includes("statusCheckRollup")) {
+              if (carrier === "errors") {
+                // GraphQL can return partial data beside errors; an errored read is never proof.
+                return new Response(JSON.stringify({
+                  errors: [{ message: "RATE_LIMITED" }],
+                  data: {
+                    repository: {
+                      pullRequest: {
+                        state: "OPEN",
+                        mergeStateStatus: "DIRTY",
+                        commits: { nodes: [{ commit: { oid: HEAD_SHA, statusCheckRollup: null } }] },
+                      },
+                    },
+                  },
+                }), { status: 200 });
+              }
+              if (carrier === "hang") {
+                // Never answers on its own; only the request's abort signal ends it.
+                const signal = (init as RequestInit | undefined)?.signal;
+                return new Promise<Response>((_resolve, reject) => {
+                  if (signal?.aborted) reject(signal.reason);
+                  signal?.addEventListener("abort", () => reject(signal.reason));
+                });
+              }
+              const contexts: Record<string, unknown> = { nodes: carrier.contexts };
+              if (carrier.hasNextPage !== null) contexts.pageInfo = { hasNextPage: carrier.hasNextPage ?? false };
+              return new Response(JSON.stringify({
+                data: {
+                  repository: {
+                    pullRequest: {
+                      state: carrier.state ?? "OPEN",
+                      mergeStateStatus: carrier.mergeStateStatus,
+                      commits: {
+                        nodes: [{
+                          commit: {
+                            oid: HEAD_SHA,
+                            statusCheckRollup: { contexts },
+                          },
+                        }],
+                      },
+                    },
+                  },
+                },
+              }), { status: 200 });
+            }
+            return new Response(JSON.stringify({ data: { repository: { pullRequest: { reviewDecision: null } } } }), { status: 200 });
+          }
+          return new Response("{}", { status: 500 });
+        });
+      }
+
+      const failedRun = (name: string, conclusion = "FAILURE"): CarrierContext => (
+        { __typename: "CheckRun", name, status: "COMPLETED", conclusion, isRequired: true }
+      );
+
+      async function closeDelegated() {
+        mockResolveLinkedPullRequestsWithState.mockResolvedValue([linkedPr(4103, "open")]);
+        return evaluateDoneTierDeclaration(
+          mockDb,
+          landedIssue(),
+          tier1Line("landing-delegated PR #4103; landing obligation transferred to done-close-landing-backstop, not yet discharged; no live consumer yet."),
+          null,
+          () => Promise.resolve([]),
+        );
+      }
+
+      it("refuses when the carrier's required check is already terminal-failed (SUP-24120 / PR 4329 shape)", async () => {
+        carrierFetch({
+          mergeStateStatus: "BLOCKED",
+          contexts: [
+            { __typename: "CheckRun", name: "ci-required", status: "COMPLETED", conclusion: "FAILURE", isRequired: true },
+            { __typename: "CheckRun", name: "lint", status: "COMPLETED", conclusion: "SUCCESS", isRequired: false },
+          ],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(false);
+        expect(result.tier).toBe(null);
+        expect(result.reason).toMatch(/^carrier_required_check_failed: /);
+        expect(result.reason).toContain("PR #4103");
+        expect(result.reason).toContain("ci-required (failure)");
+        expect(result.reason).toContain(HEAD_SHA.slice(0, 12));
+        expect(result.remedy).toContain("re-run");
+      });
+
+      it("refuses when a required commit status is terminal-failed", async () => {
+        carrierFetch({
+          mergeStateStatus: "BLOCKED",
+          contexts: [
+            { __typename: "StatusContext", context: "paperclip/approved", state: "ERROR", isRequired: true },
+          ],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toMatch(/^carrier_required_check_failed: /);
+        expect(result.reason).toContain("paperclip/approved (error)");
+      });
+
+      it("refuses when the carrier has merge conflicts", async () => {
+        carrierFetch({
+          mergeStateStatus: "DIRTY",
+          contexts: [
+            { __typename: "CheckRun", name: "ci-required", status: "COMPLETED", conclusion: "SUCCESS", isRequired: true },
+          ],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toMatch(/^carrier_merge_conflict: /);
+        expect(result.reason).toContain("PR #4103");
+      });
+
+      it("accepts a blocked carrier whose required check awaits manual approval (ACTION_REQUIRED is not terminal-failed)", async () => {
+        carrierFetch({
+          mergeStateStatus: "BLOCKED",
+          contexts: [
+            { __typename: "CheckRun", name: "ci-required", status: "COMPLETED", conclusion: "ACTION_REQUIRED", isRequired: true },
+          ],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+      });
+
+      it("accepts a blocked carrier whose required check is still running (the normal delegated close)", async () => {
+        carrierFetch({
+          mergeStateStatus: "BLOCKED",
+          contexts: [
+            { __typename: "CheckRun", name: "ci-required", status: "IN_PROGRESS", conclusion: null, isRequired: true },
+            { __typename: "CheckRun", name: "optional-e2e", status: "COMPLETED", conclusion: "FAILURE", isRequired: false },
+          ],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+      });
+
+      it("accepts when a failed required check has a re-run in progress", async () => {
+        carrierFetch({
+          mergeStateStatus: "BLOCKED",
+          contexts: [
+            { __typename: "CheckRun", name: "ci-required", status: "COMPLETED", conclusion: "FAILURE", isRequired: true },
+            { __typename: "CheckRun", name: "ci-required", status: "QUEUED", conclusion: null, isRequired: true },
+          ],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+      });
+
+      it("fails open when the carrier probe cannot be read", async () => {
+        carrierFetch("errors");
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+      });
+
+      it.each(["TIMED_OUT", "CANCELLED", "STARTUP_FAILURE"])(
+        "refuses when the required check run concluded %s",
+        async (conclusion) => {
+          carrierFetch({ mergeStateStatus: "BLOCKED", contexts: [failedRun("ci-required", conclusion)] });
+          const result = await closeDelegated();
+          expect(result.allowed).toBe(false);
+          expect(result.reason).toMatch(/^carrier_required_check_failed: /);
+          expect(result.reason).toContain(`ci-required (${conclusion.toLowerCase()})`);
+        },
+      );
+
+      it("refuses when a required commit status is FAILURE", async () => {
+        carrierFetch({
+          mergeStateStatus: "BLOCKED",
+          contexts: [{ __typename: "StatusContext", context: "paperclip/approved", state: "FAILURE", isRequired: true }],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toContain("paperclip/approved (failure)");
+      });
+
+      it("does not let a passing commit status hide a failed check run of the same name", async () => {
+        carrierFetch({
+          mergeStateStatus: "BLOCKED",
+          contexts: [
+            failedRun("build"),
+            { __typename: "StatusContext", context: "build", state: "SUCCESS", isRequired: true },
+          ],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toContain("build (failure)");
+      });
+
+      it("does not refuse on checks when the context list continues on a later page", async () => {
+        // The failed run is on page 1; its rerun may sit past context 100.
+        carrierFetch({ mergeStateStatus: "BLOCKED", contexts: [failedRun("ci-required")], hasNextPage: true });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+      });
+
+      it("does not refuse on checks when the page boundary is unknown", async () => {
+        carrierFetch({ mergeStateStatus: "BLOCKED", contexts: [failedRun("ci-required")], hasNextPage: null });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+      });
+
+      it("still refuses a merge conflict when the context list is partial", async () => {
+        carrierFetch({ mergeStateStatus: "DIRTY", contexts: [failedRun("ci-required")], hasNextPage: true });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toMatch(/^carrier_merge_conflict: /);
+      });
+
+      it("does not refuse a carrier that GitHub no longer reports open", async () => {
+        carrierFetch({ mergeStateStatus: "DIRTY", contexts: [failedRun("ci-required")], state: "MERGED" });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+      });
+
+      it.each([
+        ["merged", { state: "closed", merged: true }],
+        ["closed", { state: "closed", merged: false }],
+      ])("does not refuse a %s carrier on a stale failed check", async (_label, live) => {
+        carrierFetch({ mergeStateStatus: "DIRTY", contexts: [failedRun("ci-required")] }, live);
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+        expect(result.tier).toBe("tier1");
+      });
+
+      it("does not refuse when live hydration of the carrier fails", async () => {
+        carrierFetch({ mergeStateStatus: "DIRTY", contexts: [failedRun("ci-required")] }, { status: 503 });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(true);
+      });
+
+      it("bounds a hung carrier read with a timeout and fails open", async () => {
+        const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(
+          () => AbortSignal.abort(new DOMException("The operation timed out.", "TimeoutError")),
+        );
+        try {
+          carrierFetch("hang");
+          const result = await closeDelegated();
+          expect(result.allowed).toBe(true);
+          expect(timeout).toHaveBeenCalledWith(10_000);
+        } finally {
+          timeout.mockRestore();
+        }
+      });
+
+      it("caps the failed-check list in the refusal text", async () => {
+        const longName = `matrix-${"x".repeat(200)}`;
+        carrierFetch({
+          mergeStateStatus: "BLOCKED",
+          contexts: [failedRun(longName), failedRun("two"), failedRun("three"), failedRun("four"), failedRun("five")],
+        });
+        const result = await closeDelegated();
+        expect(result.allowed).toBe(false);
+        expect(result.reason).toContain(`${longName.slice(0, 80)}… (failure)`);
+        expect(result.reason).not.toContain(longName.slice(0, 81));
+        expect(result.reason).toContain("two (failure), three (failure) and 2 more");
+        expect(result.reason).not.toContain("four");
+        expect(result.reason.length).toBeLessThan(600);
+      });
     });
 
     it("refuses landing-delegated when the repository has auto-merge disabled and no merge queue", async () => {

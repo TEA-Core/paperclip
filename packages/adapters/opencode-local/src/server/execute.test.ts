@@ -100,6 +100,7 @@ vi.mock("./models.js", async (importOriginal) => {
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { isSpawnEnvelopeTooLargeError, runningProcesses, sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 import * as serverUtils from "@paperclipai/adapter-utils/server-utils";
+import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixtures/prompt-context";
 
 import {
   buildOpenCodeFailureLogLine,
@@ -553,6 +554,31 @@ describe("OpenCode local chat policy", () => {
     expect(prompt).toContain(custom ? "Custom agent instruction." : "Continue your Paperclip conversation");
     expect(prompt).not.toContain("Execution contract:");
     expect(prompt).not.toContain("Create child issues");
+  });
+
+  // Upstream's resume-fallback context test. The fork's resolveOpenCodeSessionResume
+  // declines a saved session with no recorded cwd (unknown_cwd), so the runtime
+  // carries the session's cwd to keep the first attempt a resume.
+  it("delivers assignment context on an ordinary task turn and rebuilds it after resume fallback", async () => {
+    const commandPath = path.join(configHome, "fake-opencode-context");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const prompts: string[] = [];
+    runAdapterExecutionTargetProcessMock
+      .mockReset()
+      .mockResolvedValueOnce(probeResult({ stdout: JSON.stringify({ type: "error", error: "unknown session" }) }))
+      .mockResolvedValueOnce(probeResult({ stdout: JSON.stringify({ type: "text", sessionID: "fresh", part: { text: "done" } }) }));
+    await execute({
+      runId: "run-context-fallback",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: "previous", sessionParams: { sessionId: "previous", cwd: configHome }, sessionDisplayId: null, taskKey: null },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: createPromptContextFixture(),
+      onLog: async () => {},
+      onMeta: async (meta) => { prompts.push(String(meta.prompt ?? "")); },
+    });
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]).toContain("## Compact assignment");
+    expect(prompts[1]).toContain("## Owned assignment");
   });
 });
 

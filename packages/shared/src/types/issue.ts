@@ -565,6 +565,12 @@ export interface IssueUnblockDescriptor {
 }
 
 export interface IssueRecoveryAction {
+  /** Read-only activity of the exact native run named by the wake policy. */
+  nativeRunActivity?: {
+    runId: string;
+    status: "queued" | "running";
+    workspaceOperationId: string | null;
+  } | null;
   id: string;
   companyId: string;
   sourceIssueId: string;
@@ -889,6 +895,8 @@ export interface IssueChangeReceiptEntry {
 export type IssueChanges = Record<string, IssueChangeReceiptEntry>;
 
 export interface Issue {
+  /** True only while the title is the provisional slice of the initial prompt. */
+  titleNeedsGeneration?: boolean;
   conversationAgentId?: string | null;
   conversationUserId?: string | null;
   /** Server-owned Slack lifecycle projection; not writable through task updates. */
@@ -1201,6 +1209,15 @@ export interface IssueCommentMetadata {
   sourceRunId?: string | null;
   sourceIdentityContextId?: string | null;
   authorizationReason?: string | null;
+  /** Display snapshot only. Retry authority comes from the current recovery action. */
+  recovery?: {
+    kind: "disposition_repair_escalated";
+    actionId: string;
+    attemptCount: number;
+    maxAttempts: number;
+    reason: string;
+    assigneeAgentId: string | null;
+  };
   sections: IssueCommentMetadataSection[];
 }
 

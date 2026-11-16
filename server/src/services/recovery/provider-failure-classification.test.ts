@@ -1,3 +1,5 @@
+import { classifyRunLiveness } from "../run-liveness.js";
+import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import { describe, expect, it } from "vitest";
 import {
   PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS,
@@ -7,6 +9,33 @@ import {
 import { legacyExecutionNeedsReconciliation } from "../legacy-execution-recovery.js";
 
 describe("classifyAdapterFailureForRecovery", () => {
+  it.each(["acpx_auth_required", "claude_auth_required", "codex_auth_required", "adapter_auth_missing", "refresh_token_reused", "authentication_required"])("does not automatically retry provider authentication failure %s", (errorCode) => {
+    const classification = classifyRunLiveness({ runStatus: "failed", issue: null, errorCode, authenticationRepairRequested: true });
+    const run = { errorCode, ...classification };
+    expect(isAiAuthenticationBlocked(run)).toBe(true);
+    expect(classifyContinuationFailure(run as never)).toMatchObject({ kind: "non_retryable", maxAttempts: 0 });
+  });
+
+  // FORK-DIVERGENCE(SUP-13716): upstream #14629 also lists acpx_auth_required
+  // here. The fork stops continuation recovery for acpx_auth_required even
+  // without a repair card: unrefreshable ACP lane OAuth credentials fail every
+  // retry identically, so the issue is blocked for an operator re-login.
+  it.each(["kimi_auth_required", "gemini_auth_required"])("preserves recovery when %s did not produce an inline repair card", (errorCode) => {
+    const classification = classifyRunLiveness({ runStatus: "failed", issue: null, errorCode, authenticationRepairRequested: false });
+    const run = { errorCode, ...classification };
+    expect(isAiAuthenticationBlocked(run)).toBe(false);
+    expect(classifyContinuationFailure(run as never).kind).toBe("default");
+  });
+
+  it("stops continuation recovery for acpx_auth_required without an inline repair card (SUP-13716)", () => {
+    const errorCode = "acpx_auth_required";
+    const classification = classifyRunLiveness({ runStatus: "failed", issue: null, errorCode, authenticationRepairRequested: false });
+    expect(classifyContinuationFailure({ errorCode, ...classification } as never)).toMatchObject({
+      kind: "non_retryable",
+      maxAttempts: 0,
+    });
+  });
+
   it("uses a typed ACP quota reset without needing the provider's original message", () => {
     const now = new Date("2026-07-15T20:00:00.000Z");
     expect(classifyAdapterFailureForRecovery({
