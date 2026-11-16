@@ -567,6 +567,8 @@ npx paperclipai agent instructions-file:put <agent-id> --path AGENTS.md --conten
 npx paperclipai agent instructions-file:delete <agent-id> --path AGENTS.md
 ```
 
+`permissions:update` requires `canCreateAgents`. `canAssignTasks` is optional: omit it, or send the agent's current `access.canAssignTasks` value, to leave its task-assignment grant untouched. Only a different value writes or removes the `tasks:assign` grant.
+
 Agent config, instructions, skills, project env, environment, secret, and workspace edits affect the next run. Active runs finish with the config they started with. When a saved session, reused workspace, or sandbox lease no longer matches the effective next-run config, Paperclip may start fresh execution and records non-sensitive freshness categories in run result JSON and workspace operation logs.
 
 `agent local-cli` is the quickest way to run local Claude/Codex manually as a Paperclip agent:

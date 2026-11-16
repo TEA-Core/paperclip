@@ -296,7 +296,9 @@ export type TestAdapterEnvironment = z.infer<typeof testAdapterEnvironmentSchema
 export const updateAgentPermissionsSchema = z.object({
   canCreateAgents: z.boolean(),
   canCreateSkills: z.boolean().optional(),
-  canAssignTasks: z.boolean(),
+  // Omitted means "leave task assignment as it is": the route writes no
+  // tasks:assign grant unless this differs from the agent's effective value.
+  canAssignTasks: z.boolean().optional(),
   trustPreset: trustPresetSchema.optional(),
   authorizationPolicy: trustAuthorizationPolicySchema.optional(),
 });

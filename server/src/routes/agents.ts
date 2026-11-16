@@ -5004,24 +5004,42 @@ export function agentRoutes(
       await assertBoardCanManageAgentsForCompany(req, existing.companyId);
     }
 
-    const agent = await svc.updatePermissions(id, req.body);
+    // A request changes task assignment only when canAssignTasks is present and
+    // differs from the effective value the agent would have after this update
+    // with its current grants and membership. Otherwise the tasks:assign grant,
+    // the membership, and the stored flag stay as they are, so a single-flag
+    // change cannot move a default-sourced agent onto an explicit grant or
+    // rewrite an existing grant.
+    const requestedCanAssignTasks = req.body.canAssignTasks as boolean | undefined;
+    const projectedAccess = await buildAgentAccessState({
+      ...existing,
+      permissions: { ...existing.permissions, canCreateAgents: req.body.canCreateAgents },
+    });
+    const changesTaskAssign =
+      requestedCanAssignTasks !== undefined && requestedCanAssignTasks !== projectedAccess.canAssignTasks;
+    const { canAssignTasks: _canAssignTasks, ...permissionsWithoutTaskAssign } = req.body;
+
+    const agent = await svc.updatePermissions(id, changesTaskAssign ? req.body : permissionsWithoutTaskAssign);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
 
-    const effectiveCanAssignTasks =
-      agent.role === "ceo" || Boolean(agent.permissions?.canCreateAgents) || req.body.canAssignTasks;
-    await access.ensureMembership(agent.companyId, "agent", agent.id, "member", "active");
-    await access.setPrincipalPermission(
-      agent.companyId,
-      "agent",
-      agent.id,
-      "tasks:assign",
-      effectiveCanAssignTasks,
-      req.actor.type === "board" ? (req.actor.userId ?? null) : null,
-    );
+    if (changesTaskAssign) {
+      const grantTaskAssign =
+        agent.role === "ceo" || Boolean(agent.permissions?.canCreateAgents) || requestedCanAssignTasks === true;
+      await access.ensureMembership(agent.companyId, "agent", agent.id, "member", "active");
+      await access.setPrincipalPermission(
+        agent.companyId,
+        "agent",
+        agent.id,
+        "tasks:assign",
+        grantTaskAssign,
+        req.actor.type === "board" ? (req.actor.userId ?? null) : null,
+      );
+    }
 
+    const detail = await buildAgentDetail(agent);
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
@@ -5037,12 +5055,12 @@ export function agentRoutes(
       details: {
         canCreateAgents: agent.permissions?.canCreateAgents ?? false,
         canCreateSkills: agent.permissions?.canCreateSkills ?? true,
-        canAssignTasks: effectiveCanAssignTasks,
+        canAssignTasks: detail.access.canAssignTasks,
         trustPreset: agent.permissions?.trustPreset ?? "standard",
       },
     });
 
-    res.json(await buildAgentDetail(agent));
+    res.json(detail);
   });
 
   router.patch("/agents/:id/instructions-path", validate(updateAgentInstructionsPathSchema), async (req, res) => {

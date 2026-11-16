@@ -1815,10 +1815,12 @@ describe.sequential("agent permission routes", () => {
       .send({ canCreateAgents: false, canAssignTasks: true }));
 
     expect(res.status).toBe(200);
+    // canAssignTasks matches the agent's simple_default effective value, so it
+    // is not merged into the stored permissions.
     expect(mockAgentService.updatePermissions).toHaveBeenCalledWith(agentId, {
       canCreateAgents: false,
-      canAssignTasks: true,
     });
+    expect(mockAccessService.setPrincipalPermission).not.toHaveBeenCalled();
     expect(res.body.permissions.canCreateSkills).toBe(false);
   });
 
