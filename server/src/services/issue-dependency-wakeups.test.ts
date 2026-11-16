@@ -18,6 +18,7 @@ type WakeRow = {
   status: string;
   idempotencyKey: string | null;
   requestedAt: Date;
+  updatedAt?: Date;
 };
 
 function dbWithWakes(rows: WakeRow[]): Db {
@@ -52,7 +53,7 @@ describe("buildIssueBlockersResolvedWakeStateKey", () => {
     expect(first).toContain(dependentIssueId);
   });
 
-  it("changes when blockedTransitionAt changes", () => {
+  it("ignores blockedTransitionAt so every producer keys the same ready state", () => {
     const first = buildIssueBlockersResolvedWakeStateKey({
       dependentIssueId,
       blockerIssueIds: [blockerIssueId],
@@ -63,10 +64,10 @@ describe("buildIssueBlockersResolvedWakeStateKey", () => {
       blockerIssueIds: [blockerIssueId],
       blockedTransitionAt: secondCycle,
     });
-    expect(first).not.toBe(second);
+    expect(first).toBe(second);
   });
 
-  it("hashes a null cycle as none and differs from any timestamp", () => {
+  it("uses the same stable key for null, omitted, and dated transition stamps", () => {
     const noneKey = buildIssueBlockersResolvedWakeStateKey({
       dependentIssueId,
       blockerIssueIds: [blockerIssueId],
@@ -82,7 +83,7 @@ describe("buildIssueBlockersResolvedWakeStateKey", () => {
       blockedTransitionAt: firstCycle,
     });
     expect(noneKey).toBe(omittedKey);
-    expect(noneKey).not.toBe(datedKey);
+    expect(noneKey).toBe(datedKey);
     expect(noneKey).not.toBe(
       buildIssueBlockersResolvedWakeStateKeyWithoutCycle({
         dependentIssueId,
@@ -100,20 +101,41 @@ describe("findExistingIssueBlockersResolvedWakeForReadyState", () => {
     blockedTransitionAt: secondCycle,
   };
 
-  it("suppresses a completed wake on the cycle-aware state key", async () => {
-    const cycleKey = buildIssueBlockersResolvedWakeStateKey(readyState);
+  it("suppresses a completed wake on the stable state key", async () => {
+    const stateKey = buildIssueBlockersResolvedWakeStateKey(readyState);
     const existing = await findExistingIssueBlockersResolvedWakeForReadyState(
       dbWithWakes([
         {
-          id: "wake-cycle",
+          id: "wake-stable-state",
           status: "completed",
-          idempotencyKey: cycleKey,
+          idempotencyKey: stateKey,
           requestedAt: secondCycle,
         },
       ]),
       readyState,
     );
-    expect(existing?.id).toBe("wake-cycle");
+    expect(existing?.id).toBe("wake-stable-state");
+  });
+
+  it("suppresses a later producer after an earlier producer completed the same blocker-set wake", async () => {
+    const producerKey = buildIssueBlockersResolvedWakeStateKey({
+      dependentIssueId,
+      blockerIssueIds: [blockerIssueId],
+      blockedTransitionAt: firstCycle,
+    });
+    const existing = await findExistingIssueBlockersResolvedWakeForReadyState(
+      dbWithWakes([
+        {
+          id: "wake-earlier-producer",
+          status: "completed",
+          idempotencyKey: producerKey,
+          requestedAt: firstCycle,
+          updatedAt: firstCycle,
+        },
+      ]),
+      readyState,
+    );
+    expect(existing?.id).toBe("wake-earlier-producer");
   });
 
   it("does not let a completed old-key wake from a previous blocked cycle suppress", async () => {

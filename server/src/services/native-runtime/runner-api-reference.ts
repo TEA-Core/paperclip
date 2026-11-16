@@ -152,7 +152,7 @@ export const runnerApiReference: Record<string, { section: string; description?:
   },
   "POST /api/issues/{}/release": {
     "section": "Issues (Tasks)",
-    "description": "Release task ownership"
+    "description": "Release execution locks; preserve terminal task ownership"
   },
   "GET /api/issues/{}/comments": {
     "section": "Issues (Tasks)",
@@ -164,11 +164,11 @@ export const runnerApiReference: Record<string, { section: string; description?:
   },
   "POST /api/issues/{}/comments": {
     "section": "Issues (Tasks)",
-    "description": "Add comment (@-mentions trigger wakeups)",
+    "description": "Add comment (@-mentions provide context)",
     "examples": [
       {
         "body": {
-          "body": "[@QA Reviewer](agent://qa-agent-id) please review this implementation."
+          "body": "[@QA Reviewer](agent://qa-agent-id) has relevant testing context."
         }
       }
     ]
@@ -189,6 +189,44 @@ export const runnerApiReference: Record<string, { section: string; description?:
     "section": "Issues (Tasks)",
     "description": "Create issue-thread interaction (`suggest_tasks`, `ask_user_questions`, `request_confirmation`, `request_checkbox_confirmation`, `request_item_verdicts`)",
     "examples": [
+      {
+        "body": {
+          "kind": "ask_user_questions",
+          "idempotencyKey": "questions:{issueId}:responsibility-text:v1",
+          "title": "Hire responsibility",
+          "resolverPolicy": "human_only",
+          "continuationPolicy": "wake_assignee",
+          "payload": {
+            "version": 1,
+            "questions": [
+              {
+                "id": "responsibility",
+                "prompt": "What should the new agent be responsible for?",
+                "selectionMode": "single",
+                "required": true,
+                "options": [
+                  {
+                    "id": "describe",
+                    "label": "I'll describe it",
+                    "freeText": true
+                  }
+                ]
+              }
+            ],
+            "questionSet": {
+              "schema": "paperclip.question_set.v1",
+              "questions": [
+                {
+                  "id": "responsibility",
+                  "prompt": "What should the new agent be responsible for?",
+                  "required": true,
+                  "answerMode": "text"
+                }
+              ]
+            }
+          }
+        }
+      },
       {
         "body": {
           "kind": "ask_user_questions",
@@ -215,33 +253,6 @@ export const runnerApiReference: Record<string, { section: string; description?:
                     "id": "writing",
                     "label": "Writing",
                     "description": "Draft and edit content."
-                  }
-                ]
-              }
-            ]
-          }
-        }
-      },
-      {
-        "body": {
-          "kind": "ask_user_questions",
-          "idempotencyKey": "questions:{issueId}:responsibility-text:v1",
-          "title": "Hire responsibility",
-          "resolverPolicy": "human_only",
-          "continuationPolicy": "wake_assignee",
-          "payload": {
-            "version": 1,
-            "questions": [
-              {
-                "id": "responsibility",
-                "prompt": "What should the new agent be responsible for?",
-                "selectionMode": "single",
-                "required": true,
-                "options": [
-                  {
-                    "id": "describe",
-                    "label": "I'll describe it",
-                    "freeText": true
                   }
                 ]
               }
@@ -361,6 +372,10 @@ export const runnerApiReference: Record<string, { section: string; description?:
         }
       }
     ]
+  },
+  "POST /api/issues/{}/interactions/{}/resolve-from-comment": {
+    "section": "Issues (Tasks)",
+    "description": "Resolve a confirmation from the latest user reply; body: commentId, decision (accept/reject), selectedOptionIds for checkbox acceptance, optional reason"
   },
   "POST /api/issues/{}/interactions/{}/accept": {
     "section": "Issues (Tasks)",
@@ -656,6 +671,22 @@ export const runnerApiReference: Record<string, { section: string; description?:
     "section": "Approvals, Costs, Activity, Dashboard",
     "description": "Create hire request/agent draft",
     "examples": [
+      {
+        "body": {
+          "name": "Marketing Analyst",
+          "role": "researcher",
+          "reportsTo": "{manager-agent-id}",
+          "capabilities": "Market research, competitor analysis",
+          "adapterType": "paperclip_runner",
+          "inheritRuntimeFrom": "caller",
+          "instructionsBundle": {
+            "entryFile": "AGENTS.md",
+            "files": {
+              "AGENTS.md": "# Marketing Analyst\nResearch markets and competitors. Report findings with sources to your manager.\n"
+            }
+          }
+        }
+      },
       {
         "body": {
           "name": "Marketing Analyst",

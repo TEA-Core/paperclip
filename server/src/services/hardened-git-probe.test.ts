@@ -792,6 +792,20 @@ describe("probeNoRepositoryWorktree (SUP-22570 record_only close)", () => {
       });
     });
 
+    it("permits an explicitly authorized source card while still refusing an unrelated card", async () => {
+      const layout = managedLayout();
+      const branch = "SUP-7-recover-SUP-70-after-OTHER-999";
+      const worktree = layout.addWorktree(branch);
+      expect(await probeNoRepositoryWorktree({
+        ...layout.input,
+        recordedWorktreePath: worktree,
+        permittedOtherCardIdentifiers: new Set(["SUP-70"]),
+      })).toEqual({
+        ok: false,
+        reason: `the recorded worktree's branch ${branch} also names another card (OTHER-999)`,
+      });
+    });
+
     // The default branch is the identifier and the lower-cased issue title, so
     // a word-number token from a title names no card.
     it.each([

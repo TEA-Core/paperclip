@@ -30,7 +30,6 @@ export type InstanceExecutionMode = "kubernetes" | "any";
 
 export interface InstanceGeneralSettings {
   censorUsernameInLogs: boolean;
-  keyboardShortcuts: boolean;
   feedbackDataSharingPreference: FeedbackDataSharingPreference;
   backupRetention: BackupRetentionPolicy;
   /**
@@ -81,6 +80,10 @@ export interface InstanceExperimentalSettings {
   enableApps: boolean;
   /** Exposes chat connector setup and Board surfaces; existing delivery continues when hidden. */
   enableChatConnectors: boolean;
+  /** @deprecated Compatibility key only. MCP aggregators are always enabled. */
+  enableMcpAggregators: boolean;
+  /** Show experimental memory connection setup. Existing connections remain usable. */
+  enableMemoryConnectors: boolean;
   enablePipelines: boolean;
   enableCases: boolean;
   enableAgentChat: boolean;

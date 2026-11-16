@@ -1,3 +1,4 @@
+import { agentAppearanceSchema } from "../agent-appearance.js";
 import { aiConnectionBindingSchema } from "../ai-connections.js";
 import { z } from "zod";
 import {
@@ -38,10 +39,18 @@ export const updateAgentInstructionsBundleSchema = z.object({
 export type UpdateAgentInstructionsBundle = z.infer<typeof updateAgentInstructionsBundleSchema>;
 
 export const upsertAgentInstructionsFileSchema = z.object({
-  path: z.string().trim().min(1),
-  content: z.string(),
+  path: z.string().min(1).max(512),
+  content: z.string().max(1024 * 1024),
+  baseRevisionId: z.string().uuid().nullable().optional(),
+  baseHash: z.string().regex(/^[a-f0-9]{64}$/).nullable().optional(),
   clearLegacyPromptTemplate: z.boolean().optional().default(false),
-});
+}).strict();
+
+export const restoreAgentInstructionSchema = z.object({
+  path: z.string().min(1).max(512),
+  revisionId: z.string().uuid(),
+  baseRevisionId: z.string().uuid(),
+}).strict();
 
 export type UpsertAgentInstructionsFile = z.infer<typeof upsertAgentInstructionsFileSchema>;
 
@@ -85,6 +94,7 @@ export const createAgentSchema = z.object({
   role: z.enum(AGENT_ROLES).optional().default("general"),
   title: z.string().optional().nullable(),
   icon: z.enum(AGENT_ICON_NAMES).optional().nullable(),
+  appearance: agentAppearanceSchema.optional(),
   reportsTo: z.string().guid().optional().nullable(),
   capabilities: z.string().optional().nullable(),
   desiredSkills: z.array(agentDesiredSkillSelectionSchema).optional(),
@@ -136,6 +146,9 @@ export type BuiltInAgentReset = z.infer<typeof builtInAgentResetSchema>;
 export const createAgentHireSchema = createAgentSchema.extend({
   sourceIssueId: z.string().guid().optional().nullable(),
   sourceIssueIds: z.array(z.string().guid()).optional(),
+  // Agent-authored hires may explicitly request the caller's native runner
+  // settings. The server consumes this intent; it is never an agent column.
+  inheritRuntimeFrom: z.literal("caller").optional(),
 });
 
 export type CreateAgentHire = z.infer<typeof createAgentHireSchema>;
@@ -289,3 +302,9 @@ export const updateAgentPermissionsSchema = z.object({
 });
 
 export type UpdateAgentPermissions = z.infer<typeof updateAgentPermissionsSchema>;
+
+export const resolveAgentInstructionCandidateSchema = z.object({
+  baseRevisionId: z.string().uuid().nullable(),
+  content: z.string().max(1024 * 1024),
+}).strict();
+export type ResolveAgentInstructionCandidate = z.infer<typeof resolveAgentInstructionCandidateSchema>;

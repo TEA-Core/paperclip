@@ -257,7 +257,13 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
   async function liveRun(seeded: Seeded, agentId: string, issueId: string) {
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({
-      id: runId, companyId: seeded.companyId, agentId, status: "running", contextSnapshot: { issueId },
+      id: runId, companyId: seeded.companyId, agentId, status: "running",
+      // SUP-23490: the done-tier gate places a record-only observation inside
+      // the closing run's lifetime (startedAt ?? createdAt); a run that closes
+      // its own card has always started, so seed the start before the suite's
+      // fixed probe instant (2026-11-04T09:15:00Z).
+      startedAt: new Date("2026-11-04T09:00:00Z"),
+      contextSnapshot: { issueId },
     });
     seededRunIds.push(runId);
     return runId;
@@ -507,6 +513,7 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     ["adds itself beside the reviewer", (policy, seeded) => ({ executionPolicy: withArbiterBesideReviewer(policy, seeded) })],
     ["only changes baseRef", (policy) => ({ executionPolicy: { ...policy, baseRef: "release/r20" } })],
     ["writes the review policy", () => ({ reviewPolicy: "anyone" })],
+    ["sends the top-level monitor alias", () => ({ monitor: { nextCheckAt: "2099-01-01T00:00:00.000Z", notes: "alias" } })],
     // Malformed bodies get the same refusal, before body validation (no 400).
     ["sends a malformed policy with unknown and type-wrong keys", () => ({ executionPolicy: { stages: "not-a-list", bogus: true } })],
     ["sends an unknown key beside a valid policy", (policy) => ({ executionPolicy: { ...policy, unknownKey: 1 } })],
@@ -591,6 +598,10 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
       .send({ status: "in_progress", comment: "Regenerate the stale fixture and redeliver." });
     expect(directive.status, JSON.stringify(directive.body)).toBe(200);
     expect((await issueRow(issueId)).assigneeAgentId).toBe(seeded.coderId);
+    // These runs are seeded, not owned by an adapter. End each issuer before
+    // the next participant acts; a handoff no longer hides a running owner.
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, arbiterRun));
 
     const coderRun = await liveRun(seeded, seeded.coderId, issueId);
     const redelivery = await request(app(agentActor(seeded, seeded.coderId, coderRun)))
@@ -598,6 +609,8 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
       .send({ status: "in_review", comment: "Redelivered with the regenerated fixture." });
     expect(redelivery.status, JSON.stringify(redelivery.body)).toBe(200);
     expect((await issueRow(issueId)).assigneeAgentId).toBe(seeded.reviewerId);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, coderRun));
 
     const reviewerRun = await liveRun(seeded, seeded.reviewerId, issueId);
     const approval = await request(app(agentActor(seeded, seeded.reviewerId, reviewerRun)))

@@ -27,6 +27,7 @@ const apiPrefixes: Record<string, string> = {
   "adapters.ts": "/api",
   "agent-github-tokens.ts": "/api",
   "agents.ts": "/api",
+  "agent-avatars.ts": "/api",
   "announcements.ts": "/api",
   "ai-connections.ts": "/api",
   "attention.ts": "/api",
@@ -34,8 +35,10 @@ const apiPrefixes: Record<string, string> = {
   "assets.ts": "/api",
   "auth.ts": "/api/auth",
   "board-chat.ts": "/api",
+  "browser-use.ts": "/api",
   "built-in-agents.ts": "/api",
   "chat-channels.ts": "/api",
+  "slack-tools.ts": "/api",
   "email.ts": "/api",
   "cloud.ts": "/api/cloud",
   "companies.ts": "/api/companies",
@@ -267,6 +270,14 @@ describe("openapi routes", () => {
     expect(wake.responses["409"]).toBeDefined();
     expect(wake.description).toContain("durable queued/deferred receipt");
   });
+  it("documents recovery-rate alert decision queue seed signals", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/companies/{companyId}/decision-queue-seed-rules"].get;
+    const schema = operation.responses["200"].content["application/json"].schema;
+
+    expect(schema.items.properties.signal.enum).toContain("recovery_rate_alert");
+  });
+
   it("documents the recovery observability incident-based response contract", () => {
     const { spec } = loadSpecRoutes();
     const operation =
@@ -558,6 +569,17 @@ describe("openapi routes", () => {
       ["get", "/api/companies/{companyId}/chat-endpoints"],
       ["post", "/api/companies/{companyId}/chat-endpoints"],
       ["get", "/api/chat-endpoints/{endpointId}"],
+      ["get", "/api/chat-endpoints/{endpointId}/github/configuration"],
+      ["put", "/api/chat-endpoints/{endpointId}/github/configuration"],
+      ["post", "/api/chat-endpoints/{endpointId}/github/verify"],
+      ["put", "/api/chat-endpoints/{endpointId}/github/progress"],
+      ["get", "/api/chat-endpoints/{endpointId}/github/reviews"],
+      ["get", "/api/chat-endpoints/{endpointId}/github/personal-connections"],
+      ["post", "/api/chat-endpoints/{endpointId}/github/identity"],
+      ["post", "/api/chat-endpoints/{endpointId}/github/people/lookup"],
+      ["post", "/api/chat-endpoints/{endpointId}/github/registration"],
+      ["post", "/api/chat-endpoints/{endpointId}/github/app"],
+      ["post", "/api/chat-endpoints/{endpointId}/github/repositories/refresh"],
       ["patch", "/api/chat-endpoints/{endpointId}"],
       ["post", "/api/chat-endpoints/{endpointId}/setup"],
       ["post", "/api/chat-endpoints/{endpointId}/setup-secret"],
@@ -728,7 +750,7 @@ describe("openapi routes", () => {
     const activity =
       spec.paths["/api/chat-endpoints/{endpointId}/activity"].get.responses[
         "200"
-      ].content["application/json"].schema.items;
+      ].content["application/json"].schema.oneOf[0].items;
     expect(activity.properties.actionType.enum).toEqual([
       "slash_task_start",
       "provider_effect",
@@ -1896,5 +1918,36 @@ describe("issue PATCH record-only OpenAPI contract", () => {
       enum: ["record_only_self_assignee", "record_only_not_authorized"],
     });
     expect(res.body.components.schemas.Error.properties).toEqual({ error: { type: "string" } });
+  });
+});
+
+
+describe("heartbeat run ID OpenAPI contract", () => {
+  it("publishes the runtime UUID constraint and 400 response on all agent-router run endpoints", async () => {
+    const response = await request(createApp()).get("/api/openapi.json");
+    expect(response.status).toBe(200);
+    const paths = response.body.paths;
+    let checked = 0;
+    for (const [path, operations] of Object.entries(paths)) {
+      if (!path.startsWith("/api/heartbeat-runs/{runId}") || path.endsWith("/issues")) continue;
+      for (const operation of Object.values(operations as Record<string, any>)) {
+        const parameter = operation.parameters.find((param: { name: string }) => param.name === "runId");
+        expect(parameter.schema.pattern).toEqual(expect.any(String));
+        const pattern = new RegExp(parameter.schema.pattern);
+        for (const id of [
+          "aaaaaaaa-aaaa-1aaa-8aaa-aaaaaaaaaaaa",
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "AAAAAAAA-AAAA-5AAA-BAAA-AAAAAAAAAAAA",
+        ]) expect(pattern.test(id), id).toBe(true);
+        for (const id of [
+          "undefined", "not-a-uuid", " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa ",
+          "aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa", "aaaaaaaa-aaaa-4aaa-0aaa-aaaaaaaaaaaa",
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n",
+        ]) expect(pattern.test(id), JSON.stringify(id)).toBe(false);
+        expect(operation.responses["400"]).toBeDefined();
+        checked++;
+      }
+    }
+    expect(checked).toBe(12);
   });
 });

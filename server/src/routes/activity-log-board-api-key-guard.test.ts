@@ -39,6 +39,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { blankNonCode } from "../__tests__/helpers/blank-non-code.js";
 
 const SRC_ROOT = join(__dirname, "..");
 
@@ -120,6 +121,14 @@ const ALLOWLIST: AllowlistEntry[] = [
   // request-less: durable comment-delivery path (issue_comments carries no board
   // key, so the resuming comment's board provenance is not in scope here)
   { file: "agent-conversations.ts", action: "issue.tree_hold_released", actorType: '"user"', reason: "request-less comment-delivery path" },
+  // KNOWN LIMIT (SUP-23998): these two user-capable secret-proposal resolution
+  // writes were hidden from the guard by the old scanner (blind past a regex
+  // literal) and surfaced when it was fixed. `InteractionActor` carries no board
+  // key, so attribution needs the key threaded through the accept/reject/skip
+  // routes and `recordSecretProposalExecutionResult`. Follow-up work; do not
+  // copy these entries to new sites.
+  { file: "issue-thread-interactions.ts", action: "`secret.proposal.${outcome.status}`", reason: "known limit: InteractionActor has no boardApiKeyId" },
+  { file: "issue-thread-interactions.ts", action: "secret.proposal.rejected", actorType: 'current.resolvedByUserId ? "user" : "system"', reason: "known limit: recordSecretProposalExecutionResult has no actor" },
 ];
 
 function isAllowlisted(allowlist: AllowlistEntry[], file: string, action: string, actorTypeExpr: string | undefined): boolean {
@@ -132,70 +141,13 @@ function isAllowlisted(allowlist: AllowlistEntry[], file: string, action: string
 }
 
 // ---------------------------------------------------------------------------
-// Structural scanning. `toCodeOnly` blanks comments and string interiors
-// (keeping the same length so index arithmetic stays valid), leaving braces,
-// commas, colons, and identifiers intact. All structural work runs on that
-// code-only view; values are read back from the original text at the same
-// indices so string literals (actorType/action values) are preserved.
+// Structural scanning. `blankNonCode` (a real lexer: regex literals and nested
+// templates cannot knock it out of sync) blanks comments, string/regex literals
+// and template text, keeping the same length so index arithmetic stays valid
+// and leaving braces, commas, colons, and identifiers intact. All structural
+// work runs on that code-only view; values are read back from the original text
+// at the same indices so string literals (actorType/action values) are preserved.
 // ---------------------------------------------------------------------------
-
-function toCodeOnly(text: string): string {
-  const out = text.split("");
-  let i = 0;
-  const n = text.length;
-  while (i < n) {
-    const c = text[i];
-    if (c === "/" && text[i + 1] === "/") {
-      let j = i;
-      while (j < n && text[j] !== "\n") {
-        out[j] = " ";
-        j++;
-      }
-      i = j;
-      continue;
-    }
-    if (c === "/" && text[i + 1] === "*") {
-      let j = i;
-      while (j < n && !(text[j] === "*" && text[j + 1] === "/")) {
-        out[j] = " ";
-        j++;
-      }
-      if (j < n) {
-        out[j] = " ";
-        out[j + 1] = " ";
-        j += 2;
-      }
-      i = j;
-      continue;
-    }
-    if (c === '"' || c === "'" || c === "`") {
-      const q = c;
-      out[i] = " ";
-      i++;
-      while (i < n) {
-        if (text[i] === "\\") {
-          out[i] = " ";
-          i++;
-          if (i < n) {
-            out[i] = " ";
-            i++;
-          }
-          continue;
-        }
-        if (text[i] === q) {
-          out[i] = " ";
-          i++;
-          break;
-        }
-        out[i] = " ";
-        i++;
-      }
-      continue;
-    }
-    i++;
-  }
-  return out.join("");
-}
 
 function matchBrace(code: string, openIdx: number): number {
   let depth = 0;
@@ -318,7 +270,7 @@ const CALL_RE = /(?<![\w$.])(logActivity|persistActivity|logActivityInTransactio
  * not masking a board-authenticable gap.
  */
 function scanSource(content: string, fileName: string, allowlist: AllowlistEntry[] = ALLOWLIST): Violation[] {
-  const code = toCodeOnly(content);
+  const code = blankNonCode(content);
   const violations: Violation[] = [];
   const n = code.length;
 
@@ -405,7 +357,9 @@ describe("board-api-key activity log guard", () => {
     const files = collectSourceFiles();
     for (const entry of ALLOWLIST) {
       const content = readFileSync(pathByBasename(files, entry.file), "utf-8");
-      const actionPattern = new RegExp(`action\\s*:\\s*["']${entry.action}["']`);
+      // An action written as a template literal keeps its backticks in the entry.
+      const escapedAction = entry.action.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const actionPattern = new RegExp(`action\\s*:\\s*(?:["']${escapedAction}["']|${escapedAction})`);
       expect(
         actionPattern.test(content),
         `Allowlist entry ${entry.file} (${entry.action}): action string not found in file`,
@@ -485,6 +439,66 @@ describe("board-api-key activity log guard", () => {
     const violations = scanSource(snippet, "synthetic.ts");
     expect(violations).toHaveLength(1);
     expect(violations[0].action).toBe("synthetic.missing_board");
+  });
+
+  // --- Sync tests (SUP-23998): the old quote-pairing scan lost sync on these two
+  // shapes and was then blind to the rest of the file, so a real violation
+  // below them (slack-board-messages.ts) went unreported. ---
+
+  it("still flags a violation that follows a regex literal containing a backtick", () => {
+    const snippet = [
+      "export function handler(req: any, db: any, name: string) {",
+      '  const safe = name.replace(/[\\r\\n*_`<>\\[\\]()\\\\]/g, " ");',
+      "  return logActivity(db, {",
+      "    companyId: req.companyId,",
+      '    actorType: "user",',
+      "    actorId: safe,",
+      '    action: "synthetic.after_regex",',
+      '    entityType: "synthetic",',
+      '    entityId: "x",',
+      "  });",
+      "}",
+    ].join("\n");
+    const violations = scanSource(snippet, "synthetic.ts");
+    expect(violations).toHaveLength(1);
+    expect(violations[0].action).toBe("synthetic.after_regex");
+  });
+
+  it("still flags a violation that follows a nested template literal", () => {
+    const snippet = [
+      "export function handler(req: any, db: any, key?: string) {",
+      "  const id = `${key ?? `fallback:${req.id}`}:attachment`;",
+      "  return logActivity(db, {",
+      "    companyId: req.companyId,",
+      '    actorType: "user",',
+      "    actorId: id,",
+      '    action: "synthetic.after_template",',
+      '    entityType: "synthetic",',
+      '    entityId: "x",',
+      "  });",
+      "}",
+    ].join("\n");
+    const violations = scanSource(snippet, "synthetic.ts");
+    expect(violations).toHaveLength(1);
+    expect(violations[0].action).toBe("synthetic.after_template");
+  });
+
+  it("flags a call inside a template substitution and ignores one inside template text", () => {
+    const snippet = [
+      "export function handler(req: any, db: any) {",
+      "  const text = `logActivity(db, { actorType: \"user\", action: \"in.text\" })`;",
+      "  return `${logActivity(db, {",
+      "    companyId: req.companyId,",
+      '    actorType: "user",',
+      "    actorId: req.userId,",
+      '    action: "synthetic.in_substitution",',
+      '    entityType: "synthetic",',
+      '    entityId: "x",',
+      "  })}`;",
+      "}",
+    ].join("\n");
+    const violations = scanSource(snippet, "synthetic.ts");
+    expect(violations.map((v) => v.action)).toEqual(["synthetic.in_substitution"]);
   });
 
   it("passes an actorType: actor.actorType call that carries a top-level boardApiKeyId", () => {

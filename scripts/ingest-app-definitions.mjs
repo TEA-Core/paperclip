@@ -1,6 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 const root = process.cwd();
+// Provider definitions can be regenerated without the external research corpus.
+// This mode preserves the checked-in ingestion report.
+const definitionsOnly = process.argv.includes("--definitions-only");
 const corpus =
   process.env.PAPERCLIP_CONTENT_TEMPLATES ??
   path.resolve(
@@ -204,10 +207,58 @@ const apps = [
       },
     ),
   ],
+  ...[
+    ["arcade", "Arcade", "https://api.arcade.dev/*", "https://docs.arcade.dev/en/operate/governance/mcp-gateways"],
+    ["executor", "Executor", "https://executor.sh/*", "https://executor.sh/docs/mcp-proxy"],
+  ].map(([slug, name, pattern, docsUrl]) => [
+    slug, name, `Use the tools exposed by your ${name} MCP connection.`, "productivity", new URL(pattern).hostname, [pattern],
+    method("mcp", "mcp_remote", "none", {}, "S3", `Paste your ${name} MCP URL. Sign in if required, or add a token or headers under Advanced authentication.`, {
+      label: "Connect MCP server", ownershipModes: ["dcr", "customer"], consoleLinks: { docs: docsUrl },
+    }),
+    { featured: true, docsUrl },
+  ]),
+  [
+    "railway",
+    "Railway",
+    "Inspect services and logs, deploy applications, and run commands in your Railway containers.",
+    "developer",
+    "railway.com",
+    ["https://mcp.railway.com/"],
+    method(
+      "mcp-oauth",
+      "mcp_remote",
+      "oauth",
+      {
+        serverUrl: "https://mcp.railway.com",
+        scopesHint: ["openid", "offline_access", "workspace:member"],
+        oauthAuthorizationParams: { prompt: "consent" },
+      },
+      "S4",
+      "Sign in to Railway and select the workspaces your agents may use. Paperclip adds direct service, deployment, and bounded log tools when Railway accepts the connection for API access. Container commands require the separate SSH setup on the connection. Project tokens are not supported by Railway's hosted connection.",
+      {
+        label: "Connect Railway",
+        ownershipModes: ["dcr", "customer"],
+        whenToUse: "Authorize your Railway account in the browser.",
+        consoleLinks: {
+          docs: "https://docs.railway.com/ai/mcp-server",
+          register: "https://docs.railway.com/integrations/oauth/creating-an-app",
+          settings: "https://railway.com/account",
+        },
+        warnings: [
+          "Railway enforces the workspaces selected at consent. Selected actions start Allowed; choose Ask first for operations you want to approve.",
+          "Logs and container commands can expose application data and secrets. Grant access only to agents trusted with the selected services.",
+          "The general Railway agent and committing staged changes are unavailable because their internal changes cannot be individually reviewed in Paperclip.",
+          "Live Railway qualification is pending. If Railway rejects API access, reconnect with the required permissions; Paperclip never falls back to another credential.",
+        ],
+        requiredResourceFilters: ["workspace", "project", "environment", "service"],
+      },
+    ),
+    { redirectConstraints: "https-or-loopback-http" },
+  ],
   [
     "github",
     "GitHub",
-    "Give agents repository tools or let people work with an agent from GitHub issues and pull requests.",
+    "Give agents access to GitHub repositories, issues, and pull requests.",
     "developer",
     "github.com",
     ["https://api.githubcopilot.com/mcp/*", "https://github.com/*"],
@@ -220,7 +271,7 @@ const apps = [
         "S3",
         "Authorize Paperclip, then choose selected repositories in GitHub. You can edit repository access later from GitHub's installation settings.",
         {
-          label: "Use this connection as an agent tool",
+          label: "Connect GitHub",
           purpose: "tool",
           oauthStrategy: "paperclip_cloud_connector",
           connectorProfile: "github.code",
@@ -255,31 +306,40 @@ const apps = [
           requiredResourceFilters: ["organization", "repository"],
         },
       ),
-      channelMethod(
-        "github",
-        [
-          {
-            ...field("appId", "GitHub App ID", "123456"),
-            type: "text",
-            secret: false,
-          },
-          {
-            ...field(
-              "privateKey",
-              "Private key (PEM)",
-              "-----BEGIN RSA PRIVATE KEY-----",
-            ),
-            type: "textarea",
-          },
-        ],
-        ["organization", "repository"],
-        "Generate the webhook secret in Paperclip, then create one private GitHub App with active SSL-verified webhooks, Issues and Pull requests read/write permission, and the selectable issue_comment and pull_request_review_comment events. GitHub sends installation and installation_repositories automatically. Install the App only on repositories where people may mention the agent.",
-        {
-          register: "https://github.com/settings/apps/new",
-          docs: "https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app",
-        },
-      ),
     ],
+  ],
+  [
+    "github-code-review-bot",
+    "GitHub Code Review Bot",
+    "Have an agent review pull requests and respond to GitHub mentions.",
+    "developer",
+    "github.com",
+    [],
+    channelMethod(
+      "github",
+      [
+        {
+          ...field("appId", "GitHub App ID", "123456"),
+          type: "text",
+          secret: false,
+        },
+        {
+          ...field(
+            "privateKey",
+            "Private key (PEM)",
+            "-----BEGIN RSA PRIVATE KEY-----",
+          ),
+          type: "textarea",
+        },
+      ],
+      ["organization", "repository"],
+      "Generate the webhook secret in Paperclip, then create one private GitHub App with active SSL-verified webhooks, Issues and Pull requests read/write permission, and the selectable issue_comment and pull_request_review_comment events. GitHub sends installation and installation_repositories automatically. Install the App only on repositories where people may mention the agent.",
+      {
+        register: "https://github.com/settings/apps/new",
+        docs: "https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app",
+      },
+    ),
+    { featured: true },
   ],
   [
     "slack",
@@ -652,36 +712,12 @@ const apps = [
   [
     "composio",
     "Composio",
-    "Connect Composio so Paperclip can discover and manage the toolkits in your project.",
+    "Discover and use connected apps through Composio Connect.",
     "productivity",
     "composio.dev",
-    ["https://backend.composio.dev/*"],
-    method(
-      "api-key",
-      "rest_api",
-      "api_key",
-      { serviceHost: "backend.composio.dev" },
-      "S3",
-      "Create a scoped project API key in Composio. It needs read access to toolkits and auth configs; later service-connection phases also need connected-account and session access.",
-      {
-        whenToUse:
-          "Use a project API key from the Composio project that owns the toolkits and connected accounts.",
-        credentialFields: [
-          field(
-            "apiKey",
-            "Composio project API key",
-            "Paste the Composio API key",
-          ),
-        ],
-        keyPlacement: { location: "header", name: "x-api-key" },
-        consoleLinks: {
-          keys: "https://app.composio.dev/",
-          settings: "https://app.composio.dev/",
-          docs: "https://docs.composio.dev/reference/authenticating-to-composio/project-api-key-permissions",
-        },
-      },
-    ),
-    { featured: true },
+    ["https://backend.composio.dev/*", "https://connect.composio.dev/*", "https://mcp.composio.dev/*", "https://*.composio.dev/*"],
+    [method("mcp", "mcp_remote", "none", { serverUrl: "https://connect.composio.dev/mcp" }, "S3", "Sign in to Composio Connect, or paste an externally configured MCP session URL and headers.", { label: "Composio Connect", ownershipModes: ["dcr", "customer"] })],
+    { featured: true, docsUrl: "https://docs.composio.dev/docs/composio-connect" },
   ],
   [
     "oauth-generic",
@@ -791,6 +827,16 @@ const apps = [
       },
     ),
   ],
+  ["browser-use-cloud", "Browser Use Cloud", "Delegate browser tasks and watch them live in Paperclip.", "productivity", "browser-use.com", ["https://cloud.browser-use.com/*"],
+    method("cloud-v4", "rest_api", "api_key", { serverUrl: "https://api.browser-use.com/api/v4" }, "S3",
+      "Create an API key in [Browser Use settings](https://cloud.browser-use.com/settings) and paste it below. Your agents can browse websites while you watch and interact from the task's Browser tab.", {
+        label: "Browser Use Cloud",
+        credentialFields: [{ ...field("apiKey", "API key", "bu_…"), helperMd: "Open Browser Use → Settings → API keys. Create a key for the project agents should use." }],
+        keyPlacement: { location: "header", name: "X-Browser-Use-API-Key" },
+        consoleLinks: { keys: "https://cloud.browser-use.com/settings", docs: "https://docs.browser-use.com/cloud/api-v4-overview" },
+      }),
+    { docsUrl: "https://docs.browser-use.com/cloud/api-v4-overview" },
+  ],
 ].map(
   ([
     slug,
@@ -885,6 +931,7 @@ const categoryBySlug = {
   coda: "productivity",
   egnyte: "content",
   embat: "commerce",
+  fireflies: "productivity",
   "hugging-face": "ai",
   jira: "productivity",
   kernel: "developer",
@@ -892,6 +939,9 @@ const categoryBySlug = {
   make: "productivity",
   manufact: "productivity",
   mem0: "ai",
+  zep: "ai",
+  supermemory: "ai",
+  honcho: "ai",
   miro: "productivity",
   mixpanel: "analytics",
   netlify: "developer",
@@ -914,6 +964,7 @@ const categoryBySlug = {
   webflow: "content",
   wix: "content",
   xero: "commerce",
+  youcom: "ai",
   zapier: "productivity",
 };
 const oauthMethodFor = (
@@ -966,7 +1017,7 @@ const apiKeySpec = {
     prefix: null,
     placeholder: "Paste your Kernel API key",
   },
-  mem0: { name: "Authorization", prefix: "Bearer ", placeholder: "m0sk_..." },
+  mem0: { name: "Authorization", prefix: "Bearer ", placeholder: "Paste your Mem0 API key" },
   oreilly: {
     name: "Authorization",
     prefix: "Bearer ",
@@ -1000,6 +1051,11 @@ const apiKeySpec = {
     name: "Authorization",
     prefix: "Bearer ",
     placeholder: "sbp_...",
+  },
+  youcom: {
+    name: "Authorization",
+    prefix: "Bearer ",
+    placeholder: "Paste your You.com API key",
   },
 };
 const apiKeyMethodFor = (
@@ -1039,6 +1095,38 @@ const apiKeyMethodFor = (
   );
 };
 const specialMethodsFor = (entry) => {
+  if (entry.slug === "mem0" || entry.slug === "honcho") return [
+    apiKeyMethodFor(entry, "mcp-api-key", entry.serverUrl, {
+      guidanceMd: `Open the ${entry.name} dashboard, create an API key for the account agents should use, and paste it below.`,
+      consoleLinks: { keys: entry.slug === "mem0" ? "https://app.mem0.ai/dashboard/api-keys" : "https://app.honcho.dev", docs: entry.docsUrl },
+    }),
+  ];
+  if (entry.slug === "zep") return [oauthMethodFor(entry, "mcp-oauth", entry.serverUrl, {
+    grantKinds: ["user"],
+    defaults: { serverUrl: entry.serverUrl, scopesHint: ["graph:read", "graph:write"] },
+    guidanceMd: "Sign in with the work identity configured for your Zep project's Memory MCP server. Zep restricts access to that identity's memory and authorized shared graphs.",
+    consoleLinks: { settings: "https://app.getzep.com", docs: entry.docsUrl },
+  })];
+  if (entry.slug === "supermemory") return [oauthMethodFor(entry, "mcp-oauth", entry.serverUrl, {
+    grantKinds: ["user"],
+    defaults: { serverUrl: entry.serverUrl, scopesHint: ["openid", "profile", "email", "offline_access"] },
+    guidanceMd: "Sign in to Supermemory, then choose a workspace, read or write access, and optional tags. Use a separate space for unrelated work.",
+  })];
+  if (entry.slug === "fireflies")
+    return [
+      oauthMethodFor(entry, "mcp-oauth", entry.serverUrl, {
+        defaults: { serverUrl: entry.serverUrl, scopesHint: ["email", "profile"] },
+        guidanceMd: "Sign in to Fireflies to use meeting transcripts, summaries, and action items. Configure optional summary-ready webhooks separately in a routine's Triggers tab.",
+      }),
+      apiKeyMethodFor(entry, "mcp-api-key", entry.serverUrl, {
+        whenToUse: "Use your Fireflies API key instead of browser sign-in.",
+        guidanceMd: "Open Fireflies Settings → Developer Settings, copy your API key, and paste it below. This key accesses your meeting data; routine webhooks use a separate signing secret.",
+        consoleLinks: {
+          keys: "https://app.fireflies.ai/settings",
+          docs: entry.docsUrl,
+        },
+      }),
+    ];
   // Atlassian's /authv2 rollout only issues GA-tool-compatible tokens when the
   // authorization request includes this reviewed protected-resource scope set.
   // Omitting scope currently yields agent-interface scopes that its own Jira
@@ -1301,8 +1389,59 @@ const specialMethodsFor = (entry) => {
       }),
     ];
   }
+  if (entry.slug === "youcom") {
+    // You.com also serves a documented keyless profile at ?profile=free with a
+    // reduced read-only tool set. That is a real user choice: try web search
+    // with no account, or connect the full authenticated server.
+    return [
+      oauthMethodFor(entry),
+      apiKeyMethodFor(entry),
+      method(
+        "mcp-free",
+        "mcp_remote",
+        "none",
+        { serverUrl: "https://api.you.com/mcp?profile=free" },
+        entry.riskTier,
+        "Use the keyless free profile. You.com limits the free profile to a reduced read-only tool set.",
+        {
+          label: "Use the free profile",
+          whenToUse:
+            "Connect without an account for limited, rate-capped web search.",
+          consoleLinks: { docs: entry.docsUrl },
+          warnings: [
+            "The free profile is keyless and exposes a reduced read-only tool set with You.com rate limits.",
+          ],
+        },
+      ),
+    ];
+  }
   return null;
 };
+
+// Cognee Cloud publishes a local MCP client, not a hosted remote MCP endpoint.
+// This approved, pinned template uses the ordinary vault and stdio gateway.
+apps.push({
+  schemaVersion: 1, slug: "cognee", name: "Cognee",
+  description: "Build and recall shared graph memory from documents and conversations.",
+  categories: ["ai"], branding: brandingFor("cognee"),
+  urlPatterns: ["https://*.aws.cognee.ai/*"],
+  docsUrl: "https://docs.cognee.ai/cognee-cloud/connections/cloud-mcp",
+  setupPrerequisite: {
+    title: "Cognee Cloud and a local runtime",
+    description: "Use your Cognee Cloud tenant API URL and key. Paperclip's runtime host needs uv installed to run the official Cognee MCP client. Public deployments require a trusted MCP runtime host.",
+    actionLabel: "Open Cognee API keys", actionUrl: "https://platform.cognee.ai/api-keys",
+  },
+  methods: [method("cloud-local", "local_stdio", "api_key", { templateKey: "paperclip.cognee-cloud" }, "S3",
+    "Copy the API Base URL and create an API key on Cognee's API Keys page. Use a Cloud workspace with an active subscription. Paperclip uses its bundled Cloud client; no extra runtime installation is required.", {
+      label: "Connect Cognee Cloud", whenToUse: "Connect your Cloud tenant through the official Cognee MCP client.",
+      credentialFields: [
+        { key: "COGNEE_BASE_URL", label: "API Base URL", type: "text", required: true, secret: false, placeholder: "https://your-tenant.aws.cognee.ai", validation: { pattern: "^https://[a-zA-Z0-9-]+\\.aws\\.cognee\\.ai/?$", maxLength: 255 }, helperMd: "Copy API Base URL from Cognee's API Keys page." },
+        { ...field("COGNEE_API_KEY", "Cognee API key", "Paste your Cognee API key"), helperMd: "Create a key in Cognee → API Keys. The key is shown once." },
+      ],
+      keyPlacement: { location: "env", name: "COGNEE_API_KEY" },
+      consoleLinks: { keys: "https://platform.cognee.ai/api-keys", docs: "https://docs.cognee.ai/cognee-cloud/connections/cloud-mcp" },
+    })],
+});
 
 for (const entry of researchManifest.entries) {
   const existing = apps.find((app) => app.slug === entry.slug);
@@ -1351,7 +1490,9 @@ for (const entry of researchManifest.entries) {
     schemaVersion: 1,
     slug: entry.slug,
     name: entry.name,
-    description: `Connect ${entry.name}'s provider-hosted MCP server.`,
+    description: ({ mem0: "Remember preferences, conversations, events, and agent state.", zep: "Retrieve temporal graph memory and authorized business context.", supermemory: "Search and save shared memories, documents, and profiles.", honcho: "Remember conversations and retrieve context about peers." })[entry.slug] ?? (entry.slug === "fireflies"
+      ? "Search meeting transcripts, read summaries and action items, and connect meeting-ready routines."
+      : `Connect ${entry.name}'s provider-hosted MCP server.`),
     categories: [categoryBySlug[entry.slug] ?? "other"],
     featured: entry.slug === "jira",
     branding: brandingFor(entry.slug),
@@ -1386,6 +1527,7 @@ const reviewedGoogleSlugs = [
   "google-chat",
   "google-people",
   "google-workspace-search",
+
 ];
 for (const slug of reviewedGoogleSlugs) {
   const existingIndex = apps.findIndex((app) => app.slug === slug);
@@ -1494,6 +1636,39 @@ for (const [slug, name, subscription, envKey] of [["anthropic", "Claude", true, 
  // AI account flow; saved REST connections remain removable through Connections.
  app.methods = [...methods, ...app.methods.filter(method => method.transport !== "rest_api")];
 }
+// Every tool method has a checked-in permission review. Discovery metadata is
+// evidence for reviewers, never a runtime instruction to request more scopes.
+const permissionReviews = JSON.parse(fs.readFileSync(
+  path.join(root, "doc/connections/tool-method-permission-reviews.json"), "utf8",
+)).methods;
+for (const app of apps) {
+  for (const connectionMethod of app.methods) {
+    if (["channel", "ai"].includes(connectionMethod.purpose)) continue;
+    const review = permissionReviews.find((entry) => entry.app === app.slug && entry.method === connectionMethod.key);
+    if (!review) throw new Error(`${app.slug}/${connectionMethod.key}: permission review required`);
+    if (connectionMethod.auth === "oauth") {
+      if (review.policy === "explicit") {
+        connectionMethod.defaults = { ...connectionMethod.defaults, scopesHint: review.requestedScopes };
+      } else if (review.policy !== "provider-default" || !review.providerDefaultReason) {
+        throw new Error(`${app.slug}/${connectionMethod.key}: reviewed scopes or documented provider default required`);
+      }
+    }
+    for (const configField of connectionMethod.tenantFields ?? []) {
+      if (configField.key === "readOnly") configField.advanced = true;
+    }
+    if (review.keyPermissions) {
+      for (const credential of connectionMethod.credentialFields ?? []) {
+        if (credential.secret !== false) credential.helperMd = review.keyPermissions;
+      }
+    }
+    if (app.slug === "planetscale") {
+      connectionMethod.capabilityProfile = connectionMethod.key === "mcp-insights-only"
+        ? { key: "read", label: "Read only", description: "Inspect database performance with the insights-only server." }
+        : { key: "write", label: "Read and write", description: "Query and change the databases you authorize in PlanetScale." };
+    }
+  }
+}
+
 const validateApp = (app) => {
   if (
     app.schemaVersion !== 1 ||
@@ -1534,11 +1709,11 @@ const validateApp = (app) => {
         );
   }
 };
-const captureFiles = fs
+const captureFiles = definitionsOnly ? [] : fs
   .readdirSync(corpus)
   .filter((fileName) => fileName.endsWith(".md") && fileName !== "INDEX.md")
   .sort();
-if (captureFiles.length !== 99)
+if (!definitionsOnly && captureFiles.length !== 99)
   throw new Error(`Expected 99 captures, found ${captureFiles.length}`);
 const parsedCaptures = Object.fromEntries(
   captureFiles.map((fileName) => [
@@ -1575,7 +1750,7 @@ for (const app of apps)
     path.join(out, `${app.slug}.json`),
     JSON.stringify(app, null, 2) + "\n",
   );
-fs.writeFileSync(
+if (!definitionsOnly) fs.writeFileSync(
   path.join(root, "packages/shared/src/app-definitions.ingestion-report.json"),
   JSON.stringify(reviewReport, null, 2) + "\n",
 );

@@ -1,6 +1,6 @@
 import type { NativeEvidenceAssessment } from "./evidence-classifier.js";
 
-export const NATIVE_STATUS_ARBITER_POLICY_VERSION = "phase6-v5";
+export const NATIVE_STATUS_ARBITER_POLICY_VERSION = "phase6-v7";
 
 export type NativeAuthoritativeIssueStatus =
   | "backlog"
@@ -110,7 +110,11 @@ export function arbitrateNativeStatus(input: {
     "authorized" | "revoked" | "not_applicable";
   boardResponseWaitAuthorized?: boolean;
   boardResponseWaitOrigin?: boolean;
+  isConversation?: boolean;
+  hasActivePauseHold?: boolean;
   reviewOwnerUserId?: string | null;
+  /** Review decisions own task state; a reviewer's finish report cannot override them. */
+  nativeReviewOutcome?: "resolved" | "pending" | "stale";
   agentId: string;
   priorIssueStatus: NativeAuthoritativeIssueStatus;
 }): NativeStatusDecision {
@@ -139,6 +143,22 @@ export function arbitrateNativeStatus(input: {
             "Repair and re-run workspace finalization for the persisted native result.",
           agentId: input.agentId,
         },
+      ],
+    };
+  }
+  if (input.nativeReviewOutcome) {
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "preserve", toStatus: input.priorIssueStatus,
+      reasonCode: input.nativeReviewOutcome === "pending" ? "native_review_unresolved" : "native_review_action_finished",
+      unblockDescriptor: null,
+      effects: [
+        { kind: "release_checkout" },
+        ...(input.nativeReviewOutcome === "pending" ? [{
+          kind: "record_recovery" as const, cause: "native_review_unresolved",
+          nextAction: "The named reviewer must resolve the pending completion review or explain the concrete blocker. Do not restart the worker's assignment or create another review request.",
+          agentId: input.agentId,
+        }] : []),
       ],
     };
   }
@@ -228,9 +248,15 @@ export function arbitrateNativeStatus(input: {
       effects: [],
     };
   }
+  const unfinishedResponseWait =
+    !input.isConversation &&
+    !["authorized", "revoked"].includes(input.externalChatResponseWaitAuthorization ?? "") &&
+    input.assessment.reportedDisposition === "yielded" &&
+    input.assessment.continuation?.kind === "response_wake" &&
+    input.assessment.hasBlockingRemainingWork;
   if (
     input.hasUnresolvedIssueBlockers === true &&
-    ["done", "blocked"].includes(input.assessment.reportedDisposition)
+    (["done", "blocked"].includes(input.assessment.reportedDisposition) || unfinishedResponseWait)
   ) {
     const owner = input.assessment.blocker?.boardOwned
       ? ("board" as const)
@@ -386,10 +412,21 @@ export function arbitrateNativeStatus(input: {
       effects: [],
     };
   }
+  if (unfinishedResponseWait && input.hasActivePauseHold) {
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "preserve",
+      toStatus: input.priorIssueStatus,
+      reasonCode: "response_wait_pause_preserved",
+      unblockDescriptor: null,
+      effects: [],
+    };
+  }
   if (
     input.assessment.reportedDisposition === "yielded" &&
     input.assessment.continuation?.kind === "response_wake" &&
-    input.boardResponseWaitAuthorized === true
+    input.boardResponseWaitAuthorized === true &&
+    !unfinishedResponseWait
   ) {
     return {
       policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
@@ -405,7 +442,8 @@ export function arbitrateNativeStatus(input: {
   if (
     input.assessment.reportedDisposition === "yielded" &&
     input.assessment.continuation?.kind === "response_wake" &&
-    input.boardResponseWaitOrigin
+    input.boardResponseWaitOrigin &&
+    !input.boardResponseWaitAuthorized
   ) {
     return {
       policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
@@ -418,7 +456,8 @@ export function arbitrateNativeStatus(input: {
   }
   if (
     input.assessment.reportedDisposition === "yielded" &&
-    input.assessment.continuation
+    input.assessment.continuation &&
+    !unfinishedResponseWait
   ) {
     return {
       policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
@@ -437,6 +476,8 @@ export function arbitrateNativeStatus(input: {
       ],
     };
   }
+  // A current response that admits blocking work must use the server's bounded
+  // repair path, not a passive wait or a model-chosen continuation retry key.
   if (input.allowIncompleteContinuation === false) {
     return {
       policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,

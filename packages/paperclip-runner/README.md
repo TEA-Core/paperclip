@@ -54,7 +54,24 @@ leave the board showing an active run after the provider turn has already ended.
 The package also builds `paperclip-runner-acpx-sidecar`. This bounded v2
 stdin/stdout bridge admits the pinned Claude and Codex ACPX profiles. It
 validates the exact model, session identity, tool catalog, structured input,
-and terminal settlement at the process boundary. Pi remains unavailable.
+and terminal settlement at the process boundary. Cursor, Copilot and Pi have
+separate candidate branches and remain unavailable in production until local
+and Daytona qualification passes. Their verified distributions are build-owned;
+no candidate accepts an arbitrary executable. See
+[the rich ACP capability report](../../doc/architecture/runner-rich-acp-capabilities.md).
+
+Remote Codex sessions relay assigned app tools through the server's configured
+gateway. Small catalogs are sent directly. When a catalog would exceed the
+runner's 256-operation or 768 KiB contract limit, the server exposes
+`paperclip_search_assigned_tools` and `paperclip_call_assigned_tool` instead.
+Search returns bounded pages of names, descriptions, and input schemas. Each
+page intersects the session's pinned assignments with current gateway grants.
+An individual schema that exceeds a page returns an `inputSchemaRef`. The same
+search tool retrieves that schema in chunks via `schemaTool` and
+`schemaOffset`; discovery can continue past the large tool.
+Calls retain task ownership, work-mode restrictions, gateway authorization,
+approvals, and audit. Core task tools and the runner's completion tools keep
+their reserved space; no assigned tools are silently removed to fit the limit.
 
 Native Claude skill assignments travel in the runtime-context snapshot through
 runnerd to the ACPX sidecar. After acquiring the provider lifetime lease, the
@@ -69,21 +86,36 @@ alias during selection and verification. Users can keep selecting models from
 the normal Claude catalog or entering custom IDs; unavailable models still fail
 at the provider rather than silently falling back.
 
-For ACPX Claude, `approve-reads` is shown as **Allow Paperclip reads**. The host
-intersects the run's public tools with the implementation catalog's read effects
-and writes exact MCP permission rules into the isolated Claude settings. The
-`paperclip` connection is always the runner's authenticated tool bridge; ambient
-MCP configuration is excluded. Tool hints and provider permission metadata cannot
-grant access. Unassigned tools, writes, external tools, and provider-native
-operations do not receive automatic read permission. Protocol completion and
-task-delivery controls keep their existing separate allowance.
+ACPX Claude defaults to `approve-all`, shown as **Full auto (approve all)**.
+OpenCode defaults to `allow`; native Codex defaults to `never` (no approval
+pauses). These defaults cover all assigned tools and connections, including
+provider-native operations. Full auto is resolved consistently for agent
+creation, adapter conversion, direct driver launches, and fresh/resumed turns.
+Explicitly stored restrictive modes still apply.
 
-This runtime has no interactive permission handler. An operation that still
-requires approval stops the turn with `approval_required`. The server marks the
-task blocked, exposes the permission action to the operator, and disables
-automatic retry. The operator must review the operation and the agent's
-permission setting before retrying. Company access checks still run when each
-Paperclip tool executes.
+The runner's authenticated bridge and controller still enforce company access,
+action claims, task modes, and governed approvals. Provider permission defaults
+do not change workspace isolation or grant credentials or connection access.
+`approve-paperclip` remains an optional narrower mode for assigned planning and
+task tools; `approve-reads` allows assigned reads; `deny-all` rejects requests.
+None of these restrictive modes is the default.
+
+Restrictive profiles route supported permission decisions through durable runtime
+requests and the existing task interaction controls. Requests are persisted
+before presentation; answers are checked against the offered decisions and
+acknowledged by the sidecar before settlement. Unknown, stale and duplicate
+responses fail. Missing provider decision support remains a blocked disposition,
+not implicit approval. Company access checks still run for each Paperclip tool.
+Provider death expires pending promises; approvals are never replayed into a
+replacement process.
+
+Automatic Paperclip/read allowances currently require the Claude SDK dispatch
+boundary. Grok preserves these restricted settings, but its ACP requests lack
+independently bound tool authority. Those operations require a supported operator
+permission decision; a missing interactive responder stops with
+`approval_required`. An explicitly selected `approve-all` policy permits unattended
+Grok work in an assigned sandbox. Paperclip authorization and governed approvals
+still apply.
 
 Runnerd selects only qualified provider profiles. Claude Managed and AWS
 AgentCore receive immutable company-profile snapshots with explicit retention,
@@ -260,7 +292,11 @@ pnpm --filter @paperclipai/paperclip-runner report:runner-chaos-evals
 `report:runner-live-evals` is a paid, provider-backed command. Native Codex
 requires `OPENAI_API_KEY`; ACPX Claude requires
 `ANTHROPIC_API_KEY`; OpenCode candidates require `OPENROUTER_API_KEY`. The live
-matrix admits no Pi profile and does not persist credential values. Set
+matrix remains qualified-only and does not persist credential values. Candidate
+qualification uses `eval-session --candidate-profile <pi|cursor|copilot>` with an
+explicit model and a separately materialized pinned candidate pack. This option
+is a constructor-bound diagnostic opt-in; session JSON cannot enable a candidate.
+Missing credentials or unverifiable spend block paid qualification. Set
 `PAPERCLIP_EVAL_MAX_CAMPAIGN_COST_USD` to a positive finite number to bound
 additional scheduling after the observed campaign total reaches that value:
 
@@ -408,3 +444,5 @@ then open the protocol inspector to review events and reducer state. Expand a
 Terminal row and its nested **Debug details** disclosure to inspect every
 canonical event retained for that command. The header marker `🖇️ v0.1.2`
 identifies the current console iteration.
+
+`create_task` accepts an optional initial `status` of `backlog` or `todo`. Use `backlog` when the user wants a saved task or plan without execution: assignment and the initial plan are committed without scheduling a wake, even when dependencies are already complete. Omitting status preserves immediate delegation (`todo`, or `blocked` for unresolved dependencies).

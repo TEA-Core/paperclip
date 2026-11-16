@@ -12,6 +12,12 @@ const mockIssueService = vi.hoisted(() => ({
   update: vi.fn(),
   addComment: vi.fn(),
   getDependencyReadiness: vi.fn(),
+  // Default: every wired blocker counts as unresolved, matching this suite's
+  // pre-SUP-23854 semantics. Tests that exercise the all-done refusal
+  // override this per-test.
+  listUnresolvedBlockerIssueIds: vi.fn(
+    async (_companyId: string, blockerIssueIds: string[]) => blockerIssueIds,
+  ),
   getCurrentScheduledRetry: vi.fn(),
   findMentionedAgents: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
@@ -162,6 +168,10 @@ vi.mock("@paperclipai/shared/telemetry", () => ({
 
 vi.mock("../telemetry.js", () => ({
   getTelemetryClient: vi.fn(() => ({ track: vi.fn() })),
+}));
+
+vi.mock("../services/queued-interaction-response.js", () => ({
+  hasQueuedInteractionResponse: vi.fn(async () => false),
 }));
 
 vi.mock("../services/access.js", () => ({
@@ -1852,6 +1862,8 @@ describe.sequential("issue comment reopen routes", () => {
         attachmentIds: undefined,
         authorType: "user",
         authorizationReason: "allow_board_actor",
+        clientRequestId: undefined,
+        mirrorToSlack: true, boardApiKeyId: null,
         presentation: {
           kind: "system_notice",
           tone: "warning",
@@ -2827,15 +2839,11 @@ describe.sequential("issue comment reopen routes", () => {
     );
 
     mockHeartbeatService.wakeup.mockClear();
-    mockIssueService.findMentionedAgents.mockClear();
     res = await request(await installActor(createApp(), agentActor(agentB)))
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: "B replies on B's own issue" });
     expect(res.status).toBe(201);
-    await vi.waitFor(() =>
-      expect(mockIssueService.findMentionedAgents).toHaveBeenCalledOnce(),
-    );
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise<void>((resolve) => setImmediate(resolve));
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
 
     mockIssueService.getById.mockResolvedValue({
@@ -4879,7 +4887,7 @@ describe.sequential("issue comment reopen routes", () => {
       expect(res.status).toBe(200);
       expect(mockIssueService.update).toHaveBeenCalledWith(
         issueId,
-        expect.objectContaining({ status: "in_progress" }),
+        expect.objectContaining({ status: "in_progress" }), expect.anything(),
       );
     });
 

@@ -1,4 +1,6 @@
 import { createCodexTaskEnvelope } from "../contracts/codex.js";
+import { ACPX_CAPABILITY_PROFILES } from "../drivers/acpx/capability-profiles.js";
+import { NATIVE_EXECUTION_INPUT_SCHEMA } from "../contracts/native-execution.js";
 import type { NativeExecutionInput } from "../contracts/native-execution.js";
 import type { PersistedHarnessSession } from "../contracts/harness-driver.js";
 import type {
@@ -11,6 +13,7 @@ import type { CodexWorkingDirectoryAuthority } from "../drivers/codex/codex-boun
 import { HarnessDriverBackend } from "./harness-driver-backend.js";
 import {
   nativeSystemInstructions,
+  nativeTaskSkillInputs,
   nativeTaskConstraints,
 } from "./runtime-context.js";
 
@@ -68,7 +71,7 @@ function transportDriverIdentity(input: NativeExecutionInput): {
       return {
         kind: "opencode_server",
         displayName: "OpenCode server",
-        version: "1.18.29",
+        version: "1.18.32",
       };
     case "claude_managed":
       return {
@@ -83,14 +86,9 @@ function transportDriverIdentity(input: NativeExecutionInput): {
         version: input.provider.agentCoreProfile.qualificationRevision,
       };
     case "acpx":
-      if (input.provider.agent === "pi") {
-        throw new Error(
-          "Native ACPX backend for pi is unavailable until descriptor-confined verified launch is implemented",
-        );
-      }
       return {
         kind: "acpx_runtime",
-        displayName: `${input.provider.agent === "claude" ? "Claude" : "Codex"} via ACPX`,
+        displayName: `${ACPX_CAPABILITY_PROFILES[input.provider.agent].displayName} via ACPX`,
         version: "0.13.1",
       };
     default:
@@ -114,6 +112,7 @@ function createTransportBackedNativeSessionBackend(
   }
   const driverIdentity = transportDriverIdentity(input);
   const isCodex = input.provider.kind === "codex";
+  const preparedContext = input.schema === NATIVE_EXECUTION_INPUT_SCHEMA;
   const supportsCollaborativePlanning =
     isCodex ||
     input.provider.kind === "opencode" ||
@@ -128,9 +127,27 @@ function createTransportBackedNativeSessionBackend(
     );
   }
 
+  const constraints = [
+    ...(supportsCollaborativePlanning &&
+    "executionMode" in input &&
+    input.executionMode === "plan"
+      ? [
+          "Use native plan collaboration mode and do not modify workspace files.",
+          "Treat the supplied Paperclip planning context as the canonical pinned base revision.",
+          "Complete one structured provider plan item; Paperclip will synchronize it after completion.",
+          "Keep the final response to a short synchronization summary instead of repeating the full plan.",
+        ]
+      : []),
+    ...nativeTaskConstraints(input),
+    "Return one semantic completion result.",
+  ];
+
   return new HarnessDriverBackend(
     new CodexAppServerDriver({
       ...(input.provider.model ? { model: input.provider.model } : {}),
+      ...(input.provider.kind === "codex" && "reasoningEffort" in input.provider && input.provider.reasoningEffort
+        ? { reasoningEffort: input.provider.reasoningEffort }
+        : {}),
       // Runnerd owns provider permissions for non-Codex facades. Their
       // Codex-compatible surface must never open a second approval channel.
       approvalPolicy:
@@ -138,7 +155,14 @@ function createTransportBackedNativeSessionBackend(
           ? (input.provider.approvalPolicy ?? "never")
           : "never",
       baseInstructions: nativeSystemInstructions(input),
+      instructionWorkingCopyRoot: "runtimeContext" in input ? input.runtimeContext.instructions.workingCopy?.rootPath : undefined,
       includeSkillInstructions: isCodex && "runtimeContext" in input,
+      skillInputs: isCodex
+        ? nativeTaskSkillInputs(
+            input.task.description,
+            "runtimeContext" in input ? input.runtimeContext : null,
+          )
+        : [],
       requestedCollaborationMode:
         supportsCollaborativePlanning && "executionMode" in input
           ? input.executionMode
@@ -147,22 +171,9 @@ function createTransportBackedNativeSessionBackend(
         objective: input.completionContract.contract.objective,
         contractRevision: input.completionContract.contract.revision,
         criteria: input.completionContract.contract.criteria,
-        constraints: [
-          "Work only inside the supplied working directory.",
-          ...(supportsCollaborativePlanning &&
-          "executionMode" in input &&
-          input.executionMode === "plan"
-            ? [
-                "Use native plan collaboration mode and do not modify workspace files.",
-                "Treat the supplied Paperclip planning context as the canonical pinned base revision.",
-                "Complete one structured provider plan item; Paperclip will synchronize it after completion.",
-                "Keep the final response to a short synchronization summary instead of repeating the full plan.",
-              ]
-            : []),
-          ...nativeTaskConstraints(input),
-          "Return one semantic completion result.",
-        ],
+        constraints,
       }),
+      conversationMode: preparedContext ? "prepared" : "task",
       runnerInstanceId:
         options.runnerInstanceId ?? `paperclip-native-${input.binding.runId}`,
       onSpawn: options.onSpawn,
@@ -181,6 +192,7 @@ function createTransportBackedNativeSessionBackend(
         : ["default"],
       requireProviderSessionIdentity: options.transportFactory !== undefined,
     }),
+    preparedContext ? constraints : undefined,
   );
 }
 

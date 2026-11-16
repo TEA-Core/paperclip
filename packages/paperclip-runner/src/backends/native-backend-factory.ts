@@ -77,11 +77,6 @@ export function createNativeSessionBackend(
     });
   }
   if (input.provider.kind === "acpx") {
-    if (input.provider.agent === "pi") {
-      throw new Error(
-        "Native ACPX backend for pi is unavailable until descriptor-confined verified launch is implemented",
-      );
-    }
     if (!options.acpxRuntimeDirectory?.trim()) {
       throw new Error("ACPX backend requires an instance runtime directory");
     }
@@ -96,6 +91,7 @@ export function createNativeSessionBackend(
         : {}),
       dynamicTools: options.dynamicTools,
       dynamicToolHandler: options.acpxDynamicToolHandler,
+      completionFeedback: options.completionFeedback,
     });
   }
   if (input.provider.kind !== "codex") {

@@ -75,12 +75,10 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedQueuedRun() {
+  async function seedAgentAndIssue() {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
-    const runId = randomUUID();
-    const wakeupRequestId = randomUUID();
 
     await db.insert(companies).values({
       id: companyId,
@@ -119,6 +117,14 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
       assigneeAgentId: agentId,
       responsibleUserId: "responsible-user",
     });
+
+    return { companyId, agentId, issueId };
+  }
+
+  async function seedQueuedRun() {
+    const { companyId, agentId, issueId } = await seedAgentAndIssue();
+    const runId = randomUUID();
+    const wakeupRequestId = randomUUID();
 
     await db.insert(agentWakeupRequests).values({
       id: wakeupRequestId,
@@ -219,40 +225,115 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
     expect(finished?.status).toBe("succeeded");
   }, 20_000);
 
-  // Wraps db.transaction so the callback's tx object throws the moment code
-  // calls tx.update(table) for a table named in tablesByCall — this makes a
-  // real Postgres transaction roll back exactly like a genuine write failure
-  // partway through, without touching any other table's update path.
-  // tablesByCall maps a 0-based db.transaction() call index (in call order)
-  // to the table that call should fail on; a call index with no entry runs
-  // every update for real. For example { 1: issues } lets the atomic stale-run
-  // validation transaction complete, then fails only the issue-lock write
-  // inside releaseRunClaimedJustBeforeSuppression's transaction.
-  function withFailingTransactionalUpdate(realDb: typeof db, tablesByCall: Record<number, unknown>) {
-    let callIndex = 0;
+  it("keeps a wake that arrives during a task drain queued and runs it once the drain lifts", async () => {
+    const { agentId, issueId } = await seedAgentAndIssue();
+    const heartbeat = heartbeatService(db);
+
+    // The drain holds ADMISSION, not the request. The wake lands in the
+    // durable queue, so the restart that clears the process-local drain
+    // resumes it instead of losing it. (Before this, the wake was written
+    // as `skipped` and the issue sat in `todo` with no run and no path.)
+    startTaskDrain({});
+    await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      requestedByActorType: "system",
+      requestedByActorId: "issue_assignment",
+    });
+    await heartbeat.drainActiveRunExecutions();
+
+    const wakeup = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup).toMatchObject({ status: "queued", reason: "issue_assigned" });
+    expect(wakeup?.payload).not.toHaveProperty("heartbeatSkip");
+    const queuedRuns = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns);
+    expect(queuedRuns).toHaveLength(1);
+    expect(queuedRuns[0]).toMatchObject({ status: "queued" });
+    const runId = queuedRuns[0]!.id;
+
+    // Admission stays held for as long as the drain is active, and the
+    // queued row does not count against quiescence: the restart may proceed.
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    const held = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(held?.status).toBe("queued");
+    expect(getTaskDrainStatus()).toMatchObject({
+      draining: true,
+      activeRuns: 0,
+      pendingWakes: 0,
+      quiescent: true,
+    });
+
+    // The drain lifts (a restart clears it the same way): the queued wake
+    // runs to completion through the normal admission path.
+    stopTaskDrain();
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    const finished = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(finished?.status).toBe("succeeded");
+    const completedWakeup = await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .then((rows) => rows[0] ?? null);
+    expect(completedWakeup?.status).toBe("completed");
+  }, 20_000);
+
+  // Wraps db.transaction so the callback's tx object throws on the issue-lock
+  // write of the atomic release: tx.update(issues) clearing executionRunId in a
+  // transaction that already put its run back to "queued" (the un-claim). The
+  // admission claim stamps a non-null executionRunId, and the orphan reaper
+  // clears the lock after setting its run to "failed", so both run for real.
+  // The fault is chosen by what the write does, not by which db.transaction()
+  // call it lands in, so a new transaction ahead of the claim cannot shift it.
+  function withFailingAtomicRelease(realDb: typeof db) {
     return new Proxy(realDb, {
       get(target, prop, receiver) {
         if (prop !== "transaction") return Reflect.get(target, prop, receiver);
-        return (fn: (tx: unknown) => Promise<unknown>) => {
-          const failingTable = tablesByCall[callIndex];
-          callIndex += 1;
-          return target.transaction((tx) => {
+        return (fn: (tx: unknown) => Promise<unknown>) =>
+          target.transaction((tx) => {
+            let runUnclaimed = false;
             const txProxy = new Proxy(tx as object, {
               get(txTarget, txProp, txReceiver) {
-                if (txProp === "update") {
-                  return (table: unknown) => {
-                    if (failingTable !== undefined && table === failingTable) {
-                      throw new Error("simulated transactional write failure");
-                    }
-                    return (txTarget as any).update(table);
-                  };
-                }
-                return Reflect.get(txTarget, txProp, txReceiver);
+                if (txProp !== "update") return Reflect.get(txTarget, txProp, txReceiver);
+                return (table: unknown) => {
+                  const builder = (txTarget as any).update(table);
+                  if (table !== heartbeatRuns && table !== issues) return builder;
+                  return new Proxy(builder, {
+                    get(builderTarget, builderProp, builderReceiver) {
+                      if (builderProp !== "set") return Reflect.get(builderTarget, builderProp, builderReceiver);
+                      return (values: { status?: unknown; executionRunId?: unknown }) => {
+                        if (table === heartbeatRuns && values.status === "queued") runUnclaimed = true;
+                        if (table === issues && runUnclaimed && values.executionRunId === null) {
+                          throw new Error("simulated transactional write failure");
+                        }
+                        return builderTarget.set(values);
+                      };
+                    },
+                  });
+                };
               },
             });
             return fn(txProxy);
           });
-        };
       },
     }) as typeof db;
   }
@@ -262,15 +343,8 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
     // Fault the release transaction on the issue-lock write, so executeRun's
     // suppression branch catches the failure, logs it, and returns instead
     // of throwing. There is no in-process fallback or retry for this path.
-    // Fork divergence (claim-path staleness gate kept in-file, slice 2c):
-    // upstream f65991a5f (#12920) moved claimQueuedRun's stale-run check onto
-    // runDispatch.cancelStaleQueuedRun, whose issue-then-run lock transaction
-    // is db.transaction() call 0, so upstream faults call 1. The fold kept the
-    // fork's in-file evaluateQueuedRunStaleness at the claim gate (SUP-10605
-    // handoff, SUP-15237 review-participant exemption; revisit with the D9
-    // run-dispatch port), which opens no transaction, so the release
-    // transaction is call 0 here. Restore { 1: issues } when that port lands.
-    const failingDb = withFailingTransactionalUpdate(db, { 0: issues });
+    // The admission claim's own transaction and issue-lock stamp run for real.
+    const failingDb = withFailingAtomicRelease(db);
     const heartbeat = heartbeatService(failingDb);
 
     const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {

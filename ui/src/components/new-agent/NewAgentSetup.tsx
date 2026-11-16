@@ -1,3 +1,5 @@
+import { AgentCharacter } from "../AgentCharacter";
+import { useAgentAppearanceDraft } from "../../hooks/useAgentAppearanceDraft";
 import { AiConnectionField, aiProviderForAdapter } from "../ai-connections/AiConnectionField";
 import type { AiConnectionBinding } from "@paperclipai/shared";
 import { DEFAULT_CODEX_LOCAL_MODEL } from "@paperclipai/adapter-codex-local";
@@ -51,7 +53,6 @@ import { Field } from "../agent-config-primitives";
 import { SecretPicker } from "../environment-variables-editor/SecretPicker";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
-import { PillGuy } from "../onboarding/PillGuy";
 import {
   OnboardingCard,
   OnboardingHeading,
@@ -107,9 +108,12 @@ function Setup({
   const navigate = useNavigate();
   const cache = useQueryClient();
   const { openNewIssue } = useDialogActions();
+  const appearanceDraft = useAgentAppearanceDraft(`${companyId}:new-agent`);
   const isRunner = adapterType === "paperclip_runner";
   const brandType = isRunner
-    ? runnerProvider === "claude"
+    ? runnerProvider === "grok"
+      ? "grok_local"
+      : runnerProvider === "claude"
       ? "claude_local"
       : runnerProvider === "opencode"
         ? "opencode_local"
@@ -338,8 +342,8 @@ function Setup({
       ...(isRunner
         ? {
             adapterSchemaValues: {
-              provider: runnerProvider === "claude" ? "acpx" : runnerProvider,
-              ...(runnerProvider === "claude" ? { acpxAgent: "claude" } : {}),
+              provider: (runnerProvider === "claude" || runnerProvider === "grok") ? "acpx" : runnerProvider,
+              ...((runnerProvider === "claude" || runnerProvider === "grok") ? { acpxAgent: runnerProvider } : {}),
             },
           }
         : {}),
@@ -347,8 +351,8 @@ function Setup({
     const config = getUIAdapter(adapterType).buildAdapterConfig(values);
     if (isRunner)
       Object.assign(config, {
-        provider: runnerProvider === "claude" ? "acpx" : runnerProvider,
-        ...(runnerProvider === "claude" ? { acpxAgent: "claude" } : {}),
+        provider: (runnerProvider === "claude" || runnerProvider === "grok") ? "acpx" : runnerProvider,
+        ...((runnerProvider === "claude" || runnerProvider === "grok") ? { acpxAgent: runnerProvider } : {}),
         ...(model ? { model } : {}),
       });
     if (!aiBinding && !nextConnection?.aiConnection && hasCredentialField && binding) {
@@ -497,6 +501,7 @@ function Setup({
       );
       const response = await agentsApi.hire(companyId, {
         name: name.trim(),
+        appearance: appearanceDraft.appearance,
         role: existing.length ? "general" : "ceo",
         ...(leader ? { reportsTo: leader.id } : {}),
         adapterType,
@@ -517,6 +522,7 @@ function Setup({
       setApiKey("");
       setConnection(null);
       setCreated(response.agent);
+      appearanceDraft.clear();
       setScreen("saved");
       navigate(
         `/agents/new?${new URLSearchParams({ name: response.agent.name, adapterType, runnerProvider, createdAgentId: response.agent.id })}`,
@@ -624,10 +630,9 @@ function Setup({
     <MotionConfig reducedMotion="user">
       <div className="mx-auto flex max-w-5xl flex-col gap-8 py-6">
         <header className="flex items-center gap-4">
-          <PillGuy
-            state={created ? "alive" : "dormant"}
-            className="size-14 shrink-0"
-          />
+          <AgentCharacter appearance={created?.appearance ?? appearanceDraft.appearance} size={256} className="size-48" trackingScope="page"
+            state={created || testState === "pass" ? "success" : testState === "running" ? "loading" : "sleepy"}
+            muted={!created && testState !== "pass"} />
           <div className="space-y-2">
             <h1 className="text-2xl font-semibold tracking-tight">{name}</h1>
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -713,6 +718,26 @@ function Setup({
                         lede={`Connect ${name} to ${connectionAdapter === "claude_local" ? "Claude" : connectionAdapter === "grok_local" ? "Grok" : "OpenAI"}.`}
                         center
                       />
+                    </div>
+                    <div className="mb-5">
+                      <Field label="Environment">
+                        <select
+                          aria-label="Environment"
+                          className={controlClass}
+                          value={environmentOverride}
+                          disabled={busy || forced.forced}
+                          onChange={(event) => {
+                            setEnvironmentOverride(event.target.value);
+                            setConnection(null);
+                            resetTest();
+                          }}
+                        >
+                          <option value="">Default: {environmentLabel}</option>
+                          {(envs.data ?? []).filter((env) => env.status === "active" && (!managedOnly || env.driver !== "local")).map((env) => (
+                            <option key={env.id} value={env.id}>{environmentDisplayLabel(env)}</option>
+                          ))}
+                        </select>
+                      </Field>
                     </div>
                     <AgentProviderConnection
                       key={environmentId ?? "local"}
@@ -1103,7 +1128,7 @@ function Setup({
                             aria-label="Environment"
                             className={controlClass}
                             value={environmentOverride}
-                            disabled={forced.forced || managedOnly}
+                            disabled={forced.forced}
                             onChange={(event) => {
                               setEnvironmentOverride(event.target.value);
                               setConnection(null);
@@ -1115,7 +1140,7 @@ function Setup({
                               Default: {environmentLabel}
                             </option>
                             {(envs.data ?? [])
-                              .filter((env) => env.status === "active")
+                              .filter((env) => env.status === "active" && (!managedOnly || env.driver !== "local"))
                               .map((env) => (
                                 <option key={env.id} value={env.id}>
                                   {environmentDisplayLabel(env)}

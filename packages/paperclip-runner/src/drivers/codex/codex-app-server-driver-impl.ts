@@ -169,6 +169,10 @@ export class CodexAppServerDriver implements HarnessDriver {
     return this.#options.conversationMode === "direct";
   }
 
+  #prepared(): boolean {
+    return this.#options.conversationMode === "prepared";
+  }
+
   #providerDynamicTools(): readonly Readonly<Record<string, unknown>>[] {
     if (!this.#caps.dynamicTools) return [];
     const supplied = this.#options.dynamicTools ?? [];
@@ -271,7 +275,7 @@ export class CodexAppServerDriver implements HarnessDriver {
             this.#options.includeSkillInstructions ?? false,
             this.#options.environment,
           ),
-          approvalPolicy: this.#options.approvalPolicy ?? "untrusted",
+          approvalPolicy: this.#options.approvalPolicy ?? "never",
           ...(this.#options.model ? { model: this.#options.model } : {}),
           ...(this.#direct()
             ? {}
@@ -287,6 +291,7 @@ export class CodexAppServerDriver implements HarnessDriver {
                 },
               }),
           dynamicTools: this.#providerDynamicTools(),
+          ...(this.#prepared() ? { conversationMode: "prepared" } : {}),
           experimentalRawEvents: false,
           persistExtendedHistory: false,
         }),
@@ -404,9 +409,10 @@ export class CodexAppServerDriver implements HarnessDriver {
             this.#options.environment,
           ),
           baseInstructions: this.#direct() ? "" : this.#baseInstructions(),
-          approvalPolicy: this.#options.approvalPolicy ?? "untrusted",
+          approvalPolicy: this.#options.approvalPolicy ?? "never",
           ...(this.#options.model ? { model: this.#options.model } : {}),
           dynamicTools: this.#providerDynamicTools(),
+          ...(this.#prepared() ? { conversationMode: "prepared" } : {}),
           persistExtendedHistory: false,
         }),
       );
@@ -654,7 +660,7 @@ export class CodexAppServerDriver implements HarnessDriver {
       this.#options.transportFactory?.(context) ??
       new ProcessCodexAppServerTransport({
         workingDirectory,
-        args: createIsolatedCodexAppServerArgs(this.#options.environment, codexExecutableReadOnlyRoots(this.#options.environment ?? process.env)),
+        args: createIsolatedCodexAppServerArgs(this.#options.environment, codexExecutableReadOnlyRoots(this.#options.environment ?? process.env), this.#options.instructionWorkingCopyRoot),
         environment: createSanitizedCodexEnvironment(this.#options.environment),
         onDiagnostic: this.#options.onDiagnostic,
         processGroup: true,
@@ -851,7 +857,7 @@ export class CodexAppServerDriver implements HarnessDriver {
         approvalPolicy: boundedCodexValue(
           response.approvalPolicy ??
             this.#options.approvalPolicy ??
-            "untrusted",
+            "never",
         ),
         baseInstructions: this.#baseInstructions(),
         instructionSources: Array.isArray(response.instructionSources)
@@ -874,7 +880,11 @@ export class CodexAppServerDriver implements HarnessDriver {
         ),
         modelInputKinds: ["text"],
         liveConsole: {
-          conversationMode: this.#direct() ? "direct" : "task",
+          conversationMode: this.#prepared()
+            ? "prepared"
+            : this.#direct()
+              ? "direct"
+              : "task",
           runtimeRequestResolution: this.#caps.runtimeRequestResolution,
           goals: this.#caps.goals,
           threadLineage: this.#caps.threadLineage,
@@ -908,13 +918,19 @@ export class CodexAppServerDriver implements HarnessDriver {
     return new CodexHarnessSession({
       ...input,
       taskEnvelope: this.#options.taskEnvelope,
-      conversationMode: this.#direct() ? "direct" : "task",
+      conversationMode: this.#prepared()
+        ? "prepared"
+        : this.#direct()
+          ? "direct"
+          : "task",
       now: this.#options.now ?? (() => new Date()),
       runnerInstanceId: this.#options.runnerInstanceId ?? "runner-codex",
       driverKind: this.#options.driverIdentity?.kind ?? DRIVER_KIND,
       capabilities: this.#caps,
       goalCapability: this.#goalCapability,
       dynamicTools: this.#providerDynamicTools(),
+      skillInputs: this.#options.skillInputs,
+      reasoningEffort: this.#options.reasoningEffort,
       dynamicToolHandler: this.#options.dynamicToolHandler,
       completionFeedback: this.#options.completionFeedback,
     });

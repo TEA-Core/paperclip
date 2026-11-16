@@ -1,7 +1,7 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { deriveOriginatingActor, INBOX_MINE_ISSUE_STATUS_FILTER } from "@paperclipai/shared";
+import { deriveOriginatingActor, INBOX_MINE_ISSUE_STATUS_FILTER, isHeartbeatRunVisibleInMine } from "@paperclipai/shared";
 import { usePublishSharedQueryData, useSharedPollingQuery } from "@/hooks/useSharedPolling";
 import { approvalsApi } from "../api/approvals";
 import { accessApi } from "../api/access";
@@ -23,7 +23,6 @@ import {
 import { useCompany } from "../context/CompanyContext";
 import { useToastActions } from "../context/ToastContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
-import { useGeneralSettings } from "../context/GeneralSettingsContext";
 import { useSidebar } from "../context/SidebarContext";
 import { queryKeys } from "../lib/queryKeys";
 import { useDialogActions } from "../context/DialogContext";
@@ -806,7 +805,6 @@ function StreamlinedInbox() {
   const location = useLocation();
   const queryClient = useQueryClient();
   const [actionError, setActionError] = useState<string | null>(null);
-  const { keyboardShortcutsEnabled } = useGeneralSettings();
   const { data: experimentalSettings } = useQuery({
     queryKey: queryKeys.instance.experimentalSettings,
     queryFn: () => instanceSettingsApi.getExperimental(),
@@ -1328,8 +1326,9 @@ function StreamlinedInbox() {
   const showAlertsCategory = allCategoryFilter === "everything" || allCategoryFilter === "alerts";
   const failedRunsForTab = useMemo(() => {
     if (tab === "all" && !showFailedRunsCategory) return [];
+    if (tab === "mine") return failedRuns.filter((run) => isHeartbeatRunVisibleInMine(run, currentUserId));
     return failedRuns;
-  }, [failedRuns, tab, showFailedRunsCategory]);
+  }, [failedRuns, tab, showFailedRunsCategory, currentUserId]);
 
   const joinRequestsForTab = useMemo(() => {
     if (tab === "all" && !showJoinRequestsCategory) return [];
@@ -2130,8 +2129,6 @@ function StreamlinedInbox() {
 
   // Keyboard shortcuts (mail-client style) — single stable listener using refs
   useEffect(() => {
-    if (!keyboardShortcutsEnabled) return;
-
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.defaultPrevented) return;
 
@@ -2320,7 +2317,7 @@ function StreamlinedInbox() {
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [issueLinkState, keyboardShortcutsEnabled, noteInboxSortInteraction]);
+  }, [issueLinkState, noteInboxSortInteraction]);
 
   // Scroll selected item into view
   useEffect(() => {
@@ -2693,7 +2690,7 @@ function StreamlinedInbox() {
         <BlockedInboxView
           companyId={selectedCompanyId!}
           searchQuery={searchQuery}
-          agentNameById={agentById}
+          agentNameById={agentById} agents={agents}
           userLabelById={companyUserLabelMap}
           issueLinkState={issueLinkState}
           groupBy={blockedGroupBy}
@@ -2787,7 +2784,7 @@ function StreamlinedInbox() {
                     && blockerAttention?.state === "covered"
                   );
                   const rowStatusIcon = (
-                    <StatusIcon status={issue.status} blockerAttention={blockerAttention} size="md" />
+                    <StatusIcon status={issue.status} externalConversationState={issue.externalConversationState} blockerAttention={blockerAttention} size="md" />
                   );
                   return (
                     <IssueRow
@@ -2886,7 +2883,7 @@ function StreamlinedInbox() {
                             <ChevronRight className={cn("h-3.5 w-3.5 transition-transform", isExpanded && "rotate-90")} />
                           </button>
                         ) : (
-                          <StatusIcon status={issue.status} blockerAttention={blockerAttention} size="md" />
+                          <StatusIcon status={issue.status} externalConversationState={issue.externalConversationState} blockerAttention={blockerAttention} size="md" />
                         )
                       ) : undefined}
                       unreadState={isUnread ? "visible" : isFading ? "fading" : "hidden"}
@@ -2906,6 +2903,8 @@ function StreamlinedInbox() {
                               defaultProjectWorkspaceIdByProjectId,
                             })}
                             assigneeName={agentName(issue.assigneeAgentId)}
+                            assigneeAgent={agents?.find((agent) => agent.id === issue.assigneeAgentId)}
+                            creatorAgent={agents?.find((agent) => agent.id === issue.createdByAgentId)}
                             assigneeUserName={
                               formatAssigneeUserLabel(issue.assigneeUserId, currentUserId, companyUserLabelMap)
                               ?? assigneeUserProfile?.label

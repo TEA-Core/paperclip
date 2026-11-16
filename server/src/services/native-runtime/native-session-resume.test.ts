@@ -1755,6 +1755,35 @@ describe("rebindNativeSessionCheckpoint", () => {
     },
   );
 
+  it.each([
+    ["paperclip.native-execution-input.v4", "paperclip.native-execution-input.v5"],
+    ["paperclip.native-execution-input.v5", "paperclip.native-execution-input.v4"],
+  ] as const)("retains a recoverable %s session when the constructor defaults to %s", (priorSchema, currentSchema) => {
+    const prior = previousRun();
+    const profile = prior.runnerProfileJson as Record<string, unknown>;
+    profile.nativeExecutionInput = { ...execution(previousRunId), schema: priorSchema };
+    const checkpoint = profile.sessionCheckpoint as Record<string, unknown>;
+    checkpoint.goal = { status: "paused", objective: "Preserve the existing durable work" };
+    const before = structuredClone(prior);
+    const result = buildNativeExecutionWithCheckpoint({
+      previousRun: prior,
+      normalizedSessionId,
+      buildExecution: ({ normalizedSessionId: sessionId, resumedSession }) => parseNativeExecutionInput({
+        ...execution(currentRunId), schema: currentSchema,
+        session: { ...execution(currentRunId).session, normalizedSessionId: sessionId },
+        continuationPrompt: resumedSession ? "New direction only; do not replay completed actions" : null,
+      }),
+    });
+    expect(result.execution.schema).toBe(priorSchema);
+    expect(result.normalizedSessionId).toBe(normalizedSessionId);
+    expect(result.checkpoint).toMatchObject({
+      providerSessionId: "provider-thread-123",
+      providerRecoveryPolicy: "same_session_only",
+      goal: { status: "paused", objective: "Preserve the existing durable work" },
+    });
+    expect(prior).toEqual(before);
+  });
+
   it("keeps a valid checkpoint and does not rebuild the resumed task", () => {
     const calls: boolean[] = [];
     const result = buildNativeExecutionWithCheckpoint({
@@ -2288,6 +2317,32 @@ describe("rebindNativeSessionCheckpoint", () => {
 });
 
 describe("buildNativeExecutionInput wake projection", () => {
+  it("uses compact Slack input only after provider resume, preserving fresh bootstrap fallback", () => {
+    const base = execution(currentRunId);
+    const issue = { id: issueId, identifier: "DOT-2", title: "Old greeting", description: null, workMode: "standard" };
+    const message = { id: "wake", body: "NEW_SLACK_MESSAGE", authorType: "user", authorId: "board", sourceTrust: "user", createdByRunId: null };
+    const input = buildNativeExecutionInput({
+      companyId, runId: currentRunId, agentId, issue,
+      taskPrompt: "FULL_BOOTSTRAP_WITH_FILE_AND_AUTHORIZATION_INSTRUCTIONS",
+      resumedSession: true,
+      previousTurn: { runId: previousRunId, task: issue },
+      wakePayload: {
+        reason: "External chat message received", issue,
+        externalChatProvider: "slack", checkedOutByHarness: true,
+        comments: [{ ...message, author: { type: "user", id: "board" } }], commentIds: [message.id], latestCommentId: message.id,
+        commentWindow: { requestedCount: 1, includedCount: 1, missingCount: 0 },
+        executionContinuation: { version: 1, objective: message.body, messages: [message], resumeDelta: { baseRunId: previousRunId, messages: [message] } },
+      },
+      workspace: { id: currentRunId, ...base.workspace }, normalizedSessionId,
+      provider: "codex", completionContract: base.completionContract,
+      runtimeContext: nativeRuntimeContextFixture(),
+    });
+    expect(input.continuationPrompt).toContain(message.body);
+    expect(input.continuationPrompt).not.toContain("FULL_BOOTSTRAP");
+    expect(input.task.prompt).toContain("FULL_BOOTSTRAP");
+    expect(input.task.prompt).toContain(message.body);
+  });
+
   it("uses a neutral turn title for authenticated external-chat follow-ups", () => {
     const staleRootTitle = "Reply with exactly STALE-ROOT-MARKER";
     const input = buildNativeExecutionInput({
@@ -2488,15 +2543,15 @@ describe("buildNativeExecutionInput wake projection", () => {
     });
 
     expect(codex).toMatchObject({
-      schema: "paperclip.native-execution-input.v4",
+      schema: "paperclip.native-execution-input.v5",
       provider: { kind: "codex", approvalPolicy: "on-request" },
     });
     expect(opencode).toMatchObject({
-      schema: "paperclip.native-execution-input.v4",
+      schema: "paperclip.native-execution-input.v5",
       provider: { kind: "opencode", permissionMode: "ask" },
     });
     expect(acpx).toMatchObject({
-      schema: "paperclip.native-execution-input.v4",
+      schema: "paperclip.native-execution-input.v5",
       provider: { kind: "acpx", permissionMode: "deny-all" },
     });
     expect(claudeManaged).toMatchObject({
@@ -2519,13 +2574,13 @@ describe("buildNativeExecutionInput wake projection", () => {
       },
     });
     expect(defaultOpenCode).toMatchObject({
-      provider: { kind: "opencode", permissionMode: "ask" },
+      provider: { kind: "opencode", permissionMode: "allow" },
     });
     expect(defaultAcpx).toMatchObject({
       provider: {
         kind: "acpx",
         agent: "codex",
-        permissionMode: "approve-reads",
+        permissionMode: "approve-all",
       },
     });
     expect(
@@ -2598,9 +2653,10 @@ describe("buildNativeExecutionInput wake projection", () => {
       runtimeContext: nativeRuntimeContextFixture(),
     });
 
-    expect(input.task.prompt.includes("Execution contract:")).toBe(!conversationMode);
-    expect(input.task.prompt.includes("Use child issues")).toBe(!conversationMode);
-    expect(input.task.prompt).toContain("## Paperclip Resume Delta");
+    expect(input.task.prompt).not.toContain("Execution contract:");
+    expect(input.task.prompt).not.toContain("Use child issues");
+    // Full bootstrap stays available if provider recovery fails after admission.
+    expect(input.task.prompt).toContain("## Paperclip Wake Payload");
     expect(input.task.prompt).toContain("reason: issue_children_completed");
     expect(input.task.prompt).toContain("DOT-147 Build utility (done)");
     expect(input.task.prompt).toContain(

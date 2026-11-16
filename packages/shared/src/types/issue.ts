@@ -565,6 +565,12 @@ export interface IssueUnblockDescriptor {
 }
 
 export interface IssueRecoveryAction {
+  /** Read-only activity of the exact native run named by the wake policy. */
+  nativeRunActivity?: {
+    runId: string;
+    status: "queued" | "running";
+    workspaceOperationId: string | null;
+  } | null;
   id: string;
   companyId: string;
   sourceIssueId: string;
@@ -889,8 +895,12 @@ export interface IssueChangeReceiptEntry {
 export type IssueChanges = Record<string, IssueChangeReceiptEntry>;
 
 export interface Issue {
+  /** True only while the title is the provisional slice of the initial prompt. */
+  titleNeedsGeneration?: boolean;
   conversationAgentId?: string | null;
   conversationUserId?: string | null;
+  /** Server-owned Slack lifecycle projection; not writable through task updates. */
+  externalConversationState?: "active" | "waiting" | null;
   conversationState?: "active" | "waiting" | null;
   conversationSessionGeneration?: number;
   conversationBoundaryCommentId?: string | null;
@@ -989,6 +999,7 @@ export interface Issue {
 
 export type CompactIssue = Pick<
   Issue,
+  | "externalConversationState"
   | "id"
   | "companyId"
   | "projectId"
@@ -1103,6 +1114,13 @@ export type IssueQueuedCommentSteeringDisposition =
   | "temporarily_unavailable";
 
 export interface IssueQueuedCommentEntry {
+  /** Immutable response projected from its durable interaction receipt. */
+  source?: {
+    kind: "interaction";
+    interactionId: string;
+    interactionKind: string;
+    requiresFreshSession?: boolean;
+  };
   comment: IssueComment;
   position: number;
   canEdit: boolean;
@@ -1191,6 +1209,15 @@ export interface IssueCommentMetadata {
   sourceRunId?: string | null;
   sourceIdentityContextId?: string | null;
   authorizationReason?: string | null;
+  /** Display snapshot only. Retry authority comes from the current recovery action. */
+  recovery?: {
+    kind: "disposition_repair_escalated";
+    actionId: string;
+    attemptCount: number;
+    maxAttempts: number;
+    reason: string;
+    assigneeAgentId: string | null;
+  };
   sections: IssueCommentMetadataSection[];
 }
 
@@ -1460,6 +1487,7 @@ export type ConnectionIntentPhase = "requested" | "authorizing" | "needs_retry";
  */
 export interface ConnectionIntentPayload {
   version: 1;
+  upstreamService?: { slug: string; name: string; selectionInteractionId?: string };
   /** Runtime authentication requests cannot be satisfied by tool credentials. */
   purpose?: "ai";
   serviceSlug: string;
@@ -1473,6 +1501,8 @@ export interface ConnectionIntentPayload {
 
 export interface ConnectionIntentResult {
   version: 1;
+  /** Server-authored next steps for the resumed agent. */
+  instruction?: string;
   outcome: "connected" | "declined" | "superseded" | "expired";
   connectionId?: string | null;
   reason?: string | null;

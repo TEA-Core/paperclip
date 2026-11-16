@@ -90,7 +90,51 @@ save a healthy connection. Reconnect preserves the connection ID, bindings,
 customized name, and access settings. A completed connection remains even if
 subsequent agent creation fails or is cancelled.
 
+Account adoption during Save and the agent runtime test use the selected agent
+environment, or the instance default when no override is set. An unavailable
+remote environment blocks validation rather than probing the server host. The
+runtime test accepts the form’s prospective adapter selection before it is saved.
+For a saved-agent test, omitting `environmentId` uses the agent’s saved override.
+Sending `environmentId: null` tests a change back to the instance default.
+
 ## Runtime isolation
+
+Provider authentication failures, including `acpx_auth_required`, adapter login
+requirements, and expired/invalidated refresh tokens, create an AI connection
+card as the failed run is finalized. The card names the provider and uses the
+same inline connection/reconnect controls as missing-account setup. Pending
+cards are deduplicated. Creating a repair card persists a blocked run classification
+that suppresses immediate and periodic generic retries until the responsible user
+repairs the connection. Unsupported providers and failures that could not create
+a card retain their existing recovery path. Tool permission errors and provider quota failures do not
+request model authentication.
+
+An attributed managed credential is marked as needing reauthorization only if
+its stored generation still matches the failed run. Late failures cannot
+invalidate a refreshed or reconnected credential. Repair preserves the selected
+account and its permissions when the same sign-in method is selected. The card
+also lets the user switch between API key and subscription authentication for
+providers that support both. Switching creates a separate account, then selects
+it as the user's provider default or validates and updates the agent's explicit
+account binding. The original account is retained. Accepting the card resumes with a fresh session
+through the existing durable continuation delivery.
+
+For compatible legacy agents, the card offers the responsible person's provider
+connection without changing authentication automatically. After connecting,
+**Use connection and continue** checks agent-update permissions and validates in
+the agent's execution environment before committing the agent binding, connection
+install, audit, and card completion in one transaction. A failed validation or
+completion leaves the request pending and the old agent configuration and access
+intact. Unsupported harness/provider routes are not guessed.
+
+Codex ACP terminal failures with category `limit` and explicit usage-exhaustion
+wording enter provider-quota recovery. A supported reset clock uses the existing
+Codex parser; when none is available, recovery uses its existing quota backoff.
+Context, turn, rate, storage-capacity and configured-budget limits retain their
+existing handling. The adapter inspects bounded provider text only in memory
+and retains recovery labels and a parsed timestamp, without copying the text to
+run results or logs. A historical generic terminal-limit message alone does not
+establish quota exhaustion.
 
 `prepareManagedAiRuntime` is shared by runs, environment tests, and adoption.
 Claude ACP validates working directories on the selected execution target. A
@@ -135,9 +179,33 @@ Already-started native sessions retain their existing same-run recovery path;
 they must not be replaced by a fresh execution with a pre-provider receipt.
 
 Session reuse includes grant identity, responsible user, and credential
-generation. A changed identity starts a fresh provider session. Managed native
-executions use per-turn lifecycle cleanup; a suspended native execution whose
-credential identity changed must restart as a new execution.
+generation. A changed identity starts a fresh provider session. Native Codex
+(`paperclip_runner`) honors the configured warm lifecycle. It copies refreshed
+credentials back to the current invocation before deleting that invocation's
+private home. The session-owned credential stays private until idle timeout or
+explicit closure. Each follow-up rechecks current authorization and account
+identity before reusing the session; changing identity retires the previous owner.
+Other managed harnesses retain per-turn cleanup. A suspended native execution
+whose credential identity changed must restart as a new execution.
+
+After a verified provider resume, plain-text Slack follow-ups send the new
+authorized message delta instead of repeating the full task framing. The saved
+run and current message identities and bodies must match. Actual brief edits
+still arrive; historical Slack task titles are not repeated as new directions.
+Attachments, omitted input, questions, approvals, and recovery retain their full
+framing. A fresh provider session always receives the complete bootstrap.
+Retained sandbox runner binaries are reused only after an exact SHA-256 match
+with the controller artifact and the normal capability checks. Run-scoped
+credential changes still require provider process rotation.
+
+
+Warm sandbox execution requires both `reuseLease: true` and
+`runnerLifecycleMode: "warm"` on the environment. `runnerIdleTimeoutMs` bounds
+idle process retention. Chat tasks without a project reuse a sandbox only within
+the same company, environment, task, agent, and runtime configuration. They do
+not need an artificial project workspace. Other tasks, other agents, and ad-hoc
+connection tests cannot claim that retained sandbox. Daytona verifies a matching
+workspace sentinel before accepting either a workspace-scoped or task-scoped lease.
 
 Revocation blocks new invocations and refresh persistence. A running provider
 process may already hold credentials. The revoke confirmation lists attributed
@@ -284,7 +352,10 @@ Native Codex and ACPX/Claude provider selections follow the same compatibility r
 Hiring may succeed before that personal account exists or while it needs repair,
 including hires awaiting board approval. The first assigned task then shows an AI
 connection card. First-time setup presents the provider's subscription/API controls
-inside the task. Connecting installs access for that agent and resumes the pending
+inside the task. The inline form omits the connection name field and names new
+accounts from the user's display name, provider, and selected authentication
+method (for example, `dotta's Claude API account`). Reconnecting preserves the
+existing account name. Connecting installs access for that agent and resumes the pending
 work automatically. Explicit incompatible bindings and shared-account permission
 denials still fail; hiring never expands a restricted shared account's audience.
 
@@ -303,3 +374,13 @@ boundaries, and concurrent runs of one subscription for both providers. The opt-
 [`tests/hiring-ai-connections/README.md`](../../tests/hiring-ai-connections/README.md)
 describes real browser hiring, subtask, connection, and automatic-resume checks on
 local and Daytona environments, plus the production component Storybook checks.
+
+### Managed session compatibility
+
+Resume checks compare the selected account identity with the server-owned
+metadata in the saved task session. Read this metadata before decoding the
+adapter session: adapter codecs intentionally discard unknown fields. A missing
+identity, a different grant or responsible user, or a changed credential generation
+requires a fresh session. The metadata is removed before passing session params
+to an adapter. Temporary authentication-home paths do not change the configuration
+fingerprint. These checks do not relax current connection authorization.

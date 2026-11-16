@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { randomBytes, randomUUID } from "node:crypto";
 import test from "node:test";
 import fs from "node:fs";
 import os from "node:os";
@@ -129,11 +130,12 @@ process.exit(0);
   return baseCwd;
 }
 
-function runProvision(baseCwd, { pathPrefix, setupWorktree, existingWorktree } = {}) {
+function runProvision(baseCwd, { pathPrefix, setupWorktree, setupInstance, existingWorktree } = {}) {
   const worktreeCwd = existingWorktree ?? makeTempDir("paperclip-provision-worktree-");
   setupWorktree?.(worktreeCwd);
   const worktreesHome = makeTempDir("paperclip-provision-home-");
   const paperclipHome = makeInstanceHome();
+  setupInstance?.(paperclipHome);
   const result = spawnSync("bash", [script], {
     cwd: worktreeCwd,
     encoding: "utf8",
@@ -245,15 +247,45 @@ test("uses the base CLI when its import graph boots", () => {
   );
 });
 
+// FORK DIVERGENCE (SUP-15582): upstream #14795's "explains unavailable instance
+// source config without creating target state" expects an absent seed source to
+// fail with setup guidance. This fork provisions a self-contained worktree for an
+// absent source instead; "provisions a self-contained worktree when no seed source
+// config exists on disk" and "runtime provisioning exits 0 when no seed source
+// config exists on disk" below pin that behavior. Present-but-malformed sources are
+// still refused (the symlink and non-regular cases that follow).
+
 test("rejects a dangling base workspace config symlink instead of falling back", () => {
   const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
   fs.mkdirSync(path.join(baseCwd, ".paperclip"), { recursive: true });
   fs.symlinkSync(path.join(baseCwd, "absent.json"), path.join(baseCwd, ".paperclip", "config.json"));
 
-  const { result } = runProvision(baseCwd);
+  const { result, worktreeCwd } = runProvision(baseCwd);
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /seed source config is a symlink/);
+  assert.match(result.stderr, /is not a canonical file \(base project workspace\)/);
+  assert.doesNotMatch(result.stderr, /checkout-only|provisionCommand/);
+  assert.equal(fs.existsSync(path.join(worktreeCwd, ".paperclip")), false);
+  assert.deepEqual(readCliInvocations(baseCwd), []);
+});
+
+test("rejects a non-regular instance config without suggesting a setup bypass", () => {
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const { result, worktreeCwd } = runProvision(baseCwd, {
+    setupInstance: (home) => {
+      const configPath = path.join(home, "instances", "default", "config.json");
+      fs.rmSync(configPath);
+      fs.mkdirSync(configPath);
+    },
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /is not a canonical file \(control-plane instance\)/);
+  assert.match(result.stderr, /Repair the registered source path/);
+  assert.doesNotMatch(result.stderr, /checkout-only|provisionCommand/);
+  assert.equal(fs.existsSync(path.join(worktreeCwd, ".paperclip")), false);
+  assert.deepEqual(readCliInvocations(baseCwd), []);
 });
 
 test("rejects a dangling base workspace .paperclip symlink instead of falling back", () => {
@@ -913,6 +945,228 @@ test("runtime provisioning does not trust a truncated verified manifest", () => 
       .filter((args) => args[0] === "worktree" && args[1] === "ensure-seeded").length,
     1,
   );
+});
+
+function completeSeedManifest(seedMode) {
+  return JSON.stringify({
+    version: 2,
+    source: { instanceId: "base-source", configPath: "/fixture/source/config.json" },
+    snapshotAt: "2026-08-19T00:00:00.000Z",
+    seedMode,
+    migrationRevision: "0142_test.sql",
+    targetInstanceId: "target-test",
+    phase: "complete",
+    state: "verified",
+    attemptId: "attempt-test",
+    startedAt: "2026-08-19T00:00:00.000Z",
+    finishedAt: "2026-08-19T00:01:00.000Z",
+    diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-08-19T00:01:00.000Z" }],
+  });
+}
+
+function makeManifestWorktree(prefix, writeManifest) {
+  const worktreeCwd = makeTempDir(prefix);
+  fs.mkdirSync(path.join(worktreeCwd, ".paperclip"), { recursive: true });
+  fs.writeFileSync(path.join(worktreeCwd, ".paperclip", "config.json"), "{}\n");
+  writeManifest(path.join(worktreeCwd, ".paperclip", "seed-manifest.json"));
+  return worktreeCwd;
+}
+
+test("runtime provisioning skips complete minimal and full seed manifests", () => {
+  for (const seedMode of ["minimal", "full"]) {
+    const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+    const worktreeCwd = makeManifestWorktree(`paperclip-provision-runtime-${seedMode}-`, (manifestPath) => {
+      fs.writeFileSync(manifestPath, completeSeedManifest(seedMode));
+    });
+    const result = runRuntimeProvision(baseCwd, worktreeCwd);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /verified seed manifest; skipping runtime provisioning/);
+    assert.deepEqual(readCliInvocations(baseCwd), []);
+  }
+});
+
+/**
+ * A verified v3 fresh manifest for this checkout's migration lineage head and
+ * its 0600 initialization key, as the real writer stores them. `forge` keeps
+ * the key but writes a binding the key did not produce.
+ */
+async function verifiedFreshFiles(targetInstanceId, { schemaOverride = {}, forge = false } = {}) {
+  const { computeWorktreeSchemaLineage } = await import(
+    new URL("../../packages/shared/src/worktree-initialization-identity.ts", import.meta.url).href
+  );
+  const { computeWorktreeInitializationBinding } = await import(
+    new URL("../../packages/shared/src/worktree-initialization-manifest.ts", import.meta.url).href
+  );
+  const head = computeWorktreeSchemaLineage(new URL("../../packages/db/src/migrations/", import.meta.url).pathname).at(-1);
+  const generationId = randomUUID();
+  const attemptId = randomUUID();
+  const body = {
+    version: 3,
+    kind: "worktree-initialization",
+    profile: "fresh",
+    policyVersion: 1,
+    schemaFingerprint: head.schemaFingerprint,
+    migrationRevision: head.migrationRevision,
+    ...schemaOverride,
+    targetInstanceId,
+    generationId,
+    attemptId,
+    state: "verified",
+    phase: "complete",
+    startedAt: "2026-11-16T10:00:00.000Z",
+    finishedAt: "2026-11-16T10:00:05.000Z",
+    source: null,
+    diagnostics: [{ phase: "complete", code: "fresh_ready", status: "succeeded", at: "2026-11-16T10:00:05.000Z" }],
+    validation: { kind: "fresh-ready", attemptId, generationId, completedAt: "2026-11-16T10:00:05.000Z" },
+  };
+  const key = randomBytes(32);
+  const binding = forge
+    ? `hmac-sha256:${randomBytes(32).toString("hex")}`
+    : computeWorktreeInitializationBinding(key, body);
+  return { manifest: JSON.stringify({ ...body, binding }), key };
+}
+
+function writeFreshFiles(manifestPath, files, env) {
+  fs.writeFileSync(manifestPath, files.manifest);
+  fs.writeFileSync(path.join(path.dirname(manifestPath), "initialization.key"), files.key, { mode: 0o600 });
+  if (env !== null) fs.writeFileSync(path.join(path.dirname(manifestPath), ".env"), env);
+}
+
+test("runtime provisioning skips a verified fresh initialization for this worktree instance and schema", async () => {
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const files = await verifiedFreshFiles("wt-fresh");
+  const worktreeCwd = makeManifestWorktree("paperclip-provision-runtime-fresh-", (manifestPath) => {
+    writeFreshFiles(manifestPath, files, "PAPERCLIP_INSTANCE_ID=wt-fresh\n");
+  });
+  const result = runRuntimeProvision(baseCwd, worktreeCwd);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /verified seed manifest; skipping runtime provisioning/);
+  assert.deepEqual(readCliInvocations(baseCwd), [], "a fresh worktree is never seeded from a parent");
+});
+
+test("runtime provisioning refuses a forged fresh initialization, or one for another instance or schema, without reseeding", async () => {
+  const cases = [
+    ["forged", await verifiedFreshFiles("wt-fresh", { forge: true }), "PAPERCLIP_INSTANCE_ID=wt-fresh\n", /not bound to this worktree's initialization key/],
+    ["other-instance", await verifiedFreshFiles("wt-fresh"), "PAPERCLIP_INSTANCE_ID=wt-other\n", /different target instance/],
+    ["no-env", await verifiedFreshFiles("wt-fresh"), null, /cannot confirm the target identity/],
+    [
+      "diverged-schema",
+      await verifiedFreshFiles("wt-fresh", { schemaOverride: { schemaFingerprint: `sha256:${"0".repeat(64)}` } }),
+      "PAPERCLIP_INSTANCE_ID=wt-fresh\n",
+      /different destination schema/,
+    ],
+  ];
+  for (const [label, files, env, reason] of cases) {
+    const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+    const worktreeCwd = makeManifestWorktree(`paperclip-provision-runtime-fresh-refuse-${label}-`, (manifestPath) => {
+      writeFreshFiles(manifestPath, files, env);
+    });
+    const result = runRuntimeProvision(baseCwd, worktreeCwd);
+    assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+    assert.match(result.stderr, reason, label);
+    assert.deepEqual(readCliInvocations(baseCwd), [], `${label}: the seed CLI must not run`);
+  }
+});
+
+test("runtime provisioning refuses legacy-unsafe, initialization and malformed manifests without reseeding", () => {
+  const cases = [
+    ["legacy-unsafe", completeSeedManifest("minimal-no-secrets"), /minimal-no-secrets.*clean generation/s],
+    ["initialization", JSON.stringify({ version: 3, kind: "worktree-initialization", state: "verified" }), /initialization manifest/],
+    ["malformed", "{ truncated", /not a complete strict JSON document/],
+    ["null", "null", /not a JSON object/],
+  ];
+  for (const [label, contents, reason] of cases) {
+    const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+    const worktreeCwd = makeManifestWorktree(`paperclip-provision-runtime-refuse-${label}-`, (manifestPath) => {
+      fs.writeFileSync(manifestPath, contents);
+    });
+    const result = runRuntimeProvision(baseCwd, worktreeCwd);
+    assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+    assert.match(result.stderr, reason, label);
+    assert.match(result.stderr, /not provisioning or reseeding this worktree/, label);
+    assert.deepEqual(readCliInvocations(baseCwd), [], `${label}: the seed CLI must not run`);
+    assert.equal(fs.readFileSync(path.join(worktreeCwd, ".paperclip", "seed-manifest.json"), "utf8"), contents, label);
+  }
+});
+
+test("runtime provisioning refuses a manifest in a state dir it cannot search", { skip: process.getuid?.() === 0 ? "root ignores directory search permission" : false }, () => {
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const worktreeCwd = makeManifestWorktree("paperclip-provision-runtime-unsearchable-", (manifestPath) => {
+    fs.writeFileSync(manifestPath, completeSeedManifest("full"));
+  });
+  const stateDir = path.join(worktreeCwd, ".paperclip");
+  fs.chmodSync(stateDir, 0o600);
+  try {
+    const result = runRuntimeProvision(baseCwd, worktreeCwd);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /Refusing worktree state file/);
+    assert.match(result.stderr, /not provisioning or reseeding this worktree/);
+    assert.deepEqual(readCliInvocations(baseCwd), [], "the seed CLI must not run");
+  } finally {
+    fs.chmodSync(stateDir, 0o700);
+  }
+});
+
+test("runtime provisioning refuses FIFO, directory and symlinked manifests without blocking", () => {
+  const cases = [
+    ["fifo", (manifestPath) => assert.equal(spawnSync("mkfifo", [manifestPath]).status, 0), /FIFO/],
+    ["directory", (manifestPath) => fs.mkdirSync(manifestPath), /directory/],
+    ["symlink", (manifestPath) => {
+      const target = path.join(path.dirname(manifestPath), "complete.json");
+      fs.writeFileSync(target, completeSeedManifest("full"));
+      fs.symlinkSync(target, manifestPath);
+    }, /symbolic link/],
+    ["dangling-symlink", (manifestPath) => fs.symlinkSync(path.join(path.dirname(manifestPath), "missing.json"), manifestPath), /symbolic link/],
+  ];
+  for (const [label, writeManifest, reason] of cases) {
+    const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+    const worktreeCwd = makeManifestWorktree(`paperclip-provision-runtime-nonregular-${label}-`, writeManifest);
+    const started = performance.now();
+    const result = spawnSync("bash", [runtimeScript], {
+      cwd: worktreeCwd,
+      encoding: "utf8",
+      timeout: 20_000,
+      env: {
+        PATH: testPath,
+        HOME: os.homedir(),
+        PAPERCLIP_WORKSPACE_BASE_CWD: baseCwd,
+        PAPERCLIP_WORKSPACE_CWD: worktreeCwd,
+        PAPERCLIP_HOME: makeInstanceHome(),
+      },
+    });
+    const elapsedMs = performance.now() - started;
+    assert.equal(result.signal, null, `${label}: the provisioner was killed instead of finishing`);
+    assert.ok(elapsedMs < 2_000, `${label}: took ${Math.round(elapsedMs)}ms`);
+    assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+    assert.match(result.stderr, reason, label);
+    assert.deepEqual(readCliInvocations(baseCwd), [], `${label}: the seed CLI must not run`);
+  }
+});
+
+test("runtime provisioning refuses a manifest behind a linked state directory", () => {
+  // Another instance's state directory holds a complete manifest. A worktree
+  // whose `.paperclip`, or whose `uid-<uid>` scoped directory, links to it must
+  // refuse that manifest rather than borrow it and skip provisioning.
+  const otherState = makeTempDir("paperclip-provision-runtime-other-state-");
+  fs.writeFileSync(path.join(otherState, "config.json"), "{}\n");
+  fs.writeFileSync(path.join(otherState, ".env"), "");
+  fs.writeFileSync(path.join(otherState, "seed-manifest.json"), completeSeedManifest("full"));
+
+  const linkedRoot = makeTempDir("paperclip-provision-runtime-linked-root-");
+  fs.symlinkSync(otherState, path.join(linkedRoot, ".paperclip"));
+  const linkedScoped = makeTempDir("paperclip-provision-runtime-linked-scoped-");
+  fs.mkdirSync(path.join(linkedScoped, ".paperclip"));
+  fs.writeFileSync(path.join(linkedScoped, ".paperclip", "config.json"), "{}\n");
+  fs.symlinkSync(otherState, path.join(linkedScoped, ".paperclip", `uid-${process.getuid()}`));
+
+  for (const worktreeCwd of [linkedRoot, linkedScoped]) {
+    const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+    const result = runRuntimeProvision(baseCwd, worktreeCwd);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /below its trusted state root is a symbolic link/);
+    assert.match(result.stderr, /not provisioning or reseeding this worktree/);
+    assert.deepEqual(readCliInvocations(baseCwd), [], "the seed CLI must not run");
+  }
 });
 
 /**

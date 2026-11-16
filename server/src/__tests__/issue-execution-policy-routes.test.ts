@@ -31,9 +31,18 @@ const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
   triggerIssueMonitor: vi.fn(async () => ({ outcome: "triggered" as const })),
   reportRunActivity: vi.fn(async () => undefined),
-  getRun: vi.fn(async () => null),
-  getActiveRunForAgent: vi.fn(async () => null),
-  cancelRun: vi.fn(async () => null),
+  getRun: vi.fn(async () => null as unknown),
+  getActiveRunForAgent: vi.fn(async () => null as unknown),
+  cancelRun: vi.fn(async () => null as unknown), releaseIssueExecutionAndPromote: vi.fn(async () => undefined),
+}));
+const mockExecutionWorkspaceService = vi.hoisted(() => ({
+  getById: vi.fn(async () => null as unknown),
+  reopenClosedIsolatedExecutionWorkspaceForIssue: vi.fn(),
+}));
+const mockIssueRecoveryActionService = vi.hoisted(() => ({
+  getActiveForIssue: vi.fn(async () => null as unknown),
+  resolveActiveForIssue: vi.fn(async () => null as unknown),
+  listActiveForIssues: vi.fn(async () => new Map()),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -141,6 +150,9 @@ function registerModuleMocks() {
     return { ...actual, evaluateDoneTransitionGuard: mockEvaluateDoneTransitionGuard };
   });
 
+  vi.doMock("../services/queued-interaction-response.js", () => ({
+    hasQueuedInteractionResponse: vi.fn(async () => false),
+  }));
   vi.doMock("../services/runner-goals.js", () => ({
     runnerGoalService: () => mockRunnerGoalService,
     RunnerGoalActionError: class RunnerGoalActionError extends Error {},
@@ -196,7 +208,7 @@ function registerModuleMocks() {
     documentService: () => ({
       getIssueDocumentPayload: vi.fn(async () => ({})),
     }),
-    executionWorkspaceService: () => ({}),
+    executionWorkspaceService: () => mockExecutionWorkspaceService,
     feedbackService: () => ({
       listIssueVotesForUser: vi.fn(async () => []),
       saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
@@ -233,10 +245,7 @@ function registerModuleMocks() {
       syncDocument: async () => undefined,
       syncIssue: async () => undefined,
     }),
-    issueRecoveryActionService: () => ({
-      getActiveForIssue: vi.fn(async () => null),
-      listActiveForIssues: vi.fn(async () => new Map()),
-    }),
+    issueRecoveryActionService: () => mockIssueRecoveryActionService,
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     logActivity: mockLogActivity,
@@ -322,6 +331,9 @@ const HANDOFF_AGENT_ROWS = [{
   resourceId: "33333333-3333-4333-8333-333333333333",
   contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
   permissions: null,
+  // Also used for closing-run attribution by the real done-tier guard.
+  startedAt: new Date("2026-11-04T09:00:00Z"),
+  createdAt: new Date("2026-11-04T08:58:00Z"),
 }];
 
 // SUP-17410: ids that exercise the agent-reference guard. PHANTOM is the live
@@ -355,9 +367,12 @@ describe("issue execution policy routes", () => {
     vi.doUnmock("../services/external-objects.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
+    mockIssueRecoveryActionService.resolveActiveForIssue.mockResolvedValue(null);
     mockResolveSummaryGenerationReturnAssignee.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
+    mockExecutionWorkspaceService.getById.mockResolvedValue(null);
     mockIssueService.addComment.mockImplementation(async (_id: string, body: string) => ({
       id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
       body,
@@ -868,6 +883,333 @@ describe("issue execution policy routes", () => {
       }),
       expect.anything(),
     );
+  });
+
+  describe("SUP-22840 top-level monitor alias", () => {
+    const REVIEWER_AGENT_ID = "44444444-4444-4444-8444-444444444444";
+    const RETURN_ASSIGNEE_AGENT_ID = "66666666-6666-4666-8666-666666666666";
+    const aliasMonitor = { nextCheckAt: "2026-12-01T12:00:00.000Z" };
+
+    function agentApp() {
+      return createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "55555555-5555-4555-8555-555555555555",
+      });
+    }
+
+    function seededIssue(executionPolicy: unknown, title: string) {
+      return {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-2284",
+        title,
+        executionPolicy,
+        executionState: null,
+        monitorAttemptCount: 0,
+        monitorNextCheckAt: null,
+        monitorLastTriggeredAt: null,
+        monitorNotes: null,
+        monitorScheduledBy: null,
+      };
+    }
+
+    const storedLadderRaw = {
+      mode: "normal",
+      commentRequired: true,
+      returnAssigneeAgentId: RETURN_ASSIGNEE_AGENT_ID,
+      maxReviewRounds: 3,
+      baseRef: "main",
+      stages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          type: "review",
+          participants: [
+            { id: "22222222-2222-4222-8222-222222222222", type: "agent", agentId: REVIEWER_AGENT_ID },
+          ],
+        },
+      ],
+    };
+
+    it("translates the alias into the same monitor-only policy write as the nested spelling", async () => {
+      const issue = seededIssue(storedLadderRaw, "Alias arm over live ladder");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitor: aliasMonitor });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(patch).not.toHaveProperty("monitor");
+      expect(patch.executionPolicy).toEqual(
+        normalizeIssueExecutionPolicy({ ...storedLadderRaw, monitor: aliasMonitor }),
+      );
+      expect(patch.executionPolicy).toMatchObject({
+        baseRef: "main",
+        returnAssigneeAgentId: RETURN_ASSIGNEE_AGENT_ID,
+        maxReviewRounds: 3,
+      });
+      expect(patch).toMatchObject({
+        monitorNextCheckAt: new Date("2026-12-01T12:00:00.000Z"),
+      });
+    });
+    it("rejects a monitor alias when the stored policy changed before the locked write", async () => {
+      const issue = seededIssue(storedLadderRaw, "Concurrent policy update");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.getByIdForUpdate.mockResolvedValue({
+        ...issue,
+        executionPolicy: { ...storedLadderRaw, maxReviewRounds: 5 },
+      });
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitor: aliasMonitor });
+
+      expect(res.status).toBe(409);
+      expect(res.body.details).toMatchObject({ code: "issue_execution_policy_conflict" });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("arms a fresh policy when the stored executionPolicy is null", async () => {
+      const issue = seededIssue(null, "Alias arm on null policy");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitor: aliasMonitor });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(patch).not.toHaveProperty("monitor");
+      expect(patch.executionPolicy).toEqual(normalizeIssueExecutionPolicy({ monitor: aliasMonitor }));
+      expect(patch).toMatchObject({
+        monitorNextCheckAt: new Date("2026-12-01T12:00:00.000Z"),
+      });
+    });
+
+    it("treats alias null as disarm while keeping the stored ladder", async () => {
+      const issue = seededIssue(
+        { ...storedLadderRaw, monitor: { nextCheckAt: "2026-11-01T00:00:00.000Z" } },
+        "Alias disarm",
+      );
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitor: null });
+
+      expect(res.status).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(patch.executionPolicy).toEqual(
+        normalizeIssueExecutionPolicy({ ...storedLadderRaw, monitor: null }),
+      );
+      expect(patch.executionPolicy).toMatchObject({
+        baseRef: "main",
+        returnAssigneeAgentId: RETURN_ASSIGNEE_AGENT_ID,
+        maxReviewRounds: 3,
+      });
+      expect(patch).toMatchObject({ monitorNextCheckAt: null });
+    });
+
+    it("requires a closed workspace to reopen before an alias-only agent PATCH can commit", async () => {
+      const workspaceId = "78787878-7878-4787-8787-787878787878";
+      const issue = {
+        ...seededIssue(null, "Alias on closed workspace"),
+        executionWorkspaceId: workspaceId,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue, ...patch,
+      }));
+      mockExecutionWorkspaceService.getById.mockResolvedValue({
+        id: workspaceId,
+        mode: "isolated_workspace",
+        status: "archived",
+        closedAt: new Date("2026-01-01T00:00:00.000Z"),
+      });
+      mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue.mockResolvedValue({
+        ok: false,
+        code: "rebuild_failed",
+        message: "Failed to rebuild the execution workspace",
+      });
+
+      const res = await request(await agentApp())
+        .patch(`/api/issues/${issue.id}`)
+        .send({ monitor: aliasMonitor });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(503);
+      expect(mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue).toHaveBeenCalledWith(
+        expect.objectContaining({ workspaceId, issue: expect.objectContaining({ id: issue.id }) }),
+      );
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("refuses a body carrying both the alias and an executionPolicy key before any write", async () => {
+      const issue = seededIssue(storedLadderRaw, "Alias conflict");
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({
+          monitor: aliasMonitor,
+          executionPolicy: { monitor: { nextCheckAt: "2027-01-01T00:00:00.000Z" } },
+        });
+
+      expect(res.status).toBe(400);
+      // The refusal rides the zod issue in `details`, pinned at ["monitor"].
+      expect(res.body.details).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: ["monitor"],
+            message: expect.stringContaining("monitor cannot be combined with executionPolicy"),
+          }),
+        ]),
+      );
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("keeps unknown top-level keys a strict 400 that commits nothing", async () => {
+      const issue = seededIssue(storedLadderRaw, "Strict around the alias");
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitorr: aliasMonitor, comment: "co-sent side effect", status: "todo" });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("monitorr");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+    it("checks recovery-action authority for monitor:null alias disarms", async () => {
+      const issue = {
+        ...seededIssue(null, "Recovery-owned card"),
+        status: "in_progress",
+        assigneeAgentId: null,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+        id: "88888888-8888-4888-8888-888888888888",
+        kind: "monitor_timeout",
+        ownerAgentId: RA_SEAT_AGENT_ID,
+      } as never);
+
+      const res = await request(await agentApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ monitor: null });
+
+      expect(res.status).toBe(403);
+      expect(mockIssueRecoveryActionService.getActiveForIssue).toHaveBeenCalledWith(
+        "company-1",
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      );
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    const RA_SEAT_AGENT_ID = "99999999-9999-4999-8999-999999999999";
+    const storedReleaseAssuranceRaw = {
+      mode: "normal",
+      commentRequired: true,
+      approvalAuthority: "release_assurance",
+      stages: [
+        {
+          id: "12121212-1212-4121-8121-121212121212",
+          type: "approval",
+          approvalsNeeded: 1,
+          participants: [
+            { id: "23232323-2323-4232-8232-232323232323", type: "agent", agentId: RA_SEAT_AGENT_ID },
+          ],
+        },
+      ],
+    };
+
+    it.each([
+      { actor: "board", monitor: aliasMonitor },
+      { actor: "board", monitor: null },
+      { actor: "agent", monitor: aliasMonitor },
+      { actor: "agent", monitor: null },
+    ])("refuses $actor monitor updates on a release-assurance card", async ({ actor, monitor }) => {
+      const issue = seededIssue(storedReleaseAssuranceRaw, "Release-assurance card");
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const app = actor === "agent" ? await agentApp() : await createApp();
+      const res = await request(app)
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ title: "Must not change", monitor });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain("release_assurance");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("still refuses a caller-supplied executionPolicy that selects release-assurance authority", async () => {
+      const issue = seededIssue(storedReleaseAssuranceRaw, "Nested selection refused");
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await createApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ executionPolicy: { ...storedReleaseAssuranceRaw, monitor: aliasMonitor } });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain("release_assurance");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+    it("revalidates a stranded recovery action against a stored RA monitor without throwing", async () => {
+      const issue = {
+        ...seededIssue(
+          { ...storedReleaseAssuranceRaw, monitor: aliasMonitor },
+          "RA recovery projection",
+        ),
+        status: "todo",
+        assigneeAgentId: null,
+        monitorNextCheckAt: new Date(aliasMonitor.nextCheckAt),
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+        id: "88888888-8888-4888-8888-888888888888",
+        kind: "stranded_assigned_issue",
+        ownerAgentId: null,
+        createdAt: new Date("2026-10-01T00:00:00.000Z"),
+      } as never);
+      mockIssueRecoveryActionService.resolveActiveForIssue.mockResolvedValue({
+        id: "88888888-8888-4888-8888-888888888888",
+        status: "cancelled",
+        outcome: "cancelled",
+        resolutionNote: "Recovery action became stale because the source issue now has a scheduled monitor.",
+      } as never);
+
+      const res = await request(await createApp())
+        .get("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+
+      expect(res.status).toBe(200);
+      expect(mockIssueRecoveryActionService.resolveActiveForIssue).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sourceIssueId: issue.id,
+          resolutionNote: expect.stringContaining("scheduled monitor"),
+        }),
+      );
+    });
   });
 
   it("rejects board-authored in_review transitions without a review path", async () => {
@@ -2056,6 +2398,7 @@ describe("issue execution policy routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
+      expect.anything(),
     );
     const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
     expect(updatePatch.status).toBeUndefined();
@@ -2542,6 +2885,63 @@ describe("issue execution policy routes", () => {
       expect(written.executionPolicy?.monitor?.maxAttempts).toBe(100);
     });
 
+    // SUP-22890: the destructive shape. The SUP-13925 round-trip with the
+    // `monitor` key dropped used to return 200 while nulling executionPolicy
+    // and clearing the monitor — a silent wake loss on a monitor-only watcher.
+    // It must now 422 naming the field it would destroy, before any write.
+    it("rejects the stage-less round-trip that drops the monitor key, naming the monitor", async () => {
+      const issueId = randomUUID();
+      const issue = monitorOnlyIssue(issueId);
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockResolvedValue({ ...issue, executionPolicy: null } as any);
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            stages: [],
+          },
+        });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain("executionPolicy must not clear the issue's monitor");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    // SUP-22890 AC2: both monitor-bearing re-arm shapes must persist a
+    // non-null policy. The whole-object shape is covered above; this is the
+    // partial shape (`stages` omitted) from the field repro.
+    it("persists a non-null policy for the partial monitor re-arm with stages omitted", async () => {
+      const issueId = randomUUID();
+      const issue = monitorOnlyIssue(issueId);
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockResolvedValue(issue as any);
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            monitor: {
+              nextCheckAt: "2026-08-27T08:00:00.000Z",
+              notes: "ci-health digest",
+            },
+          },
+        });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+      const written = mockIssueService.update.mock.calls.at(-1)?.[1] as {
+        executionPolicy?: { stages?: unknown[]; monitor?: { nextCheckAt?: string } } | null;
+      };
+      expect(written.executionPolicy).not.toBeNull();
+      expect(written.executionPolicy?.stages).toEqual([]);
+      expect(written.executionPolicy?.monitor?.nextCheckAt).toBe("2026-08-27T08:00:00.000Z");
+    });
+
     it("rejects a PATCH that sets executionPolicy to null over a non-null stored policy and leaves it untouched", async () => {
       const issueId = randomUUID();
       const issue = ladderIssue(issueId);
@@ -2559,6 +2959,47 @@ describe("issue execution policy routes", () => {
         expect(((call as unknown[])[1] as { action?: string }).action).not.toBe("issue.reviewers_updated");
         expect(((call as unknown[])[1] as { action?: string }).action).not.toBe("issue.approvers_updated");
       }
+    });
+
+    it("rejects a policy PATCH when the locked row has changed since the request snapshot", async () => {
+      const issueId = randomUUID();
+      const issue = ladderIssue(issueId);
+      const replacement = normalizeIssueExecutionPolicy({
+        stages: [
+          {
+            type: "review",
+            participants: [{ type: "agent", agentId: "55555555-5555-4555-8555-555555555555" }],
+          },
+          {
+            type: "approval",
+            participants: [{ type: "user", userId: "cto-user" }],
+          },
+        ],
+      })!;
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.getByIdForUpdate.mockResolvedValue({
+        ...issue,
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [
+            {
+              type: "review",
+              participants: [{ type: "agent", agentId: "66666666-6666-4666-8666-666666666666" }],
+            },
+            {
+              type: "approval",
+              participants: [{ type: "user", userId: "cto-user" }],
+            },
+          ],
+        }),
+      });
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ executionPolicy: replacement });
+
+      expect(res.status).toBe(409);
+      expect(res.body.details).toMatchObject({ code: "execution_policy_stale" });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
     it("still allows a full replacement policy so repaired ladders can be re-PATCHed", async () => {
@@ -3686,6 +4127,118 @@ describe("issue execution policy routes", () => {
       });
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
+
+    // SUP-24280: the SUP-24090 shape — an unassigned, half-emitted Wiki
+    // handoff stub. Only a status-only cancellation passes the route guard.
+    function unassignedStub(overrides: Record<string, unknown> = {}) {
+      return {
+        ...issueWithParticipants([maintainerId]),
+        status: "backlog",
+        assigneeAgentId: null,
+        executionPolicy: null,
+        ...overrides,
+      };
+    }
+
+    it("cancels an unassigned stub on a status-only PATCH without writing an assignee (SUP-24280)", async () => {
+      const stub = unassignedStub();
+      mockIssueService.getById.mockResolvedValue(stub);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...stub,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp()).patch(`/api/issues/${issueId}`).send({ status: "cancelled" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(patch.status).toBe("cancelled");
+      expect(patch.assigneeAgentId).toBeUndefined();
+      expect(patch.assigneeUserId).toBeUndefined();
+    });
+
+    it.each([
+      ["a status-only todo write", {}, { status: "todo" }, "wiki_handoff_unassigned"],
+      ["a status-only done write", {}, { status: "done" }, "wiki_handoff_unassigned"],
+      ["a cancellation with an explicit null agent assignee", {}, { status: "cancelled", assigneeAgentId: null }, "wiki_handoff_unassigned"],
+      ["a cancellation with an explicit null user assignee", {}, { status: "cancelled", assigneeUserId: null }, "wiki_handoff_unassigned"],
+      ["a cancellation that assigns a non-canonical agent", {}, { status: "cancelled", assigneeAgentId: otherId }, "wiki_handoff_non_canonical_assignee"],
+      ["a cancellation of a user-owned handoff", { assigneeUserId: "board-owner" }, { status: "cancelled" }, "wiki_handoff_unassigned"],
+    ])("keeps refusing %s on an unassigned stub (SUP-24280)", async (_name, issueOverrides, body, reason) => {
+      mockIssueService.getById.mockResolvedValue(unassignedStub(issueOverrides));
+
+      const res = await request(await createApp()).patch(`/api/issues/${issueId}`).send(body);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details).toMatchObject({
+        guard: "assignee_review_gate",
+        subGuard: "wiki_handoff",
+        reason,
+      });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    // SUP-23890 / SUP-23886: canonical in_progress handoff with an ACTIVE
+    // issuing run entering a user-only review stage. The route must project
+    // the workflow-controlled user seating into the update patch (so the
+    // service guard can exempt it) and must not cancel the issuing run.
+    it("lands the canonical Maintainer's issuing-run stage handoff into a user-only review without cancelling the run (SUP-23890)", async () => {
+      const issuingRunId = "55555555-5555-4555-8555-555555555555";
+      const issue = {
+        ...issueWithParticipants([maintainerId]),
+        executionRunId: issuingRunId,
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [{
+            id: stageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ type: "user", userId: "human-reviewer" }],
+          }],
+        }),
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+      mockHeartbeatService.getRun.mockResolvedValue({
+        id: issuingRunId,
+        companyId: "company-1",
+        agentId: maintainerId,
+        status: "running",
+        contextSnapshot: { issueId },
+      });
+      vi.doMock("../services/cross-issue-influence-limit.js", async (importOriginal) => ({
+        ...await importOriginal<typeof import("../services/cross-issue-influence-limit.js")>(),
+        observeCrossIssueInfluence: vi.fn(async () => null),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: maintainerId,
+        companyId: "company-1",
+        runId: issuingRunId,
+      })).patch(`/api/issues/${issueId}`).send({ status: "in_review" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(patch).toMatchObject({
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: "human-reviewer",
+        workflowControlledAssignment: true,
+        actorAgentId: maintainerId,
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentParticipant: { type: "user", userId: "human-reviewer" },
+          returnAssignee: { type: "agent", agentId: maintainerId },
+        },
+      });
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
   });
 
   it.each([
@@ -3760,12 +4313,10 @@ describe("issue execution policy routes", () => {
         .send({ executionPolicy: { baseRef } });
 
       expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(200);
-      expect(mockIssueService.update).toHaveBeenCalledWith(
-        issueId,
-        expect.objectContaining({
-          executionPolicy: expect.objectContaining({ baseRef }),
-        }),
-      );
+      // A policy write runs on the transactional path, so the service also
+      // receives the transaction handle; only the id and patch are the contract.
+      expect(mockIssueService.update.mock.calls[0]?.[0]).toBe(issueId);
+      expect(mockIssueService.update.mock.calls[0]?.[1]).toMatchObject({ executionPolicy: { baseRef } });
 
       // The exact policy handed to the service is what a later read must project
       // back verbatim — deliver.sh Phase 2c reads `.executionPolicy.baseRef` off
@@ -4140,6 +4691,628 @@ describe("issue execution policy routes", () => {
       expect(res.body.error).toContain(PHANTOM_AGENT_ID);
       expect(res.body.details).toMatchObject({ stageIndex: 0, agentId: PHANTOM_AGENT_ID });
       expect(mockIssueService.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("reassignment run stop (SUP-22662)", () => {
+    const issueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const runId = "55555555-5555-4555-8555-555555555555";
+    const reviewerAgentId = "33333333-3333-4333-8333-333333333333";
+    const nextAgentId = "55555555-5555-4555-8555-555555555555";
+    const runningRun = {
+      id: runId,
+      companyId: "company-1",
+      agentId: reviewerAgentId,
+      status: "running",
+      contextSnapshot: { issueId },
+    };
+
+    beforeEach(() => {
+      mockHeartbeatService.getRun.mockResolvedValue(runningRun);
+      mockHeartbeatService.cancelRun.mockResolvedValue({
+        ...runningRun,
+        status: "cancelled",
+      });
+    });
+
+    function mockStageHandoff() {
+      const stage1Id = "11111111-1111-4111-8111-111111111111";
+      const stage2Id = "aaaaaaaa-0000-4000-8000-000000000002";
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [
+          {
+            id: stage1Id,
+            type: "review",
+            participants: [{ type: "agent", agentId: reviewerAgentId }],
+          },
+          {
+            id: stage2Id,
+            type: "review",
+            participants: [{ type: "agent", agentId: nextAgentId }],
+          },
+        ],
+      })!;
+      const issue = {
+        id: issueId,
+        companyId: "company-1",
+        status: "in_review",
+        assigneeAgentId: reviewerAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-1012",
+        title: "Stage hand-off",
+        deliveryRequirement: "record_only",
+        executionPolicy: policy,
+        executionRunId: runId,
+        executionState: {
+          status: "pending",
+          currentStageId: stage1Id,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: reviewerAgentId },
+          returnAssignee: { type: "agent", agentId: "44444444-4444-4444-8444-444444444444" },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const insertedRows: Record<string, unknown>[] = [];
+      mockDb.transaction.mockImplementation(async (callback: (tx: any) => Promise<unknown>) =>
+        callback({
+          select: mockDbSelect,
+          insert: () => ({
+            values: async (values: Record<string, unknown>) => {
+              insertedRows.push(values);
+              return [{ id: values.id }];
+            },
+          }),
+          update: () => mockTxWriteChain([]),
+          delete: () => mockTxWriteChain([]),
+        }));
+      return { stage1Id, stage2Id, insertedRows };
+    }
+
+    it("does not cancel the issuing run on a workflow-controlled non-final stage approval", async () => {
+      const { stage1Id, stage2Id, insertedRows } = mockStageHandoff();
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId,
+      }))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Stage approved; handing to the next reviewer." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({
+          assigneeAgentId: nextAgentId,
+          executionState: expect.objectContaining({
+            status: "pending",
+            currentStageId: stage2Id,
+            currentParticipant: expect.objectContaining({
+              type: "agent",
+              agentId: nextAgentId,
+            }),
+          }),
+        }),
+        expect.anything(),
+      );
+      expect(insertedRows).toContainEqual(expect.objectContaining({
+        issueId,
+        stageId: stage1Id,
+        stageType: "review",
+        actorAgentId: reviewerAgentId,
+        outcome: "approved",
+      }));
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
+    it("refuses terminal approval when cancellation does not confirm the run stopped", async () => {
+      const { stage1Id } = mockStageHandoff();
+      const issue = await mockIssueService.getById();
+      mockIssueService.getById.mockResolvedValue({
+        ...issue,
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [{
+            id: stage1Id,
+            type: "approval",
+            participants: [{ type: "agent", agentId: reviewerAgentId }],
+          }],
+        }),
+        executionState: {
+          ...issue.executionState,
+          currentStageType: "approval",
+          returnAssignee: { type: "agent", agentId: nextAgentId },
+        },
+      });
+      mockHeartbeatService.cancelRun.mockResolvedValue(runningRun);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId,
+      }))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "done",
+          assigneeAgentId: nextAgentId,
+          comment: "Final approval passed.",
+          doneTier: {
+            tier: "tier2",
+            probeEvidence: "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records",
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+        runId,
+        "Cancelled before issue reassignment",
+        expect.objectContaining({ errorCode: "issue_reassigned" }),
+      );
+      expect(res.body).toMatchObject({
+        details: { code: "runner_goal_reassignment_stop_unconfirmed", runId },
+      });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("cancels the outgoing run when a workflow hand-off comes from a different run", async () => {
+      mockStageHandoff();
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId: "66666666-6666-4666-8666-666666666666",
+      }))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Hand-off requested by another run." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ assigneeAgentId: nextAgentId }),
+        expect.anything(),
+      );
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+        runId,
+        "Cancelled before issue reassignment",
+        expect.objectContaining({ errorCode: "issue_reassigned" }),
+      );
+      expect(mockIssueService.update.mock.invocationCallOrder[0])
+        .toBeLessThan(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]);
+    });
+
+    it("saves a hand-off without cancelling when the issue lookup finds no run", async () => {
+      mockStageHandoff();
+      const issue = await mockIssueService.getById();
+      mockIssueService.getById.mockResolvedValue({ ...issue, executionRunId: null });
+      const unscopedRunId = "66666666-6666-4666-8666-666666666666";
+      mockHeartbeatService.getRun.mockResolvedValue({
+        ...runningRun,
+        id: unscopedRunId,
+        contextSnapshot: { wakeReason: "timer" },
+      });
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId: unscopedRunId,
+      }))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Hand-off from a run the issue never recorded." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ assigneeAgentId: nextAgentId }),
+        expect.anything(),
+      );
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
+    it("still cancels the outgoing run after a plain reassignment commits", async () => {
+      const issue = {
+        id: issueId,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: reviewerAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-1013",
+        title: "Plain reassignment",
+        executionPolicy: null,
+        executionRunId: runId,
+        executionState: null,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: nextAgentId });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ assigneeAgentId: nextAgentId }),
+      );
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+        runId,
+        "Cancelled before issue reassignment",
+        expect.objectContaining({ errorCode: "issue_reassigned" }),
+      );
+      expect(mockIssueService.update.mock.invocationCallOrder[0])
+        .toBeLessThan(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]);
+    });
+
+    // SUP-24250 (Shape B): a deliberate reassignment must not be treated as a
+    // reviewer failure. The flag below is the whole mechanism: cancelRunInternal
+    // honors suppressImmediateRecovery and skips releaseIssueExecutionAndPromote
+    // recovery, so no recovery run or action is created for the cancelled run.
+    it("suppresses immediate recovery when a deliberate reassignment cancels the pending-stage participant run", async () => {
+      mockStageHandoff();
+      // Not a stage participant: assigning the next-stage participant would
+      // trip the assignee_review_gate self-satisfiability refusal instead.
+      const unrelatedAgentId = "99999999-9999-4999-8999-999999999999";
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: unrelatedAgentId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+        runId,
+        "Cancelled before issue reassignment",
+        expect.objectContaining({
+          errorCode: "issue_reassigned",
+          suppressImmediateRecovery: true,
+        }),
+      );
+    });
+
+    it("suppresses immediate recovery on the pre-commit terminal-approval reassignment cancel", async () => {
+      const { stage1Id } = mockStageHandoff();
+      const issue = await mockIssueService.getById();
+      mockIssueService.getById.mockResolvedValue({
+        ...issue,
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [{
+            id: stage1Id,
+            type: "approval",
+            participants: [{ type: "agent", agentId: reviewerAgentId }],
+          }],
+        }),
+        executionState: {
+          ...issue.executionState,
+          currentStageType: "approval",
+          returnAssignee: { type: "agent", agentId: nextAgentId },
+        },
+      });
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId,
+      }))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "done",
+          assigneeAgentId: nextAgentId,
+          comment: "Final approval passed.",
+          doneTier: {
+            tier: "tier2",
+            probeEvidence: "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records",
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+        runId,
+        "Cancelled before issue reassignment",
+        expect.objectContaining({
+          errorCode: "issue_reassigned",
+          suppressImmediateRecovery: true,
+        }),
+      );
+    });
+
+    // RA NO-GO on PR 1196: the pre-commit cancel is suppressed because the
+    // reassignment is expected to commit. When the update then fails before
+    // commit, the card is unchanged and the participant must be re-woken
+    // through the unsuppressed release, exactly as the base cancel did.
+    it("re-wakes the participant when the update fails after a suppressed pre-commit reassignment cancel", async () => {
+      const { stage1Id } = mockStageHandoff();
+      const issue = await mockIssueService.getById();
+      mockIssueService.getById.mockResolvedValue({
+        ...issue,
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [{
+            id: stage1Id,
+            type: "approval",
+            participants: [{ type: "agent", agentId: reviewerAgentId }],
+          }],
+        }),
+        executionState: {
+          ...issue.executionState,
+          currentStageType: "approval",
+          returnAssignee: { type: "agent", agentId: nextAgentId },
+        },
+      });
+      mockIssueService.update.mockRejectedValue(new Error("simulated update failure"));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId,
+      }))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "done",
+          assigneeAgentId: nextAgentId,
+          comment: "Final approval passed.",
+          doneTier: {
+            tier: "tier2",
+            probeEvidence: "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records",
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(500);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+        runId,
+        "Cancelled before issue reassignment",
+        expect.objectContaining({
+          errorCode: "issue_reassigned",
+          suppressImmediateRecovery: true,
+        }),
+      );
+      expect(mockHeartbeatService.releaseIssueExecutionAndPromote).toHaveBeenCalledTimes(1);
+      expect(mockHeartbeatService.releaseIssueExecutionAndPromote).toHaveBeenCalledWith(
+        expect.objectContaining({ id: runId, status: "cancelled" }),
+      );
+    });
+
+    it("re-wakes the participant when the deferred preflight finds the card changed after the suppressed cancel", async () => {
+      const { stage1Id } = mockStageHandoff();
+      const issue = await mockIssueService.getById();
+      const approvedIssue = {
+        ...issue,
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [{
+            id: stage1Id,
+            type: "approval",
+            participants: [{ type: "agent", agentId: reviewerAgentId }],
+          }],
+        }),
+        executionState: {
+          ...issue.executionState,
+          currentStageType: "approval",
+          returnAssignee: { type: "agent", agentId: nextAgentId },
+        },
+      };
+      // Once the cancel has landed, the post-stop re-read sees a card that
+      // moved during the stop, so the deferred preflight refuses with 409.
+      mockIssueService.getById.mockImplementation(async () =>
+        mockHeartbeatService.cancelRun.mock.calls.length > 0
+          ? { ...approvedIssue, title: "Changed during the stop" }
+          : approvedIssue);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId,
+      }))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "done",
+          assigneeAgentId: nextAgentId,
+          comment: "Final approval passed.",
+          doneTier: {
+            tier: "tier2",
+            probeEvidence: "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records",
+          },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.releaseIssueExecutionAndPromote).toHaveBeenCalledTimes(1);
+      expect(mockHeartbeatService.releaseIssueExecutionAndPromote).toHaveBeenCalledWith(
+        expect.objectContaining({ id: runId, status: "cancelled" }),
+      );
+    });
+
+    it("still recovers after a terminalizing PATCH that changes neither assignee nor stage", async () => {
+      const issue = {
+        id: issueId,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: reviewerAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-1016",
+        title: "Terminalized without reassignment",
+        executionPolicy: null,
+        executionRunId: runId,
+        executionState: null,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "cancelled" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      // The cancelled-status cleanup cancel below carries no options at all:
+      // recovery for a non-reassignment cancel is untouched by this change.
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(runId);
+      const calls = mockHeartbeatService.cancelRun.mock.calls as unknown as Array<
+        [string, string?, { suppressImmediateRecovery?: boolean }?]
+      >;
+      expect(calls.length).toBeGreaterThan(0);
+      for (const call of calls) {
+        expect(call[2]?.suppressImmediateRecovery).not.toBe(true);
+      }
+    });
+
+    it("does not strand the pending stage on the old participant when a reassignment commits", async () => {
+      mockStageHandoff();
+      const unrelatedAgentId = "99999999-9999-4999-8999-999999999999";
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: unrelatedAgentId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const persisted = await mockIssueService.update.mock.results[0]?.value as Record<string, unknown>;
+      // The board-override membership rule still governs: a non-participant
+      // assignee dissolves the review instead of stranding the pending stage
+      // armed on the old participant, so the sweep's armed-stage detectors see
+      // a clean in_progress card rather than a stale wedge. Suppressing
+      // immediate recovery on the cancel therefore cannot hide a stranded
+      // stage from them.
+      expect(persisted.assigneeAgentId).toBe(unrelatedAgentId);
+      expect(persisted.status).toBe("in_progress");
+      expect(persisted.executionState).toBeNull();
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+        runId,
+        "Cancelled before issue reassignment",
+        expect.objectContaining({
+          errorCode: "issue_reassigned",
+          suppressImmediateRecovery: true,
+        }),
+      );
+    });
+
+    it.each(["throws", "returns a running run"] as const)(
+      "reports an unconfirmed post-commit reassignment cancellation when it %s",
+      async (outcome) => {
+        mockStageHandoff();
+        if (outcome === "throws") {
+          mockHeartbeatService.cancelRun.mockRejectedValue(new Error("cancellation ownership is unverified"));
+        } else {
+          mockHeartbeatService.cancelRun.mockResolvedValue(runningRun);
+        }
+        // Import after resetModules so the spy observes the route's fresh logger instance.
+        const { logger } = await import("../middleware/logger.js");
+        const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+        try {
+          const res = await request(await createApp({
+            type: "agent",
+            agentId: reviewerAgentId,
+            companyId: "company-1",
+            runId: "66666666-6666-4666-8666-666666666666",
+          }))
+            .patch(`/api/issues/${issueId}`)
+            .send({ status: "done", comment: "Review passed; hand off before trying to stop the outgoing run." });
+
+          expect(res.status, JSON.stringify(res.body)).toBe(200);
+          expect(res.body).toMatchObject({ status: "in_review", assigneeAgentId: nextAgentId });
+          expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+          expect(mockIssueService.update.mock.invocationCallOrder[0])
+            .toBeLessThan(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]);
+          const warnings = warn.mock.calls.filter(([fields]) =>
+            fields !== null && typeof fields === "object"
+            && "issueId" in fields && fields.issueId === issueId
+            && "runId" in fields && fields.runId === runId);
+          expect(warnings).toHaveLength(1);
+          expect(mockLogActivity).toHaveBeenCalledWith(
+            expect.anything(),
+            expect.objectContaining({
+              action: "heartbeat.cancel_failed",
+              entityType: "heartbeat_run",
+              entityId: runId,
+              issueId,
+              details: { source: "issue_reassigned", issueId },
+            }),
+          );
+          // The activity mock records variadic service calls at runtime.
+          const activityCalls = mockLogActivity.mock.calls as unknown as Array<[unknown, { action: string }]>;
+          expect(activityCalls.filter(([, entry]) => entry.action === "heartbeat.cancel_failed")).toHaveLength(1);
+        } finally {
+          warn.mockRestore();
+        }
+      },
+    );
+
+    it("retries cancelled-status cleanup when deferred reassignment cancellation fails", async () => {
+      const issue = {
+        id: issueId,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: reviewerAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-1015",
+        title: "Cancelled reassignment",
+        executionPolicy: null,
+        executionRunId: runId,
+        executionState: null,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+      mockHeartbeatService.cancelRun
+        .mockRejectedValueOnce(new Error("simulated cancellation failure"))
+        .mockResolvedValue({ ...runningRun, status: "cancelled" });
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: nextAgentId, status: "cancelled" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(2);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenNthCalledWith(2, runId);
+    });
+
+    it("does not cancel the outgoing run when the reassignment update fails", async () => {
+      const issue = {
+        id: issueId,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: reviewerAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-1014",
+        title: "Failed reassignment",
+        executionPolicy: null,
+        executionRunId: runId,
+        executionState: null,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockRejectedValue(new Error("simulated update failure"));
+
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: nextAgentId });
+
+      expect(res.status).toBe(500);
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
     });
   });
 });

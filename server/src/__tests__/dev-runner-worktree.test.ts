@@ -9,13 +9,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
 import {
   bootstrapDevRunnerWorktreeEnv,
   isWorktreeSeedPending,
   isLinkedGitWorktreeCheckout,
   resolveWorktreeEnvFilePath,
+  resolveWorktreeSeedGate,
   resolveWorktreeStateDir,
 } from "../dev-runner-worktree.ts";
+import { writeCheckoutMigrations, writeVerifiedInitialization } from "./helpers/worktree-initialization.ts";
 
 const tempRoots = new Set<string>();
 
@@ -72,6 +75,93 @@ describe("dev-runner worktree env bootstrap", () => {
 
     fs.writeFileSync(manifestPath, "not-json", "utf8");
     expect(isWorktreeSeedPending(root)).toBe(true);
+  });
+
+  it("refuses legacy-unsafe, initialization, and non-regular manifests with an actionable message", () => {
+    const root = createTempRoot("paperclip-dev-runner-seed-gate-");
+    const stateDir = path.join(root, ".paperclip");
+    const manifestPath = path.join(stateDir, "seed-manifest.json");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const complete = (seedMode: string) => JSON.stringify({
+      version: 2,
+      source: { instanceId: "source", configPath: "/source/config.json" },
+      snapshotAt: "2026-08-18T00:00:00.000Z",
+      seedMode,
+      migrationRevision: "0001",
+      targetInstanceId: "target",
+      phase: "complete",
+      state: "verified",
+      attemptId: "attempt",
+      startedAt: "2026-08-18T00:00:00.000Z",
+      finishedAt: "2026-08-18T00:01:00.000Z",
+      diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-08-18T00:01:00.000Z" }],
+    });
+
+    fs.writeFileSync(manifestPath, complete("full"), "utf8");
+    expect(resolveWorktreeSeedGate(root)).toEqual({ kind: "ready" });
+
+    fs.writeFileSync(manifestPath, complete("minimal-no-secrets"), "utf8");
+    const unsafe = resolveWorktreeSeedGate(root);
+    expect(unsafe.kind).toBe("refused");
+    expect(unsafe.kind === "refused" ? unsafe.message : "").toMatch(/minimal-no-secrets.*clean generation/s);
+
+    fs.writeFileSync(manifestPath, JSON.stringify({ version: 3, kind: "worktree-initialization", state: "verified" }), "utf8");
+    expect(resolveWorktreeSeedGate(root).kind).toBe("refused");
+
+    fs.rmSync(manifestPath);
+    const target = path.join(root, "complete.json");
+    fs.writeFileSync(target, complete("full"), "utf8");
+    fs.symlinkSync(target, manifestPath);
+    expect(resolveWorktreeSeedGate(root).kind).toBe("refused");
+
+    fs.rmSync(manifestPath);
+    expect(spawnSync("mkfifo", [manifestPath]).status).toBe(0);
+    const started = performance.now();
+    expect(resolveWorktreeSeedGate(root).kind).toBe("refused");
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(isWorktreeSeedPending(root)).toBe(true);
+  });
+
+  it("opens the gate for a verified fresh initialization of this instance and checkout lineage only", () => {
+    const root = createTempRoot("paperclip-dev-runner-fresh-init-");
+    const stateDir = path.join(root, ".paperclip");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const revision = writeCheckoutMigrations(root);
+    writeVerifiedInitialization(stateDir, { targetInstanceId: "wt-fresh", revision });
+
+    expect(resolveWorktreeSeedGate(root, { PAPERCLIP_INSTANCE_ID: "wt-fresh" })).toEqual({ kind: "ready" });
+    for (const env of [{ PAPERCLIP_INSTANCE_ID: "wt-other" }, {}]) {
+      const gate = resolveWorktreeSeedGate(root, env);
+      expect(gate.kind).toBe("refused");
+    }
+
+    // Without its initialization key the manifest cannot be verified.
+    fs.rmSync(path.join(stateDir, "initialization.key"));
+    expect(resolveWorktreeSeedGate(root, { PAPERCLIP_INSTANCE_ID: "wt-fresh" }).kind).toBe("refused");
+
+    // A manifest from a diverged migration chain is refused even for this instance.
+    writeVerifiedInitialization(stateDir, {
+      targetInstanceId: "wt-fresh",
+      revision: { ...revision, schemaFingerprint: `sha256:${"0".repeat(64)}` },
+    });
+    const diverged = resolveWorktreeSeedGate(root, { PAPERCLIP_INSTANCE_ID: "wt-fresh" });
+    expect(diverged.kind === "refused" ? diverged.message : "").toMatch(/different destination schema/);
+
+    // Without a readable migration journal the checkout cannot confirm any schema.
+    const noLineage = createTempRoot("paperclip-dev-runner-fresh-no-lineage-");
+    fs.mkdirSync(path.join(noLineage, ".paperclip"), { recursive: true });
+    writeVerifiedInitialization(path.join(noLineage, ".paperclip"), { targetInstanceId: "wt-fresh", revision });
+    expect(resolveWorktreeSeedGate(noLineage, { PAPERCLIP_INSTANCE_ID: "wt-fresh" }).kind).toBe("refused");
+  });
+
+  it("refuses a forged fresh initialization manifest at the boot gate", () => {
+    const root = createTempRoot("paperclip-dev-runner-forged-init-");
+    const stateDir = path.join(root, ".paperclip");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const revision = writeCheckoutMigrations(root);
+    writeVerifiedInitialization(stateDir, { targetInstanceId: "wt-fresh", revision, forge: true });
+    const gate = resolveWorktreeSeedGate(root, { PAPERCLIP_INSTANCE_ID: "wt-fresh" });
+    expect(gate.kind === "refused" ? gate.message : "").toMatch(/not bound to this worktree's initialization key/);
   });
 
   it("resolves the uid-scoped state dir when it exists for the running uid, else the canonical dir", () => {
