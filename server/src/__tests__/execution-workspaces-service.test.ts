@@ -1725,10 +1725,12 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   }, 20_000);
 
   it.each([
-    { name: "no recorded branch", mergedAt: "2026-01-01T00:00:00Z" as string | null, recordedBranch: null as string | null, inSqlClass: false },
-    { name: "no merged PR", mergedAt: null, recordedBranch: "fm/recorded-delivery-branch", inSqlClass: false },
-    { name: "a merged PR with a blank mergedAt", mergedAt: "   ", recordedBranch: "fm/recorded-delivery-branch", inSqlClass: false },
-    { name: "the recorded branch checked out", mergedAt: "2026-01-01T00:00:00Z", recordedBranch: "PAP-16015-delivery", inSqlClass: true },
+    { name: "no recorded branch", mergedAt: "2026-01-01T00:00:00Z" as string | number | null, prStatus: "merged", recordedBranch: null as string | null, inSqlClass: false },
+    { name: "no merged PR", mergedAt: null, prStatus: "merged", recordedBranch: "fm/recorded-delivery-branch", inSqlClass: false },
+    { name: "an unmerged PR that carries a mergedAt", mergedAt: "2026-01-01T00:00:00Z", prStatus: "ready_for_review", recordedBranch: "fm/recorded-delivery-branch", inSqlClass: false },
+    { name: "a merged PR with a blank mergedAt", mergedAt: "   ", prStatus: "merged", recordedBranch: "fm/recorded-delivery-branch", inSqlClass: false },
+    { name: "a merged PR with a non-string mergedAt", mergedAt: 1767225600, prStatus: "merged", recordedBranch: "fm/recorded-delivery-branch", inSqlClass: false },
+    { name: "the recorded branch checked out", mergedAt: "2026-01-01T00:00:00Z", prStatus: "merged", recordedBranch: "PAP-16015-delivery", inSqlClass: true },
   ])("keeps a determinate refusal with $name out of the cleanup path and escalates it once", async (row) => {
     const seeded = await seedTerminalWorkspace({ publish: true });
     if (row.mergedAt !== null) {
@@ -1740,7 +1742,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         provider: "github",
         title: "Delivered PR",
         url: "https://github.com/paperclipai/paperclip/pull/10623",
-        status: "merged",
+        status: row.prStatus,
         metadata: { mergedAt: row.mergedAt },
       });
     }
