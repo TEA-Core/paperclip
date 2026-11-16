@@ -250,6 +250,9 @@ describe("applyWorktreeEnvPrecedence", () => {
 
     expect(result.overridden).toContain("PAPERCLIP_INSTANCE_ID");
     expect(process.env.PAPERCLIP_INSTANCE_ID).toBe("CANARY_WORKTREE_INSTANCE");
+    expect(process.env.PAPERCLIP_CONFIG).toBe(configPath);
+    expect(maybeRepairLegacyWorktreeConfigAndEnvFiles().repairedEnv).toBe(true);
+    expect(process.env.PAPERCLIP_CONFIG).toBe(configPath);
   });
 
   it("leaves a moved worktree to the repair path, which adopts the moved config and derived instance id", async () => {

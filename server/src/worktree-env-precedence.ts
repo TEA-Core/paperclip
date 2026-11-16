@@ -78,8 +78,9 @@ export function applyWorktreeEnvPrecedence(): WorktreeEnvPrecedenceResult {
       keptInherited.push(key);
       continue;
     }
-    if (current === fileValue) continue;
-    process.env[key] = fileValue;
+    const nextValue = key === "PAPERCLIP_CONFIG" ? path.resolve(expandHomePrefix(fileValue.trim())) : fileValue;
+    if (current === nextValue) continue;
+    process.env[key] = nextValue;
     overridden.push(key);
   }
 
