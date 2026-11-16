@@ -154,6 +154,7 @@ import {
   type IssueWakeDiagnosticWakeRequest,
   type IssueWakeDiagnosticsResponse,
   type IssueRelationIssueSummary,
+  type IssueDeliveryRequirement,
   type IssueReviewPolicy,
   type IssueUnblockDescriptor,
   type IssueThreadInteractionCanonicalResolverPolicy,
@@ -5505,6 +5506,10 @@ export function issueRoutes(
     // record-only Tier 2 close whose closing run cannot be resolved, so an
     // agent cannot skip the lifetime gate by dropping the run id header.
     closingAgentId?: string | null;
+    // SUP-24429: the requirement stored before the request, passed by a door
+    // whose request can change it. The guard's record-only skip then applies
+    // only when this is record_only too.
+    storedDeliveryRequirement?: IssueDeliveryRequirement | null;
   }): Promise<DoneTransitionGuardOutcome> {
     const {
       issue,
@@ -5515,9 +5520,16 @@ export function issueRoutes(
       boardActor,
       caller,
       persistRefusalComment = true,
+      storedDeliveryRequirement,
     } = input;
 
-    const guardResult = await evaluateDoneTransitionGuard(db, issue, override, decisionCarried);
+    const guardResult = await evaluateDoneTransitionGuard(
+      db,
+      issue,
+      override,
+      decisionCarried,
+      storedDeliveryRequirement,
+    );
     const overrideAccepted =
       !!override && guardResult.allowed && guardResult.reason === `Override accepted: ${override.disposition}`;
     // SUP-24298: `issue.done_transition_guard_skipped` is the guard's "transition
@@ -5536,6 +5548,12 @@ export function issueRoutes(
         owner: guardResult.owner,
         repo: guardResult.repo,
         decisionCarried,
+        // SUP-24429: a close request that changed the requirement names both
+        // sides, so the landing backstop keeps a card whose stored requirement
+        // was repository_delivery whatever its live label says.
+        ...(storedDeliveryRequirement !== undefined && storedDeliveryRequirement !== issue.deliveryRequirement
+          ? { storedDeliveryRequirement, requestedDeliveryRequirement: issue.deliveryRequirement }
+          : {}),
         source: "done_transition_guard",
       });
     };
@@ -20563,6 +20581,47 @@ export function issueRoutes(
     ) {
       throw expectedUpdatedAtUnsupportedWithSideEffects();
     }
+    // SUP-24429: a card's landing obligation follows the deliveryRequirement it
+    // carried while the work was done, not the label on the close request. The
+    // guard below reads effectiveDeliveryRequirement, so a close that also
+    // relabels a stored repository_delivery card record_only would skip its own
+    // landing check. Refuse that shape before the guard runs, for every actor:
+    // board_actor_bypass skips only the tier form. A record_only
+    // reclassification without a close stays lawful.
+    if (
+      isDoneRequest &&
+      req.body.deliveryRequirement === "record_only" &&
+      existing.deliveryRequirement !== "record_only"
+    ) {
+      const reason =
+        `Cannot mark this issue done in the same request that changes deliveryRequirement from ` +
+        `${existing.deliveryRequirement} to record_only: the landing check for the stored requirement still applies.`;
+      await writeDoneTransitionRefusedAuditLog(db, existing, {
+        code: "done_transition_record_only_flip_refused",
+        httpStatus: 409,
+        reason,
+        decisionCarried: !!transition.decision,
+        runId: actor.runId ?? null,
+        storedDeliveryRequirement: existing.deliveryRequirement,
+        requestedDeliveryRequirement: "record_only",
+        landingCheckSkipped: false,
+      });
+      res.status(409).json({
+        error: reason,
+        code: "done_transition_record_only_flip_refused",
+        details: {
+          issueId: existing.id,
+          identifier: existing.identifier ?? null,
+          storedDeliveryRequirement: existing.deliveryRequirement,
+          requestedDeliveryRequirement: "record_only",
+          landingCheckSkipped: false,
+          remedy:
+            "Close without changing deliveryRequirement in this request; the repository landing check applies " +
+            "to the stored requirement. A record_only reclassification is not part of a close.",
+        },
+      });
+      return;
+    }
     if (isDoneRequest && !missingApprovalStageGap) {
       const override: DoneTransitionOverride | null =
         req.body.doneTransitionOverride && typeof req.body.doneTransitionOverride === "object"
@@ -20590,6 +20649,7 @@ export function issueRoutes(
         caller: refusalCaller,
         closingAgentId: actor.agentId ?? null,
         noRepositoryLandingCloser: closingActor,
+        storedDeliveryRequirement: existing.deliveryRequirement,
       });
       if (!outcome.ok) {
         res.status(outcome.status).json(outcome.body);

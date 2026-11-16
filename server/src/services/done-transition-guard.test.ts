@@ -1,7 +1,16 @@
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import express from "express";
+import request from "supertest";
+import { eq } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it, vi, beforeEach } from "vitest";
 import {
+  activityLog as activityLogTable,
   agents as agentsTable,
+  companies as companiesTable,
+  companyMemberships as companyMembershipsTable,
+  createDb,
+  getEmbeddedPostgresTestSupport,
   heartbeatRuns as heartbeatRunsTable,
   issueExecutionDecisions as issueExecutionDecisionsTable,
   issueLabels as issueLabelsTable,
@@ -9,6 +18,9 @@ import {
   issues as issuesTable,
   issueWorkProducts as issueWorkProductsTable,
   labels as labelsTable,
+  startEmbeddedPostgresTestDatabase,
+  type Db,
+  type EmbeddedPostgresTestDatabase,
 } from "@paperclipai/db";
 import {
   countLadderedChildren,
@@ -32,6 +44,10 @@ import {
 } from "./done-transition-guard.js";
 import { logActivity } from "./activity-log.js";
 import { mechanismACorpus } from "./done-transition-guard-mechanism-a-fixtures.js";
+import { createDoneCloseLandingBackstopService } from "./done-close-landing-backstop.js";
+import type { StorageService } from "../storage/types.js";
+import { issueRoutes } from "../routes/issues.js";
+import { errorHandler } from "../middleware/index.js";
 
 const mockDb = {
   select: vi.fn(),
@@ -310,7 +326,10 @@ vi.mock("../build-commit.js", async (importOriginal) => {
   return { ...actual, readBuildCommit: mockReadBuildCommit };
 });
 
-vi.mock("./activity-log.js", () => ({
+vi.mock("./activity-log.js", async (importOriginal) => ({
+  // The SUP-24429 route tests reach other activity-log exports through the
+  // issue service; only logActivity is captured.
+  ...(await importOriginal<typeof import("./activity-log.js")>()),
   logActivity: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -336,9 +355,12 @@ vi.mock("./merge-arming.js", async (importOriginal) => {
 });
 
 const mockExecFile = vi.hoisted(() => vi.fn());
-vi.mock("node:child_process", async () => {
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
   const { spawnFromExecFile } = await import("../__tests__/helpers/spawn-from-exec-file.js");
-  return { execFile: mockExecFile, spawn: spawnFromExecFile(mockExecFile) };
+  // The SUP-24429 route tests load modules that read other child_process
+  // exports (ChildProcess); only execFile and spawn are stubbed.
+  return { ...actual, execFile: mockExecFile, spawn: spawnFromExecFile(mockExecFile) };
 });
 
 import { ghFetch } from "./github-fetch.js";
@@ -3340,6 +3362,40 @@ describe("evaluateDoneTransitionGuard", () => {
       );
       expect(result.allowed).toBe(false);
       expect(result.skipReason).not.toBe("record_only_delivery_skipped");
+    });
+
+    // SUP-24429: the skip follows the requirement the card carried while the
+    // work was done. A close request that relabels a stored repository_delivery
+    // card record_only still runs the repository landing check.
+    it("runs the landing check when the close request just relabelled a stored repository_delivery card record_only (SUP-24429)", async () => {
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+        { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 1, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#1", cachedState: "open", lastErrorCode: null },
+      ]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, deliveryRequirement: "record_only" },
+        null,
+        false,
+        "repository_delivery",
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.skipped).toBe(false);
+      expect(result.skipReason).not.toBe("record_only_delivery_skipped");
+      expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalled();
+    });
+
+    it("keeps the record-only skip when the stored requirement is already record_only (SUP-24429)", async () => {
+      const result = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, deliveryRequirement: "record_only" },
+        null,
+        false,
+        "record_only",
+      );
+      expect(result.allowed).toBe(true);
+      expect(result.skipReason).toBe("record_only_delivery_skipped");
+      expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
     });
 
     it("still refuses a record_only close whose review ladder is unsatisfied", async () => {
@@ -9056,5 +9112,236 @@ describe("resolveCitedCommits (SUP-20525)", () => {
     );
     expect(resolution).toEqual({ results: [] });
     expect(ghFetchMock).not.toHaveBeenCalled();
+  });
+});
+
+// SUP-24429: a card's landing obligation follows the deliveryRequirement it
+// carried while the work was done, not the label on the close request. These
+// tests drive PATCH /api/issues/{id} and the landing backstop against a real
+// Postgres; activity rows are read from the mocked logActivity above.
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping SUP-24429 record_only close-flip route tests on this host: ${
+      embeddedPostgresSupport.reason ?? "unsupported environment"
+    }`,
+  );
+}
+
+describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", () => {
+  let db!: Db;
+  let tempDb: EmbeddedPostgresTestDatabase | null = null;
+  let app!: express.Express;
+  let currentActor!: Express.Request["actor"];
+  let seedSequence = 0;
+  let previousSchedulingSuppression: string | undefined;
+
+  beforeAll(async () => {
+    previousSchedulingSuppression = process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+    process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = "true";
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-sup-24429-");
+    db = createDb(tempDb.connectionString);
+    app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = currentActor;
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as unknown as StorageService));
+    app.use(errorHandler);
+  }, 60_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+    if (previousSchedulingSuppression === undefined) {
+      delete process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+    } else {
+      process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = previousSchedulingSuppression;
+    }
+  });
+
+  beforeEach(() => {
+    vi.mocked(logActivity).mockClear();
+    ghFetchMock.mockReset();
+    mockResolveLinkedPullRequestsWithState.mockReset();
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
+  });
+
+  function boardActor(companyId: string): Express.Request["actor"] {
+    return {
+      type: "board",
+      userId: "cloud-user-1",
+      companyIds: [companyId],
+      memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+      source: "cloud_tenant",
+      isInstanceAdmin: false,
+      runId: randomUUID(),
+    } as Express.Request["actor"];
+  }
+
+  async function seedCard(deliveryRequirement: "repository_delivery" | "record_only", status = "in_progress") {
+    seedSequence += 1;
+    const issuePrefix = `FLIP${seedSequence}`;
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    const identifier = `${issuePrefix}-1`;
+    await db.insert(companiesTable).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      issueCounter: 1,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companyMembershipsTable).values({
+      companyId,
+      principalType: "user",
+      principalId: "cloud-user-1",
+      status: "active",
+      membershipRole: "owner",
+      updatedAt: new Date(),
+    });
+    await db.insert(issuesTable).values({
+      id: issueId,
+      companyId,
+      identifier,
+      title: "Delivered card",
+      status,
+      priority: "medium",
+      deliveryRequirement,
+      createdByUserId: "cloud-user-1",
+    });
+    // The work was delivered: a merged pull request is recorded on the card.
+    await db.insert(issueWorkProductsTable).values({
+      companyId, issueId, type: "pull_request", provider: "github",
+      externalId: "TEA-Core/paperclip#404", title: "PR #404 TEA-Core/paperclip",
+      url: "https://github.com/TEA-Core/paperclip/pull/404", status: "merged",
+      reviewState: "none", isPrimary: true, healthStatus: "unknown",
+      metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    });
+    currentActor = boardActor(companyId);
+    return { companyId, issueId, identifier };
+  }
+
+  function activityFor(issueId: string) {
+    return vi.mocked(logActivity).mock.calls
+      .map(([, entry]) => entry as { action: string; entityId: string; details?: Record<string, unknown> | null })
+      .filter((entry) => entry.entityId === issueId);
+  }
+
+  async function storedCard(issueId: string) {
+    const [row] = await db
+      .select({ status: issuesTable.status, deliveryRequirement: issuesTable.deliveryRequirement })
+      .from(issuesTable)
+      .where(eq(issuesTable.id, issueId));
+    return row;
+  }
+
+  it("refuses a board PATCH that sets record_only and done together on a stored repository_delivery card", async () => {
+    const { issueId, identifier } = await seedCard("repository_delivery");
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ deliveryRequirement: "record_only", status: "done", comment: "Reclassify and close." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.code).toBe("done_transition_record_only_flip_refused");
+    expect(res.body.details).toMatchObject({
+      storedDeliveryRequirement: "repository_delivery",
+      requestedDeliveryRequirement: "record_only",
+      landingCheckSkipped: false,
+    });
+    expect(await storedCard(issueId)).toEqual({ status: "in_progress", deliveryRequirement: "repository_delivery" });
+
+    const rows = activityFor(issueId);
+    // The erase is its own event: exactly one refusal row naming both requirements.
+    const refusals = rows.filter((row) => row.action === "issue.done_transition_refused");
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]!.details).toMatchObject({
+      code: "done_transition_record_only_flip_refused",
+      httpStatus: 409,
+      storedDeliveryRequirement: "repository_delivery",
+      requestedDeliveryRequirement: "record_only",
+      landingCheckSkipped: false,
+    });
+    expect(rows.some((row) => row.details?.skipReason === "record_only_delivery_skipped")).toBe(false);
+    // board_actor_bypass did not clear the landing check on this request: no
+    // bypass row carrying decisionCarried, no guard-skip disposition, no update.
+    expect(rows.some((row) => row.details?.skipReason === "board_actor_bypass")).toBe(false);
+    expect(rows.some((row) => row.action === "issue.done_tier_declaration_skipped")).toBe(false);
+    expect(rows.some((row) => row.action === "issue.done_transition_guard_skipped")).toBe(false);
+    expect(rows.some((row) => row.action === "issue.updated")).toBe(false);
+  });
+
+  it("keeps the record-only skip for a board close of a card already stored record_only", async () => {
+    const { issueId, identifier } = await seedCard("record_only");
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "Close the record-only card." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await storedCard(issueId)).toEqual({ status: "done", deliveryRequirement: "record_only" });
+    const rows = activityFor(issueId);
+    expect(rows.some((row) => row.details?.skipReason === "record_only_delivery_skipped")).toBe(true);
+    expect(rows.some((row) => row.details?.skipReason === "board_actor_bypass")).toBe(true);
+    expect(rows.some((row) => row.action === "issue.done_transition_refused")).toBe(false);
+  });
+
+  it("leaves a record_only flip in an earlier request followed by a plain close unchanged", async () => {
+    const { issueId, identifier } = await seedCard("repository_delivery");
+
+    const flip = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ deliveryRequirement: "record_only" });
+    expect(flip.status, JSON.stringify(flip.body)).toBe(200);
+
+    const close = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "Close after the earlier reclassification." });
+    expect(close.status, JSON.stringify(close.body)).toBe(200);
+    expect(await storedCard(issueId)).toEqual({ status: "done", deliveryRequirement: "record_only" });
+    const rows = activityFor(issueId);
+    expect(rows.some((row) => row.details?.skipReason === "record_only_delivery_skipped")).toBe(true);
+    expect(rows.some((row) => row.action === "issue.done_transition_refused")).toBe(false);
+  });
+
+  it("keeps a card closed under the refused shape in the landing sweep despite its live record_only label", async () => {
+    const flipped = await seedCard("record_only", "done");
+    const reclassifiedAfterClose = await seedCard("record_only", "done");
+    const closeAt = new Date("2026-08-26T00:00:00Z");
+    await db.insert(activityLogTable).values([
+      {
+        // The guard-skip row the close route writes when the close request
+        // itself changed the requirement from a stored repository_delivery.
+        companyId: flipped.companyId, actorId: "done-transition-guard", action: "issue.done_transition_guard_skipped",
+        entityType: "issue", entityId: flipped.issueId, createdAt: closeAt,
+        details: {
+          reason: "open_linked_prs_decision_carried:1",
+          storedDeliveryRequirement: "repository_delivery",
+          requestedDeliveryRequirement: "record_only",
+        },
+      },
+      {
+        // A lawful reclassification after the close carries no marker and stays excluded.
+        companyId: reclassifiedAfterClose.companyId, actorId: "done-transition-guard",
+        action: "issue.done_transition_guard_skipped",
+        entityType: "issue", entityId: reclassifiedAfterClose.issueId, createdAt: closeAt,
+        details: { reason: "open_linked_prs_decision_carried:1" },
+      },
+    ]);
+
+    const service = createDoneCloseLandingBackstopService(db, {
+      now: () => new Date("2026-08-28T00:00:00Z"),
+      graceMs: 60_000,
+      reenqueueGraceMs: 60_000,
+      lookbackMs: 7 * 24 * 60 * 60 * 1000,
+    });
+    const result = await service.sweep();
+
+    expect(result.candidates).toBe(1);
+    const measuredIssueIds = mockResolveLinkedPullRequestsWithState.mock.calls.map((call) => call[2]);
+    expect(measuredIssueIds).toContain(flipped.issueId);
+    expect(measuredIssueIds).not.toContain(reclassifiedAfterClose.issueId);
   });
 });
