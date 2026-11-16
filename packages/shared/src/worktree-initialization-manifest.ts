@@ -23,7 +23,16 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 export const WORKTREE_INITIALIZATION_MANIFEST_VERSION = 3;
-/** Name of the 0600 binding key file next to the manifest in the state directory. */
+/**
+ * Name of the 0600 binding key file next to the manifest in the state directory.
+ * Threat model: the binding stops planted, copied-from-another-instance,
+ * hand-written and single-field-tampered manifests by anything that cannot read
+ * this file. It does NOT stop a process running as the same uid as the
+ * initializer, which could equally rewrite the .env and the whole state
+ * directory. On this fleet the server (uid 1000) and agents (uid 1001) differ,
+ * and the bounded reader refuses files owned by neither the reader nor the
+ * directory owner, so an agent-planted key or manifest is refused.
+ */
 export const WORKTREE_INITIALIZATION_KEY_FILE = "initialization.key";
 export const WORKTREE_INITIALIZATION_KEY_BYTES = 32;
 export const WORKTREE_INITIALIZATION_MANIFEST_KIND = "worktree-initialization";
