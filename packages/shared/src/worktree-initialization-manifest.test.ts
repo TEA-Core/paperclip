@@ -30,18 +30,19 @@ const fingerprint = () => `sha256:${randomBytes(32).toString("hex")}`;
 function buildFixture() {
   const generationId = randomUUID();
   const attemptId = randomUUID();
+  const revision = { schemaFingerprint: fingerprint(), migrationRevision: "0142_fixture.sql" };
   const expected = {
     targetInstanceId: `wt-${randomBytes(4).toString("hex")}`,
     generationId,
-    schema: { schemaFingerprint: fingerprint(), migrationRevision: "0142_fixture.sql" },
+    schema: [{ schemaFingerprint: fingerprint(), migrationRevision: "0141_fixture.sql" }, revision],
   } satisfies WorktreeInitializationExpectation;
   const manifest: Record<string, unknown> = {
     version: 3,
     kind: "worktree-initialization",
     profile: "fresh",
     policyVersion: 1,
-    schemaFingerprint: expected.schema.schemaFingerprint,
-    migrationRevision: expected.schema.migrationRevision,
+    schemaFingerprint: revision.schemaFingerprint,
+    migrationRevision: revision.migrationRevision,
     targetInstanceId: expected.targetInstanceId,
     generationId,
     attemptId,
@@ -61,7 +62,7 @@ function buildFixture() {
       completedAt: "2026-11-11T10:00:05.000Z",
     },
   };
-  return { manifest, expected };
+  return { manifest, expected, revision };
 }
 
 /** Write real bytes to a real file, then read them back through the bounded reader. */
@@ -112,8 +113,24 @@ describe("classifyWorktreeStateManifest", () => {
     expect(classifyFile(JSON.stringify(synthetic), expected).kind).toBe("initialization");
   });
 
-  it("refuses policy, profile, target, generation and schema mismatches", () => {
+  it("accepts any exact revision of the reader's lineage and refuses one outside it", () => {
     const { manifest, expected } = buildFixture();
+    const [older] = expected.schema;
+    const atOlderRevision = {
+      ...manifest,
+      migrationRevision: older.migrationRevision,
+      schemaFingerprint: older.schemaFingerprint,
+    };
+    expect(classifyFile(JSON.stringify(atOlderRevision), expected).kind).toBe("initialization");
+    // The older revision's name with the newer fingerprint is a diverged chain.
+    const crossed = { ...atOlderRevision, schemaFingerprint: manifest.schemaFingerprint };
+    expect(refusalReason(classifyFile(JSON.stringify(crossed), expected))).toBe("initialization_mismatch");
+    expect(refusalReason(classifyFile(JSON.stringify(manifest), { ...expected, schema: [] })))
+      .toBe("initialization_mismatch");
+  });
+
+  it("refuses policy, profile, target, generation and schema mismatches", () => {
+    const { manifest, expected, revision } = buildFixture();
     const cases: Array<[Record<string, unknown>, WorktreeInitializationExpectation, string]> = [
       [{ ...manifest, policyVersion: 2 }, expected, "initialization_policy"],
       [{
@@ -129,8 +146,8 @@ describe("classifyWorktreeStateManifest", () => {
       }, expected, "initialization_policy"],
       [manifest, { ...expected, targetInstanceId: "wt-other" }, "initialization_mismatch"],
       [manifest, { ...expected, generationId: randomUUID() }, "initialization_mismatch"],
-      [manifest, { ...expected, schema: { ...expected.schema, schemaFingerprint: fingerprint() } }, "initialization_mismatch"],
-      [manifest, { ...expected, schema: { ...expected.schema, migrationRevision: "0143_other.sql" } }, "initialization_mismatch"],
+      [manifest, { ...expected, schema: [{ ...revision, schemaFingerprint: fingerprint() }] }, "initialization_mismatch"],
+      [manifest, { ...expected, schema: [{ ...revision, migrationRevision: "0143_other.sql" }] }, "initialization_mismatch"],
     ];
     for (const [candidate, expectation, reason] of cases) {
       expect(refusalReason(classifyFile(JSON.stringify(candidate), expectation))).toBe(reason);

@@ -18,6 +18,7 @@ import {
   resolveWorktreeSeedGate,
   resolveWorktreeStateDir,
 } from "../dev-runner-worktree.ts";
+import { verifiedInitializationManifest, writeCheckoutMigrations } from "./helpers/worktree-initialization.ts";
 
 const tempRoots = new Set<string>();
 
@@ -119,6 +120,39 @@ describe("dev-runner worktree env bootstrap", () => {
     expect(resolveWorktreeSeedGate(root).kind).toBe("refused");
     expect(performance.now() - started).toBeLessThan(2_000);
     expect(isWorktreeSeedPending(root)).toBe(true);
+  });
+
+  it("opens the gate for a verified fresh initialization of this instance and checkout lineage only", () => {
+    const root = createTempRoot("paperclip-dev-runner-fresh-init-");
+    const stateDir = path.join(root, ".paperclip");
+    const manifestPath = path.join(stateDir, "seed-manifest.json");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const revision = writeCheckoutMigrations(root);
+    fs.writeFileSync(manifestPath, verifiedInitializationManifest({ targetInstanceId: "wt-fresh", revision }), "utf8");
+
+    expect(resolveWorktreeSeedGate(root, { PAPERCLIP_INSTANCE_ID: "wt-fresh" })).toEqual({ kind: "ready" });
+    for (const env of [{ PAPERCLIP_INSTANCE_ID: "wt-other" }, {}]) {
+      const gate = resolveWorktreeSeedGate(root, env);
+      expect(gate.kind).toBe("refused");
+    }
+
+    // A manifest from a diverged migration chain is refused even for this instance.
+    fs.writeFileSync(manifestPath, verifiedInitializationManifest({
+      targetInstanceId: "wt-fresh",
+      revision: { ...revision, schemaFingerprint: `sha256:${"0".repeat(64)}` },
+    }), "utf8");
+    const diverged = resolveWorktreeSeedGate(root, { PAPERCLIP_INSTANCE_ID: "wt-fresh" });
+    expect(diverged.kind === "refused" ? diverged.message : "").toMatch(/different destination schema/);
+
+    // Without a readable migration journal the checkout cannot confirm any schema.
+    const noLineage = createTempRoot("paperclip-dev-runner-fresh-no-lineage-");
+    fs.mkdirSync(path.join(noLineage, ".paperclip"), { recursive: true });
+    fs.writeFileSync(
+      path.join(noLineage, ".paperclip", "seed-manifest.json"),
+      verifiedInitializationManifest({ targetInstanceId: "wt-fresh", revision }),
+      "utf8",
+    );
+    expect(resolveWorktreeSeedGate(noLineage, { PAPERCLIP_INSTANCE_ID: "wt-fresh" }).kind).toBe("refused");
   });
 
   it("resolves the uid-scoped state dir when it exists for the running uid, else the canonical dir", () => {

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import test from "node:test";
 import fs from "node:fs";
 import os from "node:os";
@@ -981,6 +982,72 @@ test("runtime provisioning skips complete minimal and full seed manifests", () =
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stderr, /verified seed manifest; skipping runtime provisioning/);
     assert.deepEqual(readCliInvocations(baseCwd), []);
+  }
+});
+
+/** A verified v3 fresh manifest for this checkout's migration lineage head. */
+async function verifiedFreshManifest(targetInstanceId, schemaOverride = {}) {
+  const { computeWorktreeSchemaLineage } = await import(
+    new URL("../../packages/shared/src/worktree-initialization-identity.ts", import.meta.url).href
+  );
+  const head = computeWorktreeSchemaLineage(new URL("../../packages/db/src/migrations/", import.meta.url).pathname).at(-1);
+  const generationId = randomUUID();
+  const attemptId = randomUUID();
+  return JSON.stringify({
+    version: 3,
+    kind: "worktree-initialization",
+    profile: "fresh",
+    policyVersion: 1,
+    schemaFingerprint: head.schemaFingerprint,
+    migrationRevision: head.migrationRevision,
+    ...schemaOverride,
+    targetInstanceId,
+    generationId,
+    attemptId,
+    state: "verified",
+    phase: "complete",
+    startedAt: "2026-11-16T10:00:00.000Z",
+    finishedAt: "2026-11-16T10:00:05.000Z",
+    source: null,
+    diagnostics: [{ phase: "complete", code: "fresh_ready", status: "succeeded", at: "2026-11-16T10:00:05.000Z" }],
+    validation: { kind: "fresh-ready", attemptId, generationId, completedAt: "2026-11-16T10:00:05.000Z" },
+  });
+}
+
+test("runtime provisioning skips a verified fresh initialization for this worktree instance and schema", async () => {
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const manifest = await verifiedFreshManifest("wt-fresh");
+  const worktreeCwd = makeManifestWorktree("paperclip-provision-runtime-fresh-", (manifestPath) => {
+    fs.writeFileSync(manifestPath, manifest);
+    fs.writeFileSync(path.join(path.dirname(manifestPath), ".env"), "PAPERCLIP_INSTANCE_ID=wt-fresh\n");
+  });
+  const result = runRuntimeProvision(baseCwd, worktreeCwd);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /verified seed manifest; skipping runtime provisioning/);
+  assert.deepEqual(readCliInvocations(baseCwd), [], "a fresh worktree is never seeded from a parent");
+});
+
+test("runtime provisioning refuses a fresh initialization for another instance or schema without reseeding", async () => {
+  const cases = [
+    ["other-instance", await verifiedFreshManifest("wt-fresh"), "PAPERCLIP_INSTANCE_ID=wt-other\n", /different target instance/],
+    ["no-env", await verifiedFreshManifest("wt-fresh"), null, /cannot confirm the target identity/],
+    [
+      "diverged-schema",
+      await verifiedFreshManifest("wt-fresh", { schemaFingerprint: `sha256:${"0".repeat(64)}` }),
+      "PAPERCLIP_INSTANCE_ID=wt-fresh\n",
+      /different destination schema/,
+    ],
+  ];
+  for (const [label, contents, env, reason] of cases) {
+    const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+    const worktreeCwd = makeManifestWorktree(`paperclip-provision-runtime-fresh-refuse-${label}-`, (manifestPath) => {
+      fs.writeFileSync(manifestPath, contents);
+      if (env !== null) fs.writeFileSync(path.join(path.dirname(manifestPath), ".env"), env);
+    });
+    const result = runRuntimeProvision(baseCwd, worktreeCwd);
+    assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+    assert.match(result.stderr, reason, label);
+    assert.deepEqual(readCliInvocations(baseCwd), [], `${label}: the seed CLI must not run`);
   }
 });
 

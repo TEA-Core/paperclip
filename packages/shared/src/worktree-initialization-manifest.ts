@@ -103,13 +103,29 @@ export type WorktreeInitializationManifest = {
 };
 
 /**
+ * One revision of the destination schema lineage this reader's build knows:
+ * the migration file name and the fingerprint of the migration chain up to and
+ * including it.
+ */
+export type WorktreeSchemaRevisionExpectation = {
+  migrationRevision: string;
+  schemaFingerprint: string;
+};
+
+/**
  * What the reader knows about the destination it is guarding. `null` means the
  * reader cannot confirm that property, so no v3 manifest can be accepted.
+ *
+ * `schema` is the ordered migration lineage of the reader's build. A manifest is
+ * accepted only when its `migrationRevision` and `schemaFingerprint` name one
+ * revision of that lineage exactly, so a destination created by this build, or
+ * by an older build on the same migration chain, is accepted and a destination
+ * from an unknown or diverged chain is refused.
  */
 export type WorktreeInitializationExpectation = {
   targetInstanceId: string | null;
   generationId?: string | null;
-  schema: { schemaFingerprint: string; migrationRevision: string } | null;
+  schema: readonly WorktreeSchemaRevisionExpectation[] | null;
 };
 
 export type WorktreeStateManifestRefusalReason =
@@ -502,8 +518,10 @@ function classifyInitializationManifest(
   }
   if (
     expected.schema !== null
-    && (manifest.schemaFingerprint !== expected.schema.schemaFingerprint
-      || manifest.migrationRevision !== expected.schema.migrationRevision)
+    && !expected.schema.some((revision) => (
+      revision.migrationRevision === manifest.migrationRevision
+      && revision.schemaFingerprint === manifest.schemaFingerprint
+    ))
   ) {
     return refuse(
       "initialization_mismatch",
