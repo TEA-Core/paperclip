@@ -436,7 +436,6 @@ describeEmbeddedPostgres("startup recovery wiki handoff isolation", () => {
     return blockerId;
   }
 
-<<<<<<< HEAD
   it("routes repository-delivery orphan blockers to execution-capable recovery owners", async () => {
     const seeded = await seedCompany();
     const leadId = randomUUID();
