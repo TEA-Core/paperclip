@@ -4313,12 +4313,10 @@ describe("issue execution policy routes", () => {
         .send({ executionPolicy: { baseRef } });
 
       expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(200);
-      expect(mockIssueService.update).toHaveBeenCalledWith(
-        issueId,
-        expect.objectContaining({
-          executionPolicy: expect.objectContaining({ baseRef }),
-        }),
-      );
+      // A policy write runs on the transactional path, so the service also
+      // receives the transaction handle; only the id and patch are the contract.
+      expect(mockIssueService.update.mock.calls[0]?.[0]).toBe(issueId);
+      expect(mockIssueService.update.mock.calls[0]?.[1]).toMatchObject({ executionPolicy: { baseRef } });
 
       // The exact policy handed to the service is what a later read must project
       // back verbatim — deliver.sh Phase 2c reads `.executionPolicy.baseRef` off
