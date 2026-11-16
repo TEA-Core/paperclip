@@ -1773,6 +1773,152 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   }, 20_000);
 
+  describe("a stranded recorded-branch row that is not proven landed and clean", () => {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const fixedNowMs = Date.UTC(2026, 5, 1);
+    const determinateReason =
+      "issue_terminal | Refusing terminal workspace cleanup because the git worktree changed after delivery was verified";
+
+    // Each row is in the recorded-branch SQL class (determinate refusal, a
+    // recorded branch that differs from the checked-out branch, a recorded
+    // merged PR, no escalation) with exactly one disqualifying condition. The
+    // recorded branch is absent as a local ref, so only the disqualifier keeps
+    // the worktree, with or without a cleanup gate that accepts a landed branch.
+    const cases: Array<{
+      name: string;
+      prepare: (seeded: Awaited<ReturnType<typeof seedTerminalWorkspace>>) => Promise<void>;
+      options?: { activeRun?: boolean };
+      cooldownDays?: number;
+      gitStatusUnavailable?: boolean;
+      gitReadable?: boolean;
+      pathExists?: boolean;
+    }> = [
+      {
+        name: "an unlanded commit on no remote",
+        prepare: async (seeded) => {
+          await fs.writeFile(path.join(seeded.worktreePath, "unlanded.txt"), "unlanded\n", "utf8");
+          await runGit(seeded.worktreePath, ["add", "unlanded.txt"]);
+          await runGit(seeded.worktreePath, ["commit", "-m", "Unlanded change"]);
+        },
+      },
+      {
+        name: "a dirty tracked file",
+        prepare: async (seeded) => {
+          await fs.writeFile(path.join(seeded.worktreePath, "delivered.txt"), "edited\n", "utf8");
+        },
+      },
+      {
+        name: "an untracked file",
+        prepare: async (seeded) => {
+          await fs.writeFile(path.join(seeded.worktreePath, "untracked.txt"), "untracked\n", "utf8");
+        },
+      },
+      {
+        name: "a missing worktree path",
+        pathExists: false,
+        gitReadable: false,
+        prepare: async (seeded) => {
+          await fs.rm(seeded.worktreePath, { recursive: true, force: true });
+        },
+      },
+      {
+        name: "a path that is not a git repository",
+        gitReadable: false,
+        prepare: async (seeded) => {
+          await fs.rm(path.join(seeded.worktreePath, ".git"), { force: true });
+        },
+      },
+      {
+        name: "an active run on the source issue",
+        options: { activeRun: true },
+        prepare: async () => {},
+      },
+      {
+        name: "a linked open issue",
+        prepare: async (seeded) => {
+          await db.insert(issues).values({
+            id: randomUUID(),
+            companyId: seeded.companyId,
+            projectId: seeded.projectId,
+            title: "Open linked issue",
+            status: "todo",
+            priority: "medium",
+            executionWorkspaceId: seeded.executionWorkspaceId,
+          });
+        },
+      },
+      {
+        name: "the reaper cooldown",
+        cooldownDays: 7,
+        prepare: async (seeded) => {
+          await db
+            .update(issues)
+            .set({ completedAt: new Date(fixedNowMs - DAY_MS) })
+            .where(eq(issues.id, seeded.sourceIssueId));
+        },
+      },
+      {
+        name: "a reopen-pending fence",
+        prepare: async (seeded) => {
+          await db
+            .update(executionWorkspaces)
+            .set({
+              metadata: {
+                [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 1,
+                [EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY]: true,
+                [EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY]: new Date(fixedNowMs).toISOString(),
+              },
+            })
+            .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+        },
+      },
+      {
+        name: "a git status that cannot be verified",
+        gitStatusUnavailable: true,
+        prepare: async () => {},
+      },
+    ];
+
+    it.each(cases)("keeps the worktree and escalates once for $name", async (row) => {
+      const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true, ...row.options });
+      await strandWithDeterminateRefusal(seeded.executionWorkspaceId, "fm/recorded-delivery-branch");
+      await row.prepare(seeded);
+      const filesBefore = row.pathExists === false ? null : (await fs.readdir(seeded.worktreePath)).sort();
+      const headBefore = row.gitReadable === false ? null : await readGit(seeded.worktreePath, ["rev-parse", "HEAD"]);
+      const service = executionWorkspaceService(db, {
+        workspaceReaperCooldownDays: row.cooldownDays ?? 0,
+        now: () => new Date(fixedNowMs),
+      });
+      const statusSpy = row.gitStatusUnavailable
+        ? vi.spyOn(workspaceGitOperationScheduler, "run").mockRejectedValue(new Error("scan queue unavailable"))
+        : null;
+
+      let sweep;
+      try {
+        sweep = await service.sweepTerminalWorkspaces();
+      } finally {
+        statusSpy?.mockRestore();
+      }
+      const [workspace] = await db
+        .select({ status: executionWorkspaces.status, cleanupReason: executionWorkspaces.cleanupReason })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+      expect(sweep.archived).toBe(0);
+      expect(workspace).toEqual({ status: "cleanup_failed", cleanupReason: determinateReason });
+      expect(await terminalCleanupEscalations(seeded.executionWorkspaceId)).toHaveLength(1);
+      if (row.pathExists === false) {
+        await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+      } else {
+        await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+        expect((await fs.readdir(seeded.worktreePath)).sort()).toEqual(filesBefore);
+      }
+      if (headBefore !== null) {
+        expect(await readGit(seeded.worktreePath, ["rev-parse", "HEAD"])).toBe(headBefore);
+      }
+    }, 30_000);
+  });
+
   it("does not let already-escalated stranded rows fill the escalation batch", async () => {
     const seeded = await seedTerminalWorkspace();
     const determinateReason =

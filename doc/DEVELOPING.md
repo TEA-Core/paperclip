@@ -1576,11 +1576,19 @@ Environment overrides:
   the row's status or cleanup reason changes. One exception: when the row records
   a branch and a merged PR, has no escalation yet, and the checked-out branch
   differs from the recorded branch, the sweep makes one more attempt under the
-  same gates before it escalates. Other refusals are retried at most
+  same gates before it escalates. By owner decision 2026-11-16, that attempt may remove a
+  stranded worktree only when the cleanup gate proves it landed and clean: a recorded merged PR,
+  the recorded branch absent as a local ref, HEAD landed (an ancestor of the base ref, or equal to
+  the head SHA of a recorded merged PR), 0 commits missing from every remote, no tracked changes,
+  no untracked files, and HEAD equal to the assessed HEAD. The landed-branch acceptance lives in
+  the cleanup gate (#1211); without it the gate refuses and nothing is removed. Every other stranded
+  row is refused and escalated and is never removed. The escalation runs after candidate selection
+  on purpose, so a row this attempt removes is intentionally not escalated. Other refusals are retried at most
   5 times per archive lifecycle, with a backoff of 10 minutes doubling after each
   attempt. A stranded row gets one system comment on its source issue and one
-  `execution_workspace.issue_terminal_cleanup_escalated` activity row; nothing
-  cleans, removes or returns it. Services remain running while deletion is
+  `execution_workspace.issue_terminal_cleanup_escalated` activity row; the
+  escalation and the backfill never write the workspace row and never call a cleanup, removal,
+  release or return function. Services remain running while deletion is
   refused.
   Turning the flag off prevents further widened deletion; it cannot restore
   directories or runtime-owned branches already removed.

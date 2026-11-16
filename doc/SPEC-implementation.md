@@ -1371,16 +1371,23 @@ The current app also exposes V1-supporting surfaces for:
   retries it only after the row's status or cleanup reason changes. One exception: a row with that
   refusal that records a branch name and a merged pull request (status `merged`, non-blank
   `mergedAt`), and has no escalation in its lifecycle, gets one more attempt when its checked-out
-  branch differs from the recorded branch; the cleanup gates are unchanged, and the end-of-sweep
-  escalation then marks the row so it is not selected again. Every other refusal is retried
+  branch differs from the recorded branch; the cleanup gates are unchanged. By owner decision
+  2026-11-16, that one attempt may remove a stranded worktree only when the cleanup gate proves it
+  landed and clean: a recorded merged PR, the recorded branch absent as a local ref, HEAD landed (an
+  ancestor of the base ref, or equal to the head SHA of a recorded merged PR), 0 commits missing from
+  every remote, no tracked changes, no untracked files, and HEAD equal to the assessed HEAD. The
+  landed-branch acceptance lives in the cleanup gate (#1211); without it the gate refuses and nothing
+  is removed. Every other stranded row is refused and escalated and is never removed. The escalation
+  runs after candidate selection on purpose, so a row this attempt removes is intentionally not
+  escalated; a row it keeps is escalated and not selected again. Every other refusal is retried
   at most 5 times per archive lifecycle; the wait after attempt N is 10 minutes times 2^(N-1), and the
   attempt that reaches the ceiling carries `retrySuspended: true`. Each failure row records the
   lifecycle generation it counts against. A stranded row (the determinate refusal, or another refusal
   at the ceiling) is escalated once per lifecycle generation: a system comment on the source issue
   asks a person or agent to keep, deliver again or discard the worktree, and an
   `execution_workspace.issue_terminal_cleanup_escalated` row marks it. Each live sweep runs this
-  escalation, so rows stranded before it shipped are escalated too. The escalation never changes the
-  workspace row or its worktree. Reopening the source issue
+  escalation, so rows stranded before it shipped are escalated too. The escalation and the backfill
+  never write the workspace row and never call a cleanup, removal, release or return function. Reopening the source issue
   records activity but does not restore that workspace.
   The default-off `PAPERCLIP_WORKSPACE_REAPER_RECLAIM_CLEAN_WORKTREES` flag widens
   deletion only to isolated, attached, clean no-PR Git worktrees inside the

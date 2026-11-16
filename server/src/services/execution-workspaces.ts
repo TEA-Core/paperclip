@@ -3513,8 +3513,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       // determinate refusal on a row that records a branch and a merged PR, and
       // has no escalation in this lifecycle, gets one more attempt. The refusal
       // can come from the recorded branch alone (the branch is gone after the
-      // merge), which a later cleanup gate can accept. The end-of-sweep
-      // escalation marks the row, so it is not selected again.
+      // merge), which the cleanup gate may accept only when it proves the
+      // HEAD landed and the worktree clean; otherwise it refuses and nothing is
+      // removed. Escalation runs after selection on purpose: a row this attempt
+      // removes is not escalated, a row it keeps is escalated and not selected
+      // again.
       const retryDueAt = now().toISOString();
       const terminalCleanupBranchMismatchRetryFilter = and(
         eq(executionWorkspaces.cleanupReason, TERMINAL_CLEANUP_WORKTREE_CHANGED_REASON),
