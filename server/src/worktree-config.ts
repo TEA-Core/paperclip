@@ -3,6 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+// The same parser config.ts loads the env file with, so the worktree gate and
+// repair read exactly the values the server booted with.
+import { parse as parseEnvFile } from "dotenv";
 import {
   mergePaperclipConfig,
   paperclipConfigSchema,
@@ -21,7 +24,7 @@ function nonEmpty(value: string | null | undefined): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
-export function expandHomePrefix(value: string): string {
+function expandHomePrefix(value: string): string {
   if (value === "~") return os.homedir();
   if (value.startsWith("~/")) return path.resolve(os.homedir(), value.slice(2));
   return value;
@@ -38,37 +41,6 @@ function sanitizeWorktreeInstanceId(rawValue: string): string {
     .replace(/-+/g, "-")
     .replace(/^[-_]+|[-_]+$/g, "");
   return normalized || "worktree";
-}
-
-function parseEnvFile(contents: string): Record<string, string> {
-  const entries: Record<string, string> = {};
-
-  for (const rawLine of contents.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-
-    const match = rawLine.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
-    if (!match) continue;
-
-    const [, key, rawValue] = match;
-    const value = rawValue.trim();
-    if (!value) {
-      entries[key] = "";
-      continue;
-    }
-
-    if (
-      (value.startsWith("\"") && value.endsWith("\"")) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      entries[key] = value.slice(1, -1);
-      continue;
-    }
-
-    entries[key] = value.replace(/\s+#.*$/, "").trim();
-  }
-
-  return entries;
 }
 
 function readEnvEntries(envPath: string): Record<string, string> {
@@ -169,18 +141,6 @@ function resolveWorktreeRuntimeContext(
     storageDir: path.resolve(instanceRoot, "data", "storage"),
     secretsKeyFilePath: path.resolve("/etc/paperclip/worktrees", instanceId, "master.key"),
   };
-}
-
-/**
- * The worktree gate shared with `maybeRepairLegacyWorktreeConfigAndEnvFiles`:
- * returns the resolved config and env paths only when the boot target is a
- * real worktree instance, otherwise null.
- */
-export function resolveWorktreeEnvTarget(
-  env: NodeJS.ProcessEnv,
-): { configPath: string; envPath: string } | null {
-  const context = resolveWorktreeRuntimeContext(env);
-  return context ? { configPath: context.configPath, envPath: context.envPath } : null;
 }
 
 function atomicWriteFile(filePath: string, contents: string): void {

@@ -1367,4 +1367,79 @@ describe("worktree config repair", () => {
     const rerepairedEnv = await fs.readFile(envPath, "utf8");
     expect(rerepairedEnv).not.toContain(inheritedCanary);
   });
+
+  it.each([
+    { name: "double-quoted with an inline comment", line: 'PAPERCLIP_TOOL_ACTION_SIGNING_SECRET="CANARY_DQ_SECRET" # rotated by hand', value: "CANARY_DQ_SECRET" },
+    { name: "single-quoted with an inline comment", line: "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET='CANARY_SQ_SECRET' # rotated by hand", value: "CANARY_SQ_SECRET" },
+    { name: "unquoted with an inline comment", line: "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET=CANARY_UQ_SECRET # rotated by hand", value: "CANARY_UQ_SECRET" },
+    { name: "export-prefixed and double-quoted", line: 'export PAPERCLIP_TOOL_ACTION_SIGNING_SECRET="CANARY_EXPORT_SECRET"', value: "CANARY_EXPORT_SECRET" },
+    { name: "quoted with # inside the value", line: 'PAPERCLIP_TOOL_ACTION_SIGNING_SECRET="CANARY#HASH#SECRET" # rotated by hand', value: "CANARY#HASH#SECRET" },
+  ])("reads and keeps a worktree tool-action secret that is $name (SUP-24365)", async ({ line, value }) => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-secret-roundtrip-"));
+    const worktreeRoot = path.join(tempRoot, "SUP-24365-secret-roundtrip");
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const configPath = path.join(paperclipDir, "config.json");
+    const envPath = path.join(paperclipDir, ".env");
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    await fs.writeFile(configPath, JSON.stringify(buildLegacyConfig(path.join(tempRoot, "shared")), null, 2) + "\n", "utf8");
+    await fs.writeFile(envPath, ["PAPERCLIP_IN_WORKTREE=true", line, ""].join("\n"), "utf8");
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREES_DIR = path.join(tempRoot, ".paperclip-worktrees");
+    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "CANARY_PARENT_SHELL_TOOL_ACTION_SECRET";
+    delete process.env.PORT;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_CONFIG;
+    delete process.env.PAPERCLIP_CONTEXT;
+
+    maybeRepairLegacyWorktreeConfigAndEnvFiles();
+
+    expect(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBe(value);
+    const repairedEnv = await fs.readFile(envPath, "utf8");
+    // The repair leaves the secret line byte-identical, and a later boot reads
+    // the same value back from disk.
+    expect(repairedEnv.split("\n")).toContain(line);
+    expect(repairedEnv).not.toContain("CANARY_PARENT_SHELL_TOOL_ACTION_SECRET");
+    delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+    maybeRepairLegacyWorktreeConfigAndEnvFiles();
+    expect(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBe(value);
+    expect(await fs.readFile(envPath, "utf8")).toBe(repairedEnv);
+  });
+
+  it("reads quoted and commented worktree markers and identity the same way the server loads them (SUP-24365)", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-quoted-identity-"));
+    const worktreeRoot = path.join(tempRoot, "SUP-24365-quoted-identity");
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const configPath = path.join(paperclipDir, "config.json");
+    const envPath = path.join(paperclipDir, ".env");
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    await fs.writeFile(configPath, JSON.stringify(buildLegacyConfig(path.join(tempRoot, "shared")), null, 2) + "\n", "utf8");
+    await fs.writeFile(
+      envPath,
+      [
+        'PAPERCLIP_IN_WORKTREE="true" # worktree marker',
+        "export PAPERCLIP_INSTANCE_ID='sup-24365-quoted' # set by worktree init",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREES_DIR = path.join(tempRoot, ".paperclip-worktrees");
+    delete process.env.PORT;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_CONFIG;
+    delete process.env.PAPERCLIP_CONTEXT;
+
+    const result = maybeRepairLegacyWorktreeConfigAndEnvFiles();
+
+    expect(result.repairedConfig).toBe(true);
+    expect(process.env.PAPERCLIP_INSTANCE_ID).toBe("sup-24365-quoted");
+  });
 });

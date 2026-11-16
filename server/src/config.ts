@@ -6,7 +6,6 @@ import { resolve } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { resolvePaperclipEnvPath } from "./paths.js";
 import { maybeRepairLegacyWorktreeConfigAndEnvFiles } from "./worktree-config.js";
-import { applyWorktreeEnvPrecedence } from "./worktree-env-precedence.js";
 import { shouldLoadWorkingDirectoryEnv } from "./env-file-policy.js";
 import {
   AUTH_BASE_URL_MODES,
@@ -48,8 +47,6 @@ if (shouldLoadWorkingDirectoryEnv({
 })) {
   loadDotenv({ path: CWD_ENV_PATH, override: false, quiet: true });
 }
-
-applyWorktreeEnvPrecedence();
 
 maybeRepairLegacyWorktreeConfigAndEnvFiles();
 
