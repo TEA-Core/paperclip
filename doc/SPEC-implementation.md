@@ -1368,7 +1368,11 @@ The current app also exposes V1-supporting surfaces for:
   `cleanup_failed` refusals under the same safety gates, except the determinate refusal that the
   git worktree changed after delivery was verified: the sweep records it once, with one
   `execution_workspace.issue_terminal_cleanup_failed` row that carries `retrySuspended: true`, and
-  retries it only after the row's status or cleanup reason changes. Every other refusal is retried
+  retries it only after the row's status or cleanup reason changes. One exception: a row with that
+  refusal that records a branch name and a merged pull request (status `merged`, non-blank
+  `mergedAt`), and has no escalation in its lifecycle, gets one more attempt when its checked-out
+  branch differs from the recorded branch; the cleanup gates are unchanged, and the end-of-sweep
+  escalation then marks the row so it is not selected again. Every other refusal is retried
   at most 5 times per archive lifecycle; the wait after attempt N is 10 minutes times 2^(N-1), and the
   attempt that reaches the ceiling carries `retrySuspended: true`. Each failure row records the
   lifecycle generation it counts against. A stranded row (the determinate refusal, or another refusal

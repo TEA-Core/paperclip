@@ -1671,6 +1671,106 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   });
 
+  // A row stranded with the determinate refusal before this sweep ran: no
+  // escalation marker and no generation-tagged failure row yet.
+  async function strandWithDeterminateRefusal(executionWorkspaceId: string, branchName: string | null) {
+    await db
+      .update(executionWorkspaces)
+      .set({
+        status: "cleanup_failed",
+        closedAt: new Date("2026-01-02T00:00:00Z"),
+        updatedAt: new Date("2026-01-02T00:00:00Z"),
+        cleanupReason:
+          "issue_terminal | Refusing terminal workspace cleanup because the git worktree changed after delivery was verified",
+        metadata: { [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 1 },
+        branchName,
+      })
+      .where(eq(executionWorkspaces.id, executionWorkspaceId));
+  }
+
+  it("passes a stranded recorded-branch mismatch of a merged delivery to the cleanup path once, then escalates it", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
+    // The row records a delivery branch that is not checked out. The branch also
+    // exists as a local ref, so every cleanup gate refuses the attempt.
+    const recordedBranch = "fm/recorded-delivery-branch";
+    await runGit(seeded.repoRoot, ["branch", recordedBranch, "main"]);
+    await strandWithDeterminateRefusal(seeded.executionWorkspaceId, recordedBranch);
+
+    const first = await svc.sweepTerminalWorkspaces();
+    const second = await svc.sweepTerminalWorkspaces();
+    const [workspace] = await db
+      .select({ status: executionWorkspaces.status, cleanupReason: executionWorkspaces.cleanupReason })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    // One attempt reached the cleanup path and was refused, then escalated.
+    expect(first).toMatchObject({ checked: 1, eligible: 1, cleanupFailed: 1, archived: 0, escalated: 1 });
+    expect(second).toMatchObject({ checked: 0, cleanupFailed: 0, escalated: 0 });
+    expect((await terminalCleanupFailedActivity(seeded.executionWorkspaceId)).map((row) => row.details)).toEqual([
+      {
+        sourceIssueId: seeded.sourceIssueId,
+        failure: "Refusing terminal workspace cleanup because the git worktree changed after delivery was verified",
+        lifecycleGeneration: 1,
+        retrySuspended: true,
+      },
+    ]);
+    expect((await terminalCleanupEscalations(seeded.executionWorkspaceId)).map((row) => row.details?.cause))
+      .toEqual(["determinate_refusal"]);
+    expect(workspace).toEqual({
+      status: "cleanup_failed",
+      cleanupReason: "issue_terminal | Refusing terminal workspace cleanup because the git worktree changed after delivery was verified",
+    });
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    expect(await readGit(seeded.repoRoot, ["rev-parse", "--verify", `refs/heads/${recordedBranch}`])).toBeTruthy();
+  }, 20_000);
+
+  it.each([
+    { name: "no recorded branch", mergedAt: "2026-01-01T00:00:00Z" as string | null, recordedBranch: null as string | null, inSqlClass: false },
+    { name: "no merged PR", mergedAt: null, recordedBranch: "fm/recorded-delivery-branch", inSqlClass: false },
+    { name: "a merged PR with a blank mergedAt", mergedAt: "   ", recordedBranch: "fm/recorded-delivery-branch", inSqlClass: false },
+    { name: "the recorded branch checked out", mergedAt: "2026-01-01T00:00:00Z", recordedBranch: "PAP-16015-delivery", inSqlClass: true },
+  ])("keeps a determinate refusal with $name out of the cleanup path and escalates it once", async (row) => {
+    const seeded = await seedTerminalWorkspace({ publish: true });
+    if (row.mergedAt !== null) {
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.sourceIssueId,
+        executionWorkspaceId: seeded.executionWorkspaceId,
+        type: "pull_request",
+        provider: "github",
+        title: "Delivered PR",
+        url: "https://github.com/paperclipai/paperclip/pull/10623",
+        status: "merged",
+        metadata: { mergedAt: row.mergedAt },
+      });
+    }
+    await strandWithDeterminateRefusal(seeded.executionWorkspaceId, row.recordedBranch);
+    let cleanupAttempts = 0;
+    const service = executionWorkspaceService(db, {
+      workspaceReaperCooldownDays: 0,
+      beforeTerminalWorkspaceCleanup: async () => {
+        cleanupAttempts += 1;
+      },
+    });
+
+    const first = await service.sweepTerminalWorkspaces();
+    const second = await service.sweepTerminalWorkspaces();
+
+    // Only the recorded-branch class is selected; the loop still refuses to
+    // attempt it when the recorded branch is the checked-out branch.
+    expect(first).toMatchObject({ checked: row.inSqlClass ? 1 : 0, eligible: 0, cleanupFailed: 0, archived: 0, escalated: 1 });
+    expect(second).toMatchObject({ checked: 0, eligible: 0, escalated: 0 });
+    expect(cleanupAttempts).toBe(0);
+    expect(await terminalCleanupFailedActivity(seeded.executionWorkspaceId)).toEqual([]);
+    expect(await terminalCleanupEscalations(seeded.executionWorkspaceId)).toHaveLength(1);
+    const [workspace] = await db
+      .select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(workspace?.status).toBe("cleanup_failed");
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  }, 20_000);
+
   it("does not let already-escalated stranded rows fill the escalation batch", async () => {
     const seeded = await seedTerminalWorkspace();
     const determinateReason =

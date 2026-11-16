@@ -3509,23 +3509,48 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       // refusal is retried at most TERMINAL_CLEANUP_MAX_ATTEMPTS times in one
       // lifecycle, and the wait after attempt N is the base backoff times 2^(N-1),
       // measured from the row's last write.
+      // One narrow exception (terminalCleanupBranchMismatchRetryFilter): a
+      // determinate refusal on a row that records a branch and a merged PR, and
+      // has no escalation in this lifecycle, gets one more attempt. The refusal
+      // can come from the recorded branch alone (the branch is gone after the
+      // merge), which a later cleanup gate can accept. The end-of-sweep
+      // escalation marks the row, so it is not selected again.
       const retryDueAt = now().toISOString();
+      const terminalCleanupBranchMismatchRetryFilter = and(
+        eq(executionWorkspaces.cleanupReason, TERMINAL_CLEANUP_WORKTREE_CHANGED_REASON),
+        sql<boolean>`${executionWorkspaces.branchName} IS NOT NULL AND ${executionWorkspaces.branchName} <> ''`,
+        sql<boolean>`EXISTS (
+          SELECT 1 FROM ${issueWorkProducts} merged_pr
+          WHERE merged_pr.company_id = ${executionWorkspaces.companyId}
+            AND merged_pr.issue_id = ${executionWorkspaces.sourceIssueId}
+            AND merged_pr.type = 'pull_request'
+            AND merged_pr.status = 'merged'
+            AND jsonb_typeof(merged_pr.metadata -> 'mergedAt') = 'string'
+            AND (merged_pr.metadata ->> 'mergedAt') ~ '\\S'
+        )`,
+        sql<boolean>`${terminalCleanupActivityCountSql(TERMINAL_CLEANUP_ESCALATED_ACTION)} = 0`,
+      );
       const terminalCleanupRetryFilter = and(
         eq(executionWorkspaces.status, "cleanup_failed"),
         sql<boolean>`${executionWorkspaces.cleanupReason} LIKE 'issue_terminal | %'`,
-        ne(executionWorkspaces.cleanupReason, TERMINAL_CLEANUP_WORKTREE_CHANGED_REASON),
         sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
-        sql<boolean>`EXISTS (
-          SELECT 1
-          FROM (SELECT ${terminalCleanupActivityCountSql(TERMINAL_CLEANUP_FAILED_ACTION)} AS attempts) cleanup_attempts
-          WHERE cleanup_attempts.attempts < ${TERMINAL_CLEANUP_MAX_ATTEMPTS}
-            AND (
-              cleanup_attempts.attempts = 0
-              OR ${executionWorkspaces.updatedAt} <= ${retryDueAt}::timestamptz
-                - interval '1 millisecond'
-                  * (${TERMINAL_CLEANUP_RETRY_BACKOFF_BASE_MS}::double precision * power(2, cleanup_attempts.attempts - 1))
-            )
-        )`,
+        or(
+          and(
+            ne(executionWorkspaces.cleanupReason, TERMINAL_CLEANUP_WORKTREE_CHANGED_REASON),
+            sql<boolean>`EXISTS (
+              SELECT 1
+              FROM (SELECT ${terminalCleanupActivityCountSql(TERMINAL_CLEANUP_FAILED_ACTION)} AS attempts) cleanup_attempts
+              WHERE cleanup_attempts.attempts < ${TERMINAL_CLEANUP_MAX_ATTEMPTS}
+                AND (
+                  cleanup_attempts.attempts = 0
+                  OR ${executionWorkspaces.updatedAt} <= ${retryDueAt}::timestamptz
+                    - interval '1 millisecond'
+                      * (${TERMINAL_CLEANUP_RETRY_BACKOFF_BASE_MS}::double precision * power(2, cleanup_attempts.attempts - 1))
+                )
+            )`,
+          ),
+          terminalCleanupBranchMismatchRetryFilter,
+        ),
       );
       const baseCandidateFilter = or(openCandidateFilter, terminalCleanupRetryFilter);
       // Continue the scan after the previous sweep's last row. The keyset
@@ -3873,6 +3898,19 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           }
         }
         if (workspace.status === "cleanup_failed") {
+          if (workspace.cleanupReason === TERMINAL_CLEANUP_WORKTREE_CHANGED_REASON) {
+            // The retry filter lets a determinate refusal through once. Attempt
+            // it only when the checked-out branch differs from the recorded
+            // branch, the one cause that a later cleanup gate can accept. Any
+            // other cause stands, and the end-of-sweep escalation surfaces it.
+            const checkedOutBranch = git?.repoRoot && git.workspacePath
+              ? await readGitStdout(["symbolic-ref", "--quiet", "--short", "HEAD"], git.workspacePath).catch(() => null)
+              : undefined;
+            if (checkedOutBranch === undefined || checkedOutBranch === workspace.branchName) {
+              keep(workspace, "the determinate refusal is not a recorded-branch mismatch");
+              continue;
+            }
+          }
           result.eligible += 1;
           const capturedGeneration = readExecutionWorkspaceLifecycleGeneration(
             workspace.metadata as Record<string, unknown> | null,
