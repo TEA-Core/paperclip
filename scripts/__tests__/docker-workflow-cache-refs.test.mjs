@@ -154,3 +154,39 @@ test("the registry-backed build cache still exists", () => {
   );
   assert.ok(registryRefs.length > 0, "the image builds must still publish a registry-backed build cache");
 });
+
+// SUP-23998 (mutants B-m5, B-m6). The fork-only `docker-build-assert` check name and
+// the canonical-repository guard on the digest resolve were pinned by no test: renaming
+// the job silently dropped its coverage, and removing the guard let a fork run look up
+// (and attest) the upstream image by the fork's SHA.
+test("docker.yml keeps the pull-request docker-build-assert job", () => {
+  const workflow = workflows.find(item => item.path === ".github/workflows/docker.yml");
+  const job = jobs(workflow).find(item => item.name === "docker-build-assert");
+  assert.ok(job, "the docker-build-assert job id must not change: it is a check name");
+  assert.match(job.body, /if:\s*github\.event_name == 'pull_request'/);
+});
+
+test("docker.yml resolves and attests the standard image only for canonical master pushes", () => {
+  const workflow = workflows.find(item => item.path === ".github/workflows/docker.yml");
+  const step = name => {
+    const start = workflow.text.indexOf(`- name: ${name}`);
+    assert.notEqual(start, -1, `step "${name}" must exist`);
+    const next = workflow.text.indexOf("\n      - name:", start + 1);
+    return workflow.text.slice(start, next === -1 ? undefined : next);
+  };
+  const resolve = step("Resolve standard image digest");
+  for (const condition of [
+    "github.repository == 'paperclipai/paperclip'",
+    "github.repository_id == '1170821064'",
+    "github.event_name == 'push'",
+    "github.ref == 'refs/heads/master'",
+  ]) {
+    assert.ok(resolve.includes(condition), `the digest resolve must require ${condition}`);
+  }
+  for (const name of ["Verify the immutable standard image", "Attest the standard production image"]) {
+    assert.ok(
+      step(name).includes("steps.standard.outputs.digest != ''"),
+      `"${name}" must run only when the guarded resolve produced a digest`,
+    );
+  }
+});
