@@ -43,6 +43,7 @@ import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { buildIssueBlockersResolvedWakeStateKey } from "../services/issue-dependency-wakeups.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
 
 // SUP-21902: the done-transition guard resolves a company GitHub token and
@@ -4458,6 +4459,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   it("wakes dependents blocked on the source issue when recovery resolution closes it", async () => {
     const { companyId, managerId, coderId, sourceIssueId, prefix } = await seedCompany();
     const dependentIssueId = randomUUID();
+    // The dependent re-blocked (generation 2) after a completed canonical wake
+    // that was requested in its earlier generation; that wake must not
+    // suppress the cascade for the current generation.
+    const generationTwoAt = new Date(Date.now() - 60 * 60 * 1000);
     await db.insert(issues).values({
       id: dependentIssueId,
       companyId,
@@ -4467,12 +4472,27 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       assigneeAgentId: coderId,
       issueNumber: 2,
       identifier: `${prefix}-2`,
+      blockedTransitionAt: generationTwoAt,
     });
     await db.insert(issueRelations).values({
       companyId,
       issueId: sourceIssueId,
       relatedIssueId: dependentIssueId,
       type: "blocks",
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: coderId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      status: "completed",
+      idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+        dependentIssueId,
+        blockerIssueIds: [sourceIssueId],
+      }),
+      requestedAt: new Date(generationTwoAt.getTime() - 60 * 60 * 1000),
+      updatedAt: new Date(generationTwoAt.getTime() + 30 * 60 * 1000),
     });
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({

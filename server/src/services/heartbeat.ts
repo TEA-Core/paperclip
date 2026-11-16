@@ -33003,10 +33003,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             );
             // Producers do not always stamp blockedTransitionAt into the
             // context snapshot (the liveness backstop is one). Without the
-            // cycle timestamp an old-key COMPLETED wake from any earlier
-            // blocked cycle would suppress the enqueue, so fall back to the
-            // dependent issue's live cycle timestamp — the same information
-            // the producer's own pre-check used.
+            // generation timestamp a COMPLETED canonical or old-key wake from
+            // any earlier blocked generation would suppress the enqueue, so
+            // fall back to the dependent issue's live generation timestamp —
+            // the same information the producer's own pre-check used.
             const dependencyBlockedTransitionAt = snapshotBlockedTransitionAt ??
               (await tx
                 .select({ blockedTransitionAt: issues.blockedTransitionAt })
@@ -33017,20 +33017,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 ))
                 .limit(1)
                 .then((rows) => rows[0]?.blockedTransitionAt ?? null));
-            let dependencyCompletedRearmCutoff = opts.completedRearmCutoff ?? null;
-            if (!dependencyCompletedRearmCutoff) {
-              dependencyCompletedRearmCutoff = dependencyBlockedTransitionAt instanceof Date
-                ? dependencyBlockedTransitionAt
-                : dependencyBlockedTransitionAt
-                  ? new Date(dependencyBlockedTransitionAt)
-                  : null;
-              if (
-                dependencyCompletedRearmCutoff &&
-                Number.isNaN(dependencyCompletedRearmCutoff.getTime())
-              ) {
-                dependencyCompletedRearmCutoff = null;
-              }
-            }
             const existingDependencyWake = await findExistingIssueBlockersResolvedWakeForReadyState(
               tx as unknown as Db,
               {
@@ -33038,7 +33024,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 dependentIssueId: issueId,
                 blockerIssueIds: dependencyBlockerIds,
                 blockedTransitionAt: dependencyBlockedTransitionAt,
-                completedRearmCutoff: dependencyCompletedRearmCutoff,
+                completedRearmCutoff: opts.completedRearmCutoff,
                 excludeWakeupRequestIds: [nativeStatusWakeIntentId, executionWaitRequestId]
                   .filter((id): id is string => Boolean(id)),
               },

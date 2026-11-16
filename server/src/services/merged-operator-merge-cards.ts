@@ -622,7 +622,6 @@ export function createMergedOperatorMergeCardSweepService(
               dependentIssueId: dependent.id,
               blockerIssueIds: dependent.blockerIssueIds,
               blockedTransitionAt: dependent.blockedTransitionAt,
-              completedRearmCutoff: dependent.blockedTransitionAt,
             });
             if (existingWake) continue;
           } catch (err) {

@@ -8394,12 +8394,12 @@ export function recoveryService(
               dependentIssueId: candidate.id,
               blockerIssueIds: readiness?.blockerIssueIds ?? [],
               blockedTransitionAt: candidate.blockedTransitionAt,
-              // Generation cutoff, not the re-arm window: a COMPLETED canonical
-              // wake only covers the ready state of the blocked cycle it ran in
-              // (updatedAt >= blockedTransitionAt), so a later done → unresolved
-              // → done generation gets its fresh wake. The re-arm-age `cutoff`
-              // stays reserved for recovery eligibility and cap accounting.
-              completedRearmCutoff: candidate.blockedTransitionAt,
+              // Two independent cutoffs: blockedTransitionAt scopes a finished
+              // canonical wake to the generation it was requested in, and the
+              // re-arm-age `cutoff` lets a same-generation wake that aged out
+              // re-arm so the cap and the blocked_without_blockers escalation
+              // still fire.
+              completedRearmCutoff: cutoff,
             });
         if (existingWake) {
           result.existingWakeSkipped += 1;
@@ -8668,11 +8668,10 @@ export function recoveryService(
               ...(zeroBlockerHeal ? { zeroBlockerHeal: true } : {}),
             },
             idempotencyKey,
-            // Heartbeat preserves an explicitly supplied completedRearmCutoff
-            // for its own canonical ready-state lookup instead of deriving the
-            // dependent's blockedTransitionAt, so hand it the same generation
-            // cutoff the producer lookup used — never the re-arm-age cutoff.
-            completedRearmCutoff: candidate.blockedTransitionAt,
+            // Heartbeat's own canonical ready-state lookup derives the
+            // generation (blockedTransitionAt) itself; hand it the same
+            // re-arm-age cutoff the producer lookup used.
+            completedRearmCutoff: cutoff,
             requestedByActorType: "system",
             requestedByActorId,
             contextSnapshot: {

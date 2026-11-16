@@ -3,6 +3,7 @@ import request from "supertest";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
 import { evaluateIssueContinuationPath } from "../routes/issues.js";
+import { buildIssueBlockersResolvedWakeStateKey } from "../services/issue-dependency-wakeups.js";
 import { reportUnexpectedRouteError } from "./helpers/report-unexpected-route-error.js";
 
 const mockIssueService = vi.hoisted(() => ({
@@ -3708,13 +3709,33 @@ describe.sequential("issue comment reopen routes", () => {
         _tx: tx,
       }),
     );
+    // The dependent re-blocked (generation 2) after a completed canonical wake
+    // that was requested in its earlier generation; that wake must not
+    // suppress the comment-path cascade for the current generation.
+    const generationTwoAt = new Date("2026-08-01T15:00:00.000Z");
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([
       {
         id: "dependent-1",
         assigneeAgentId: dependentAgentId,
         blockerIssueIds: [issue.id],
+        blockedTransitionAt: generationTwoAt,
       },
     ]);
+    const earlierGenerationWake = {
+      id: "wake-earlier-generation",
+      runId: null,
+      status: "completed",
+      idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+        dependentIssueId: "dependent-1",
+        blockerIssueIds: [issue.id],
+      }),
+      requestedAt: new Date("2026-08-01T14:00:00.000Z"),
+      updatedAt: new Date("2026-08-01T15:30:00.000Z"),
+    };
+    mockDbSelectFrom.mockImplementation(((table: object) =>
+      (table as Record<symbol, unknown>)[Symbol.for("drizzle:Name")] === "agent_wakeup_requests"
+        ? { where: () => Promise.resolve([earlierGenerationWake]), innerJoin: mockDbSelectJoined }
+        : { where: mockDbSelectWhere, innerJoin: mockDbSelectJoined }) as never);
 
     const res = await request(
       await installActor(createApp(), {

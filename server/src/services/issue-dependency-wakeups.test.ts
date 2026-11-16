@@ -117,7 +117,7 @@ describe("findExistingIssueBlockersResolvedWakeForReadyState", () => {
     expect(existing?.id).toBe("wake-stable-state");
   });
 
-  it("suppresses a later producer after an earlier producer completed the same blocker-set wake", async () => {
+  it("suppresses a later producer after an earlier producer completed the same blocker-set wake in the same generation", async () => {
     const producerKey = buildIssueBlockersResolvedWakeStateKey({
       dependentIssueId,
       blockerIssueIds: [blockerIssueId],
@@ -129,8 +129,8 @@ describe("findExistingIssueBlockersResolvedWakeForReadyState", () => {
           id: "wake-earlier-producer",
           status: "completed",
           idempotencyKey: producerKey,
-          requestedAt: firstCycle,
-          updatedAt: firstCycle,
+          requestedAt: secondCycle,
+          updatedAt: secondCycle,
         },
       ]),
       readyState,
@@ -138,44 +138,101 @@ describe("findExistingIssueBlockersResolvedWakeForReadyState", () => {
     expect(existing?.id).toBe("wake-earlier-producer");
   });
 
-  it("does not let a completed canonical wake from a previous generation suppress a later cutoff", async () => {
-    const stateKey = buildIssueBlockersResolvedWakeStateKey(readyState);
-    const existing = await findExistingIssueBlockersResolvedWakeForReadyState(
-      dbWithWakes([
-        {
-          id: "wake-cycle",
-          status: "completed",
-          idempotencyKey: stateKey,
-          requestedAt: firstCycle,
-          updatedAt: firstCycle,
-        },
-      ]),
-      {
-        ...readyState,
-        completedRearmCutoff: secondCycle,
-      },
-    );
-    expect(existing).toBeNull();
-  });
+  describe("blocked generation and re-arm window", () => {
+    // Timeline: generation 1 blocked at 09:00, generation 2 blocked at 11:00,
+    // the sweep runs at 12:00 with a 6 h re-arm window (age cutoff 06:00).
+    const generationOneAt = new Date("2026-11-12T09:00:00.000Z");
+    const generationTwoAt = new Date("2026-11-12T11:00:00.000Z");
+    const ageCutoff = new Date("2026-11-12T06:00:00.000Z");
+    const generationTwo = { ...readyState, blockedTransitionAt: generationTwoAt };
+    const stateKey = buildIssueBlockersResolvedWakeStateKey(generationTwo);
 
-  it("keeps a completed canonical wake covering repeats within the same generation", async () => {
-    const stateKey = buildIssueBlockersResolvedWakeStateKey(readyState);
-    const existing = await findExistingIssueBlockersResolvedWakeForReadyState(
-      dbWithWakes([
+    it("does not let an earlier-generation wake completed inside the re-arm window suppress the current generation", async () => {
+      const wakes = dbWithWakes([
         {
-          id: "wake-current-cycle",
+          id: "wake-generation-one",
           status: "completed",
           idempotencyKey: stateKey,
-          requestedAt: secondCycle,
-          updatedAt: secondCycle,
+          requestedAt: generationOneAt,
+          updatedAt: new Date("2026-11-12T09:30:00.000Z"),
         },
-      ]),
-      {
-        ...readyState,
-        completedRearmCutoff: secondCycle,
-      },
-    );
-    expect(existing?.id).toBe("wake-current-cycle");
+      ]);
+      expect(
+        await findExistingIssueBlockersResolvedWakeForReadyState(wakes, {
+          ...generationTwo,
+          completedRearmCutoff: ageCutoff,
+        }),
+      ).toBeNull();
+      expect(await findExistingIssueBlockersResolvedWakeForReadyState(wakes, generationTwo)).toBeNull();
+    });
+
+    it("does not let a wake requested in generation 1 and completed after generation 2 began suppress generation 2", async () => {
+      const wakes = dbWithWakes([
+        {
+          id: "wake-straddling",
+          status: "completed",
+          idempotencyKey: stateKey,
+          requestedAt: new Date("2026-11-12T10:00:00.000Z"),
+          updatedAt: new Date("2026-11-12T11:30:00.000Z"),
+        },
+      ]);
+      expect(
+        await findExistingIssueBlockersResolvedWakeForReadyState(wakes, {
+          ...generationTwo,
+          completedRearmCutoff: ageCutoff,
+        }),
+      ).toBeNull();
+      expect(await findExistingIssueBlockersResolvedWakeForReadyState(wakes, generationTwo)).toBeNull();
+    });
+
+    it("suppresses a same-generation completed wake inside the re-arm window, including one requested at the transition instant", async () => {
+      const existing = await findExistingIssueBlockersResolvedWakeForReadyState(
+        dbWithWakes([
+          {
+            id: "wake-generation-two",
+            status: "completed",
+            idempotencyKey: stateKey,
+            requestedAt: generationTwoAt,
+            updatedAt: new Date("2026-11-12T11:05:00.000Z"),
+          },
+        ]),
+        { ...generationTwo, completedRearmCutoff: ageCutoff },
+      );
+      expect(existing?.id).toBe("wake-generation-two");
+    });
+
+    it("re-arms a same-generation completed wake once it ages past the re-arm window", async () => {
+      const longBlockedAt = new Date("2026-11-12T03:00:00.000Z");
+      const existing = await findExistingIssueBlockersResolvedWakeForReadyState(
+        dbWithWakes([
+          {
+            id: "wake-aged-out",
+            status: "completed",
+            idempotencyKey: stateKey,
+            requestedAt: new Date("2026-11-12T04:00:00.000Z"),
+            updatedAt: new Date("2026-11-12T05:59:59.999Z"),
+          },
+        ]),
+        { ...readyState, blockedTransitionAt: longBlockedAt, completedRearmCutoff: ageCutoff },
+      );
+      expect(existing).toBeNull();
+    });
+
+    it("keeps an in-flight canonical wake from an earlier generation covering the current one", async () => {
+      const existing = await findExistingIssueBlockersResolvedWakeForReadyState(
+        dbWithWakes([
+          {
+            id: "wake-generation-one-queued",
+            status: "queued",
+            idempotencyKey: stateKey,
+            requestedAt: generationOneAt,
+            updatedAt: generationOneAt,
+          },
+        ]),
+        { ...generationTwo, completedRearmCutoff: ageCutoff },
+      );
+      expect(existing?.id).toBe("wake-generation-one-queued");
+    });
   });
 
   it("does not let a completed old-key wake from a previous blocked cycle suppress", async () => {

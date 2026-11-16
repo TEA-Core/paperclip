@@ -5836,15 +5836,6 @@ export function issueRoutes(
   // the other emits the matching audit record once the enqueue resolves. Keeping
   // both here is what makes an issue update, a comment decision and a recovery-action
   // resolution emit the same cascade instead of three drifting copies.
-  const issueBlockersResolvedCompletedRearmCutoff = (
-    blockedTransitionAt: Date | string | null | undefined,
-  ): Date | null => {
-    if (blockedTransitionAt == null || blockedTransitionAt === "") return null;
-    const parsed = blockedTransitionAt instanceof Date
-      ? blockedTransitionAt
-      : new Date(blockedTransitionAt);
-    return Number.isNaN(parsed.getTime()) ? null : parsed;
-  };
   const prepareIssueBlockersResolvedWakeup = async (input: {
     companyId: string;
     dependentIssueId: string;
@@ -5925,7 +5916,6 @@ export function issueRoutes(
         dependentIssueId: input.dependentIssueId,
         blockerIssueIds: input.blockerIssueIds,
         blockedTransitionAt: input.blockedTransitionAt,
-        completedRearmCutoff: issueBlockersResolvedCompletedRearmCutoff(input.blockedTransitionAt),
       });
       if (existingWake) return null;
     } catch (err) {
@@ -22746,7 +22736,6 @@ export function issueRoutes(
             dependentIssueId: input.dependentIssueId,
             blockerIssueIds: input.blockerIssueIds,
             blockedTransitionAt: input.blockedTransitionAt,
-            completedRearmCutoff: issueBlockersResolvedCompletedRearmCutoff(input.blockedTransitionAt),
           });
           if (existingWake) return;
         } catch (err) {
@@ -26724,7 +26713,6 @@ export function issueRoutes(
             dependentIssueId: input.dependentIssueId,
             blockerIssueIds: input.blockerIssueIds,
             blockedTransitionAt: input.blockedTransitionAt,
-            completedRearmCutoff: issueBlockersResolvedCompletedRearmCutoff(input.blockedTransitionAt),
           });
           if (existingWake) return;
         } catch (err) {
