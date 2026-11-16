@@ -847,4 +847,15 @@ second-line\" status=401`,
       apiKey: REDACTED_EVENT_VALUE,
     });
   });
+
+  // SUP-23998 (mutant C-m5): `bearer` is its own alternative in the secret-name rule. A
+  // field called just `bearer` matches no other alternative, so dropping it leaks the value.
+  it("redacts a field named bearer and a bearer value in text", () => {
+    expect(sanitizeRecord({ bearer: "synthetic-bearer-value", note: "kept" })).toEqual({
+      bearer: REDACTED_EVENT_VALUE,
+      note: "kept",
+    });
+    expect(redactSensitiveText('{"bearer": "synthetic-bearer-value"}')).not.toContain("synthetic-bearer-value");
+    expect(redactSensitiveText("--bearer=synthetic-bearer-value")).not.toContain("synthetic-bearer-value");
+  });
 });

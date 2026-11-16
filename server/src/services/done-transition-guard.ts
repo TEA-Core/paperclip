@@ -2107,8 +2107,14 @@ async function attributeTier2EvidenceToClosingRun(
     return { ...result, tier2Audit: audit };
   }
   const latestObserved = audit.observedRangeEnd ?? audit.observed;
-  const latestObservedMs = latestObserved ? Date.parse(latestObserved) : Number.NaN;
-  if (!Number.isNaN(latestObservedMs) && latestObservedMs > Date.now()) {
+  // Compare at the full accepted precision (1-6 fractional digits): `Date.parse`
+  // truncates to milliseconds, so `.7261Z` would tie a `.726Z` close write. The
+  // evaluation clock has millisecond precision, so any observed sub-millisecond
+  // tail past it is strictly later.
+  if (
+    latestObserved &&
+    utcInstantSortKey(latestObserved) > utcInstantSortKey(new Date(Date.now()).toISOString())
+  ) {
     return refuseTier2(
       `record-only close Tier 2 probe evidence names observed instant ${latestObserved}, which postdates this ` +
         "close; an observation cannot be made after the close that cites it, and it must fall inside the " +

@@ -19506,6 +19506,24 @@ export function issueRoutes(
     }
     let interruptedRunId: string | null = null;
     let pendingReassignmentStopRunId: string | null = null;
+    // A pre-commit reassignment cancel is suppressed only because the update
+    // is expected to commit. If the update fails first, the card is unchanged
+    // and the participant must be re-woken through the unsuppressed release,
+    // exactly as the unsuppressed cancel did on the base.
+    let suppressedReassignmentCancelledRun: Awaited<ReturnType<typeof heartbeat.cancelRun>> | null = null;
+    const rewakeSuppressedReassignmentRun = async () => {
+      const run = suppressedReassignmentCancelledRun;
+      if (!run) return;
+      suppressedReassignmentCancelledRun = null;
+      try {
+        await heartbeat.releaseIssueExecutionAndPromote(run);
+      } catch (err) {
+        logger.warn(
+          { err, issueId: existing.id, runId: run.id },
+          "failed to re-wake participant after failed reassignment update",
+        );
+      }
+    };
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(existing);
     const isAgentWorkUpdate =
       req.actor.type === "agent" &&
@@ -20797,6 +20815,7 @@ export function issueRoutes(
             "Cancelled before issue reassignment",
             {
               errorCode: "issue_reassigned",
+              suppressImmediateRecovery: true,
               resultJson: { reassignmentStopConfirmed: true, issueMutationStopId },
               eventMessage: "run cancelled before issue reassignment",
               eventPayload: { issueId: existing.id },
@@ -20812,6 +20831,13 @@ export function issueRoutes(
             );
           }
           interruptedRunId = cancelled.id;
+          suppressedReassignmentCancelledRun = cancelled;
+          // One compensation scope for every exit between this cancel and
+          // the commit: eager rewakes at the known exits below call the same
+          // helper, and this finish/close fallback covers any exit that
+          // responds without reaching them. It disarms on commit.
+          res.once("finish", () => { void rewakeSuppressedReassignmentRun(); });
+          res.once("close", () => { void rewakeSuppressedReassignmentRun(); });
         } else {
           pendingReassignmentStopRunId = runToStopForReassignment.id;
         }
@@ -20859,52 +20885,57 @@ export function issueRoutes(
       }
     }
     if (deferFinalDeliveryPrefetch) {
-      const afterStop = await svc.getById(existing.id);
-      const withoutRunRelease = (row: object) => {
-        const { updatedAt: _u, executionRunId: _r, executionAgentNameKey: _k, executionLockedAt: _l, checkoutRunId: _c, ...rest } = row as Record<string, unknown>;
-        return rest;
-      };
-      // Agent mutation authorization can atomically adopt a stale checkout into
-      // this request's live run before the first external certificate is taken.
-      // That write changes only run links and stamps both times identically;
-      // any later timestamp write still makes this pre-certificate check stale.
-      const adoptedOwnCheckout = afterStop !== null &&
-        req.actor.type === "agent" &&
-        actor.runId !== null &&
-        existing.status === "in_progress" &&
-        existing.assigneeAgentId === req.actor.agentId &&
-        existing.checkoutRunId !== actor.runId &&
-        afterStop.checkoutRunId === actor.runId &&
-        afterStop.executionRunId === actor.runId &&
-        afterStop.executionLockedAt !== null &&
-        afterStop.executionLockedAt.getTime() === afterStop.updatedAt.getTime();
-      if (
-        !afterStop ||
-        !isDeepStrictEqual(issueRowWithFoldedDecisionAgentIds(withoutRunRelease(afterStop)), issueRowWithFoldedDecisionAgentIds(withoutRunRelease(existing))) ||
-        (interruptedRunId === null && !adoptedOwnCheckout && !isDeepStrictEqual(issueRowWithFoldedDecisionAgentIds(afterStop), issueRowWithFoldedDecisionAgentIds(existing))) ||
-        (await readFinalDeliveryBinding(db, afterStop)) !== originalDeliveryBinding
-      ) {
-        throw conflict("Card or delivery binding changed before the final delivery preflight; retry the final verdict", {
-          code: "approval_final_delivery_preflight_stale",
-          reason: "head_moved: card or delivery binding changed before final delivery preflight",
-        });
-      }
-      if (effectiveDeliveryRequirement !== "record_only") {
-        finalDeliveryPrefetch = await prefetchFinalDelivery(
+      try {
+        const afterStop = await svc.getById(existing.id);
+        const withoutRunRelease = (row: object) => {
+          const { updatedAt: _u, executionRunId: _r, executionAgentNameKey: _k, executionLockedAt: _l, checkoutRunId: _c, ...rest } = row as Record<string, unknown>;
+          return rest;
+        };
+        // Agent mutation authorization can atomically adopt a stale checkout into
+        // this request's live run before the first external certificate is taken.
+        // That write changes only run links and stamps both times identically;
+        // any later timestamp write still makes this pre-certificate check stale.
+        const adoptedOwnCheckout = afterStop !== null &&
+          req.actor.type === "agent" &&
+          actor.runId !== null &&
+          existing.status === "in_progress" &&
+          existing.assigneeAgentId === req.actor.agentId &&
+          existing.checkoutRunId !== actor.runId &&
+          afterStop.checkoutRunId === actor.runId &&
+          afterStop.executionRunId === actor.runId &&
+          afterStop.executionLockedAt !== null &&
+          afterStop.executionLockedAt.getTime() === afterStop.updatedAt.getTime();
+        if (
+          !afterStop ||
+          !isDeepStrictEqual(issueRowWithFoldedDecisionAgentIds(withoutRunRelease(afterStop)), issueRowWithFoldedDecisionAgentIds(withoutRunRelease(existing))) ||
+          (interruptedRunId === null && !adoptedOwnCheckout && !isDeepStrictEqual(issueRowWithFoldedDecisionAgentIds(afterStop), issueRowWithFoldedDecisionAgentIds(existing))) ||
+          (await readFinalDeliveryBinding(db, afterStop)) !== originalDeliveryBinding
+        ) {
+          throw conflict("Card or delivery binding changed before the final delivery preflight; retry the final verdict", {
+            code: "approval_final_delivery_preflight_stale",
+            reason: "head_moved: card or delivery binding changed before final delivery preflight",
+          });
+        }
+        if (effectiveDeliveryRequirement !== "record_only") {
+          finalDeliveryPrefetch = await prefetchFinalDelivery(
+            effectiveDeliveryRequirement === afterStop.deliveryRequirement
+              ? afterStop
+              : { ...afterStop, deliveryRequirement: effectiveDeliveryRequirement },
+          );
+        }
+        await preflightTerminalApproval(
           effectiveDeliveryRequirement === afterStop.deliveryRequirement
             ? afterStop
             : { ...afterStop, deliveryRequirement: effectiveDeliveryRequirement },
+          updateFields,
+          transition.decision,
+          nextExecutionPolicy,
+          { overrideAccepted: doneOverrideAccepted, prefetched: finalDeliveryPrefetch },
         );
+      } catch (err) {
+        await rewakeSuppressedReassignmentRun();
+        throw err;
       }
-      await preflightTerminalApproval(
-        effectiveDeliveryRequirement === afterStop.deliveryRequirement
-          ? afterStop
-          : { ...afterStop, deliveryRequirement: effectiveDeliveryRequirement },
-        updateFields,
-        transition.decision,
-        nextExecutionPolicy,
-        { overrideAccepted: doneOverrideAccepted, prefetched: finalDeliveryPrefetch },
-      );
     }
     const nextParentId = updateFields.parentId === undefined
       ? existing.parentId
@@ -20928,22 +20959,28 @@ export function issueRoutes(
         ? updateFields.parentLinkKind
         : existing.parentLinkKind;
 
-    const shouldRelayStop =
-      Boolean(nextParentId) &&
-      existing.status !== updateFields.status &&
-      (updateFields.status === "blocked" || updateFields.status === "cancelled") &&
-      await directParentReportDisabledForIssue({
-        companyId: existing.companyId,
-        projectId: updateFields.projectId === undefined
-          ? existing.projectId
-          : updateFields.projectId as string | null,
-        executionPolicy: updateFields.executionPolicy === undefined
-          ? existing.executionPolicy
-          : updateFields.executionPolicy,
-        assigneeAgentId: nextAssigneeAgentId,
-        checkoutRunId: existing.checkoutRunId,
-        executionRunId: existing.executionRunId,
-      });
+    let shouldRelayStop = false;
+    try {
+      shouldRelayStop =
+        Boolean(nextParentId) &&
+        existing.status !== updateFields.status &&
+        (updateFields.status === "blocked" || updateFields.status === "cancelled") &&
+        await directParentReportDisabledForIssue({
+          companyId: existing.companyId,
+          projectId: updateFields.projectId === undefined
+            ? existing.projectId
+            : updateFields.projectId as string | null,
+          executionPolicy: updateFields.executionPolicy === undefined
+            ? existing.executionPolicy
+            : updateFields.executionPolicy,
+          assigneeAgentId: nextAssigneeAgentId,
+          checkoutRunId: existing.checkoutRunId,
+          executionRunId: existing.executionRunId,
+        });
+    } catch (err) {
+      await rewakeSuppressedReassignmentRun();
+      throw err;
+    }
     const stopRelayResult: {
       value: Awaited<ReturnType<typeof svc.addStopRelayCommentIfNeeded>>;
     } = { value: null };
@@ -21048,13 +21085,20 @@ export function issueRoutes(
     let reopenedWorkspace: Pick<ExecutionWorkspace, "id"> | null = null;
     let reopenedGeneration: number | null = null;
     if (closedExecutionWorkspace && (commentBody || isAgentWorkUpdate)) {
-      const reopenOutcome = await reopenClosedIssueExecutionWorkspaceOrRespond(
-        req,
-        res,
-        existing,
-        closedExecutionWorkspace,
-      );
+      let reopenOutcome;
+      try {
+        reopenOutcome = await reopenClosedIssueExecutionWorkspaceOrRespond(
+          req,
+          res,
+          existing,
+          closedExecutionWorkspace,
+        );
+      } catch (err) {
+        await rewakeSuppressedReassignmentRun();
+        throw err;
+      }
       if (reopenOutcome === null) {
+        await rewakeSuppressedReassignmentRun();
         return;
       }
       // Install the guard only when this request set the reopen-pending flag. A
@@ -21094,9 +21138,15 @@ export function issueRoutes(
     let commentDeduplicated = false;
     let deduplicatedFromCommentId: string | null = null;
     let commentHandledInTransaction = false;
-    const attachmentCommentSourceTrust = commentAttachmentIds?.length
-      ? await sourceTrustForActorWrite(existing, actor)
-      : undefined;
+    let attachmentCommentSourceTrust;
+    try {
+      attachmentCommentSourceTrust = commentAttachmentIds?.length
+        ? await sourceTrustForActorWrite(existing, actor)
+        : undefined;
+    } catch (err) {
+      await rewakeSuppressedReassignmentRun();
+      throw err;
+    }
     // The in-scope `done` refusal below must run inside the update transaction,
     // under the same update lock that serializes concurrent mutations. Force the
     // transactional path when the gap is present so the guarantee is self-contained
@@ -21505,6 +21555,7 @@ export function issueRoutes(
                 attachmentIds: commentAttachmentIds,
                 clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
                 mirrorToSlack: actor.actorType === "user",
+                boardApiKeyId: actor.boardApiKeyId,
                 authorizationReason: issueMutationAuthorizationReason,
                 sourceTrust: attachmentCommentSourceTrust,
                 onIssueTouched: noteCommittedUpdatedAt,
@@ -21554,6 +21605,7 @@ export function issueRoutes(
                 authorizationReason: issueMutationAuthorizationReason,
                 clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
                 mirrorToSlack: actor.actorType === "user",
+                boardApiKeyId: actor.boardApiKeyId,
                 sourceTrust: await sourceTrustForActorWrite(existing, actor, tx as unknown as Db),
                 onIssueTouched: noteCommittedUpdatedAt,
               }, tx);
@@ -21656,6 +21708,7 @@ export function issueRoutes(
         issue = await updateIssue();
       }
     } catch (err) {
+      await rewakeSuppressedReassignmentRun();
       if (err instanceof HttpError && err.status === 422) {
         logger.warn(
           {
@@ -21764,9 +21817,13 @@ export function issueRoutes(
       throw err;
     }
     if (!issue) {
+      await rewakeSuppressedReassignmentRun();
       res.status(404).json({ error: "Issue not found" });
       return;
     }
+    // The reassignment has committed; the suppressed cancel stands and the
+    // compensation scope above is disarmed.
+    suppressedReassignmentCancelledRun = null;
     recordDeferredGuardSkipDisposition?.();
     if (pendingReassignmentStopRunId) {
       let cancellationFailed = false;
@@ -21777,6 +21834,7 @@ export function issueRoutes(
           "Cancelled before issue reassignment",
           {
             errorCode: "issue_reassigned",
+            suppressImmediateRecovery: true,
             resultJson: { reassignmentStopConfirmed: true },
             eventMessage: "run cancelled before issue reassignment",
             eventPayload: { issueId: existing.id },
@@ -22539,6 +22597,7 @@ export function issueRoutes(
         authorizationReason: issueMutationAuthorizationReason,
         clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
         mirrorToSlack: actor.actorType === "user",
+        boardApiKeyId: actor.boardApiKeyId,
         sourceTrust: await sourceTrustForActorWrite(issue, actor),
         onIssueTouched: noteCommittedUpdatedAt,
       });
@@ -26364,6 +26423,7 @@ export function issueRoutes(
         attachmentIds: req.body.attachmentIds,
         clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
         mirrorToSlack: actor.actorType === "user",
+        boardApiKeyId: actor.boardApiKeyId,
         sourceTrust,
       };
       let txResult: { comment: Awaited<ReturnType<typeof svc.addComment>>; issue: NonNullable<Awaited<ReturnType<typeof svc.update>>> };
@@ -26544,6 +26604,7 @@ export function issueRoutes(
         attachmentIds: req.body.attachmentIds,
         clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
         mirrorToSlack: actor.actorType === "user",
+        boardApiKeyId: actor.boardApiKeyId,
         authorizationReason: commentAuthorizationReason,
         sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
       };

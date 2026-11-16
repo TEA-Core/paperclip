@@ -49,7 +49,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, onTestFinished, v
 import {
   agents,
   agentWakeupRequests,
-  activityLog,
+  activityLog, boardApiKeys,
   assets,
   authUsers,
   chatActions,
@@ -4354,9 +4354,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     wakeup.mockClear();
     const [boardPrincipal] = await db.insert(chatExternalPrincipals).values({ companyId: fixture.companyId, provider: "slack", providerAccountId: "T-PAPERCLIP", externalId: "UBOARD" }).returning();
     await db.insert(chatIdentityLinks).values({ companyId: fixture.companyId, endpointId: endpoint.id, principalId: boardPrincipal.id, paperclipUserId: "owner-user", status: "linked", confirmedAt: new Date() });
-    const clientRequestId = randomUUID();
+    const clientRequestId = randomUUID(); const [boardKey] = await db.insert(boardApiKeys).values({ userId: "owner-user", name: "slack-mirror-test", keyHash: randomUUID() }).returning();
     const comment = await issueService(db).addComment(conversation.issueId, "Please make the plan", { userId: "owner-user" },
-      { authorType: "user", mirrorToSlack: true, clientRequestId });
+      { authorType: "user", mirrorToSlack: true, clientRequestId, boardApiKeyId: boardKey.id });
     expect((await issueService(db).addComment(conversation.issueId, "Please make the plan", { userId: "owner-user" },
       { authorType: "user", mirrorToSlack: true, clientRequestId })).id).toBe(comment.id);
     await service.processPendingPublications();
@@ -4380,7 +4380,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ]);
     // The explicit Board composer uses the same mirror and a durable wakeup.
     const key = randomUUID();
-    await service.publishBoardMessage(endpoint.id, conversation.id, "Now assign the follow-ups", key, "owner-user");
+    await service.publishBoardMessage(endpoint.id, conversation.id, "Now assign the follow-ups", key, "owner-user", [], boardKey.id);
     await service.publishBoardMessage(endpoint.id, conversation.id, "Now assign the follow-ups", key, "owner-user");
     expect(wakeup).toHaveBeenCalledTimes(1);
     expect(wakeup).toHaveBeenCalledWith(fixture.assignedAgentId, expect.objectContaining({ requestedByActorId: "owner-user", contextSnapshot: expect.objectContaining({ source: "issue.comment", taskKey: (await issueService(db).getById(conversation.issueId))!.identifier, wakeCommentId: expect.any(String) }) }));
@@ -4394,7 +4394,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await service.processPendingDeliveries();
     await service.processPendingPublications();
     expect(await db.select().from(chatActions).where(and(eq(chatActions.endpointId, endpoint.id), eq(chatActions.kind, "slack_board_message"), eq(chatActions.status, "received")))).toHaveLength(0);
-    expect(runtime.endpoints.get(endpoint.id)!.posts.filter(post => post.text.includes("Retry this work"))).toHaveLength(1);
+    expect(runtime.endpoints.get(endpoint.id)!.posts.filter(post => post.text.includes("Retry this work"))).toHaveLength(1); const requested = await db.select({ commentId: sql<string>`${activityLog.details}->>'commentId'`, boardApiKeyId: activityLog.boardApiKeyId }).from(activityLog).where(and(eq(activityLog.companyId, fixture.companyId), eq(activityLog.action, "chat.publication_requested"))); expect(requested.find(row => row.commentId === comment.id)?.boardApiKeyId).toBe(boardKey.id); expect(requested.filter(row => row.boardApiKeyId === boardKey.id)).toHaveLength(2); expect(requested.filter(row => row.boardApiKeyId === null)).toHaveLength(1); // SUP-23998: mirrored `chat.publication_requested` rows carry the request's board key (one line: the typecheck baseline is line-keyed)
   });
 
   it.each(["revoked", "relinked", "private-membership", "later-cancelled"] as const)("rechecks %s authority before queued Slack Board messages and replies", async (change) => {

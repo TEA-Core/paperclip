@@ -14073,6 +14073,8 @@ export function issueService(db: Db) {
         onIssueTouched?: (updatedAt: Date) => void;
         /** Server-only: authenticated Paperclip messages also belong in the Slack thread. */
         mirrorToSlack?: boolean;
+        /** Server-only: board API key of the authenticated request, for the mirrored Slack activity row. */
+        boardApiKeyId?: string | null;
       },
       dbOrTx: any = db,
     ): Promise<IssueComment> {
@@ -14576,7 +14578,10 @@ export function issueService(db: Db) {
         await dbOrTx.update(issues).set({ conversationState: "active" }).where(eq(issues.id, issueId));
       }
       if (options?.mirrorToSlack && actor.userId && authorType === "user") {
-        await mirrorSlackBoardComment(dbOrTx, comment, { attachmentIds: options.attachmentIds });
+        await mirrorSlackBoardComment(dbOrTx, comment, {
+          attachmentIds: options.attachmentIds,
+          boardApiKeyId: options.boardApiKeyId,
+        });
       }
       if (authorType === "user" || actor.userId) {
         await resumeSlackConversation(dbOrTx, issue.companyId, issueId);
