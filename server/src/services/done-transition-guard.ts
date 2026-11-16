@@ -720,6 +720,9 @@ export async function writeDoneTransitionRefusedAuditLog(
         storedDeliveryRequirement: IssueDeliveryRequirement;
         requestedDeliveryRequirement: "record_only";
         landingCheckSkipped: false;
+        // `request`: refused against the unlocked read; `locked_recheck`:
+        // refused under the issue row lock in the write transaction.
+        stage: "request" | "locked_recheck";
       },
 ): Promise<void> {
   await writeAuditLog(db, issue, DONE_TRANSITION_REFUSED_ACTION, {
@@ -4672,6 +4675,9 @@ async function evaluateDoneTransitionGuardCore(
     executionPolicy?: unknown;
     executionState?: unknown;
     deliveryRequirement?: IssueDeliveryRequirement | null;
+    // The status version before this close; it binds a requirement-change
+    // marker to the close (SUP-24429).
+    statusVersion?: number;
   },
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
@@ -5170,6 +5176,17 @@ async function evaluateDoneTransitionGuardCore(
         reason: `open_linked_prs_decision_carried:${openPrs.length}`,
         skipReason: `open_linked_prs_decision_carried:${openPrs.length}`,
         prs: prNames,
+        // SUP-24429: this row is a landing-backstop candidate. When the close
+        // request relabelled the stored requirement, name both sides and the
+        // status version this close produces, so the backstop keeps sweeping
+        // the card under a live record_only label until a later close.
+        ...(storedDeliveryRequirement !== undefined && storedDeliveryRequirement !== issue.deliveryRequirement
+          ? {
+              storedDeliveryRequirement,
+              requestedDeliveryRequirement: issue.deliveryRequirement ?? null,
+              ...(issue.statusVersion !== undefined ? { closeStatusVersion: issue.statusVersion + 1 } : {}),
+            }
+          : {}),
       });
       return {
         allowed: true,

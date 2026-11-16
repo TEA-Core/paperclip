@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi, beforeEach } from "vitest";
 import {
   activityLog as activityLogTable,
@@ -12,6 +12,7 @@ import {
   createDb,
   getEmbeddedPostgresTestSupport,
   heartbeatRuns as heartbeatRunsTable,
+  issueComments as issueCommentsTable,
   issueExecutionDecisions as issueExecutionDecisionsTable,
   issueLabels as issueLabelsTable,
   issueRelations as issueRelationsTable,
@@ -3385,6 +3386,48 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(mockResolveLinkedPullRequestsWithState).toHaveBeenCalled();
     });
 
+    it("marks the decision-carried backstop row with both requirements and the close's status version when the close relabelled (SUP-24429)", async () => {
+      const openPr = { id: "pr-1", owner: "TEA-Core", repo: "paperclip", number: 1, nodeId: null, headRefName: null, displayName: "TEA-Core/paperclip#1", cachedState: "open", lastErrorCode: null };
+      mockResolveLinkedPullRequestsWithState.mockResolvedValue([openPr]);
+      mockResolveGitHubToken.mockResolvedValue({ token: null, scope: null, secretName: null });
+      const relabelled = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, deliveryRequirement: "record_only", statusVersion: 4 },
+        null,
+        true,
+        "repository_delivery",
+      );
+      expect(relabelled.allowed).toBe(true);
+      expect(logActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.done_transition_guard_skipped",
+          details: expect.objectContaining({
+            reason: "open_linked_prs_decision_carried:1",
+            storedDeliveryRequirement: "repository_delivery",
+            requestedDeliveryRequirement: "record_only",
+            closeStatusVersion: 5,
+          }),
+        }),
+      );
+
+      // A close that did not change the requirement writes no marker.
+      vi.mocked(logActivity).mockClear();
+      await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, deliveryRequirement: "repository_delivery", statusVersion: 4 },
+        null,
+        true,
+        "repository_delivery",
+      );
+      const unchanged = vi.mocked(logActivity).mock.calls
+        .map(([, entry]) => entry.details as Record<string, unknown>)
+        .find((details) => details.reason === "open_linked_prs_decision_carried:1");
+      expect(unchanged).toBeDefined();
+      expect(unchanged).not.toHaveProperty("storedDeliveryRequirement");
+      expect(unchanged).not.toHaveProperty("closeStatusVersion");
+    });
+
     it("keeps the record-only skip when the stored requirement is already record_only (SUP-24429)", async () => {
       const result = await evaluateDoneTransitionGuard(
         mockDb,
@@ -3396,6 +3439,22 @@ describe("evaluateDoneTransitionGuard", () => {
       expect(result.allowed).toBe(true);
       expect(result.skipReason).toBe("record_only_delivery_skipped");
       expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+    });
+
+    it("treats an explicit null stored requirement as not record_only, and an omitted one as unchanged (SUP-24429)", async () => {
+      const omitted = await evaluateDoneTransitionGuard(mockDb, { ...issue, deliveryRequirement: "record_only" }, null, false);
+      expect(omitted.skipReason).toBe("record_only_delivery_skipped");
+      expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+
+      const explicitNull = await evaluateDoneTransitionGuard(
+        mockDb,
+        { ...issue, deliveryRequirement: "record_only" },
+        null,
+        false,
+        null,
+      );
+      expect(explicitNull.skipped).toBe(false);
+      expect(explicitNull.skipReason).not.toBe("record_only_delivery_skipped");
     });
 
     it("still refuses a record_only close whose review ladder is unsatisfied", async () => {
@@ -9237,22 +9296,28 @@ describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", ()
     return row;
   }
 
-  it("refuses a board PATCH that sets record_only and done together on a stored repository_delivery card", async () => {
-    const { issueId, identifier } = await seedCard("repository_delivery");
+  async function systemCommentsFor(issueId: string) {
+    const rows = await db
+      .select({ authorType: issueCommentsTable.authorType, body: issueCommentsTable.body })
+      .from(issueCommentsTable)
+      .where(eq(issueCommentsTable.issueId, issueId));
+    return rows.filter((row) => row.authorType === "system").map((row) => row.body);
+  }
 
-    const res = await request(app)
-      .patch(`/api/issues/${identifier}`)
-      .send({ deliveryRequirement: "record_only", status: "done", comment: "Reclassify and close." });
-
+  async function expectFlipRefusal(
+    issueId: string,
+    res: request.Response,
+    expected: { stage: "request" | "locked_recheck"; decisionCarried: boolean; status: string },
+  ) {
     expect(res.status, JSON.stringify(res.body)).toBe(409);
     expect(res.body.code).toBe("done_transition_record_only_flip_refused");
     expect(res.body.details).toMatchObject({
       storedDeliveryRequirement: "repository_delivery",
       requestedDeliveryRequirement: "record_only",
       landingCheckSkipped: false,
+      stage: expected.stage,
     });
-    expect(await storedCard(issueId)).toEqual({ status: "in_progress", deliveryRequirement: "repository_delivery" });
-
+    expect(await storedCard(issueId)).toEqual({ status: expected.status, deliveryRequirement: "repository_delivery" });
     const rows = activityFor(issueId);
     // The erase is its own event: exactly one refusal row naming both requirements.
     const refusals = rows.filter((row) => row.action === "issue.done_transition_refused");
@@ -9263,14 +9328,137 @@ describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", ()
       storedDeliveryRequirement: "repository_delivery",
       requestedDeliveryRequirement: "record_only",
       landingCheckSkipped: false,
+      decisionCarried: expected.decisionCarried,
+      stage: expected.stage,
     });
-    expect(rows.some((row) => row.details?.skipReason === "record_only_delivery_skipped")).toBe(false);
+    // A request-stage refusal runs before the guard, so no skip row exists. A
+    // locked re-check refuses after the guard evaluated the stale unlocked read;
+    // the write then rolls back and the refusal row above is the outcome.
+    if (expected.stage === "request") {
+      expect(rows.some((row) => row.details?.skipReason === "record_only_delivery_skipped")).toBe(false);
+    }
+    expect(rows.some((row) => row.action === "issue.updated")).toBe(false);
+    // The thread carries the refusal for the next run: code and remedy.
+    const comments = await systemCommentsFor(issueId);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toContain("done_transition_record_only_flip_refused");
+    expect(comments[0]).toContain("Remedy: Close without changing deliveryRequirement in this request");
+    return rows;
+  }
+
+  it("refuses a board PATCH that sets record_only and done together on a stored repository_delivery card", async () => {
+    const { issueId, identifier } = await seedCard("repository_delivery");
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ deliveryRequirement: "record_only", status: "done", comment: "Reclassify and close." });
+
+    const rows = await expectFlipRefusal(issueId, res, { stage: "request", decisionCarried: false, status: "in_progress" });
     // board_actor_bypass did not clear the landing check on this request: no
-    // bypass row carrying decisionCarried, no guard-skip disposition, no update.
+    // bypass row carrying decisionCarried and no guard-skip disposition.
     expect(rows.some((row) => row.details?.skipReason === "board_actor_bypass")).toBe(false);
     expect(rows.some((row) => row.action === "issue.done_tier_declaration_skipped")).toBe(false);
     expect(rows.some((row) => row.action === "issue.done_transition_guard_skipped")).toBe(false);
-    expect(rows.some((row) => row.action === "issue.updated")).toBe(false);
+  });
+
+  it("refuses the same shape from an authorized non-assignee agent", async () => {
+    const { companyId, issueId, identifier } = await seedCard("repository_delivery");
+    const agentId = randomUUID();
+    await db.insert(agentsTable).values({
+      id: agentId, companyId, name: "Reclassifier", role: "engineer", status: "active",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    });
+    const runId = randomUUID();
+    await db.insert(heartbeatRunsTable).values({
+      id: runId, companyId, agentId, status: "running", contextSnapshot: { issueId },
+    });
+    currentActor = { type: "agent", agentId, companyId, source: "agent_key", runId } as Express.Request["actor"];
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ deliveryRequirement: "record_only", status: "done", comment: "Reclassify and close." });
+
+    await expectFlipRefusal(issueId, res, { stage: "request", decisionCarried: false, status: "in_progress" });
+  });
+
+  it("refuses the same shape on a decision-carrying close whose approval resolves the status to done", async () => {
+    const { issueId, identifier } = await seedCard("repository_delivery", "in_review");
+    const stageId = randomUUID();
+    const participant = { type: "user" as const, agentId: null, userId: "cloud-user-1" };
+    await db
+      .update(issuesTable)
+      .set({
+        assigneeUserId: "cloud-user-1",
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [{ id: stageId, type: "review", approvalsNeeded: 1, participants: [participant] }],
+        },
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: participant,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: null,
+          changesRequestedCount: 0,
+        },
+      })
+      .where(eq(issuesTable.id, issueId));
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        deliveryRequirement: "record_only",
+        status: "done",
+        comment: "Looks good.\n\nkind: review\ndecision: approved",
+      });
+
+    await expectFlipRefusal(issueId, res, { stage: "request", decisionCarried: true, status: "in_review" });
+  });
+
+  it("refuses under the issue row lock when the stored requirement changes after the unlocked read", async () => {
+    const { issueId, identifier } = await seedCard("record_only");
+    // The server tsconfig lib predates Promise.withResolvers.
+    let releaseHolder!: () => void;
+    const holderReleased = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    let holderUpdated!: () => void;
+    const holderHasUpdated = new Promise<void>((resolve) => {
+      holderUpdated = resolve;
+    });
+    // A concurrent writer reclassifies the card back to repository_delivery and
+    // holds the row lock: the close reads the committed record_only row, then
+    // waits for the lock in its write transaction.
+    const holder = db.transaction(async (tx) => {
+      await tx.update(issuesTable).set({ deliveryRequirement: "repository_delivery" }).where(eq(issuesTable.id, issueId));
+      holderUpdated();
+      await holderReleased;
+    });
+    await holderHasUpdated;
+    const pending = request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ deliveryRequirement: "record_only", status: "done", comment: "Close the record-only card." })
+      .then((res) => res);
+    await vi.waitFor(
+      async () => {
+        const [row] = await db.execute<{ waiting: number }>(
+          sql`select count(*)::int as waiting from pg_locks where not granted`,
+        );
+        if (!row || row.waiting === 0) throw new Error("close is not waiting on the issue row lock yet");
+      },
+      { timeout: 20_000, interval: 25 },
+    );
+    releaseHolder();
+    await holder;
+
+    await expectFlipRefusal(issueId, await pending, { stage: "locked_recheck", decisionCarried: false, status: "in_progress" });
   });
 
   it("keeps the record-only skip for a board close of a card already stored record_only", async () => {
@@ -9286,16 +9474,31 @@ describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", ()
     expect(rows.some((row) => row.details?.skipReason === "record_only_delivery_skipped")).toBe(true);
     expect(rows.some((row) => row.details?.skipReason === "board_actor_bypass")).toBe(true);
     expect(rows.some((row) => row.action === "issue.done_transition_refused")).toBe(false);
+    expect(rows.some((row) => row.action === "issue.delivery_requirement_reclassified")).toBe(false);
   });
 
-  it("leaves a record_only flip in an earlier request followed by a plain close unchanged", async () => {
+  it("audits a record_only reclassification without a close, and leaves the later plain close unchanged", async () => {
     const { issueId, identifier } = await seedCard("repository_delivery");
 
     const flip = await request(app)
       .patch(`/api/issues/${identifier}`)
       .send({ deliveryRequirement: "record_only" });
     expect(flip.status, JSON.stringify(flip.body)).toBe(200);
+    const reclassified = activityFor(issueId).filter((row) => row.action === "issue.delivery_requirement_reclassified");
+    expect(reclassified).toHaveLength(1);
+    expect(reclassified[0]!.details).toMatchObject({
+      storedDeliveryRequirement: "repository_delivery",
+      requestedDeliveryRequirement: "record_only",
+      actorType: "user",
+      actorId: "cloud-user-1",
+      landingCheckOwed: true,
+    });
+    const comments = await systemCommentsFor(issueId);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toContain("Delivery requirement reclassified");
+    expect(comments[0]).toContain("from `repository_delivery` to `record_only` by user `cloud-user-1`");
 
+    // The two-request path stays open: the later close takes the record-only skip.
     const close = await request(app)
       .patch(`/api/issues/${identifier}`)
       .send({ status: "done", comment: "Close after the earlier reclassification." });
@@ -9304,23 +9507,57 @@ describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", ()
     const rows = activityFor(issueId);
     expect(rows.some((row) => row.details?.skipReason === "record_only_delivery_skipped")).toBe(true);
     expect(rows.some((row) => row.action === "issue.done_transition_refused")).toBe(false);
+    expect(rows.filter((row) => row.action === "issue.delivery_requirement_reclassified")).toHaveLength(1);
   });
 
-  it("keeps a card closed under the refused shape in the landing sweep despite its live record_only label", async () => {
+  it("writes no reclassification audit when the stored value is already record_only or the requested value is not record_only", async () => {
+    const alreadyRecordOnly = await seedCard("record_only");
+    const noop = await request(app)
+      .patch(`/api/issues/${alreadyRecordOnly.identifier}`)
+      .send({ deliveryRequirement: "record_only" });
+    expect(noop.status, JSON.stringify(noop.body)).toBe(200);
+
+    const repositoryDelivery = await seedCard("repository_delivery");
+    const sameValue = await request(app)
+      .patch(`/api/issues/${repositoryDelivery.identifier}`)
+      .send({ deliveryRequirement: "repository_delivery", title: "Renamed card" });
+    expect(sameValue.status, JSON.stringify(sameValue.body)).toBe(200);
+
+    const backToRepository = await seedCard("record_only");
+    const reverse = await request(app)
+      .patch(`/api/issues/${backToRepository.identifier}`)
+      .send({ deliveryRequirement: "repository_delivery" });
+    expect(reverse.status, JSON.stringify(reverse.body)).toBe(200);
+
+    for (const card of [alreadyRecordOnly, repositoryDelivery, backToRepository]) {
+      expect(activityFor(card.issueId).some((row) => row.action === "issue.delivery_requirement_reclassified")).toBe(false);
+      expect(await systemCommentsFor(card.issueId)).toEqual([]);
+    }
+  });
+
+  it("sweeps a card whose latest close relabelled a stored repository_delivery card, not one closed again later", async () => {
     const flipped = await seedCard("record_only", "done");
+    const reclosed = await seedCard("record_only", "done");
     const reclassifiedAfterClose = await seedCard("record_only", "done");
     const closeAt = new Date("2026-08-26T00:00:00Z");
+    // The decision-carried row the guard writes when the close request itself
+    // changed the requirement from a stored repository_delivery (see the guard
+    // unit test above), bound to the status version that close produced (a
+    // seeded row starts at 0).
+    const marker = {
+      reason: "open_linked_prs_decision_carried:1",
+      storedDeliveryRequirement: "repository_delivery",
+      requestedDeliveryRequirement: "record_only",
+      closeStatusVersion: 0,
+    };
     await db.insert(activityLogTable).values([
       {
-        // The guard-skip row the close route writes when the close request
-        // itself changed the requirement from a stored repository_delivery.
         companyId: flipped.companyId, actorId: "done-transition-guard", action: "issue.done_transition_guard_skipped",
-        entityType: "issue", entityId: flipped.issueId, createdAt: closeAt,
-        details: {
-          reason: "open_linked_prs_decision_carried:1",
-          storedDeliveryRequirement: "repository_delivery",
-          requestedDeliveryRequirement: "record_only",
-        },
+        entityType: "issue", entityId: flipped.issueId, createdAt: closeAt, details: marker,
+      },
+      {
+        companyId: reclosed.companyId, actorId: "done-transition-guard", action: "issue.done_transition_guard_skipped",
+        entityType: "issue", entityId: reclosed.issueId, createdAt: closeAt, details: marker,
       },
       {
         // A lawful reclassification after the close carries no marker and stays excluded.
@@ -9330,6 +9567,18 @@ describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", ()
         details: { reason: "open_linked_prs_decision_carried:1" },
       },
     ]);
+    // Reopen, then close again as a plain record_only close: the marker now
+    // describes an older close.
+    currentActor = boardActor(reclosed.companyId);
+    const reopen = await request(app)
+      .patch(`/api/issues/${reclosed.identifier}`)
+      .send({ status: "todo", comment: "Reopen for follow-up." });
+    expect(reopen.status, JSON.stringify(reopen.body)).toBe(200);
+    const reclose = await request(app)
+      .patch(`/api/issues/${reclosed.identifier}`)
+      .send({ status: "done", comment: "Close again." });
+    expect(reclose.status, JSON.stringify(reclose.body)).toBe(200);
+    expect(await storedCard(reclosed.issueId)).toEqual({ status: "done", deliveryRequirement: "record_only" });
 
     const service = createDoneCloseLandingBackstopService(db, {
       now: () => new Date("2026-08-28T00:00:00Z"),
@@ -9342,6 +9591,7 @@ describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", ()
     expect(result.candidates).toBe(1);
     const measuredIssueIds = mockResolveLinkedPullRequestsWithState.mock.calls.map((call) => call[2]);
     expect(measuredIssueIds).toContain(flipped.issueId);
+    expect(measuredIssueIds).not.toContain(reclosed.issueId);
     expect(measuredIssueIds).not.toContain(reclassifiedAfterClose.issueId);
   });
 });
