@@ -5894,6 +5894,55 @@ export async function createAuthorityGuard(
   };
 }
 
+/**
+ * SUP-24409: the arm-time form of the control-plane ownership fact the mint-time
+ * gate already accepts. True only when ALL hold:
+ *   - the card's delivery repo (its project repo) resolves;
+ *   - the card's OWN execution-workspace row (sourceless or self-sourced, never a
+ *     carrier's borrowed row) carries a branch, and the PR head ref IS that branch
+ *     (exact; git refs are case-sensitive);
+ *   - `isDeliveredByCard` accepts the PR against that repo and branch — the
+ *     mint-time predicate itself, which adds the ADR-091 D5 same-repo half; and
+ *   - nothing else in the company can claim the branch: no other
+ *     execution-workspace row carries it (case-insensitive), and no other issue
+ *     binds the card's row while it is sourceless (that issue would own it too).
+ * Every accept here is also a mint-time accept: with the card's row present,
+ * resolveDeliveryIdentity's branch is that row's branch (a recorded branch must
+ * equal it exactly) and its branchIsOwn is this row's. The PR title, the agent's
+ * text and the recorded delivery identity are never read. Missing data or doubt
+ * returns false, so the caller's textual refusal stands.
+ */
+async function isOnOwnExecutionWorkspaceBranch(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  pr: { owner: string; repo: string; headRefName: string | null },
+  deliveryRepo: { owner: string; repo: string } | null,
+): Promise<boolean> {
+  if (!deliveryRepo) return false;
+  const ownership = await resolveCardDeliveryBranchOwnership(db, companyId, issueId);
+  const branch = ownership.branch;
+  if (!ownership.branchIsOwn || branch === null) return false;
+  if (!isDeliveredByCard(pr, deliveryRepo, branch)) return false;
+  if (pr.headRefName !== branch) return false;
+  const [claim] = await db
+    .select({ id: executionWorkspaces.id })
+    .from(executionWorkspaces)
+    .where(and(
+      eq(executionWorkspaces.companyId, companyId),
+      sql`lower(${executionWorkspaces.branchName}) = lower(${branch})`,
+      sql`(
+        ${executionWorkspaces.id} <> (SELECT i.execution_workspace_id FROM issues i WHERE i.id = ${issueId})
+        OR (
+          ${executionWorkspaces.sourceIssueId} IS NULL
+          AND EXISTS (SELECT 1 FROM issues x WHERE x.execution_workspace_id = ${executionWorkspaces.id} AND x.id <> ${issueId})
+        )
+      )`,
+    ))
+    .limit(1);
+  return claim === undefined;
+}
+
 export async function armMergeOnApproval(
   db: Db,
   companyId: string,
@@ -5995,13 +6044,6 @@ export async function armMergeOnApproval(
     }
   }
 
-  if (candidateIdentifiers.length === 0) {
-    return {
-      kind: "skipped",
-      message: "skipped:unowned-branch: PR title and headRefName do not name a SUP-\\d+ owner",
-    };
-  }
-
   let ownerRow:
     | { id: string; executionPolicy: unknown; executionState: unknown }
     | undefined;
@@ -6025,7 +6067,29 @@ export async function armMergeOnApproval(
     }
   }
 
+  // SUP-24409: a PR whose title and head ref name no card, or only other cards, is
+  // still this card's when the control plane says so — the same fact the mint-time
+  // gate accepts (narrowToDelivered -> isDeliveredByCard). Only the card's own,
+  // unambiguous execution-workspace branch qualifies; every other shape keeps the
+  // textual refusal below.
   if (!ownerRow) {
+    const ownsBranch = await isOnOwnExecutionWorkspaceBranch(db, companyId, issueId, pr, deliveryIdentity.repo);
+    [ownerRow] = ownsBranch
+      ? await db
+        .select({ id: issues.id, executionPolicy: issues.executionPolicy, executionState: issues.executionState })
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
+        .limit(1)
+      : [];
+  }
+
+  if (!ownerRow) {
+    if (candidateIdentifiers.length === 0) {
+      return {
+        kind: "skipped",
+        message: "skipped:unowned-branch: PR title and headRefName do not name a SUP-\\d+ owner",
+      };
+    }
     return {
       kind: "skipped",
       message: `skipped:not-pr-owner: PR ${pr.number} title=[${titleIds.length > 0 ? titleIds.join(", ") : "(none)"}] branch=${branchId ?? "(none)"} — none is the transitioning issue`,

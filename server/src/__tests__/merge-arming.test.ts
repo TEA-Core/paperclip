@@ -2954,3 +2954,361 @@ describeEmbeddedPostgres(
     });
   },
 );
+
+describeEmbeddedPostgres(
+  "armMergeOnApproval control-plane own-branch ownership (SUP-24409)",
+  () => {
+    let db: Db;
+    let companyId: string;
+    let projectId: string;
+    let issueId: string;
+    let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+    // The SUP-24405 / TEA-Core/paperclip#1210 shape: the PR title names another card and the head
+    // ref is the transitioning card's own execution-workspace branch, which carries no SUP prefix.
+    const IDENTIFIER = "SUP-24405";
+    const OTHER_IDENTIFIER = "SUP-24000";
+    const OWN_BRANCH = "fm/paperclip-1067-residuals-followup";
+    const REPO_URL = "https://github.com/TEA-Core/paperclip";
+    const PR_TITLE = "fix(SUP-24000): close PR 1067 executionPolicy PATCH residuals";
+    const HEAD_SHA = "5801dbc3ffcd5154c747e1d5985cb05af65b47d8";
+
+    beforeAll(async () => {
+      tempDb = await startEmbeddedPostgresTestDatabase("paperclip-merge-arming-own-branch-");
+      db = createDb(tempDb.connectionString);
+    }, 20_000);
+
+    afterAll(async () => {
+      await tempDb?.cleanup();
+    });
+
+    async function clearTables() {
+      await db.delete(externalObjectMentions);
+      await db.delete(externalObjects);
+      await db.delete(issues);
+      await db.delete(executionWorkspaces);
+      await db.delete(projectWorkspaces);
+      await db.delete(projects);
+      await db.delete(companies);
+    }
+
+    async function insertCompanyWithProject(issuePrefix = "SUP"): Promise<{ companyId: string; projectId: string }> {
+      const [company] = await db
+        .insert(companies)
+        .values({ name: "Own Branch Company", issuePrefix, mergeArmingEnabled: true })
+        .returning();
+      const [project] = await db
+        .insert(projects)
+        .values({ id: randomUUID(), companyId: company!.id, name: "TEA-Core/paperclip", status: "in_progress" })
+        .returning();
+      await db.insert(projectWorkspaces).values({
+        id: randomUUID(),
+        companyId: company!.id,
+        projectId: project!.id,
+        name: "paperclip",
+        repoUrl: REPO_URL,
+        isPrimary: true,
+      });
+      return { companyId: company!.id, projectId: project!.id };
+    }
+
+    beforeEach(async () => {
+      vi.resetAllMocks();
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue(GITHUB_TOKEN);
+      mockGhFetch.mockResolvedValue(createMockResponse({}));
+      await clearTables();
+
+      ({ companyId, projectId } = await insertCompanyWithProject());
+      issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        projectId,
+        title: "Stamp card",
+        status: "done",
+        identifier: IDENTIFIER,
+        executionPolicy: EXECUTION_POLICY,
+        executionState: APPROVED_STATE,
+      });
+      // The card the PR title names exists and is approved, so the textual title check resolves it
+      // to a real issue that is not the transitioning one.
+      await insertIssue({ identifier: OTHER_IDENTIFIER });
+    });
+
+    afterEach(async () => {
+      await clearTables();
+    });
+
+    async function insertIssue(
+      values: { identifier: string; parentId?: string; executionWorkspaceId?: string; companyId?: string; projectId?: string },
+    ): Promise<string> {
+      const id = randomUUID();
+      await db.insert(issues).values({
+        id,
+        companyId: values.companyId ?? companyId,
+        projectId: values.projectId ?? projectId,
+        title: `Issue ${values.identifier}`,
+        status: "in_progress",
+        identifier: values.identifier,
+        parentId: values.parentId ?? null,
+        executionWorkspaceId: values.executionWorkspaceId ?? null,
+        executionPolicy: EXECUTION_POLICY,
+        executionState: APPROVED_STATE,
+      });
+      return id;
+    }
+
+    async function insertWorkspace(
+      values: {
+        branchName: string | null;
+        repoUrl?: string | null;
+        sourceIssueId?: string | null;
+        mode?: string;
+        companyId?: string;
+        projectId?: string;
+      },
+    ): Promise<string> {
+      const [row] = await db
+        .insert(executionWorkspaces)
+        .values({
+          id: randomUUID(),
+          companyId: values.companyId ?? companyId,
+          projectId: values.projectId ?? projectId,
+          sourceIssueId: values.sourceIssueId ?? null,
+          mode: values.mode ?? "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "card-workspace",
+          status: "active",
+          branchName: values.branchName,
+          repoUrl: values.repoUrl === undefined ? REPO_URL : values.repoUrl,
+        })
+        .returning();
+      return row!.id;
+    }
+
+    async function bindWorkspace(id: string, executionWorkspaceId: string) {
+      await db.update(issues).set({ executionWorkspaceId }).where(eq(issues.id, id));
+    }
+
+    /** The transitioning card on its own sourceless execution-workspace row. */
+    async function seedOwnWorkspace(branchName: string | null = OWN_BRANCH): Promise<string> {
+      const wsId = await insertWorkspace({ branchName });
+      await bindWorkspace(issueId, wsId);
+      return wsId;
+    }
+
+    async function recordDelivery(delivery: Record<string, unknown>) {
+      await db
+        .update(issues)
+        .set({ executionState: { ...APPROVED_STATE, delivery } })
+        .where(eq(issues.id, issueId));
+    }
+
+    async function mentionPr(
+      overrides: { owner?: string; repo?: string; headRefName?: string | null; title?: string | null } = {},
+    ) {
+      const obj = createPRExternalObject(companyId, overrides.owner ?? "TEA-Core", overrides.repo ?? "paperclip", 1210, {
+        headRefName: overrides.headRefName === undefined ? OWN_BRANCH : overrides.headRefName,
+        title: overrides.title === undefined ? PR_TITLE : overrides.title,
+      });
+      const [externalObj] = await db.insert(externalObjects).values(obj).returning();
+      await db.insert(externalObjectMentions).values({
+        companyId,
+        sourceIssueId: issueId,
+        sourceKind: "comment",
+        objectId: externalObj!.id,
+        objectType: "pull_request",
+        providerKey: "github",
+      });
+    }
+
+    async function expectArmed(displayName = "TEA-Core/paperclip#1210") {
+      mockGhFetch.mockResolvedValueOnce(
+        createMockResponse({ data: { enablePullRequestAutoMerge: { clientMutationId: "abc" } } }),
+      );
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result).toEqual({ kind: "armed", message: `armed: Auto-merge enabled for ${displayName}` });
+      expect(mockGhFetch).toHaveBeenCalledTimes(1);
+    }
+
+    async function expectRefused(message: string) {
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result).toEqual({ kind: "skipped", message });
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    }
+
+    const NOT_OWNER = `skipped:not-pr-owner: PR 1210 title=[${OTHER_IDENTIFIER}] branch=(none) — none is the transitioning issue`;
+
+    it("arms the SUP-24405/#1210 shape: title names another card, head ref is the card's own workspace branch", async () => {
+      await seedOwnWorkspace();
+      await mentionPr();
+      await expectArmed();
+    });
+
+    it("the mint-time gate accepts that same PR, so arming it adds nothing the stamp does not already accept", async () => {
+      await seedOwnWorkspace();
+      await mentionPr();
+      mockGhFetch
+        .mockResolvedValueOnce(createMockResponse({ head: { sha: HEAD_SHA }, html_url: `${REPO_URL}/pull/1210` }))
+        .mockResolvedValueOnce(createMockResponse({ id: 12345 }));
+      const result = await publishApprovalStatus(db, companyId, issueId, IDENTIFIER, { enforceDeliveryIdentity: true });
+      expect(result.kind).toBe("armed");
+      expect(result.headSha).toBe(HEAD_SHA);
+    });
+
+    it("arms a PR on the card's own workspace branch whose title names no card", async () => {
+      await seedOwnWorkspace();
+      await mentionPr({ title: "chore: residuals follow-up" });
+      await expectArmed();
+    });
+
+    it("arms with a recorded delivery identity that carries the card's own workspace branch", async () => {
+      await seedOwnWorkspace();
+      await recordDelivery({ branch: OWN_BRANCH, headSha: HEAD_SHA, repo: { owner: "TEA-Core", repo: "paperclip" } });
+      await mentionPr();
+      await expectArmed();
+    });
+
+    it("a recorded identity with the correct branch still arms a SUP-prefixed head ref exactly as before", async () => {
+      const branch = `${IDENTIFIER}-own-branch`;
+      await seedOwnWorkspace(branch);
+      await recordDelivery({ branch, headSha: HEAD_SHA, repo: { owner: "TEA-Core", repo: "paperclip" } });
+      await mentionPr({ headRefName: branch, title: "chore: no card named" });
+      await expectArmed();
+    });
+
+    it("arms when a borrowing child also binds the card's self-sourced row (the child is not an owner)", async () => {
+      const wsId = await insertWorkspace({ branchName: OWN_BRANCH, sourceIssueId: issueId });
+      await bindWorkspace(issueId, wsId);
+      await insertIssue({ identifier: "SUP-24406", parentId: issueId, executionWorkspaceId: wsId });
+      await mentionPr();
+      await expectArmed();
+    });
+
+    it("arms when only another company has a workspace row on the same branch", async () => {
+      await seedOwnWorkspace();
+      const other = await insertCompanyWithProject("OTH");
+      const otherWs = await insertWorkspace({ branchName: OWN_BRANCH, companyId: other.companyId, projectId: other.projectId });
+      await insertIssue({ identifier: "SUP-30000", companyId: other.companyId, projectId: other.projectId, executionWorkspaceId: otherWs });
+      await mentionPr();
+      await expectArmed();
+    });
+
+    it("refuses when the head ref is a different issue's workspace branch", async () => {
+      await seedOwnWorkspace();
+      const otherWs = await insertWorkspace({ branchName: "fm/other-card-branch" });
+      await insertIssue({ identifier: "SUP-30001", executionWorkspaceId: otherWs });
+      await mentionPr({ headRefName: "fm/other-card-branch" });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("refuses when the head ref matches no workspace row", async () => {
+      await seedOwnWorkspace();
+      await mentionPr({ headRefName: "fm/unknown-branch" });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("refuses when the head ref differs from the card's branch only by case", async () => {
+      await seedOwnWorkspace();
+      await mentionPr({ headRefName: OWN_BRANCH.toUpperCase() });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("refuses a PR in another repo whose head ref equals the card's branch", async () => {
+      await seedOwnWorkspace();
+      await mentionPr({ repo: "other-repo" });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("refuses when the card's delivery repo cannot be resolved", async () => {
+      const wsId = await insertWorkspace({ branchName: OWN_BRANCH, repoUrl: null });
+      await bindWorkspace(issueId, wsId);
+      await mentionPr();
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("refuses when the card has no execution-workspace row", async () => {
+      await mentionPr();
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("refuses when the card's own row carries no branch", async () => {
+      await seedOwnWorkspace(null);
+      await mentionPr();
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("refuses when neither the card's row nor the PR carries a branch", async () => {
+      await seedOwnWorkspace(null);
+      await mentionPr({ headRefName: null });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("refuses a carrier: the card's row is borrowed from its parent and the PR is on the parent's branch", async () => {
+      const parentId = await insertIssue({ identifier: "SUP-20000" });
+      const wsId = await insertWorkspace({ branchName: "fm/plan-carrier-branch", sourceIssueId: parentId, mode: "shared_workspace" });
+      await bindWorkspace(parentId, wsId);
+      await db.update(issues).set({ parentId, executionWorkspaceId: wsId }).where(eq(issues.id, issueId));
+      await mentionPr({ headRefName: "fm/plan-carrier-branch" });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("refuses (unchanged) when the card's row belongs to an unrelated issue", async () => {
+      const ownerId = await insertIssue({ identifier: "SUP-30002" });
+      const wsId = await insertWorkspace({ branchName: OWN_BRANCH, sourceIssueId: ownerId });
+      await bindWorkspace(issueId, wsId);
+      await mentionPr();
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toContain("status:skipped:delivery_identity_unresolved:");
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    // The other row is sourced to its own issue, so only the "another row carries this branch"
+    // half of the ambiguity check can refuse it.
+    async function insertOtherOwnedWorkspace(identifier: string, branchName: string) {
+      const otherId = await insertIssue({ identifier });
+      await bindWorkspace(otherId, await insertWorkspace({ branchName, sourceIssueId: otherId }));
+    }
+
+    it("refuses as ambiguous when another issue's workspace row has the same branch", async () => {
+      await seedOwnWorkspace();
+      await insertOtherOwnedWorkspace("SUP-30003", OWN_BRANCH);
+      await mentionPr();
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("refuses as ambiguous when another row's branch differs from the card's only by case", async () => {
+      await seedOwnWorkspace("fm/Mixed-case-branch");
+      await insertOtherOwnedWorkspace("SUP-30004", "FM/mixed-case-BRANCH");
+      await mentionPr({ headRefName: "fm/Mixed-case-branch" });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("refuses as ambiguous when another issue also binds the card's sourceless row", async () => {
+      const wsId = await seedOwnWorkspace();
+      await insertIssue({ identifier: "SUP-30005", executionWorkspaceId: wsId });
+      await mentionPr();
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("refuses (unchanged) a recorded identity whose branch differs from the workspace branch", async () => {
+      await seedOwnWorkspace();
+      await recordDelivery({ branch: "fm/some-other-branch", headSha: HEAD_SHA, repo: { owner: "TEA-Core", repo: "paperclip" } });
+      await mentionPr();
+      await expectRefused(
+        "status:skipped:delivery_identity_unresolved: recorded delivery identity's branch does not match this card's control-plane delivery branch; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)",
+      );
+    });
+
+    it("refuses (unchanged) a recorded identity that carries no branch, as the mint-time gate does", async () => {
+      await seedOwnWorkspace();
+      await recordDelivery({ headSha: HEAD_SHA, repo: { owner: "TEA-Core", repo: "paperclip" } });
+      await mentionPr();
+      await expectRefused(
+        "status:skipped:delivery_identity_unresolved: recorded delivery identity has no branch; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)",
+      );
+    });
+  },
+);
