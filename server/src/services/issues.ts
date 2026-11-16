@@ -12163,17 +12163,24 @@ export function issueService(db: Db) {
         // must survive this write boundary too. The PATCH route resolves the
         // policy with explicit-empty preservation, but this re-normalization
         // collapsed `stages: []` back to null and wiped the stored shape.
-        // Gated on the incoming object's own raw `stages` array (the
-        // SUP-22098 raw-stages gate), so every other writer — including ones
-        // passing `null` — keeps today's semantics unchanged.
+        // Gated on the raw `stages: []` of BOTH the incoming object and the
+        // stored row (the SUP-22098 raw-stages gate). A monitor clear strips
+        // the monitor from the NORMALIZED stored policy, which always carries
+        // `stages: []`; a legacy stored row without a `stages` key must still
+        // collapse to null, as it did before SUP-22135. A writer passing `null`
+        // is unaffected.
         const incomingPolicyRaw = issueData.executionPolicy ?? null;
-        const incomingStagesExplicitEmpty =
+        const storedPolicyRaw = existing.executionPolicy ?? null;
+        const preserveExplicitEmptyPolicy =
           incomingPolicyRaw !== null &&
           Array.isArray(incomingPolicyRaw.stages) &&
-          incomingPolicyRaw.stages.length === 0;
+          incomingPolicyRaw.stages.length === 0 &&
+          storedPolicyRaw !== null &&
+          Array.isArray(storedPolicyRaw.stages) &&
+          storedPolicyRaw.stages.length === 0;
         const normalizedPolicy = normalizeIssueExecutionPolicy(incomingPolicyRaw, {
           preserveMonitorExternalRef: true,
-          preserveEmptyPolicy: incomingStagesExplicitEmpty,
+          preserveEmptyPolicy: preserveExplicitEmptyPolicy,
         });
         const normalizedPolicyRecord = (normalizedPolicy as Record<string, unknown> | null) ?? null;
         issueData.executionPolicy = normalizedPolicyRecord;

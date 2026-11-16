@@ -654,13 +654,16 @@ export function normalizeIssueExecutionPolicy(
  * - an explicitly empty `stages` array (`executionPolicy.stages: []`), unless
  *   the stored policy is *already* stage-less, in which case the array removes
  *   nothing (SUP-13925);
- * - an explicit `executionPolicy: null` on an issue whose stored policy is
- *   non-null;
+ * - an explicit `executionPolicy: null` on an issue whose stored policy holds
+ *   stages, a monitor, or other content that normalization keeps (SUP-24000);
  * - any other body over an issue that currently has stages, where the body
  *   normalizes back to null (e.g. `{}` or `{mode: "normal"}`) so it cannot
  *   silently clear the ladder.
  *
- * `null` over a `null` stored policy stays a no-op and is allowed. A
+ * `null` over a `null` stored policy stays a no-op and is allowed. SUP-24000:
+ * `null` over a stored `stages: []` policy with no other content is also
+ * allowed. That policy normalizes to null without the explicit-empty preserve,
+ * so the null removes nothing that this guard protects. A
  * monitor-only policy (or a policy with authorization/review-preset content
  * but no stages) can still be cleared or replaced with a body that is not
  * null-as-is and that omits the `stages` field.
@@ -731,7 +734,11 @@ export function assertPatchableExecutionPolicyWrite(input: {
     throw unprocessable("executionPolicy.stages must not be empty");
   }
 
-  if (raw === null && currentPolicy !== null) {
+  // SUP-24000: the stored explicit-empty policy (SUP-22135) is non-null, but
+  // when it holds nothing else, a normalization without the preserve option
+  // returns null. A null body removes no content from it, so allow the null,
+  // as for a null stored policy.
+  if (raw === null && currentPolicy !== null && normalizeIssueExecutionPolicy(currentPolicy) !== null) {
     throw unprocessable(
       "executionPolicy must not be set to null on an issue that currently has a policy; send the full replacement policy instead",
     );

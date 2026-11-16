@@ -19581,14 +19581,15 @@ export function issueRoutes(
       typeof req.body.executionPolicy === "object"
       && req.body.executionPolicy !== null
       && Object.prototype.hasOwnProperty.call(req.body.executionPolicy, "monitor");
-    // SUP-16525: set when this PATCH writes an executionPolicy that must satisfy
-    // INV-LADDER-1 against the *live* pointer. The assert in the block below
-    // reads `existing.executionState`; the pointer can move between that
-    // request-time read and the locked write, so a non-null value here forces
-    // the update onto the transactional path and is re-asserted against the
-    // locked row inside that transaction (see the re-check before `updateIssue`).
+    // SUP-16525 / SUP-22135: set when this PATCH writes an executionPolicy that
+    // must be re-checked against the *locked* row. The checks in the block
+    // below read the request-time snapshot `existing`; the stored policy and
+    // the live pointer can change before the locked write, so this flag forces
+    // the update onto the transactional path. Inside that transaction the
+    // stored policy is compared with the snapshot (409 on change) and
+    // INV-LADDER-1 is re-asserted against the locked pointer (see the
+    // re-check before `updateIssue`).
     const executionPolicyWriteRequested = req.body.executionPolicy !== undefined;
-    let invariantPolicyToRecheck: ReturnType<typeof resolvePatchExecutionPolicy> = null;
     let executionPolicyNeedsLockedRevalidation = false;
     if (executionPolicyWriteRequested) {
       // SUP-13634: a PATCH must not strip the close ladder. An explicitly
@@ -19621,8 +19622,11 @@ export function issueRoutes(
         executionState: parsedExecutionState,
         rearmPointer: rearmExecutionPolicyRequested,
       });
-      if (!rearmExecutionPolicyRequested && !stagesKeyAbsent && normalizedExecutionPolicy !== null) {
-        invariantPolicyToRecheck = normalizedExecutionPolicy;
+      // SUP-24000: every policy write except an authorized §4 re-arm is
+      // compared under the lock. A stages-omitted partial write carries the
+      // snapshot's stored stages forward, and a null write replaces the
+      // snapshot's policy, so either one can overwrite a concurrent ladder edit.
+      if (!rearmExecutionPolicyRequested) {
         executionPolicyNeedsLockedRevalidation = true;
       }
       // requestedAssigneeAgentId is the assignee AFTER this PATCH, so a PATCH that
@@ -21057,7 +21061,6 @@ export function issueRoutes(
       || workspaceReprovisionCloseId !== null
       || deliveryIdentityWorkspaceBranchWrite
       || parentEdgeWriteRequested
-      || invariantPolicyToRecheck !== null
       || executionPolicyNeedsLockedRevalidation
       || (
         missingApprovalStageGap !== null
@@ -21087,9 +21090,9 @@ export function issueRoutes(
       // transactional update below, where the gate would have no transaction to
       // run in).
       || parentEdgeWriteRequested
-      // SUP-16525: a policy write that must satisfy INV-LADDER-1 is re-asserted
-      // against the locked row, so it has to run on the transactional path.
-      || invariantPolicyToRecheck !== null
+      // SUP-16525 / SUP-24000: a policy write is re-checked against the
+      // locked row, so it has to run on the transactional path.
+      || executionPolicyNeedsLockedRevalidation
       // Both monitor spellings must recheck policy and ownership under the lock.
       || monitorKeyExplicit
       || monitorChanged
@@ -21321,11 +21324,11 @@ export function issueRoutes(
             const lockedPreviousPolicy = normalizeIssueExecutionPolicy(lockedStoredPolicyRaw, {
               preserveEmptyPolicy: lockedStoredStagesExplicitlyEmpty,
             });
-            const lockedStagesKeyAbsent =
-              req.body.executionPolicy !== null &&
-              typeof req.body.executionPolicy === "object" &&
-              !Array.isArray(req.body.executionPolicy) &&
-              !("stages" in (req.body.executionPolicy as Record<string, unknown>));
+            // The schema default adds `stages: []` to a validated body, so the
+            // omission is read from the flag the pre-validate middleware set.
+            const lockedStagesKeyAbsent = Boolean(
+              (req as unknown as Record<string, unknown>).executionPolicyStagesKeyAbsent,
+            );
             const lockedResolvedPolicy = resolvePatchExecutionPolicy({
               raw: req.body.executionPolicy,
               currentPolicy: lockedPreviousPolicy,
@@ -21344,7 +21347,10 @@ export function issueRoutes(
               executionState: parseIssueExecutionState(lockedForInvariant.executionState),
               rearmPointer: rearmExecutionPolicyRequested,
             });
-            if (lockedResolvedPolicy !== null) {
+            // A stages-omitted write carries the stored stages forward and
+            // cannot insert a stage, so it skips INV-LADDER-1, as the
+            // request-time check does.
+            if (lockedResolvedPolicy !== null && !lockedStagesKeyAbsent) {
               assertNoStageInsertedBehindPointer({
                 policy: lockedResolvedPolicy,
                 executionState: parseIssueExecutionState(lockedForInvariant.executionState),
