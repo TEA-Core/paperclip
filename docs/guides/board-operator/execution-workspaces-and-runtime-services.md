@@ -173,6 +173,8 @@ A checkout whose untracked listing is too large to read at all reports neither f
 
 Anything that appears there is a file an agent wrote to a shared checkout. Deleting it is safe once you know which run produced it; leaving it is safe until its path ships upstream.
 
+A card that runs in `project_primary` (shared workspace) mode does work in the base repository: its execution workspace's cwd *is* this checkout. When a sibling `git_worktree` dispatch finds the checkout untidy (a non-default branch, a detached HEAD off the base ref, unmerged paths, or modified tracked files), hygiene would normally restore it to the base ref. That restore is skipped while the checkout is the cwd of a non-closed `project_primary` execution workspace whose source issue, or an issue bound to it, is not `done`/`cancelled` or still has a queued or running run. Hygiene also skips the restore when that lookup fails. The checkout is then left exactly as it is, and the dispatch carries a `was not restored` warning that names the reasons. The attach-preserving fast-forward of a clean, behind default branch still runs. Once the card is terminal and idle, or its workspace is closed, the next dispatch restores the checkout as before.
+
 ## Current implementation guarantees
 
 With the current implementation:
