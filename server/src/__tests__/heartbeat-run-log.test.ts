@@ -61,12 +61,14 @@ describe("compactRunLogChunk composed with redactSecretTokens", () => {
 
     const result = redactSecretTokens(compactRunLogChunk(chunk));
 
-    // Two filters cover this line and the inner one wins: compactRunLogChunk
-    // itself runs redactSensitiveText, which masks `NAME=value` shapes before
-    // redactSecretTokens ever sees them. What matters here is that the tail of
-    // an oversized chunk is retained AND masked, not which filter did it.
+    // Two filters cover this line: compactRunLogChunk runs redactSensitiveText on
+    // `NAME=value` shapes, and redactSecretTokens runs outside it. Upstream #14937
+    // narrowed the inner field-name pattern (it no longer matches `*_SECRET_KEY`), so
+    // the outer filter masks this one. What matters here is that the tail of an
+    // oversized chunk is retained AND masked, not which filter did it.
     expect(result).not.toContain(secret);
-    expect(result).toContain(`SUPABASE_SECRET_KEY=${REDACTED_EVENT_VALUE}`);
+    expect([`SUPABASE_SECRET_KEY=${REDACTED_EVENT_VALUE}`, `SUPABASE_SECRET_KEY=${SECRET_REDACTION_TOKEN}`]
+      .some((masked) => result.includes(masked))).toBe(true);
   });
 
   it("masks a bare secret-shaped token in the tail of an oversized chunk", () => {

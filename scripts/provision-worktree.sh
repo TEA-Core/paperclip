@@ -63,7 +63,8 @@ fi
 # present but malformed (a symlink or a non-canonical alias) is still refused.
 # FORK DIVERGENCE (SUP-15582): upstream #14795 fails an absent source with setup
 # guidance; this fork keeps the self-contained provisioning path below and takes only
-# upstream's origin-labelled diagnostics for a present-but-malformed source.
+# upstream's origin-labelled diagnostics for a present-but-malformed source. Upstream
+# #14810's config-less "plain checkout" for an absent default source is not taken.
 have_source_config=0
 source_env_path=""
 if [[ -L "$source_config_path" ]]; then
