@@ -196,6 +196,40 @@ async function countCommitsMissingFromRemote(workspacePath: string): Promise<num
   }
 }
 
+type TerminalCleanupGitRunner = (args: string[]) => Promise<{ stdout: string }>;
+
+// A terminal row can record the delivery (PR) branch while its worktree is on
+// the branch the runtime created at `git worktree add -b`, or on a detached
+// HEAD after a squash merge. The recorded branch is then gone and the names can
+// never match again. Terminal cleanup tolerates that mismatch only when the
+// recorded branch is absent as a local ref, HEAD is landed (an ancestor of the
+// base ref, or the head of a recorded merged PR), and no HEAD commit is missing
+// from every remote. The caller still requires a clean worktree at the verified
+// HEAD. Any git error or unexpected output returns false, so cleanup refuses.
+export async function terminalCleanupBranchMismatchIsLanded(input: {
+  recordedBranchName: string;
+  headSha: string;
+  isMergedIntoBase: boolean | null;
+  mergedPullRequestHeadShas: readonly string[];
+  git: TerminalCleanupGitRunner;
+}): Promise<boolean> {
+  if (input.isMergedIntoBase !== true && !input.mergedPullRequestHeadShas.includes(input.headSha)) return false;
+  try {
+    try {
+      await input.git(["rev-parse", "--verify", "--quiet", `refs/heads/${input.recordedBranchName}`]);
+      return false;
+    } catch (error) {
+      // Exit 1 is the only "no such ref" answer. Any other failure is unknown.
+      const code = typeof error === "object" && error !== null && "code" in error ? error.code : null;
+      if (code !== 1) return false;
+    }
+    const missing = await input.git(["rev-list", "--count", "HEAD", "--not", "--remotes"]);
+    return missing.stdout.trim() === "0";
+  } catch {
+    return false;
+  }
+}
+
 function workspaceReaperDryRunEnabled(override: boolean | undefined) {
   if (override === true) return true;
   if (override === false) return false;
@@ -1807,6 +1841,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     const hasMergedPullRequestProduct = deliveryPullRequestProducts.some((product) => hasMergedMarker(product));
     const hasUnmergedPullRequestProduct = deliveryPullRequestProducts.some((product) => !hasMergedMarker(product));
     const aheadOfBase = typeof git?.aheadCount === "number" && git.aheadCount > 0;
+    // Head SHAs that recorded merged PRs carry. Terminal cleanup accepts one as
+    // landed-HEAD evidence for a squash-merged worktree.
+    const mergedPullRequestHeadShas = deliveryPullRequestProducts
+      .filter((product) => hasMergedMarker(product))
+      .map((product) => readNullableString(product.metadata?.headSha))
+      .filter((sha): sha is string => sha !== null);
 
     return {
       deliveryState: deriveExecutionWorkspaceDeliveryState({
@@ -1820,6 +1860,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       workspaceDirty: Boolean(git?.hasDirtyTrackedFiles || git?.hasUntrackedFiles),
       hasPullRequestProduct: deliveryPullRequestProducts.length > 0,
       workspaceHeadSha,
+      mergedPullRequestHeadShas,
     };
   }
 
@@ -1908,6 +1949,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   async function assertTerminalCleanupGitStateUnchanged(
     workspace: ExecutionWorkspaceRow,
     expectedHeadSha: string | null,
+    mergedPullRequestHeadShas: readonly string[],
     reader: RuntimeServiceReadDb,
     reclaimRecordOnly = false,
   ) {
@@ -1942,7 +1984,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       || current.git.hasDirtyTrackedFiles
       || current.git.hasUntrackedFiles
       || currentHeadSha !== expectedHeadSha
-      || (workspace.branchName && currentBranchName !== workspace.branchName)
+      || (workspace.branchName && currentBranchName !== workspace.branchName
+        && !(await terminalCleanupBranchMismatchIsLanded({
+          recordedBranchName: workspace.branchName,
+          headSha: expectedHeadSha,
+          isMergedIntoBase: current.git.isMergedIntoBase,
+          mergedPullRequestHeadShas,
+          git: (args) => runGit(args, workspacePath),
+        })))
     ) {
       throw new Error("Refusing terminal workspace cleanup because the git worktree changed after delivery was verified");
     }
@@ -2135,6 +2184,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   async function cleanupTerminalWorkspace(
     workspace: ExecutionWorkspaceRow,
     expectedHeadSha: string | null,
+    mergedPullRequestHeadShas: readonly string[],
     capturedGeneration: number,
     reclaimRecordOnly = false,
   ): Promise<{ cleaned: boolean; warnings: string[]; skippedReopened?: boolean }> {
@@ -2153,13 +2203,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         message: "execution workspace cleanup skipped because it was reopened",
       },
       onSkip: () => ({ cleaned: false, warnings: [], skippedReopened: true }),
-      write: ({ tx }) => runTerminalWorkspaceCleanup(workspace, expectedHeadSha, tx, reclaimRecordOnly),
+      write: ({ tx }) => runTerminalWorkspaceCleanup(workspace, expectedHeadSha, mergedPullRequestHeadShas, tx, reclaimRecordOnly),
     });
   }
 
   async function runTerminalWorkspaceCleanup(
     workspace: ExecutionWorkspaceRow,
     expectedHeadSha: string | null,
+    mergedPullRequestHeadShas: readonly string[],
     tx: DbTransaction,
     reclaimRecordOnly: boolean,
   ) {
@@ -2198,7 +2249,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       ? await acquireGitWorktreeCleanupLock(workspace.providerRef ?? workspace.cwd!)
       : null;
     try {
-      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, tx, reclaimRecordOnly);
+      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, mergedPullRequestHeadShas, tx, reclaimRecordOnly);
       await opts.beforeTerminalWorkspaceCleanup?.(workspace);
       if (reclaimRecordOnly && !(await cleanNoPrWorktreeCanBeReclaimed(workspace, true))) {
         throw new Error("Refusing terminal workspace cleanup because fresh remote reachability is unverified");
@@ -2209,7 +2260,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // Keep legacy cleanup free of host-wide table locks.
         await tx.execute(sql`LOCK TABLE ${executionWorkspaces}, ${issues} IN SHARE ROW EXCLUSIVE MODE NOWAIT`);
       }
-      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, tx, reclaimRecordOnly);
+      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, mergedPullRequestHeadShas, tx, reclaimRecordOnly);
       await stopRuntimeServicesForExecutionWorkspace({
         db: cleanupDb,
         executionWorkspaceId: workspace.id,
@@ -2224,7 +2275,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           companyId: workspace.companyId,
           executionWorkspaceId: workspace.id,
         }),
-        assertSafeToCleanup: () => assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, tx, reclaimRecordOnly),
+        assertSafeToCleanup: () => assertTerminalCleanupGitStateUnchanged(
+          workspace,
+          expectedHeadSha,
+          mergedPullRequestHeadShas,
+          tx,
+          reclaimRecordOnly,
+        ),
         beforeBranchDelete: () => cleanupLock?.releaseBranchRefLock() ?? Promise.resolve(),
         expectedBranchHeadSha: expectedHeadSha,
         // Git index, HEAD, and branch-ref locks prevent a clean HEAD change
@@ -3587,6 +3644,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             const cleanup = await cleanupTerminalWorkspace(
               workspace,
               assessment.workspaceHeadSha,
+              assessment.mergedPullRequestHeadShas,
               capturedGeneration,
               cleanupRecordOnly,
             );
@@ -3803,7 +3861,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           archived.metadata as Record<string, unknown> | null,
         );
         try {
-          const cleanup = await cleanupTerminalWorkspace(archived, assessment.workspaceHeadSha, capturedGeneration, cleanupRecordOnly);
+          const cleanup = await cleanupTerminalWorkspace(
+            archived,
+            assessment.workspaceHeadSha,
+            assessment.mergedPullRequestHeadShas,
+            capturedGeneration,
+            cleanupRecordOnly,
+          );
           if (cleanup.skippedReopened) result.skippedReopened += 1;
           else if (!cleanup.cleaned) result.cleanupFailed += 1;
           else result.archived += 1;

@@ -1500,7 +1500,11 @@ Environment overrides:
 - `PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS=<days>` sets how long the
   terminal-workspace reaper waits after an issue tree becomes terminal before it
   archives the execution workspace. By default, only a row with a recorded merged
-  pull request also has its worktree deleted. Every other archive (shared sessions,
+  pull request also has its worktree deleted. That deletion accepts a checked-out
+  branch other than the recorded one only when the recorded branch no longer
+  exists locally, HEAD is landed (an ancestor of the base ref, or the `headSha` of
+  the merged pull request) and pushed, and the worktree is clean; otherwise, or on
+  any git error, the row stays `cleanup_failed`. Every other archive (shared sessions,
   rows with no pull request, missing or non-git cwds) changes the database row and
   no work-tree file, and leaves the directory and branch on disk. One live case
   also touches git metadata: a no-PR row whose recorded branch is gone is first

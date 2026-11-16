@@ -7153,6 +7153,215 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       }
     }, 20_000);
   });
+
+  describe("terminal cleanup when the recorded branch differs from the checked-out branch", () => {
+    // The row records the delivery (PR) branch while the worktree is on the
+    // branch the runtime created at `git worktree add -b`, or on a detached HEAD
+    // after a squash merge. The recorded branch does not exist as a local ref.
+    const RECORDED_BRANCH = "fm/recorded-delivery-branch";
+    const CHANGED_REASON = "Refusing terminal workspace cleanup because the git worktree changed after delivery was verified";
+
+    async function seedBranchIdentityWorkspace(options: {
+      landing: "ancestor" | "squash";
+      prHeadSha?: "head" | "other";
+    }) {
+      const seeded = await seedTerminalWorkspace({ publish: true });
+      if (options.landing === "ancestor") {
+        await runGit(seeded.repoRoot, ["merge", "--ff-only", "PAP-16015-delivery"]);
+      } else {
+        await runGit(seeded.repoRoot, ["merge", "--squash", "PAP-16015-delivery"]);
+        await runGit(seeded.repoRoot, ["commit", "-m", "Squash-merged delivery"]);
+        await runGit(seeded.worktreePath, ["checkout", "--detach"]);
+        await runGit(seeded.repoRoot, ["branch", "-D", "PAP-16015-delivery"]);
+      }
+      const prHeadSha = options.prHeadSha === "head"
+        ? seeded.headSha
+        : options.prHeadSha === "other"
+          ? "1111111111111111111111111111111111111111"
+          : undefined;
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.sourceIssueId,
+        executionWorkspaceId: seeded.executionWorkspaceId,
+        type: "pull_request",
+        provider: "github",
+        title: "Delivered PR",
+        url: "https://github.com/paperclipai/paperclip/pull/10623",
+        status: "merged",
+        metadata: { mergedAt: "2026-01-01T00:00:00Z", ...(prHeadSha ? { headSha: prHeadSha } : {}) },
+      });
+      await db.update(executionWorkspaces)
+        .set({ branchName: RECORDED_BRANCH })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      return seeded;
+    }
+
+    function serviceWithHook(hook: () => Promise<void>) {
+      return executionWorkspaceService(db, { workspaceReaperCooldownDays: 0, beforeTerminalWorkspaceCleanup: hook });
+    }
+
+    async function readRow(executionWorkspaceId: string) {
+      const [workspace] = await db
+        .select({ status: executionWorkspaces.status, cleanupReason: executionWorkspaces.cleanupReason })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, executionWorkspaceId));
+      return workspace;
+    }
+
+    async function expectCleanedUp(seeded: { executionWorkspaceId: string; worktreePath: string }, sweep: unknown) {
+      expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
+      expect(await readRow(seeded.executionWorkspaceId)).toMatchObject({ status: "archived" });
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+    }
+
+    async function expectRefused(
+      seeded: { executionWorkspaceId: string; worktreePath: string },
+      sweep: unknown,
+      reason = CHANGED_REASON,
+    ) {
+      expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 1 });
+      expect(await readRow(seeded.executionWorkspaceId)).toMatchObject({
+        status: "cleanup_failed",
+        cleanupReason: `issue_terminal | ${reason}`,
+      });
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    }
+
+    it("cleans up when the recorded branch is gone and HEAD is an ancestor of the base ref", async () => {
+      const seeded = await seedBranchIdentityWorkspace({ landing: "ancestor" });
+      await expectCleanedUp(seeded, await svc.sweepTerminalWorkspaces());
+    }, 20_000);
+
+    it("cleans up a detached squash-merged HEAD that equals the merged PR head", async () => {
+      const seeded = await seedBranchIdentityWorkspace({ landing: "squash", prHeadSha: "head" });
+      expect(await readGit(seeded.worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => null)).toBeNull();
+      await expect(runGit(seeded.worktreePath, ["merge-base", "--is-ancestor", "HEAD", "main"])).rejects.toThrow();
+      await expectCleanedUp(seeded, await svc.sweepTerminalWorkspaces());
+    }, 20_000);
+
+    it("retries a stranded cleanup_failed row once the squash-merged HEAD is proven landed", async () => {
+      const seeded = await seedBranchIdentityWorkspace({ landing: "squash", prHeadSha: "head" });
+      await db.update(executionWorkspaces)
+        .set({
+          status: "cleanup_failed",
+          closedAt: new Date("2026-01-02T00:00:00Z"),
+          updatedAt: new Date("2026-01-02T00:00:00Z"),
+          cleanupReason: `issue_terminal | ${CHANGED_REASON}`,
+        })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      await expectCleanedUp(seeded, await svc.sweepTerminalWorkspaces());
+    }, 20_000);
+
+    it("refuses when the recorded branch still exists as a local ref", async () => {
+      const seeded = await seedBranchIdentityWorkspace({ landing: "ancestor" });
+      await runGit(seeded.repoRoot, ["branch", RECORDED_BRANCH, "main"]);
+      await expectRefused(seeded, await svc.sweepTerminalWorkspaces());
+    }, 20_000);
+
+    it("refuses when HEAD is neither an ancestor of the base ref nor a merged PR head", async () => {
+      const seeded = await seedBranchIdentityWorkspace({ landing: "squash" });
+      await expectRefused(seeded, await svc.sweepTerminalWorkspaces());
+    }, 20_000);
+
+    it("refuses when the merged PR head differs from HEAD", async () => {
+      const seeded = await seedBranchIdentityWorkspace({ landing: "squash", prHeadSha: "other" });
+      await expectRefused(seeded, await svc.sweepTerminalWorkspaces());
+    }, 20_000);
+
+    it("refuses when only an unmerged PR records HEAD as its head", async () => {
+      const seeded = await seedBranchIdentityWorkspace({ landing: "squash" });
+      await db.insert(issueWorkProducts).values({
+        companyId: seeded.companyId,
+        issueId: seeded.sourceIssueId,
+        executionWorkspaceId: seeded.executionWorkspaceId,
+        type: "pull_request",
+        provider: "github",
+        title: "Unmerged PR",
+        url: "https://github.com/paperclipai/paperclip/pull/10624",
+        status: "ready_for_review",
+        metadata: { headSha: seeded.headSha },
+      });
+      await expectRefused(seeded, await svc.sweepTerminalWorkspaces());
+    }, 20_000);
+
+    it("refuses when whether HEAD is landed cannot be determined", async () => {
+      const seeded = await seedBranchIdentityWorkspace({ landing: "ancestor" });
+      await db.update(executionWorkspaces)
+        .set({ baseRef: "refs/heads/missing-base" })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      await expectRefused(seeded, await svc.sweepTerminalWorkspaces());
+    }, 20_000);
+
+    it("refuses when a tracked file changes after delivery was assessed", async () => {
+      const seeded = await seedBranchIdentityWorkspace({ landing: "ancestor" });
+      const sweep = await serviceWithHook(async () => {
+        await fs.writeFile(path.join(seeded.worktreePath, "delivered.txt"), "changed\n", "utf8");
+      }).sweepTerminalWorkspaces();
+      await expectRefused(seeded, sweep);
+      await expect(fs.readFile(path.join(seeded.worktreePath, "delivered.txt"), "utf8")).resolves.toBe("changed\n");
+    }, 20_000);
+
+    it("refuses when an untracked file appears after delivery was assessed", async () => {
+      const seeded = await seedBranchIdentityWorkspace({ landing: "ancestor" });
+      const sweep = await serviceWithHook(async () => {
+        await fs.writeFile(path.join(seeded.worktreePath, "late-work.txt"), "not delivered\n", "utf8");
+      }).sweepTerminalWorkspaces();
+      await expectRefused(seeded, sweep);
+      await expect(fs.readFile(path.join(seeded.worktreePath, "late-work.txt"), "utf8")).resolves.toBe("not delivered\n");
+    }, 20_000);
+
+    it("refuses when HEAD is on no remote", async () => {
+      const seeded = await seedBranchIdentityWorkspace({ landing: "ancestor" });
+      const sweep = await serviceWithHook(async () => {
+        // HEAD stays an ancestor of the local base ref, but no remote-tracking
+        // ref holds it any more.
+        const remoteRefs = await readGit(seeded.repoRoot, ["for-each-ref", "--format=%(refname)", "refs/remotes"]);
+        for (const ref of (remoteRefs ?? "").split("\n").filter(Boolean)) {
+          await runGit(seeded.repoRoot, ["update-ref", "-d", ref]);
+        }
+      }).sweepTerminalWorkspaces();
+      await expectRefused(seeded, sweep);
+    }, 20_000);
+
+    it("refuses when HEAD moves after delivery was assessed", async () => {
+      const seeded = await seedBranchIdentityWorkspace({ landing: "ancestor" });
+      // A twin commit with the same tree is landed and on the remote, so moving
+      // HEAD to it leaves only the HEAD check to differ. The cleanup holds the
+      // index and HEAD locks, so the racing writer edits HEAD directly.
+      const twin = await readGit(seeded.repoRoot, ["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "Twin"]);
+      if (!twin) throw new Error("twin commit was not created");
+      await runGit(seeded.repoRoot, ["merge", "--ff-only", twin]);
+      await runGit(seeded.repoRoot, ["push", "origin", "main"]);
+      const gitDir = await readGit(seeded.worktreePath, ["rev-parse", "--absolute-git-dir"]);
+      if (!gitDir) throw new Error("worktree has no git dir");
+      const sweep = await serviceWithHook(async () => {
+        await fs.writeFile(path.join(gitDir, "HEAD"), `${twin}\n`, "utf8");
+      }).sweepTerminalWorkspaces();
+      await expectRefused(seeded, sweep);
+      await expect(readGit(seeded.worktreePath, ["rev-parse", "HEAD"])).resolves.toBe(twin);
+    }, 20_000);
+
+    it("refuses when git status cannot be verified", async () => {
+      const seeded = await seedBranchIdentityWorkspace({ landing: "ancestor" });
+      const originalRun = workspaceGitOperationScheduler.run.bind(workspaceGitOperationScheduler);
+      let statusScanCount = 0;
+      const statusSpy = vi.spyOn(workspaceGitOperationScheduler, "run")
+        .mockImplementation(async (input) => {
+          statusScanCount += 1;
+          if (statusScanCount > 1) throw new Error("scan timed out");
+          return originalRun(input);
+        });
+      try {
+        await expectRefused(
+          seeded,
+          await svc.sweepTerminalWorkspaces(),
+          "Refusing terminal workspace cleanup because the git status could not be verified",
+        );
+      } finally {
+        statusSpy.mockRestore();
+      }
+    }, 20_000);
+  });
 });
 
 describeEmbeddedPostgres("detachIssuesFromClosedExecutionWorkspace", () => {
