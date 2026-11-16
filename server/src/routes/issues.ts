@@ -21449,6 +21449,7 @@ export function issueRoutes(
                 attachmentIds: commentAttachmentIds,
                 clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
                 mirrorToSlack: actor.actorType === "user",
+                boardApiKeyId: actor.boardApiKeyId,
                 authorizationReason: issueMutationAuthorizationReason,
                 sourceTrust: attachmentCommentSourceTrust,
                 onIssueTouched: noteCommittedUpdatedAt,
@@ -21498,6 +21499,7 @@ export function issueRoutes(
                 authorizationReason: issueMutationAuthorizationReason,
                 clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
                 mirrorToSlack: actor.actorType === "user",
+                boardApiKeyId: actor.boardApiKeyId,
                 sourceTrust: await sourceTrustForActorWrite(existing, actor, tx as unknown as Db),
                 onIssueTouched: noteCommittedUpdatedAt,
               }, tx);
@@ -22485,6 +22487,7 @@ export function issueRoutes(
         authorizationReason: issueMutationAuthorizationReason,
         clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
         mirrorToSlack: actor.actorType === "user",
+        boardApiKeyId: actor.boardApiKeyId,
         sourceTrust: await sourceTrustForActorWrite(issue, actor),
         onIssueTouched: noteCommittedUpdatedAt,
       });
@@ -26298,6 +26301,7 @@ export function issueRoutes(
         attachmentIds: req.body.attachmentIds,
         clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
         mirrorToSlack: actor.actorType === "user",
+        boardApiKeyId: actor.boardApiKeyId,
         sourceTrust,
       };
       let txResult: { comment: Awaited<ReturnType<typeof svc.addComment>>; issue: NonNullable<Awaited<ReturnType<typeof svc.update>>> };
@@ -26478,6 +26482,7 @@ export function issueRoutes(
         attachmentIds: req.body.attachmentIds,
         clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
         mirrorToSlack: actor.actorType === "user",
+        boardApiKeyId: actor.boardApiKeyId,
         authorizationReason: commentAuthorizationReason,
         sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
       };

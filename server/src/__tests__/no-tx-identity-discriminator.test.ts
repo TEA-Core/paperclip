@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
+import { blankNonCode } from "./helpers/blank-non-code.js";
+
 /**
  * Ratchet guard (SUP-17465): no service module may decide "am I already inside
  * a transaction?" by comparing a db-or-tx handle against the pool `db`
@@ -17,11 +19,11 @@ import { describe, expect, it } from "vitest";
  * that only fires when a caller starts passing a real transaction handle.
  *
  * Scope: every `*.ts` under `server/src/services/` (recursive). The scanner is
- * comment-aware — a commented-out offender or prose mentioning the shape is
- * NOT a violation (AC1 is a code-level census) — but it is deliberately
- * text-based rather than AST-aware, so it matches the shape wherever it
- * appears in live code, including inside a string it cannot tell apart from
- * code.
+ * comment- and literal-aware — a commented-out offender, prose mentioning the
+ * shape, or the shape inside a string or regex literal is NOT a violation (AC1
+ * is a code-level census) — but it is deliberately text-based rather than
+ * AST-aware, so it matches the shape wherever it appears in live code,
+ * including inside a template `${ ... }` substitution.
  *
  * The allowlist is empty and MUST stay empty: this card's premise is that the
  * three SUP-16541 consumer children plus SUP-17462 already migrated every
@@ -46,47 +48,15 @@ const TX_IDENTITY_CHECK = /(?:===|!==)[ \t]*db\b/g;
 const AGENTS_MEMOIZATION_EXCEPTION = /dbClient === db \? secretsSvc : secretService\(dbClient\)/;
 
 /**
- * Blanks out `//`, `/* ... *\/` and string/template literals while preserving
- * line breaks, so reported line numbers still map to the original file.
+ * 1-based line numbers of every live tx-identity check in `source`.
+ *
+ * The code-only view comes from `blankNonCode`, a real lexer: a quote-pairing
+ * scan loses sync on a regex literal that holds a quote character or on a
+ * nested template literal, and from there reads the rest of the file inside
+ * out (SUP-23998).
  */
-export function stripCommentsAndStrings(source: string): string {
-  let out = "";
-  let i = 0;
-  const n = source.length;
-  let state: "code" | "line" | "block" | "single" | "double" | "template" = "code";
-  while (i < n) {
-    const c = source[i];
-    const next = source[i + 1];
-    if (state === "code") {
-      if (c === "/" && next === "/") { state = "line"; out += "  "; i += 2; continue; }
-      if (c === "/" && next === "*") { state = "block"; out += "  "; i += 2; continue; }
-      if (c === "'") { state = "single"; out += c; i += 1; continue; }
-      if (c === '"') { state = "double"; out += c; i += 1; continue; }
-      if (c === "`") { state = "template"; out += c; i += 1; continue; }
-      out += c; i += 1; continue;
-    }
-    if (state === "line") {
-      if (c === "\n") { state = "code"; out += c; i += 1; continue; }
-      out += " "; i += 1; continue;
-    }
-    if (state === "block") {
-      if (c === "*" && next === "/") { state = "code"; out += "  "; i += 2; continue; }
-      out += c === "\n" ? "\n" : " "; i += 1; continue;
-    }
-    if (c === "\\") { out += "  "; i += 2; continue; }
-    if (
-      (state === "single" && c === "'")
-      || (state === "double" && c === '"')
-      || (state === "template" && c === "`")
-    ) { state = "code"; out += c; i += 1; continue; }
-    out += c === "\n" ? "\n" : " "; i += 1; continue;
-  }
-  return out;
-}
-
-/** 1-based line numbers of every live tx-identity check in `source`. */
 export function findTxIdentityChecks(source: string): number[] {
-  const code = stripCommentsAndStrings(source);
+  const code = blankNonCode(source);
   const lines: number[] = [];
   for (const match of code.matchAll(TX_IDENTITY_CHECK)) {
     lines.push(code.slice(0, match.index!).split("\n").length);
@@ -120,6 +90,26 @@ describe("no service module discriminates a transaction by `=== db`", () => {
     expect(findTxIdentityChecks("const msg = 'dbOrTx === db';")).toEqual([]);
     expect(findTxIdentityChecks("if (dbOrTx === dbase) {}")).toEqual([]);
     expect(findTxIdentityChecks("if (dbOrTx === pool) {}")).toEqual([]);
+  });
+
+  it("stays in sync after a regex literal with a quote or a nested template (SUP-23998)", () => {
+    // A quote-pairing scan read the backtick in the regex as a template opener
+    // and then saw the rest of the file inside out.
+    expect(
+      findTxIdentityChecks("const r = name.replace(/[`<>]/g, ' ');\nif (dbOrTx === db) {}"),
+    ).toEqual([2]);
+    expect(
+      findTxIdentityChecks('const r = name.replace(/"/g, "");\nif (dbOrTx === db) {}'),
+    ).toEqual([2]);
+    // The inner backtick closed the outer template early.
+    expect(
+      findTxIdentityChecks("const k = `${a ?? `b:${c}`}:x`;\nif (dbOrTx !== db) {}"),
+    ).toEqual([2]);
+    // Division is not a regex.
+    expect(findTxIdentityChecks("const h = a / b / c;\nif (dbOrTx === db) {}")).toEqual([2]);
+    // Code inside a substitution is live; template text is not.
+    expect(findTxIdentityChecks("const k = `${dbOrTx === db ? 1 : 2}`;")).toEqual([1]);
+    expect(findTxIdentityChecks("const k = `dbOrTx === db ${x}`;")).toEqual([]);
   });
 
   it("treats the agents.ts memoization check as a documented exception", () => {

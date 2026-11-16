@@ -272,6 +272,14 @@ describeEmbeddedPostgres("connectionIntentService", () => {
         "Cloudflare is reserved for operator-managed sandbox execution",
       );
 
+      // SUP-23998: the denylist runs before aggregator routing, so an operator-listed
+      // route is refused as denylisted, not routed to the provider-choice question.
+      process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = "via:composio:github";
+      await expect(connectionIntentService(db).request(claims, "via:composio:github")).rejects.toMatchObject({
+        status: 422,
+        message: expect.stringContaining("already provides via:composio:github"),
+      });
+
       process.env.PAPERCLIP_CONNECTION_REQUEST_DENYLIST = "";
       const allowed = await connectionIntentService(db).search(claims, "cloudflare");
       expect(allowed.results[0]).toEqual(
