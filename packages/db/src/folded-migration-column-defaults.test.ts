@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { is } from "drizzle-orm";
-import { getTableConfig, PgTable } from "drizzle-orm/pg-core";
+import { SQL, is } from "drizzle-orm";
+import { PgDialect, PgTable, getTableConfig, pgTable, timestamp, uuid } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
 import * as schema from "./schema/index.js";
 
@@ -64,6 +64,11 @@ function sqlDefaultValue(defaultSql: string): unknown {
   return defaultSql;
 }
 
+/** A schema default as the migration SQL writes it: literals as values, SQL fragments as text. */
+function schemaDefaultValue(value: unknown): unknown {
+  return is(value, SQL) ? new PgDialect().sqlToQuery(value).sql : value;
+}
+
 function schemaColumns() {
   const tables = new Map<string, ReturnType<typeof getTableConfig>>();
   for (const value of Object.values(schema)) {
@@ -101,11 +106,20 @@ describe("folded migrations 0303-0306 agree with the Drizzle schema", () => {
     expect(column!.notNull, `${added.migration}: NOT NULL differs from the schema`).toBe(added.notNull);
     if (added.defaultSql === null) {
       expect(column!.hasDefault, `${added.migration}: the schema has a default the SQL lacks`).toBe(false);
-    } else if (/\(\)$/.test(added.defaultSql)) {
-      // `now()`, `gen_random_uuid()`: the schema holds an SQL fragment, so check presence only.
-      expect(column!.hasDefault, `${added.migration}: the schema lacks the SQL default`).toBe(true);
     } else {
-      expect(column!.default, `${added.migration}: DEFAULT differs from the schema`).toEqual(sqlDefaultValue(added.defaultSql));
+      expect(column!.hasDefault, `${added.migration}: the schema lacks the SQL default`).toBe(true);
+      expect(schemaDefaultValue(column!.default), `${added.migration}: DEFAULT differs from the schema`).toEqual(sqlDefaultValue(added.defaultSql));
     }
+  });
+
+  // CodeRabbit on PR 1208: a function default must match by expression, not only exist.
+  it("tells apart two different function defaults", () => {
+    const fixture = getTableConfig(pgTable("fixture", { createdAt: timestamp("created_at").defaultNow(), id: uuid("id").defaultRandom() }));
+    const now = fixture.columns.find((column) => column.name === "created_at")!.default;
+    const random = fixture.columns.find((column) => column.name === "id")!.default;
+    expect(schemaDefaultValue(now)).toEqual(sqlDefaultValue("now()"));
+    expect(schemaDefaultValue(random)).toEqual(sqlDefaultValue("gen_random_uuid()"));
+    expect(schemaDefaultValue(now)).not.toEqual(sqlDefaultValue("gen_random_uuid()"));
+    expect(schemaDefaultValue(random)).not.toEqual(sqlDefaultValue("now()"));
   });
 });

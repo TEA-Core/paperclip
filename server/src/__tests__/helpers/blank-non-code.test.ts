@@ -68,6 +68,29 @@ describe("blankNonCode", () => {
     expect(compact("if (!/'/.test(s)) live();")).toBe("if (! .test(s)) live();");
   });
 
+  // CodeRabbit on PR 1208. Each case below made the lexer lose sync, so a guard went blind.
+  it("treats `of` as a name outside a for...of header", () => {
+    expect(compact("const of = 12; const n = of / (dbOrTx === db ? 1 : 2) / 3;")).toBe(
+      "const of = 12; const n = of / (dbOrTx === db ? 1 : 2) / 3;",
+    );
+    expect(compact("for (const x of /'/.exec(s)) live(); after();")).toBe("for (const x of .exec(s)) live(); after();");
+  });
+
+  it("reads a slash after an if, while or for header as a regex, and after any other parenthesis as division", () => {
+    expect(compact("if (ok) /`/.test(s);\nif (dbOrTx === db) {}")).toBe("if (ok) .test(s); if (dbOrTx === db) {}");
+    expect(compact("while (go) /'/.test(s); live();")).toBe("while (go) .test(s); live();");
+    expect(compact("for (;;) /'/.test(s); live();")).toBe("for (;;) .test(s); live();");
+    expect(compact("const h = f(a) / (dbOrTx === db ? 1 : 2) / 3;")).toBe("const h = f(a) / (dbOrTx === db ? 1 : 2) / 3;");
+    expect(compact("if (ok) { x = (a) / b / c; }")).toBe("if (ok) { x = (a) / b / c; }");
+  });
+
+  it("reads a slash after a postfix ++ or -- as division", () => {
+    expect(compact("count++ / (dbOrTx === db ? 1 : 2) / 3;")).toBe("count++ / (dbOrTx === db ? 1 : 2) / 3;");
+    expect(compact("const h = xs[i]-- / 2 / 3; live();")).toBe("const h = xs[i]-- / 2 / 3; live();");
+    expect(compact("x = ++n / 2 / 3; live();")).toBe("x = ++n / 2 / 3; live();");
+    expect(compact("x = a + +/'/.test(s); live();")).toBe("x = a + + .test(s); live();");
+  });
+
   it("keeps substitution code live and blanks template text, including nested templates", () => {
     expect(compact("`a ${live(1)} b`;")).toBe("live(1) ;");
     expect(compact("`${k ?? `n:${id}`}:x`; after();")).toBe("k ?? id ; after();");

@@ -28,7 +28,6 @@ const REGEX_PRECEDING_KEYWORDS = new Set([
   "void",
   "throw",
   "in",
-  "of",
   "instanceof",
   "new",
   "else",
@@ -37,11 +36,13 @@ const REGEX_PRECEDING_KEYWORDS = new Set([
   "await",
 ]);
 
-/** Punctuation after which a `/` starts a regular expression. */
+/** Punctuation after which a `/` starts a regular expression. `control)` closes an `if`/`while`/`for` header. */
 const REGEX_PRECEDING_PUNCTUATION = new Set([
   "(", ",", "=", ":", "[", "!", "&", "|", "?", "{", "}", ";",
-  "+", "-", "*", "%", "<", ">", "~", "^",
+  "+", "-", "*", "%", "<", ">", "~", "^", "control)",
 ]);
+
+const CONTROL_KEYWORDS = new Set(["if", "while", "with"]);
 
 function isIdentifierChar(c: string | undefined): boolean {
   return c !== undefined && /[A-Za-z0-9_$]/.test(c);
@@ -61,6 +62,8 @@ export function blankNonCode(source: string): string {
   // The last significant code token, to tell a regex from a division.
   let prevPunctuation: string | null = null;
   let prevWord: string | null = null;
+  // One entry per open `(`: the kind of header it belongs to.
+  const parens: Array<"for" | "control" | "plain"> = [];
 
   /** Blank a template text part starting after a backtick or `}`; returns the next index. */
   const scanTemplateText = (start: number): number => {
@@ -161,7 +164,9 @@ export function blankNonCode(source: string): string {
       const regexAllowed =
         (prevPunctuation === null && prevWord === null) ||
         (prevPunctuation !== null && REGEX_PRECEDING_PUNCTUATION.has(prevPunctuation)) ||
-        (prevWord !== null && REGEX_PRECEDING_KEYWORDS.has(prevWord));
+        (prevWord !== null && REGEX_PRECEDING_KEYWORDS.has(prevWord)) ||
+        // `of` is a keyword only in a `for (... of ...)` header; elsewhere it is a name.
+        (prevWord === "of" && parens[parens.length - 1] === "for");
       if (regexAllowed) {
         let j = i + 1;
         let inClass = false;
@@ -202,11 +207,35 @@ export function blankNonCode(source: string): string {
       i = j;
       continue;
     }
-    if (c === ")" || c === "]") {
-      // An operand ends here, so a following `/` is a division.
+    if (c === "(") {
+      // The header of `if (...)`, `while (...)`, `for (...)` and `with (...)` is not an
+      // operand: a `/` after its closing parenthesis starts a regex statement.
+      const control = prevWord === "for" ? "for" : prevWord !== null && CONTROL_KEYWORDS.has(prevWord) ? "control" : "plain";
+      parens.push(control);
+      setPunctuation("(");
+      i++;
+      continue;
+    }
+    if (c === ")") {
+      // A plain `)` ends an operand, so a following `/` is a division.
+      const closed = parens.pop();
+      prevPunctuation = closed === "for" || closed === "control" ? "control)" : ")";
+      prevWord = null;
+      i++;
+      continue;
+    }
+    if (c === "]") {
       prevPunctuation = c;
       prevWord = null;
       i++;
+      continue;
+    }
+    if ((c === "+" || c === "-") && next === c) {
+      // `x++ / y` is a division, so a postfix operator keeps the operand. A prefix `++x`
+      // is always followed by an operand, which sets the state again, so one rule fits both.
+      prevPunctuation = ")";
+      prevWord = null;
+      i += 2;
       continue;
     }
     if (c !== " " && c !== "\t" && c !== "\n" && c !== "\r") {
