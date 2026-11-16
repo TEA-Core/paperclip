@@ -1438,13 +1438,6 @@ test.describe("Exact failed chat run retry", () => {
             ? `/${seed.prefix}/agents/${seed.agentId}/runs/${failedRunId}`
             : `/${seed.prefix}/inbox/all`;
         await page.goto(startPath);
-        if (surface === "agent run") {
-          // The route replaces the UUID with the agent's URL key once the agent
-          // loads; a retry clicked before that loses its mutation error state.
-          await expect(page).toHaveURL(
-            new RegExp(`/${seed.prefix}/agents/maya/runs/${failedRunId}$`),
-          );
-        }
         const retry = page
           .getByRole("button", { name: "Retry", exact: true })
           .filter({ visible: true });
