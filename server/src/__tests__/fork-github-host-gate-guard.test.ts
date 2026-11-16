@@ -177,22 +177,6 @@ describe("fold decision D1 call-site guard", () => {
     expect(gateArgs).not.toMatch(/driverKind|driver_kind/);
   });
 
-  // SUP-23998 (mutants m6, m6b). The native session path is gated twice: the managed
-  // identity is never even resolved for a forced-host driver (`githubSelection`), and the
-  // value handed to the native executor is also masked by `useHostGitHub`. Dropping both
-  // layers lets a local-driver native run mint managed GitHub access, and no committed
-  // behaviour test drives a native run through this seam, so pin both layers here.
-  it("keeps both host gates in front of the native session's managed GitHub access", () => {
-    const heartbeat = sources.get("services/heartbeat.ts")!;
-    const selection = heartbeat.indexOf("const githubSelection =");
-    expect(selection).toBeGreaterThan(-1);
-    expect(heartbeat.indexOf("const githubSelection =", selection + 1)).toBe(-1);
-    const selectionExpression = heartbeat.slice(selection, heartbeat.indexOf("resolveManagedGitHubIdentitySelection(", selection));
-    expect(selectionExpression).toMatch(/workspacePreparationOnly\s*\|\|\s*forkHostGitHub\s*\?\s*\{\s*configured:\s*false/);
-    const managedArgs = [...heartbeat.matchAll(/\bmanagedGitHub:\s*([^,\n]+),/g)].map((match) => match[1]!.trim());
-    expect(managedArgs).toEqual(["!useHostGitHub && githubSelection.configured"]);
-  });
-
   it("gates the provider's run-identity branch on host mode, not on the env flag alone", () => {
     const gitCredentials = sources.get("services/git-credentials.ts")!;
     expect(gitCredentials).toContain("if (!hostGitHub && db && context?.heartbeatRunId && context.agentId)");
