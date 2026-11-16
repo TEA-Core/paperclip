@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 import { applyWorktreeEnvPrecedence } from "../worktree-env-precedence.js";
+import { maybeRepairLegacyWorktreeConfigAndEnvFiles } from "../worktree-config.js";
 
 const ORIGINAL_ENV = { ...process.env };
 const ORIGINAL_CWD = process.cwd();
@@ -209,21 +210,67 @@ describe("applyWorktreeEnvPrecedence", () => {
     expect(process.env.BETTER_AUTH_SECRET).toBe("CANARY_PARENT_AUTH");
   });
 
-  it("fails closed when the worktree env names a different config than the resolved one", async () => {
+  it.each([
+    { name: "a ~-prefixed nonexistent path", declared: () => "~/paperclip-canary-nonexistent/config.json" },
+    { name: "a stale absolute path", declared: () => "/elsewhere/.paperclip/config.json" },
+  ])("secrets still win and identity keys stay inherited when the worktree env holds $name", async ({ declared }) => {
     await makeInstance([".paperclip"], () => [
       "PAPERCLIP_IN_WORKTREE=true",
-      "PAPERCLIP_CONFIG=/elsewhere/.paperclip/config.json",
-      "BETTER_AUTH_SECRET=CANARY_FILE_AUTH",
+      `PAPERCLIP_CONFIG=${declared()}`,
+      ...[...SECRET_KEYS, ...IDENTITY_KEYS].map((key) => `${key}=CANARY_WORKTREE_${key}`),
     ]);
-    process.env.BETTER_AUTH_SECRET = "CANARY_PARENT_AUTH";
-    const before = { ...process.env };
+    const inheritedConfig = process.env.PAPERCLIP_CONFIG;
+    for (const key of [...SECRET_KEYS, ...IDENTITY_KEYS]) process.env[key] = `CANARY_PARENT_${key}`;
 
     const result = applyWorktreeEnvPrecedence();
 
-    expect(result.applied).toBe(false);
-    expect({ ...process.env }).toEqual(before);
-    expect(warnings()).toContain("PAPERCLIP_CONFIG");
+    expect(result.applied).toBe(true);
+    expect([...result.overridden].sort()).toEqual([...SECRET_KEYS].sort());
+    for (const key of SECRET_KEYS) expect(process.env[key]).toBe(`CANARY_WORKTREE_${key}`);
+    for (const key of IDENTITY_KEYS) expect(process.env[key]).toBe(`CANARY_PARENT_${key}`);
+    expect(process.env.PAPERCLIP_CONFIG).toBe(inheritedConfig);
+    expect([...result.keptInherited].sort()).toEqual([...IDENTITY_KEYS].sort());
+    for (const key of IDENTITY_KEYS) expect(warnings()).toContain(key);
     expect(warnings()).not.toContain("CANARY");
+    expect(warnings()).not.toContain("elsewhere");
+  });
+
+  it("overrides identity keys when the worktree env PAPERCLIP_CONFIG is ~-prefixed and expands to the resolved config", async () => {
+    const { configPath } = await makeInstance([".paperclip"], () => []);
+    process.env.HOME = path.dirname(path.dirname(path.dirname(configPath)));
+    const tilde = `~/${path.relative(process.env.HOME, configPath)}`;
+    await fs.writeFile(
+      path.join(path.dirname(configPath), ".env"),
+      ["PAPERCLIP_IN_WORKTREE=true", `PAPERCLIP_CONFIG=${tilde}`, "PAPERCLIP_INSTANCE_ID=CANARY_WORKTREE_INSTANCE", ""].join("\n"),
+      "utf8",
+    );
+    process.env.PAPERCLIP_INSTANCE_ID = "CANARY_PARENT_INSTANCE";
+
+    const result = applyWorktreeEnvPrecedence();
+
+    expect(result.overridden).toContain("PAPERCLIP_INSTANCE_ID");
+    expect(process.env.PAPERCLIP_INSTANCE_ID).toBe("CANARY_WORKTREE_INSTANCE");
+  });
+
+  it("leaves a moved worktree to the repair path, which adopts the moved config and derived instance id", async () => {
+    const { configPath, stateDir } = await makeInstance([".paperclip"], () => [
+      "PAPERCLIP_IN_WORKTREE=true",
+      "PAPERCLIP_CONFIG=/old/home/paperclip/.paperclip/worktrees/SUP-24365-worktree/.paperclip/config.json",
+      "PAPERCLIP_INSTANCE_ID=wt-old",
+      "PAPERCLIP_WORKTREE_NAME=SUP-24365-worktree",
+    ]);
+    process.env.PAPERCLIP_WORKTREES_DIR = path.join(path.dirname(path.dirname(stateDir)), ".paperclip-worktrees");
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+
+    applyWorktreeEnvPrecedence();
+    const result = maybeRepairLegacyWorktreeConfigAndEnvFiles();
+
+    expect(result).toEqual({ repairedConfig: true, repairedEnv: true });
+    expect(process.env.PAPERCLIP_CONFIG).toBe(configPath);
+    expect(process.env.PAPERCLIP_INSTANCE_ID).toBe("sup-24365-worktree");
+    const persisted = await fs.readFile(path.join(stateDir, ".env"), "utf8");
+    expect(persisted).toContain(`PAPERCLIP_CONFIG=${JSON.stringify(configPath)}`);
+    expect(persisted).not.toContain("wt-old");
   });
 
   it("only covers keys that agent child processes never inherit", () => {

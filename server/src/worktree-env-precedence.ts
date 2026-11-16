@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { parse as parseDotenv } from "dotenv";
-import { resolveWorktreeEnvTarget } from "./worktree-config.js";
+import { expandHomePrefix, resolveWorktreeEnvTarget } from "./worktree-config.js";
 
 /**
  * Keys whose worktree `.env` value beats an inherited process value inside a
@@ -10,20 +10,26 @@ import { resolveWorktreeEnvTarget } from "./worktree-config.js";
  * cannot change what an agent sees. Never add provider or cloud credentials:
  * those reach agent children.
  */
-export const WORKTREE_ENV_PRECEDENCE_KEYS = [
-  // Instance secrets.
+const WORKTREE_SECRET_KEYS = [
   "PAPERCLIP_AGENT_JWT_SECRET",
   "BETTER_AUTH_SECRET",
   "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
   "PAPERCLIP_DECISION_SIGNING_SECRET",
   "PAPERCLIP_SECRETS_MASTER_KEY",
   "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
-  // Instance identity.
+] as const;
+
+const WORKTREE_IDENTITY_KEYS = [
   "PAPERCLIP_HOME",
   "PAPERCLIP_INSTANCE_ID",
   "PAPERCLIP_CONFIG",
   "PAPERCLIP_CONTEXT",
   "PAPERCLIP_WORKTREE_NAME",
+] as const;
+
+export const WORKTREE_ENV_PRECEDENCE_KEYS = [
+  ...WORKTREE_SECRET_KEYS,
+  ...WORKTREE_IDENTITY_KEYS,
 ] as const;
 
 export type WorktreeEnvPrecedenceResult = {
@@ -51,21 +57,22 @@ export function applyWorktreeEnvPrecedence(): WorktreeEnvPrecedenceResult {
     return notApplied;
   }
 
-  // The worktree env must agree that it belongs to the resolved config;
-  // otherwise its values could describe another instance.
+  // Secrets always win under the gate. Identity keys win only when the worktree
+  // env does not name another config; otherwise worktree repair owns them.
   const declaredConfigPath = fileEnv.PAPERCLIP_CONFIG?.trim();
-  if (declaredConfigPath && path.resolve(declaredConfigPath) !== target.configPath) {
-    console.warn(
-      `[paperclip] Worktree env ${target.envPath} declares a PAPERCLIP_CONFIG other than the resolved config; inherited environment keeps precedence.`,
-    );
-    return notApplied;
-  }
+  const identityAgrees =
+    !declaredConfigPath || path.resolve(expandHomePrefix(declaredConfigPath)) === path.resolve(target.configPath);
+  const identityKeys: readonly string[] = WORKTREE_IDENTITY_KEYS;
 
   const overridden: string[] = [];
   const keptInherited: string[] = [];
   for (const key of WORKTREE_ENV_PRECEDENCE_KEYS) {
     const current = process.env[key];
     if (current === undefined) continue;
+    if (!identityAgrees && identityKeys.includes(key)) {
+      keptInherited.push(key);
+      continue;
+    }
     const fileValue = fileEnv[key];
     if (fileValue === undefined || fileValue.trim() === "") {
       keptInherited.push(key);
@@ -83,7 +90,7 @@ export function applyWorktreeEnvPrecedence(): WorktreeEnvPrecedenceResult {
   }
   if (keptInherited.length > 0) {
     console.warn(
-      `[paperclip] Worktree env ${target.envPath} does not set ${keptInherited.join(", ")}; keeping the inherited value.`,
+      `[paperclip] Worktree env ${target.envPath} does not set or does not own ${keptInherited.join(", ")}; keeping the inherited value.`,
     );
   }
   return { applied: true, overridden, keptInherited };
