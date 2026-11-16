@@ -1,6 +1,6 @@
-import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, notInArray, or, sql, type SQL, type SQLWrapper } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { heartbeatRuns, issues } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, heartbeatRuns, issues } from "@paperclipai/db";
 
 export interface LiveExecutionLease {
   runId: string;
@@ -90,10 +90,38 @@ export async function resolveLiveExecutionLeases(
 }
 
 /**
+ * SUP-20121: `runId` created the `issues` row in scope (`originRunId`) or
+ * assigned it to its current assignee (its `issue.updated` activity names that
+ * assignee). Callers add the agent and issue-scope conditions.
+ */
+function runAuthoredIssueAssignment(runId: SQLWrapper | string): SQL {
+  return sql`(
+    ${runId}::text = ${issues.originRunId}
+    or exists (
+      select 1 from ${activityLog}
+      where ${activityLog.runId} = ${runId}
+        and ${activityLog.companyId} = ${issues.companyId}
+        and ${activityLog.entityType} = 'issue'
+        and ${activityLog.entityId} = ${issues.id}::text
+        and ${activityLog.action} = 'issue.updated'
+        and ${activityLog.details} ->> 'assigneeAgentId' = ${issues.assigneeAgentId}::text
+    )
+  )`;
+}
+
+/**
  * Finds the owner before acquiring an issue execution lock. The caller must
  * hold the issue row lock until its stamp commits. Include legacy
  * context-only owners and queued reservations, not just running direct leases.
  * Do not exclude the caller: its running issuer must win over an older queue.
+ *
+ * SUP-20121: a running run of the card's assignee that has no issue scope of
+ * its own also owns the card when it created it (`originRunId`) or assigned
+ * it to its own agent (its `issue.updated` activity names the current
+ * assignee). Neither pointer is set for such a run, so without this term every
+ * start gate saw the card as unowned and started a second run of the same
+ * agent, which took the checkout and locked the author out of its own card.
+ * A run whose context names another issue is not included (SUP-16052).
  */
 export async function findLiveIssueExecutionHolder(
   db: Pick<Db, "select">,
@@ -117,6 +145,12 @@ export async function findLiveIssueExecutionHolder(
         eq(heartbeatRuns.id, issues.executionRunId),
         eq(heartbeatRuns.id, issues.checkoutRunId),
         sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        and(
+          eq(heartbeatRuns.status, "running"),
+          eq(heartbeatRuns.agentId, issues.assigneeAgentId),
+          sql`nullif(btrim(${heartbeatRuns.contextSnapshot} ->> 'issueId'), '') is null`,
+          runAuthoredIssueAssignment(heartbeatRuns.id),
+        ),
       ),
     ))
     .orderBy(
@@ -127,4 +161,37 @@ export async function findLiveIssueExecutionHolder(
     )
     .limit(1)
     .then((rows) => rows[0] ?? null);
+}
+
+/**
+ * SUP-20121: open cards an issue-less run of `agentId` owned through
+ * `findLiveIssueExecutionHolder` (it created or self-assigned them) that no
+ * longer carry an execution lock but still hold that agent's deferred wakes.
+ * A status write clears the lock while the run is live, and the finishing
+ * run's release would otherwise never visit the card, so these wakes are
+ * promoted when the run finishes.
+ */
+export async function listUnlockedIssuesWithDeferredWakesForRun(
+  db: Pick<Db, "select">,
+  input: { companyId: string; runId: string; agentId: string },
+): Promise<string[]> {
+  return db
+    .select({ id: issues.id })
+    .from(issues)
+    .where(and(
+      eq(issues.companyId, input.companyId),
+      eq(issues.assigneeAgentId, input.agentId),
+      isNull(issues.executionRunId),
+      notInArray(issues.status, ["done", "cancelled"]),
+      runAuthoredIssueAssignment(input.runId),
+      sql`exists (
+        select 1 from ${agentWakeupRequests}
+        where ${agentWakeupRequests.companyId} = ${issues.companyId}
+          and ${agentWakeupRequests.agentId} = ${input.agentId}
+          and ${agentWakeupRequests.status} = 'deferred_issue_execution'
+          and ${agentWakeupRequests.payload} ->> 'issueId' = ${issues.id}::text
+      )`,
+    ))
+    .orderBy(asc(issues.id))
+    .then((rows) => rows.map((row) => row.id));
 }

@@ -297,7 +297,12 @@ import {
 import { createNativeSessionHandoffLoader } from "./native-runtime/native-session-handoff.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
-import { findLiveIssueExecutionHolder, resolveLiveExecutionLeases, type LiveExecutionLease } from "./issue-execution-lease.js";
+import {
+  findLiveIssueExecutionHolder,
+  listUnlockedIssuesWithDeferredWakesForRun,
+  resolveLiveExecutionLeases,
+  type LiveExecutionLease,
+} from "./issue-execution-lease.js";
 import {
   buildTimerDispatchSuppressionDetails,
   evaluateIssueContinuationPath,
@@ -32390,6 +32395,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
     }
+    // SUP-20121: an issue-less run also owns cards it created or self-assigned.
+    // A status write by that run clears their lock, so the release above never
+    // visits them; promote the wakes that were held behind the run here.
+    if (!promotionOnly && !contextIssueId) {
+      const linkedIssueIds = await listUnlockedIssuesWithDeferredWakesForRun(db, {
+        companyId: run.companyId,
+        runId: run.id,
+        agentId: run.agentId,
+      }).catch((err) => {
+        logger.error({ err, runId: run.id }, "failed to list cards held behind a finished run");
+        return [] as string[];
+      });
+      for (const issueId of linkedIssueIds) {
+        try {
+          await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true }, issueId);
+        } catch (err) {
+          logger.error({ err, runId: run.id, issueId }, "failed to promote wakes held behind a finished run");
+        }
+      }
+    }
     if (!promotionOnly) {
       const completed = await getRun(run.id);
       const settledIssueId = readNonEmptyString(completed?.contextSnapshot?.issueId)
@@ -34040,6 +34065,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                       legacyAgent?.name,
                     ),
                     executionLockedAt: new Date(),
+                    updatedAt: new Date(),
+                  })
+                  .where(eq(issues.id, issue.id));
+              }
+            }
+          }
+
+          // SUP-20121: the woken agent's live run may own the card without
+          // either pointer or a context naming it: it created the card, holds
+          // only its checkout, or assigned the card to its own agent. Starting
+          // a run here made a second run of the same agent that took the
+          // checkout and locked the author out of its own card. Hold this wake
+          // behind that run instead, through the same owner lookup the claim,
+          // checkout and release gates use.
+          if (!activeExecutionRun) {
+            const holder = await findLiveIssueExecutionHolder(
+              tx as unknown as Db,
+              issue.companyId,
+              issue.id,
+            );
+            if (holder?.status === "running" && holder.agentId === agentId) {
+              const holderRun = await tx
+                .select()
+                .from(heartbeatRuns)
+                .where(eq(heartbeatRuns.id, holder.runId))
+                .then((rows) => rows[0] ?? null);
+              if (holderRun) {
+                activeExecutionRun = holderRun;
+                await tx
+                  .update(issues)
+                  .set({
+                    executionRunId: holderRun.id,
+                    executionAgentNameKey: agentNameKey,
+                    executionLockedAt: holderRun.startedAt ?? new Date(),
                     updatedAt: new Date(),
                   })
                   .where(eq(issues.id, issue.id));

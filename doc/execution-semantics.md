@@ -204,6 +204,20 @@ from the claiming run. A board or user claim, a claim for a different agent, an
 assignment that does not set `in_progress`, and a claim from a run scoped to a
 different issue still wake the assignee.
 
+A `running` run whose context names no issue also owns a card it created
+(`originRunId`) or assigned to its own agent (its `issue.updated` activity names
+the current assignee), as long as that agent is still the assignee. Every
+execution gate treats that run as the card's live holder: a wake for the same
+agent on the card (assignment, monitor, comment, stage, recovery) is held behind
+it instead of starting a second run, the run is stamped as the card's execution
+holder, a queued run for the card is not claimed, and checkout by another run is
+refused. A held wake is never merged into that run, because merging would scope
+the run to the card. Held wakes are promoted when the run finishes, including
+wakes on cards whose lock a status write cleared while the run was live. Wakes
+for a different agent, and wakes after the run has finished, start normally. A
+run whose context names a different issue does not own the cards it creates or
+assigns.
+
 A non-final workflow handoff may change the assignee while its issuing run is
 still running. Only an issuer whose run context names this issue is exempt from
 its own handoff PATCH's cancellation. For any other issuer, the handoff is saved
