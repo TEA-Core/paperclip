@@ -6565,6 +6565,36 @@ describe("evaluateDoneTierDeclaration", () => {
           expect(result.reason).toContain("postdates this close");
         });
 
+        // The grammar accepts 1-6 fractional digits; `Date.parse` truncates to
+        // milliseconds, so these used to tie the close write and pass.
+        it.each(["2026-11-14T08:19:28.7261Z", "2026-11-14T08:19:28.7269Z", "2026-11-14T08:19:28.726001Z"])(
+          "refuses a sub-millisecond observation %s after the close write: single instant, range end, no-run closer",
+          async (observation) => {
+            const single = await closeAt(observation);
+            expect(single.allowed).toBe(false);
+            expect(single.reason).toContain(`observed instant ${observation}`);
+            expect(single.reason).toContain("postdates this close");
+            const range = await closeAt(`2026-11-14T08:19:00Z-${observation}`);
+            expect(range.allowed).toBe(false);
+            expect(range.reason).toContain(`observed instant ${observation}`);
+            const noRun = await closeWithNoRunAt(observation);
+            expect(noRun.allowed).toBe(false);
+            expect(noRun.reason).toContain("postdates this close");
+          },
+        );
+
+        it.each(["2026-11-14T08:19:28.726000Z", "2026-11-14T08:19:28.7260Z", "2026-11-14T08:19:28.725999Z", "2026-11-14T08:19:28.7259Z"])(
+          "positive control: accepts %s at or one tick before the close write at full precision",
+          async (observation) => {
+            const single = await closeAt(observation);
+            expect(single.allowed).toBe(true);
+            const range = await closeAt(`2026-11-14T08:19:00Z-${observation}`);
+            expect(range.allowed).toBe(true);
+            const noRun = await closeWithNoRunAt(observation);
+            expect(noRun.allowed).toBe(true);
+          },
+        );
+
         it("positive control: accepts an observation exactly at the close write", async () => {
           const result = await closeAt(CLOSE_WRITE_AT);
           expect(result.allowed).toBe(true);

@@ -32,6 +32,8 @@ import {
   WORKSPACE_READINESS_USER_EMAIL_HEADER,
   WORKSPACE_READINESS_USER_ID_HEADER,
 } from "../auth/workspace-login-handoff.js";
+import { resolvePaperclipInstanceId } from "../home-paths.js";
+import { serverSchemaHead, writeVerifiedInitialization } from "./helpers/worktree-initialization.js";
 
 const tempDirs: string[] = [];
 
@@ -289,6 +291,32 @@ describe("resolveWorkspaceReadiness", () => {
     const { configPath } = createMarkerDir({
       "seed-manifest.json": JSON.stringify({ version: 3, kind: "worktree-initialization", state: "verified" }),
     });
+    const readiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(configPath) });
+    expect(readiness).toMatchObject({ state: "failed", failurePhase: "seed_manifest_unsupported" });
+  });
+
+  it("reports a verified fresh initialization as a non-ready fresh preview, never ready or degraded", async () => {
+    const revision = serverSchemaHead();
+    const { dir, configPath } = createMarkerDir();
+    writeVerifiedInitialization(dir, { targetInstanceId: resolvePaperclipInstanceId(), revision });
+    const readiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(configPath) });
+    expect(readiness).toMatchObject({
+      state: "failed",
+      seedState: "failed",
+      seedPhase: "complete",
+      failurePhase: "seed_manifest_fresh_preview",
+    });
+
+    // A fresh manifest for another instance is refused, not a preview.
+    const other = createMarkerDir();
+    writeVerifiedInitialization(other.dir, { targetInstanceId: "wt-other-instance", revision });
+    const refused = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(other.configPath) });
+    expect(refused).toMatchObject({ state: "failed", failurePhase: "seed_manifest_unsupported" });
+  });
+
+  it("refuses a forged fresh initialization manifest instead of reporting a fresh preview", async () => {
+    const { dir, configPath } = createMarkerDir();
+    writeVerifiedInitialization(dir, { targetInstanceId: resolvePaperclipInstanceId(), revision: serverSchemaHead(), forge: true });
     const readiness = await resolveWorkspaceReadiness({ db: readyDb(), env: readyGuestEnv(configPath) });
     expect(readiness).toMatchObject({ state: "failed", failurePhase: "seed_manifest_unsupported" });
   });
