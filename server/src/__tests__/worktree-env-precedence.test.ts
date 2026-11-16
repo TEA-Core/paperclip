@@ -255,6 +255,41 @@ describe("applyWorktreeEnvPrecedence", () => {
     expect(process.env.PAPERCLIP_CONFIG).toBe(configPath);
   });
 
+  it("overrides identity keys when the worktree env does not declare PAPERCLIP_CONFIG", async () => {
+    await makeInstance([".paperclip"], () => [
+      "PAPERCLIP_IN_WORKTREE=true",
+      "PAPERCLIP_INSTANCE_ID=CANARY_WORKTREE_INSTANCE",
+      "PAPERCLIP_HOME=CANARY_WORKTREE_HOME",
+      "BETTER_AUTH_SECRET=CANARY_WORKTREE_AUTH",
+    ]);
+    const inheritedConfig = process.env.PAPERCLIP_CONFIG;
+    process.env.PAPERCLIP_INSTANCE_ID = "CANARY_PARENT_INSTANCE";
+    process.env.PAPERCLIP_HOME = "CANARY_PARENT_HOME";
+    process.env.BETTER_AUTH_SECRET = "CANARY_PARENT_AUTH";
+
+    const result = applyWorktreeEnvPrecedence();
+
+    expect([...result.overridden].sort()).toEqual(["BETTER_AUTH_SECRET", "PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID"]);
+    expect(process.env.PAPERCLIP_INSTANCE_ID).toBe("CANARY_WORKTREE_INSTANCE");
+    expect(process.env.PAPERCLIP_HOME).toBe("CANARY_WORKTREE_HOME");
+    // Absent from the worktree env: the resolved config path stays as inherited.
+    expect(result.keptInherited).toEqual(["PAPERCLIP_CONFIG"]);
+    expect(process.env.PAPERCLIP_CONFIG).toBe(inheritedConfig);
+  });
+
+  it("stores an overridden relative PAPERCLIP_CONFIG as the absolute resolved config path", async () => {
+    const { stateDir, configPath } = await makeInstance([".paperclip"], () => [
+      "PAPERCLIP_IN_WORKTREE=true",
+      "PAPERCLIP_CONFIG=.paperclip/./config.json",
+    ]);
+    process.env.PAPERCLIP_CONFIG = `${stateDir}/./config.json`;
+
+    const result = applyWorktreeEnvPrecedence();
+
+    expect(result.overridden).toEqual(["PAPERCLIP_CONFIG"]);
+    expect(process.env.PAPERCLIP_CONFIG).toBe(configPath);
+  });
+
   it("leaves a moved worktree to the repair path, which adopts the moved config and derived instance id", async () => {
     const { configPath, stateDir } = await makeInstance([".paperclip"], () => [
       "PAPERCLIP_IN_WORKTREE=true",
