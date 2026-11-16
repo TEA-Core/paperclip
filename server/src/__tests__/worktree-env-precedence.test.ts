@@ -229,8 +229,8 @@ describe("applyWorktreeEnvPrecedence", () => {
     for (const key of SECRET_KEYS) expect(process.env[key]).toBe(`CANARY_WORKTREE_${key}`);
     for (const key of IDENTITY_KEYS) expect(process.env[key]).toBe(`CANARY_PARENT_${key}`);
     expect(process.env.PAPERCLIP_CONFIG).toBe(inheritedConfig);
-    expect([...result.keptInherited].sort()).toEqual([...IDENTITY_KEYS].sort());
-    for (const key of IDENTITY_KEYS) expect(warnings()).toContain(key);
+    expect([...result.keptInherited].sort()).toEqual([...IDENTITY_KEYS, "PAPERCLIP_CONFIG"].sort());
+    for (const key of [...IDENTITY_KEYS, "PAPERCLIP_CONFIG"]) expect(warnings()).toContain(key);
     expect(warnings()).not.toContain("CANARY");
     expect(warnings()).not.toContain("elsewhere");
   });
@@ -264,6 +264,26 @@ describe("applyWorktreeEnvPrecedence", () => {
     ]);
     process.env.PAPERCLIP_WORKTREES_DIR = path.join(path.dirname(path.dirname(stateDir)), ".paperclip-worktrees");
     delete process.env.PAPERCLIP_INSTANCE_ID;
+    // The repair path only rewrites a parseable, non-isolated config.
+    const shared = path.join(path.dirname(stateDir), "shared");
+    await fs.writeFile(
+      configPath,
+      JSON.stringify({
+        $meta: { version: 1, updatedAt: "2026-03-26T00:00:00.000Z", source: "configure" },
+        database: {
+          mode: "embedded-postgres",
+          embeddedPostgresDataDir: path.join(shared, "db"),
+          embeddedPostgresPort: 54329,
+          backup: { enabled: true, intervalMinutes: 60, retentionDays: 30, dir: path.join(shared, "backups") },
+        },
+        logging: { mode: "file", logDir: path.join(shared, "logs") },
+        server: { deploymentMode: "local_trusted", exposure: "private", host: "127.0.0.1", port: 3100, allowedHostnames: [], serveUi: true },
+        auth: { baseUrlMode: "explicit", publicBaseUrl: "http://127.0.0.1:3100", disableSignUp: false },
+        storage: { provider: "local_disk", localDisk: { baseDir: path.join(shared, "storage") }, s3: { bucket: "paperclip", region: "us-east-1", prefix: "", forcePathStyle: false } },
+        secrets: { provider: "local_encrypted", strictMode: false, localEncrypted: { keyFilePath: path.join(shared, "master.key") } },
+      }),
+      "utf8",
+    );
 
     applyWorktreeEnvPrecedence();
     const result = maybeRepairLegacyWorktreeConfigAndEnvFiles();
