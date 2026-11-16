@@ -20,7 +20,7 @@
  */
 
 /** Keywords after which a `/` starts a regular expression, not a division. */
-const REGEX_PRECEDING_KEYWORDS = new Set([
+export const REGEX_PRECEDING_KEYWORDS = new Set([
   "return",
   "typeof",
   "case",
@@ -39,7 +39,7 @@ const REGEX_PRECEDING_KEYWORDS = new Set([
 /** Punctuation after which a `/` starts a regular expression. `control)` closes an `if`/`while`/`for` header. */
 const REGEX_PRECEDING_PUNCTUATION = new Set([
   "(", ",", "=", ":", "[", "!", "&", "|", "?", "{", "}", ";",
-  "+", "-", "*", "%", "<", ">", "~", "^", "control)",
+  "+", "-", "*", "%", "<", ">", "~", "^", "control)", "...",
 ]);
 
 const CONTROL_KEYWORDS = new Set(["if", "while", "with"]);
@@ -202,7 +202,9 @@ export function blankNonCode(source: string): string {
     if (isIdentifierChar(c)) {
       let j = i;
       while (j < n && isIdentifierChar(source[j])) j++;
-      prevWord = source.slice(i, j);
+      // A word after `.` or `?.` is a property name, so it is an operand even when it spells a
+      // keyword: `obj.of / x` and `obj?.await / x` divide.
+      prevWord = prevPunctuation === "." ? `.${source.slice(i, j)}` : source.slice(i, j);
       prevPunctuation = null;
       i = j;
       continue;
@@ -236,6 +238,20 @@ export function blankNonCode(source: string): string {
       prevPunctuation = ")";
       prevWord = null;
       i += 2;
+      continue;
+    }
+    if (c === "!" && ((prevWord !== null && !REGEX_PRECEDING_KEYWORDS.has(prevWord)) || prevPunctuation === ")" || prevPunctuation === "]")) {
+      // TypeScript's non-null assertion (`x! / y`) keeps the operand, so a slash divides. In
+      // `x != y` the `=` that follows sets the state again, so no special case is needed.
+      prevPunctuation = ")";
+      prevWord = null;
+      i++;
+      continue;
+    }
+    if (c === "." && source.startsWith("...", i)) {
+      // A spread is not a property access: `...of / 2` reads `of` as a name, `.../re/` as a regex.
+      setPunctuation("...");
+      i += 3;
       continue;
     }
     if (c !== " " && c !== "\t" && c !== "\n" && c !== "\r") {

@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import { blankNonCode } from "./blank-non-code.js";
+import { REGEX_PRECEDING_KEYWORDS, blankNonCode } from "./blank-non-code.js";
 
 /** The code-only view with whitespace runs collapsed, so expectations stay readable. */
 function compact(source: string): string {
@@ -89,6 +89,36 @@ describe("blankNonCode", () => {
     expect(compact("const h = xs[i]-- / 2 / 3; live();")).toBe("const h = xs[i]-- / 2 / 3; live();");
     expect(compact("x = ++n / 2 / 3; live();")).toBe("x = ++n / 2 / 3; live();");
     expect(compact("x = a + +/'/.test(s); live();")).toBe("x = a + + .test(s); live();");
+  });
+
+  // Release assurance NO-GO on PR 1208: a keyword after `.` or `?.` is a property name, an operand.
+  // The sweep covers every word the lexer treats as regex-preceding, plus `of`.
+  const KEYWORD_LIKE = [...REGEX_PRECEDING_KEYWORDS, "of"];
+  const LIVE = "(dbOrTx === db ? 1 : 2) / 3;";
+
+  it.each(KEYWORD_LIKE)("reads `%s` after a dot or `?.` as a property name, so a slash divides", (word) => {
+    expect(compact(`obj.${word} / ${LIVE}`)).toBe(`obj.${word} / ${LIVE}`);
+    expect(compact(`obj?.${word} / ${LIVE}`)).toBe(`obj?.${word} / ${LIVE}`);
+    expect(compact(`obj . ${word} / ${LIVE}`)).toBe(`obj . ${word} / ${LIVE}`);
+  });
+
+  it.each([...REGEX_PRECEDING_KEYWORDS])("still reads `%s` as a keyword when no dot precedes it", (word) => {
+    expect(compact(`${word} /'/.test(s); live();`)).toBe(`${word} .test(s); live();`);
+  });
+
+  it("tells a spread from a property access", () => {
+    expect(compact(`[...of / ${LIVE}]`)).toBe(`[...of / ${LIVE}]`);
+    expect(compact("[.../'/.exec(s)]; live();")).toBe("[... .exec(s)]; live();");
+  });
+
+  // The same class of bug: TypeScript's non-null assertion ends an operand, so a slash divides.
+  it("reads a slash after a non-null assertion as division, and after a prefix or != as a regex", () => {
+    for (const operand of ["a", "obj.x", "xs[0]", "f()"]) {
+      expect(compact(`const v = ${operand}! / ${LIVE}`)).toBe(`const v = ${operand}! / ${LIVE}`);
+    }
+    expect(compact("if (a != /'/.test(s)) live();")).toBe("if (a != .test(s)) live();");
+    expect(compact("x = !/'/.test(s); live();")).toBe("x = ! .test(s); live();");
+    expect(compact("if (a !== b / 2) live();")).toBe("if (a !== b / 2) live();");
   });
 
   it("keeps substitution code live and blanks template text, including nested templates", () => {
