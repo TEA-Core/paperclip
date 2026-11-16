@@ -513,9 +513,11 @@ async function findFreePort() {
 }
 
 async function reserveContiguousPorts(count: number) {
+  // Draw the base from 20000-31999, below the Linux and macOS ephemeral port
+  // ranges. Outbound connections hold ephemeral ports, so on a busy host a run
+  // of free ports there is often broken and every attempt failed.
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const basePort = await findFreePort();
-    if (basePort + count - 1 > 65_535) continue;
+    const basePort = 20_000 + Math.floor(Math.random() * (12_000 - count));
     const servers: net.Server[] = [];
     try {
       for (let offset = 0; offset < count; offset += 1) {
