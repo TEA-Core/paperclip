@@ -9227,10 +9227,10 @@ describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", ()
     mockResolveLinkedPullRequestsWithState.mockResolvedValue([]);
   });
 
-  function boardActor(companyId: string): Express.Request["actor"] {
+  function boardActor(companyId: string, userId = "cloud-user-1"): Express.Request["actor"] {
     return {
       type: "board",
-      userId: "cloud-user-1",
+      userId,
       companyIds: [companyId],
       memberships: [{ companyId, membershipRole: "owner", status: "active" }],
       source: "cloud_tenant",
@@ -9508,6 +9508,106 @@ describeEmbeddedPostgres("record_only flip in the close request (SUP-24429)", ()
     expect(rows.some((row) => row.details?.skipReason === "record_only_delivery_skipped")).toBe(true);
     expect(rows.some((row) => row.action === "issue.done_transition_refused")).toBe(false);
     expect(rows.filter((row) => row.action === "issue.delivery_requirement_reclassified")).toHaveLength(1);
+  });
+
+  it.each([
+    { label: "a title-only write", secondBody: { title: "Renamed while the flip lands" } },
+    { label: "a second record_only flip", secondBody: { deliveryRequirement: "record_only", title: "Second flip" } },
+  ])("attributes a concurrent reclassification to the first flipping request only, never to $label", async ({ secondBody }) => {
+    const { companyId, issueId, identifier } = await seedCard("repository_delivery");
+    await db.insert(companyMembershipsTable).values({
+      companyId,
+      principalType: "user",
+      principalId: "cloud-user-2",
+      status: "active",
+      membershipRole: "owner",
+      updatedAt: new Date(),
+    });
+    const waitingLocks = async () => {
+      const [row] = await db.execute<{ waiting: number }>(
+        sql`select count(*)::int as waiting from pg_locks where not granted`,
+      );
+      return row?.waiting ?? 0;
+    };
+    // A holder takes the row lock, so both requests read repository_delivery
+    // unlocked and queue on the lock: the flip first, then the second write.
+    let releaseHolder!: () => void;
+    const holderReleased = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    let holderLocked!: () => void;
+    const holderHasLock = new Promise<void>((resolve) => {
+      holderLocked = resolve;
+    });
+    const holder = db.transaction(async (tx) => {
+      await tx.update(issuesTable).set({ priority: "medium" }).where(eq(issuesTable.id, issueId));
+      holderLocked();
+      await holderReleased;
+    });
+    await holderHasLock;
+
+    currentActor = boardActor(companyId, "cloud-user-1");
+    const flip = request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ deliveryRequirement: "record_only" })
+      .then((res) => res);
+    await vi.waitFor(async () => {
+      if ((await waitingLocks()) < 1) throw new Error("flip is not waiting on the row lock yet");
+    }, { timeout: 20_000, interval: 25 });
+    currentActor = boardActor(companyId, "cloud-user-2");
+    const second = request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send(secondBody)
+      .then((res) => res);
+    await vi.waitFor(async () => {
+      if ((await waitingLocks()) < 2) throw new Error("second write is not waiting on the row lock yet");
+    }, { timeout: 20_000, interval: 25 });
+    releaseHolder();
+    await holder;
+
+    const [flipRes, secondRes] = [await flip, await second];
+    expect(flipRes.status, JSON.stringify(flipRes.body)).toBe(200);
+    expect(secondRes.status, JSON.stringify(secondRes.body)).toBe(200);
+    expect(await storedCard(issueId)).toEqual({ status: "in_progress", deliveryRequirement: "record_only" });
+    const reclassified = activityFor(issueId).filter((row) => row.action === "issue.delivery_requirement_reclassified");
+    expect(reclassified).toHaveLength(1);
+    expect(reclassified[0]!.details).toMatchObject({ actorId: "cloud-user-1", storedDeliveryRequirement: "repository_delivery" });
+    const comments = await systemCommentsFor(issueId);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toContain("by user `cloud-user-1`");
+  });
+
+  it("returns the updatedAt the reclassification comment wrote, so the next expectedUpdatedAt write succeeds", async () => {
+    const { issueId, identifier } = await seedCard("repository_delivery");
+
+    const flip = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ deliveryRequirement: "record_only" });
+    expect(flip.status, JSON.stringify(flip.body)).toBe(200);
+    const [stored] = await db
+      .select({ updatedAt: issuesTable.updatedAt })
+      .from(issuesTable)
+      .where(eq(issuesTable.id, issueId));
+    expect(new Date(flip.body.updatedAt).getTime()).toBe(stored!.updatedAt.getTime());
+
+    const next = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ title: "Follow-up write", expectedUpdatedAt: flip.body.updatedAt });
+    expect(next.status, JSON.stringify(next.body)).toBe(200);
+  });
+
+  it("records that no landing check was owed when an already-closed repository_delivery issue is reclassified", async () => {
+    const { issueId, identifier } = await seedCard("repository_delivery", "done");
+
+    const flip = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ deliveryRequirement: "record_only" });
+    expect(flip.status, JSON.stringify(flip.body)).toBe(200);
+    const reclassified = activityFor(issueId).filter((row) => row.action === "issue.delivery_requirement_reclassified");
+    expect(reclassified).toHaveLength(1);
+    expect(reclassified[0]!.details).toMatchObject({ landingCheckOwed: false });
+    const comments = await systemCommentsFor(issueId);
+    expect(comments[0]).toContain("The issue was already closed");
   });
 
   it("writes no reclassification audit when the stored value is already record_only or the requested value is not record_only", async () => {

@@ -20584,7 +20584,8 @@ export function issueRoutes(
     // issue row lock in the write transaction below. A record_only
     // reclassification without a close stays lawful; it is audited after the
     // write instead.
-    const recordOnlyCloseRequested = isDoneRequest && req.body.deliveryRequirement === "record_only";
+    const recordOnlyRequested = req.body.deliveryRequirement === "record_only";
+    const recordOnlyCloseRequested = isDoneRequest && recordOnlyRequested;
     const recordOnlyCloseFlipReason = (storedDeliveryRequirement: IssueDeliveryRequirement) =>
       `Cannot mark this issue done in the same request that changes deliveryRequirement from ` +
       `${storedDeliveryRequirement} to record_only: the landing check for the stored requirement still applies.`;
@@ -20633,6 +20634,11 @@ export function issueRoutes(
     // Set when the locked re-check refuses inside the write transaction; the
     // refusal is recorded after the rollback, outside the row lock.
     let recordOnlyCloseFlipLockedStored: IssueDeliveryRequirement | null = null;
+    // The stored requirement and status read under the issue row lock by a
+    // request that sets record_only; the reclassification audit after the write
+    // compares against this, never against the unlocked `existing` read.
+    type LockedRequirementRead = { deliveryRequirement: IssueDeliveryRequirement; status: string };
+    let lockedRequirementBeforeWrite: LockedRequirementRead | null = null;
     if (recordOnlyCloseRequested && existing.deliveryRequirement !== "record_only") {
       await recordRecordOnlyCloseFlipRefusal(existing.deliveryRequirement, "request");
       throw recordOnlyCloseFlipRefusal(existing.deliveryRequirement, "request");
@@ -21173,8 +21179,9 @@ export function issueRoutes(
       || monitorChanged
       // SUP-22570: a record_only no-repository close re-probes inside the write.
       || noRepositoryLandingCloser !== null
-      // SUP-24429: a record_only close re-checks the stored requirement under the row lock.
-      || recordOnlyCloseRequested
+      // SUP-24429: a record_only request reads the stored requirement under the
+      // row lock (close re-check and reclassification audit).
+      || recordOnlyRequested
       || (
         missingApprovalStageGap !== null
         && requestedTransitionStatus === "done"
@@ -21222,14 +21229,20 @@ export function issueRoutes(
         issue = await db.transaction(async (tx) => {
           // SUP-24429: re-read the stored requirement under the issue row lock.
           // A request that changed it after the unlocked read above must not let
-          // this close relabel a repository_delivery card record_only.
-          if (recordOnlyCloseRequested) {
+          // this close relabel a repository_delivery card record_only, and the
+          // reclassification audit below must describe this write, not a
+          // concurrent one.
+          if (recordOnlyRequested) {
             const lockedForRequirement = await svc.getByIdForUpdate(id, tx);
             if (!lockedForRequirement) return null;
-            if (lockedForRequirement.deliveryRequirement !== "record_only") {
+            if (recordOnlyCloseRequested && lockedForRequirement.deliveryRequirement !== "record_only") {
               recordOnlyCloseFlipLockedStored = lockedForRequirement.deliveryRequirement;
               throw recordOnlyCloseFlipRefusal(lockedForRequirement.deliveryRequirement, "locked_recheck");
             }
+            lockedRequirementBeforeWrite = {
+              deliveryRequirement: lockedForRequirement.deliveryRequirement,
+              status: lockedForRequirement.status,
+            };
           }
           // ADR-103 M4: validate the re-parent edge inside the write
           // transaction. The gate takes an exclusive lock on the parent row so
@@ -22201,8 +22214,21 @@ export function issueRoutes(
     // record_only without closing it stays lawful, but a later close then takes
     // the record-only skip. Record the reclassification as its own event, in the
     // activity log and in the thread the next run reads. (A close in the same
-    // request was refused above.)
-    if (existing.deliveryRequirement !== "record_only" && issue.deliveryRequirement === "record_only") {
+    // request was refused above.) The stored side is the value this request read
+    // under the row lock, so a concurrent flip never attributes the change to an
+    // unrelated request.
+    // Assigned inside the write transaction callback; widen past the `null` narrowing.
+    const lockedRequirementRead = lockedRequirementBeforeWrite as LockedRequirementRead | null;
+    if (
+      lockedRequirementRead !== null &&
+      lockedRequirementRead.deliveryRequirement !== "record_only" &&
+      issue.deliveryRequirement === "record_only"
+    ) {
+      const storedDeliveryRequirement = lockedRequirementRead.deliveryRequirement;
+      // A closed issue owes no later close; its landing check is not skipped by this change.
+      const landingCheckOwed =
+        storedDeliveryRequirement === "repository_delivery" &&
+        !isClosedIssueStatus(lockedRequirementRead.status);
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
@@ -22217,11 +22243,11 @@ export function issueRoutes(
         entityId: issue.id,
         details: {
           identifier: issue.identifier,
-          storedDeliveryRequirement: existing.deliveryRequirement,
+          storedDeliveryRequirement,
           requestedDeliveryRequirement: issue.deliveryRequirement,
           actorType: actor.actorType,
           actorId: actor.actorId,
-          landingCheckOwed: existing.deliveryRequirement === "repository_delivery",
+          landingCheckOwed,
         },
       });
       await svc.addComment(
@@ -22229,12 +22255,16 @@ export function issueRoutes(
         [
           "**Delivery requirement reclassified** (`issue.delivery_requirement_reclassified`)",
           "",
-          `The landing obligation of this issue was reclassified from \`${existing.deliveryRequirement}\` to ` +
+          `The landing obligation of this issue was reclassified from \`${storedDeliveryRequirement}\` to ` +
             `\`record_only\` by ${actor.actorType} \`${actor.actorId}\`, in a request that did not close the issue.`,
-          "A later close of this issue takes the record-only skip: no repository landing check runs at that close.",
+          landingCheckOwed
+            ? "A later close of this issue takes the record-only skip: no repository landing check runs at that close."
+            : "The issue was already closed; this reclassification skips no landing check.",
         ].join("\n"),
         {},
-        { authorType: "system" },
+        // The comment touches issues.updatedAt; the response carries that value
+        // so the caller's next expectedUpdatedAt write is not refused as stale.
+        { authorType: "system", onIssueTouched: noteCommittedUpdatedAt },
       );
     }
 
