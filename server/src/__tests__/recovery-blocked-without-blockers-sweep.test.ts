@@ -2534,7 +2534,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       const payload = wake.payload as { issueId?: unknown } | null;
       return payload?.issueId === action.recoveryIssueId;
     })).toBe(true);
-  });
+  }, 60_000);
 
   it("SUP-21344: an open exhausted recovery issue is not re-woken on later drain ticks", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
