@@ -989,10 +989,13 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, fixture.issue.id))).toEqual(
       expect.arrayContaining([expect.objectContaining({ body: "## Review: APPROVED\n\nIndependent final review." })]),
     );
-    expect(fixture.writes).toEqual([{
-      url: `https://api.github.com/repos/TEA-Core/paperclip/statuses/${fixture.pr.head.sha}`,
-      body: expect.objectContaining({ state: "success", context: "paperclip/approved" }),
-    }]);
+    // The PR sits on the card's own workspace branch, so arming proceeds and the arm gate
+    // flips failure -> success around the approved stamp.
+    expect(fixture.writes.map((w) => { const b = w.body as { context: string; state: string }; return [b.context, b.state]; })).toEqual([
+      ["paperclip/approved", "success"],
+      ["paperclip/arm-gate", "failure"],
+      ["paperclip/arm-gate", "success"],
+    ]);
   });
 
   it("refuses a final approval comment when the delivery branch changes after external preflight", async () => {
