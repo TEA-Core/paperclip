@@ -1325,14 +1325,20 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     await drainAgentRuns(agentId);
   });
 
-  async function seedCompanyAgentAndProject(overrides?: { agentRole?: string }) {
-    const { companyId, agentId } = await seedCompanyAndAgent(overrides);
+  async function seedCompanyAgentAndProject(overrides?: {
+    agentRole?: string;
+    executionWorkspacePolicy?: Record<string, unknown>;
+  }) {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: overrides?.agentRole });
     const projectId = randomUUID();
     const projectWorkspaceId = randomUUID();
     await db.insert(projects).values({
       id: projectId,
       companyId,
       name: "Test Project",
+      ...(overrides?.executionWorkspacePolicy
+        ? { executionWorkspacePolicy: overrides.executionWorkspacePolicy }
+        : {}),
     });
     await db.insert(projectWorkspaces).values({
       id: projectWorkspaceId,
@@ -2444,6 +2450,90 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
         ),
       );
     expect(recoveryIssues).toHaveLength(1);
+  });
+
+  // F1 (SUP-23493 review): the recovery mint names `agent_default`, and issues.ts
+  // refuses any explicit workspace preference on a project whose policy sets
+  // allowIssueOverride=false while isolated workspaces are on. The mint must not
+  // become an un-mintable card for such a project (base minted it and woke the owner).
+  it("SUP-23493: an exhausted recovery card is still minted and the owner woken on an allowIssueOverride=false isolated project", async () => {
+    const { companyId, agentId, projectId, projectWorkspaceId } = await seedCompanyAgentAndProject({
+      agentRole: "cto",
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        allowIssueOverride: false,
+      },
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Todo behind an exhausted workspace validation, unassigned",
+      status: "todo",
+      priority: "high",
+      updatedAt: oldDate(),
+    });
+    // The source is bound to an unusable execution workspace. With no preference sent,
+    // only skipExecutionWorkspaceInheritance keeps the card off that binding.
+    const sourceWorkspaceId = randomUUID();
+    await db.insert(executionWorkspaces).values({
+      id: sourceWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: `failed-source-${sourceWorkspaceId}`,
+      status: "active",
+      cwd: "/tmp/not-a-real-worktree-path-override-disallowed-card",
+    });
+    await db.update(issues).set({
+      executionWorkspaceId: sourceWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    }).where(eq(issues.id, issueId));
+    await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+    mockAdapterExecute.mockClear();
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileExhaustedRecoveryDrain();
+    expect(result.recoveryIssueMinted).toBe(1);
+
+    const [action] = await db
+      .select({ recoveryIssueId: issueRecoveryActions.recoveryIssueId })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action.recoveryIssueId).not.toBeNull();
+    const [recoveryIssue] = await db
+      .select({
+        assigneeAgentId: issues.assigneeAgentId,
+        deliveryRequirement: issues.deliveryRequirement,
+        executionWorkspaceId: issues.executionWorkspaceId,
+        executionWorkspacePreference: issues.executionWorkspacePreference,
+        projectWorkspaceId: issues.projectWorkspaceId,
+      })
+      .from(issues)
+      .where(eq(issues.id, action.recoveryIssueId!));
+    expect(recoveryIssue.assigneeAgentId).toBe(agentId);
+    expect(recoveryIssue.deliveryRequirement).toBe("record_only");
+    expect(recoveryIssue.executionWorkspaceId).toBeNull();
+    // No override preference is sent, so the card keeps the project default binding
+    // (not the no-binding exemption shape) exactly as it did before this change.
+    expect(recoveryIssue.executionWorkspacePreference).toBeNull();
+    expect(recoveryIssue.projectWorkspaceId).toBe(projectWorkspaceId);
+
+    await drainAgentRuns(agentId);
+    const wakes = await db
+      .select({ payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.some((wake) => {
+      const payload = wake.payload as { issueId?: unknown } | null;
+      return payload?.issueId === action.recoveryIssueId;
+    })).toBe(true);
   });
 
   it("SUP-21344: an open exhausted recovery issue is not re-woken on later drain ticks", async () => {

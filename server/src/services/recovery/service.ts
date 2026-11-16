@@ -218,6 +218,7 @@ import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, resolveCanonicalWikiM
 import { loadConfig } from "../../config.js";
 import {
   canAgentSatisfyIssueWorkspaceSettings,
+  gateProjectExecutionWorkspacePolicy,
   parseProjectExecutionWorkspacePolicy,
 } from "../execution-workspace-policy.js";
 import {
@@ -9963,6 +9964,27 @@ export function recoveryService(
     const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
     if (!ownerAgentId) return null;
 
+    // The issue write boundary refuses ANY explicit workspace preference on a
+    // project whose policy sets allowIssueOverride=false while isolated
+    // workspaces are on (SUP-13058). Naming `agent_default` there would make
+    // this card un-mintable, which is worse than the inherited-workspace
+    // failure it exists to avoid. Such a project keeps the policy-resolved
+    // workspace (no preference) and relies on the skip flag below; the card
+    // is then not the no-binding exemption shape and keeps every workspace
+    // check, as before this change.
+    const sourceProjectPolicy = input.issue.projectId
+      ? await db
+          .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
+          .from(projects)
+          .where(and(eq(projects.id, input.issue.projectId), eq(projects.companyId, input.issue.companyId)))
+          .then((rows) => rows[0]?.executionWorkspacePolicy ?? null)
+      : null;
+    const overrideDisallowedByProject =
+      gateProjectExecutionWorkspacePolicy(
+        parseProjectExecutionWorkspacePolicy(sourceProjectPolicy),
+        (await instanceSettings.getExperimental()).enableIsolatedWorkspaces === true,
+      )?.allowIssueOverride === false;
+
     const titleSource = input.issue.identifier ?? input.issue.title;
     let recoveryIssue: typeof issues.$inferSelect;
     try {
@@ -9982,8 +10004,9 @@ export function recoveryService(
         // A null projectWorkspaceId is refilled from the project default, and
         // that binding is itself a git-workspace expectation. agent_default is
         // the create-time normalization that drops it, so the board card is
-        // not dispatched against the source checkout (SUP-23493).
-        executionWorkspacePreference: "agent_default",
+        // not dispatched against the source checkout (SUP-23493). Omitted for a
+        // project that disallows issue-level overrides (see above).
+        ...(overrideDisallowedByProject ? {} : { executionWorkspacePreference: "agent_default" as const }),
         goalId: input.issue.goalId,
         assigneeAgentId: ownerAgentId,
         originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,

@@ -538,6 +538,67 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
     );
   });
 
+  // The exemption is shape-only, so each of the five fields must be load-bearing
+  // on its own: a card that matches the exhausted-recovery shape in four fields
+  // and differs in exactly one must keep every workspace check.
+  describe("exhausted-recovery exemption shape: one field off", () => {
+    const exemptShape: NonNullable<WorkspaceValidationInput["issue"]> = {
+      id: "issue-1",
+      identifier: "PAP-1",
+      projectId: "project-1",
+      deliveryRequirement: "record_only",
+      executionWorkspaceId: null,
+      projectWorkspaceId: null,
+      executionWorkspacePreference: "agent_default",
+      originKind: "stranded_issue_recovery",
+    };
+    const cwd = "/tmp/paperclip-exemption-shape-without-git-metadata";
+    type IssueFields = Partial<NonNullable<WorkspaceValidationInput["issue"]>>;
+    function inputWithIssueFields(fields: IssueFields) {
+      const base = buildWorkspaceValidationInput();
+      return buildWorkspaceValidationInput({
+        issue: { ...base.issue!, ...exemptShape, ...fields },
+        resolvedWorkspace: buildResolvedWorkspace({ cwd }),
+        executionWorkspace: { ...base.executionWorkspace, baseCwd: cwd, cwd },
+        persistedExecutionWorkspace: { ...base.persistedExecutionWorkspace!, cwd },
+      });
+    }
+
+    it("control: the exact five-field shape is exempt", async () => {
+      await expect(
+        assertGitSensitiveAdapterWorkspaceValid(inputWithIssueFields({})),
+      ).resolves.toBeUndefined();
+    });
+
+    const oneFieldOff: Array<[string, IssueFields]> = [
+      ["deliveryRequirement", { deliveryRequirement: "repository_delivery" }],
+      ["executionWorkspaceId", { executionWorkspaceId: "bound-execution-workspace-1" }],
+      ["projectWorkspaceId", { projectWorkspaceId: "workspace-1" }],
+      ["executionWorkspacePreference", { executionWorkspacePreference: "reuse_existing" }],
+      ["originKind", { originKind: "manual" }],
+    ];
+    it.each(oneFieldOff)("keeps every workspace check when only %s differs", async (_field, fields) => {
+      await expectWorkspaceValidationFailure(
+        inputWithIssueFields(fields),
+        "missing_git_metadata",
+        "has no .git metadata",
+      );
+    });
+
+    const absentFields: Array<[string, IssueFields]> = [
+      ["deliveryRequirement", { deliveryRequirement: null }],
+      ["executionWorkspacePreference", { executionWorkspacePreference: null }],
+      ["originKind", { originKind: null }],
+    ];
+    it.each(absentFields)("keeps every workspace check when %s is absent", async (_field, fields) => {
+      await expectWorkspaceValidationFailure(
+        inputWithIssueFields(fields),
+        "missing_git_metadata",
+        "has no .git metadata",
+      );
+    });
+  });
+
   it("does not apply the git-sensitive workspace guard to non-local execution targets", async () => {
     const input = buildWorkspaceValidationInput();
 
