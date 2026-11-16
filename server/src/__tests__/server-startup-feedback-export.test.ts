@@ -483,7 +483,10 @@ vi.mock("../services/index.js", () => ({
   })),
 }));
 
-vi.mock("../services/chat-completion-delivery.js", () => ({ chatCompletionDeliveryService: () => ({ sweepPending: completionSweepMock }) }));
+vi.mock("../services/chat-completion-delivery.js", () => ({
+  chatCompletionDeliveryService: () => ({ sweepPending: completionSweepMock }),
+  recordChatCompletion: vi.fn(async () => undefined),
+}));
 
 vi.mock("../services/connection-intent-delivery.js", () => ({
   connectionIntentDeliveryService: vi.fn(() => ({
