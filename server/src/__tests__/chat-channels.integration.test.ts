@@ -87,7 +87,7 @@ import {
   principalPermissionGrants,
   toolConnections,
 } from "@paperclipai/db";
-import type { ChatProvider } from "@paperclipai/shared";
+import type { ChatProvider, CreateIssueThreadInteractionInput } from "@paperclipai/shared";
 import { isPaperclipExternalChatTurn } from "@paperclipai/adapter-utils/server-utils";
 import type { Attachment, Author, Message, Thread } from "chat";
 import { errorHandler } from "../middleware/index.js";
@@ -1173,7 +1173,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await db.insert(companies).values({
       id: companyId,
       name: `Chat Test ${companyId.slice(0, 8)}`,
-      issuePrefix: `C${companyId.replaceAll("-", "").slice(0, 7).toUpperCase()}`,
+      issuePrefix: `C${companyId.replace(/-/g, "").toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     });
     const now = new Date();
@@ -28229,7 +28229,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
                         },
                       ],
                     },
-            },
+            } as CreateIssueThreadInteractionInput,
             { agentId: f.assignedAgentId, runId: f.runId },
           );
           const [prompt] = await db
