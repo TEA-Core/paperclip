@@ -79,6 +79,7 @@ import {
   isLocalServiceProcessInWorkspace,
   readLocalServiceProcessCwd,
   readLocalServicePortOwner,
+  terminateLocalService,
   writeLocalServiceRegistryRecord,
 } from "../services/local-service-supervisor.ts";
 import { logger } from "../middleware/logger.js";
@@ -493,7 +494,9 @@ async function closeNetServer(server: net.Server) {
 }
 
 async function listenOnPort(port: number) {
-  const server = net.createServer();
+  // These listeners only hold a port. Drop inbound connections (for example a
+  // local port watcher probing new listeners) so close() never waits on them.
+  const server = net.createServer((socket) => socket.destroy());
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, "127.0.0.1", resolve);
@@ -10938,7 +10941,16 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     const fixture = await createRuntimeFixture();
     const cleanupRuntimeHome = await createRuntimeHome();
     const workspace = fixture.workspaces[0]!;
-    const basePort = await findFreePort();
+    // Hold every port in the bounded range except the preferred one. The child
+    // binds the preferred port, its listener ownership cannot be attributed, and
+    // the start must refuse it. The retry then finds the rest of the range taken
+    // and returns the bounded conflict. One real child start proves the refusal;
+    // refusing a fresh child on every port of the range costs one child start
+    // per port and ran past the test timeout on a loaded CI runner.
+    const reservation = await reserveContiguousPorts(WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS);
+    const [baseReservation, ...otherReservations] = reservation.servers;
+    await closeNetServer(baseReservation!);
+    const basePort = reservation.basePort;
     const fakeBin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-no-lsof-"));
     const fakeLsof = path.join(fakeBin, "lsof");
     const previousPath = process.env.PATH;
@@ -10971,6 +10983,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
         workspaceCwd: workspace.cwd,
       }).catch(() => undefined);
       await fs.rm(fakeBin, { recursive: true, force: true });
+      await Promise.all(otherReservations.map((server) => closeNetServer(server).catch(() => undefined)));
       await cleanupRuntimeHome();
       await fixture.cleanup();
     }
@@ -11681,7 +11694,18 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     expect(persisted?.providerRef).toBe(originalProviderRef);
     await expect(fetch(service!.url!)).resolves.toMatchObject({ ok: true });
 
-    await resetRuntimeServicesForTests({ terminateProcesses: true });
+    // Stop the adopted service outside the runtime. The adopted record reuses
+    // this service's id, and the child handle from the first start still has
+    // its `exit` listener in this test process (a real restart would not).
+    // Stopping through the runtime fires that stale listener, which persists
+    // the row again without being awaited. Under load that write lands after
+    // afterEach deletes the rows, and the company delete then fails its
+    // foreign key. Dropping the in-memory records first makes the stale
+    // listener a no-op.
+    const servicePid = Number(originalProviderRef);
+    expect(Number.isInteger(servicePid) && servicePid > 0).toBe(true);
+    await resetRuntimeServicesForTests();
+    await terminateLocalService({ pid: servicePid, processGroupId: servicePid, port: originalPort });
     leasedRunIds.delete(runId);
     await fs.rm(paperclipHome, { recursive: true, force: true });
     await fs.rm(workspaceRoot, { recursive: true, force: true });
