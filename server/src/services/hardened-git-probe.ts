@@ -486,12 +486,13 @@ async function listIndexEntries(
   return entries;
 }
 
-async function snapshotStatusIsDirty(
+/** `status --porcelain=v1 -z --untracked-files=all` through the snapshot git dir, one entry per NUL-separated record. */
+async function snapshotStatusRecords(
   snapshotGitDir: string,
   workTree: string,
   ignoreSubmodules: "all" | "dirty",
   options: HardenedGitOptions,
-): Promise<boolean> {
+): Promise<string[]> {
   const raw = await runHardenedGit(
     [
       "-C", workTree, `--git-dir=${snapshotGitDir}`, `--work-tree=${workTree}`,
@@ -499,7 +500,7 @@ async function snapshotStatusIsDirty(
     ],
     options,
   );
-  return raw.split("\0").some((record) => record.length > 0);
+  return raw.split("\0").filter((record) => record.length > 0);
 }
 
 /**
@@ -723,13 +724,55 @@ export type NoRepositoryWorktreeProbeResult =
     }
   | { ok: false; reason: string };
 
-function refuse(reason: string): NoRepositoryWorktreeProbeResult {
+function refuse(reason: string): { ok: false; reason: string } {
   return { ok: false, reason };
 }
 
 type CleanWorktreeVerdict =
   | { ok: true; branch: string; headSha: string }
   | { ok: false; reason: string };
+
+/** Why the path is not a plain, full-history Git work tree; null when it is one. */
+async function worktreeShapeRefusal(worktreePath: string, options: HardenedGitOptions): Promise<string | null> {
+  let flags: string[];
+  try {
+    flags = (await runHardenedGit(
+      [
+        "-C", worktreePath, "rev-parse",
+        "--is-bare-repository", "--is-inside-git-dir", "--is-inside-work-tree", "--is-shallow-repository",
+      ],
+      options,
+    )).split("\n").filter((line) => line.length > 0);
+  } catch {
+    return "is not a Git work tree";
+  }
+  if (flags.length !== 4) return "could not be identified as a Git work tree";
+  if (flags[0] !== "false") return "is a bare repository";
+  if (flags[1] !== "false") return "is inside a Git directory";
+  if (flags[2] !== "true") return "is not a Git work tree";
+  if (flags[3] !== "false") return "is a shallow clone";
+  return null;
+}
+
+/** Info/exclude rules other than the one the server writes: they can hide untracked work from status. */
+function hasForeignExcludeRules(exclude: string | null): boolean {
+  return (
+    exclude !== null &&
+    exclude.split(/\r?\n/).some((line) => {
+      const trimmed = line.trim();
+      return trimmed.length > 0 && !trimmed.startsWith("#") && trimmed !== SERVER_WRITTEN_EXCLUDE_LINE;
+    })
+  );
+}
+
+/** Why an index entry hides or blocks a status check; null for a plain stage-0 tracked file. */
+function indexEntryRefusal(entry: IndexEntry): string | null {
+  if (entry.stage !== "0") return "has unmerged index entries";
+  if (entry.tag === "S") return "has skip-worktree index entries";
+  if (entry.tag !== "H") return "has assume-unchanged index entries";
+  if (entry.mode === "160000") return "has submodules";
+  return null;
+}
 
 /**
  * Identity, configuration, index and status checks for one linked worktree of
@@ -742,23 +785,8 @@ async function verifyCleanLinkedWorktree(
   options: HardenedGitOptions,
 ): Promise<CleanWorktreeVerdict> {
   const worktreeOptions: HardenedGitOptions = { ...options, ceilingDirectory: path.dirname(worktreePath) };
-  let flags: string[];
-  try {
-    flags = (await runHardenedGit(
-      [
-        "-C", worktreePath, "rev-parse",
-        "--is-bare-repository", "--is-inside-git-dir", "--is-inside-work-tree", "--is-shallow-repository",
-      ],
-      worktreeOptions,
-    )).split("\n").filter((line) => line.length > 0);
-  } catch {
-    return { ok: false, reason: "is not a Git work tree" };
-  }
-  if (flags.length !== 4) return { ok: false, reason: "could not be identified as a Git work tree" };
-  if (flags[0] !== "false") return { ok: false, reason: "is a bare repository" };
-  if (flags[1] !== "false") return { ok: false, reason: "is inside a Git directory" };
-  if (flags[2] !== "true") return { ok: false, reason: "is not a Git work tree" };
-  if (flags[3] !== "false") return { ok: false, reason: "is a shallow clone" };
+  const shapeRefusal = await worktreeShapeRefusal(worktreePath, worktreeOptions);
+  if (shapeRefusal) return { ok: false, reason: shapeRefusal };
 
   let identity: WorktreeIdentity;
   try {
@@ -790,13 +818,7 @@ async function verifyCleanLinkedWorktree(
   } catch {
     return { ok: false, reason: "status could not be verified" };
   }
-  if (
-    exclude !== null &&
-    exclude.split(/\r?\n/).some((line) => {
-      const trimmed = line.trim();
-      return trimmed.length > 0 && !trimmed.startsWith("#") && trimmed !== SERVER_WRITTEN_EXCLUDE_LINE;
-    })
-  ) {
+  if (hasForeignExcludeRules(exclude)) {
     return { ok: false, reason: "has info/exclude ignore rules the server did not write" };
   }
   try {
@@ -805,13 +827,11 @@ async function verifyCleanLinkedWorktree(
       async (snapshot) => {
         const trackedPaths = new Set<string>();
         for (const entry of await listIndexEntries(snapshot, worktreePath, worktreeOptions)) {
-          if (entry.stage !== "0") return "has unmerged index entries";
-          if (entry.tag === "S") return "has skip-worktree index entries";
-          if (entry.tag !== "H") return "has assume-unchanged index entries";
-          if (entry.mode === "160000") return "has submodules";
+          const entryRefusal = indexEntryRefusal(entry);
+          if (entryRefusal) return entryRefusal;
           trackedPaths.add(entry.path);
         }
-        if (await snapshotStatusIsDirty(snapshot, worktreePath, "all", worktreeOptions)) {
+        if ((await snapshotStatusRecords(snapshot, worktreePath, "all", worktreeOptions)).length > 0) {
           return "has uncommitted changes (modified, staged or untracked)";
         }
         const ignored = await firstDisallowedIgnoredEntry(snapshot, worktreePath, trackedPaths, worktreeOptions);
@@ -1036,4 +1056,148 @@ export async function recheckRecordedWorktree(input: {
     return { ok: false, reason: "the recorded worktree's HEAD moved after the close was measured" };
   }
   return { ok: true };
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// SUP-24402: the zero-delta repository_delivery close. A routine cycle card
+// classified repository_delivery whose own branch carries no change has no
+// pull request and no merge commit, so the Tier 2 merge-head proof has nothing
+// to compare with. The guard accepts that close only when, among its other
+// proofs, this probe measures the card's own recorded worktree on the card's
+// recorded branch and finds:
+//   - `rev-list --count <base>..<HEAD>` printing exactly 0;
+//   - `merge-base --is-ancestor <HEAD> <base>` exiting 0;
+//   - `status --porcelain=v1 --untracked-files=all` printing nothing;
+// where <base> is `refs/remotes/origin/<base branch>`. Every git process runs
+// under the hardened runner, and status runs through the snapshot git dir, so
+// no repository-local configuration (a filter driver, fsmonitor, hooks) runs
+// or reshapes what status reports. Index flags that hide a modification from
+// status (assume-unchanged, skip-worktree), unmerged entries, submodules, an
+// in-progress git operation and info/exclude rules the server did not write
+// all refuse, because each leaves an empty status unproven. Any git failure,
+// unparseable output or missing ref refuses. The base ref is read from the
+// worktree's own refs, which an agent can write, so the caller also compares
+// HEAD with the base branch on the remote.
+// ───────────────────────────────────────────────────────────────────────
+
+export interface ZeroDeltaWorktreeProbeInput {
+  /** Path recorded on the card's own execution workspace row (`providerRef ?? cwd`, not agent-writable). */
+  recordedWorktreePath: string;
+  /** Branch recorded on that row (`branchName`, not agent-writable). */
+  branch: string;
+  /** The base branch name, normalized; measured as `refs/remotes/origin/<baseBranch>`. */
+  baseBranch: string;
+  timeoutMs?: number;
+}
+
+/** What the three base and status commands answered. */
+export interface ZeroDeltaWorktreeMeasurement {
+  /** `rev-list --count <base>..<HEAD>` standard output, verbatim. */
+  aheadCountOutput: string;
+  /** True only when `merge-base --is-ancestor <HEAD> <base>` exited 0. */
+  headIsAncestorOfBase: boolean;
+  /** `status --porcelain=v1 -z --untracked-files=all` records. */
+  statusRecords: readonly string[];
+}
+
+export type ZeroDeltaWorktreeProbeResult =
+  | { ok: true; worktreePath: string; branch: string; headSha: string; baseRef: string; baseSha: string }
+  | { ok: false; reason: string };
+
+/**
+ * Why a measurement is not zero-delta; null when every clause holds. Each
+ * clause is checked on its own, so an inconsistent answer (a zero count with
+ * a failed ancestry check) still refuses.
+ */
+export function zeroDeltaWorktreeRefusal(measurement: ZeroDeltaWorktreeMeasurement, baseRef: string): string | null {
+  const aheadOutput = measurement.aheadCountOutput.trim();
+  if (!/^\d+$/.test(aheadOutput)) return `printed no commit count for ${baseRef}..HEAD`;
+  if (aheadOutput !== "0") return `has ${aheadOutput} commit(s) on HEAD that ${baseRef} lacks`;
+  if (!measurement.headIsAncestorOfBase) return `has a HEAD that is not an ancestor of ${baseRef}`;
+  if (measurement.statusRecords.some((record) => !record.startsWith("?? "))) {
+    return "has uncommitted changes to tracked files";
+  }
+  if (measurement.statusRecords.length > 0) return "has untracked files";
+  return null;
+}
+
+async function readBranchHead(
+  worktreePath: string,
+  options: HardenedGitOptions,
+): Promise<{ branchRef: string; headSha: string } | null> {
+  const headSha = await readHeadCommit(worktreePath, options);
+  if (!headSha) return null;
+  const branchRef = (await runHardenedGit(["-C", worktreePath, "symbolic-ref", "--quiet", "HEAD"], options)).trim();
+  return { branchRef, headSha };
+}
+
+export async function probeZeroDeltaWorktree(input: ZeroDeltaWorktreeProbeInput): Promise<ZeroDeltaWorktreeProbeResult> {
+  if (!resolveTrustedGitBinary()) return refuse("no root-owned git binary is installed at a fixed system path");
+  const baseRef = `refs/remotes/origin/${input.baseBranch}`;
+  const branchRef = `refs/heads/${input.branch}`;
+  let worktreePath: string;
+  try {
+    worktreePath = await realpath(input.recordedWorktreePath);
+  } catch {
+    return refuse("the recorded worktree path does not exist");
+  }
+  const options: HardenedGitOptions = { cwd: "/", timeoutMs: input.timeoutMs, ceilingDirectory: path.dirname(worktreePath) };
+  try {
+    const shapeRefusal = await worktreeShapeRefusal(worktreePath, options);
+    if (shapeRefusal) return refuse(`the recorded worktree ${shapeRefusal}`);
+    const identity = await readWorktreeIdentity(worktreePath, options);
+    if (identity.topLevel !== worktreePath) {
+      return refuse("the recorded worktree has a work-tree top level other than its own path");
+    }
+    const head = await readBranchHead(worktreePath, options).catch(() => null);
+    if (!head) return refuse(`the recorded worktree is not on the card's recorded branch ${input.branch}`);
+    if (head.branchRef !== branchRef) {
+      return refuse(`the recorded worktree is on ${head.branchRef}, not on the card's recorded branch ${input.branch}`);
+    }
+    if (await lstat(path.join(identity.gitDir, "index.lock")).then(() => true, () => false)) {
+      return refuse("the recorded worktree has a Git operation in progress (index.lock is present)");
+    }
+    const exclude = await readOptionalRegularFile(path.join(identity.commonDir, "info", "exclude"), MAX_EXCLUDE_FILE_BYTES);
+    if (hasForeignExcludeRules(exclude)) {
+      return refuse("the recorded worktree has info/exclude ignore rules the server did not write");
+    }
+    const baseSha = (
+      await runHardenedGit(["-C", worktreePath, "rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`], options)
+        .catch(() => "")
+    ).trim();
+    if (!SHA_RE.test(baseSha)) return refuse(`the base ref ${baseRef} does not resolve in the recorded worktree`);
+
+    const aheadCountOutput = await runHardenedGit(
+      ["-C", worktreePath, "rev-list", "--count", `${baseSha}..${head.headSha}`],
+      options,
+    );
+    const headIsAncestorOfBase = await runHardenedGit(
+      ["-C", worktreePath, "merge-base", "--is-ancestor", head.headSha, baseSha],
+      options,
+    ).then(() => true, () => false);
+    const snapshotResult = await withSnapshotGitDir(
+      { identity, headSha: head.headSha, config: snapshotConfig(identity.objectFormat), exclude },
+      async (snapshot): Promise<{ refusal: string } | { statusRecords: string[] }> => {
+        for (const entry of await listIndexEntries(snapshot, worktreePath, options)) {
+          const entryRefusal = indexEntryRefusal(entry);
+          if (entryRefusal) return { refusal: entryRefusal };
+        }
+        return { statusRecords: await snapshotStatusRecords(snapshot, worktreePath, "all", options) };
+      },
+    );
+    if ("refusal" in snapshotResult) return refuse(`the recorded worktree ${snapshotResult.refusal}`);
+    const refusal = zeroDeltaWorktreeRefusal(
+      { aheadCountOutput, headIsAncestorOfBase, statusRecords: snapshotResult.statusRecords },
+      baseRef,
+    );
+    if (refusal) return refuse(`the recorded worktree ${refusal}`);
+
+    const final = await readBranchHead(worktreePath, options).catch(() => null);
+    if (!final || final.branchRef !== head.branchRef || final.headSha !== head.headSha) {
+      return refuse("the recorded worktree's HEAD moved while it was being measured");
+    }
+    return { ok: true, worktreePath, branch: input.branch, headSha: head.headSha, baseRef, baseSha };
+  } catch (error) {
+    return refuse(`the recorded worktree could not be measured (${error instanceof Error ? error.message : "unknown"})`);
+  }
 }
