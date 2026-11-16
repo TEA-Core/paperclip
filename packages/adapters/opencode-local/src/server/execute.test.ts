@@ -551,7 +551,7 @@ describe("OpenCode local chat policy", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(prompt).toContain(directive);
-    expect(prompt).toContain(custom ? "Custom agent instruction." : "Continue your Paperclip conversation");
+    expect(prompt).toContain(custom ? "Custom agent instruction." : "You are agent agent-1");
     expect(prompt).not.toContain("Execution contract:");
     expect(prompt).not.toContain("Create child issues");
   });
@@ -579,6 +579,9 @@ describe("OpenCode local chat policy", () => {
     expect(prompts).toHaveLength(2);
     expect(prompts[0]).toContain("## Compact assignment");
     expect(prompts[1]).toContain("## Owned assignment");
+    for (const prompt of prompts) expect(prompt).not.toContain("Execution contract:");
+    expect(prompts[1]).toContain("You are agent agent-1 (OpenCode).");
+    expect(prompts[1]).toContain("Connection tools:");
   });
 });
 
