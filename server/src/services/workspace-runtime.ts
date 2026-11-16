@@ -58,6 +58,7 @@ import {
 } from "@paperclipai/shared/worktree-initialization-manifest";
 import { resolveWorktreeStateDir } from "../dev-runner-worktree.js";
 import {
+  readWorktreeInitializationKey,
   readWorktreeSeedManifestStatus,
   readWorktreeStateInstanceId,
   readWorktreeStateManifest,
@@ -8940,14 +8941,16 @@ const NO_SOURCE_SEED_SKIP_MARKER = "seed-skip-no-source";
 
 /**
  * What a v3 initialization manifest in `stateDir` must be verified for: the
- * instance the worktree runs as (its state `.env`) and a revision of this
- * server build's migration lineage. This server never reads the worktree's own
- * migration files, which that worktree controls.
+ * instance the worktree runs as (its state `.env`), a revision of this server
+ * build's migration lineage, and the initialization key in the same state
+ * directory. This server never reads the worktree's own migration files,
+ * which that worktree controls.
  */
 function expectWorktreeInitialization(stateDir: string): WorktreeInitializationExpectation {
   return {
     targetInstanceId: readWorktreeStateInstanceId(stateDir),
     schema: resolveWorktreeSchemaLineage(MIGRATIONS_FOLDER),
+    bindingKey: readWorktreeInitializationKey(stateDir),
   };
 }
 

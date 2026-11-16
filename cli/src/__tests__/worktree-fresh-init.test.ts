@@ -12,8 +12,10 @@ import {
 } from "../commands/worktree.js";
 import {
   assertFreshInitializationRows,
+  assertNoLinkBelow,
   FreshInitializationRecord,
   mintFreshWorktreeIdentity,
+  resolveFreshWorktreeDeletionSet,
   resolveSyntheticWorktreeFixture,
 } from "../commands/worktree-fresh-init.js";
 import { resolveWorktreeLocalPaths } from "../commands/worktree-lib.js";
@@ -196,7 +198,10 @@ describe("fresh worktree initialization record", () => {
       source: null,
       validation: { kind: "fresh-ready", attemptId: manifest.attemptId, generationId: manifest.generationId },
     });
-    if (process.platform !== "win32") expect(fs.statSync(manifestPath).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      expect(fs.statSync(manifestPath).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(path.join(root, ".paperclip", "initialization.key")).mode & 0o777).toBe(0o600);
+    }
     expect(readVerifiedWorktreeInitialization(configPath)?.generationId).toBe(manifest.generationId);
     await expect(ensureWorktreeSeeded({ config: configPath })).resolves.toEqual({
       seeded: false,
@@ -207,6 +212,35 @@ describe("fresh worktree initialization record", () => {
     fs.writeFileSync(path.join(root, ".paperclip", ".env"), "PAPERCLIP_INSTANCE_ID=wt-other\n");
     expect(() => readVerifiedWorktreeInitialization(configPath)).toThrow(/different target instance/);
     await expect(ensureWorktreeSeeded({ config: configPath })).rejects.toThrow(/different target instance/);
+  });
+
+  it("refuses a forged, edited or copied manifest at ensure-seeded instead of reseeding", async () => {
+    const root = tempRoot("paperclip-fresh-record-forged-");
+    const { configPath, manifestPath } = await writeRecordedInitialization(root, "wt-fresh");
+    const written = fs.readFileSync(manifestPath, "utf8");
+    const manifest = JSON.parse(written) as Record<string, unknown>;
+
+    // A hand-written manifest: right shape, binding not produced by this worktree's key.
+    fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, binding: `hmac-sha256:${randomBytes(32).toString("hex")}` }));
+    await expect(ensureWorktreeSeeded({ config: configPath })).rejects.toThrow(/not bound to this worktree's initialization key/);
+
+    // The writer's manifest with one field edited afterwards.
+    const diagnostics = manifest.diagnostics as Array<Record<string, unknown>>;
+    fs.writeFileSync(manifestPath, JSON.stringify({
+      ...manifest,
+      diagnostics: diagnostics.map((entry, index) => (index === 0 ? { ...entry, code: "attempt_edited" } : entry)),
+    }));
+    await expect(ensureWorktreeSeeded({ config: configPath })).rejects.toThrow(/not bound/);
+
+    // Another worktree's real manifest for the same instance id, copied in.
+    const other = tempRoot("paperclip-fresh-record-other-");
+    const { manifestPath: otherManifest } = await writeRecordedInitialization(other, "wt-fresh");
+    fs.copyFileSync(otherManifest, manifestPath);
+    await expect(ensureWorktreeSeeded({ config: configPath })).rejects.toThrow(/not bound/);
+
+    // The writer's own output still verifies.
+    fs.writeFileSync(manifestPath, written);
+    await expect(ensureWorktreeSeeded({ config: configPath })).resolves.toMatchObject({ reason: "verified_initialization" });
   });
 
   it("records a failed phase with a fixed code and no exception text", async () => {
@@ -259,6 +293,133 @@ describe("fresh worktree initialization record", () => {
     expect(() => mintFreshWorktreeIdentity(paths, { name: "wt-fresh", color: "#336699" })).toThrow(/existing/);
     expect(fs.readFileSync(paths.envPath, "utf8")).toBe("PAPERCLIP_AGENT_JWT_SECRET=earlier\n");
     expect(fs.existsSync(paths.secretsKeyFilePath)).toBe(false);
+  });
+
+  it("keeps manifest times ordered when the wall clock steps back", async () => {
+    const root = tempRoot("paperclip-fresh-record-clock-");
+    fs.mkdirSync(path.join(root, ".paperclip"));
+    let clock = Date.parse("2026-11-16T12:00:00.000Z");
+    const record = new FreshInitializationRecord(path.join(root, ".paperclip", "seed-manifest.json"), {
+      profile: "fresh",
+      fixture: null,
+      targetInstanceId: "wt-fresh",
+      schemaRevision: schemaHead,
+    }, () => new Date((clock -= 1_000)));
+    for (const phase of RUNNING_PHASES) await record.phase(phase, () => undefined);
+    expect(record.complete()).toMatchObject({ state: "verified", phase: "complete" });
+  });
+
+  it("checks the deletion set: a target outside the root, a forged instance path and a wrong entry kind", () => {
+    const root = tempRoot("paperclip-fresh-deletion-set-");
+    expect(() => assertNoLinkBelow(path.join(root, "wt"), path.join(root, "elsewhere", "config.json"), "file"))
+      .toThrow(/not inside/);
+    expect(() => assertNoLinkBelow(path.join(root, "wt"), path.join(root, "wt"), "directory")).toThrow(/not inside/);
+
+    const paths = resolveWorktreeLocalPaths({ cwd: path.join(root, "wt"), homeDir: path.join(root, "home"), instanceId: "wt" });
+    fs.mkdirSync(paths.repoConfigDir, { recursive: true });
+    expect(resolveFreshWorktreeDeletionSet(paths).instanceRoot).toBe(paths.instanceRoot);
+    expect(() => resolveFreshWorktreeDeletionSet({ ...paths, instanceRoot: path.join(root, "home") }))
+      .toThrow(/not one instance directory/);
+    expect(() => resolveFreshWorktreeDeletionSet({ ...paths, instanceId: "..", instanceRoot: path.join(root, "home", "instances", "..") }))
+      .toThrow(/not one instance directory/);
+    // A nested id would remove a directory below another instance directory.
+    expect(() => resolveFreshWorktreeDeletionSet({
+      ...paths,
+      instanceId: "other/wt",
+      instanceRoot: path.join(root, "home", "instances", "other", "wt"),
+    })).toThrow(/not one instance directory/);
+
+    // A state file that is a directory is refused before anything is removed.
+    fs.writeFileSync(paths.envPath, "PAPERCLIP_INSTANCE_ID=wt\n");
+    fs.mkdirSync(paths.configPath);
+    expect(() => resolveFreshWorktreeDeletionSet(paths)).toThrow(/not a regular file/);
+    expect(fs.existsSync(paths.envPath)).toBe(true);
+    // A .paperclip that is a file, not a directory, is refused too.
+    const other = resolveWorktreeLocalPaths({ cwd: path.join(root, "wt2"), homeDir: path.join(root, "home"), instanceId: "wt2" });
+    fs.mkdirSync(other.cwd);
+    fs.writeFileSync(other.repoConfigDir, "not a directory");
+    expect(() => resolveFreshWorktreeDeletionSet(other)).toThrow(/not a directory/);
+  });
+});
+
+/** Invented files in a directory outside the worktree; returns a snapshot to compare later. */
+function plantDecoy(dir: string, names: string[]): Record<string, string> {
+  fs.mkdirSync(dir, { recursive: true });
+  const snapshot: Record<string, string> = {};
+  for (const name of names) {
+    const file = path.join(dir, name);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    snapshot[file] = `decoy ${randomBytes(8).toString("hex")}\n`;
+    fs.writeFileSync(file, snapshot[file]);
+  }
+  return snapshot;
+}
+
+function expectUntouched(snapshot: Record<string, string>): void {
+  for (const [file, contents] of Object.entries(snapshot)) {
+    expect(fs.readFileSync(file, "utf8"), file).toBe(contents);
+  }
+}
+
+describe("worktree init --force through symbolic links", () => {
+  const STATE_FILES = ["config.json", "config.json.backup", ".env", "seed-pending", "seed-complete", "seed-skip-no-source", "initialization.key"];
+
+  function setup(prefix: string) {
+    const root = tempRoot(prefix);
+    const worktreeRoot = path.join(root, "wt");
+    const home = path.join(root, "home");
+    fs.mkdirSync(worktreeRoot);
+    process.chdir(worktreeRoot);
+    return { root, worktreeRoot, home };
+  }
+
+  it("refuses a linked .paperclip and removes nothing it points to", async () => {
+    const { root, worktreeRoot, home } = setup("paperclip-force-linked-state-");
+    const decoy = plantDecoy(path.join(root, "decoy-state"), STATE_FILES);
+    fs.symlinkSync(path.join(root, "decoy-state"), path.join(worktreeRoot, ".paperclip"));
+    for (const opts of [{ profile: "fresh" }, { seed: false, fromConfig: path.join(root, "missing", "config.json") }]) {
+      await expect(worktreeInitCommand({ ...opts, name: "wt", home, force: true })).rejects.toThrow(/symbolic link/);
+      expectUntouched(decoy);
+    }
+  });
+
+  it("refuses a .paperclip that links to the worktree's parent directory", async () => {
+    const { root, worktreeRoot, home } = setup("paperclip-force-linked-parent-");
+    const decoy = plantDecoy(root, ["config.json", ".env", "seed-pending"]);
+    fs.symlinkSync(root, path.join(worktreeRoot, ".paperclip"));
+    await expect(worktreeInitCommand({ profile: "fresh", name: "wt", home, force: true })).rejects.toThrow(/symbolic link/);
+    expectUntouched(decoy);
+  });
+
+  it("refuses a linked instances directory or instance directory under the worktree home", async () => {
+    for (const linkAt of ["instances", path.join("instances", "wt")]) {
+      const { root, home } = setup("paperclip-force-linked-instance-");
+      const target = path.join(root, "decoy-instance");
+      const decoy = plantDecoy(target, linkAt === "instances" ? ["wt/db/PG_VERSION", "wt/secrets/master.key"] : ["db/PG_VERSION", "secrets/master.key"]);
+      fs.mkdirSync(path.dirname(path.join(home, linkAt)), { recursive: true });
+      fs.symlinkSync(target, path.join(home, linkAt));
+      for (const opts of [{ profile: "fresh" }, { seed: false, fromConfig: path.join(root, "missing", "config.json") }]) {
+        await expect(worktreeInitCommand({ ...opts, name: "wt", home, force: true })).rejects.toThrow(/symbolic link/);
+        expectUntouched(decoy);
+      }
+    }
+  });
+
+  it("refuses a state file that is itself a link, and keeps its target", async () => {
+    const { root, worktreeRoot, home } = setup("paperclip-force-linked-file-");
+    const decoy = plantDecoy(path.join(root, "outside"), ["config.json"]);
+    fs.mkdirSync(path.join(worktreeRoot, ".paperclip"));
+    fs.symlinkSync(path.join(root, "outside", "config.json"), path.join(worktreeRoot, ".paperclip", "config.json"));
+    await expect(worktreeInitCommand({ profile: "fresh", name: "wt", home, force: true })).rejects.toThrow(/symbolic link/);
+    expectUntouched(decoy);
+  });
+
+  it("refuses a linked .paperclip without --force before writing anything into it", async () => {
+    const { root, worktreeRoot, home } = setup("paperclip-linked-state-no-force-");
+    fs.mkdirSync(path.join(root, "empty-decoy"));
+    fs.symlinkSync(path.join(root, "empty-decoy"), path.join(worktreeRoot, ".paperclip"));
+    await expect(worktreeInitCommand({ profile: "fresh", name: "wt", home })).rejects.toThrow(/symbolic link/);
+    expect(fs.readdirSync(path.join(root, "empty-decoy"))).toEqual([]);
   });
 });
 

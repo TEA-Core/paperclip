@@ -40,6 +40,7 @@ import {
 import {
   classifyWorktreeStateManifest,
   type WorktreeInitializationManifest,
+  WORKTREE_INITIALIZATION_KEY_FILE,
 } from "@paperclipai/shared/worktree-initialization-manifest";
 import {
   applyPendingMigrations,
@@ -105,10 +106,13 @@ import {
 } from "./worktree-lib.js";
 import {
   assertFreshInitializationRows,
+  assertNoLinkBelow,
   buildFreshWorktreeConfig,
   FreshInitializationRecord,
   isWorktreeInitProfile,
   mintFreshWorktreeIdentity,
+  removeFreshWorktreeState,
+  resolveFreshWorktreeDeletionSet,
   resolveSyntheticWorktreeFixture,
   type WorktreeInitProfile,
 } from "./worktree-fresh-init.js";
@@ -1877,26 +1881,30 @@ function writeNoSourceSeedSkipMarker(
 /**
  * The verified v3 initialization manifest of this worktree, or `null` when the
  * state holds no v3 manifest. A v3 manifest is accepted only for the instance
- * named in the worktree state `.env` and a revision of this build's migration
- * lineage; any other v3 manifest throws with its refusal reason. A manifest
- * that is unsafe to read (link, FIFO, oversized) throws, as in
- * {@link readWorktreeSeedManifest}.
+ * named in the worktree state `.env`, a revision of this build's migration
+ * lineage, and a binding that verifies under the state initialization key; any
+ * other v3 manifest throws with its refusal reason. A manifest that is unsafe
+ * to read (link, FIFO, oversized) throws, as in {@link readWorktreeSeedManifest}.
  */
 export function readVerifiedWorktreeInitialization(configPath: string): WorktreeInitializationManifest | null {
   const manifestPath = path.resolve(resolveWorktreeSeedMarkerPaths(configPath).manifest);
+  const stateDir = path.dirname(manifestPath);
   const trustedRoot = resolveWorktreeStateRoot(manifestPath);
   const bytes = readBoundedStateFile(manifestPath, { trustedRoot });
   if (bytes === null) return null;
-  let targetInstanceId: string | null = null;
-  try {
-    const envBytes = readBoundedStateFile(path.join(path.dirname(manifestPath), ".env"), { trustedRoot });
-    targetInstanceId = envBytes === null ? null : parseWorktreeEnvInstanceId(envBytes);
-  } catch {
-    // An unreadable `.env` cannot confirm the target; the manifest is not accepted.
-  }
+  const readOptional = (name: string): Buffer | null => {
+    try {
+      return readBoundedStateFile(path.join(stateDir, name), { trustedRoot });
+    } catch {
+      // An unreadable file cannot confirm the manifest; it is not accepted.
+      return null;
+    }
+  };
+  const envBytes = readOptional(".env");
   const classification = classifyWorktreeStateManifest(bytes, {
-    targetInstanceId,
+    targetInstanceId: envBytes === null ? null : parseWorktreeEnvInstanceId(envBytes),
     schema: resolveWorktreeSchemaLineage(MIGRATIONS_FOLDER),
+    bindingKey: readOptional(WORKTREE_INITIALIZATION_KEY_FILE),
   });
   if (classification.kind === "initialization") return classification.manifest;
   if (classification.kind === "refused" && classification.reason.startsWith("initialization_")) {
@@ -1914,7 +1922,7 @@ export function readWorktreeSeedManifest(configPath: string): WorktreeSeedManife
   if (bytes === null) return null;
   // The legacy seed path never provisions a v3 initialization directory, so it
   // asserts no v3 expectation and every v3 manifest is refused.
-  const classification = classifyWorktreeStateManifest(bytes, { targetInstanceId: null, schema: null });
+  const classification = classifyWorktreeStateManifest(bytes, { targetInstanceId: null, schema: null, bindingKey: null });
   if (classification.kind !== "legacy-seed") {
     const reason = classification.kind === "refused"
       ? classification.message
@@ -2501,6 +2509,11 @@ async function runFreshWorktreeInit(opts: WorktreeInitOptions, profile: Worktree
   // This build's migration head is the destination schema the manifest names.
   const schemaRevision = computeWorktreeSchemaLineage(MIGRATIONS_FOLDER).at(-1)!;
 
+  // Checked before anything is read, written or removed: no state file or the
+  // instance directory may be reached through a symbolic link, so neither a
+  // write nor a --force removal can land outside this worktree and its
+  // instance directory.
+  const deletionSet = resolveFreshWorktreeDeletionSet(paths);
   const existing = [paths.configPath, paths.envPath, markers.manifest, paths.instanceRoot].filter((entry) => existsSync(entry));
   if (existing.length > 0 && !opts.force) {
     throw new Error(
@@ -2508,20 +2521,10 @@ async function runFreshWorktreeInit(opts: WorktreeInitOptions, profile: Worktree
     );
   }
   if (opts.force) {
-    // A clean generation: the earlier config (and its backup), env, markers and
-    // instance data are removed, never merged or carried forward. Sibling repo
-    // state such as `.paperclip/worktrees/` is kept.
-    for (const entry of [
-      paths.configPath,
-      `${paths.configPath}.backup`,
-      paths.envPath,
-      markers.pending,
-      markers.complete,
-      path.join(paths.repoConfigDir, "seed-skip-no-source"),
-    ]) {
-      rmSync(entry, { force: true });
-    }
-    rmSync(paths.instanceRoot, { recursive: true, force: true });
+    // A clean generation: the earlier config (and its backup), env, markers,
+    // initialization key and instance data are removed, never merged or
+    // carried forward. Sibling repo state such as `.paperclip/worktrees/` is kept.
+    removeFreshWorktreeState(deletionSet);
   }
   mkdirSync(paths.repoConfigDir, { recursive: true });
 
@@ -2655,12 +2658,14 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
     // Only remove the specific files we're about to rewrite, not the whole
     // repoConfigDir — that directory can contain sibling state such as
     // <repo>/.paperclip/worktrees/ holding every repo-managed worktree
-    // checkout, and a recursive rmSync here would nuke them all.
-    rmSync(paths.configPath, { force: true });
-    rmSync(paths.envPath, { force: true });
+    // checkout, and a recursive rmSync here would nuke them all. Every entry is
+    // checked first, so a linked `.paperclip` or instance directory removes
+    // nothing outside this worktree and its instance directory.
     const seedMarkers = resolveWorktreeSeedMarkerPaths(paths.configPath);
-    rmSync(seedMarkers.pending, { force: true });
-    rmSync(seedMarkers.complete, { force: true });
+    const removals = [paths.configPath, paths.envPath, seedMarkers.pending, seedMarkers.complete];
+    for (const file of removals) assertNoLinkBelow(paths.cwd, file, "file");
+    assertNoLinkBelow(paths.homeDir, paths.instanceRoot, "directory");
+    for (const file of removals) rmSync(file, { force: true });
     rmSync(paths.instanceRoot, { recursive: true, force: true });
   }
 

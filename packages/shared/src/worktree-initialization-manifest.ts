@@ -11,7 +11,8 @@
  * - Version 3 `worktree-initialization` manifests, for fresh isolated
  *   initialization. A v3 manifest is accepted only for the exact policy, target
  *   identity and destination schema the reader expects, with completed
- *   validation evidence bound to the same attempt and generation.
+ *   validation evidence bound to the same attempt and generation, and with a
+ *   `binding` that verifies under the worktree's own initialization key.
  *
  * This module is pure and self-contained (no relative imports) so the runtime
  * provisioner can load it through Node's type stripping without a build step.
@@ -19,7 +20,12 @@
  * only fields from this contract and fixed reason codes.
  */
 
+import { createHmac, timingSafeEqual } from "node:crypto";
+
 export const WORKTREE_INITIALIZATION_MANIFEST_VERSION = 3;
+/** Name of the 0600 binding key file next to the manifest in the state directory. */
+export const WORKTREE_INITIALIZATION_KEY_FILE = "initialization.key";
+export const WORKTREE_INITIALIZATION_KEY_BYTES = 32;
 export const WORKTREE_INITIALIZATION_MANIFEST_KIND = "worktree-initialization";
 /** The single initialization policy this code implements. */
 export const WORKTREE_INITIALIZATION_POLICY_VERSION = 1;
@@ -100,6 +106,8 @@ export type WorktreeInitializationManifest = {
   fixtureVersion?: number;
   diagnostics: WorktreeInitializationDiagnostic[];
   validation: WorktreeInitializationValidation | null;
+  /** {@link computeWorktreeInitializationBinding} of every other field. */
+  binding: string;
 };
 
 /**
@@ -126,6 +134,13 @@ export type WorktreeInitializationExpectation = {
   targetInstanceId: string | null;
   generationId?: string | null;
   schema: readonly WorktreeSchemaRevisionExpectation[] | null;
+  /**
+   * Contents of the worktree initialization key file
+   * ({@link WORKTREE_INITIALIZATION_KEY_FILE}) in the manifest's own state
+   * directory, or `null` when the reader has no key. A manifest is accepted
+   * only when its `binding` verifies under this key.
+   */
+  bindingKey: Uint8Array | null;
 };
 
 export type WorktreeStateManifestRefusalReason =
@@ -159,6 +174,8 @@ const TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const DIAGNOSTIC_CODE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/;
+const BINDING_PATTERN = /^hmac-sha256:[0-9a-f]{64}$/;
+const BINDING_DOMAIN = "paperclip-worktree-initialization-binding-v1\n";
 const UTC_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
 
 const MANIFEST_REQUIRED_FIELDS = [
@@ -178,6 +195,7 @@ const MANIFEST_REQUIRED_FIELDS = [
   "source",
   "diagnostics",
   "validation",
+  "binding",
 ] as const;
 const MANIFEST_OPTIONAL_FIELDS = ["fixtureId", "fixtureVersion"] as const;
 const SOURCE_FIELDS = ["sourceIdentity", "companyId", "exportSchemaFingerprint", "bundleDigest"] as const;
@@ -418,6 +436,7 @@ export function validateWorktreeInitializationManifest(value: unknown): Worktree
   if (!isUuid(value.attemptId)) return invalid("attemptId");
   if (!includes(WORKTREE_INITIALIZATION_STATES, value.state)) return invalid("state");
   if (!includes(WORKTREE_INITIALIZATION_PHASES, value.phase)) return invalid("phase");
+  if (typeof value.binding !== "string" || !BINDING_PATTERN.test(value.binding)) return invalid("binding");
   if (!validateSource(profile, value.source)) return invalid("source");
 
   const hasFixtureId = Object.prototype.hasOwnProperty.call(value, "fixtureId");
@@ -473,6 +492,36 @@ export function validateWorktreeInitializationManifest(value: unknown): Worktree
   return { ok: true, manifest: value as unknown as WorktreeInitializationManifest };
 }
 
+/** Object keys sorted at every level, so the bytes do not depend on field order. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (isPlainObject(value)) {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/**
+ * The `binding` of a v3 manifest: HMAC-SHA256, keyed by the worktree
+ * initialization key, over the canonical JSON of every other manifest field.
+ * Only the writer that created the key can produce it, so a hand-written,
+ * edited, or copied manifest does not verify. The key file is 0600 in the
+ * worktree state directory; a process with the same uid can still read it.
+ */
+export function computeWorktreeInitializationBinding(key: Uint8Array, manifest: Record<string, unknown>): string {
+  const { binding: _binding, ...body } = manifest;
+  const mac = createHmac("sha256", key).update(BINDING_DOMAIN).update(canonicalJson(body)).digest("hex");
+  return `hmac-sha256:${mac}`;
+}
+
+function verifyBinding(key: Uint8Array, manifest: WorktreeInitializationManifest): boolean {
+  if (key.length !== WORKTREE_INITIALIZATION_KEY_BYTES) return false;
+  const expected = Buffer.from(computeWorktreeInitializationBinding(key, manifest), "utf8");
+  const actual = Buffer.from(manifest.binding, "utf8");
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
 function refuse(
   reason: WorktreeStateManifestRefusalReason,
   message: string,
@@ -502,6 +551,12 @@ function classifyInitializationManifest(
     return refuse(
       "initialization_policy",
       "Worktree initialization profile is not authorized by the current initialization policy. Create a clean generation with an authorized profile.",
+    );
+  }
+  if (expected.bindingKey !== null && !verifyBinding(expected.bindingKey, manifest)) {
+    return refuse(
+      "initialization_mismatch",
+      "Worktree initialization manifest is not bound to this worktree's initialization key: it was written by hand, changed after it was written, or copied from another worktree. It will not be adopted; create a clean generation.",
     );
   }
   if (expected.targetInstanceId !== null && manifest.targetInstanceId !== expected.targetInstanceId) {
@@ -534,10 +589,10 @@ function classifyInitializationManifest(
       `Worktree initialization has not completed (state: ${manifest.state}, phase: ${manifest.phase}). Run a clean fresh initialization; no parent data is used as a fallback.`,
     );
   }
-  if (expected.targetInstanceId === null || expected.schema === null) {
+  if (expected.targetInstanceId === null || expected.schema === null || expected.bindingKey === null) {
     return refuse(
       "initialization_unconfirmed",
-      "This Paperclip build cannot confirm the target identity and destination schema of a worktree initialization manifest, so it refuses to use it. Use a build that supports fresh worktree initialization.",
+      "This Paperclip build cannot confirm the target identity, destination schema and initialization key of a worktree initialization manifest, so it refuses to use it. Use a build that supports fresh worktree initialization.",
     );
   }
   return { kind: "initialization", manifest };

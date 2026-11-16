@@ -6,6 +6,10 @@ import {
   computeWorktreeSchemaLineage,
   type WorktreeSchemaRevision,
 } from "@paperclipai/shared/worktree-initialization-identity";
+import {
+  computeWorktreeInitializationBinding,
+  WORKTREE_INITIALIZATION_KEY_FILE,
+} from "@paperclipai/shared/worktree-initialization-manifest";
 
 /** Head revision of this server build's migration lineage. */
 export function serverSchemaHead(): WorktreeSchemaRevision {
@@ -28,15 +32,14 @@ export function writeCheckoutMigrations(root: string): WorktreeSchemaRevision {
   return computeWorktreeSchemaLineage(folder).at(-1)!;
 }
 
-/** A verified v3 `fresh` initialization manifest with generated identities. */
-export function verifiedInitializationManifest(input: {
+/** A verified v3 `fresh` manifest body with generated identities and no binding. */
+function verifiedInitializationBody(input: {
   targetInstanceId: string;
   revision: WorktreeSchemaRevision;
-  overrides?: Record<string, unknown>;
-}): string {
+}): Record<string, unknown> {
   const generationId = randomUUID();
   const attemptId = randomUUID();
-  return JSON.stringify({
+  return {
     version: 3,
     kind: "worktree-initialization",
     profile: "fresh",
@@ -53,6 +56,24 @@ export function verifiedInitializationManifest(input: {
     source: null,
     diagnostics: [{ phase: "complete", code: "fresh_ready", status: "succeeded", at: "2026-11-16T10:00:05.000Z" }],
     validation: { kind: "fresh-ready", attemptId, generationId, completedAt: "2026-11-16T10:00:05.000Z" },
-    ...input.overrides,
-  });
+  };
+}
+
+/**
+ * Write a verified v3 manifest into `stateDir` the way the real writer does:
+ * a new 0600 initialization key next to it and a binding under that key.
+ * `forge` keeps the key file but writes a hand-made binding that the key did
+ * not produce, as a hand-written or edited manifest would look.
+ */
+export function writeVerifiedInitialization(
+  stateDir: string,
+  input: { targetInstanceId: string; revision: WorktreeSchemaRevision; forge?: boolean },
+): void {
+  const body = verifiedInitializationBody(input);
+  const key = randomBytes(32);
+  fs.writeFileSync(path.join(stateDir, WORKTREE_INITIALIZATION_KEY_FILE), key, { mode: 0o600 });
+  const binding = input.forge
+    ? `hmac-sha256:${randomBytes(32).toString("hex")}`
+    : computeWorktreeInitializationBinding(key, body);
+  fs.writeFileSync(path.join(stateDir, "seed-manifest.json"), JSON.stringify({ ...body, binding }), "utf8");
 }

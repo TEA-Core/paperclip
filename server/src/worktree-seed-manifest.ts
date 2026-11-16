@@ -6,6 +6,7 @@ import {
   isVerifiedWorktreeSeedManifest,
   type WorktreeInitializationExpectation,
   type WorktreeInitializationManifest,
+  WORKTREE_INITIALIZATION_KEY_FILE,
 } from "@paperclipai/shared/worktree-initialization-manifest";
 
 export type WorktreeSeedManifestStatus =
@@ -23,10 +24,14 @@ export type WorktreeStateManifestRead =
 export type LegacySeedManifestRead = Exclude<WorktreeStateManifestRead, { kind: "initialization" }>;
 
 /**
- * Callers that cannot confirm a v3 target identity and destination schema
- * refuse every v3 initialization manifest.
+ * Callers that cannot confirm a v3 target identity, destination schema and
+ * initialization key refuse every v3 initialization manifest.
  */
-const UNCONFIRMED_INITIALIZATION: WorktreeInitializationExpectation = { targetInstanceId: null, schema: null };
+const UNCONFIRMED_INITIALIZATION: WorktreeInitializationExpectation = {
+  targetInstanceId: null,
+  schema: null,
+  bindingKey: null,
+};
 
 /**
  * Bounded read of a file in a worktree state directory. The directory that
@@ -46,6 +51,19 @@ export function readWorktreeStateInstanceId(stateDir: string): string | null {
   try {
     const bytes = readStateFileBytes(path.resolve(stateDir, ".env"));
     return bytes === null ? null : parseWorktreeEnvInstanceId(bytes);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The worktree initialization key in `stateDir`, the directory that holds the
+ * manifest it binds. `null` when the file is absent or refused by the bounded
+ * reader; a v3 manifest is then not accepted.
+ */
+export function readWorktreeInitializationKey(stateDir: string): Buffer | null {
+  try {
+    return readStateFileBytes(path.resolve(stateDir, WORKTREE_INITIALIZATION_KEY_FILE));
   } catch {
     return null;
   }

@@ -23,6 +23,7 @@ import {
   isVerifiedWorktreeSeedManifest,
 } from "@paperclipai/shared/worktree-initialization-manifest";
 import { resolveWorktreeSchemaLineage } from "@paperclipai/shared/worktree-initialization-identity";
+import { readWorktreeInitializationKey } from "../worktree-seed-manifest.js";
 import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { authUsers, companies, companyMemberships, issues, MIGRATIONS_FOLDER } from "@paperclipai/db";
@@ -74,11 +75,12 @@ function readSeedManifestSummary(markerDir: string): SeedManifestSummary {
     return { state: "failed", phase: null, mode: null, failurePhase: "seed_manifest_unreadable" };
   }
   if (bytes !== null) {
-    // A v3 manifest is confirmed for this running instance and a revision of
-    // this build's migration lineage.
+    // A v3 manifest is confirmed for this running instance, a revision of this
+    // build's migration lineage, and the initialization key next to it.
     const classification = classifyWorktreeStateManifest(bytes, {
       targetInstanceId: resolvePaperclipInstanceId(),
       schema: resolveWorktreeSchemaLineage(MIGRATIONS_FOLDER),
+      bindingKey: readWorktreeInitializationKey(markerDir),
     });
     if (classification.kind === "refused") {
       // A manifest we cannot parse is evidence of an interrupted write, which is

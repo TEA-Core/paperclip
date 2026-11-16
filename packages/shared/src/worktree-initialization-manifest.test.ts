@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { BoundedStateFileError, readBoundedStateFile, STATE_FILE_MAX_BYTES } from "./bounded-state-file.js";
 import {
   classifyWorktreeStateManifest,
+  computeWorktreeInitializationBinding,
   isVerifiedWorktreeSeedManifest,
   WORKTREE_INITIALIZATION_DIAGNOSTIC_LIMIT,
   type WorktreeInitializationExpectation,
@@ -31,11 +32,18 @@ function buildFixture() {
   const generationId = randomUUID();
   const attemptId = randomUUID();
   const revision = { schemaFingerprint: fingerprint(), migrationRevision: "0142_fixture.sql" };
+  const key = randomBytes(32);
   const expected = {
     targetInstanceId: `wt-${randomBytes(4).toString("hex")}`,
     generationId,
     schema: [{ schemaFingerprint: fingerprint(), migrationRevision: "0141_fixture.sql" }, revision],
+    bindingKey: key,
   } satisfies WorktreeInitializationExpectation;
+  /** A manifest as the real writer stores it: bound under this worktree's key. */
+  const signed = (candidate: Record<string, unknown>): Record<string, unknown> => ({
+    ...candidate,
+    binding: computeWorktreeInitializationBinding(key, candidate),
+  });
   const manifest: Record<string, unknown> = {
     version: 3,
     kind: "worktree-initialization",
@@ -62,7 +70,7 @@ function buildFixture() {
       completedAt: "2026-11-11T10:00:05.000Z",
     },
   };
-  return { manifest, expected, revision };
+  return { manifest: signed(manifest), expected, revision, signed };
 }
 
 /** Write real bytes to a real file, then read them back through the bounded reader. */
@@ -100,30 +108,30 @@ function completeLegacyManifest(seedMode: string): Record<string, unknown> {
 
 describe("classifyWorktreeStateManifest", () => {
   it("accepts a verified fresh manifest only for the exact policy, identity and schema", () => {
-    const { manifest, expected } = buildFixture();
+    const { manifest, expected, signed } = buildFixture();
     const accepted = classifyFile(JSON.stringify(manifest), expected);
     expect(accepted.kind).toBe("initialization");
 
-    const synthetic = {
+    const synthetic = signed({
       ...manifest,
       profile: "synthetic-fixture",
       fixtureId: "board-basics",
       fixtureVersion: 1,
-    };
+    });
     expect(classifyFile(JSON.stringify(synthetic), expected).kind).toBe("initialization");
   });
 
   it("accepts any exact revision of the reader's lineage and refuses one outside it", () => {
-    const { manifest, expected } = buildFixture();
+    const { manifest, expected, signed } = buildFixture();
     const [older] = expected.schema;
-    const atOlderRevision = {
+    const atOlderRevision = signed({
       ...manifest,
       migrationRevision: older.migrationRevision,
       schemaFingerprint: older.schemaFingerprint,
-    };
+    });
     expect(classifyFile(JSON.stringify(atOlderRevision), expected).kind).toBe("initialization");
     // The older revision's name with the newer fingerprint is a diverged chain.
-    const crossed = { ...atOlderRevision, schemaFingerprint: manifest.schemaFingerprint };
+    const crossed = signed({ ...atOlderRevision, schemaFingerprint: manifest.schemaFingerprint });
     expect(refusalReason(classifyFile(JSON.stringify(crossed), expected))).toBe("initialization_mismatch");
     expect(refusalReason(classifyFile(JSON.stringify(manifest), { ...expected, schema: [] })))
       .toBe("initialization_mismatch");
@@ -160,14 +168,51 @@ describe("classifyWorktreeStateManifest", () => {
       .toBe("initialization_unconfirmed");
     expect(refusalReason(classifyFile(JSON.stringify(manifest), { ...expected, targetInstanceId: null })))
       .toBe("initialization_unconfirmed");
+    expect(refusalReason(classifyFile(JSON.stringify(manifest), { ...expected, bindingKey: null })))
+      .toBe("initialization_unconfirmed");
+  });
+
+  it("refuses a hand-written, tampered or copied manifest and accepts the writer's binding", () => {
+    const { manifest, expected, signed } = buildFixture();
+    const mismatch = (candidate: Record<string, unknown>, expectation = expected) =>
+      refusalReason(classifyFile(JSON.stringify(candidate), expectation));
+    expect(classifyFile(JSON.stringify(manifest), expected).kind).toBe("initialization");
+
+    // Written by hand: a well-formed binding that no key produced.
+    expect(mismatch({ ...manifest, binding: `hmac-sha256:${randomBytes(32).toString("hex")}` }))
+      .toBe("initialization_mismatch");
+    // No binding, or a binding that is not an HMAC-SHA256 value, is not a valid v3 manifest.
+    const { binding: _binding, ...unbound } = manifest;
+    expect(mismatch(unbound)).toBe("initialization_invalid");
+    for (const binding of ["", `sha256:${"a".repeat(64)}`, `hmac-sha256:${"A".repeat(64)}`, 42]) {
+      expect(mismatch({ ...manifest, binding })).toBe("initialization_invalid");
+    }
+    // A field changed after the writer bound it, even one the reader does not check.
+    expect(mismatch({ ...manifest, finishedAt: "2026-11-11T10:00:06.000Z" })).toBe("initialization_mismatch");
+    const diagnostics = manifest.diagnostics as Array<Record<string, unknown>>;
+    expect(mismatch({ ...manifest, diagnostics: [{ ...diagnostics[0], code: "attempt_tampered" }, diagnostics[1]] }))
+      .toBe("initialization_mismatch");
+    // Copied from another worktree: that worktree's key bound it, not this one's.
+    const other = buildFixture();
+    const copied = { ...other.signed({ ...manifest }) };
+    expect(mismatch(copied)).toBe("initialization_mismatch");
+    expect(classifyFile(JSON.stringify(copied), { ...expected, bindingKey: other.expected.bindingKey }).kind)
+      .toBe("initialization");
+    // An empty key file never verifies, even for a manifest bound with an empty key.
+    const emptyKey = Buffer.alloc(0);
+    const emptyBound = { ...manifest, binding: computeWorktreeInitializationBinding(emptyKey, manifest) };
+    expect(mismatch(emptyBound, { ...expected, bindingKey: emptyKey })).toBe("initialization_mismatch");
+    // Field order does not matter: the binding is over canonical JSON.
+    const reordered = Object.fromEntries(Object.entries(manifest).reverse());
+    expect(classifyFile(JSON.stringify(reordered), expected).kind).toBe("initialization");
   });
 
   it("refuses manifests that have not completed", () => {
-    const { manifest, expected } = buildFixture();
+    const { manifest, expected, signed } = buildFixture();
     const notReady = [
-      { ...manifest, state: "pending", phase: "pending", startedAt: null, finishedAt: null, validation: null },
-      { ...manifest, state: "running", phase: "schema_migration", finishedAt: null, validation: null },
-      { ...manifest, state: "failed", phase: "populate", validation: null },
+      signed({ ...manifest, state: "pending", phase: "pending", startedAt: null, finishedAt: null, validation: null }),
+      signed({ ...manifest, state: "running", phase: "schema_migration", finishedAt: null, validation: null }),
+      signed({ ...manifest, state: "failed", phase: "populate", validation: null }),
     ];
     for (const candidate of notReady) {
       expect(refusalReason(classifyFile(JSON.stringify(candidate), expected))).toBe("initialization_not_ready");
@@ -266,11 +311,11 @@ describe("classifyWorktreeStateManifest", () => {
   });
 
   it("bounds diagnostics at the documented limit", () => {
-    const { manifest, expected } = buildFixture();
+    const { manifest, expected, signed } = buildFixture();
     const entry = { phase: "populate", code: "fixture_rows", status: "succeeded", at: "2026-11-11T10:00:01.000Z" };
-    const atLimit = { ...manifest, diagnostics: Array.from({ length: WORKTREE_INITIALIZATION_DIAGNOSTIC_LIMIT }, () => entry) };
+    const atLimit = signed({ ...manifest, diagnostics: Array.from({ length: WORKTREE_INITIALIZATION_DIAGNOSTIC_LIMIT }, () => entry) });
     expect(classifyFile(JSON.stringify(atLimit), expected).kind).toBe("initialization");
-    const overLimit = { ...atLimit, diagnostics: [...atLimit.diagnostics, entry] };
+    const overLimit = { ...atLimit, diagnostics: [...(atLimit.diagnostics as unknown[]), entry] };
     expect(refusalReason(classifyFile(JSON.stringify(overLimit), expected))).toBe("initialization_invalid");
   });
 

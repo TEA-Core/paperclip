@@ -8,7 +8,8 @@
 //   absent      no manifest exists
 //   verified    complete v2 `minimal`/`full` seed manifest, or a verified v3
 //               initialization manifest for the instance named in the state
-//               `.env` and for a revision of this checkout's migration lineage
+//               `.env`, for a revision of this checkout's migration lineage,
+//               and bound under the state `initialization.key`
 //   incomplete  any other v2 seed manifest (pending, running, failed, partial)
 // Exits 3 after printing an actionable reason on stderr when the manifest is
 // refused: legacy-unsafe v2 `minimal-no-secrets`, a v3 initialization
@@ -39,9 +40,11 @@ const { readBoundedStateFile, resolveWorktreeStateRoot } = await import(new URL(
 const { parseWorktreeEnvInstanceId, resolveWorktreeSchemaLineage } = await import(
   new URL("worktree-initialization-identity.ts", sharedSource).href
 );
-const { classifyWorktreeStateManifest, isVerifiedWorktreeSeedManifest } = await import(
-  new URL("worktree-initialization-manifest.ts", sharedSource).href
-);
+const {
+  classifyWorktreeStateManifest,
+  isVerifiedWorktreeSeedManifest,
+  WORKTREE_INITIALIZATION_KEY_FILE,
+} = await import(new URL("worktree-initialization-manifest.ts", sharedSource).href);
 
 function readStateFile(filePath) {
   return readBoundedStateFile(filePath, { trustedRoot: resolveWorktreeStateRoot(filePath) });
@@ -61,17 +64,26 @@ if (bytes === null) {
 }
 
 // A v3 manifest is accepted only for the instance the worktree runs as (its
-// state `.env`) and a revision of this checkout's migration lineage.
+// state `.env`), a revision of this checkout's migration lineage, and the
+// initialization key in the same state directory.
+const stateDir = path.dirname(manifestPath);
 let targetInstanceId = null;
 try {
-  const envBytes = readStateFile(path.join(path.dirname(manifestPath), ".env"));
+  const envBytes = readStateFile(path.join(stateDir, ".env"));
   targetInstanceId = envBytes === null ? null : parseWorktreeEnvInstanceId(envBytes);
 } catch {
   // An unreadable `.env` cannot confirm the target, so a v3 manifest is refused.
 }
+let bindingKey = null;
+try {
+  bindingKey = readStateFile(path.join(stateDir, WORKTREE_INITIALIZATION_KEY_FILE));
+} catch {
+  // An unreadable key cannot verify the binding, so a v3 manifest is refused.
+}
 const classification = classifyWorktreeStateManifest(bytes, {
   targetInstanceId,
   schema: resolveWorktreeSchemaLineage(migrationsFolder),
+  bindingKey,
 });
 if (classification.kind === "initialization") {
   process.stdout.write("verified");

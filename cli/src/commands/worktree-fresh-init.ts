@@ -23,7 +23,10 @@ import { agents, authUsers, companies, goals, issues, projects, type Db } from "
 import { resolveWorktreeStateRoot, writeStateFileAtomic } from "@paperclipai/shared/bounded-state-file";
 import type { WorktreeSchemaRevision } from "@paperclipai/shared/worktree-initialization-identity";
 import {
+  computeWorktreeInitializationBinding,
   validateWorktreeInitializationManifest,
+  WORKTREE_INITIALIZATION_KEY_BYTES,
+  WORKTREE_INITIALIZATION_KEY_FILE,
   WORKTREE_INITIALIZATION_MANIFEST_KIND,
   WORKTREE_INITIALIZATION_MANIFEST_VERSION,
   WORKTREE_INITIALIZATION_POLICY_VERSION,
@@ -37,6 +40,8 @@ import { buildWorktreeEnvEntries, type WorktreeLocalPaths, type WorktreeUiBrandi
 
 export const WORKTREE_INIT_PROFILES = ["fresh", "synthetic-fixture"] as const;
 export type WorktreeInitProfile = (typeof WORKTREE_INIT_PROFILES)[number];
+/** Shape of a sanitized instance id: one path segment, no separators or dots. */
+const INSTANCE_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 export function isWorktreeInitProfile(value: string): value is WorktreeInitProfile {
   return (WORKTREE_INIT_PROFILES as readonly string[]).includes(value);
@@ -108,6 +113,88 @@ export function mintFreshWorktreeIdentity(paths: WorktreeLocalPaths, branding: W
     },
     paths.envPath,
   );
+}
+
+/**
+ * Refuse `target` when it, or any directory between the trusted `root` and
+ * it, is a symbolic link or not the expected kind. Existing entries only: a
+ * missing component ends the walk, because nothing below it exists. `root`
+ * itself may be reached through links (it is resolved once with realpath).
+ * `target` must lie strictly below `root`.
+ */
+export function assertNoLinkBelow(root: string, target: string, finalKind: "file" | "directory"): void {
+  const relative = path.relative(path.resolve(root), path.resolve(target));
+  if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`Refusing ${target}: it is not inside ${root}.`);
+  }
+  let current: string;
+  try {
+    current = fs.realpathSync(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  const parts = relative.split(path.sep);
+  for (const [index, part] of parts.entries()) {
+    current = path.join(current, part);
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    const shown = path.join(root, ...parts.slice(0, index + 1));
+    if (stat.isSymbolicLink()) {
+      throw new Error(`Refusing ${shown}: it is a symbolic link. Worktree state is never written or deleted through a link.`);
+    }
+    const wantDirectory = index < parts.length - 1 || finalKind === "directory";
+    if (wantDirectory ? !stat.isDirectory() : !stat.isFile()) {
+      throw new Error(`Refusing ${shown}: it is not a ${wantDirectory ? "directory" : "regular file"}.`);
+    }
+  }
+}
+
+export type FreshWorktreeDeletionSet = {
+  /** Repo state files below the worktree root. */
+  files: string[];
+  /** The instance directory `<home>/instances/<instance-id>`. */
+  instanceRoot: string;
+};
+
+/**
+ * The explicit entries a clean generation (`--force`) removes, checked before
+ * anything is written or removed: repo state files below the worktree root and
+ * the instance directory below the worktree home, none reached through a
+ * symbolic link, and the instance directory exactly
+ * `<home>/instances/<instance-id>`. Sibling state such as
+ * `.paperclip/worktrees/` and the manifest (replaced atomically) are not in the
+ * set. Checking every entry first means a refusal removes nothing.
+ */
+export function resolveFreshWorktreeDeletionSet(paths: WorktreeLocalPaths): FreshWorktreeDeletionSet {
+  const files = [
+    paths.configPath,
+    `${paths.configPath}.backup`,
+    paths.envPath,
+    path.join(paths.repoConfigDir, "seed-pending"),
+    path.join(paths.repoConfigDir, "seed-complete"),
+    path.join(paths.repoConfigDir, "seed-skip-no-source"),
+    path.join(paths.repoConfigDir, WORKTREE_INITIALIZATION_KEY_FILE),
+  ];
+  for (const file of files) assertNoLinkBelow(paths.cwd, file, "file");
+  const expectedInstanceRoot = path.join(path.resolve(paths.homeDir), "instances", paths.instanceId);
+  if (!INSTANCE_ID_PATTERN.test(paths.instanceId) || path.resolve(paths.instanceRoot) !== expectedInstanceRoot) {
+    throw new Error(
+      `Refusing instance directory ${paths.instanceRoot}: it is not one instance directory directly below ${path.dirname(expectedInstanceRoot)}.`,
+    );
+  }
+  assertNoLinkBelow(paths.homeDir, paths.instanceRoot, "directory");
+  return { files, instanceRoot: paths.instanceRoot };
+}
+
+export function removeFreshWorktreeState(deletionSet: FreshWorktreeDeletionSet): void {
+  for (const file of deletionSet.files) fs.rmSync(file, { force: true });
+  fs.rmSync(deletionSet.instanceRoot, { recursive: true, force: true });
 }
 
 export type SyntheticWorktreeFixture = {
@@ -232,14 +319,17 @@ export async function assertFreshInitializationRows(db: Db, fixture: SyntheticWo
 }
 
 /**
- * Durable record of one fresh initialization attempt. Every write is validated
- * against the v3 contract first and goes through the trusted-root atomic
- * writer, so a linked state directory is refused and a reader sees either the
- * previous or the next complete manifest.
+ * Durable record of one fresh initialization attempt. Every write is bound
+ * under the generation's initialization key, validated against the v3
+ * contract, and written through the trusted-root atomic writer, so a linked
+ * state directory is refused and a reader sees either the previous or the
+ * next complete manifest.
  */
 export class FreshInitializationRecord {
   private manifest: WorktreeInitializationManifest;
   private readonly trustedRoot: string;
+  private readonly key: Buffer;
+  private lastTimestampMs = 0;
 
   constructor(
     private readonly manifestPath: string,
@@ -252,6 +342,14 @@ export class FreshInitializationRecord {
     private readonly now: () => Date = () => new Date(),
   ) {
     this.trustedRoot = resolveWorktreeStateRoot(manifestPath);
+    // A new key per generation, written 0600 next to the manifest before the
+    // first manifest write. Every manifest is bound under it, so readers can
+    // tell this writer's output from a hand-written, edited or copied file, and
+    // a manifest of an earlier generation stops verifying.
+    this.key = randomBytes(WORKTREE_INITIALIZATION_KEY_BYTES);
+    writeStateFileAtomic(path.join(path.dirname(manifestPath), WORKTREE_INITIALIZATION_KEY_FILE), this.key, {
+      trustedRoot: this.trustedRoot,
+    });
     this.manifest = {
       version: WORKTREE_INITIALIZATION_MANIFEST_VERSION,
       kind: WORKTREE_INITIALIZATION_MANIFEST_KIND,
@@ -270,6 +368,7 @@ export class FreshInitializationRecord {
       ...(input.fixture ? { fixtureId: input.fixture.id, fixtureVersion: input.fixture.version } : {}),
       diagnostics: [{ phase: "pending", code: "attempt_pending", status: "succeeded", at: this.timestamp() }],
       validation: null,
+      binding: "",
     };
     this.write();
   }
@@ -319,8 +418,14 @@ export class FreshInitializationRecord {
     return this.manifest;
   }
 
+  /**
+   * Never earlier than the previous timestamp of this record, so a wall clock
+   * that steps back during initialization cannot produce a manifest whose
+   * finish precedes its start.
+   */
   private timestamp(): string {
-    return this.now().toISOString();
+    this.lastTimestampMs = Math.max(this.now().getTime(), this.lastTimestampMs);
+    return new Date(this.lastTimestampMs).toISOString();
   }
 
   private update(
@@ -336,6 +441,7 @@ export class FreshInitializationRecord {
   }
 
   private write(): void {
+    this.manifest = { ...this.manifest, binding: computeWorktreeInitializationBinding(this.key, this.manifest) };
     const validated = validateWorktreeInitializationManifest(this.manifest);
     if (!validated.ok) {
       throw new Error(`Refusing to write an invalid worktree initialization manifest (field: ${validated.field}).`);
