@@ -898,7 +898,7 @@ The dev-runner, `worktree ensure-seeded`, the runtime-provision decision, `scrip
 
 - malformed, non-object, or duplicate-key JSON, or an unknown `version`;
 - a v2 manifest with the retired `minimal-no-secrets` seed mode. That instance may hold parent credentials: retire it and create a clean generation with a new instance and fresh keys. It is never relabeled or converted;
-- every v3 `worktree-initialization` manifest. The validator in `@paperclipai/shared/worktree-initialization-manifest` accepts a v3 manifest only for the exact initialization policy, target instance, generation, and destination schema with completed validation evidence. No current reader can confirm the destination schema yet, so they refuse v3 instead of entering the legacy seed path.
+- a v3 `worktree-initialization` manifest that is not verified for this worktree. The validator in `@paperclipai/shared/worktree-initialization-manifest` accepts a v3 manifest only for the exact initialization policy, the target instance the worktree runs as, a destination schema revision of the reader's own migration lineage, and a `binding` that verifies under the `initialization.key` in the same state directory, with completed validation evidence. A v3 manifest that is pending, running, failed, for another instance, from an unknown or diverged migration chain, or written by hand, edited, or copied from another worktree is refused and never enters the legacy seed path. See [Fresh isolated initialization](#fresh-isolated-initialization).
 
 The runtime-provision decision and the recorded `workspace_seed` evidence read the manifest and the `seed-skip-no-source` marker in the state directory that the server's uid resolves: `.paperclip/uid-<uid>/` when it holds an `.env`, else `.paperclip/`. `scripts/provision-worktree-runtime.sh` runs as that uid and resolves the same directory, so all three use one manifest. A skip marker never outweighs a refused manifest: the decision then runs the provisioner, which reports the refusal, and the evidence counts the marker only when that directory has no manifest. Another uid's scoped state belongs to that uid and does not select or skip the seed command.
 
@@ -926,6 +926,35 @@ paperclipai worktree env
 # or:
 eval "$(paperclipai worktree env)"
 ```
+
+### Fresh isolated initialization
+
+`worktree init --profile fresh` (and `worktree:make --profile fresh`) creates a new isolated instance that holds no data from a parent instance. Use it when the work needs a Paperclip instance but not a copy of an existing company:
+
+```sh
+paperclipai worktree init --profile fresh
+paperclipai worktree init --profile synthetic-fixture            # fixture: starter
+paperclipai worktree init --profile fresh --force                # replace the current state with a clean generation
+```
+
+The initializer copies no parent secrets. It does not read a parent config, `.env`, secrets key file, or database, and it does not reuse a secret from the inherited process environment. It writes:
+
+- a config built only from literals and destination paths: `local_trusted` on loopback, no `llm` block, telemetry off, automatic backups off, strict `local_encrypted` secrets;
+- a new `.paperclip/.env` with fresh agent JWT, tool-action and decision-signing secrets, and a new 32-byte secrets master key file (`0600` in a `0700` directory);
+- an empty embedded database created from this checkout's migrations. `synthetic-fixture` then inserts the `starter` fixture: one paused company, one paused `process` agent, a goal, a project and two unassigned backlog issues. Every fixture value is a literal in `cli/src/commands/worktree-fresh-init.ts`;
+- a new 32-byte `.paperclip/initialization.key` (0600) for this generation, and a v3 `worktree-initialization` manifest, written atomically after every phase (`destination_validation`, `generation_create`, `schema_migration`, `identity_mint`, `populate`, `validation`). Every manifest carries a `binding`: HMAC-SHA256 under that key over the canonical JSON of all other fields. The terminal `verified` manifest is written last, with validation evidence bound to the same attempt and generation. A failed phase leaves a `failed` manifest with a fixed diagnostic code, never exception text.
+
+The manifest records the instance id and the destination schema: the head revision of the checkout's migration journal and a fingerprint of the migration chain up to it. A reader accepts it only for the instance it runs as (`PAPERCLIP_INSTANCE_ID` from the worktree `.env`), for a revision of the reader's own migration lineage, and when its `binding` verifies under the `initialization.key` next to it. A checkout that later adds migrations still accepts it; a different or edited migration chain refuses it. A hand-written manifest, a manifest edited after it was written, and a manifest copied from another worktree (bound under that worktree's key) are refused.
+
+A verified fresh initialization:
+
+- opens the `pnpm dev` seed gate;
+- makes `worktree ensure-seeded`, `paperclipai run`, the runtime-provision decision and `scripts/provision-worktree-runtime.sh` treat the worktree as initialized. It is never seeded from a parent;
+- reports workspace readiness `failed` with the `seed_manifest_fresh_preview` phase. A fresh preview has no cloned company, issue, or membership, so the managed "Open workspace" login handoff does not apply; open it locally with its own board identity.
+
+The default `worktree init` and managed workspace provisioning still use the clone seed. `--profile` cannot be combined with `--from-config`, `--from-data-dir`, `--preserve-live-work` or `--no-seed`. Existing worktree state is replaced only with `--force`, which removes the earlier config (and its backup), `.env`, markers, initialization key and instance data and creates a new generation with new keys. Before it writes or removes anything, init refuses a `.paperclip` directory, a state file, the `instances` directory or the instance directory that is a symbolic link, so neither a write nor a `--force` removal reaches outside the worktree and its instance directory. `worktree init --force` without `--profile` applies the same check to the files it removes.
+
+Limits: a Git worktree is not a security boundary. A process that runs as the same user can still read parent files, and can read the initialization key and so bind a manifest of its own; the binding stops hand-written, edited and copied manifests, not a same-user process that runs the writer's algorithm. A value that the server inherits from the shell environment still takes precedence over the worktree `.env` at run time, so start a fresh worktree from a shell that does not export parent secrets.
 
 ### Workspace login handoff and readiness
 
@@ -965,6 +994,8 @@ The workspace UI surfaces `Provisioning database`, `Validating clone`, `Ready`, 
 | `--seed-mode <mode>` | Seed profile: `minimal` or `full` (default: `minimal`) |
 | `--no-seed` | Skip database seeding from the source instance |
 | `--force` | Replace existing repo-local config and isolated instance data |
+| `--profile <profile>` | `fresh` or `synthetic-fixture`: a new instance with no parent data (see [Fresh isolated initialization](#fresh-isolated-initialization)). Omit it to keep the clone seed |
+| `--fixture <id>` | Fixture for `--profile synthetic-fixture` (default: `starter`) |
 
 Examples:
 
@@ -1066,6 +1097,8 @@ Managed workspace repair uses this same verified full-reseed contract through `P
 | `--seed-mode <mode>` | Seed profile: `minimal` or `full` (default: `minimal`) |
 | `--no-seed` | Skip database seeding from the source instance |
 | `--force` | Replace existing repo-local config and isolated instance data |
+| `--profile <profile>` | `fresh` or `synthetic-fixture`: a new instance with no parent data |
+| `--fixture <id>` | Fixture for `--profile synthetic-fixture` (default: `starter`) |
 
 Examples:
 
