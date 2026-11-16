@@ -9,7 +9,14 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AdapterRuntimeServiceReport } from "@paperclipai/adapter-utils";
 import type { Db } from "@paperclipai/db";
-import { executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
+import {
+  executionWorkspaces,
+  issueComments,
+  issues,
+  MIGRATIONS_FOLDER,
+  projectWorkspaces,
+  workspaceRuntimeServices,
+} from "@paperclipai/db";
 import {
   ISSUE_COMMENT_METADATA_TEXT_MAX_LENGTH,
   DEFAULT_TAILSCALE_HTTPS_EXPOSURE,
@@ -44,9 +51,18 @@ import {
   type EnsureSharedGroupOwnershipOptions,
   type SharedGroupRepairOutcome,
 } from "./shared-group-ownership.js";
-import { isVerifiedWorktreeSeedManifest } from "@paperclipai/shared/worktree-initialization-manifest";
+import { resolveWorktreeSchemaLineage } from "@paperclipai/shared/worktree-initialization-identity";
+import {
+  isVerifiedWorktreeSeedManifest,
+  type WorktreeInitializationExpectation,
+} from "@paperclipai/shared/worktree-initialization-manifest";
 import { resolveWorktreeStateDir } from "../dev-runner-worktree.js";
-import { readLegacySeedManifest, readWorktreeSeedManifestStatus } from "../worktree-seed-manifest.js";
+import {
+  readWorktreeInitializationKey,
+  readWorktreeSeedManifestStatus,
+  readWorktreeStateInstanceId,
+  readWorktreeStateManifest,
+} from "../worktree-seed-manifest.js";
 import {
   buildManagedWorkspaceGuestEnv,
   logManagedWorkspaceReadinessRejection,
@@ -8923,6 +8939,21 @@ const BUILTIN_WORKSPACE_SEED_COMMAND = "bash ./scripts/provision-worktree-runtim
 // evidence here.
 const NO_SOURCE_SEED_SKIP_MARKER = "seed-skip-no-source";
 
+/**
+ * What a v3 initialization manifest in `stateDir` must be verified for: the
+ * instance the worktree runs as (its state `.env`), a revision of this server
+ * build's migration lineage, and the initialization key in the same state
+ * directory. This server never reads the worktree's own migration files,
+ * which that worktree controls.
+ */
+function expectWorktreeInitialization(stateDir: string): WorktreeInitializationExpectation {
+  return {
+    targetInstanceId: readWorktreeStateInstanceId(stateDir),
+    schema: resolveWorktreeSchemaLineage(MIGRATIONS_FOLDER),
+    bindingKey: readWorktreeInitializationKey(stateDir),
+  };
+}
+
 type RuntimeProvisionKind = "workspace_seed" | "runtime_dependencies";
 
 export function readWorkspaceSeedOperationEvidence(worktreePath: string): {
@@ -8931,7 +8962,25 @@ export function readWorkspaceSeedOperationEvidence(worktreePath: string): {
   metadata: Record<string, unknown>;
 } {
   const stateDir = resolveWorktreeStateDir(worktreePath);
-  const manifestRead = readLegacySeedManifest(path.join(stateDir, "seed-manifest.json"));
+  const manifestRead = readWorktreeStateManifest(
+    path.join(stateDir, "seed-manifest.json"),
+    expectWorktreeInitialization(stateDir),
+  );
+  if (manifestRead.kind === "initialization") {
+    // A verified fresh initialization has nothing to seed: it is complete
+    // evidence for this worktree, and it never selects a clone source.
+    return {
+      verified: true,
+      error: null,
+      metadata: {
+        provisionKind: "workspace_seed",
+        seedState: "verified",
+        seedPhase: "complete",
+        seedFailurePhase: null,
+        initializationProfile: manifestRead.manifest.profile,
+      },
+    };
+  }
   if (manifestRead.kind === "legacy-seed") {
     const manifest = manifestRead.manifest;
     const state = typeof manifest.state === "string" ? manifest.state : "unknown";
@@ -9007,7 +9056,10 @@ export function resolveRuntimeProvisionCommand(input: {
   // that checks a different directory.
   const stateDir = resolveWorktreeStateDir(input.workspace.cwd);
   const scoped = stateDir !== path.resolve(input.workspace.cwd, ".paperclip");
-  const manifest = readWorktreeSeedManifestStatus(path.join(stateDir, "seed-manifest.json"));
+  const manifest = readWorktreeSeedManifestStatus(
+    path.join(stateDir, "seed-manifest.json"),
+    expectWorktreeInitialization(stateDir),
+  );
   if (manifest.kind === "verified") return "";
   // The provisioner reads this same manifest and fails fast on a refused one
   // with the reason, without a reseed, so a skip marker never hides a refusal.

@@ -35,11 +35,13 @@ fi
 
 # The seed manifest is validated by the shared bounded reader and validator, not
 # by a shell-local predicate. The checker never follows links or blocks on a
-# FIFO; a refused manifest (legacy-unsafe minimal-no-secrets, any v3
-# initialization manifest, malformed or non-regular input) is a fast error with
-# no automatic reseed and no parent fallback. It runs unconditionally: a
-# pathname test cannot see a manifest inside a state dir this user cannot
-# search, and the checker reports a missing manifest as `absent` itself.
+# FIFO; a refused manifest (legacy-unsafe minimal-no-secrets, a v3
+# initialization manifest not verified for this worktree instance and schema,
+# malformed or non-regular input) is a fast error with no automatic reseed and
+# no parent fallback. A verified v3 fresh initialization reports `verified`, so
+# it is never seeded from a parent. It runs unconditionally: a pathname test
+# cannot see a manifest inside a state dir this user cannot search, and the
+# checker reports a missing manifest as `absent` itself.
 manifest_check_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/worktree-state-manifest-check.mjs"
 if ! seed_manifest_state="$(node "$manifest_check_script" "$seed_manifest_path")"; then
   echo "Worktree seed manifest was refused; not provisioning or reseeding this worktree: $seed_manifest_path" >&2
