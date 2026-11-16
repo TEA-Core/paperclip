@@ -10,7 +10,6 @@
 #
 # Regenerate from the repository root:
 #   node scripts/check-server-test-typecheck.mjs --update
-packages/adapter-utils/src/acpx-engine/execute.ts(5279,11): TS2353
 packages/paperclip-runner/src/contracts/native-execution.test.ts(207,20): TS2352
 packages/paperclip-runner/src/contracts/native-execution.test.ts(351,20): TS2352
 packages/paperclip-runner/src/contracts/native-execution.test.ts(482,90): TS2345
@@ -1183,15 +1182,15 @@ server/src/__tests__/secrets-service.test.ts(2338,12): TS18047
 server/src/__tests__/secrets-service.test.ts(2339,12): TS18047
 server/src/__tests__/secrets-service.test.ts(2614,13): TS2352
 server/src/__tests__/sentry.test.ts(763,13): TS2352
-server/src/__tests__/server-startup-feedback-export.test.ts(1036,9): TS2322
-server/src/__tests__/server-startup-feedback-export.test.ts(1234,7): TS2345
-server/src/__tests__/server-startup-feedback-export.test.ts(1256,42): TS2493
+server/src/__tests__/server-startup-feedback-export.test.ts(1039,9): TS2322
+server/src/__tests__/server-startup-feedback-export.test.ts(1237,7): TS2345
+server/src/__tests__/server-startup-feedback-export.test.ts(1259,42): TS2493
 server/src/__tests__/server-startup-feedback-export.test.ts(327,14): TS2683
-server/src/__tests__/server-startup-feedback-export.test.ts(681,42): TS2493
-server/src/__tests__/server-startup-feedback-export.test.ts(714,7): TS2349
-server/src/__tests__/server-startup-feedback-export.test.ts(792,7): TS2322
-server/src/__tests__/server-startup-feedback-export.test.ts(812,7): TS2349
-server/src/__tests__/server-startup-feedback-export.test.ts(851,7): TS2349
+server/src/__tests__/server-startup-feedback-export.test.ts(684,42): TS2493
+server/src/__tests__/server-startup-feedback-export.test.ts(717,7): TS2349
+server/src/__tests__/server-startup-feedback-export.test.ts(795,7): TS2322
+server/src/__tests__/server-startup-feedback-export.test.ts(815,7): TS2349
+server/src/__tests__/server-startup-feedback-export.test.ts(854,7): TS2349
 server/src/__tests__/slack-conversation-lifecycle.test.ts(53,48): TS2769
 server/src/__tests__/slack-conversation-lifecycle.test.ts(86,87): TS2339
 server/src/__tests__/status-cards.test.ts(134,49): TS2322
