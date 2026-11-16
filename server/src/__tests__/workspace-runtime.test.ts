@@ -25,7 +25,7 @@ import {
   workspaceOperations,
   workspaceRuntimeServices,
 } from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   buildExecutionWorkspaceAdapterConfig,
   parseIssueExecutionWorkspaceSettings,
@@ -79,7 +79,6 @@ import {
   isLocalServiceProcessInWorkspace,
   readLocalServiceProcessCwd,
   readLocalServicePortOwner,
-  terminateLocalService,
   writeLocalServiceRegistryRecord,
 } from "../services/local-service-supervisor.ts";
 import { logger } from "../middleware/logger.js";
@@ -10104,17 +10103,24 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     // that references the deleted project, which raises an unhandled foreign-key
     // error in the next test.
     await resetRuntimeServicesForTests({ terminateProcesses: true });
-    // Service control writes activity_log rows. Delete them before the company
-    // delete so a lingering foreign-key row cannot block the company delete and
-    // leak rows into the next test.
-    await db.delete(activityLog);
-    await db.delete(workspaceRuntimeServices);
-    await db.delete(executionWorkspaces);
-    await db.delete(projectWorkspaces);
-    await db.delete(issues);
-    await db.delete(projects);
-    await db.delete(agents);
-    await db.delete(companies);
+    // Delete in one transaction that first locks workspace_runtime_services, so
+    // an unawaited child `exit` persist cannot re-insert a row between the
+    // runtime-service delete and the company delete (see the startup
+    // reconciliation afterEach below).
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`lock table workspace_runtime_services in exclusive mode`);
+      // Service control writes activity_log rows. Delete them before the company
+      // delete so a lingering foreign-key row cannot block the company delete and
+      // leak rows into the next test.
+      await tx.delete(activityLog);
+      await tx.delete(workspaceRuntimeServices);
+      await tx.delete(executionWorkspaces);
+      await tx.delete(projectWorkspaces);
+      await tx.delete(issues);
+      await tx.delete(projects);
+      await tx.delete(agents);
+      await tx.delete(companies);
+    });
   });
 
   it("persists provisioning before starting and excludes provision time from readiness timeout", async () => {
@@ -10874,24 +10880,31 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     const basePort = await findFreePort();
     const markerPath = path.join(workspace.cwd, "bind-race.marker");
     const blockerPidPath = path.join(workspace.cwd, "bind-race.pid");
+    const blockerReadyPath = path.join(workspace.cwd, "bind-race.ready");
     const blockerScript = [
       "const net=require('node:net');",
       "const port=Number(process.argv[1]);",
-      "net.createServer((socket)=>socket.destroy()).listen(port,'127.0.0.1');",
+      "net.createServer((socket)=>socket.destroy()).listen(port,'127.0.0.1',",
+      "()=>require('node:fs').writeFileSync(process.argv[2],'ready'));",
     ].join("");
+    // The first start binds only after the blocker owns the port. A fixed delay
+    // let a slow blocker start lose that race on a loaded runner, so the first
+    // start bound the base port and the test saw no bind race at all.
     const raceScript = [
       "const fs=require('node:fs');",
       "const http=require('node:http');",
       "const {spawn}=require('node:child_process');",
       `const marker=${JSON.stringify(markerPath)};`,
       `const pidFile=${JSON.stringify(blockerPidPath)};`,
+      `const readyFile=${JSON.stringify(blockerReadyPath)};`,
       `const blockerScript=${JSON.stringify(blockerScript)};`,
       "const port=Number(process.env.PORT);",
       "const start=()=>http.createServer((_req,res)=>res.end('ok')).listen(port,'127.0.0.1');",
+      "const startWhenBlocked=()=>fs.existsSync(readyFile)?start():setTimeout(startWhenBlocked,10);",
       "if(!fs.existsSync(marker)){",
       "fs.writeFileSync(marker,String(port));",
-      "const blocker=spawn(process.execPath,['-e',blockerScript,String(port)],{detached:true,stdio:'ignore'});",
-      "fs.writeFileSync(pidFile,String(blocker.pid));blocker.unref();setTimeout(start,200);",
+      "const blocker=spawn(process.execPath,['-e',blockerScript,String(port),readyFile],{detached:true,stdio:'ignore'});",
+      "fs.writeFileSync(pidFile,String(blocker.pid));blocker.unref();startWhenBlocked();",
       "}else{start();}",
       "setInterval(()=>{},1000);",
     ].join("");
@@ -11159,23 +11172,33 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     // writes a workspace_runtime_services row that references the deleted
     // project, which raises an unhandled foreign-key error in the next test.
     await resetRuntimeServicesForTests({ terminateProcesses: true });
-    // Startup reconciliation writes activity_log rows (for example, exposure
-    // reservation drift). Delete those rows before the company delete. A stale
-    // activity_log row holds a foreign key to the company and makes the company
-    // delete fail, which leaks rows into the next test.
-    await db.delete(activityLog);
-    await db.delete(workspaceRuntimeServices);
-    await db.delete(executionWorkspaces);
-    await db.delete(projectWorkspaces);
-    await db.delete(projects);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
-    // The runtime service control path writes activity_log rows through
-    // logActivity. Those rows reference the company. Delete them before the
-    // company to respect the activity_log.company_id foreign key.
-    await db.delete(activityLog);
-    await db.delete(agents);
-    await db.delete(companies);
+    // Stopping a runtime child fires its `exit` listener, which persists the
+    // service row without being awaited. Under load that write can land between
+    // the runtime-service delete and the company delete below and re-insert the
+    // row, so the company delete fails its foreign key. Delete in one
+    // transaction that first locks workspace_runtime_services: a late write
+    // waits for the commit and then fails its own foreign key, which the runtime
+    // catches and logs.
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`lock table workspace_runtime_services in exclusive mode`);
+      // Startup reconciliation writes activity_log rows (for example, exposure
+      // reservation drift). Delete those rows before the company delete. A stale
+      // activity_log row holds a foreign key to the company and makes the company
+      // delete fail, which leaks rows into the next test.
+      await tx.delete(activityLog);
+      await tx.delete(workspaceRuntimeServices);
+      await tx.delete(executionWorkspaces);
+      await tx.delete(projectWorkspaces);
+      await tx.delete(projects);
+      await tx.delete(heartbeatRunEvents);
+      await tx.delete(heartbeatRuns);
+      // The runtime service control path writes activity_log rows through
+      // logActivity. Those rows reference the company. Delete them before the
+      // company to respect the activity_log.company_id foreign key.
+      await tx.delete(activityLog);
+      await tx.delete(agents);
+      await tx.delete(companies);
+    });
   });
 
   it("restores desired services when one row is stopped and a live registered service has no row", async () => {
@@ -11694,18 +11717,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     expect(persisted?.providerRef).toBe(originalProviderRef);
     await expect(fetch(service!.url!)).resolves.toMatchObject({ ok: true });
 
-    // Stop the adopted service outside the runtime. The adopted record reuses
-    // this service's id, and the child handle from the first start still has
-    // its `exit` listener in this test process (a real restart would not).
-    // Stopping through the runtime fires that stale listener, which persists
-    // the row again without being awaited. Under load that write lands after
-    // afterEach deletes the rows, and the company delete then fails its
-    // foreign key. Dropping the in-memory records first makes the stale
-    // listener a no-op.
-    const servicePid = Number(originalProviderRef);
-    expect(Number.isInteger(servicePid) && servicePid > 0).toBe(true);
-    await resetRuntimeServicesForTests();
-    await terminateLocalService({ pid: servicePid, processGroupId: servicePid, port: originalPort });
+    await resetRuntimeServicesForTests({ terminateProcesses: true });
     leasedRunIds.delete(runId);
     await fs.rm(paperclipHome, { recursive: true, force: true });
     await fs.rm(workspaceRoot, { recursive: true, force: true });
