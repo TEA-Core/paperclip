@@ -1324,4 +1324,47 @@ describe("worktree config repair", () => {
       }
     }
   });
+
+  it("never persists an inherited tool-action signing secret into the worktree env (SUP-24365)", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-inherited-tool-secret-"));
+    const worktreeRoot = path.join(tempRoot, "SUP-24365-inherited-secret");
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const configPath = path.join(paperclipDir, "config.json");
+    const envPath = path.join(paperclipDir, ".env");
+    const inheritedCanary = "CANARY_PARENT_SHELL_TOOL_ACTION_SECRET";
+    const worktreeCanary = "CANARY_WORKTREE_TOOL_ACTION_SECRET";
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    await fs.writeFile(configPath, JSON.stringify(buildLegacyConfig(path.join(tempRoot, "shared")), null, 2) + "\n", "utf8");
+    await fs.writeFile(envPath, "PAPERCLIP_IN_WORKTREE=true\n", "utf8");
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREES_DIR = path.join(tempRoot, ".paperclip-worktrees");
+    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = inheritedCanary;
+    delete process.env.PORT;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_CONFIG;
+    delete process.env.PAPERCLIP_CONTEXT;
+
+    maybeRepairLegacyWorktreeConfigAndEnvFiles();
+
+    // Absent from the worktree env: the inherited value is kept for this boot
+    // but never written into the worktree's own env file.
+    expect(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBe(inheritedCanary);
+    const repairedEnv = await fs.readFile(envPath, "utf8");
+    expect(repairedEnv).not.toContain(inheritedCanary);
+    expect(repairedEnv).not.toContain("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET=");
+
+    // Present in the worktree env: the worktree value wins over the inherited one.
+    await fs.appendFile(envPath, `PAPERCLIP_TOOL_ACTION_SIGNING_SECRET=${worktreeCanary}\n`, "utf8");
+    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = inheritedCanary;
+
+    maybeRepairLegacyWorktreeConfigAndEnvFiles();
+
+    expect(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBe(worktreeCanary);
+    const rerepairedEnv = await fs.readFile(envPath, "utf8");
+    expect(rerepairedEnv).not.toContain(inheritedCanary);
+  });
 });

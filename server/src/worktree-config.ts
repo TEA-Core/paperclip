@@ -171,6 +171,18 @@ function resolveWorktreeRuntimeContext(
   };
 }
 
+/**
+ * The worktree gate shared with `maybeRepairLegacyWorktreeConfigAndEnvFiles`:
+ * returns the resolved config and env paths only when the boot target is a
+ * real worktree instance, otherwise null.
+ */
+export function resolveWorktreeEnvTarget(
+  env: NodeJS.ProcessEnv,
+): { configPath: string; envPath: string } | null {
+  const context = resolveWorktreeRuntimeContext(env);
+  return context ? { configPath: context.configPath, envPath: context.envPath } : null;
+}
+
 function atomicWriteFile(filePath: string, contents: string): void {
   let attempt = 0;
 
@@ -543,9 +555,13 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
     ? fs.readFileSync(context.envPath, "utf8")
     : null;
   const existingEnvEntries = parseEnvFile(existingContents ?? "");
+  // The worktree file wins. An inherited value is used for this boot only and
+  // never persisted, so a parent shell's secret cannot become the worktree's
+  // own (SUP-24365).
+  const inheritedToolActionSigningSecret = nonEmpty(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET);
   const toolActionSigningSecret =
-    nonEmpty(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET) ??
     nonEmpty(existingEnvEntries.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET) ??
+    inheritedToolActionSigningSecret ??
     randomBytes(32).toString("hex");
 
   const managedEnvEntries: Record<string, string> = {
@@ -556,7 +572,9 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
     PAPERCLIP_IN_WORKTREE: "true",
     PAPERCLIP_DB_BACKUP_ENABLED: "false",
     PAPERCLIP_WORKTREE_NAME: context.worktreeName,
-    PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: toolActionSigningSecret,
+    ...(toolActionSigningSecret === inheritedToolActionSigningSecret
+      ? {}
+      : { PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: toolActionSigningSecret }),
   };
 
   process.env.PAPERCLIP_DB_BACKUP_ENABLED = "false";
