@@ -46,7 +46,7 @@ async function importFreshSentry() {
  */
 function mockSentryPackage() {
   const init = vi.fn();
-  const captureException = vi.fn(() => "event-id");
+  const captureException = vi.fn((_error: unknown, _hint?: unknown) => "event-id");
   const close = vi.fn(async () => true);
   const httpIntegration = vi.fn((options: unknown) => ({ name: "Http", ...(options as object) }));
   const onUnhandledRejectionIntegration = vi.fn((options: unknown) => ({

@@ -11,7 +11,7 @@ import { agentJoinGrantsFromDefaults } from "../services/invite-grants.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeDatabase = support.supported ? describe : describe.skip;
-const expectedNewAgentGrantKeys: PermissionKey[] = [
+const expectedNewAgentGrantKeys: PermissionKey[] = ([
   "agents:configure",
   "agents:suggest-changes",
   "skills:create",
@@ -26,7 +26,7 @@ const expectedNewAgentGrantKeys: PermissionKey[] = [
   "tasks:assign",
   "tasks:assign_scope",
   "tasks:manage_active_checkouts",
-].sort();
+] satisfies PermissionKey[]).sort();
 
 describeDatabase("new agent configuration defaults", () => {
   let db!: ReturnType<typeof createDb>;

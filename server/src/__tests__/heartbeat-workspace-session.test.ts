@@ -2564,7 +2564,7 @@ describe("effective run session config freshness", () => {
     const first = await buildSessionConfigMetadata({ effectiveAdapterConfig: { paperclipConnectionInstructions: { text: "Use the handbook.", digest: "before" } } });
     for (const instructions of [null, { text: "Use the updated handbook.", digest: "after" }]) {
       const next = await buildSessionConfigMetadata({ effectiveAdapterConfig: { paperclipConnectionInstructions: instructions } });
-      expect(resolveTaskSessionConfigFreshness({ hasTaskSession: true, configuredModel: "gpt-5.4-mini", taskSessionParams: sessionParamsWithConfigMetadata(first), configMetadata: next }).reset).toBe(true);
+      expect(resolveTaskSessionConfigFreshness({ hasTaskSession: true, taskSessionParams: sessionParamsWithConfigMetadata(first), configMetadata: next }).reset).toBe(true);
     }
   });
 

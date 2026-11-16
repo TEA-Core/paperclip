@@ -11861,15 +11861,15 @@ describeEmbeddedPostgres("tool access service", () => {
       instanceId: "test-instance", environment: "staging" as const,
       provider: "asana" as const, profile: "asana.mcp" as const,
     };
-    const connector: PaperclipCloudConnector = {
-      getCapabilities: vi.fn(async () => ["asana.mcp"]),
+    const connector = {
+      getCapabilities: vi.fn(async () => ["asana.mcp" as const]),
       startAuthorization: vi.fn(async ({ returnState }) => ({
         authorizationUrl: `https://app.asana.com/-/oauth_authorize?state=${encodeURIComponent(returnState)}`,
         expiresAt: new Date(Date.now() + 600_000).toISOString(),
       })),
       claim: vi.fn(async () => credentials), refresh: vi.fn(async () => credentials),
       revoke: vi.fn(async () => undefined),
-    };
+    } satisfies Partial<PaperclipCloudConnector> as unknown as PaperclipCloudConnector;
     const service = createTestToolAccessService(db, { paperclipCloudConnector: connector });
     const custom = await service.connectGalleryApp(company.id, {
       galleryKey: "asana", connectionMethodKey: "mcp-own-oauth", name: "Asana", grantKind: "user",

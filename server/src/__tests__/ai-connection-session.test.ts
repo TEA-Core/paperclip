@@ -21,7 +21,7 @@ async function decision(previous: Partial<MetadataInput>, next: Partial<Metadata
   const after = await buildEffectiveRunSessionConfigMetadata(afterInput);
   const candidates = aiConnectionSessionCompatibilityInputs({ ...afterInput, originalIssueOverrides: null, binding, router: true, storedIdentity: sessionIdentity, sessionIdentity, credentialIdentity, revisions: [], ...compatibility });
   const alternatives = await Promise.all(candidates.map(candidate => buildEffectiveRunSessionConfigMetadata({ ...afterInput, ...candidate })));
-  return resolveTaskSessionConfigFreshness({ hasTaskSession: true, configuredModel: String(afterInput.effectiveAdapterConfig.model), taskSessionParams: { __paperclipConfiguredModel: "gpt-5.6-sol", __paperclipConfigFingerprint: before.fingerprint, __paperclipConfigFingerprintVersion: before.version, __paperclipConfigCategoryFingerprints: before.categoryFingerprints }, configMetadata: after, compatibleConfigMetadata: alternatives, wakeResetReason });
+  return resolveTaskSessionConfigFreshness({ hasTaskSession: true, taskSessionParams: { __paperclipConfiguredModel: "gpt-5.6-sol", __paperclipConfigFingerprint: before.fingerprint, __paperclipConfigFingerprintVersion: before.version, __paperclipConfigCategoryFingerprints: before.categoryFingerprints }, configMetadata: after, compatibleConfigMetadata: alternatives, wakeResetReason });
 }
 
 describe("AI pool session adoption", () => {

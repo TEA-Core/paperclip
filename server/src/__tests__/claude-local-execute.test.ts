@@ -172,6 +172,7 @@ type CapturePayload = {
   skillEntries: string[];
   claudeConfigDir: string | null;
   claudeConfigEntries?: string[];
+  mcpConfigContents?: string | null;
   paperclipApiUrl?: string | null;
   paperclipApiKey?: string | null;
   paperclipApiBridgeMode?: string | null;

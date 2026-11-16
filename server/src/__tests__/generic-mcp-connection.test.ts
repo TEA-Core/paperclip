@@ -943,13 +943,13 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       const start = await service.startOAuth(company.id, connected.connectionId, input);
       expect(new URL(start.authorizationUrl).searchParams.get("scope")).toBe("mcp:read offline_access");
       const saved = await service.getConnection(connected.connectionId, company.id);
-      expect(saved.config.oauth).toMatchObject({ scopes: ["mcp:read", "offline_access"] });
+      expect(saved.config?.oauth).toMatchObject({ scopes: ["mcp:read", "offline_access"] });
       const callback = await approveFixtureAuthorization(start.authorizationUrl);
       const completed = await service.completeOAuthCallback({
         state: callback.searchParams.get("state")!, code: callback.searchParams.get("code")!,
         iss: callback.searchParams.get("iss")!, redirectUri: input.redirectUri, actor,
       });
-      expect(completed.connection.config.oauth).toMatchObject({ scopes: ["mcp:read", "offline_access"] });
+      expect(completed.connection.config?.oauth).toMatchObject({ scopes: ["mcp:read", "offline_access"] });
       const reconnect = await service.startOAuth(company.id, connected.connectionId, { redirectUri: input.redirectUri, actor });
       expect(new URL(reconnect.authorizationUrl).searchParams.get("scope")).toBe("mcp:read offline_access");
     } finally { await fixture.close(); }
@@ -1033,7 +1033,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       const input = { redirectUri: "http://127.0.0.1:3100/api/tools/oauth/callback", actor: { actorType: "user" as const, actorId: "board-user" } };
       await service.startOAuth(company.id, connected.connectionId, input);
       const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
-      const oauth = { ...connection!.config.oauth as Record<string, unknown>, scopes: ["mcp:read"] };
+      const oauth: Record<string, unknown> = { ...connection!.config.oauth as Record<string, unknown>, scopes: ["mcp:read"] };
       delete oauth.offlineAccessSupported;
       delete oauth.grantTypesSupported;
       const config = { ...connection!.config, oauth };

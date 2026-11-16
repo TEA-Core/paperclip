@@ -1124,7 +1124,7 @@ describe("AgentMail durable email pipeline", () => {
     await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user",
       principalId: actor.userId, permissionKey: "tools:manage_connections" });
     expect(await accessService(db).hasPermission(f.companyId, "user", actor.userId, "tools:manage_connections")).toBe(true);
-    expect(await accessService(db).hasPermission(f.companyId, "user", actor.userId, "agent_config:update")).toBe(false);
+    expect(await accessService(db).hasPermission(f.companyId, "user", actor.userId, "agents:configure")).toBe(false);
     const requestId = randomUUID();
     const svc = emailConnectionService(db, f.fetcher);
     const connection = await svc.connect(f.companyId, { apiKey: "test-key", grantKind: "organization",

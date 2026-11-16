@@ -385,7 +385,7 @@ describe("durable, authorized connection routing", () => {
       const current = await buildEffectiveRunSessionConfigMetadata(currentInput);
       const alternatives = aiConnectionSessionCompatibilityInputs({ ...currentInput, originalIssueOverrides: null, binding: selected.binding, router: true, storedIdentity: before.sessionIdentity, sessionIdentity: after.sessionIdentity, credentialIdentity: after.identity, revisions: [] });
       const compatibleConfigMetadata = await Promise.all(alternatives.map(candidate => buildEffectiveRunSessionConfigMetadata({ ...currentInput, ...candidate })));
-      expect(resolveTaskSessionConfigFreshness({ hasTaskSession: true, configuredModel: String(selected.runtimeConfig.model), taskSessionParams: { __paperclipConfiguredModel: selected.runtimeConfig.model, __paperclipConfigFingerprint: previous.fingerprint, __paperclipConfigFingerprintVersion: previous.version, __paperclipConfigCategoryFingerprints: previous.categoryFingerprints }, configMetadata: current, compatibleConfigMetadata }).reset).toBe(false);
+      expect(resolveTaskSessionConfigFreshness({ hasTaskSession: true, taskSessionParams: { __paperclipConfiguredModel: selected.runtimeConfig.model, __paperclipConfigFingerprint: previous.fingerprint, __paperclipConfigFingerprintVersion: previous.version, __paperclipConfigCategoryFingerprints: previous.categoryFingerprints }, configMetadata: current, compatibleConfigMetadata }).reset).toBe(false);
     } finally { await before.cleanup(); await after.cleanup(); }
   });
   it("keeps session identity and fingerprints stable on authenticated refresh, but changes them on manual replacement", async () => {

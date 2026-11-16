@@ -30,7 +30,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { ONBOARDING_FIRST_TASK_ORIGIN_KIND, connectionIntentPayloadSchema, type CreateIssueThreadInteractionInput } from "@paperclipai/shared";
+import { ONBOARDING_FIRST_TASK_ORIGIN_KIND, connectionIntentPayloadSchema, type CreateIssueThreadInteractionInput, type IssueThreadInteractionPayload } from "@paperclipai/shared";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
@@ -4681,7 +4681,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       expect(interaction.acceptanceBlocker).toBeUndefined();
     });
 
-    it.each(["toolAction", "ask_user_questions"])(
+    it.each(["toolAction", "ask_user_questions"] as const)(
       "keeps live %s decisions available while the workspace is active",
       async (kind) => {
         const { companyId, executionWorkspaceId, issueId, interactionId, sourceRunId } =
@@ -4690,7 +4690,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
           companyId, executionWorkspaceId, heartbeatRunId: sourceRunId,
           phase: "worktree_prepare", status: "succeeded",
         });
-        const payload = kind === "ask_user_questions"
+        const payload: IssueThreadInteractionPayload = kind === "ask_user_questions"
           ? { version: 1, questions: [{ id: "question", prompt: "Which option?", selectionMode: "single", options: [{ id: "first", label: "First" }] }] }
           : { version: 1, prompt: "Allow this action?", [kind]: { version: 1, actionRequestId: randomUUID(), invocationId: randomUUID(), toolName: "example.write",
                 toolDisplayName: "Write", connectionId: randomUUID(), applicationId: randomUUID(),

@@ -87,7 +87,7 @@ if (!support.supported) console.warn(`Planning fixture API calibration skipped: 
     expect(inputs).toHaveLength(variant === "disabled" ? 0 : 2);
     expect(inputs.map(i => i.name)).toEqual(invocations.map(i => i.name));
     const providerHome = path.join(root, "isolated-codex-home");
-    expect(resolveRunnerdCodexSkillInputs(inputs, context, providerHome)).toEqual(inputs.map(i => ({
+    expect(resolveRunnerdCodexSkillInputs(inputs.map(i => ({ ...i })), context, providerHome)).toEqual(inputs.map(i => ({
       ...i, path: path.join(providerHome, "skills", i.name, "SKILL.md"),
     })));
     await verifyPlanSelection(api, companyId, agentId, sources);

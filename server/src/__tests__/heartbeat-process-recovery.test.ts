@@ -86,7 +86,9 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { runningProcesses } from "../adapters/index.ts";
+import type { EnvironmentLease } from "@paperclipai/shared";
+import type { NativeExecutionInput } from "../vendor/paperclip-runner/index.js";
+import { runningProcesses, type AdapterExecutionContext, type AdapterExecutionResult } from "../adapters/index.ts";
 import {
   resolveDefaultAgentWorkspaceDir,
   resolvePaperclipInstanceRoot,
@@ -135,7 +137,7 @@ const mockExecutePaperclipNativeSession = vi.hoisted(() =>
   >(),
 );
 const mockAdapterExecute = vi.hoisted(() =>
-  vi.fn(async (_input?: unknown) => ({
+  vi.fn(async (_input: AdapterExecutionContext): Promise<AdapterExecutionResult> => ({
     exitCode: 0,
     signal: null,
     timedOut: false,
@@ -8543,7 +8545,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       }
       return originalAllocate(db, runId);
     });
-    mockAdapterExecute.mockImplementationOnce((async () => {
+    mockAdapterExecute.mockImplementationOnce(async () => {
       await db.insert(issueThreadInteractions).values({ id: interactionId, companyId, issueId, sourceRunId: runId,
         kind: "request_confirmation", title: "Approve the saved plan", payload: { version: 1, prompt: "Accept the plan?" } });
       await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, issueId));
@@ -8554,7 +8556,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         errorMessage: providerOutcome === "succeeded" ? null : "Original provider failure",
         summary: "Plan saved; awaiting approval.", provider: "test", model: "test-model",
         usage: { inputTokens: 100, outputTokens: 25 }, costUsd: 0.05 };
-    }) as typeof mockAdapterExecute);
+    });
     const heartbeat = heartbeatService(db);
     try {
       await heartbeat.resumeQueuedRuns();

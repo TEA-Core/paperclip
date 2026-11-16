@@ -105,7 +105,7 @@ describe("unclaimed Cloud background work", () => {
     vi.useFakeTimers();
     let standby = true;
     const isEnabled = vi.fn().mockResolvedValue(false);
-    const events = createPublicMcpEvents({} as Db, { isEnabled } as PublicMcpOAuth, vi.fn(), {
+    const events = createPublicMcpEvents({} as Db, { isEnabled } as unknown as PublicMcpOAuth, vi.fn(), {
       isBackgroundWorkEnabled: () => !standby,
     });
     try {

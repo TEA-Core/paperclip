@@ -17,7 +17,7 @@ const runner: CommandManagedRuntimeRunner = {
       timeout: input.timeoutMs, maxBuffer: 16 * 1024 * 1024,
     }, (error, stdout, stderr) => resolve({
       exitCode: error ? (typeof error.code === "number" ? error.code : 1) : 0,
-      signal: error?.signal ?? null, timedOut: error?.killed ?? false, stdout, stderr,
+      signal: error?.signal ?? null, timedOut: error?.killed ?? false, stdout, stderr, pid: null, startedAt: null,
     }));
     child.stdin?.end(input.stdin ?? "");
   }),

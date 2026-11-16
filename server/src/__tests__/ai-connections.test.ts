@@ -100,12 +100,12 @@ describe("managed AI connections", () => {
     const account = await service.save(companyId, "alice", { provider: "anthropic", method: "subscription", ownership: "shared", name: "Shared usage account", loginSessionId: "fixture", agentIds: [], allAgents: true }, "shared-usage-secret");
     const selected = { provider: "anthropic", method: "subscription", mode: "shared", ...account } as const;
     const tools = toolAccessService(db);
-    await tools.replaceConnectionGrantMembers(account.connectionId, account.grantId, ["alice"], { userId: "alice" });
+    await tools.replaceConnectionGrantMembers(account.connectionId, account.grantId, ["alice"], { actorType: "user", actorId: "alice" });
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({ five_hour: { utilization: 100 }, extra_usage: { is_enabled: false } })));
     try {
       await expect(service.probeUsage(companyId, "bob", account.connectionId)).rejects.toThrow("not found");
       expect(fetchSpy).not.toHaveBeenCalled();
-      await tools.replaceConnectionGrantMembers(account.connectionId, account.grantId, ["bob"], { userId: "alice" });
+      await tools.replaceConnectionGrantMembers(account.connectionId, account.grantId, ["bob"], { actorType: "user", actorId: "alice" });
       for (const config of [{ adapterType: "claude_local" }, { adapterType: "paperclip_runner", runnerProvider: "acpx", acpxAgent: "claude" }]) {
         const row = await service.select({ companyId, userId: "bob", agentId, binding: selected, ...config });
         expect(await service.probeUsage(companyId, "bob", row.connection.id, row.grant.id)).toMatchObject({ status: "ok", overage: { available: false }, limits: [{ limitReached: true }, { allowed: false }] });

@@ -288,6 +288,8 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
         name: "Other agent run",
         subjectType: "heartbeat_run",
         subjectId: other!.run.id,
+        clientLabel: "Runtime MCP test client",
+        ownerNote: "",
         allowedActions: ["tools/list", "tools/call"],
         expiresAt: new Date(Date.now() + 60_000),
       },
@@ -325,7 +327,7 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     const service = createToolGatewayService(db);
     const token = await service.createNamedGatewayToken({
       companyId: owner!.agent.companyId, gatewayId: gateway!.id,
-      body: { name: "Other run", subjectType: "heartbeat_run", subjectId: other!.run.id,
+      body: { name: "Other run", subjectType: "heartbeat_run", subjectId: other!.run.id, clientLabel: "Runtime MCP test client", ownerNote: "",
         allowedActions: ["tools/list"], expiresAt: new Date(Date.now() + 60_000) },
       actor: { agentId: other!.agent.id },
     });
@@ -357,7 +359,7 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     const service = createToolGatewayService(db);
     const token = await service.createNamedGatewayToken({
       companyId: owner!.agent.companyId, gatewayId: gateway!.id,
-      body: { name: "Other run", subjectType: "heartbeat_run", subjectId: other!.run.id,
+      body: { name: "Other run", subjectType: "heartbeat_run", subjectId: other!.run.id, clientLabel: "Runtime MCP test client", ownerNote: "",
         allowedActions: ["tools/list"], expiresAt: new Date(Date.now() + 60_000) },
       actor: { agentId: other!.agent.id },
     });
@@ -424,7 +426,7 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     expect(managed?.gateways.map((entry) => entry.id)).toEqual([shared.id]);
     const token = await service.createNamedGatewayToken({
       companyId: owner!.agent.companyId, gatewayId: shared.id,
-      body: { name: "Shared run", subjectType: "heartbeat_run", subjectId: other!.run.id,
+      body: { name: "Shared run", subjectType: "heartbeat_run", subjectId: other!.run.id, clientLabel: "Runtime MCP test client", ownerNote: "",
         allowedActions: ["tools/list"], expiresAt: new Date(Date.now() + 60_000) },
       actor: { agentId: other!.agent.id },
     });
