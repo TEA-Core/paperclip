@@ -6,7 +6,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -1782,8 +1782,12 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     // Each row is in the recorded-branch SQL class (determinate refusal, a
     // recorded branch that differs from the checked-out branch, a recorded
     // merged PR, no escalation) with exactly one disqualifying condition. The
-    // recorded branch is absent as a local ref, so only the disqualifier keeps
-    // the worktree, with or without a cleanup gate that accepts a landed branch.
+    // recorded branch is absent as a local ref, HEAD equals the recorded merged
+    // PR head and is pushed, and the tree is clean, so a gate that accepts a
+    // landed recorded-branch mismatch would remove the base row and only the
+    // disqualifier keeps the worktree. For the unlanded commit, the new commit
+    // also moves HEAD away from the merged PR head, so both the landed clause
+    // and the remote clause refuse it.
     const cases: Array<{
       name: string;
       prepare: (seeded: Awaited<ReturnType<typeof seedTerminalWorkspace>>) => Promise<void>;
@@ -1882,6 +1886,10 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     it.each(cases)("keeps the worktree and escalates once for $name", async (row) => {
       const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true, ...row.options });
       await strandWithDeterminateRefusal(seeded.executionWorkspaceId, "fm/recorded-delivery-branch");
+      await db
+        .update(issueWorkProducts)
+        .set({ metadata: { mergedAt: "2026-01-01T00:00:00Z", headSha: seeded.headSha } })
+        .where(eq(issueWorkProducts.issueId, seeded.sourceIssueId));
       await row.prepare(seeded);
       const filesBefore = row.pathExists === false ? null : (await fs.readdir(seeded.worktreePath)).sort();
       const headBefore = row.gitReadable === false ? null : await readGit(seeded.worktreePath, ["rev-parse", "HEAD"]);
@@ -1906,7 +1914,17 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
 
       expect(sweep.archived).toBe(0);
       expect(workspace).toEqual({ status: "cleanup_failed", cleanupReason: determinateReason });
-      expect(await terminalCleanupEscalations(seeded.executionWorkspaceId)).toHaveLength(1);
+      const escalations = await terminalCleanupEscalations(seeded.executionWorkspaceId);
+      expect(escalations).toHaveLength(1);
+      expect(escalations[0]?.details?.cause).toBe("determinate_refusal");
+      const archivedRows = await db
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.entityId, seeded.executionWorkspaceId),
+          eq(activityLog.action, "execution_workspace.issue_terminal_archived"),
+        ));
+      expect(archivedRows).toHaveLength(0);
       if (row.pathExists === false) {
         await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
       } else {
