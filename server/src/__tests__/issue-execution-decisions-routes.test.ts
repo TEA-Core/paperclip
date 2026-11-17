@@ -295,6 +295,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     deliveryRequirement,
     assigneeAgentId = null,
     mentionState,
+    prAuthor = "paperclip-delivery",
   }: {
     draft?: boolean;
     missing?: boolean;
@@ -307,6 +308,8 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     assigneeAgentId?: string | null;
     /** SUP-22346: cache the mentioned PR as merged/closed out-of-band ("merged" | "ambiguous") or closed-unmerged. */
     mentionState?: "merged" | "ambiguous" | "closed-unmerged";
+    /** The live PR's author login; the arming token's login (GET /user) is "paperclip-delivery". */
+    prAuthor?: string;
   } = {}) {
     const company = await seedCompany(db);
     if (mergeArmingEnabled) {
@@ -360,6 +363,8 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       title: identifier, head: { ref: branch, sha: "a".repeat(40), repo: { full_name: "TEA-Core/paperclip" } },
       // The GitHub provider caches the head repository flat; the arm-time owner fallback requires it.
       headRepoFullName: "TEA-Core/paperclip",
+      // The PR was opened as the control plane's delivery identity (the arming token's login below).
+      user: { login: prAuthor },
       ...(mentionState
         ? {
             state: "closed" as const,
@@ -452,6 +457,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         return Response.json(mergedMention ? { status: "behind", ahead_by: 0 } : { ahead_by: 1 });
       }
       if (url.includes("/git/ref/")) return Response.json({ object: { sha: pr.head.sha } });
+      if (url.endsWith("/user")) return Response.json({ login: "paperclip-delivery" });
       throw new Error(`Unexpected sandbox request: ${url}`);
     });
     return {
@@ -1027,6 +1033,20 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
   it("stamps but does not arm a final approval when another issue's workspace row carries the same branch", async () => {
     const fixture = await pendingDelivery({ mergeArmingEnabled: true });
     await seedOtherCardWorkspace(fixture, fixture.pr.head.ref);
+
+    const response = await approveByComment(fixture);
+
+    expect(response.status, JSON.stringify(response.body)).toBe(201);
+    expect((await fixture.read()).status).toBe("done");
+    expect(fixture.writes).toEqual([{
+      url: `https://api.github.com/repos/TEA-Core/paperclip/statuses/${fixture.pr.head.sha}`,
+      body: expect.objectContaining({ state: "success", context: "paperclip/approved" }),
+    }]);
+    expect(fixture.armCalls).toEqual([]);
+  });
+
+  it("stamps but does not arm a final approval when another author opened the PR on the card's branch (owner ruling)", async () => {
+    const fixture = await pendingDelivery({ mergeArmingEnabled: true, prAuthor: "outside-contributor" });
 
     const response = await approveByComment(fixture);
 

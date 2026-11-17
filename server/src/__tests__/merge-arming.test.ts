@@ -9,6 +9,7 @@ import {
   issues,
   projectWorkspaces,
   projects,
+  workspaceOperations,
   type Db,
 } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
@@ -2972,6 +2973,33 @@ describeEmbeddedPostgres(
     const REPO_URL = "https://github.com/TEA-Core/paperclip";
     const PR_TITLE = "fix(SUP-24000): close PR 1067 executionPolicy PATCH residuals";
     const HEAD_SHA = "5801dbc3ffcd5154c747e1d5985cb05af65b47d8";
+    /** The login of the token the control plane arms with (GET /user): the delivery identity. */
+    const DELIVERY_LOGIN = "paperclip-delivery";
+
+    /** GitHub as the arm sees it: the arming token's login and the live PR's author (null = unreadable). */
+    let github: { deliveryLogin: string | null; author: string | null };
+
+    function fakeGitHub(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+      const url = String(input);
+      if (url.endsWith("/user")) {
+        return Promise.resolve(github.deliveryLogin
+          ? createMockResponse({ login: github.deliveryLogin })
+          : createMockResponse({ message: "Resource not accessible by integration" }, false, 403));
+      }
+      if (/\/pulls\/1210$/.test(url) && (init?.method ?? "GET") === "GET") {
+        return Promise.resolve(github.author
+          ? createMockResponse({ number: 1210, user: { login: github.author } })
+          : createMockResponse({ message: "Not Found" }, false, 404));
+      }
+      if (String(init?.body ?? "").includes("enablePullRequestAutoMerge")) {
+        return Promise.resolve(createMockResponse({ data: { enablePullRequestAutoMerge: { clientMutationId: "abc" } } }));
+      }
+      return Promise.resolve(createMockResponse({}));
+    }
+
+    /** How many auto-merge enable mutations reached GitHub. */
+    const enableCalls = () =>
+      mockGhFetch.mock.calls.filter(([, init]) => String((init as RequestInit | undefined)?.body ?? "").includes("enablePullRequestAutoMerge")).length;
 
     beforeAll(async () => {
       tempDb = await startEmbeddedPostgresTestDatabase("paperclip-merge-arming-own-branch-");
@@ -2983,6 +3011,7 @@ describeEmbeddedPostgres(
     });
 
     async function clearTables() {
+      await db.delete(workspaceOperations);
       await db.delete(externalObjectMentions);
       await db.delete(externalObjects);
       await db.delete(issues);
@@ -3016,7 +3045,8 @@ describeEmbeddedPostgres(
       vi.resetAllMocks();
       mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
       mockResolveSecretValue.mockResolvedValue(GITHUB_TOKEN);
-      mockGhFetch.mockResolvedValue(createMockResponse({}));
+      github = { deliveryLogin: DELIVERY_LOGIN, author: DELIVERY_LOGIN };
+      mockGhFetch.mockImplementation(fakeGitHub);
       await clearTables();
 
       ({ companyId, projectId } = await insertCompanyWithProject());
@@ -3137,12 +3167,9 @@ describeEmbeddedPostgres(
     }
 
     async function expectArmed(displayName = "TEA-Core/paperclip#1210") {
-      mockGhFetch.mockResolvedValueOnce(
-        createMockResponse({ data: { enablePullRequestAutoMerge: { clientMutationId: "abc" } } }),
-      );
       const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
       expect(result).toEqual({ kind: "armed", message: `armed: Auto-merge enabled for ${displayName}` });
-      expect(mockGhFetch).toHaveBeenCalledTimes(1);
+      expect(enableCalls()).toBe(1);
     }
 
     async function expectRefused(message: string) {
@@ -3395,7 +3422,7 @@ describeEmbeddedPostgres(
 
       expect(result.kind).toBe("skipped");
       expect(result.message).toMatch(/^skipped:authority-changed: TEA-Core\/paperclip#1210 — /);
-      expect(mockGhFetch).not.toHaveBeenCalled();
+      expect(enableCalls()).toBe(0);
     });
 
     it("RA: refuses when the card's row claims the fold branch", async () => {
@@ -3474,7 +3501,7 @@ describeEmbeddedPostgres(
 
       expect(result.kind).toBe("skipped");
       expect(result.message).toMatch(/^skipped:authority-changed: TEA-Core\/paperclip#1210 — /);
-      expect(mockGhFetch).not.toHaveBeenCalled();
+      expect(enableCalls()).toBe(0);
     });
 
     it("RA rebind race: a rebind to an identical row (old row removed) mid-arm still stops as authority-changed", async () => {
@@ -3491,7 +3518,7 @@ describeEmbeddedPostgres(
 
       expect(result.kind).toBe("skipped");
       expect(result.message).toMatch(/^skipped:authority-changed: TEA-Core\/paperclip#1210 — /);
-      expect(mockGhFetch).not.toHaveBeenCalled();
+      expect(enableCalls()).toBe(0);
     });
 
     it("ignores another company's project-workspace row when deciding the project's default refs", async () => {
@@ -3582,6 +3609,128 @@ describeEmbeddedPostgres(
 
       expect(result).toEqual({ kind: "skipped", message: NOT_OWNER });
       expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    // ---- Owner ruling on PR 1214: an agent-chosen existing branch is not delivery evidence ----
+
+    /** The control-plane receipt of the runtime's `git worktree add -b`, as the workspace recorder writes it. */
+    async function recordWorktreeReceipt(
+      executionWorkspaceId: string,
+      branchName: string,
+      overrides: { issueId?: string; status?: string; phase?: string; metadata?: Record<string, unknown> } = {},
+    ) {
+      await db.insert(workspaceOperations).values({
+        companyId,
+        executionWorkspaceId,
+        issueId: overrides.issueId ?? issueId,
+        phase: overrides.phase ?? "worktree_prepare",
+        command: `git worktree add -b ${branchName}`,
+        status: overrides.status ?? "succeeded",
+        metadata: { branchName, created: true, ...overrides.metadata },
+      });
+    }
+
+    async function expectRefusedAfterProof() {
+      const result = await armMergeOnApproval(db, companyId, issueId, DECISION);
+      expect(result).toEqual({ kind: "skipped", message: NOT_OWNER });
+      expect(enableCalls()).toBe(0);
+    }
+
+    it("refuses an agent-named existing branch whose PR another author opened (no control-plane record)", async () => {
+      await seedOwnWorkspace();
+      github.author = "stranger";
+      await mentionPr();
+      await expectRefusedAfterProof();
+    });
+
+    it("arms a control-plane-created branch whose PR the delivery identity opened", async () => {
+      await recordWorktreeReceipt(await seedOwnWorkspace(), OWN_BRANCH);
+      await mentionPr();
+      await expectArmed();
+    });
+
+    it("refuses a control-plane-created branch whose PR a stranger opened", async () => {
+      await recordWorktreeReceipt(await seedOwnWorkspace(), OWN_BRANCH);
+      github.author = "stranger";
+      await mentionPr();
+      await expectRefusedAfterProof();
+    });
+
+    it("arms on the PR author alone: no control-plane record, PR opened by the delivery identity", async () => {
+      await seedOwnWorkspace();
+      await mentionPr();
+      await expectArmed();
+    });
+
+    it.each([
+      ["the author", { deliveryLogin: DELIVERY_LOGIN, author: "Paperclip-Delivery" }],
+      ["the token's login", { deliveryLogin: "Paperclip-Delivery", author: DELIVERY_LOGIN }],
+    ] as const)("compares the PR author with the delivery identity case-insensitively (%s in another case)", async (_label, state) => {
+      await seedOwnWorkspace();
+      github = { ...state };
+      await mentionPr();
+      await expectArmed();
+    });
+
+    it.each([
+      ["the token's login (GET /user) is unreadable", { deliveryLogin: null, author: DELIVERY_LOGIN }],
+      ["the live PR's author is unreadable", { deliveryLogin: DELIVERY_LOGIN, author: null }],
+    ] as const)("falls back to the control-plane record when %s: armed with the record", async (_label, state) => {
+      await recordWorktreeReceipt(await seedOwnWorkspace(), OWN_BRANCH);
+      github = { ...state };
+      await mentionPr();
+      await expectArmed();
+    });
+
+    it.each([
+      ["the token's login (GET /user) is unreadable", { deliveryLogin: null, author: DELIVERY_LOGIN }],
+      ["the live PR's author is unreadable", { deliveryLogin: DELIVERY_LOGIN, author: null }],
+    ] as const)("refuses when %s and there is no control-plane record", async (_label, state) => {
+      await seedOwnWorkspace();
+      github = { ...state };
+      await mentionPr();
+      await expectRefusedAfterProof();
+    });
+
+    it.each([
+      ["an adopted existing branch (created: false)", { metadata: { created: false, attachedExistingBranch: true } }],
+      ["a recreated (restored) branch", { metadata: { restored: true } }],
+      ["a failed worktree add", { status: "failed" }],
+      ["an operation of another phase", { phase: "worktree_cleanup" }],
+      ["another branch name (the row's branch was changed after)", { metadata: { branchName: "fm/previous-branch" } }],
+    ] as const)("does not count %s as a control-plane record", async (_label, overrides) => {
+      await recordWorktreeReceipt(await seedOwnWorkspace(), OWN_BRANCH, overrides);
+      github.deliveryLogin = null;
+      await mentionPr();
+      await expectRefusedAfterProof();
+    });
+
+    it("does not count a record made for another card", async () => {
+      const otherIssueId = await insertIssue({ identifier: "SUP-30020" });
+      await recordWorktreeReceipt(await seedOwnWorkspace(), OWN_BRANCH, { issueId: otherIssueId });
+      github.deliveryLogin = null;
+      await mentionPr();
+      await expectRefusedAfterProof();
+    });
+
+    it("does not count a record made for another workspace row", async () => {
+      await seedOwnWorkspace();
+      await recordWorktreeReceipt(await insertWorkspace({ branchName: null }), OWN_BRANCH);
+      github.deliveryLogin = null;
+      await mentionPr();
+      await expectRefusedAfterProof();
+    });
+
+    it("does not count another company's record for the same row", async () => {
+      const wsId = await seedOwnWorkspace();
+      const other = await insertCompanyWithProject("OTH");
+      await db.insert(workspaceOperations).values({
+        companyId: other.companyId, executionWorkspaceId: wsId, issueId, phase: "worktree_prepare",
+        status: "succeeded", metadata: { branchName: OWN_BRANCH, created: true },
+      });
+      github.deliveryLogin = null;
+      await mentionPr();
+      await expectRefusedAfterProof();
     });
   },
 );

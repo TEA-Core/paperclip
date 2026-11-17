@@ -5929,6 +5929,16 @@ export async function createAuthorityGuard(
  *     project_primary row, and never the row's base ref or a default/repo ref of the
  *     card's or the row's project, read in the same snapshot (RA round 2: a separate
  *     read let a default ref changed in between slip through).
+ *   - the card PROVES the branch is its own (SUP-24409 owner ruling: an agent-chosen
+ *     existing branch is not delivery evidence; a field the card's writer can set is
+ *     not proof). The live PR's author and the delivery identity (the login of a GitHub
+ *     token the control plane arms this repo with) are both read from GitHub: the
+ *     delivery identity as author proves it, any other author refuses. When either
+ *     login cannot be read, only the control-plane receipt proves it: a succeeded
+ *     `git worktree add -b` the runtime ran for THIS card on THIS row and recorded with
+ *     this exact branch (workspace_operations: phase worktree_prepare, created, not a
+ *     restore). An adopted existing branch, a branch set by PATCH, and a recreated
+ *     (restored) branch have no such receipt.
  * Every accept here is also a mint-time accept at the snapshot: resolveDeliveryIdentity
  * resolves the same row's repo and branch, and its branchIsOwn is this row's. A rebind
  * after the snapshot changes the authority fingerprint, which stops the arm before the
@@ -5939,7 +5949,7 @@ async function isOnOwnExecutionWorkspaceBranch(
   db: Db,
   companyId: string,
   issueId: string,
-  pr: { owner: string; repo: string; headRefName: string | null; headRepoFullName?: string | null },
+  pr: { owner: string; repo: string; number: number; headRefName: string | null; headRepoFullName?: string | null },
 ): Promise<boolean> {
   const [snapshot] = await db
     .select({
@@ -5965,6 +5975,17 @@ async function isOnOwnExecutionWorkspaceBranch(
           AND EXISTS (SELECT 1 FROM issues x WHERE x.execution_workspace_id = ${executionWorkspaces.id} AND x.id <> ${issueId})
         )
       )`,
+      createdBranchReceipt: sql<boolean>`EXISTS (
+        SELECT 1 FROM workspace_operations op
+        WHERE op.company_id = ${companyId}
+          AND op.execution_workspace_id = ${executionWorkspaces.id}
+          AND op.issue_id = ${issueId}
+          AND op.phase = 'worktree_prepare'
+          AND op.status = 'succeeded'
+          AND op.metadata->>'created' = 'true'
+          AND op.metadata->>'restored' IS DISTINCT FROM 'true'
+          AND op.metadata->>'branchName' = ${executionWorkspaces.branchName}
+      )`,
     })
     .from(issues)
     .innerJoin(executionWorkspaces, eq(executionWorkspaces.id, issues.executionWorkspaceId))
@@ -5979,11 +6000,70 @@ async function isOnOwnExecutionWorkspaceBranch(
   if (pr.headRefName !== branch) return false;
   if (pr.headRepoFullName?.toLowerCase() !== `${repo.owner}/${repo.repo}`.toLowerCase()) return false;
   if (snapshot.claimedElsewhere) return false;
-  return !isProtectedDeliveryBranch({
+  if (isProtectedDeliveryBranch({
     branch,
     defaultRefs: [snapshot.baseRef, ...snapshot.projectRefs],
     workspaceMode: snapshot.mode,
-  });
+  })) return false;
+  const authorProof = await readPullRequestAuthorProof(db, companyId, pr);
+  if (authorProof !== "unverified") return authorProof === "delivery-identity";
+  return snapshot.createdBranchReceipt;
+}
+
+/** Whether a PR's live author is the delivery identity, a different author, or not readable. */
+type PullRequestAuthorProof = "delivery-identity" | "other-author" | "unverified";
+
+/** A GitHub REST GET with `token`; the parsed body, or null on any failure. */
+async function fetchGitHubObject(token: string, path: string): Promise<Record<string, unknown> | null> {
+  try {
+    const response = await ghFetch(`${gitHubApiBase("github.com")}${path}`, {
+      headers: {
+        accept: "application/vnd.github+json",
+        "user-agent": "paperclip-merge-arming",
+        "x-github-api-version": "2022-11-28",
+        authorization: `Bearer ${token}`,
+      },
+    });
+    if (!response.ok) return null;
+    const body: unknown = await response.json().catch(() => null);
+    return body !== null && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+/** `value.login` when `value` is an object with a non-empty string login (a GitHub user). */
+function loginOf(value: unknown): string | null {
+  if (value === null || typeof value !== "object") return null;
+  const login = (value as Record<string, unknown>).login;
+  return typeof login === "string" && login.length > 0 ? login : null;
+}
+
+/**
+ * SUP-24409 owner ruling, proof (b): the live PR's author against the delivery identity,
+ * both read from GitHub (never from a card field). The delivery identity is the login of
+ * each GitHub token the control plane resolves for the repo (`GET /user`), the identity it
+ * opens and arms PRs as. `unverified` when no login of either side can be read (no token,
+ * an app token `GET /user` refuses, a network error), so the caller falls back to proof (a).
+ */
+async function readPullRequestAuthorProof(
+  db: Db,
+  companyId: string,
+  pr: { owner: string; repo: string; number: number },
+): Promise<PullRequestAuthorProof> {
+  const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo).catch(() => []);
+  const deliveryLogins: string[] = [];
+  let author: string | null = null;
+  for (const candidate of candidates) {
+    const login = loginOf(await fetchGitHubObject(candidate.token, "/user"));
+    if (login) deliveryLogins.push(login.toLowerCase());
+    author ??= loginOf((await fetchGitHubObject(
+      candidate.token,
+      `/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}/pulls/${pr.number}`,
+    ))?.user);
+  }
+  if (author === null || deliveryLogins.length === 0) return "unverified";
+  return deliveryLogins.includes(author.toLowerCase()) ? "delivery-identity" : "other-author";
 }
 
 export async function armMergeOnApproval(
