@@ -16,6 +16,7 @@ import {
   maybePersistWorktreeRuntimePorts,
   maybeRepairLegacyWorktreeConfigAndEnvFiles,
 } from "../worktree-config.js";
+import { parse as parseEnvFile } from "dotenv";
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
 
 const ORIGINAL_ENV = { ...process.env };
@@ -1404,6 +1405,109 @@ describe("worktree config repair", () => {
     expect(repairedEnv.split("\n")).toContain(line);
     expect(repairedEnv).not.toContain("CANARY_PARENT_SHELL_TOOL_ACTION_SECRET");
     delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+    maybeRepairLegacyWorktreeConfigAndEnvFiles();
+    expect(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBe(value);
+    expect(await fs.readFile(envPath, "utf8")).toBe(repairedEnv);
+  });
+
+  it.each([
+    {
+      name: "double-quoted multiline with a DATABASE_URL continuation",
+      secretLines: [
+        'PAPERCLIP_TOOL_ACTION_SIGNING_SECRET="alpha',
+        "DATABASE_URL=postgresql://attacker:secret@evil.invalid/db",
+        'omega"',
+      ],
+      value: "alpha\nDATABASE_URL=postgresql://attacker:secret@evil.invalid/db\nomega",
+      injectedKey: "DATABASE_URL",
+    },
+    {
+      name: "single-quoted multiline with a PORT continuation",
+      secretLines: [
+        "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET='alpha",
+        "PORT=12345",
+        "omega'",
+      ],
+      value: "alpha\nPORT=12345\nomega",
+      injectedKey: "PORT",
+    },
+  ])("does not split a $name worktree secret into a loadable key (SUP-24365)", async ({ secretLines, value, injectedKey }) => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-secret-multiline-"));
+    const worktreeRoot = path.join(tempRoot, "SUP-24365-secret-multiline");
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const configPath = path.join(paperclipDir, "config.json");
+    const envPath = path.join(paperclipDir, ".env");
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    await fs.writeFile(configPath, JSON.stringify(buildLegacyConfig(path.join(tempRoot, "shared")), null, 2) + "\n", "utf8");
+    const originalSecretBlock = secretLines.join("\n");
+    await fs.writeFile(envPath, ["PAPERCLIP_IN_WORKTREE=true", originalSecretBlock, ""].join("\n"), "utf8");
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREES_DIR = path.join(tempRoot, ".paperclip-worktrees");
+    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "CANARY_PARENT_SHELL_TOOL_ACTION_SECRET";
+    delete process.env.PORT;
+    delete process.env.DATABASE_URL;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_CONFIG;
+    delete process.env.PAPERCLIP_CONTEXT;
+
+    maybeRepairLegacyWorktreeConfigAndEnvFiles();
+
+    expect(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBe(value);
+    const repairedEnv = await fs.readFile(envPath, "utf8");
+    expect(repairedEnv).toContain(originalSecretBlock);
+    expect(repairedEnv).not.toContain("CANARY_PARENT_SHELL_TOOL_ACTION_SECRET");
+    const parsed = parseEnvFile(repairedEnv);
+    expect(parsed.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBe(value);
+    expect(parsed[injectedKey]).toBeUndefined();
+
+    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "CANARY_PARENT_SHELL_TOOL_ACTION_SECRET";
+    maybeRepairLegacyWorktreeConfigAndEnvFiles();
+    expect(await fs.readFile(envPath, "utf8")).toBe(repairedEnv);
+    expect(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBe(value);
+  });
+
+  it.each([
+    { name: "backspace escape", line: String.raw`PAPERCLIP_TOOL_ACTION_SIGNING_SECRET="CANARY\bescape"`, value: String.raw`CANARY\bescape` },
+    { name: "tab escape", line: String.raw`PAPERCLIP_TOOL_ACTION_SIGNING_SECRET="CANARY\tescape"`, value: String.raw`CANARY\tescape` },
+    { name: "quote escape", line: String.raw`PAPERCLIP_TOOL_ACTION_SIGNING_SECRET="CANARY\"escape"`, value: String.raw`CANARY\"escape` },
+  ])("does not rotate a worktree tool-action secret with a $name on every repair (SUP-24365)", async ({ line, value }) => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-secret-escapes-"));
+    const worktreeRoot = path.join(tempRoot, "SUP-24365-secret-escapes");
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const configPath = path.join(paperclipDir, "config.json");
+    const envPath = path.join(paperclipDir, ".env");
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    await fs.writeFile(configPath, JSON.stringify(buildLegacyConfig(path.join(tempRoot, "shared")), null, 2) + "\n", "utf8");
+    await fs.writeFile(envPath, ["PAPERCLIP_IN_WORKTREE=true", line, ""].join("\n"), "utf8");
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREES_DIR = path.join(tempRoot, ".paperclip-worktrees");
+    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "CANARY_PARENT_SHELL_TOOL_ACTION_SECRET";
+    delete process.env.PORT;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_CONFIG;
+    delete process.env.PAPERCLIP_CONTEXT;
+
+    maybeRepairLegacyWorktreeConfigAndEnvFiles();
+
+    expect(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBe(value);
+    const repairedEnv = await fs.readFile(envPath, "utf8");
+    expect(repairedEnv.split("\n")).toContain(line);
+    expect(parseEnvFile(repairedEnv).PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBe(value);
+
+    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "CANARY_PARENT_SHELL_TOOL_ACTION_SECRET";
+    maybeRepairLegacyWorktreeConfigAndEnvFiles();
+    expect(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBe(value);
+    expect(await fs.readFile(envPath, "utf8")).toBe(repairedEnv);
+
+    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "CANARY_PARENT_SHELL_TOOL_ACTION_SECRET";
     maybeRepairLegacyWorktreeConfigAndEnvFiles();
     expect(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBe(value);
     expect(await fs.readFile(envPath, "utf8")).toBe(repairedEnv);

@@ -519,8 +519,9 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
   // never persisted, so a parent shell's secret cannot become the worktree's
   // own (SUP-24365).
   const inheritedToolActionSigningSecret = nonEmpty(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET);
+  const fileToolActionSigningSecret = nonEmpty(existingEnvEntries.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET);
   const toolActionSigningSecret =
-    nonEmpty(existingEnvEntries.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET) ??
+    fileToolActionSigningSecret ??
     inheritedToolActionSigningSecret ??
     randomBytes(32).toString("hex");
 
@@ -532,7 +533,7 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
     PAPERCLIP_IN_WORKTREE: "true",
     PAPERCLIP_DB_BACKUP_ENABLED: "false",
     PAPERCLIP_WORKTREE_NAME: context.worktreeName,
-    ...(toolActionSigningSecret === inheritedToolActionSigningSecret
+    ...(fileToolActionSigningSecret || toolActionSigningSecret === inheritedToolActionSigningSecret
       ? {}
       : { PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: toolActionSigningSecret }),
   };
