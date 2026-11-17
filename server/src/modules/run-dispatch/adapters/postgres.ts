@@ -932,6 +932,7 @@ export function createPostgresRunDispatchAdapter(
     decision: Extract<ReturnType<typeof decideQueuedRunStaleness>, { stale: true }>,
     expectedStatus: "queued" | "running",
     now: Date,
+    resultPatch: Record<string, unknown> = {},
   ): Promise<CancelStaleQueuedRunOutcome> {
       const [row] = await tx
         .update(heartbeatRuns)
@@ -950,6 +951,7 @@ export function createPostgresRunDispatchAdapter(
             timeoutConfigured: false,
             timeoutSource: "stale_queued_run_gate",
             timeoutFired: false,
+            ...resultPatch,
           },
           updatedAt: now,
         })
@@ -1225,7 +1227,20 @@ export function createPostgresRunDispatchAdapter(
         if (!decision.stale || !QUEUED_RUN_EXPIRY_ERROR_CODES[decision.errorCode]) {
           return { outcome: "not_stale" };
         }
-        const cancelled = await cancelStaleRunInTx(tx, run, issueId, decision, "queued", input.now);
+        // Same receipt the generic cancel path records for a never-started
+        // legacy queued run: without it stranded-work recovery reads the
+        // expired run as an uncertain provider execution and parks the issue
+        // behind a board reconciliation hold instead of re-dispatching it.
+        const neverStarted = run.runtimeMode !== "native" && !run.startedAt && !run.processPid;
+        const cancelled = await cancelStaleRunInTx(
+          tx,
+          run,
+          issueId,
+          decision,
+          "queued",
+          input.now,
+          neverStarted ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } : {},
+        );
         if (cancelled.outcome !== "cancelled") return cancelled;
         await logActivityInTransaction(
           tx,

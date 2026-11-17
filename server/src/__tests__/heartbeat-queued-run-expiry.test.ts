@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -10,6 +10,8 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
+  issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
 import {
@@ -43,6 +45,8 @@ describeEmbeddedPostgres("heartbeat queued-run age bound", () => {
   }, 60_000);
 
   afterEach(async () => {
+    await db.delete(issueRecoveryActions);
+    await db.delete(issueComments);
     await db.delete(issues);
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
@@ -91,6 +95,7 @@ describeEmbeddedPostgres("heartbeat queued-run age bound", () => {
       assigneeAgentId: agentId,
       issueNumber,
       identifier: `T-${issueNumber}`,
+      responsibleUserId: "responsible-user",
     });
     return issueId;
   }
@@ -327,5 +332,89 @@ describeEmbeddedPostgres("heartbeat queued-run age bound", () => {
     expect(await expiryActivityRows()).toHaveLength(1);
     expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, stale.runId)))
       .toHaveLength(1);
+  });
+
+  /**
+   * A run that was legitimately waiting: an ordinary assignment wake queued
+   * behind the agent's single slot while another issue's run held it for
+   * more than a day.
+   */
+  async function seedAssignmentRunBehindBusyAgent(status: "todo" | "in_progress") {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, agentId));
+    const issueId = await seedIssue(companyId, agentId, 1);
+    await db.update(issues).set({ status }).where(eq(issues.id, issueId));
+    const busyIssueId = await seedIssue(companyId, agentId, 2);
+    const busyRunId = await seedRunningRun(companyId, agentId, busyIssueId, new Date(Date.now() - 30 * HOUR_MS));
+    await db.update(issues).set({ executionRunId: busyRunId, executionLockedAt: new Date() })
+      .where(eq(issues.id, busyIssueId));
+    const waiting = await seedQueuedLockHolder({
+      companyId,
+      agentId,
+      issueId,
+      createdAt: new Date(Date.now() - QUEUED_RUN_BOUND_MS - HOUR_MS),
+    });
+    await db.update(agentWakeupRequests)
+      .set({ source: "assignment", reason: "issue_assigned", requestedByActorType: "user", requestedByActorId: "board-user" })
+      .where(eq(agentWakeupRequests.id, waiting.wakeupRequestId));
+    await db.update(heartbeatRuns)
+      .set({ invocationSource: "assignment", contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" } })
+      .where(eq(heartbeatRuns.id, waiting.runId));
+    return { companyId, issueId, waiting };
+  }
+
+  it.each(["todo", "in_progress"] as const)(
+    "hands a legitimately waiting %s run's work back to stranded-work recovery, not to a board hold",
+    async (status) => {
+      const { issueId, waiting } = await seedAssignmentRunBehindBusyAgent(status);
+      const heartbeat = heartbeatService(db);
+
+      expect(await heartbeat.expireStaleQueuedRuns()).toEqual({ expired: 1, runIds: [waiting.runId] });
+      expect((await readRun(waiting.runId)).resultJson).toMatchObject({
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      });
+
+      const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+      await heartbeat.drainActiveRunExecutions();
+
+      expect(reconciled.issueIds).toContain(issueId);
+      const replacements = await db
+        .select({ status: heartbeatRuns.status, retryOfRunId: heartbeatRuns.retryOfRunId })
+        .from(heartbeatRuns)
+        .where(and(
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          eq(heartbeatRuns.retryOfRunId, waiting.runId),
+        ));
+      expect(replacements).toEqual([{ status: "scheduled_retry", retryOfRunId: waiting.runId }]);
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))
+        .toEqual([]);
+    },
+  );
+
+  it("leaves an automatic continuation whose source cannot be verified for the next wake, with the issue unlocked", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedIssue(companyId, agentId, 1);
+    // A system continuation with no retry ancestry: the chat-control source
+    // check is unresolved, the same verdict that kept the claim skipping it.
+    const stale = await seedQueuedLockHolder({
+      companyId,
+      agentId,
+      issueId,
+      createdAt: new Date(Date.now() - QUEUED_RUN_BOUND_MS - HOUR_MS),
+    });
+    const heartbeat = heartbeatService(db);
+
+    expect(await heartbeat.expireStaleQueuedRuns()).toEqual({ expired: 1, runIds: [stale.runId] });
+    const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+    await heartbeat.drainActiveRunExecutions();
+
+    expect(reconciled.issueIds).not.toContain(issueId);
+    const issueRuns = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`);
+    expect(issueRuns).toEqual([{ id: stale.runId }]);
+    expect(await readIssueLock(issueId)).toEqual({ executionRunId: null, executionLockedAt: null, checkoutRunId: null });
+    expect((await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId)))[0]?.status)
+      .toBe("in_progress");
   });
 });
