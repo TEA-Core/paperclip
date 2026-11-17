@@ -12,6 +12,22 @@ import { testAdapterEnvironmentSchema } from "@paperclipai/shared";
 import { createHttpLogger } from "../middleware/logger.js";
 
 describe("HTTP logger redaction", () => {
+  it("redacts inbound MCP OAuth codes, PKCE verifiers, refresh tokens and redirect credentials", async () => {
+    const chunks: string[] = [];
+    const stream = new Writable({ write(chunk, _encoding, callback) { chunks.push(chunk.toString()); callback(); } });
+    const app = express();
+    app.use(express.json());
+    app.use(createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
+    app.post("/mcp/paperclip", (_req, res) => res.status(400).json({ error: "invalid_request" }));
+    app.post("/mcp/oauth/token", (_req, res) => res.status(400).json({ error: "invalid_grant" }));
+    app.get("/mcp/oauth/authorize", (_req, res) => res.redirect("https://client.example/callback?code=redirect-canary"));
+    await request(app).post("/mcp/oauth/token").send({ code: "code-canary", code_verifier: "pkce-canary", refresh_token: "refresh-canary" });
+    await request(app).get("/mcp/oauth/authorize?state=state-canary");
+    await request(app).post("/mcp/paperclip").send({ params: { delivery: { url: "https://receiver.example/callback-path-canary", secret: "whsec_callback-secret-canary" }, _meta: { "ai.paperclip/cloudAuthority": { token: "cloud-authority-canary" } } } });
+    expect(chunks.join("")).not.toMatch(/callback-path-canary|callback-secret-canary|cloud-authority-canary/);
+    expect(chunks.join("")).not.toMatch(/code-canary|pkce-canary|refresh-canary|redirect-canary|state-canary/);
+  });
+
   it.each([
     { method: "POST", path: "/api/routine-triggers/public/private-url-canary/fire" },
     { method: "PUT", path: "/api/routine-triggers/public/private-url-canary/fire" },
@@ -426,6 +442,58 @@ describe("HTTP logger redaction", () => {
     expect(log.req.headers["x-paperclip-github-capability"]).toBe("[Redacted]");
     expect(log.req.url).toBe("/runtime-tools/github/credentials");
     expect(log.res.statusCode).toBe(status);
+  });
+
+  it.each([200, 403, 500])("redacts cloud credentials and assertions from HTTP %i logs", async (status) => {
+    const headers = {
+      "X-Paperclip-Cloud-Tenant-Token": "cloud-tenant-token-canary",
+      "X-Paperclip-Cloud-Session-Id": "cloud-session-id-canary",
+      "X-Paperclip-Cloud-Runtime-Identity": "cloud-runtime-identity-canary",
+      "X-Paperclip-Cloud-Control": "cloud-control-canary",
+    };
+    const chunks: string[] = [];
+    const stream = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    });
+    const app = express();
+    app.use(createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
+    app.get("/api/companies", (_req, res, next) => {
+      if (status === 403) {
+        next(new HttpError(403, "Cloud tenant authentication required"));
+        return;
+      }
+      if (status === 500) {
+        next(new Error("Synthetic cloud request failure"));
+        return;
+      }
+      res.status(status).json({ status });
+    });
+    app.use(errorHandler);
+
+    const response = await request(app).get("/api/companies").set(headers).expect(status);
+    if (status === 403) {
+      expect(response.body).toEqual({ error: "Cloud tenant authentication required" });
+    } else if (status === 500) {
+      expect(response.body).toEqual({ error: "Internal server error" });
+    }
+
+    const output = chunks.join("");
+    const log = JSON.parse(output.trim());
+    for (const [header, secret] of Object.entries(headers)) {
+      expect(output).not.toContain(secret);
+      expect(log.req.headers[header.toLowerCase()]).toBe("[Redacted]");
+    }
+    expect(log.req.method).toBe("GET");
+    expect(log.req.url).toBe("/api/companies");
+    expect(log.res.statusCode).toBe(status);
+    expect(log.level).toBe(status === 500 ? 50 : status === 403 ? 40 : 30);
+    if (status === 500) {
+      expect(log.errorContext.message).toBe("Synthetic cloud request failure");
+      expect(log.err.message).toBe("Synthetic cloud request failure");
+    }
   });
 
   it("drops OAuth callback query data from the message and structured request", async () => {
