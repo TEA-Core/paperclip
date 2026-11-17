@@ -27,6 +27,12 @@ import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { captureRunIdentity } from "../services/run-identity.js";
 import { boardAuthService } from "../services/board-auth.js";
+import { retryIdempotentDatabaseOperation } from "../database-retry.js";
+
+export {
+  isTransientDbConnectionError,
+  retryIdempotentDatabaseOperation as retryOnTransientDbConnectionError,
+} from "../database-retry.js";
 
 const CLOUD_TENANT_WRITE_DEBOUNCE_MS = 5_000;
 const CLOUD_TENANT_WRITE_DEBOUNCE_MAX = 1_000;
@@ -57,7 +63,6 @@ function pruneCloudTenantWriteDebounce(
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import { forbidden, unauthorized, unprocessable } from "../errors.js";
-import { isTransientDbConnectionError } from "../lib/db-connection-errors.js";
 
 export { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { cloudTenantPrimaryCompanyId } from "../services/cloud-instance.js";
@@ -565,28 +570,6 @@ export function cloudActorHeaderSourceFromHeaders(
   };
 }
 
-export { isTransientDbConnectionError };
-
-/**
- * Runs `run` and retries it up to twice when it fails on a transient
- * connection error. Two replays, not one: when a pooled endpoint
- * suspends or recycles, EVERY pooled socket is dead at once, so the first
- * replay can draw another stale socket from the pool and fail identically
- * (observed 2026-09-12: retried actor resolution still surfacing
- * CONNECTION_CLOSED). The short pause gives the driver time to notice and
- * re-dial. Callers must pass an idempotent operation. Exported for tests.
- */
-export async function retryOnTransientDbConnectionError<T>(run: () => Promise<T>): Promise<T> {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      return await run();
-    } catch (error) {
-      if (attempt >= 2 || !isTransientDbConnectionError(error)) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
-    }
-  }
-}
-
 /**
  * Trusted-header actor resolution with bounded transient-connection retries.
  * The tenant sync inside is idempotent end to end — every write is an
@@ -598,7 +581,7 @@ export async function resolveCloudTenantActor(
   db: Db,
   req: CloudActorHeaderSource,
 ): Promise<Express.Request["actor"] | null> {
-  return retryOnTransientDbConnectionError(() => resolveCloudTenantActorOnce(db, req));
+  return retryIdempotentDatabaseOperation(() => resolveCloudTenantActorOnce(db, req));
 }
 
 async function resolveCloudTenantActorOnce(

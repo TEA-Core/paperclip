@@ -39,6 +39,8 @@ export async function mirrorSlackBoardComment(
     endpointId?: string;
     conversationId?: string;
     attachmentIds?: readonly string[];
+    /** Board API key that authenticated the originating request, for audit attribution only. */
+    boardApiKeyId?: string | null;
   } = {},
 ) {
   if (
@@ -185,6 +187,7 @@ export async function mirrorSlackBoardComment(
       companyId: comment.companyId,
       actorType: "user",
       actorId: comment.authorUserId,
+      boardApiKeyId: options.boardApiKeyId ?? null,
       action: "chat.publication_requested",
       entityType: "chat_publication",
       entityId: publication.id,

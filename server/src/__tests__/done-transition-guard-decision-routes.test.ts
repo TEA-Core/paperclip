@@ -1199,6 +1199,30 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     expect(await statusOf(issueId)).toBe("in_review");
   });
 
+  it("PATCH: record_only close whose Tier 2 evidence ends in the Tier 1 marker is refused with done_transition_tier_conflict, structured and comment forms (SUP-24299)", async () => {
+    // Same card and evidence as the accepted close in the SUP-22801 test above;
+    // only the trailing Tier 1 marker differs, so only the conflict refusal can stop it.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D24299A", { deliveryRequirement: "record_only" });
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockNoOpenPulls();
+    const conflicted = `${RECORD_ONLY_EVIDENCE}. Liveness unverified.`;
+
+    for (const body of [
+      { status: "done", comment: "Closing.", doneTier: { tier: "tier2", probeEvidence: conflicted } },
+      { status: "done", comment: `Closing.\n\nClosed at Tier 2 (live): ${conflicted}` },
+    ]) {
+      const res = await request(app).patch(`/api/issues/${identifier}`).send(body);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_tier_conflict");
+      expect(String(res.body.error)).toContain("mutually exclusive");
+      expect(String(res.body.details?.remedy)).toContain('remove "Liveness unverified." from the Tier 2 line');
+      expect(await statusOf(issueId)).toBe("in_review");
+    }
+    expect(await auditRows(companyId, issueId, "issue.done_transition_tier2_close")).toHaveLength(0);
+  });
+
   it("PATCH: the record_only missing-tier 422 remedy names both record-only forms and no merge head (SUP-22801)", async () => {
     // Round-1 repair (record-only-remedy-omits-structured-form): the 422
     // remedy is classification-aware. A record_only card is steered to the
@@ -2385,6 +2409,38 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       });
     });
 
+    it("PATCH: a record_only close refused for a nonexistent cited SHA leaves no allowed guard disposition (SUP-24298)", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D24298A");
+      await db
+        .update(issues)
+        .set({ executionPolicy: null, executionState: null, deliveryRequirement: "record_only" })
+        .where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockMergedBranchWithCommitProbes({ afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60: "absent" });
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment:
+            "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe re-hit the endpoint; cited commit TEA-Core/paperclip@afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_cited_sha_unresolvable");
+      // The refused write is not an allowed transition. Wait for the resolver's own
+      // fire-and-forget row so a late guard row would have landed before this check.
+      await vi.waitFor(
+        async () => {
+          if ((await auditRows(companyId, issueId, "issue.done_transition_cited_sha_resolved")).length === 0) {
+            throw new Error("waiting for cited-sha audit row");
+          }
+        },
+        { timeout: 5000 },
+      );
+      expect(await auditRows(companyId, issueId, "issue.done_transition_guard_skipped")).toHaveLength(0);
+    });
+
     it("PATCH: a close citing only resolvable SHAs still closes (no regression)", async () => {
       const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D20525B");
       await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
@@ -2400,6 +2456,16 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(await statusOf(issueId)).toBe("done");
+      // An allowed close the guard did not skip writes no skipped disposition (SUP-24298).
+      await vi.waitFor(
+        async () => {
+          if ((await auditRows(companyId, issueId, "issue.done_transition_cited_sha_resolved")).length === 0) {
+            throw new Error("waiting for cited-sha audit row");
+          }
+        },
+        { timeout: 5000 },
+      );
+      expect(await auditRows(companyId, issueId, "issue.done_transition_guard_skipped")).toHaveLength(0);
       // Exact probe list, restored: two calls, both for the same ref — the
       // Tier 2 origin predicate resolves the named probe head, and the
       // cited-SHA resolver probes the cited commit. A single call cannot
