@@ -714,7 +714,7 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
       email: "responsible@example.com",
       createdAt: new Date(),
       updatedAt: new Date(),
-    });
+    }).onConflictDoNothing();
     await db.insert(companyMemberships).values({
       companyId,
       principalType: "user",
@@ -900,7 +900,7 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     const { companyId, writerAgentId, writerRunId } = await seedCreateDoor();
     await db.insert(authUsers).values({
       id: "board-key-user", name: "Board Key", email: "key@example.com", createdAt: new Date(), updatedAt: new Date(),
-    });
+    }).onConflictDoNothing();
     await db.insert(companyMemberships).values({
       companyId, principalType: "user", principalId: "board-key-user", status: "active", membershipRole: "operator",
     });
@@ -923,7 +923,7 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     const { companyId, writerAgentId, writerRunId } = await seedCreateDoor();
     await db.insert(authUsers).values({
       id: "responsible-user", name: "Responsible", email: "responsible@example.com", createdAt: new Date(), updatedAt: new Date(),
-    });
+    }).onConflictDoNothing();
     await db.insert(companyMemberships).values({
       companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "operator",
     });

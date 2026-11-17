@@ -10037,7 +10037,7 @@ export function issueRoutes(
     assigneeAgentId: string | null;
     executionRunId?: string | null;
     checkoutRunId?: string | null;
-  }) {
+  }, opts?: { allowIssueLessStampedRunId?: string | null }) {
     let runToInterrupt = issue.executionRunId
       ? await heartbeat.getRun(issue.executionRunId)
       : null;
@@ -10046,14 +10046,12 @@ export function issueRoutes(
     // card's own run: its context names no issue (the adoption stamps both
     // pointers), so it must never become the interruptible run for this card.
     // Only a stamped run whose context names this card is the card's run.
-    if (runToInterrupt) {
+    if (runToInterrupt?.contextSnapshot && typeof runToInterrupt.contextSnapshot === "object") {
       const stampedIssueId =
-        runToInterrupt.contextSnapshot &&
-        typeof runToInterrupt.contextSnapshot === "object" &&
         typeof (runToInterrupt.contextSnapshot as Record<string, unknown>).issueId === "string"
           ? ((runToInterrupt.contextSnapshot as Record<string, unknown>).issueId as string)
           : null;
-      if (stampedIssueId !== issue.id) {
+      if (stampedIssueId !== issue.id && runToInterrupt.id !== opts?.allowIssueLessStampedRunId) {
         runToInterrupt = null;
       }
     }
@@ -21073,7 +21071,13 @@ export function issueRoutes(
         issueId: existing.id,
         agentId: existing.assigneeAgentId,
       });
-      const runToStopForReassignment = await resolveActiveIssueRun(existing);
+      const runToStopForReassignment = await resolveActiveIssueRun(existing, {
+        // A workflow-controlled stage handoff issued by the stamped run
+        // itself still cancels that issuer after it hands off. An adopted
+        // issue-less author is never interrupted this way.
+        allowIssueLessStampedRunId:
+          transition.workflowControlledAssignment && actor.runId ? actor.runId : null,
+      });
       const isIssuingRunStageHandoff = transition.workflowControlledAssignment &&
         !terminalApprovalNeedsClassificationCheck &&
         actor.runId !== null &&
@@ -21289,7 +21293,7 @@ export function issueRoutes(
         }
         return shouldCollectTerminalIssueActions
           ? svc.update(id, issueUpdateData, tx, undefined, postCommitIssueActions)
-          : svc.update(id, issueUpdateData, tx, undefined, postCommitIssueActions);
+          : svc.update(id, issueUpdateData, tx);
       }
       return shouldCollectCompletionPublication
         ? svc.update(id, issueUpdateData, db, postCommitActivityPublications)
@@ -22283,6 +22287,19 @@ export function issueRoutes(
     }
     for (const publication of postCommitActivityPublications) publishActivity(publication);
     await flushIssuePostCommitActions(postCommitIssueActions);
+    // A transactional update that cleared the execution lock without the
+    // post-commit list (a comment-joined status change) still promotes the
+    // held wake here, once the route transaction has committed.
+    if (existing.executionRunId && !issue.executionRunId) {
+      try {
+        const clearedRun = await heartbeat.getRun(existing.executionRunId);
+        if (clearedRun) {
+          await heartbeat.releaseIssueExecutionAndPromote(clearedRun, { suppressImmediateRecovery: true }, issue.id);
+        }
+      } catch (err) {
+        logger.warn({ err, issueId: issue.id, runId: existing.executionRunId }, "failed to promote wakes after a transactional lock clear");
+      }
+    }
 
     if (transition.droppedStageIds?.length) {
       void logActivity(db, {
