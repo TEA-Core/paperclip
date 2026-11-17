@@ -1411,7 +1411,7 @@ The current app also exposes V1-supporting surfaces for:
   branch differs from the recorded branch (a detached HEAD or a failed branch read counts as
   different); the cleanup gates are unchanged. The row is selected on each sweep until the
   end-of-sweep escalation records its marker, and one escalation pass marks at most 100 rows. By owner decision
-  2026-11-16, that one attempt may remove a stranded worktree only when the cleanup gate proves it
+  2026-11-16, that attempt may remove a stranded worktree only when the cleanup gate proves it
   landed and clean: a recorded merged PR, the recorded branch absent as a local ref, HEAD landed (an
   ancestor of the base ref, or equal to the head SHA of a recorded merged PR), 0 commits missing from
   every remote, no tracked changes, no untracked files, and HEAD equal to the assessed HEAD. The
