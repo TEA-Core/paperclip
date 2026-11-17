@@ -1,12 +1,18 @@
 import path from "node:path";
-import { and, eq, inArray, isNotNull, ne, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
+  companyMemberships,
   documentRevisions,
   documents,
+  environmentLeases,
+  executionWorkspaceRuntimeLeases,
   executionWorkspaces,
+  externalObjectMentions,
   heartbeatRuns,
+  instanceUserRoles,
+  issueComments,
   issueDocuments,
   issueExecutionDecisions,
   issueLabels,
@@ -15,6 +21,7 @@ import {
   labels,
   projectWorkspaces,
   workspaceOperations,
+  workspaceRuntimeServices,
   type Db,
 } from "@paperclipai/db";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
@@ -2443,13 +2450,19 @@ export type NoRepositoryLandingVerdict =
 
 type NoRepositoryLandingRefusal = Extract<NoRepositoryLandingVerdict, { ok: false }>;
 
-/** The records checked to establish that a card never had an execution workspace. */
+/** The records checked to establish that a card never had a project, a workspace or a repository deliverable. */
 const NO_WORKSPACE_HISTORY_RECORDS = [
   "execution_workspaces.source_issue_id",
   "workspace_operations.execution_workspace_id",
-  "heartbeat_runs.context_snapshot.executionWorkspaceId",
-  "activity_log.details.executionWorkspaceId",
-  "issue_work_products.execution_workspace_id",
+  "environment_leases.execution_workspace_id",
+  "workspace_runtime_services.issue_id",
+  "execution_workspace_runtime_leases.owner_issue_id",
+  "issue_work_products.execution_workspace_id/project_id",
+  "heartbeat_runs.context_snapshot (project or workspace keys, any depth)",
+  "activity_log.details (project, workspace, repository or delivery-requirement keys, any depth)",
+  "external_object_mentions.source_issue_id",
+  "issue_work_products.type/url",
+  "issue title, description, comments and documents (pull request, merge request, code-host URL or Git ref)",
 ] as const;
 
 /** The close audit's view of a measurement: the proof used, the ruling, and for a worktree the binding, base and probe result. */
@@ -2542,18 +2555,32 @@ type NoRepositoryLandingRead =
   | { ok: true; proof: "isolated_worktree"; record: NoRepositoryLandingRecord }
   | { ok: true; proof: "never_had_execution_workspace"; ruling: NoRepositoryLandingRuling };
 
+// SUP-24547 round 2: key names that, with a non-null value anywhere in a JSON
+// record, show the card was bound to a project, a project or execution
+// workspace, a repository, or a repository_delivery classification. A run's
+// context carries the workspace it ran in (projectId, workspaceId, repoUrl,
+// branchName, worktreePath, executionWorkspaceId), and every PATCH that moves
+// one of the card's own pointers records it in `changes`/`_previous`.
+const RUN_CONTEXT_PROJECT_OR_WORKSPACE_PATH =
+  'lax $.** ? (@.type() == "object").keyvalue() ? (@.key like_regex "^(executionWorkspaceId|projectId|projectWorkspaceId|workspaceId|repoUrl|branchName|worktreePath|providerRef)$" && @.value != null)';
+const ACTIVITY_PROJECT_OR_WORKSPACE_PATH =
+  'lax $.** ? (@.type() == "object").keyvalue() ? (@.key like_regex "(workspace|^project|repourl|reporef|branchname|worktree|providerref|deliveryrequirement)" flag "i" && @.value != null)';
+
 /**
- * SUP-24547: whether any control-plane record shows an execution workspace was
- * ever attached to this card. The pointers on the issue row (projectId,
- * projectWorkspaceId, executionWorkspaceId) are writable by the card's
- * assignee, so their being null proves nothing on its own. These records are
- * written only by the server: the workspace row sourced from the card, the
- * provisioning operations and run context that name a workspace for it, any
- * audit row of the card that names a workspace (every PATCH that binds or
- * unbinds one records it), and work products recorded against a workspace.
- * Detaching, closing or archiving the workspace leaves them in place.
+ * SUP-24547: whether any control-plane record shows this card ever had a
+ * project, a project or execution workspace, or a repository_delivery
+ * classification. The pointers on the issue row are writable by the card's
+ * assignee, and a PATCH can clear them in one request and close in the next,
+ * so their being null proves nothing on its own. These records are written
+ * only by the server and outlive a cleared pointer: the workspace row sourced
+ * from the card; the provisioning operations, environment leases, runtime
+ * services and runtime leases that name a workspace for it; work products
+ * recorded against a project or workspace; every run whose context names the
+ * card and a project, workspace or repository; and every audit row of the
+ * card that names one (each PATCH that sets or clears a project or workspace
+ * pointer, or reclassifies the card, records it).
  */
-async function cardEverHadExecutionWorkspace(db: Db, issue: { id: string; companyId: string }): Promise<boolean> {
+async function cardHistoryNamesProjectOrWorkspace(db: Db, issue: { id: string; companyId: string }): Promise<boolean> {
   const checks = [
     db
       .select({ id: executionWorkspaces.id })
@@ -2572,13 +2599,54 @@ async function cardEverHadExecutionWorkspace(db: Db, issue: { id: string; compan
       )
       .limit(1),
     db
+      .select({ id: environmentLeases.id })
+      .from(environmentLeases)
+      .where(
+        and(
+          eq(environmentLeases.companyId, issue.companyId),
+          eq(environmentLeases.issueId, issue.id),
+          isNotNull(environmentLeases.executionWorkspaceId),
+        ),
+      )
+      .limit(1),
+    db
+      .select({ id: workspaceRuntimeServices.id })
+      .from(workspaceRuntimeServices)
+      .where(and(eq(workspaceRuntimeServices.companyId, issue.companyId), eq(workspaceRuntimeServices.issueId, issue.id)))
+      .limit(1),
+    db
+      .select({ id: executionWorkspaceRuntimeLeases.id })
+      .from(executionWorkspaceRuntimeLeases)
+      .where(
+        and(
+          eq(executionWorkspaceRuntimeLeases.companyId, issue.companyId),
+          eq(executionWorkspaceRuntimeLeases.ownerIssueId, issue.id),
+        ),
+      )
+      .limit(1),
+    db
+      .select({ id: issueWorkProducts.id })
+      .from(issueWorkProducts)
+      .where(
+        and(
+          eq(issueWorkProducts.companyId, issue.companyId),
+          eq(issueWorkProducts.issueId, issue.id),
+          or(isNotNull(issueWorkProducts.executionWorkspaceId), isNotNull(issueWorkProducts.projectId)),
+        ),
+      )
+      .limit(1),
+    db
       .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
       .where(
         and(
           eq(heartbeatRuns.companyId, issue.companyId),
-          sql`(${heartbeatRuns.contextSnapshot} ->> 'issueId') = ${issue.id}`,
-          sql`(${heartbeatRuns.contextSnapshot} ->> 'executionWorkspaceId') is not null`,
+          or(
+            sql`(${heartbeatRuns.contextSnapshot} ->> 'issueId') = ${issue.id}`,
+            sql`(${heartbeatRuns.contextSnapshot} ->> 'taskId') = ${issue.id}`,
+            sql`((${heartbeatRuns.contextSnapshot} -> 'paperclipIssue') ->> 'id') = ${issue.id}`,
+          ),
+          sql`jsonb_path_exists(${heartbeatRuns.contextSnapshot}, ${RUN_CONTEXT_PROJECT_OR_WORKSPACE_PATH}::jsonpath, '{}'::jsonb, true)`,
         ),
       )
       .limit(1),
@@ -2590,18 +2658,7 @@ async function cardEverHadExecutionWorkspace(db: Db, issue: { id: string; compan
           eq(activityLog.companyId, issue.companyId),
           eq(activityLog.entityType, "issue"),
           eq(activityLog.entityId, issue.id),
-          sql`jsonb_path_exists(${activityLog.details}, 'lax $.**.executionWorkspaceId ? (@ != null)')`,
-        ),
-      )
-      .limit(1),
-    db
-      .select({ id: issueWorkProducts.id })
-      .from(issueWorkProducts)
-      .where(
-        and(
-          eq(issueWorkProducts.companyId, issue.companyId),
-          eq(issueWorkProducts.issueId, issue.id),
-          isNotNull(issueWorkProducts.executionWorkspaceId),
+          sql`jsonb_path_exists(${activityLog.details}, ${ACTIVITY_PROJECT_OR_WORKSPACE_PATH}::jsonpath, '{}'::jsonb, true)`,
         ),
       )
       .limit(1),
@@ -2610,6 +2667,138 @@ async function cardEverHadExecutionWorkspace(db: Db, issue: { id: string; compan
     if ((await check).length > 0) return true;
   }
   return false;
+}
+
+// Repository evidence in the card's own text: a pull or merge request, a
+// code-host URL or a Git ref, in any form, with or without a structured
+// mention record. A commit-SHA heuristic is not applied here: thread text
+// routinely carries run and record ids.
+const THREAD_REPOSITORY_EVIDENCE_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/\bPR\s*#\s*\d+/i, "a pull request number"],
+  [/\bMR\s*!\s*\d+/i, "a merge request number"],
+  [/\/pulls?\/\d+/i, "a pull request URL"],
+  [/\/pull-requests\/\d+/i, "a pull request URL"],
+  [/\/merge_requests\/\d+/i, "a merge request URL"],
+  [/\bgithub\.com\//i, "a GitHub URL"],
+  [/\bgitlab\.[a-z0-9.-]+\//i, "a GitLab URL"],
+  [/\bbitbucket\.org\//i, "a Bitbucket URL"],
+  [/\brefs\/(?:heads|remotes|tags)\//i, "a Git ref"],
+];
+
+function threadRepositoryEvidence(text: string | null | undefined): string | null {
+  if (!text) return null;
+  for (const [pattern, label] of THREAD_REPOSITORY_EVIDENCE_PATTERNS) {
+    if (pattern.test(text)) return label;
+  }
+  return null;
+}
+
+// Work product types that carry no repository deliverable by themselves.
+const NON_REPOSITORY_WORK_PRODUCT_TYPES: ReadonlySet<string> = new Set(["artifact", "document"]);
+
+/**
+ * SUP-24547: repository work recorded on a card that has no workspace, in any
+ * form the linked-pull-request check does not resolve: an external object
+ * mention of any provider or shape, a work product other than an artifact or
+ * a document (a branch, a commit, a preview, a pull request of any head), or
+ * repository evidence in the card's title, description, comments or
+ * documents. Any one refuses the close.
+ */
+async function cardRepositoryEvidenceRefusal(
+  db: Db,
+  issue: { id: string; companyId: string },
+): Promise<NoRepositoryLandingRefusal | null> {
+  const mention = await db
+    .select({ objectType: externalObjectMentions.objectType, providerKey: externalObjectMentions.providerKey })
+    .from(externalObjectMentions)
+    .where(and(eq(externalObjectMentions.companyId, issue.companyId), eq(externalObjectMentions.sourceIssueId, issue.id)))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (mention) {
+    return noRepositoryRefusal(
+      `cannot be declared on an issue that mentions an external object (${mention.providerKey} ${mention.objectType}).`,
+    );
+  }
+  const products = await db
+    .select({
+      type: issueWorkProducts.type,
+      url: issueWorkProducts.url,
+      externalId: issueWorkProducts.externalId,
+      title: issueWorkProducts.title,
+    })
+    .from(issueWorkProducts)
+    .where(and(eq(issueWorkProducts.companyId, issue.companyId), eq(issueWorkProducts.issueId, issue.id)));
+  const repositoryProduct = products.find(
+    (product) =>
+      !NON_REPOSITORY_WORK_PRODUCT_TYPES.has(product.type) ||
+      threadRepositoryEvidence([product.url, product.externalId, product.title].filter(Boolean).join("\n")) !== null,
+  );
+  if (repositoryProduct) {
+    return noRepositoryRefusal(
+      `cannot be declared on an issue that records a repository work product (${repositoryProduct.type}).`,
+    );
+  }
+  const texts: string[] = [];
+  const card = await db
+    .select({ title: issues.title, description: issues.description })
+    .from(issues)
+    .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId)))
+    .then((rows) => rows[0] ?? null);
+  if (card) texts.push(card.title, card.description ?? "");
+  const comments = await db
+    .select({ body: issueComments.body })
+    .from(issueComments)
+    .where(and(eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id)));
+  texts.push(...comments.map((comment) => comment.body));
+  const cardDocuments = await db
+    .select({ body: documents.latestBody })
+    .from(issueDocuments)
+    .innerJoin(documents, and(eq(issueDocuments.documentId, documents.id), eq(documents.companyId, issue.companyId)))
+    .where(and(eq(issueDocuments.companyId, issue.companyId), eq(issueDocuments.issueId, issue.id)));
+  texts.push(...cardDocuments.map((document) => document.body));
+  for (const text of texts) {
+    const evidence = threadRepositoryEvidence(text);
+    if (evidence) {
+      return noRepositoryRefusal(`cannot be declared on an issue whose thread cites repository work (${evidence}).`);
+    }
+  }
+  return null;
+}
+
+/**
+ * SUP-24547: whether a ruling author is a board user of this company: a user
+ * with an active, non-viewer membership in the company, or an instance admin.
+ * Agents are not accepted as authors of a ruling for a card with no
+ * workspace: an assignee can rewrite the card's execution policy, so a
+ * "named reviewer" read from it is not independent of the closer.
+ */
+async function isBoardUserOfCompany(db: Db, companyId: string, userId: string): Promise<boolean> {
+  const membership = await db
+    .select({ role: companyMemberships.membershipRole })
+    .from(companyMemberships)
+    .where(
+      and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, userId),
+        eq(companyMemberships.status, "active"),
+      ),
+    )
+    .then((rows) => rows[0] ?? null);
+  if (membership && membership.role !== "viewer") return true;
+  const admin = await db
+    .select({ id: instanceUserRoles.id })
+    .from(instanceUserRoles)
+    .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
+    .limit(1);
+  return admin.length > 0;
+}
+
+interface EntryRulingOptions {
+  /** SUP-24547: every author of every revision must be a board user of this company. */
+  boardAuthorsOnly?: boolean;
+  /** Lock the ruling and its link until the status write commits, so it cannot be replaced under the close. */
+  lock?: boolean;
 }
 
 /**
@@ -2621,8 +2810,9 @@ async function readEntryRuling(
   db: Db,
   issue: NoRepositoryLandingSubject,
   closingActor: DoneTierClosingActor,
+  options: EntryRulingOptions = {},
 ): Promise<NoRepositoryLandingRefusal | { ok: true; ruling: NoRepositoryLandingRuling }> {
-  const ruling = await db
+  const rulingQuery = db
     .select({
       documentId: documents.id,
       latestBody: documents.latestBody,
@@ -2644,8 +2834,8 @@ async function readEntryRuling(
         eq(issueDocuments.issueId, issue.id),
         eq(issueDocuments.key, ENTRY_RULING_DOCUMENT_KEY),
       ),
-    )
-    .then((rows) => rows[0] ?? null);
+    );
+  const ruling = await (options.lock ? rulingQuery.for("update") : rulingQuery).then((rows) => rows[0] ?? null);
   if (!ruling || ruling.latestBody.trim().length === 0) {
     return noRepositoryRefusal(`requires a non-empty "${ENTRY_RULING_DOCUMENT_KEY}" document on this issue.`);
   }
@@ -2684,6 +2874,16 @@ async function readEntryRuling(
     return noRepositoryRefusal(
       `requires an "${ENTRY_RULING_DOCUMENT_KEY}" document written by someone other than the closing actor; the closer wrote at least one revision of it.`,
     );
+  }
+  if (options.boardAuthorsOnly) {
+    for (const author of authors) {
+      if (author.agentId || !author.userId || !(await isBoardUserOfCompany(db, issue.companyId, author.userId))) {
+        return noRepositoryRefusal(
+          `requires an "${ENTRY_RULING_DOCUMENT_KEY}" document whose every revision was written by a board user of this company ` +
+            "(an active, non-viewer member or an instance admin) when the issue has no execution workspace.",
+        );
+      }
+    }
   }
   return {
     ok: true,
@@ -2729,6 +2929,7 @@ async function readNoRepositoryLandingRecord(
   db: Db,
   issue: NoRepositoryLandingSubject,
   closingActor: DoneTierClosingActor | null,
+  options: { lockRuling?: boolean } = {},
 ): Promise<NoRepositoryLandingRead> {
   if (issue.deliveryRequirement !== "record_only") {
     return noRepositoryRefusal("is accepted only on a record_only issue.", REPOSITORY_DELIVERY_RECLASSIFY_REMEDY);
@@ -2743,14 +2944,19 @@ async function readNoRepositoryLandingRecord(
     if (
       issue.projectId !== null ||
       issue.projectWorkspaceId !== null ||
-      (await cardEverHadExecutionWorkspace(db, issue))
+      (await cardHistoryNamesProjectOrWorkspace(db, issue))
     ) {
       return noRepositoryRefusal("requires this issue's own execution workspace.");
     }
-    const ruling = await readEntryRuling(db, issue, closingActor);
+    const ruling = await readEntryRuling(db, issue, closingActor, {
+      boardAuthorsOnly: true,
+      lock: options.lockRuling === true,
+    });
     if (!ruling.ok) return ruling;
     const linkedWork = await linkedRepositoryWorkRefusal(db, issue);
     if (linkedWork) return linkedWork;
+    const repositoryEvidence = await cardRepositoryEvidenceRefusal(db, issue);
+    if (repositoryEvidence) return repositoryEvidence;
     return { ok: true, proof: "never_had_execution_workspace", ruling: ruling.ruling };
   }
 
@@ -3199,7 +3405,9 @@ async function verifyNoWorkspaceLandingAtTransition(
   }
   let read: NoRepositoryLandingRead;
   try {
-    read = await readNoRepositoryLandingRecord(tx, lockedIssue, closingActor);
+    // The ruling and its link stay locked until this status write commits, so
+    // a ruling replaced after this re-check waits for the close, not the reverse.
+    read = await readNoRepositoryLandingRecord(tx, lockedIssue, closingActor, { lockRuling: true });
   } catch (err) {
     return noRepositoryRefusal(
       `could not be verified at the close write (${err instanceof Error ? err.message : "unknown"}).`,
