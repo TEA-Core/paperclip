@@ -11,6 +11,7 @@ import type { AdapterRuntimeServiceReport } from "@paperclipai/adapter-utils";
 import type { Db } from "@paperclipai/db";
 import {
   executionWorkspaces,
+  heartbeatRuns,
   issueComments,
   issues,
   MIGRATIONS_FOLDER,
@@ -41,7 +42,7 @@ import {
   type WorkspaceRuntimeDesiredState,
   type WorkspaceRuntimeServiceStateMap,
 } from "@paperclipai/shared";
-import { and, desc, eq, gte, inArray, isNull, lte, ne, or } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import { asNumber, asString, defaultPathForPlatform, parseObject, renderTemplate, resolveCommandForLogs } from "../adapters/utils.js";
 import { conflict } from "../errors.js";
 import { resolveHomeAwarePath, resolvePaperclipInstanceRoot } from "../home-paths.js";
@@ -4340,6 +4341,10 @@ export type BaseRepoHygieneDecision =
  * Restoring is hygiene, not a gate. It never blocks the dispatch: refusing to run
  * because the base repo is untidy would dead-block issues over a condition the
  * issue did not cause, which is the SUP-11207 mistake.
+ *
+ * SUP-24442 narrows the premise: while the primary clone is the cwd of a live
+ * project_primary execution workspace it is that card's workspace, and the
+ * caller's restore guard skips `restore` (see liveProjectPrimaryRestoreGuard).
  */
 export function resolveBaseRepoHygieneDecision(input: {
   /** Branch the base repo has checked out; null when detached. */
@@ -5445,11 +5450,112 @@ async function resolveGitRepoRootForWorkspaceCleanup(
   return path.dirname(resolvedGitDir);
 }
 
+/**
+ * SUP-24442: decides, only once hygiene has already chosen `restore`, whether
+ * the restore must be skipped. Returns the reason to skip, or null to restore.
+ */
+export type BaseRepoRestoreGuard = () => Promise<string | null>;
+
+const TERMINAL_ISSUE_STATUSES = ["done", "cancelled"];
+const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running"];
+
+/**
+ * SUP-24442: ids of the non-closed project_primary execution workspaces that a
+ * live card still uses and whose cwd is this checkout: the repo root, a
+ * directory inside it, or the sibling's base cwd. A card is live while its issue
+ * (the workspace's source issue, or any issue bound to the workspace) is not
+ * terminal, or while that issue has a queued or running heartbeat run.
+ */
+async function findLiveProjectPrimaryWorkspacesAtCheckout(
+  db: Db,
+  checkout: { repoRoot: string; baseCwd: string },
+): Promise<string[]> {
+  const spellings = async (dir: string) => [
+    path.resolve(dir),
+    await fs.realpath(dir).catch(() => path.resolve(dir)),
+  ];
+  const roots = [...new Set(await spellings(checkout.repoRoot))];
+  const exactPaths = [...new Set([...roots, ...(checkout.baseCwd ? await spellings(checkout.baseCwd) : [])])];
+  const workspaces = await db
+    .select({ id: executionWorkspaces.id, sourceIssueId: executionWorkspaces.sourceIssueId })
+    .from(executionWorkspaces)
+    .where(and(
+      eq(executionWorkspaces.strategyType, "project_primary"),
+      isNull(executionWorkspaces.closedAt),
+      notInArray(executionWorkspaces.status, ["archived", "cleanup_failed"]),
+      or(
+        inArray(executionWorkspaces.cwd, exactPaths),
+        ...roots.map((root) => sql`starts_with(${executionWorkspaces.cwd}, ${root + path.sep})`),
+      ),
+    ));
+  if (workspaces.length === 0) return [];
+
+  const workspaceIds = workspaces.map((workspace) => workspace.id);
+  const sourceIssueIds = workspaces
+    .map((workspace) => workspace.sourceIssueId)
+    .filter((id): id is string => Boolean(id));
+  const linkedIssues = await db
+    .select({
+      id: issues.id,
+      executionWorkspaceId: issues.executionWorkspaceId,
+      status: issues.status,
+      executionRunId: issues.executionRunId,
+      checkoutRunId: issues.checkoutRunId,
+    })
+    .from(issues)
+    .where(or(
+      inArray(issues.executionWorkspaceId, workspaceIds),
+      sourceIssueIds.length > 0 ? inArray(issues.id, sourceIssueIds) : undefined,
+    ));
+  const runIds = [...new Set(linkedIssues.flatMap((issue) => [issue.executionRunId, issue.checkoutRunId])
+    .filter((id): id is string => Boolean(id)))];
+  const liveRunIds = new Set(runIds.length === 0
+    ? []
+    : (await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(inArray(heartbeatRuns.id, runIds), inArray(heartbeatRuns.status, LIVE_HEARTBEAT_RUN_STATUSES))))
+      .map((run) => run.id));
+
+  return workspaces
+    .filter((workspace) => linkedIssues.some((issue) =>
+      (issue.executionWorkspaceId === workspace.id || issue.id === workspace.sourceIssueId) &&
+      (!TERMINAL_ISSUE_STATUSES.includes(issue.status) ||
+        [issue.executionRunId, issue.checkoutRunId].some((runId) => runId !== null && liveRunIds.has(runId)))))
+    .map((workspace) => workspace.id);
+}
+
+/**
+ * SUP-24442: the hygiene restore treats the primary checkout as nobody's
+ * workspace, but it is the cwd of every project_primary execution workspace.
+ * Restoring it under a live card detaches the card's branch (or force-checks
+ * out main over its edits). Without a database there is nothing to look up, so
+ * no guard applies and hygiene behaves as before.
+ */
+function liveProjectPrimaryRestoreGuard(
+  db: Db | null | undefined,
+  checkout: { repoRoot: string; baseCwd: string },
+): BaseRepoRestoreGuard | null {
+  if (!db) return null;
+  return async () => {
+    const liveWorkspaceIds = await findLiveProjectPrimaryWorkspacesAtCheckout(db, checkout);
+    return liveWorkspaceIds.length > 0
+      ? `it is the working directory of ${liveWorkspaceIds.length} live project_primary execution workspace(s)`
+      : null;
+  };
+}
+
 export async function prepareBaseRepoForWorkspace(input: {
   repoRoot: string;
   configuredBaseRef: string | null;
   resolveGitAuth?: GitRemoteAuthProvider | null;
   recorder?: WorkspaceOperationRecorder | null;
+  /**
+   * SUP-24442: consulted only when hygiene decides `restore`. A non-null
+   * reason (or a guard failure) skips the restore and leaves the checkout
+   * untouched with a warning; every other hygiene action is unaffected.
+   */
+  restoreGuard?: BaseRepoRestoreGuard | null;
 }): Promise<{
   baseRef: string;
   baseRefSha: string | null;
@@ -5552,7 +5658,17 @@ export async function prepareBaseRepoForWorkspace(input: {
         divergenceComputable: shallowState.divergenceComputable,
         graftCommits: shallowState.graftCommits,
       });
-      if (decision.action === "restore") {
+      const restoreSkipReason = decision.action === "restore" && input.restoreGuard
+        ? await input.restoreGuard().catch((err: unknown) =>
+            `the live project_primary workspace lookup failed (${err instanceof Error ? err.message : String(err)}), so the checkout is treated as live`)
+        : null;
+      if (decision.action === "restore" && restoreSkipReason) {
+        const message =
+          `Base repository at ${input.repoRoot} was not restored to ${baseRef} (${decision.reasons.join("; ")}): ` +
+          `${restoreSkipReason}. Hygiene restore skipped; the checkout was left untouched.`;
+        baseRepoHygieneWarnings.push(message);
+        logger.warn(message);
+      } else if (decision.action === "restore") {
         const result = await restoreBaseRepoToDefaultRef({
           repoRoot: input.repoRoot,
           baseRef,
@@ -5949,6 +6065,7 @@ export async function realizeExecutionWorkspace(input: {
     configuredBaseRef,
     resolveGitAuth: input.resolveGitAuth ?? null,
     recorder: input.recorder ?? null,
+    restoreGuard: liveProjectPrimaryRestoreGuard(input.db, { repoRoot, baseCwd: input.base.baseCwd }),
   });
   if (baseRepoHygiene.divergenceAlert) {
     await emitBaseRepoDivergenceSignal({
@@ -6463,6 +6580,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
           configuredBaseRef: reuseBaseRef,
           resolveGitAuth: input.resolveGitAuth ?? null,
           recorder: input.recorder ?? null,
+          restoreGuard: liveProjectPrimaryRestoreGuard(input.db, { repoRoot, baseCwd }),
         })
       : { baseRef: reuseBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: reuseBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false, divergenceAlert: null };
     if (baseRepoHygiene.divergenceAlert) {
@@ -6531,6 +6649,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         configuredBaseRef: restoreBaseRef,
         resolveGitAuth: input.resolveGitAuth ?? null,
         recorder: input.recorder ?? null,
+        restoreGuard: liveProjectPrimaryRestoreGuard(input.db, { repoRoot, baseCwd }),
       })
     : { baseRef: restoreBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: restoreBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false, divergenceAlert: null };
   if (baseRepoHygiene.divergenceAlert) {
