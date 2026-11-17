@@ -5187,7 +5187,17 @@ export function agentRoutes(
         id,
         changesTaskAssign ? req.body : permissionsWithoutTaskAssign,
       );
-      if (!updated || !changesTaskAssign) return updated;
+      if (!updated) return updated;
+      if (!changesTaskAssign) {
+        // A false request reaches this point only when it read no stored grant
+        // and the agent has no role or creator grant. Grant writers outside this
+        // route do not take the agent row lock, so delete a tasks:assign row
+        // they committed after that read, as the unconditional write used to.
+        if (requestedCanAssignTasks === false) {
+          await txAccess.setPrincipalPermission(updated.companyId, "agent", updated.id, "tasks:assign", false, grantedByUserId);
+        }
+        return updated;
+      }
 
       const grantTaskAssign =
         updated.role === "ceo" || Boolean(updated.permissions?.canCreateAgents) || requestedCanAssignTasks === true;
