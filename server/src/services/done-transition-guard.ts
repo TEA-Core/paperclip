@@ -691,20 +691,39 @@ const LADDER_REFUSAL_REPEATED_ACTION = "issue.done_transition_ladder_refusal_rep
  * (`postTerminalStatusRefusalComment`), so a repeated refusal posts no second
  * comment and this row is the only per-write machine trace. Never throws, so the
  * HTTP result of the refusal is unchanged by a failed audit write.
+ *
+ * SUP-24429: a 409 `done_transition_record_only_flip_refused` (a close request that
+ * also relabels a stored repository_delivery card record_only) writes the same
+ * refusal-class row, naming the stored and requested requirements and recording
+ * that the landing check was not skipped.
  */
 export const DONE_TRANSITION_REFUSED_ACTION = "issue.done_transition_refused";
 
 export async function writeDoneTransitionRefusedAuditLog(
   db: Db,
   issue: { id: string; companyId: string; identifier: string | null },
-  details: {
-    code: "done_transition_missing_tier_declaration";
-    httpStatus: 422;
-    reason: string;
-    decisionCarried: boolean;
-    runId: string | null;
-    stage?: string;
-  },
+  details:
+    | {
+        code: "done_transition_missing_tier_declaration";
+        httpStatus: 422;
+        reason: string;
+        decisionCarried: boolean;
+        runId: string | null;
+        stage?: string;
+      }
+    | {
+        code: "done_transition_record_only_flip_refused";
+        httpStatus: 409;
+        reason: string;
+        decisionCarried: boolean;
+        runId: string | null;
+        storedDeliveryRequirement: IssueDeliveryRequirement;
+        requestedDeliveryRequirement: "record_only";
+        landingCheckSkipped: false;
+        // `request`: refused against the unlocked read; `locked_recheck`:
+        // refused under the issue row lock in the write transaction.
+        stage: "request" | "locked_recheck";
+      },
 ): Promise<void> {
   await writeAuditLog(db, issue, DONE_TRANSITION_REFUSED_ACTION, {
     ...details,
@@ -4656,6 +4675,9 @@ async function evaluateDoneTransitionGuardCore(
     executionPolicy?: unknown;
     executionState?: unknown;
     deliveryRequirement?: IssueDeliveryRequirement | null;
+    // The status version before this close; it binds a requirement-change
+    // marker to the close (SUP-24429).
+    statusVersion?: number;
   },
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
@@ -4663,6 +4685,9 @@ async function evaluateDoneTransitionGuardCore(
   // exported wrapper can audit a below-threshold carve-out on a successful close
   // without issuing a second countLadderedChildren query.
   observer?: { census?: DoneTransitionCensus },
+  // SUP-24429: the requirement stored before the close request; undefined when
+  // the caller's request does not change it.
+  storedDeliveryRequirement?: IssueDeliveryRequirement | null,
 ): Promise<DoneTransitionGuardResult> {
   const fallback = (reason: string, skipped = false, skipReason: string | null = null): DoneTransitionGuardResult => ({
     allowed: true,
@@ -4919,7 +4944,14 @@ async function evaluateDoneTransitionGuardCore(
     };
   }
 
-  if (issue.deliveryRequirement === "record_only") {
+  // SUP-24429: the skip follows the requirement stored before this request.
+  // A close request that just relabelled a repository_delivery card record_only
+  // falls through to the repository landing check below. A caller that passes
+  // no stored requirement changes nothing in that request.
+  if (
+    issue.deliveryRequirement === "record_only" &&
+    (storedDeliveryRequirement === undefined || storedDeliveryRequirement === "record_only")
+  ) {
     return {
       allowed: true,
       reason: "Record-only delivery requirement: repository/PR delivery is not required; transition allowed",
@@ -5144,6 +5176,17 @@ async function evaluateDoneTransitionGuardCore(
         reason: `open_linked_prs_decision_carried:${openPrs.length}`,
         skipReason: `open_linked_prs_decision_carried:${openPrs.length}`,
         prs: prNames,
+        // SUP-24429: this row is a landing-backstop candidate. When the close
+        // request relabelled the stored requirement, name both sides and the
+        // status version this close produces, so the backstop keeps sweeping
+        // the card under a live record_only label until a later close.
+        ...(storedDeliveryRequirement !== undefined && storedDeliveryRequirement !== issue.deliveryRequirement
+          ? {
+              storedDeliveryRequirement,
+              requestedDeliveryRequirement: issue.deliveryRequirement ?? null,
+              ...(issue.statusVersion !== undefined ? { closeStatusVersion: issue.statusVersion + 1 } : {}),
+            }
+          : {}),
       });
       return {
         allowed: true,
@@ -5700,9 +5743,20 @@ export async function evaluateDoneTransitionGuard(
   issue: Parameters<typeof evaluateDoneTransitionGuardCore>[1],
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
+  // SUP-24429: the requirement stored before this request, passed by a door that
+  // lets the close request change it. The record-only skip applies only when this
+  // is record_only too; omitted means the request did not change the requirement.
+  storedDeliveryRequirement?: IssueDeliveryRequirement | null,
 ): Promise<DoneTransitionGuardResult> {
   const observer: { census?: DoneTransitionCensus } = {};
-  const result = await evaluateDoneTransitionGuardCore(db, issue, override, decisionCarried, observer);
+  const result = await evaluateDoneTransitionGuardCore(
+    db,
+    issue,
+    override,
+    decisionCarried,
+    observer,
+    storedDeliveryRequirement,
+  );
   const census = observer.census;
   if (
     result.allowed
