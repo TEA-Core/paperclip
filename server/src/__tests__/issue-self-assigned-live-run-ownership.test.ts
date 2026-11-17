@@ -13,6 +13,7 @@ import {
   agentWakeupRequests,
   agents,
   authUsers,
+  boardApiKeys,
   companies,
   companyMemberships,
   createDb,
@@ -138,7 +139,8 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
   }
 
   function agentActor(companyId: string, agentId: string, runId: string): Express.Request["actor"] {
-    return { type: "agent", companyId, agentId, runId };
+    // An authenticated run: an agent JWT is minted for one run.
+    return { type: "agent", companyId, agentId, runId, source: "agent_jwt" };
   }
 
   function boardActor(companyId: string): Express.Request["actor"] {
@@ -848,6 +850,207 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     const result = await heartbeat.sweepStaleIssueLocks();
     expect(result.terminalizedRunIds).toContain(writerRunId);
     await expectWakePromoted(issueId, writerAgentId, writerRunId, wakeId);
+  });
+
+  async function seedCreateDoor() {
+    const seeded = await seed();
+    await db.insert(companyMemberships).values({
+      companyId: seeded.companyId,
+      principalType: "user",
+      principalId: "board-user",
+      status: "active",
+      membershipRole: "operator",
+    });
+    return seeded;
+  }
+
+  async function expectNoCreatedHolder(companyId: string, issueId: string, forgedRunId: string) {
+    const [card] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(card!.originRunId).not.toBe(forgedRunId);
+    expect(await findLiveIssueExecutionHolder(db, companyId, issueId)).toBeNull();
+  }
+
+  it("a board session create naming a hung victim run does not forge the origin proof", async () => {
+    const { companyId, writerAgentId, writerRunId } = await seedCreateDoor();
+    const res = await request(authApp({
+      deploymentMode: "authenticated",
+      resolveSession: async () => ({
+        session: { id: "session-1", userId: "board-user" },
+        user: { id: "board-user", name: "Board", email: "board@example.com" },
+      }),
+    }))
+      .post(`/api/companies/${companyId}/issues`)
+      .set("x-paperclip-run-id", writerRunId)
+      .send({ title: "Forged create", status: "in_progress", assigneeAgentId: writerAgentId });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    await expectNoCreatedHolder(companyId, res.body.id as string, writerRunId);
+  });
+
+  it("a local_trusted create naming a hung victim run does not forge the origin proof", async () => {
+    const { companyId, writerAgentId, writerRunId } = await seedCreateDoor();
+    const res = await request(authApp({ deploymentMode: "local_trusted" }))
+      .post(`/api/companies/${companyId}/issues`)
+      .set("x-paperclip-run-id", writerRunId)
+      .send({ title: "Forged create", status: "in_progress", assigneeAgentId: writerAgentId });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    await expectNoCreatedHolder(companyId, res.body.id as string, writerRunId);
+  });
+
+  it("a board API key create naming a hung victim run does not forge the origin proof", async () => {
+    const { companyId, writerAgentId, writerRunId } = await seedCreateDoor();
+    await db.insert(authUsers).values({
+      id: "board-key-user", name: "Board Key", email: "key@example.com", createdAt: new Date(), updatedAt: new Date(),
+    });
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: "board-key-user", status: "active", membershipRole: "operator",
+    });
+    const token = `board-key-${randomUUID()}`;
+    await db.insert(boardApiKeys).values({
+      userId: "board-key-user",
+      name: "forge-test",
+      keyHash: createHash("sha256").update(token).digest("hex"),
+    });
+    const res = await request(authApp({ deploymentMode: "authenticated", resolveSession: async () => null }))
+      .post(`/api/companies/${companyId}/issues`)
+      .set("authorization", `Bearer ${token}`)
+      .set("x-paperclip-run-id", writerRunId)
+      .send({ title: "Forged create", status: "in_progress", assigneeAgentId: writerAgentId });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    await expectNoCreatedHolder(companyId, res.body.id as string, writerRunId);
+  });
+
+  it("an agent API key create naming another running run of the same agent does not forge the origin proof", async () => {
+    const { companyId, writerAgentId, writerRunId } = await seedCreateDoor();
+    await db.insert(authUsers).values({
+      id: "responsible-user", name: "Responsible", email: "responsible@example.com", createdAt: new Date(), updatedAt: new Date(),
+    });
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "operator",
+    });
+    const token = `forge-test-${randomUUID()}`;
+    await db.insert(agentApiKeys).values({
+      companyId,
+      agentId: writerAgentId,
+      name: "forge-test",
+      keyHash: createHash("sha256").update(token).digest("hex"),
+      responsibleUserId: "responsible-user",
+    });
+    const res = await request(authApp({ deploymentMode: "authenticated", resolveSession: async () => null }))
+      .post(`/api/companies/${companyId}/issues`)
+      .set("authorization", `Bearer ${token}`)
+      .set("x-paperclip-run-id", writerRunId)
+      .send({ title: "Forged create", status: "in_progress", assigneeAgentId: writerAgentId });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    await expectNoCreatedHolder(companyId, res.body.id as string, writerRunId);
+  });
+
+  it("a board round trip away and back does not revive the origin proof", async () => {
+    const { companyId, writerAgentId, peerAgentId, writerRunId } = await seed();
+    const writer = appFor(agentActor(companyId, writerAgentId, writerRunId));
+    const created = await request(writer)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Round trip card", status: "in_progress", assigneeAgentId: writerAgentId });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    const issueId = created.body.id as string;
+    const board = appFor(boardActor(companyId));
+    const away = await request(board).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: peerAgentId });
+    expect(away.status, JSON.stringify(away.body)).toBe(200);
+    const back = await request(board).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: writerAgentId });
+    expect(back.status, JSON.stringify(back.body)).toBe(200);
+
+    await heartbeat.wakeup(writerAgentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "board_wake",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "board_wake" },
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+    });
+    await sleep(WAKE_SETTLE_MS);
+    const wakes = await wakesForCard(issueId, writerAgentId);
+    expect(wakes.map((wake) => wake.status)).not.toContain("deferred_issue_execution");
+    expect((await cardRow(issueId)).executionRunId).not.toBe(writerRunId);
+  });
+
+  it("a comment-joined non-terminal status update promotes the held wake when it clears the lock", async () => {
+    const { companyId, writerAgentId, writerRunId } = await seed();
+    const writer = appFor(agentActor(companyId, writerAgentId, writerRunId));
+    const created = await request(writer)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Comment-joined clear", status: "in_progress", assigneeAgentId: writerAgentId });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    const issueId = created.body.id as string;
+    const comment = await request(appFor(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Board follow-up." });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+    await expectAuthorKeepsCard(issueId, writerAgentId, writerRunId);
+
+    const patch = await request(writer).patch(`/api/issues/${issueId}`).send({ status: "todo", comment: "Parking this card." });
+    expect(patch.status, JSON.stringify(patch.body)).toBe(200);
+    // The clear promotes through the post-commit list: while the author is
+    // fresh it re-holds, so the stamp is restored rather than the wake lost.
+    await vi.waitFor(
+      async () => {
+        expect((await cardRow(issueId)).executionRunId).toBe(writerRunId);
+      },
+      { timeout: WAKE_SETTLE_MS * 2, interval: 50 },
+    );
+
+    // After the author goes silent past the bound, the sweep lapses the stamp
+    // and promotes the wake instead of stranding it.
+    const staleAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await db.update(heartbeatRuns)
+      .set({ startedAt: staleAt, createdAt: staleAt, lastOutputAt: null })
+      .where(eq(heartbeatRuns.id, writerRunId));
+    const swept = await heartbeat.sweepStaleIssueLocks();
+    expect(swept.cleared).toBe(1);
+    expect(await otherRunsForCard(issueId, writerAgentId, writerRunId)).toHaveLength(1);
+    const wakes = await wakesForCard(issueId, writerAgentId);
+    expect(wakes.map((wake) => wake.status)).not.toContain("deferred_issue_execution");
+  });
+
+  it("a board reassign does not cancel the adopted issue-less author run", async () => {
+    const { companyId, writerAgentId, peerAgentId, writerRunId } = await seed();
+    const writer = appFor(agentActor(companyId, writerAgentId, writerRunId));
+    const created = await request(writer)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Adopted stamp card", status: "in_progress", assigneeAgentId: writerAgentId });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    const issueId = created.body.id as string;
+    const comment = await request(appFor(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Board follow-up." });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+    await expectAuthorKeepsCard(issueId, writerAgentId, writerRunId);
+
+    const reassign = await request(appFor(boardActor(companyId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ assigneeAgentId: peerAgentId });
+    expect(reassign.status, JSON.stringify(reassign.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, writerRunId));
+    expect(run!.status).toBe("running");
+  });
+
+  it("the author's own cancel does not cancel the adopted issue-less author run", async () => {
+    const { companyId, writerAgentId, writerRunId } = await seed();
+    const writer = appFor(agentActor(companyId, writerAgentId, writerRunId));
+    const created = await request(writer)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Adopted stamp cancel", status: "in_progress", assigneeAgentId: writerAgentId });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    const issueId = created.body.id as string;
+    const comment = await request(appFor(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Board follow-up." });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+    await expectAuthorKeepsCard(issueId, writerAgentId, writerRunId);
+
+    const cancel = await request(writer).patch(`/api/issues/${issueId}`).send({ status: "cancelled" });
+    expect(cancel.status, JSON.stringify(cancel.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, writerRunId));
+    expect(run!.status).toBe("running");
   });
 
   it("a local_trusted request with only a run header does not forge the proof", async () => {

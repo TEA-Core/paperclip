@@ -221,10 +221,12 @@ issue release, or an admin force-release clears the lock. The stale-lock sweep
 also lapses a stamped hold whose author has produced no output for 90 minutes
 while a wake is held behind it; a run with recent output never lapses there.
 Only an authenticated run claim is recorded on an `issue.updated` activity
-row: an agent JWT is minted for one run, while a board request or an agent API
-key can only claim a run through an unauthenticated header, which is never
-copied into an `issue.updated` row's `run_id`. Other actions keep their
-attribution. Wakes
+row or as a card's `originRunId`: an agent JWT is minted for one run, while a
+board request or an agent API key can only claim a run through an
+unauthenticated header, which is never copied into either proof. Other
+actions keep their attribution. A reassignment drops `originRunId`; a later
+self-assign proves itself through its assignee-change row. An adopted stamp
+never makes the issue-less author the card's interruptible run. Wakes
 for a different agent, and wakes after the run has finished, start normally. A
 run whose context names a different issue does not own the cards it creates or
 assigns.

@@ -11465,7 +11465,7 @@ export function issueService(
         const values = {
           ...issueData,
           titleNeedsGeneration,
-          originRunId: issueData.originRunId ?? actorRunId ?? null,
+          originRunId: issueData.originRunId !== undefined ? issueData.originRunId : (actorRunId ?? null),
           responsibleUserId,
           requestDepth: clampIssueRequestDepth(issueData.requestDepth),
           originKind: issueData.originKind ?? "manual",
@@ -12205,6 +12205,14 @@ export function issueService(
         issueData.assigneeAgentId !== undefined
           ? issueData.assigneeAgentId
           : existing.assigneeAgentId;
+      // A reassignment drops the creation proof: a later self-assign by a run
+      // proves itself through its assignee-change activity row instead.
+      if (
+        issueData.assigneeAgentId !== undefined &&
+        issueData.assigneeAgentId !== existing.assigneeAgentId
+      ) {
+        patch.originRunId = null;
+      }
       const nextAssigneeUserId =
         issueData.assigneeUserId !== undefined
           ? issueData.assigneeUserId

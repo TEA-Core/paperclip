@@ -9941,10 +9941,27 @@ export function issueRoutes(
     id: string;
     assigneeAgentId: string | null;
     executionRunId?: string | null;
+    checkoutRunId?: string | null;
   }) {
     let runToInterrupt = issue.executionRunId
       ? await heartbeat.getRun(issue.executionRunId)
       : null;
+
+    // An issue-less author run adopted through the SUP-20121 stamp is not the
+    // card's own run: its context names no issue (the adoption stamps both
+    // pointers), so it must never become the interruptible run for this card.
+    // Only a stamped run whose context names this card is the card's run.
+    if (runToInterrupt) {
+      const stampedIssueId =
+        runToInterrupt.contextSnapshot &&
+        typeof runToInterrupt.contextSnapshot === "object" &&
+        typeof (runToInterrupt.contextSnapshot as Record<string, unknown>).issueId === "string"
+          ? ((runToInterrupt.contextSnapshot as Record<string, unknown>).issueId as string)
+          : null;
+      if (stampedIssueId !== issue.id) {
+        runToInterrupt = null;
+      }
+    }
 
     if (
       (!runToInterrupt || runToInterrupt.status !== "running") &&
@@ -17468,7 +17485,11 @@ export function issueRoutes(
         projectId: createAssignmentScope.projectId,
         ...(taskBridgeOriginForActor(req) ?? {}),
         id: issueId,
-        originRunId: createBody.originRunId ?? actor.runId,
+        // originRunId is ownership proof: only an authenticated agent run
+        // (an agent JWT is minted for one run) may stamp it. A board request
+        // or an agent API key can only claim a run through an unauthenticated
+        // header, which is never copied into originRunId.
+        originRunId: createBody.originRunId ?? (actor.actorType === "agent" && actor.actorSource === "agent_jwt" ? actor.runId : null),
         originIdentityContextId: req.actor.identityContextId ?? null,
         executionPolicy,
         ...(sourceTrust ? { sourceTrust } : {}),
@@ -21124,7 +21145,7 @@ export function issueRoutes(
         }
         return shouldCollectTerminalIssueActions
           ? svc.update(id, issueUpdateData, tx, undefined, postCommitIssueActions)
-          : svc.update(id, issueUpdateData, tx);
+          : svc.update(id, issueUpdateData, tx, undefined, postCommitIssueActions);
       }
       return shouldCollectCompletionPublication
         ? svc.update(id, issueUpdateData, db, postCommitActivityPublications)
