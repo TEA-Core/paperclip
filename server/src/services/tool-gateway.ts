@@ -7636,6 +7636,21 @@ export function createToolGatewayService(
   function replayedInvocationFailure(
     invocation: typeof toolInvocations.$inferSelect,
   ): ToolGatewayHttpError {
+    // The provider is still waiting on its authorization/approval: replay the
+    // same 409 handoff the action-request replay returns, not a bare failure.
+    if (invocation.errorCode === "provider_interaction_required") {
+      return new ToolGatewayHttpError(
+        409,
+        "The provider is waiting for authorization or approval. Continue the existing execution; do not repeat the original call.",
+        "provider_interaction_required",
+        {
+          invocationId: invocation.id,
+          replayed: true,
+          originalStatus: invocation.status,
+          upstreamPending: recoverUpstreamHandoff(invocation),
+        },
+      );
+    }
     const status =
       invocation.status === "timed_out" ? 504
         : invocation.status === "rate_limited" ? 429
@@ -7662,6 +7677,17 @@ export function createToolGatewayService(
       || invocation.status === "denied"
       || invocation.status === "rate_limited"
     );
+  }
+
+  /**
+   * The stored outcome of a settled approved action: its result, or its
+   * persisted failure. A failed invocation never replays as a null result.
+   */
+  function replayStoredInvocation(
+    invocation: typeof toolInvocations.$inferSelect,
+  ): unknown {
+    if (isReplayableFailure(invocation)) throw replayedInvocationFailure(invocation);
+    return storedInvocationResult(invocation);
   }
 
   async function actionRequestResolution(
@@ -7927,7 +7953,7 @@ export function createToolGatewayService(
         .where(eq(toolInvocations.id, invocation.id))
         .limit(1);
       if (settled?.status === "executed" && settledInvocation) {
-        return storedInvocationResult(settledInvocation);
+        return replayStoredInvocation(settledInvocation);
       }
       if (settled?.status === "failed") {
         throw new ToolGatewayHttpError(
@@ -8391,15 +8417,9 @@ export function createToolGatewayService(
       );
     }
     if (actionRequest.status === "executed") {
-      // An approved action request can only reach "executed" after the
-      // invocation completed; if that invocation nonetheless failed, surface
-      // the persisted failure instead of replaying a success-shaped null.
-      if (isReplayableFailure(invocation)) {
-        throw replayedInvocationFailure(invocation);
-      }
       return {
         matched: true as const,
-        result: storedInvocationResult(invocation),
+        result: replayStoredInvocation(invocation),
         invocationId: invocation.id,
       };
     }
@@ -8413,7 +8433,7 @@ export function createToolGatewayService(
       if (settled?.status === "executed" && settledInvocation) {
         return {
           matched: true as const,
-          result: storedInvocationResult(settledInvocation),
+          result: replayStoredInvocation(settledInvocation),
           invocationId: invocation.id,
         };
       }
@@ -10590,16 +10610,10 @@ export function createToolGatewayService(
           ? await claimSlackRateLimitRetry(db, { companyId: session.companyId, agentId: session.agentId, runId: session.runId, issueId: session.issueId, endpointId: String(asRecord(tool.providerMetadata)?.endpointId ?? ""), identityContextId: session.identityContextId }, invocationId)
           : false;
         if (recorded.replayed && !retryingSlackRateLimit) {
-          // Slack connector replays ride the chat-action lifecycle (rate-limit
-          // retry windows, uncertain-delivery reconciliation) and must keep
-          // resolving with the stored outcome; every other replayed failure
-          // surfaces explicitly instead of a success-shaped result.
-          const slackConnectorReplay =
-            tool.providerType === "paperclip_slack_chat";
-          if (
-            isReplayableFailure(recorded.invocation)
-            && !slackConnectorReplay
-          ) {
+          // A replayed failure surfaces explicitly instead of a success-shaped
+          // result. A Slack rate-limit retry past its deadline was claimed
+          // above and re-executes instead of replaying.
+          if (isReplayableFailure(recorded.invocation)) {
             const replayFailure = replayedInvocationFailure(recorded.invocation);
             await writeAudit({
               session,

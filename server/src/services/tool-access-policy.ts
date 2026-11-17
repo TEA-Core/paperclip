@@ -77,6 +77,12 @@ type ToolAccessContext = {
 type RedactionResult = {
   summary: ToolRedactedValueSummary;
   redactionPlan: { redactedFieldCount: number; redactedFields: string[] };
+  /**
+   * Hash of the display-truncated arguments (strings cut at 500 characters,
+   * arrays at 50 items): the argumentsHash earlier builds persisted. Equal to
+   * `summary.sha256` whenever nothing was truncated.
+   */
+  legacyArgumentsHash: string;
 };
 
 type PolicyConditionEvaluation = {
@@ -242,6 +248,28 @@ function sideEffectIdempotencyKey(ctx: ToolAccessContext, argumentsHash: string)
   })}`;
 }
 
+/**
+ * How long a derived-key retry of a failed side-effecting call replays the
+ * persisted failure. Afterwards an identical retry is recorded, authorized,
+ * and executed as a new invocation, so a transient failure is not permanently
+ * unretryable for the rest of the run.
+ */
+const SIDE_EFFECT_FAILURE_REPLAY_WINDOW_MS = 5 * 60_000;
+
+/** Rows recorded before this moment may carry a pre-upgrade argument hash. */
+const PROCESS_STARTED_AT_MS = Date.now();
+
+function failureReplayExpired(invocation: typeof toolInvocations.$inferSelect, now = Date.now()): boolean {
+  // timed_out: the side effect may have landed, so never re-execute it.
+  if (!["failed", "denied", "rate_limited", "cancelled"].includes(invocation.status)) return false;
+  // The provider handoff continues the original execution; keep replaying it.
+  if (invocation.errorCode === "provider_interaction_required") return false;
+  // Slack retries ride their own lifecycle (rate-limit claim, delivery check).
+  if (invocation.providerType === "paperclip_slack_chat") return false;
+  const settledAt = invocation.completedAt ?? invocation.updatedAt;
+  return now - settledAt.getTime() >= SIDE_EFFECT_FAILURE_REPLAY_WINDOW_MS;
+}
+
 function auditOutcome(accessDecision: ToolAccessDecision): "pending" | "success" | "denied" | "timeout" {
   if (accessDecision.decision === "allow") return "success";
   if (accessDecision.decision === "require_approval") return "pending";
@@ -251,7 +279,7 @@ function auditOutcome(accessDecision: ToolAccessDecision): "pending" | "success"
 
 function summarizeAndRedact(value: unknown): RedactionResult {
   const redactedFields: string[] = [];
-  const visit = (current: unknown, path: string, depth = 0): unknown => {
+  const visit = (current: unknown, path: string): unknown => {
     if (typeof current === "string") {
       if (SECRET_VALUE_RE.test(current)) {
         redactedFields.push(path || "$");
@@ -259,12 +287,8 @@ function summarizeAndRedact(value: unknown): RedactionResult {
       }
       return current;
     }
-    if (Array.isArray(current)) return current.map((entry, index) => visit(entry, `${path}[${index}]`, depth + 1));
+    if (Array.isArray(current)) return current.map((entry, index) => visit(entry, `${path}[${index}]`));
     if (!isRecord(current)) return current;
-    if (depth >= 25) {
-      redactedFields.push(path || "$");
-      return "[DEPTH_LIMIT]";
-    }
     const out: Record<string, unknown> = {};
     for (const [key, nested] of Object.entries(current)) {
       const nestedPath = path ? `${path}.${key}` : key;
@@ -272,7 +296,7 @@ function summarizeAndRedact(value: unknown): RedactionResult {
         redactedFields.push(nestedPath);
         out[key] = "[REDACTED]";
       } else {
-        out[key] = visit(nested, nestedPath, depth + 1);
+        out[key] = visit(nested, nestedPath);
       }
     }
     return out;
@@ -301,6 +325,7 @@ function summarizeAndRedact(value: unknown): RedactionResult {
       redactedFieldCount: redactedFields.length,
       redactedFields,
     },
+    legacyArgumentsHash: createHash("sha256").update(displayText).digest("hex"),
   };
 }
 
@@ -1455,19 +1480,56 @@ export function toolAccessPolicyService(db: Db) {
     }
   }
 
+  async function invocationByIdempotencyKey(companyId: string, idempotencyKey: string) {
+    const [existing] = await db.select().from(toolInvocations).where(and(
+      eq(toolInvocations.companyId, companyId),
+      eq(toolInvocations.idempotencyKey, idempotencyKey),
+    ));
+    return existing ?? null;
+  }
+
   async function recordInvocation(input: ToolAccessDecisionInput, accessDecision: ToolAccessDecision) {
     const loaded = await loadContext(input);
     if (!loaded.ok) throw new Error("Cannot record invocation for invalid tool access context");
     const { ctx, redaction } = loaded;
     const argumentsHash = redaction.summary.sha256 ?? sha256(input.request.arguments ?? {});
+    const derivedKey = input.request.idempotencyKey == null && Boolean(input.request.sideEffecting);
     const idempotencyKey = input.request.idempotencyKey
-      ?? (input.request.sideEffecting ? sideEffectIdempotencyKey(ctx, argumentsHash) : null);
+      ?? (derivedKey ? sideEffectIdempotencyKey(ctx, argumentsHash) : null);
     if (idempotencyKey) {
-      const [existing] = await db.select().from(toolInvocations).where(and(
-        eq(toolInvocations.companyId, input.companyId),
-        eq(toolInvocations.idempotencyKey, idempotencyKey),
-      ));
-      if (existing) return { invocation: existing, replayed: true, actionRequest: null };
+      const existing = await invocationByIdempotencyKey(input.companyId, idempotencyKey);
+      if (existing && !(derivedKey && failureReplayExpired(existing))) {
+        return { invocation: existing, replayed: true, actionRequest: null };
+      }
+      if (existing) {
+        // Release the derived key from the expired failure so this retry
+        // records (and is authorized as) a fresh invocation. A concurrent
+        // retry that released it first owns the key: replay its row.
+        const [released] = await db.update(toolInvocations)
+          .set({ idempotencyKey: null, updatedAt: new Date() })
+          .where(and(eq(toolInvocations.id, existing.id), eq(toolInvocations.idempotencyKey, idempotencyKey)))
+          .returning({ id: toolInvocations.id });
+        const winner = released ? null : await invocationByIdempotencyKey(input.companyId, idempotencyKey);
+        if (winner) return { invocation: winner, replayed: true, actionRequest: null };
+      }
+    }
+    if (derivedKey && redaction.legacyArgumentsHash !== argumentsHash) {
+      // Builds before full-argument hashing derived this key from truncated
+      // arguments. A row under that key cannot prove it recorded these exact
+      // arguments, so neither replay it (a different tail would get another
+      // call's outcome) nor re-execute (a true retry would repeat the side
+      // effect). Only rows recorded before this process started can be such
+      // rows: a row this process wrote under the same key is an exact
+      // full-argument match for other arguments (an array of exactly 50
+      // items). The key is run-scoped, so this ends with the runs that
+      // spanned the upgrade.
+      const legacy = await invocationByIdempotencyKey(input.companyId, sideEffectIdempotencyKey(ctx, redaction.legacyArgumentsHash));
+      if (legacy && legacy.createdAt.getTime() < PROCESS_STARTED_AT_MS && !failureReplayExpired(legacy)) {
+        throw conflict(
+          "A call with these arguments was recorded before argument hashing changed and cannot be matched exactly; it was neither replayed nor executed again.",
+          { reasonCode: "tool_invocation_replay_ambiguous", invocationId: legacy.id },
+        );
+      }
     }
     const status = accessDecision.decision === "allow"
       ? "authorized"

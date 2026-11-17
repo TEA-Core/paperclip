@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -1335,6 +1335,52 @@ describeEmbeddedPostgres("tool access policy service", () => {
     expect(trustConfig.trustRule?.lastHitAt).toEqual(expect.any(String));
     expect(trustEvents.some((event) => event.eventType === "trust_rule_created")).toBe(true);
     expect(trustEvents.some((event) => event.eventType === "trust_rule_used")).toBe(true);
+  });
+
+  it("matches pinned trust-rule hashes on the full arguments and never on the pre-upgrade truncated hash", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { connection, catalogEntry } = await createTool(db, company.id);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review send_email",
+      policyType: "require_approval",
+      selectors: { toolName: "send_email" },
+      priority: 10,
+    });
+    const hashOf = (value: Record<string, string>) =>
+      createHash("sha256").update(`{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${JSON.stringify(value[key])}`).join(",")}}`).digest("hex");
+    const longArgs = { to: "ops@example.com", body: `release notes ${"y".repeat(900)}` };
+    const shortArgs = { to: "ops@example.com", body: "ship it" };
+    // Earlier builds hashed display-truncated arguments: strings over 500
+    // characters were cut before hashing, so long calls shared one hash.
+    const legacyLongHash = hashOf({ ...longArgs, body: `${longArgs.body.slice(0, 500)}...[truncated]` });
+    const [rule] = await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Pinned remembered sends",
+      policyType: "trust_rule",
+      selectors: { toolName: "send_email" },
+      priority: 1,
+      config: { trustRule: { argumentFilters: { allowedHashes: [legacyLongHash, hashOf(shortArgs)] } } },
+    }).returning();
+    const decide = (argumentsValue: Record<string, string>) => toolAccessPolicyService(db).decide({
+      companyId: company.id,
+      actor: { actorType: "agent", actorId: agent.id, agentId: agent.id },
+      request: { connectionId: connection.id, catalogEntryId: catalogEntry.id, toolName: "send_email", arguments: argumentsValue },
+    });
+
+    // A hash pinned before the upgrade fails closed for long arguments: the
+    // call falls back to review instead of matching a truncated prefix.
+    await expect(decide(longArgs)).resolves.toMatchObject({ allowed: false, decision: "require_approval" });
+    await expect(decide({ ...longArgs, body: `${longArgs.body} different tail` })).resolves.toMatchObject({ decision: "require_approval" });
+    // Short arguments hash identically before and after the upgrade.
+    await expect(decide(shortArgs)).resolves.toMatchObject({ allowed: true, reasonCode: "allow_trust_rule", matchedPolicyIds: [rule!.id] });
+
+    await db.update(toolPolicies).set({
+      config: { trustRule: { argumentFilters: { exactHash: hashOf(longArgs) } } },
+    }).where(eq(toolPolicies.id, rule!.id));
+    await expect(decide(longArgs)).resolves.toMatchObject({ allowed: true, reasonCode: "allow_trust_rule" });
+    await expect(decide({ ...longArgs, body: `${longArgs.body} different tail` })).resolves.toMatchObject({ decision: "require_approval" });
   });
 
   it("does not count approved actions outside the final trust-rule agent scope", async () => {

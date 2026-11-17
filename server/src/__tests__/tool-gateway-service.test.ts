@@ -555,6 +555,118 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(await db.select().from(toolCallEvents).where(eq(toolCallEvents.reasonCode, "approved_action_executed"))).toHaveLength(0);
   });
 
+  it("surfaces a failed invocation, not a replayed null result, when a waited-on approved execution settles", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Ask first", policyType: "require_approval", selectors: { toolName: "mcp-remote-fixture:update_note" } });
+    let waiting!: () => void;
+    const waitingSignal = new Promise<void>((resolve) => {
+      waiting = resolve;
+    });
+    // Signal once the retry polls the executing request, so the request
+    // settles while the retry is already on the executing-wait path.
+    const observedDb = new Proxy(db, {
+      get(target, prop) {
+        if (prop === "select") {
+          return (fields?: Parameters<typeof target.select>[0]) => {
+            if (fields && "invocationStatus" in fields) waiting();
+            return fields ? target.select(fields) : target.select();
+          };
+        }
+        const value: unknown = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const gateway = createTestToolGatewayService(observedDb);
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const call = () => gateway.executeTool({ sessionToken: session.token, tool: "mcp-remote-fixture:update_note", parameters: { noteId: "settles-failed" } });
+    await expect(call()).rejects.toMatchObject({ reasonCode: "approval_required" });
+    const [pending] = await db.select().from(toolActionRequests);
+    await commitToolActionReview(db, { companyId: company.id, actionRequestId: pending!.id, decision: "approved", actor: { userId: "reviewer" } });
+    const executingAt = new Date();
+    await db.update(toolActionRequests).set({ status: "executing", updatedAt: executingAt }).where(eq(toolActionRequests.id, pending!.id));
+    await db.update(toolInvocations).set({ status: "executing", startedAt: executingAt }).where(eq(toolInvocations.id, pending!.invocationId));
+
+    const retry = call().then((value) => ({ value }), (error: unknown) => ({ error }));
+    await waitingSignal;
+    const settledAt = new Date();
+    await db.update(toolInvocations).set({ status: "failed", errorCode: "tool_execution_failed", errorMessage: "upstream rejected the write", completedAt: settledAt }).where(eq(toolInvocations.id, pending!.invocationId));
+    await db.update(toolActionRequests).set({ status: "executed", resolvedAt: settledAt, updatedAt: settledAt }).where(eq(toolActionRequests.id, pending!.id));
+
+    expect(await retry).toMatchObject({
+      error: {
+        status: 502,
+        reasonCode: "tool_execution_failed",
+        message: "upstream rejected the write",
+        details: { invocationId: pending!.invocationId, replayed: true, originalStatus: "failed" },
+      },
+    });
+  });
+
+  it("surfaces a failed invocation when an approved retry loses the execution claim and the winner fails", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Ask first", policyType: "require_approval", selectors: { toolName: "mcp-remote-fixture:update_note" } });
+    let armed = false;
+    let claimLost!: () => void;
+    const claimLostSignal = new Promise<void>((resolve) => {
+      claimLost = resolve;
+    });
+    let pendingId = "";
+    // A concurrent executor wins the approved -> executing claim immediately
+    // before this retry's own claim runs, so the retry settles by waiting.
+    const racingDb = new Proxy(db, {
+      get(target, prop) {
+        if (prop === "update") {
+          return (table: Parameters<typeof target.update>[0]) => {
+            const builder = target.update(table);
+            if (!armed || table !== toolActionRequests) return builder;
+            return {
+              set: (values: Parameters<typeof builder.set>[0]) => {
+                if (values.status !== "executing") return builder.set(values);
+                armed = false;
+                return {
+                  where: (condition: Parameters<ReturnType<typeof builder.set>["where"]>[0]) => ({
+                    returning: async () => {
+                      const wonAt = new Date();
+                      await target.update(toolActionRequests).set({ status: "executing", updatedAt: wonAt }).where(eq(toolActionRequests.id, pendingId));
+                      const lost = await builder.set(values).where(condition).returning();
+                      claimLost();
+                      return lost;
+                    },
+                  }),
+                };
+              },
+            };
+          };
+        }
+        const value: unknown = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const gateway = createTestToolGatewayService(racingDb);
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const call = () => gateway.executeTool({ sessionToken: session.token, tool: "mcp-remote-fixture:update_note", parameters: { noteId: "claim-lost" } });
+    await expect(call()).rejects.toMatchObject({ reasonCode: "approval_required" });
+    const [pending] = await db.select().from(toolActionRequests);
+    pendingId = pending!.id;
+    await commitToolActionReview(db, { companyId: company.id, actionRequestId: pending!.id, decision: "approved", actor: { userId: "reviewer" } });
+
+    armed = true;
+    const retry = call().then((value) => ({ value }), (error: unknown) => ({ error }));
+    await claimLostSignal;
+    const settledAt = new Date();
+    await db.update(toolInvocations).set({ status: "failed", errorCode: "tool_execution_failed", errorMessage: "winner failed upstream", completedAt: settledAt }).where(eq(toolInvocations.id, pending!.invocationId));
+    await db.update(toolActionRequests).set({ status: "executed", resolvedAt: settledAt, updatedAt: settledAt }).where(eq(toolActionRequests.id, pending!.id));
+
+    expect(await retry).toMatchObject({
+      error: {
+        status: 502,
+        reasonCode: "tool_execution_failed",
+        message: "winner failed upstream",
+        details: { invocationId: pending!.invocationId, replayed: true, originalStatus: "failed" },
+      },
+    });
+  });
+
   it("remembers a read action atomically, allows changed arguments, and preserves explicit denials and definition review", async () => {
     const { company, agent, issue, run } = await createRunFixture(db);
     const [project] = await db.insert(projects).values({ companyId: company.id, name: "Reviewed project" }).returning();

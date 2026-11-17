@@ -1,3 +1,4 @@
+import { eq } from "drizzle-orm";
 import { createHash, randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
@@ -162,6 +163,41 @@ async function createAgentFixture(db: TestDb, permissions: Record<string, unknow
     .returning()
     .then((rows) => rows[0]!);
   return { company, agent, issue, run };
+}
+
+// Mirrors the gateway's canonical JSON and side-effect key derivation so a
+// test can seed an invocation row exactly as an earlier server build wrote it.
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (!value || typeof value !== "object") return JSON.stringify(value);
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(",")}}`;
+}
+
+function sha256Hex(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+function sideEffectKeyFor(row: typeof toolInvocations.$inferSelect, argumentsHash: string): string {
+  return `side_effect:${sha256Hex(stableStringify({
+    companyId: row.companyId,
+    runId: row.runId,
+    issueId: row.issueId,
+    applicationId: row.applicationId,
+    connectionId: row.connectionId,
+    catalogEntryId: row.catalogEntryId,
+    toolName: row.toolName,
+    argumentsHash,
+  }))}`;
+}
+
+async function rejectionOf(promise: Promise<unknown>): Promise<ToolGatewayHttpError & { details: Record<string, unknown> }> {
+  return promise.then(
+    () => {
+      throw new Error("Expected the call to reject");
+    },
+    (caught) => caught as ToolGatewayHttpError & { details: Record<string, unknown> },
+  );
 }
 
 // Both plugin tools must be permitted by generic policy so the only thing
@@ -751,5 +787,245 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
       errorCode: "tool_execution_failed",
       errorMessage: "plugin exploded on first attempt",
     });
+  });
+
+  it("does not replay a side-effecting plugin execute when arguments differ only below nesting depth 25", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const dispatcher = twoPluginDispatcher();
+    let dispatchAttempts = 0;
+    const gateway = createToolGatewayService(db, {
+      pluginToolDispatcher: {
+        ...dispatcher,
+        executeTool: async (tool, parameters, runContext) => {
+          dispatchAttempts += 1;
+          return dispatcher.executeTool(tool, parameters, runContext);
+        },
+      },
+    });
+    const nested = (leaf: string) => {
+      let value: Record<string, unknown> = { leaf };
+      for (let depth = 0; depth < 30; depth += 1) value = { next: value };
+      return value;
+    };
+    const base = {
+      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: "a.b:wiki_append_log",
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+    };
+
+    await gateway.executePluginTool({ ...base, parameters: { path: "log/index.md", content: "entry", tree: nested("first") } });
+    await gateway.executePluginTool({ ...base, parameters: { path: "log/index.md", content: "entry", tree: nested("second") } });
+
+    expect(dispatchAttempts).toBe(2);
+    const invocations = await db.select().from(toolInvocations);
+    expect(invocations).toHaveLength(2);
+    expect(new Set(invocations.map((row) => row.argumentsHash)).size).toBe(2);
+  });
+
+  it("scopes side-effect replay to the run: identical arguments in another run of the same agent execute again", async () => {
+    const { company, agent, issue, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const [otherRun] = await db.insert(heartbeatRuns).values({
+      companyId: company.id,
+      agentId: agent.id,
+      invocationSource: "assignment",
+      status: "running",
+      contextSnapshot: { issueId: issue.id },
+    }).returning();
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+    const call = (runId: string) => gateway.executePluginTool({
+      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId },
+      tool: "a.b:wiki_append_log",
+      parameters: { path: "log/index.md", content: "same entry" },
+      runContext: { companyId: company.id, agentId: agent.id, runId, projectId: "" },
+    });
+
+    await call(run.id);
+    await call(otherRun!.id);
+
+    const invocations = await db.select().from(toolInvocations);
+    expect(invocations).toHaveLength(2);
+    expect(new Set(invocations.map((row) => row.runId))).toEqual(new Set([run.id, otherRun!.id]));
+  });
+
+  it("refuses, rather than re-executes, a same-run retry whose prior record carries the pre-upgrade argument hash key", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const dispatcher = twoPluginDispatcher();
+    let dispatchAttempts = 0;
+    const gateway = createToolGatewayService(db, {
+      pluginToolDispatcher: {
+        ...dispatcher,
+        executeTool: async (tool, parameters, runContext) => {
+          dispatchAttempts += 1;
+          return dispatcher.executeTool(tool, parameters, runContext);
+        },
+      },
+    });
+    const parameters = { path: "log/index.md", content: `entry ${"x".repeat(1200)}` };
+    const input = {
+      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: "a.b:wiki_append_log",
+      parameters,
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+    };
+
+    await gateway.executePluginTool(input);
+    const [row] = await db.select().from(toolInvocations);
+    expect(sideEffectKeyFor(row!, row!.argumentsHash!)).toBe(row!.idempotencyKey);
+    // Earlier builds hashed the display-truncated arguments (strings cut at
+    // 500 characters); rewrite the row as such a build recorded it.
+    const legacyHash = sha256Hex(stableStringify({
+      path: parameters.path,
+      content: `${parameters.content.slice(0, 500)}...[truncated]`,
+    }));
+    expect(legacyHash).not.toBe(row!.argumentsHash);
+    await db
+      .update(toolInvocations)
+      .set({
+        idempotencyKey: sideEffectKeyFor(row!, legacyHash),
+        argumentsHash: legacyHash,
+        createdAt: new Date(Date.now() - 60 * 60_000),
+      })
+      .where(eq(toolInvocations.id, row!.id));
+
+    const retryError = await rejectionOf(gateway.executePluginTool(input));
+
+    expect(retryError.status).toBe(409);
+    expect(retryError.details).toMatchObject({
+      reasonCode: "tool_invocation_replay_ambiguous",
+      invocationId: row!.id,
+    });
+    expect(dispatchAttempts).toBe(1);
+    expect(await db.select().from(toolInvocations)).toHaveLength(1);
+  });
+
+  it("executes a longer list after a 50-item list in the same run instead of treating it as a pre-upgrade record", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: twoPluginDispatcher() });
+    const call = (count: number) => gateway.executePluginTool({
+      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: "a.b:wiki_append_log",
+      parameters: { path: "log/index.md", entries: Array.from({ length: count }, (_, index) => `entry ${index}`) },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+    });
+
+    await call(50);
+    // Its first 50 items truncate to exactly the earlier call's arguments.
+    await expect(call(51)).resolves.toMatchObject({ pluginId: "plugin-a" });
+
+    expect(await db.select().from(toolInvocations)).toHaveLength(2);
+  });
+
+  it("replays a provider-interaction failure as 409 with the recovered handoff, never a bare 502", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const dispatcher = twoPluginDispatcher();
+    let dispatchAttempts = 0;
+    const gateway = createToolGatewayService(db, {
+      pluginToolDispatcher: {
+        ...dispatcher,
+        executeTool: async (tool, parameters, runContext) => {
+          dispatchAttempts += 1;
+          return dispatcher.executeTool(tool, parameters, runContext);
+        },
+      },
+    });
+    const input = {
+      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: "a.b:wiki_append_log",
+      parameters: { path: "log/index.md", content: "needs provider authorization" },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+    };
+    await gateway.executePluginTool(input);
+    const [row] = await db.select().from(toolInvocations);
+    const pendingSummary = JSON.stringify({
+      upstreamPending: { kind: "authorization", links: [], executionId: "exec-1", message: "Authorize the provider" },
+    });
+    // Long past any failure replay window: the handoff must still be replayed.
+    await db
+      .update(toolInvocations)
+      .set({
+        status: "failed",
+        errorCode: "provider_interaction_required",
+        errorMessage: "Complete the provider's authorization or approval before continuing.",
+        resultSummary: { summary: pendingSummary, sizeBytes: pendingSummary.length, sha256: sha256Hex(pendingSummary), redactedFields: [] },
+        completedAt: new Date(Date.now() - 24 * 60 * 60_000),
+      })
+      .where(eq(toolInvocations.id, row!.id));
+
+    const replayError = await rejectionOf(gateway.executePluginTool(input));
+
+    expect(replayError).toBeInstanceOf(ToolGatewayHttpError);
+    expect(replayError.status).toBe(409);
+    expect(replayError.reasonCode).toBe("provider_interaction_required");
+    expect(replayError.details).toMatchObject({
+      invocationId: row!.id,
+      replayed: true,
+      upstreamPending: { kind: "authorization", executionId: "exec-1", links: [] },
+    });
+    expect(dispatchAttempts).toBe(1);
+  });
+
+  it("bounds the replay of a failed side-effecting plugin execute, except an uncertain timeout", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const dispatcher = twoPluginDispatcher();
+    let dispatchAttempts = 0;
+    let crashed = false;
+    const gateway = createToolGatewayService(db, {
+      pluginToolDispatcher: {
+        ...dispatcher,
+        executeTool: async (tool, parameters, runContext) => {
+          dispatchAttempts += 1;
+          if (parameters && typeof parameters === "object" && "content" in parameters && parameters.content === "slow entry") {
+            throw new ToolGatewayHttpError(504, "plugin timed out", "tool_timeout");
+          }
+          if (!crashed) {
+            crashed = true;
+            throw new Error("transient plugin crash");
+          }
+          return dispatcher.executeTool(tool, parameters, runContext);
+        },
+      },
+    });
+    const callWith = (content: string) => gateway.executePluginTool({
+      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: "a.b:wiki_append_log",
+      parameters: { path: "log/index.md", content },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+    });
+
+    await expect(callWith("same entry")).rejects.toThrow("transient plugin crash");
+    expect((await rejectionOf(callWith("same entry"))).details).toMatchObject({ replayed: true });
+    expect(dispatchAttempts).toBe(1);
+
+    const [failed] = await db.select().from(toolInvocations);
+    const pastWindow = new Date(Date.now() - 6 * 60_000);
+    // A Slack invocation's retries belong to its own lifecycle: no expiry.
+    await db.update(toolInvocations).set({ completedAt: pastWindow, providerType: "paperclip_slack_chat" }).where(eq(toolInvocations.id, failed!.id));
+    expect((await rejectionOf(callWith("same entry"))).details).toMatchObject({ replayed: true, invocationId: failed!.id });
+    expect(dispatchAttempts).toBe(1);
+    await db.update(toolInvocations).set({ providerType: failed!.providerType }).where(eq(toolInvocations.id, failed!.id));
+
+    await expect(callWith("same entry")).resolves.toMatchObject({ pluginId: "plugin-a" });
+    expect(dispatchAttempts).toBe(2);
+    const afterRetry = await db.select().from(toolInvocations);
+    expect(afterRetry).toHaveLength(2);
+    expect(afterRetry.find((row) => row.id === failed!.id)).toMatchObject({ status: "failed", idempotencyKey: null });
+    expect(afterRetry.find((row) => row.id !== failed!.id)).toMatchObject({
+      status: "succeeded",
+      idempotencyKey: failed!.idempotencyKey,
+    });
+
+    await expect(callWith("slow entry")).rejects.toThrow("plugin timed out");
+    const [timedOut] = await db.select().from(toolInvocations).where(eq(toolInvocations.status, "timed_out"));
+    await db.update(toolInvocations).set({ completedAt: pastWindow }).where(eq(toolInvocations.id, timedOut!.id));
+    const timedOutReplay = await rejectionOf(callWith("slow entry"));
+    expect(timedOutReplay.status).toBe(504);
+    expect(timedOutReplay.details).toMatchObject({ replayed: true, invocationId: timedOut!.id });
+    expect(dispatchAttempts).toBe(3);
   });
 });
