@@ -1037,6 +1037,8 @@ An expired legacy run records that provider work never started. Stranded-work re
 
 One pass expires at most 100 runs and reads at most 20 pages of 100 candidates, oldest first. Paging uses the stored `created_at` value and the run id, so runs that share one timestamp are read once. Runs past the bound that the pass does not reach wait for the next pass.
 
+Issues in `in_review` are not exempt. A queued approval, review, or wake run on an issue in review expires at the same 24-hour bound as any other queued run (owner decision 2026-11-17).
+
 The stale-lock sweep leaves native runs with their finalization coordinator while
 same-session recovery or accepted-result finalization is pending. A provider can
 exit before workspace copy-back, assessment, or arbitration completes. An expired

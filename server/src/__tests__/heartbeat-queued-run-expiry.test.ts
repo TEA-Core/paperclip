@@ -524,4 +524,68 @@ describeEmbeddedPostgres("heartbeat queued-run age bound", () => {
     expect((await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId)))[0]?.status)
       .toBe("in_progress");
   });
+
+  // Owner decision 2026-11-17: queued approval, review, and wake runs on an
+  // issue in review expire at the same 24-hour bound as any other queued run.
+  const IN_REVIEW_RUN_KINDS = [
+    { kind: "approval", wakeReason: "execution_approval_requested", byParticipant: true },
+    { kind: "review", wakeReason: "execution_review_requested", byParticipant: true },
+    { kind: "wake", wakeReason: "issue_commented", byParticipant: false },
+  ] as const;
+
+  async function seedInReviewQueuedRun(spec: (typeof IN_REVIEW_RUN_KINDS)[number], createdAt: Date) {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const participantAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: participantAgentId,
+      companyId,
+      name: "Reviewer",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const issueId = await seedIssue(companyId, agentId, 1);
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, issueId));
+    const runAgentId = spec.byParticipant ? participantAgentId : agentId;
+    const queued = await seedQueuedLockHolder({ companyId, agentId: runAgentId, issueId, createdAt });
+    await db.update(agentWakeupRequests)
+      .set({ source: "automation", reason: spec.wakeReason })
+      .where(eq(agentWakeupRequests.id, queued.wakeupRequestId));
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId, taskId: issueId, wakeReason: spec.wakeReason } })
+      .where(eq(heartbeatRuns.id, queued.runId));
+    return { issueId, runId: queued.runId };
+  }
+
+  it.each(IN_REVIEW_RUN_KINDS)(
+    "expires a queued $kind run on an in_review issue past the bound and releases its lock",
+    async (spec) => {
+      const { issueId, runId } = await seedInReviewQueuedRun(spec, new Date(Date.now() - QUEUED_RUN_BOUND_MS - HOUR_MS));
+
+      expect(await heartbeatService(db).expireStaleQueuedRuns())
+        .toEqual({ expired: 1, runIds: [runId], pageCapReached: false });
+      expect(await readRun(runId)).toMatchObject({ status: "cancelled", errorCode: "queued_run_expired" });
+      expect(await readIssueLock(issueId)).toEqual({ executionRunId: null, executionLockedAt: null, checkoutRunId: null });
+      const activity = await expiryActivityRows();
+      expect(activity).toHaveLength(1);
+      expect(activity[0]).toMatchObject({ entityId: runId, details: expect.objectContaining({ issueId }) });
+    },
+  );
+
+  it.each(IN_REVIEW_RUN_KINDS)(
+    "leaves a queued $kind run on an in_review issue inside the bound untouched",
+    async (spec) => {
+      const { issueId, runId } = await seedInReviewQueuedRun(spec, new Date(Date.now() - QUEUED_RUN_BOUND_MS + HOUR_MS));
+      const lockBefore = await readIssueLock(issueId);
+
+      expect(await heartbeatService(db).expireStaleQueuedRuns())
+        .toEqual({ expired: 0, runIds: [], pageCapReached: false });
+      expect((await readRun(runId)).status).toBe("queued");
+      expect(await readIssueLock(issueId)).toEqual(lockBefore);
+      expect(await expiryActivityRows()).toHaveLength(0);
+    },
+  );
 });
