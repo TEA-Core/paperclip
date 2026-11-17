@@ -145,7 +145,7 @@ describe("decideLiveRunCapAdmission", () => {
 });
 
 describe("classifyLiveRunCapRun", () => {
-  const base = { requestedByActorType: "system", wakeReason: "issue_assigned", issueStatus: "todo", issueOriginKind: "manual" };
+  const base = { requestedByActorType: "system", requestReason: "issue_assigned", issueStatus: "todo", issueOriginKind: "manual" };
 
   it("puts human and board wakes first, even on review work", () => {
     expect(classifyLiveRunCapRun({ ...base, requestedByActorType: "user", issueStatus: "in_review" })).toBe("human_board");
@@ -155,15 +155,29 @@ describe("classifyLiveRunCapRun", () => {
     { issueStatus: "in_review" },
     { issueOriginKind: "stranded_issue_recovery" },
     { issueOriginKind: "harness_liveness_escalation" },
-    { wakeReason: "execution_review_requested" },
-    { wakeReason: "source_scoped_recovery_action" },
+    { requestReason: "execution_review_requested" },
+    { requestReason: "source_scoped_recovery_action" },
   ])("treats %j as review/recovery", (override) => {
     expect(classifyLiveRunCapRun({ ...base, ...override })).toBe("review_recovery");
   });
 
+  it.each([
+    { requestedByActorType: "agent" },
+    { requestedByActorType: null },
+  ])("ignores a review reason on a wake not requested by the server or a board user: %j", (override) => {
+    for (const requestReason of ["execution_review_requested", "source_scoped_recovery_action", "issue_review_path_lost"]) {
+      expect(classifyLiveRunCapRun({ ...base, ...override, requestReason })).toBe("general");
+    }
+  });
+
+  it("keeps genuine review state for an agent-requested wake on an in_review or recovery-origin issue", () => {
+    expect(classifyLiveRunCapRun({ ...base, requestedByActorType: "agent", issueStatus: "in_review" })).toBe("review_recovery");
+    expect(classifyLiveRunCapRun({ ...base, requestedByActorType: "agent", issueOriginKind: "stranded_issue_recovery" })).toBe("review_recovery");
+  });
+
   it("treats agent, system and timer work without review or recovery markers as general", () => {
     expect(classifyLiveRunCapRun(base)).toBe("general");
-    expect(classifyLiveRunCapRun({ requestedByActorType: null, wakeReason: null, issueStatus: null, issueOriginKind: null })).toBe("general");
+    expect(classifyLiveRunCapRun({ requestedByActorType: null, requestReason: null, issueStatus: null, issueOriginKind: null })).toBe("general");
   });
 });
 

@@ -19206,17 +19206,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     ).length;
   }
 
-  /** Queued runs matching `where`, with their admission class and exemption. */
+  /**
+   * Queued runs matching `where`, with their admission class and exemption.
+   * The class reads the run's own wake request row (actor type and reason as
+   * the server recorded them) and the issue row, never the run's merged
+   * `contextSnapshot.wakeReason`: a coalesced or agent-supplied reason must
+   * not lift a run into the reserved slots.
+   */
   async function listLiveRunCapCandidates(where: SQL | undefined) {
     const rows = await db
       .select({
         runId: heartbeatRuns.id,
         agentId: heartbeatRuns.agentId,
         createdAt: heartbeatRuns.createdAt,
-        wakeReason: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`,
         adapterType: agents.adapterType,
         workDelivery: sql<string | null>`${agents.runtimeConfig} ->> 'workDelivery'`,
         requestedByActorType: agentWakeupRequests.requestedByActorType,
+        requestReason: agentWakeupRequests.reason,
         issueStatus: issues.status,
         issueOriginKind: issues.originKind,
       })

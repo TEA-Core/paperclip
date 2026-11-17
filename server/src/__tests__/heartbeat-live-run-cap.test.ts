@@ -196,30 +196,41 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
       .where(inArray(heartbeatRuns.id, rows.map((row) => row.id)));
   }
 
-  async function seedQueuedRun(agentId: string, runClass: RunClass = "general") {
+  async function seedQueuedRun(
+    agentId: string,
+    runClass: RunClass = "general",
+    wake: {
+      requestedByActorType?: "user" | "agent" | "system";
+      reason?: string;
+      contextWakeReason?: string;
+      issueStatus?: "todo" | "in_review";
+      issueOriginKind?: string;
+    } = {},
+  ) {
     const createdAt = new Date((createdAtCursor += 60_000));
     const issueId = randomUUID();
     await db.insert(issues).values({
       id: issueId,
       companyId,
       title: `${runClass} work`,
-      status: "todo",
+      status: wake.issueStatus ?? "todo",
       assigneeAgentId: agentId,
-      originKind: runClass === "review_recovery" ? "stranded_issue_recovery" : "manual",
+      originKind: wake.issueOriginKind ?? (runClass === "review_recovery" ? "stranded_issue_recovery" : "manual"),
     });
     const wakeupRequestId = randomUUID();
     const runId = randomUUID();
+    const requestedByActorType = wake.requestedByActorType ?? (runClass === "human_board" ? "user" : "system");
     await db.insert(agentWakeupRequests).values({
       id: wakeupRequestId,
       companyId,
       agentId,
       source: "assignment",
       triggerDetail: "system",
-      reason: "issue_assigned",
+      reason: wake.reason ?? "issue_assigned",
       payload: { issueId },
       status: "queued",
-      requestedByActorType: runClass === "human_board" ? "user" : "system",
-      requestedByActorId: runClass === "human_board" ? "board-user" : null,
+      requestedByActorType,
+      requestedByActorId: requestedByActorType === "user" ? "board-user" : requestedByActorType === "agent" ? agentId : null,
       createdAt,
       requestedAt: createdAt,
     });
@@ -231,7 +242,7 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
       triggerDetail: "system",
       status: "queued",
       wakeupRequestId,
-      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      contextSnapshot: { issueId, wakeReason: wake.contextWakeReason ?? wake.reason ?? "issue_assigned" },
       createdAt,
       updatedAt: createdAt,
     });
@@ -365,6 +376,125 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
     await heartbeat.resumeQueuedRuns();
 
     expect(await statusesOf({ general, review, human })).toEqual({ general: "queued", review: "running", human: "running" });
+  });
+
+  // ─── (i) the reserved class comes only from server-recorded facts ──────────
+
+  /**
+   * The options `POST /agents/:id/wakeup` builds (routes/agents.ts): the actor
+   * type and id come from the authenticated actor; the reason is the caller's
+   * free string.
+   */
+  function routeWake(actor: { type: "agent"; agentId: string } | { type: "board"; userId: string }, reason: string) {
+    return {
+      ...(actor.type === "board" ? { manualUserWake: true } : {}),
+      source: "on_demand" as const,
+      triggerDetail: "manual" as const,
+      reason,
+      requestedByActorType: actor.type === "agent" ? ("agent" as const) : ("user" as const),
+      requestedByActorId: actor.type === "agent" ? actor.agentId : actor.userId,
+      contextSnapshot: {
+        triggeredBy: actor.type,
+        actorId: actor.type === "agent" ? actor.agentId : actor.userId,
+      },
+    };
+  }
+
+  /** Cap 10 with 8 live: the general slots are full and the 2 reserved slots are free. */
+  async function seedReservedSlotsFree() {
+    await seedCompany();
+    await setCap(10);
+    await seedLiveRuns(8);
+    return seedQueuedRun(await seedAgent("OlderGeneral"), "general");
+  }
+
+  it.each([
+    { label: "an agent waking itself", cross: false },
+    { label: "an agent waking another agent", cross: true },
+  ])("(i) $label with a review reason does not take a reserved slot ahead of an older general run", async ({ cross }) => {
+    const olderGeneral = await seedReservedSlotsFree();
+    const target = await seedAgent("Target");
+    const requester = cross ? await seedAgent("Requester") : target;
+
+    const forged = await heartbeat.wakeup(target, routeWake({ type: "agent", agentId: requester }, "execution_review_requested"));
+    expect(forged).not.toBeNull();
+    await heartbeat.resumeQueuedRuns();
+    expect(await statusesOf({ olderGeneral, forged: forged!.id })).toEqual({ olderGeneral: "queued", forged: "queued" });
+
+    // One general slot frees: it goes to the older general run, not the forged one.
+    await finishLiveRuns(1);
+    await heartbeat.resumeQueuedRuns();
+    expect(await statusesOf({ olderGeneral, forged: forged!.id })).toEqual({ olderGeneral: "running", forged: "queued" });
+  });
+
+  it("(i) a board user's wake with the same reason still starts in a reserved slot", async () => {
+    const olderGeneral = await seedReservedSlotsFree();
+    const target = await seedAgent("Target");
+
+    const boardWake = await heartbeat.wakeup(target, routeWake({ type: "board", userId: "board-user" }, "execution_review_requested"));
+    expect(boardWake).not.toBeNull();
+    await heartbeat.resumeQueuedRuns();
+
+    expect(await statusesOf({ olderGeneral, boardWake: boardWake!.id })).toEqual({ olderGeneral: "queued", boardWake: "running" });
+  });
+
+  it.each([
+    { label: "an issue that is in_review", wake: { requestedByActorType: "agent", issueStatus: "in_review" } },
+    { label: "a recovery-origin issue", wake: { requestedByActorType: "agent", issueOriginKind: "stranded_issue_recovery" } },
+    { label: "a server recovery wake", wake: { requestedByActorType: "system", reason: "source_scoped_recovery_action" } },
+  ] as const)("(i) genuine review or recovery work on $label still starts in a reserved slot", async ({ wake }) => {
+    const olderGeneral = await seedReservedSlotsFree();
+    const genuine = await seedQueuedRun(await seedAgent("Reviewer"), "general", wake);
+
+    await heartbeat.resumeQueuedRuns();
+
+    expect(await statusesOf({ olderGeneral, genuine })).toEqual({ olderGeneral: "queued", genuine: "running" });
+  });
+
+  it("(i) a review reason merged into the run context by a coalesced wake does not change the run's class", async () => {
+    const olderGeneral = await seedReservedSlotsFree();
+    // The run's own wake request is an ordinary server retry; only the merged
+    // context carries the review reason (coalescing spreads the incoming wake
+    // over the run's context).
+    const merged = await seedQueuedRun(await seedAgent("Merged"), "general", {
+      requestedByActorType: "system",
+      reason: "transient_failure_retry",
+      contextWakeReason: "execution_review_requested",
+    });
+
+    await heartbeat.resumeQueuedRuns();
+    expect(await statusesOf({ olderGeneral, merged })).toEqual({ olderGeneral: "queued", merged: "queued" });
+
+    await finishLiveRuns(1);
+    await heartbeat.resumeQueuedRuns();
+    expect(await statusesOf({ olderGeneral, merged })).toEqual({ olderGeneral: "running", merged: "queued" });
+  });
+
+  it("(i) an agent's wake bound to another agent's in_review issue never runs in a reserved slot", async () => {
+    const olderGeneral = await seedReservedSlotsFree();
+    const owner = await seedAgent("Owner");
+    const intruder = await seedAgent("Intruder");
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Someone else's review",
+      status: "in_review",
+      assigneeAgentId: owner,
+    });
+
+    // The payload binds the run to the in_review issue, so it is ordered as
+    // review work; the claim then refuses it because the issue is not its own.
+    const forged = await heartbeat.wakeup(intruder, {
+      ...routeWake({ type: "agent", agentId: intruder }, "execution_review_requested"),
+      payload: { issueId },
+    });
+    expect(forged).not.toBeNull();
+    await heartbeat.resumeQueuedRuns();
+
+    expect(mockAdapterExecute.mock.calls.some(([context]) => context?.runId === forged!.id)).toBe(false);
+    expect(await heartbeat.getRun(forged!.id)).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed" });
+    expect(await statusOf(olderGeneral)).toBe("queued");
   });
 
   // ─── (d) router input ─────────────────────────────────────────────────────

@@ -87,6 +87,12 @@ export function isLiveRunCapExemptAgent(agent: LiveRunCapAgentInput) {
 export const LIVE_RUN_CAP_CLASSES = ["human_board", "review_recovery", "general"] as const;
 export type LiveRunCapClass = (typeof LIVE_RUN_CAP_CLASSES)[number];
 
+/**
+ * Review and recovery reasons, honoured only on a wake the server recorded as
+ * `requested_by_actor_type = 'system'` (recovery sweeps, review dispatch and
+ * other server paths). The wake routes accept any reason string from an agent
+ * key, so an agent-requested (or unrecorded) wake never reaches this list.
+ */
 const REVIEW_RECOVERY_WAKE_REASONS: ReadonlySet<string> = new Set([
   "execution_review_requested",
   "execution_approval_requested",
@@ -101,9 +107,19 @@ const REVIEW_RECOVERY_WAKE_REASONS: ReadonlySet<string> = new Set([
 ]);
 const RECOVERY_ISSUE_ORIGIN_KINDS: ReadonlySet<string> = new Set(Object.values(RECOVERY_ORIGIN_KINDS));
 
+/**
+ * The admission class of a queued run, from facts the caller of a wake
+ * cannot set:
+ * - `requestedByActorType` and `requestReason` come from the run's own wake
+ *   request row. The server records the actor type from the authenticated
+ *   actor, and a coalesced wake never rewrites that row (unlike the run's
+ *   merged `contextSnapshot.wakeReason`, which is never read here).
+ * - `issueStatus` and `issueOriginKind` come from the issue row; the issue
+ *   API does not accept an origin kind.
+ */
 export function classifyLiveRunCapRun(input: {
   requestedByActorType: string | null | undefined;
-  wakeReason: string | null | undefined;
+  requestReason: string | null | undefined;
   issueStatus: string | null | undefined;
   issueOriginKind: string | null | undefined;
 }): LiveRunCapClass {
@@ -111,7 +127,9 @@ export function classifyLiveRunCapRun(input: {
   if (
     input.issueStatus === "in_review" ||
     (input.issueOriginKind && RECOVERY_ISSUE_ORIGIN_KINDS.has(input.issueOriginKind)) ||
-    (input.wakeReason && REVIEW_RECOVERY_WAKE_REASONS.has(input.wakeReason))
+    (input.requestedByActorType === "system" &&
+      input.requestReason &&
+      REVIEW_RECOVERY_WAKE_REASONS.has(input.requestReason))
   ) {
     return "review_recovery";
   }
