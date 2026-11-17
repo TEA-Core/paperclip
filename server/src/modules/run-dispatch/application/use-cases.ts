@@ -1,4 +1,5 @@
-import type { RunDispatchWriter, ScheduledRetryReader } from "./ports.js";
+import { MAX_QUEUED_ISSUE_RUN_AGE_MS } from "../domain/policy.js";
+import type { QueuedRunExpiry, RunDispatchWriter, ScheduledRetryReader } from "./ports.js";
 import type { PostCommitEffect, PromoteScheduledRetryOutcome } from "./types.js";
 
 export function createEvaluateScheduledRetryGate(deps: { reader: ScheduledRetryReader }) {
@@ -56,6 +57,34 @@ export function createCancelStaleQueuedRun(deps: { writer: RunDispatchWriter }) 
     now?: Date;
     worktreeExecutionCutoff?: Date | null;
   }) => deps.writer.cancelStaleQueuedRun({ ...input, now: input.now ?? new Date() });
+}
+
+const MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP = 100;
+
+/**
+ * The queued-run age bound. A run still `queued` MAX_QUEUED_ISSUE_RUN_AGE_MS
+ * after creation is cancelled with its issue lock released; running runs and
+ * younger queued runs are never selected.
+ */
+export function createExpireStaleQueuedRuns(deps: { expiry: QueuedRunExpiry }) {
+  return async function expireStaleQueuedRuns(input: { now?: Date } = {}) {
+    const now = input.now ?? new Date();
+    const candidates = await deps.expiry.listExpiredQueuedRuns({
+      createdAtOrBefore: new Date(now.getTime() - MAX_QUEUED_ISSUE_RUN_AGE_MS),
+      limit: MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP,
+    });
+    const runIds: string[] = [];
+    const postCommitEffects: PostCommitEffect[] = [];
+
+    for (const candidate of candidates) {
+      const result = await deps.expiry.expireQueuedRun({ ...candidate, now });
+      if (result.outcome !== "cancelled") continue;
+      runIds.push(candidate.runId);
+      postCommitEffects.push(...result.postCommitEffects);
+    }
+
+    return { expired: runIds.length, runIds, postCommitEffects };
+  };
 }
 
 export function createDispatchResolvedInteractionIfCurrent(deps: { writer: RunDispatchWriter }) {

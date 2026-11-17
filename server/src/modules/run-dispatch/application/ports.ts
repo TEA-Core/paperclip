@@ -58,3 +58,25 @@ export interface RunDispatchWriter {
     input: DispatchResolvedInteractionInput<T>,
   ): Promise<DispatchResolvedInteractionOutcome<T>>;
 }
+
+export type ListExpiredQueuedRunsInput = {
+  /** Runs created at or before this instant are past the queued-run age bound. */
+  createdAtOrBefore: Date;
+  limit: number;
+};
+
+export type ExpireQueuedRunInput = {
+  runId: string;
+  companyId: string;
+  now: Date;
+};
+
+/**
+ * The queued-run age bound: lists issue-bound runs still `queued` past the
+ * bound and terminalizes one under the same issue -> run locks the claim and
+ * stale-run gates take.
+ */
+export interface QueuedRunExpiry {
+  listExpiredQueuedRuns(input: ListExpiredQueuedRunsInput): Promise<DueRetryRun[]>;
+  expireQueuedRun(input: ExpireQueuedRunInput): Promise<CancelStaleQueuedRunOutcome>;
+}

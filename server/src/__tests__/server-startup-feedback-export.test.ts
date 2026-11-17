@@ -76,6 +76,7 @@ const {
     reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
     resumeQueuedRuns: vi.fn(async () => undefined),
+    expireStaleQueuedRuns: vi.fn(async () => ({ expired: 0, runIds: [] })),
     recoverPendingSessionGoalActions: vi.fn(async () => ({ scanned: 0, enqueued: 0, alreadyQueued: 0, invalid: 0 })),
     recoverActiveSessionGoals: vi.fn(async () => ({ scanned: 0, enqueued: 0 })),
     reconcileStrandedAssignedIssues: vi.fn(async () => ({

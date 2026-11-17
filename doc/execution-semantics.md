@@ -1025,10 +1025,13 @@ On startup and on the periodic recovery loop, Paperclip performs the following r
 
 1. reap orphaned `running` runs
 2. resume persisted `queued` runs
-3. reconcile stranded assigned work
-4. scan silent active runs only for source-aware terminal folding and legacy cleanup; API reads classify ordinary output silence for the board UI
+3. expire issue-bound `queued` runs past the queued-run age bound
+4. reconcile stranded assigned work
+5. scan silent active runs only for source-aware terminal folding and legacy cleanup; API reads classify ordinary output silence for the board UI
 
 The stranded-work pass closes the gap where issue state survives a crash but the wake/run path does not. The silent-run scan covers the separate case where a live process exists but has stopped producing observable output.
+
+The queued-run age bound (`MAX_QUEUED_ISSUE_RUN_AGE_MS`, 24 hours) covers a run that was queued but never started. A claim can skip a queued run without ending it, and a later wake on the issue re-adopts that run as the execution holder. Without a bound, such a run holds the issue execution lock until a board user cancels it. The expiry pass runs after queued runs are resumed. It cancels an issue-bound run that has stayed `queued` for 24 hours since creation, with error code `queued_run_expired`. It also cancels such a run when its issue no longer exists or is under a recovery hold. The pass skips a run whose issue is held by another live run, a run whose retry alarm is not yet due, and any run in a paused company. In the same transaction, the pass marks the run's wake request `skipped`, clears only the execution and checkout lock columns that name that run, and writes one `heartbeat.queued_run_expired` activity row. Running runs are never selected. The pass is a system sweep: it adds no API, and it does not change who may cancel a run or write to an issue.
 
 The stale-lock sweep leaves native runs with their finalization coordinator while
 same-session recovery or accepted-result finalization is pending. A provider can

@@ -7,6 +7,7 @@ import {
   agentWakeupRequests,
   agents,
   approvals,
+  companies,
   issueApprovals,
   issueThreadInteractions,
   heartbeatRuns,
@@ -24,6 +25,11 @@ import { collectDispositionRepairSourceState } from "../../../services/recovery/
 import { legacyDispositionEpisode, legacyDispositionFingerprint } from "../../../services/recovery/legacy-continuation.js";
 import { appendHeartbeatRunEvent } from "../../../services/heartbeat-run-events.js";
 import { emitAgentTaskRun } from "../../../services/agent-task-run-telemetry.js";
+import {
+  logActivityInTransaction,
+  publishActivity,
+  type ActivityPublication,
+} from "../../../services/activity-log.js";
 import { issueService } from "../../../services/issues.js";
 import {
   issueTreeControlService,
@@ -36,9 +42,14 @@ import {
 } from "../../../services/issue-continuation-summary.js";
 import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
 import { resolveLiveExecutionLeases } from "../../../services/issue-execution-lease.js";
-import { decideQueuedRunStaleness, decideScheduledRetryGate } from "../domain/policy.js";
+import {
+  MAX_QUEUED_ISSUE_RUN_AGE_MS,
+  decideQueuedRunStaleness,
+  decideScheduledRetryGate,
+} from "../domain/policy.js";
 import type {
   QueuedRunFacts,
+  QueuedRunStalenessErrorCode,
   ReviewParticipantFacts,
   RetryReasonKind,
   ScheduledRetryFacts,
@@ -56,8 +67,11 @@ import type {
   DispatchResolvedInteractionOutcome,
   DueRetryRun,
   EvaluateScheduledRetryGateInput,
+  ExpireQueuedRunInput,
   ListDueRetriesInput,
+  ListExpiredQueuedRunsInput,
   PromoteOrCancelDueRetryInput,
+  QueuedRunExpiry,
   RunDispatchWriter,
   ScheduledRetryReader,
 } from "../application/ports.js";
@@ -69,6 +83,18 @@ import type {
 import { RunDispatchApplicationError } from "../application/types.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
+
+/**
+ * Staleness verdicts the queued-run age sweep may apply on its own: the age
+ * bound itself and the two verdicts the policy reaches before it. None of them
+ * needs a replacement wake, so a sweep can apply them outside the claim path.
+ */
+const QUEUED_RUN_EXPIRY_ERROR_CODES: Partial<Record<QueuedRunStalenessErrorCode, true>> = {
+  queued_run_expired: true,
+  issue_not_found: true,
+  execution_reconciliation_required: true,
+};
+
 type LoadGateFactsInput = {
   conversationContinuation: boolean;
   runId: string;
@@ -188,7 +214,7 @@ function statusEffect(run: HeartbeatRun, previousStatus: string | null): PostCom
 
 export function createPostgresRunDispatchAdapter(
   db: Db,
-): ScheduledRetryReader & RunDispatchWriter {
+): ScheduledRetryReader & RunDispatchWriter & QueuedRunExpiry {
   const budgets = budgetService(db);
   const treeControlSvc = issueTreeControlService(db);
   const issuesSvc = issueService(db);
@@ -1164,11 +1190,81 @@ export function createPostgresRunDispatchAdapter(
 
   }
 
+  async function listExpiredQueuedRuns(input: ListExpiredQueuedRunsInput): Promise<DueRetryRun[]> {
+    // Issue-bound queued runs only: those are the runs that hold an issue
+    // execution lock. Paused companies dispatch nothing, so their queue is left
+    // alone, matching resumeQueuedRuns.
+    const rows = await db
+      .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId })
+      .from(heartbeatRuns)
+      .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
+      .where(
+        and(
+          eq(heartbeatRuns.status, "queued"),
+          eq(companies.status, "active"),
+          lte(heartbeatRuns.createdAt, input.createdAtOrBefore),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' is not null`,
+        ),
+      )
+      .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+      .limit(input.limit);
+    return rows.map((row) => ({ runId: row.id, companyId: row.companyId }));
+  }
+
+  async function expireQueuedRun(input: ExpireQueuedRunInput): Promise<CancelStaleQueuedRunOutcome> {
+    const publications: ActivityPublication[] = [];
+    const outcome = await withIssueThenRunLocks(
+      input,
+      () => ({ outcome: "lost_race" as const }),
+      async (tx, run): Promise<CancelStaleQueuedRunOutcome> => {
+        if (run.status !== "queued") return { outcome: "lost_race" };
+        const { issueId, decision } = await decideCurrentRunStaleness(tx, run, input.now);
+        // The age bound decides; the two verdicts the policy reaches before it
+        // (issue gone, issue under a recovery hold) also mean the run can never
+        // start. Every other verdict carries a handoff the claim gate owns.
+        if (!decision.stale || !QUEUED_RUN_EXPIRY_ERROR_CODES[decision.errorCode]) {
+          return { outcome: "not_stale" };
+        }
+        const cancelled = await cancelStaleRunInTx(tx, run, issueId, decision, "queued", input.now);
+        if (cancelled.outcome !== "cancelled") return cancelled;
+        await logActivityInTransaction(
+          tx,
+          {
+            companyId: run.companyId,
+            actorType: "system",
+            actorId: "heartbeat",
+            agentId: run.agentId,
+            runId: run.id,
+            action: "heartbeat.queued_run_expired",
+            entityType: "heartbeat_run",
+            entityId: run.id,
+            issueId,
+            details: {
+              ...decision.details,
+              source: "heartbeat.expire_stale_queued_runs",
+              errorCode: decision.errorCode,
+              reason: decision.reason,
+              runCreatedAt: run.createdAt.toISOString(),
+              maxQueuedAgeMs: MAX_QUEUED_ISSUE_RUN_AGE_MS,
+            },
+          },
+          publications,
+        );
+        return cancelled;
+      },
+      true,
+    );
+    for (const publication of publications) publishActivity(publication);
+    return outcome;
+  }
+
   return {
     evaluateScheduledRetryGate,
     listDueRetries,
     cancelStaleQueuedRun,
     dispatchResolvedInteractionIfCurrent,
     promoteOrCancelDueRetry,
+    listExpiredQueuedRuns,
+    expireQueuedRun,
   };
 }
