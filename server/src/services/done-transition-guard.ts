@@ -14,6 +14,7 @@ import {
   issueWorkProducts,
   labels,
   projectWorkspaces,
+  workspaceOperations,
   type Db,
 } from "@paperclipai/db";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
@@ -170,8 +171,8 @@ export const DONE_TIER_TIER1_NO_REPOSITORY_JSON =
   '"doneTier": { "tier": "tier1", "reason": "<why not probed>", "landing": { "mode": "noRepositoryLanding" } }';
 const NO_REPOSITORY_LANDING_CONDITIONS =
   "accepted only on a record_only issue closed through PATCH /api/issues/{id}, whose own isolated git worktree is clean " +
-  "with zero commits ahead of the project's default branch, with no linked pull request, and with an entry-ruling " +
-  "document on this issue written by someone other than the closer";
+  "with zero commits ahead of the project's default branch (or that has no project and has never had an execution workspace), " +
+  "with no linked pull request, and with an entry-ruling document on this issue written by someone other than the closer";
 
 /** Appended after TIER1_FORM on record_only issues; empty otherwise. */
 export function noRepositoryTier1FormSuffix(issue: { deliveryRequirement?: IssueDeliveryRequirement | null }): string {
@@ -2376,6 +2377,7 @@ export interface NoRepositoryLandingSubject {
   companyId: string;
   identifier: string | null;
   status?: string | null;
+  projectId?: string | null;
   projectWorkspaceId?: string | null;
   executionWorkspaceId?: string | null;
   deliveryRequirement?: IssueDeliveryRequirement | null;
@@ -2383,12 +2385,22 @@ export interface NoRepositoryLandingSubject {
   originId?: string | null;
 }
 
+/** The entry ruling a no-repository close rests on, as measured. */
+interface NoRepositoryLandingRuling {
+  documentId: string;
+  revisionNumber: number;
+  revisionCount: number;
+  updatedAt: string;
+}
+
 /**
- * What a no-repository close measured: the issue's workspace binding, the
- * ruling it rests on, the base it was compared against and the probe result.
- * The close audit records it, and the status write re-checks it.
+ * What a no-repository close measured on a card that owns an isolated git
+ * worktree: the issue's workspace binding, the ruling it rests on, the base it
+ * was compared against and the probe result. The close audit records it, and
+ * the status write re-checks it.
  */
-export interface NoRepositoryLandingMeasurement {
+export interface NoRepositoryLandingWorktreeMeasurement {
+  proof: "isolated_worktree";
   executionWorkspaceId: string;
   issueProjectWorkspaceId: string | null;
   workspaceProjectWorkspaceId: string;
@@ -2399,7 +2411,7 @@ export interface NoRepositoryLandingMeasurement {
   repoRef: string | null;
   recoverySourceIssueId: string | null;
   permittedSourceCard: { id: string; identifier: string } | null;
-  ruling: { documentId: string; revisionNumber: number; revisionCount: number; updatedAt: string };
+  ruling: NoRepositoryLandingRuling;
   probe: {
     branch: string;
     headSha: string;
@@ -2409,15 +2421,52 @@ export interface NoRepositoryLandingMeasurement {
   };
 }
 
+/**
+ * SUP-24547: what a no-repository close measured on a card with no project and
+ * no execution workspace that never had one. There is no worktree to probe
+ * and no repository to compare against; the close rests on the control-plane
+ * records that show no workspace was ever attached to the card, the
+ * independent entry ruling, and the absence of linked pull requests.
+ */
+export interface NoRepositoryLandingNoWorkspaceMeasurement {
+  proof: "never_had_execution_workspace";
+  ruling: NoRepositoryLandingRuling;
+}
+
+export type NoRepositoryLandingMeasurement =
+  | NoRepositoryLandingWorktreeMeasurement
+  | NoRepositoryLandingNoWorkspaceMeasurement;
+
 export type NoRepositoryLandingVerdict =
   | { ok: true; measurement: NoRepositoryLandingMeasurement }
   | { ok: false; reason: string; remedy?: string };
 
 type NoRepositoryLandingRefusal = Extract<NoRepositoryLandingVerdict, { ok: false }>;
 
-/** The close audit's view of a measurement: the ruling, the binding, the base and the probe result. */
+/** The records checked to establish that a card never had an execution workspace. */
+const NO_WORKSPACE_HISTORY_RECORDS = [
+  "execution_workspaces.source_issue_id",
+  "workspace_operations.execution_workspace_id",
+  "heartbeat_runs.context_snapshot.executionWorkspaceId",
+  "activity_log.details.executionWorkspaceId",
+  "issue_work_products.execution_workspace_id",
+] as const;
+
+/** The close audit's view of a measurement: the proof used, the ruling, and for a worktree the binding, base and probe result. */
 export function noRepositoryLandingAuditDetails(measurement: NoRepositoryLandingMeasurement) {
+  if (measurement.proof === "never_had_execution_workspace") {
+    return {
+      proof: measurement.proof,
+      rulingDocumentId: measurement.ruling.documentId,
+      rulingRevisionNumber: measurement.ruling.revisionNumber,
+      projectId: null,
+      projectWorkspaceId: null,
+      executionWorkspaceId: null,
+      checkedRecords: [...NO_WORKSPACE_HISTORY_RECORDS],
+    };
+  }
   return {
+    proof: measurement.proof,
     rulingDocumentId: measurement.ruling.documentId,
     rulingRevisionNumber: measurement.ruling.revisionNumber,
     executionWorkspaceId: measurement.executionWorkspaceId,
@@ -2478,8 +2527,8 @@ function noRepositoryRefusal(reason: string, remedy?: string): NoRepositoryLandi
 
 /** Everything the close rests on that the database holds; `probe` aside, the measurement. */
 type NoRepositoryLandingRecord = Omit<
-  NoRepositoryLandingMeasurement,
-  "probe" | "recoverySourceIssueId" | "permittedSourceCard"
+  NoRepositoryLandingWorktreeMeasurement,
+  "proof" | "probe" | "recoverySourceIssueId" | "permittedSourceCard"
 > & {
   identifier: string;
   projectId: string;
@@ -2488,90 +2537,91 @@ type NoRepositoryLandingRecord = Omit<
   attributedBranches: string[];
 };
 
+type NoRepositoryLandingRead =
+  | NoRepositoryLandingRefusal
+  | { ok: true; proof: "isolated_worktree"; record: NoRepositoryLandingRecord }
+  | { ok: true; proof: "never_had_execution_workspace"; ruling: NoRepositoryLandingRuling };
+
 /**
- * The database half of the proof: classification, closer, workspace kind and
- * binding, base, ruling and linked pull requests. Reads only; runs no Git and
- * makes no network call, so the status write can repeat it under the row lock.
+ * SUP-24547: whether any control-plane record shows an execution workspace was
+ * ever attached to this card. The pointers on the issue row (projectId,
+ * projectWorkspaceId, executionWorkspaceId) are writable by the card's
+ * assignee, so their being null proves nothing on its own. These records are
+ * written only by the server: the workspace row sourced from the card, the
+ * provisioning operations and run context that name a workspace for it, any
+ * audit row of the card that names a workspace (every PATCH that binds or
+ * unbinds one records it), and work products recorded against a workspace.
+ * Detaching, closing or archiving the workspace leaves them in place.
  */
-async function readNoRepositoryLandingRecord(
+async function cardEverHadExecutionWorkspace(db: Db, issue: { id: string; companyId: string }): Promise<boolean> {
+  const checks = [
+    db
+      .select({ id: executionWorkspaces.id })
+      .from(executionWorkspaces)
+      .where(and(eq(executionWorkspaces.companyId, issue.companyId), eq(executionWorkspaces.sourceIssueId, issue.id)))
+      .limit(1),
+    db
+      .select({ id: workspaceOperations.id })
+      .from(workspaceOperations)
+      .where(
+        and(
+          eq(workspaceOperations.companyId, issue.companyId),
+          eq(workspaceOperations.issueId, issue.id),
+          isNotNull(workspaceOperations.executionWorkspaceId),
+        ),
+      )
+      .limit(1),
+    db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, issue.companyId),
+          sql`(${heartbeatRuns.contextSnapshot} ->> 'issueId') = ${issue.id}`,
+          sql`(${heartbeatRuns.contextSnapshot} ->> 'executionWorkspaceId') is not null`,
+        ),
+      )
+      .limit(1),
+    db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, issue.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issue.id),
+          sql`jsonb_path_exists(${activityLog.details}, 'lax $.**.executionWorkspaceId ? (@ != null)')`,
+        ),
+      )
+      .limit(1),
+    db
+      .select({ id: issueWorkProducts.id })
+      .from(issueWorkProducts)
+      .where(
+        and(
+          eq(issueWorkProducts.companyId, issue.companyId),
+          eq(issueWorkProducts.issueId, issue.id),
+          isNotNull(issueWorkProducts.executionWorkspaceId),
+        ),
+      )
+      .limit(1),
+  ];
+  for (const check of checks) {
+    if ((await check).length > 0) return true;
+  }
+  return false;
+}
+
+/**
+ * The ruling: exactly the "entry-ruling" document linked to THIS issue in
+ * THIS company, with a substantive body, and no revision of it written by
+ * the closing actor.
+ */
+async function readEntryRuling(
   db: Db,
   issue: NoRepositoryLandingSubject,
-  closingActor: DoneTierClosingActor | null,
-): Promise<NoRepositoryLandingRefusal | { ok: true; record: NoRepositoryLandingRecord }> {
-  if (issue.deliveryRequirement !== "record_only") {
-    return noRepositoryRefusal("is accepted only on a record_only issue.", REPOSITORY_DELIVERY_RECLASSIFY_REMEDY);
-  }
-  if (!closingActor || (!closingActor.agentId && !closingActor.userId)) {
-    return noRepositoryRefusal("is accepted only through PATCH /api/issues/{id} by an identified closing actor.");
-  }
-  if (!issue.identifier) {
-    return noRepositoryRefusal("requires an issue identifier to tie the worktree's branch to this issue.");
-  }
-  if (!issue.executionWorkspaceId) {
-    return noRepositoryRefusal("requires this issue's own execution workspace.");
-  }
-
-  const workspace = await db
-    .select({
-      sourceIssueId: executionWorkspaces.sourceIssueId,
-      projectId: executionWorkspaces.projectId,
-      projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
-      mode: executionWorkspaces.mode,
-      strategyType: executionWorkspaces.strategyType,
-      providerType: executionWorkspaces.providerType,
-      providerRef: executionWorkspaces.providerRef,
-      cwd: executionWorkspaces.cwd,
-    })
-    .from(executionWorkspaces)
-    .where(
-      and(
-        eq(executionWorkspaces.id, issue.executionWorkspaceId),
-        eq(executionWorkspaces.companyId, issue.companyId),
-      ),
-    )
-    .then((rows) => rows[0] ?? null);
-  if (!workspace || workspace.sourceIssueId !== issue.id) {
-    return noRepositoryRefusal("requires an execution workspace this issue owns in this company.");
-  }
-  // Workspace-kind allowlist: only the server-provisioned, per-issue isolated
-  // git worktree. mode, strategyType and providerType are set at provisioning
-  // and are not writable through PATCH /api/execution-workspaces/{id}.
-  if (
-    workspace.mode !== "isolated_workspace" ||
-    workspace.strategyType !== "git_worktree" ||
-    workspace.providerType !== "git_worktree"
-  ) {
-    return noRepositoryRefusal(
-      `requires this issue's own isolated git worktree; this workspace is ${workspace.mode}/${workspace.strategyType}/${workspace.providerType}.`,
-    );
-  }
-  if (!workspace.projectWorkspaceId) {
-    return noRepositoryRefusal("requires the workspace's project workspace to name the default branch.");
-  }
-  const projectWorkspace = await db
-    .select({
-      defaultRef: projectWorkspaces.defaultRef,
-      repoRef: projectWorkspaces.repoRef,
-      repoUrl: projectWorkspaces.repoUrl,
-    })
-    .from(projectWorkspaces)
-    .where(
-      and(
-        eq(projectWorkspaces.id, workspace.projectWorkspaceId),
-        eq(projectWorkspaces.companyId, issue.companyId),
-        eq(projectWorkspaces.projectId, workspace.projectId),
-      ),
-    )
-    .then((rows) => rows[0] ?? null);
-  const baseBranch = normalizeBaseBranch(projectWorkspace?.defaultRef ?? projectWorkspace?.repoRef ?? null);
-  const repoRef = normalizeBaseBranch(projectWorkspace?.repoRef ?? null);
-  if (!baseBranch) {
-    return noRepositoryRefusal("requires the project workspace to name its default branch.");
-  }
-
-  // The ruling: exactly the "entry-ruling" document linked to THIS issue in
-  // THIS company, with a substantive body, and no revision of it written by
-  // the closing actor.
+  closingActor: DoneTierClosingActor,
+): Promise<NoRepositoryLandingRefusal | { ok: true; ruling: NoRepositoryLandingRuling }> {
   const ruling = await db
     .select({
       documentId: documents.id,
@@ -2635,8 +2685,22 @@ async function readNoRepositoryLandingRecord(
       `requires an "${ENTRY_RULING_DOCUMENT_KEY}" document written by someone other than the closing actor; the closer wrote at least one revision of it.`,
     );
   }
+  return {
+    ok: true,
+    ruling: {
+      documentId: ruling.documentId,
+      revisionNumber: ruling.latestRevisionNumber,
+      revisionCount: revisions.length,
+      updatedAt: ruling.updatedAt.toISOString(),
+    },
+  };
+}
 
-  // Foreign repository evidence recorded on the issue itself.
+/** Foreign repository evidence recorded on the issue itself. */
+async function linkedRepositoryWorkRefusal(
+  db: Db,
+  issue: NoRepositoryLandingSubject,
+): Promise<NoRepositoryLandingRefusal | null> {
   const linkedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, { includeDrafts: true });
   if (linkedPrs.length > 0) {
     return noRepositoryRefusal(
@@ -2647,6 +2711,111 @@ async function readNoRepositoryLandingRecord(
   if (pullRequestProducts.some((product) => product.kind !== "foreign")) {
     return noRepositoryRefusal("cannot be declared on an issue that records a pull request work product.");
   }
+  return null;
+}
+
+/**
+ * The database half of the proof: classification, closer, workspace kind and
+ * binding, base, ruling and linked pull requests. Reads only; runs no Git and
+ * makes no network call, so the status write can repeat it under the row lock.
+ *
+ * SUP-24547: a card with no project, no project workspace and no execution
+ * workspace, that the control plane shows never had one, rests on the
+ * independent ruling and the absence of linked pull requests alone; there is
+ * no worktree to probe. Every other card without an execution workspace keeps
+ * the refusal below unchanged.
+ */
+async function readNoRepositoryLandingRecord(
+  db: Db,
+  issue: NoRepositoryLandingSubject,
+  closingActor: DoneTierClosingActor | null,
+): Promise<NoRepositoryLandingRead> {
+  if (issue.deliveryRequirement !== "record_only") {
+    return noRepositoryRefusal("is accepted only on a record_only issue.", REPOSITORY_DELIVERY_RECLASSIFY_REMEDY);
+  }
+  if (!closingActor || (!closingActor.agentId && !closingActor.userId)) {
+    return noRepositoryRefusal("is accepted only through PATCH /api/issues/{id} by an identified closing actor.");
+  }
+  if (!issue.identifier) {
+    return noRepositoryRefusal("requires an issue identifier to tie the worktree's branch to this issue.");
+  }
+  if (!issue.executionWorkspaceId) {
+    if (
+      issue.projectId !== null ||
+      issue.projectWorkspaceId !== null ||
+      (await cardEverHadExecutionWorkspace(db, issue))
+    ) {
+      return noRepositoryRefusal("requires this issue's own execution workspace.");
+    }
+    const ruling = await readEntryRuling(db, issue, closingActor);
+    if (!ruling.ok) return ruling;
+    const linkedWork = await linkedRepositoryWorkRefusal(db, issue);
+    if (linkedWork) return linkedWork;
+    return { ok: true, proof: "never_had_execution_workspace", ruling: ruling.ruling };
+  }
+
+  const workspace = await db
+    .select({
+      sourceIssueId: executionWorkspaces.sourceIssueId,
+      projectId: executionWorkspaces.projectId,
+      projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
+      mode: executionWorkspaces.mode,
+      strategyType: executionWorkspaces.strategyType,
+      providerType: executionWorkspaces.providerType,
+      providerRef: executionWorkspaces.providerRef,
+      cwd: executionWorkspaces.cwd,
+    })
+    .from(executionWorkspaces)
+    .where(
+      and(
+        eq(executionWorkspaces.id, issue.executionWorkspaceId),
+        eq(executionWorkspaces.companyId, issue.companyId),
+      ),
+    )
+    .then((rows) => rows[0] ?? null);
+  if (!workspace || workspace.sourceIssueId !== issue.id) {
+    return noRepositoryRefusal("requires an execution workspace this issue owns in this company.");
+  }
+  // Workspace-kind allowlist: only the server-provisioned, per-issue isolated
+  // git worktree. mode, strategyType and providerType are set at provisioning
+  // and are not writable through PATCH /api/execution-workspaces/{id}.
+  if (
+    workspace.mode !== "isolated_workspace" ||
+    workspace.strategyType !== "git_worktree" ||
+    workspace.providerType !== "git_worktree"
+  ) {
+    return noRepositoryRefusal(
+      `requires this issue's own isolated git worktree; this workspace is ${workspace.mode}/${workspace.strategyType}/${workspace.providerType}.`,
+    );
+  }
+  if (!workspace.projectWorkspaceId) {
+    return noRepositoryRefusal("requires the workspace's project workspace to name the default branch.");
+  }
+  const projectWorkspace = await db
+    .select({
+      defaultRef: projectWorkspaces.defaultRef,
+      repoRef: projectWorkspaces.repoRef,
+      repoUrl: projectWorkspaces.repoUrl,
+    })
+    .from(projectWorkspaces)
+    .where(
+      and(
+        eq(projectWorkspaces.id, workspace.projectWorkspaceId),
+        eq(projectWorkspaces.companyId, issue.companyId),
+        eq(projectWorkspaces.projectId, workspace.projectId),
+      ),
+    )
+    .then((rows) => rows[0] ?? null);
+  const baseBranch = normalizeBaseBranch(projectWorkspace?.defaultRef ?? projectWorkspace?.repoRef ?? null);
+  const repoRef = normalizeBaseBranch(projectWorkspace?.repoRef ?? null);
+  if (!baseBranch) {
+    return noRepositoryRefusal("requires the project workspace to name its default branch.");
+  }
+
+  const ruling = await readEntryRuling(db, issue, closingActor);
+  if (!ruling.ok) return ruling;
+  const linkedWork = await linkedRepositoryWorkRefusal(db, issue);
+  if (linkedWork) return linkedWork;
 
   const recordedWorktreePath = workspace.providerRef ?? workspace.cwd;
   if (!recordedWorktreePath) {
@@ -2680,6 +2849,7 @@ async function readNoRepositoryLandingRecord(
     .then((rows) => rows.map((row) => row.branchName!).sort());
   return {
     ok: true,
+    proof: "isolated_worktree",
     record: {
       identifier: issue.identifier,
       projectId: workspace.projectId,
@@ -2692,12 +2862,7 @@ async function readNoRepositoryLandingRecord(
       attributedBranches,
       baseBranch,
       repoRef,
-      ruling: {
-        documentId: ruling.documentId,
-        revisionNumber: ruling.latestRevisionNumber,
-        revisionCount: revisions.length,
-        updatedAt: ruling.updatedAt.toISOString(),
-      },
+      ruling: ruling.ruling,
     },
   };
 }
@@ -2743,6 +2908,9 @@ async function verifyNoRepositoryLanding(
 ): Promise<NoRepositoryLandingVerdict> {
   const read = await readNoRepositoryLandingRecord(db, issue, closingActor);
   if (!read.ok) return read;
+  if (read.proof === "never_had_execution_workspace") {
+    return { ok: true, measurement: { proof: read.proof, ruling: read.ruling } };
+  }
   const { record } = read;
   const { token } = await resolveGitHubToken(db, issue.companyId);
   if (!token) {
@@ -2756,7 +2924,7 @@ async function verifyNoRepositoryLanding(
   const projectBranches = new Set([record.baseBranch, githubDefaultBranch]);
   if (record.repoRef) projectBranches.add(record.repoRef);
   const recoverySourceIssueId = isStrandedIssueRecoveryOriginKind(issue.originKind) ? issue.originId ?? null : null;
-  let permittedSourceCard: NoRepositoryLandingMeasurement["permittedSourceCard"] = null;
+  let permittedSourceCard: NoRepositoryLandingWorktreeMeasurement["permittedSourceCard"] = null;
   if (recoverySourceIssueId) {
     permittedSourceCard = await db
       .select({ id: issues.id, identifier: issues.identifier })
@@ -2810,6 +2978,7 @@ async function verifyNoRepositoryLanding(
   return {
     ok: true,
     measurement: {
+      proof: "isolated_worktree",
       executionWorkspaceId: record.executionWorkspaceId,
       issueProjectWorkspaceId: record.issueProjectWorkspaceId,
       workspaceProjectWorkspaceId: record.workspaceProjectWorkspaceId,
@@ -2838,6 +3007,7 @@ export interface NoRepositoryLandingCloseRequest {
   requestedDeliveryRequirement: unknown;
   requestedExecutionWorkspaceId: unknown;
   requestedProjectWorkspaceId: unknown;
+  requestedProjectId: unknown;
 }
 
 // Neither the classification nor the workspace binding the proof rests on may
@@ -2861,6 +3031,15 @@ function closeRequestRefusal(
     request.requestedProjectWorkspaceId !== (issue.projectWorkspaceId ?? null)
   ) {
     return noRepositoryRefusal("cannot ride a request that changes the issue's project workspace.");
+  }
+  // SUP-24547: a card without an execution workspace closes only while it has
+  // no project, so the request that lands the close may not attach one.
+  if (
+    workspaceId === null &&
+    request.requestedProjectId !== undefined &&
+    request.requestedProjectId !== (issue.projectId ?? null)
+  ) {
+    return noRepositoryRefusal("cannot ride a request that changes the issue's project.");
   }
   return null;
 }
@@ -2888,9 +3067,18 @@ export async function measureNoRepositoryLandingForClose(
   }
 }
 
+function rulingChangedSinceMeasurement(current: NoRepositoryLandingRuling, measured: NoRepositoryLandingRuling): boolean {
+  return (
+    current.documentId !== measured.documentId ||
+    current.revisionNumber !== measured.revisionNumber ||
+    current.revisionCount !== measured.revisionCount ||
+    current.updatedAt !== measured.updatedAt
+  );
+}
+
 function changedSinceMeasurement(
   record: NoRepositoryLandingRecord,
-  measurement: NoRepositoryLandingMeasurement,
+  measurement: NoRepositoryLandingWorktreeMeasurement,
 ): string | null {
   if (record.workspaceProjectWorkspaceId !== measurement.workspaceProjectWorkspaceId) {
     return "the execution workspace's project workspace";
@@ -2903,12 +3091,7 @@ function changedSinceMeasurement(
   ) {
     return "the project's repository or default branch";
   }
-  if (
-    record.ruling.documentId !== measurement.ruling.documentId ||
-    record.ruling.revisionNumber !== measurement.ruling.revisionNumber ||
-    record.ruling.revisionCount !== measurement.ruling.revisionCount ||
-    record.ruling.updatedAt !== measurement.ruling.updatedAt
-  ) {
+  if (rulingChangedSinceMeasurement(record.ruling, measurement.ruling)) {
     return `the "${ENTRY_RULING_DOCUMENT_KEY}" document`;
   }
   return null;
@@ -2941,6 +3124,9 @@ export async function verifyNoRepositoryLandingAtTransition(
   if (lockedIssue.deliveryRequirement !== "record_only") {
     return noRepositoryRefusal("is accepted only on an issue already stored as record_only at the close write.");
   }
+  if (measurement.proof === "never_had_execution_workspace") {
+    return verifyNoWorkspaceLandingAtTransition(tx, lockedIssue, closingActor, measurement);
+  }
   if (
     (lockedIssue.executionWorkspaceId ?? null) !== measurement.executionWorkspaceId ||
     (lockedIssue.projectWorkspaceId ?? null) !== measurement.issueProjectWorkspaceId
@@ -2967,7 +3153,7 @@ export async function verifyNoRepositoryLandingAtTransition(
       return noRepositoryRefusal("refused: the recovery source identifier changed after the close was measured.");
     }
   }
-  let read: Awaited<ReturnType<typeof readNoRepositoryLandingRecord>>;
+  let read: NoRepositoryLandingRead;
   try {
     read = await readNoRepositoryLandingRecord(tx, lockedIssue, closingActor);
   } catch (err) {
@@ -2976,6 +3162,9 @@ export async function verifyNoRepositoryLandingAtTransition(
     );
   }
   if (!read.ok) return read;
+  if (read.proof !== "isolated_worktree") {
+    return noRepositoryRefusal("refused: the issue's workspace binding changed after the close was measured.");
+  }
   const changed = changedSinceMeasurement(read.record, measurement);
   if (changed) {
     return noRepositoryRefusal(`refused: ${changed} changed after the close was measured.`);
@@ -2988,6 +3177,40 @@ export async function verifyNoRepositoryLandingAtTransition(
   });
   if (!recheck.ok) {
     return noRepositoryRefusal(`refused at the close write: ${recheck.reason}.`);
+  }
+  return { ok: true, measurement };
+}
+
+/**
+ * SUP-24547: the compare-and-set for a close that rests on the card never
+ * having had an execution workspace. Under the row lock the card must still
+ * have no project, project workspace or execution workspace, the control-plane
+ * records must still show none was ever attached (a run that provisioned one
+ * since the measurement refuses), and the ruling must be the one measured.
+ */
+async function verifyNoWorkspaceLandingAtTransition(
+  tx: Db,
+  lockedIssue: NoRepositoryLandingSubject,
+  closingActor: DoneTierClosingActor,
+  measurement: NoRepositoryLandingNoWorkspaceMeasurement,
+): Promise<NoRepositoryLandingVerdict> {
+  if (lockedIssue.executionWorkspaceId || lockedIssue.projectWorkspaceId || lockedIssue.projectId) {
+    return noRepositoryRefusal("refused: the issue's workspace binding changed after the close was measured.");
+  }
+  let read: NoRepositoryLandingRead;
+  try {
+    read = await readNoRepositoryLandingRecord(tx, lockedIssue, closingActor);
+  } catch (err) {
+    return noRepositoryRefusal(
+      `could not be verified at the close write (${err instanceof Error ? err.message : "unknown"}).`,
+    );
+  }
+  if (!read.ok) return read;
+  if (read.proof !== "never_had_execution_workspace") {
+    return noRepositoryRefusal("refused: the issue's workspace binding changed after the close was measured.");
+  }
+  if (rulingChangedSinceMeasurement(read.ruling, measurement.ruling)) {
+    return noRepositoryRefusal(`refused: the "${ENTRY_RULING_DOCUMENT_KEY}" document changed after the close was measured.`);
   }
   return { ok: true, measurement };
 }

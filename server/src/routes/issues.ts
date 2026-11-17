@@ -21332,6 +21332,7 @@ export function issueRoutes(
       requestedDeliveryRequirement: updateFields.deliveryRequirement,
       requestedExecutionWorkspaceId: updateFields.executionWorkspaceId,
       requestedProjectWorkspaceId: updateFields.projectWorkspaceId,
+      requestedProjectId: updateFields.projectId,
     };
     const noRepositoryLandingRefusal = (reason: string) =>
       unprocessable(reason, {
