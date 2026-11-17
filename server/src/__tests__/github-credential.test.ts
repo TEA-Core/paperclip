@@ -1978,4 +1978,46 @@ describe("parseRepoUrlRef / canonicalGitHubRepoRef — host-aware repo identity 
     expect(canonicalGitHubRepoRef("http://github.com/TEA-Core/paperclip")).not.toBeNull();
     expect(canonicalGitHubRepoRef("git@github.com:TEA-Core/paperclip.git")).not.toBeNull();
   });
+
+  // Release-assurance NO-GO at bf2a23ac: the URL form must read the same to the pattern as
+  // to the WHATWG parser every real client uses, or it is null — never a host the client
+  // would not contact.
+  it.each([
+    // The review thread's exact string: WHATWG reads host attacker.example (`\` is `/`).
+    "https://attacker.example\\@github.com/TEA-Core/paperclip",
+    "https://evil.example#@github.com/TEA-Core/paperclip",
+    "https://evil.example?@github.com/TEA-Core/paperclip",
+    "https://github.com\\TEA-Core\\paperclip",
+    "https://github.com/TEA-Core/pape\trclip",
+    "https://github.com/TEA-Core/..",
+  ])("parseRepoUrlRef refuses %j, which a WHATWG parser reads differently", (repoUrl) => {
+    expect(parseRepoUrlRef(repoUrl)).toBeNull();
+    expect(canonicalGitHubRepoRef(repoUrl)).toBeNull();
+  });
+
+  it.each([
+    "https://github.com.evil.example/TEA-Core/paperclip",
+    "https://github.com@evil.example/TEA-Core/paperclip",
+    "https://github.com:443/TEA-Core/paperclip",
+    "https://github.com./TEA-Core/paperclip",
+    // Hosts WHATWG maps onto github.com (IDNA fullwidth `ｇ`, a stripped tab, a decoded `%68`)
+    // while the registration does not literally say github.com: none may mint.
+    "https://\uFF47ithub.com/TEA-Core/paperclip",
+    "https://git\thub.com/TEA-Core/paperclip",
+    "https://git%68ub.com/TEA-Core/paperclip",
+    "https://github.com/TEA%2DCore/paperclip",
+    "https://github.com/TEA-Core/pap%65rclip",
+    `https://github.com/${"o".repeat(40)}/paperclip`,
+    `https://github.com/TEA-Core/${"r".repeat(101)}`,
+    "git@github.com:TEA%2DCore/paperclip.git",
+  ])("canonicalGitHubRepoRef refuses the non-canonical github.com lookalike %j", (repoUrl) => {
+    expect(canonicalGitHubRepoRef(repoUrl)).toBeNull();
+  });
+
+  it("canonicalGitHubRepoRef keeps userinfo forms that WHATWG also reads as github.com", () => {
+    const expected = { host: "github.com", owner: "TEA-Core", repo: "paperclip" };
+    expect(canonicalGitHubRepoRef("https://user@github.com/TEA-Core/paperclip")).toEqual(expected);
+    expect(canonicalGitHubRepoRef("https://user:pass@github.com/TEA-Core/paperclip")).toEqual(expected);
+    expect(canonicalGitHubRepoRef(`https://github.com/${"o".repeat(39)}/${"r".repeat(100)}`)).not.toBeNull();
+  });
 });

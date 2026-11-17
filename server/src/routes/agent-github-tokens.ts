@@ -15,6 +15,7 @@ import { secretService } from "../services/secrets.js";
 import {
   BROKER_GITHUB_APP_ENV,
   GITHUB_CANONICAL_HOST,
+  GITHUB_READ_ONLY_REPO_PERMISSIONS,
   canonicalGitHubRepoRef,
   normalizeRepoUrl,
   resolveAppInstallationToken,
@@ -214,7 +215,8 @@ export function agentGitHubTokenRoutes(db: Db, deps: AgentGitHubTokenRoutesDeps 
         authorization.repo,
         undefined,
         app,
-        authorization.useAssurancePermissions ? { contents: "read", metadata: "read" } : permissions,
+        // The service refuses a token whose granted scope is not exactly this set on this one repo.
+        authorization.useAssurancePermissions ? GITHUB_READ_ONLY_REPO_PERMISSIONS : permissions,
       );
 
       if (!result) {
