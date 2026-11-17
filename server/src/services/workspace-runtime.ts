@@ -6046,8 +6046,8 @@ export async function realizeExecutionWorkspace(input: {
     // SUP-24409 (RA round 2): the same protected set as exact-branch mode, not only the default.
     if (isProtectedDeliveryBranch({ branch: branchName, defaultRefs: [remoteDefaultBranch, input.base.repoRef] })) {
       throw new WorkspaceRuntimeValidationFailure(
-        `Execution workspace branch name "${branchName}" is a protected branch (main, master, a release, hotfix `
-        + "or fold branch, or a default branch of the repository). Creating a worktree on it would strand the "
+        `Execution workspace branch name "${branchName}" matches the repo's default branch or another protected branch `
+        + "(main, master, a release, hotfix or fold branch). Creating a worktree on it would strand the "
         + "primary clone and make an integration branch a card's delivery branch. "
         + 'Use a branch template that produces a unique name (e.g., "{{issue.identifier}}-{{slug}}").',
         {

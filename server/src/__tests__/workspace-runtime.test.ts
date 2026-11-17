@@ -3171,7 +3171,7 @@ describe("realizeExecutionWorkspace", () => {
       config: {
         workspaceStrategy: {
           type: "git_worktree",
-          branchTemplate: "release/{{issue.identifier}}.{{slug}}",
+          branchTemplate: "feature/{{issue.identifier}}.{{slug}}",
         },
       },
       issue: {
@@ -3186,7 +3186,7 @@ describe("realizeExecutionWorkspace", () => {
       },
     });
 
-    expect(realized.branchName).toBe("release/PAP-992.hotfix-april-1");
+    expect(realized.branchName).toBe("feature/PAP-992.hotfix-april-1");
     expect(path.basename(realized.cwd)).toBe("PAP-992.hotfix-april-1");
   });
 
@@ -14076,6 +14076,22 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
     expect(await readGit(repoRoot, ["branch", "--list", "release/PAP-9001"])).toBe("");
   });
 
+  it.each([
+    "main", "master", "release/1.2", "releases/v1", "hotfix/urgent", "fold/anything", "fold-sync/2026.11",
+  ])("refuses a branch template that renders the protected branch %s with no ref configuration naming it", async (branch) => {
+    const repoRoot = await createTempRepo();
+
+    await expect(realizeExecutionWorkspace({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "HEAD" },
+      config: { workspaceStrategy: { type: "git_worktree", branchTemplate: branch } },
+      issue: { id: "issue-pr-prep", identifier: "PAP-9001", title: "Prepare pull request for an existing branch" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: { workspaceValidation: expect.objectContaining({ reason: "branch_template_matches_default_branch", branchName: branch }) },
+    });
+  });
+
   it("refuses a branch template that renders the remote's default branch", async () => {
     const { repoRoot } = await createTempRepoWithRemote("trunk");
     await runGit(repoRoot, ["remote", "set-head", "origin", "trunk"]);
@@ -14129,9 +14145,9 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
   it("never fast-forwards an unstarted exact branch to a newer base ref", async () => {
     const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
     const oldMaster = await readGit(repoRoot, ["rev-parse", "origin/master"]);
-    await runGit(repoRoot, ["branch", "release/frozen", oldMaster]);
+    await runGit(repoRoot, ["branch", "feature/frozen", oldMaster]);
 
-    const first = await realizeExistingBranch(repoRoot, "release/frozen", { baseRef: "origin/master" });
+    const first = await realizeExistingBranch(repoRoot, "feature/frozen", { baseRef: "origin/master" });
     expect(await readGit(first.cwd, ["rev-parse", "HEAD"])).toBe(oldMaster);
 
     const newMaster = await advanceRemoteMaster(sourceRepo, remotePath, "advance.txt");
@@ -14142,7 +14158,7 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
 
     expect(reused?.cwd).toBe(first.cwd);
     expect(await readGit(first.cwd, ["rev-parse", "HEAD"])).toBe(oldMaster);
-    expect(await readGit(repoRoot, ["rev-parse", "release/frozen"])).toBe(oldMaster);
+    expect(await readGit(repoRoot, ["rev-parse", "feature/frozen"])).toBe(oldMaster);
     expect(newMaster).not.toBe(oldMaster);
   });
 
