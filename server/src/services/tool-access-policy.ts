@@ -293,8 +293,15 @@ function trustRuleIsActive(policy: typeof toolPolicies.$inferSelect, now = new D
   return true;
 }
 
-function sideEffectIdempotencyKey(ctx: ToolAccessContext, argumentsHash: string): string {
-  return `side_effect:${sha256({
+/**
+ * Derived side-effect key. Builds before full-argument hashing wrote the
+ * unversioned `side_effect:` form over a truncated-argument hash; this build
+ * writes only the `side_effect:v2:` form. The key format itself therefore
+ * records which build wrote a row: a durable marker that survives restarts
+ * and rolling deploys, unlike any process-local clock.
+ */
+function sideEffectIdempotencyKey(ctx: ToolAccessContext, argumentsHash: string, format: "v2" | "legacy"): string {
+  return `${format === "v2" ? "side_effect:v2:" : "side_effect:"}${sha256({
     companyId: ctx.companyId,
     runId: ctx.heartbeatRunId,
     issueId: ctx.issueId,
@@ -307,23 +314,20 @@ function sideEffectIdempotencyKey(ctx: ToolAccessContext, argumentsHash: string)
 }
 
 /**
- * How long a derived-key retry of a failed side-effecting call replays the
- * persisted failure. Afterwards an identical retry is recorded, authorized,
- * and executed as a new invocation, so a transient failure is not permanently
- * unretryable for the rest of the run.
+ * How long a derived-key retry replays a failure that never reached the tool
+ * (a policy denial, a rate limit, or a failure before dispatch). Afterwards an
+ * identical retry is recorded, authorized, and executed as a new invocation.
  */
 const SIDE_EFFECT_FAILURE_REPLAY_WINDOW_MS = 5 * 60_000;
 
-/** Rows recorded before this moment may carry a pre-upgrade argument hash. */
-const PROCESS_STARTED_AT_MS = Date.now();
-
 function failureReplayExpired(invocation: typeof toolInvocations.$inferSelect, now = Date.now()): boolean {
-  // timed_out: the side effect may have landed, so never re-execute it.
-  if (!["failed", "denied", "rate_limited", "cancelled"].includes(invocation.status)) return false;
-  // The provider handoff continues the original execution; keep replaying it.
-  if (invocation.errorCode === "provider_interaction_required") return false;
-  // Slack retries ride their own lifecycle (rate-limit claim, delivery check).
-  if (invocation.providerType === "paperclip_slack_chat") return false;
+  // Dispatch started (startedAt): the side effect may have landed even though
+  // the call then failed (crash, timeout, blocked result, a bookkeeping error
+  // after the tool returned), so it is never dispatched again.
+  if (invocation.startedAt) return false;
+  // A human decision (declined, or approval lifecycle) is final for the call.
+  if (invocation.approvalState !== "not_required") return false;
+  if (!["failed", "denied", "rate_limited"].includes(invocation.status)) return false;
   const settledAt = invocation.completedAt ?? invocation.updatedAt;
   return now - settledAt.getTime() >= SIDE_EFFECT_FAILURE_REPLAY_WINDOW_MS;
 }
@@ -335,29 +339,49 @@ function auditOutcome(accessDecision: ToolAccessDecision): "pending" | "success"
   return "denied";
 }
 
+/**
+ * Hash-only stand-in for a redacted value: distinct values stay distinct (and
+ * never equal the literal display marker) while the summary shows only
+ * "[REDACTED]". The digest feeds the arguments hash and is never stored alone.
+ */
+function redactedValueDigest(value: unknown): string {
+  return `[REDACTED:${createHash("sha256").update(`tool-argument-redacted:${stableStringify(value)}`).digest("hex")}]`;
+}
+
 function summarizeAndRedact(value: unknown): RedactionResult {
   const redactedFields: string[] = [];
-  const visit = (current: unknown, path: string): unknown => {
+  // `shown` is the display/summary tree; `hashed` is what the arguments hash
+  // covers. A JSON "__proto__" key is an own data property of parsed input, so
+  // `hashed` keeps it as one (plain assignment would drop it or swap the
+  // prototype), and redacted values hash by a digest of the value.
+  const visit = (current: unknown, path: string): { shown: unknown; hashed: unknown } => {
     if (typeof current === "string") {
       if (SECRET_VALUE_RE.test(current)) {
         redactedFields.push(path || "$");
-        return "[REDACTED]";
+        return { shown: "[REDACTED]", hashed: redactedValueDigest(current) };
       }
-      return current;
+      return { shown: current, hashed: current };
     }
-    if (Array.isArray(current)) return current.map((entry, index) => visit(entry, `${path}[${index}]`));
-    if (!isRecord(current)) return current;
-    const out: Record<string, unknown> = {};
+    if (Array.isArray(current)) {
+      const entries = current.map((entry, index) => visit(entry, `${path}[${index}]`));
+      return { shown: entries.map((entry) => entry.shown), hashed: entries.map((entry) => entry.hashed) };
+    }
+    if (!isRecord(current)) return { shown: current, hashed: current };
+    const shown: Record<string, unknown> = {};
+    const hashed: Record<string, unknown> = {};
     for (const [key, nested] of Object.entries(current)) {
       const nestedPath = path ? `${path}.${key}` : key;
+      let entry: { shown: unknown; hashed: unknown };
       if (SENSITIVE_KEY_RE.test(key)) {
         redactedFields.push(nestedPath);
-        out[key] = "[REDACTED]";
+        entry = { shown: "[REDACTED]", hashed: redactedValueDigest(nested) };
       } else {
-        out[key] = visit(nested, nestedPath);
+        entry = visit(nested, nestedPath);
       }
+      shown[key] = entry.shown;
+      Object.defineProperty(hashed, key, { value: entry.hashed, enumerable: true, writable: true, configurable: true });
     }
-    return out;
+    return { shown, hashed };
   };
   const truncateForDisplay = (current: unknown): unknown => {
     if (typeof current === "string") {
@@ -369,14 +393,14 @@ function summarizeAndRedact(value: unknown): RedactionResult {
     for (const [key, nested] of Object.entries(current)) out[key] = truncateForDisplay(nested);
     return out;
   };
-  const redacted = visit(value ?? {}, "");
-  const fullText = stableStringify(redacted);
-  const displayText = stableStringify(truncateForDisplay(redacted));
+  const { shown, hashed } = visit(value ?? {}, "");
+  const shownText = stableStringify(shown);
+  const displayText = stableStringify(truncateForDisplay(shown));
   return {
     summary: {
       summary: displayText.length > 4000 ? `${displayText.slice(0, 4000)}...[truncated]` : displayText,
-      sizeBytes: Buffer.byteLength(fullText),
-      sha256: createHash("sha256").update(fullText).digest("hex"),
+      sizeBytes: Buffer.byteLength(shownText),
+      sha256: createHash("sha256").update(stableStringify(hashed)).digest("hex"),
       redactedFields,
     },
     redactionPlan: {
@@ -1653,12 +1677,23 @@ export function toolAccessPolicyService(db: Db) {
     }
   }
 
-  async function invocationByIdempotencyKey(companyId: string, idempotencyKey: string) {
+  /**
+   * A recorded key belongs to the principal that recorded it: the stored row's
+   * actor type, actor id and agent id must equal the caller's. Any other
+   * caller in the company gets a bare 409 that reveals nothing of the stored
+   * outcome (no invocation id, result, provider links or failure text). The
+   * same principal's retry, in this or a later run, finds and replays its row.
+   */
+  async function callerInvocationByIdempotencyKey(ctx: ToolAccessContext, idempotencyKey: string) {
     const [existing] = await db.select().from(toolInvocations).where(and(
-      eq(toolInvocations.companyId, companyId),
+      eq(toolInvocations.companyId, ctx.companyId),
       eq(toolInvocations.idempotencyKey, idempotencyKey),
     ));
-    return existing ?? null;
+    if (!existing) return null;
+    if (existing.actorType !== ctx.actorType || existing.actorId !== ctx.actorId || existing.agentId !== ctx.agentId) {
+      throw conflict("This idempotency key is already used by another caller.", { reasonCode: "idempotency_key_conflict" });
+    }
+    return existing;
   }
 
   async function recordInvocation(input: ToolAccessDecisionInput, accessDecision: ToolAccessDecision) {
@@ -1668,9 +1703,9 @@ export function toolAccessPolicyService(db: Db) {
     const argumentsHash = redaction.summary.sha256 ?? sha256(input.request.arguments ?? {});
     const derivedKey = input.request.idempotencyKey == null && Boolean(input.request.sideEffecting);
     const idempotencyKey = input.request.idempotencyKey
-      ?? (derivedKey ? sideEffectIdempotencyKey(ctx, argumentsHash) : null);
+      ?? (derivedKey ? sideEffectIdempotencyKey(ctx, argumentsHash, "v2") : null);
     if (idempotencyKey) {
-      const existing = await invocationByIdempotencyKey(input.companyId, idempotencyKey);
+      const existing = await callerInvocationByIdempotencyKey(ctx, idempotencyKey);
       if (existing && !(derivedKey && failureReplayExpired(existing))) {
         return { invocation: existing, replayed: true, actionRequest: null };
       }
@@ -1682,22 +1717,23 @@ export function toolAccessPolicyService(db: Db) {
           .set({ idempotencyKey: null, updatedAt: new Date() })
           .where(and(eq(toolInvocations.id, existing.id), eq(toolInvocations.idempotencyKey, idempotencyKey)))
           .returning({ id: toolInvocations.id });
-        const winner = released ? null : await invocationByIdempotencyKey(input.companyId, idempotencyKey);
+        const winner = released ? null : await callerInvocationByIdempotencyKey(ctx, idempotencyKey);
         if (winner) return { invocation: winner, replayed: true, actionRequest: null };
       }
     }
-    if (derivedKey && redaction.legacyArgumentsHash !== argumentsHash) {
-      // Builds before full-argument hashing derived this key from truncated
-      // arguments. A row under that key cannot prove it recorded these exact
-      // arguments, so neither replay it (a different tail would get another
-      // call's outcome) nor re-execute (a true retry would repeat the side
-      // effect). Only rows recorded before this process started can be such
-      // rows: a row this process wrote under the same key is an exact
-      // full-argument match for other arguments (an array of exactly 50
-      // items). The key is run-scoped, so this ends with the runs that
-      // spanned the upgrade.
-      const legacy = await invocationByIdempotencyKey(input.companyId, sideEffectIdempotencyKey(ctx, redaction.legacyArgumentsHash));
-      if (legacy && legacy.createdAt.getTime() < PROCESS_STARTED_AT_MS && !failureReplayExpired(legacy)) {
+    if (derivedKey) {
+      // Only an earlier build writes the unversioned key, over the
+      // display-truncated hash. When that hash equals the full one, its row
+      // recorded exactly these arguments: replay it. Otherwise the row cannot
+      // prove it recorded these arguments, so neither replay it (a different
+      // tail would get another call's outcome) nor re-execute (a true retry
+      // would repeat the side effect). The key is run-scoped, so this ends
+      // with the runs an earlier build served.
+      const legacy = await callerInvocationByIdempotencyKey(ctx, sideEffectIdempotencyKey(ctx, redaction.legacyArgumentsHash, "legacy"));
+      if (legacy && !failureReplayExpired(legacy)) {
+        if (redaction.legacyArgumentsHash === argumentsHash) {
+          return { invocation: legacy, replayed: true, actionRequest: null };
+        }
         throw conflict(
           "A call with these arguments was recorded before argument hashing changed and cannot be matched exactly; it was neither replayed nor executed again.",
           { reasonCode: "tool_invocation_replay_ambiguous", invocationId: legacy.id },
