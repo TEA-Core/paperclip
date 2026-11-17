@@ -585,10 +585,11 @@ export interface WorkspaceDiscoveryResult {
   matched: WorkspacePullRequestMatch[];
   terminalFailure: WorkspaceDiscoveryFailure | null;
   /**
-   * SUP-24033: lower-cased `owner/repo` of every repo whose open-PR list was
-   * read successfully. A cached draft mention whose repo is absent here was never
-   * live-checked by this discovery (drafts do not contribute repo pairs), so its
-   * draft bit cannot be called stale.
+   * SUP-24033: lower-cased `owner/repo` of every repo whose open PRs were read
+   * COMPLETELY (the one 100-entry page was not full). A cached draft mention whose
+   * repo is absent here was never fully live-checked by this discovery (drafts do
+   * not contribute repo pairs; a full page may hide a live draft on a later page),
+   * so its draft bit cannot be called stale.
    */
   scannedRepos: string[];
 }
@@ -778,7 +779,9 @@ async function discoverCardPullRequestByWorkspace(
         break;
       }
 
-      scannedRepos.push(`${pair.owner}/${pair.repo}`.toLowerCase());
+      // SUP-24033: a full page means open PRs past it were never read, so the repo
+      // is NOT fully scanned and a live draft past the page stays invisible.
+      if (!listResult.pageFull) scannedRepos.push(`${pair.owner}/${pair.repo}`.toLowerCase());
       for (const item of listResult.items) {
         if (!includeDrafts && item.draft === true) continue;
         const headRef = (item.headRef ?? "").toLowerCase();
@@ -3417,7 +3420,8 @@ export type DecisionHeadResolution =
       /**
        * SUP-24033: set only on a `head_draft` refusal whose draft names ALL come
        * from cached mentions, live workspace discovery found no draft, AND that
-       * discovery actually listed every cached draft's repo. Those
+       * discovery read every cached draft's repo completely (not a full
+       * 100-entry page). Those
        * cached draft bits can be stale, so the final-delivery preflight alone
        * revalidates them live. Never set when a live-discovered draft exists:
        * a merged mention must not mask a draft the forge just reported.
@@ -4643,6 +4647,9 @@ async function fetchPullRequestHeadSha(
   return withTransientReadRetry(() => fetchPullRequestHeadShaOnce(token, owner, repo, number, signal), { signal });
 }
 
+/** The open-PR list is read as one page of this size; there is no pagination. */
+const OPEN_PULL_REQUESTS_PAGE_SIZE = 100;
+
 export interface OpenPullRequestListItem {
   number: number;
   draft: boolean | null;
@@ -4654,6 +4661,12 @@ export interface OpenPullRequestListItem {
 export interface OpenPullRequestsSuccess extends GitHubFetchResult {
   ok: true;
   items: OpenPullRequestListItem[];
+  /**
+   * SUP-24033: true when the raw response filled the whole page
+   * (`OPEN_PULL_REQUESTS_PAGE_SIZE` entries), so open PRs past this page were
+   * not read. Counted on the raw array, before malformed entries are dropped.
+   */
+  pageFull: boolean;
 }
 
 export interface OpenPullRequestsFailure extends GitHubFetchResult {
@@ -4687,7 +4700,7 @@ async function fetchOpenPullRequestsOnce(
 ): Promise<OpenPullRequestsResult> {
   const url = `${gitHubApiBase(hostname)}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
     repo,
-  )}/pulls?state=open&per_page=100`;
+  )}/pulls?state=open&per_page=${OPEN_PULL_REQUESTS_PAGE_SIZE}`;
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
     "user-agent": "paperclip-merge-arming",
@@ -4727,7 +4740,7 @@ async function fetchOpenPullRequestsOnce(
       body: typeof pr.body === "string" ? pr.body : null,
     });
   }
-  return { ok: true, status: response.status, message: null, items };
+  return { ok: true, status: response.status, message: null, items, pageFull: body.length >= OPEN_PULL_REQUESTS_PAGE_SIZE };
 }
 
 async function writeCommitStatus(

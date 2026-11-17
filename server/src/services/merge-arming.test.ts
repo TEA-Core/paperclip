@@ -2483,6 +2483,76 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         expect(result.kind).toBe("resolved");
       });
 
+      // Release-assurance T2: the open-PR list is ONE 100-entry page. A repo whose
+      // page came back full was not read completely, so a live draft past it is
+      // invisible; the stale-draft revalidation must keep the base refusal. Under
+      // a full page the mock returns only the first page, exactly as GitHub does
+      // for 101 and 250 open PRs.
+      const fillerPage = (count: number) =>
+        Array.from({ length: count }, (_, i) =>
+          openPrsListItem({ number: 1000 + i, head: { ref: `unrelated-${i}` }, title: `Unrelated ${i}`, body: null }));
+      const pageRoutes = (page: unknown[]) => [
+        { url: OPEN_PRS_LIST_URL, body: page },
+        { url: PR_URL, body: mergedMentionBody() },
+        { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+        { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+      ];
+
+      it.each([
+        ["99 open PRs (page not full): read completely, merged carrier accepted", 99, "resolved"],
+        ["exactly 100 open PRs (page full): cannot prove nothing lies past it", 100, "unresolvable"],
+        ["101 open PRs (first page returned): live draft may sit on page 2", 100, "unresolvable"],
+        ["250 open PRs (first page returned): live draft may sit on a later page", 100, "unresolvable"],
+      ] as const)("open-PR page boundary: %s (T2)", async (_label, returned, expected) => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        installRoutes(pageRoutes(fillerPage(returned)));
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe(expected);
+        if (result.kind === "unresolvable") {
+          expect(result.reason).toMatch(/^head_draft:/);
+          expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
+        }
+      });
+
+      it("counts a full page on the raw response even when malformed entries are dropped (T2)", async () => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        installRoutes(pageRoutes([...fillerPage(99), "malformed-entry"]));
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe("unresolvable");
+        if (result.kind === "unresolvable") expect(result.reason).toMatch(/^head_draft:/);
+      });
+
+      // Mention-read cap boundary: 5 cited PRs may be read, a 6th turns the
+      // revalidation off with zero live reads.
+      it.each([
+        ["5 cited PRs (at the cap): revalidated and accepted", 4, "resolved"],
+        ["6 cited PRs (over the cap): refused without any live read", 5, "unresolvable"],
+      ] as const)("mention cap boundary: %s", async (_label, extraClosed, expected) => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "open", draft: true });
+        const routes = [...pageRoutes([])];
+        for (let n = 50; n < 50 + extraClosed; n++) {
+          await insertMention(issueId, { number: n, state: "closed", headRefName: `SUP-${n}-branch` });
+          routes.push({ url: pr(n), body: closedUnmerged() });
+        }
+        installRoutes(routes);
+        mockGhFetch.mockClear();
+        installRoutes(routes);
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe(expected);
+        if (expected === "unresolvable") {
+          expect(mockGhFetch.mock.calls.filter(([url]) => /\/pulls\/\d+$/.test(String(url)))).toHaveLength(0);
+        }
+      });
+
       it("refuses when only some cached drafts are the card's own delivery", async () => {
         const issueId = await insertIssue();
         await insertMention(issueId, { number: 42, state: "open", draft: true });
