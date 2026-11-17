@@ -81,7 +81,7 @@ import {
   type WorktreeRunExecutionActivationState,
 } from "./instance-settings.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
-import { logActivity, logActivityInTransaction } from "./activity-log.js";
+import { logActivity, logActivityInTransaction, publishActivity, type ActivityPublication } from "./activity-log.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
 import { isTransactionHandle } from "./db-handle.js";
@@ -100,6 +100,8 @@ const ACTIVITY_GATE_IGNORED_ACTIONS = [
   "issue.inbox_unarchived",
   "issue.inbox_touched",
 ];
+// SUP-24205: the audit rows a routine execution writes for the card it mints.
+const ROUTINE_ISSUE_CREATED_ACTIONS = ["issue.created", "issue.created_without_parent"];
 const WEEKDAY_INDEX: Record<string, number> = {
   Sun: 0,
   Mon: 1,
@@ -1628,6 +1630,12 @@ export function routineService(
               or (${activityLog.entityType} = 'routine' and ${activityLog.entityId} = ${routine.id})
             )
           )`,
+          // The routine's own card-creation rows are not outside activity: without
+          // this a webhook/manual-fired routine would re-arm its own gate.
+          sql`not (
+            ${activityLog.action} in (${sql.join(ROUTINE_ISSUE_CREATED_ACTIONS.map((action) => sql`${action}`), sql`, `)})
+            and (${activityLog.details} ->> 'routineId') = ${routine.id}
+          )`,
           sql`not exists (
             select 1
             from ${heartbeatRuns} own_run
@@ -1971,6 +1979,80 @@ export function routineService(
       );
   }
 
+  /**
+   * SUP-24205: write the same `issue.created` (and, for an agent-created card with
+   * no parent, `issue.created_without_parent`) rows the issue POST route writes, so a
+   * routine-created card's audit trail starts at its creation and names the routine
+   * execution that minted it. Runs inside the dispatch transaction; publications are
+   * deferred to the caller so nothing is announced for a card that is rolled back.
+   */
+  async function recordRoutineIssueCreated(
+    txDb: Db,
+    input: {
+      routine: typeof routines.$inferSelect;
+      trigger: typeof routineTriggers.$inferSelect | null;
+      source: "schedule" | "manual" | "api" | "webhook";
+      actor?: Actor;
+      issue: { id: string; title: string; identifier: string | null; status: string; parentId: string | null; projectId: string | null; originKind: string | null; originId: string | null; responsibleUserId: string | null };
+      routineRunId: string;
+    },
+    publications: ActivityPublication[],
+  ) {
+    const manualActor = input.source === "manual" ? input.actor : undefined;
+    const actorUserId = manualActor?.userId ?? null;
+    const actorAgentId = actorUserId ? null : manualActor?.agentId ?? null;
+    const actorRunId = actorUserId ? null : manualActor?.runId ?? null;
+    const systemActorId = input.source === "schedule"
+      ? "routine-scheduler"
+      : input.source === "webhook"
+        ? "routine-webhook"
+        : `routine-${input.source}`;
+    const base = {
+      companyId: input.routine.companyId,
+      actorType: actorUserId ? "user" : actorAgentId ? "agent" : "system",
+      actorId: actorUserId ?? actorAgentId ?? systemActorId,
+      agentId: actorAgentId,
+      runId: actorRunId,
+      boardApiKeyId: actorUserId ? manualActor?.boardApiKeyId ?? null : null,
+      entityType: "issue",
+      entityId: input.issue.id,
+      ...(input.issue.responsibleUserId ? { responsibleUserIdOverride: input.issue.responsibleUserId } : {}),
+    } as const;
+    const routineReference = {
+      originKind: input.issue.originKind,
+      routineId: input.routine.id,
+      routineExecutionId: input.routineRunId,
+      triggerId: input.trigger?.id ?? null,
+      source: input.source,
+      ...(actorRunId ? { runId: actorRunId } : {}),
+    };
+    await logActivityInTransaction(txDb, {
+      ...base,
+      action: "issue.created",
+      details: {
+        title: input.issue.title,
+        identifier: input.issue.identifier,
+        status: input.issue.status,
+        ...routineReference,
+      },
+    }, publications);
+    if (actorAgentId && !input.issue.parentId) {
+      await logActivityInTransaction(txDb, {
+        ...base,
+        action: "issue.created_without_parent",
+        details: {
+          issueId: input.issue.id,
+          identifier: input.issue.identifier,
+          companyId: input.routine.companyId,
+          projectId: input.issue.projectId ?? null,
+          actorAgentId,
+          hasBlockedByIssueIds: false,
+          ...routineReference,
+        },
+      }, publications);
+    }
+  }
+
   async function dispatchRoutineRun(input: {
     routine: typeof routines.$inferSelect;
     trigger: typeof routineTriggers.$inferSelect | null;
@@ -2051,6 +2133,7 @@ export function routineService(
       description,
     });
     let reusedExistingRun = false;
+    const createdActivityPublications: ActivityPublication[] = [];
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
@@ -2247,6 +2330,15 @@ export function routineService(
           return updated ?? createdRun;
         }
 
+        await recordRoutineIssueCreated(txDb, {
+          routine: input.routine,
+          trigger: input.trigger,
+          source: input.source,
+          actor: input.actor,
+          issue: createdIssue,
+          routineRunId: createdRun.id,
+        }, createdActivityPublications);
+
         // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
         await queueIssueAssignmentWakeup({
           heartbeat,
@@ -2272,6 +2364,13 @@ export function routineService(
         return updated ?? createdRun;
       } catch (error) {
         if (createdIssue) {
+          // The card is discarded, so its creation audit rows go with it.
+          createdActivityPublications.length = 0;
+          await txDb.delete(activityLog).where(and(
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, createdIssue.id),
+            inArray(activityLog.action, ROUTINE_ISSUE_CREATED_ACTIONS),
+          ));
           await txDb.delete(issues).where(eq(issues.id, createdIssue.id));
         }
         const failureReason = error instanceof Error ? error.message : String(error);
@@ -2290,6 +2389,8 @@ export function routineService(
         return failed ?? createdRun;
       }
     });
+
+    for (const publication of createdActivityPublications) publishActivity(publication);
 
     if (!reusedExistingRun && (input.source === "schedule" || input.source === "webhook")) {
       const actorId = input.source === "schedule" ? "routine-scheduler" : "routine-webhook";

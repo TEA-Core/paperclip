@@ -35,6 +35,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { activityService } from "../services/activity.ts";
 import { issueService } from "../services/issues.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import * as providerRegistry from "../secrets/provider-registry.ts";
@@ -3000,5 +3001,145 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .where(eq(issues.id, defaultRun.linkedIssueId!))
       .then((rows) => rows[0] ?? null);
     expect(defaultIssue?.deliveryRequirement).toBe("repository_delivery");
+  });
+
+  describe("issue.created audit rows for routine-created cards (SUP-24205)", () => {
+    async function issueActivity(companyId: string, issueId: string, action: string) {
+      const rows = await activityService(db).list({ companyId, entityId: issueId, limit: 100 });
+      return rows.filter((row) => row.action === action);
+    }
+
+    it("writes exactly one system issue.created row carrying the routine execution for a scheduled card", async () => {
+      const { companyId, routine, svc } = await seedFixture();
+
+      const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+      expect(run.status).toBe("issue_created");
+      const issueId = run.linkedIssueId!;
+      const created = await issueActivity(companyId, issueId, "issue.created");
+      expect(created).toHaveLength(1);
+      expect(created[0]).toMatchObject({
+        actorType: "system",
+        actorId: "routine-scheduler",
+        entityType: "issue",
+        entityId: issueId,
+        runId: null,
+        details: {
+          title: "ascii frog",
+          routineId: routine.id,
+          routineExecutionId: run.id,
+          originKind: "routine_execution",
+          source: "schedule",
+        },
+      });
+      // No agent created the card, so the agent-orphan observability row stays off.
+      expect(await issueActivity(companyId, issueId, "issue.created_without_parent")).toHaveLength(0);
+    });
+
+    it("attributes a user-triggered run to the user and writes a single row", async () => {
+      const { companyId, routine, svc } = await seedFixture();
+
+      const run = await svc.runRoutine(routine.id, { source: "manual" }, { userId: "board-user" });
+
+      const created = await issueActivity(companyId, run.linkedIssueId!, "issue.created");
+      expect(created).toHaveLength(1);
+      expect(created[0]).toMatchObject({
+        actorType: "user",
+        actorId: "board-user",
+        details: { routineId: routine.id, routineExecutionId: run.id, source: "manual" },
+      });
+      expect(await issueActivity(companyId, run.linkedIssueId!, "issue.created_without_parent")).toHaveLength(0);
+    });
+
+    it("carries the creating agent run and writes created_without_parent for a parentless agent-triggered card", async () => {
+      const { agentId, companyId, routine, svc } = await seedFixture();
+      const creatingRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: creatingRunId,
+        companyId,
+        agentId,
+        status: "running",
+      });
+
+      const run = await svc.runRoutine(routine.id, { source: "manual" }, { agentId, runId: creatingRunId });
+
+      const issueId = run.linkedIssueId!;
+      const created = await issueActivity(companyId, issueId, "issue.created");
+      expect(created).toHaveLength(1);
+      expect(created[0]).toMatchObject({
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        runId: creatingRunId,
+        details: { routineId: routine.id, routineExecutionId: run.id, runId: creatingRunId },
+      });
+      const orphan = await issueActivity(companyId, issueId, "issue.created_without_parent");
+      expect(orphan).toHaveLength(1);
+      expect(orphan[0]).toMatchObject({
+        actorType: "agent",
+        runId: creatingRunId,
+        details: { issueId, companyId, actorAgentId: agentId, routineExecutionId: run.id },
+      });
+    });
+
+    it("writes no created_without_parent row when the routine card has a parent", async () => {
+      const { agentId, companyId, projectId, routine, svc } = await seedFixture();
+      const parentId = randomUUID();
+      await db.insert(issues).values({ id: parentId, companyId, projectId, title: "Parent" });
+      await svc.update(routine.id, { parentIssueId: parentId }, {});
+
+      const run = await svc.runRoutine(routine.id, { source: "manual" }, { agentId });
+
+      const issueId = run.linkedIssueId!;
+      expect(await issueActivity(companyId, issueId, "issue.created")).toHaveLength(1);
+      expect(await issueActivity(companyId, issueId, "issue.created_without_parent")).toHaveLength(0);
+    });
+
+    it("writes one row per card: a coalesced run adds none", async () => {
+      const { routine, svc } = await seedFixture();
+
+      const first = await svc.runRoutine(routine.id, { source: "schedule" });
+      const second = await svc.runRoutine(routine.id, { source: "schedule" });
+
+      expect(second.status).toBe("coalesced");
+      expect(second.linkedIssueId).toBe(first.linkedIssueId);
+      const rows = await db
+        .select({ id: activityLog.id, entityId: activityLog.entityId })
+        .from(activityLog)
+        .where(eq(activityLog.action, "issue.created"));
+      expect(rows).toEqual([expect.objectContaining({ entityId: first.linkedIssueId })]);
+    });
+
+    it("leaves no issue.created row behind when the execution fails and the card is rolled back", async () => {
+      const { routine, svc } = await seedFixture({
+        wakeup: async () => {
+          throw new Error("queue unavailable");
+        },
+      });
+
+      const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+      expect(run.status).toBe("failed");
+      const rows = await db
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(eq(activityLog.action, "issue.created"));
+      expect(rows).toHaveLength(0);
+    });
+
+    it("does not let a routine's own issue.created row re-fire its activity gate", async () => {
+      const { routine, svc } = await seedFixture();
+
+      const run = await svc.runRoutine(routine.id, { source: "manual" }, { userId: "board-user" });
+      const windowStart = run.triggeredAt;
+      await db
+        .update(activityLog)
+        .set({ createdAt: new Date(windowStart.getTime() + 1_000) })
+        .where(eq(activityLog.entityId, run.linkedIssueId!));
+
+      await expect(
+        svc.evaluateActivityGate(routine, new Date(windowStart.getTime() + 5_000)),
+      ).resolves.toMatchObject({ fire: false, matchedActivity: null });
+    });
   });
 });
