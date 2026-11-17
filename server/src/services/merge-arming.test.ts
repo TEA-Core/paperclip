@@ -2491,7 +2491,8 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       const fillerPage = (count: number) =>
         Array.from({ length: count }, (_, i) =>
           openPrsListItem({ number: 1000 + i, head: { ref: `unrelated-${i}` }, title: `Unrelated ${i}`, body: null }));
-      const pageRoutes = (page: unknown[]) => [
+      type TestRoute = { url: string | RegExp; body?: unknown; ok?: boolean; status?: number };
+      const pageRoutes = (page: unknown[]): TestRoute[] => [
         { url: OPEN_PRS_LIST_URL, body: page },
         { url: PR_URL, body: mergedMentionBody() },
         { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
@@ -2536,7 +2537,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       ] as const)("mention cap boundary: %s", async (_label, extraClosed, expected) => {
         const issueId = await insertIssue();
         await insertMention(issueId, { number: 42, state: "open", draft: true });
-        const routes = [...pageRoutes([])];
+        const routes: TestRoute[] = [...pageRoutes([])];
         for (let n = 50; n < 50 + extraClosed; n++) {
           await insertMention(issueId, { number: n, state: "closed", headRefName: `SUP-${n}-branch` });
           routes.push({ url: pr(n), body: closedUnmerged() });
