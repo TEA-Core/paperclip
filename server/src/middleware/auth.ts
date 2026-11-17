@@ -21,11 +21,18 @@ import {
   rekeyCompanyIssueIdentifiers,
 } from "../services/issue-prefix.js";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
+import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
 import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { captureRunIdentity } from "../services/run-identity.js";
 import { boardAuthService } from "../services/board-auth.js";
+import { retryIdempotentDatabaseOperation } from "../database-retry.js";
+
+export {
+  isTransientDbConnectionError,
+  retryIdempotentDatabaseOperation as retryOnTransientDbConnectionError,
+} from "../database-retry.js";
 
 const CLOUD_TENANT_WRITE_DEBOUNCE_MS = 5_000;
 const CLOUD_TENANT_WRITE_DEBOUNCE_MAX = 1_000;
@@ -56,7 +63,6 @@ function pruneCloudTenantWriteDebounce(
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import { forbidden, unauthorized, unprocessable } from "../errors.js";
-import { isTransientDbConnectionError } from "../lib/db-connection-errors.js";
 
 export { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { cloudTenantPrimaryCompanyId } from "../services/cloud-instance.js";
@@ -220,7 +226,7 @@ const publicMcpGatewayProtocolPath = /^\/mcp\/gateways\/gw_[a-f0-9]{32}\/?$/i;
 
 export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
   const boardAuth = boardAuthService(db);
-  return async (req, res, rawNext) => {
+  const authenticate = async (req: Parameters<RequestHandler>[0], res: Parameters<RequestHandler>[1], rawNext: Parameters<RequestHandler>[2]) => {
     // A release request whose clock ran out has been answered (see releaseRequestClock): authentication that
     // is still running must neither write anything (the key's usage stamp) nor hand the request on.
     const clockExpired = () => (res.locals?.releaseClock as { expired?: boolean } | undefined)?.expired === true;
@@ -405,13 +411,15 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       }
 
       const [identityRun] = await db.select({ activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
-        responsibleUserId: heartbeatRuns.responsibleUserId, status: heartbeatRuns.status,
+        responsibleUserId: heartbeatRuns.responsibleUserId, status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson,
         contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
           eq(heartbeatRuns.id, claims.run_id), eq(heartbeatRuns.companyId, claims.company_id), eq(heartbeatRuns.agentId, claims.sub),
         ));
-      if (identityRun?.status === "cancelled" && identityRun.contextSnapshot?.conversationMode === true
+      if (agentRunWritesRevoked(identityRun)
         && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
-        res.status(403).json({ error: "This conversation turn was cancelled", code: "conversation_turn_cancelled" });
+        const conversation = identityRun?.contextSnapshot?.conversationMode === true;
+        res.status(403).json({ error: conversation ? "This conversation turn was cancelled" : "This run was cancelled",
+          code: conversation ? "conversation_turn_cancelled" : "agent_run_cancelled" });
         return;
       }
       if (identityRun?.activeIdentityContextId && identityRun.status === "running") {
@@ -505,6 +513,13 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
 
     next();
   };
+  // Express 4 ignores async rejections: a throw (e.g. a run cancelled mid-auth) must reach the error handler, not crash the process.
+  return (req, res, next) => {
+    // Once a release request's clock has answered it, a failed lookup (the cancelled query) is not an error to report.
+    authenticate(req, res, next).catch((err) => {
+      if ((res.locals?.releaseClock as { expired?: boolean } | undefined)?.expired !== true) next(err);
+    });
+  };
 }
 
 /**
@@ -555,28 +570,6 @@ export function cloudActorHeaderSourceFromHeaders(
   };
 }
 
-export { isTransientDbConnectionError };
-
-/**
- * Runs `run` and retries it up to twice when it fails on a transient
- * connection error. Two replays, not one: when a pooled endpoint
- * suspends or recycles, EVERY pooled socket is dead at once, so the first
- * replay can draw another stale socket from the pool and fail identically
- * (observed 2026-09-12: retried actor resolution still surfacing
- * CONNECTION_CLOSED). The short pause gives the driver time to notice and
- * re-dial. Callers must pass an idempotent operation. Exported for tests.
- */
-export async function retryOnTransientDbConnectionError<T>(run: () => Promise<T>): Promise<T> {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      return await run();
-    } catch (error) {
-      if (attempt >= 2 || !isTransientDbConnectionError(error)) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
-    }
-  }
-}
-
 /**
  * Trusted-header actor resolution with bounded transient-connection retries.
  * The tenant sync inside is idempotent end to end — every write is an
@@ -588,7 +581,7 @@ export async function resolveCloudTenantActor(
   db: Db,
   req: CloudActorHeaderSource,
 ): Promise<Express.Request["actor"] | null> {
-  return retryOnTransientDbConnectionError(() => resolveCloudTenantActorOnce(db, req));
+  return retryIdempotentDatabaseOperation(() => resolveCloudTenantActorOnce(db, req));
 }
 
 async function resolveCloudTenantActorOnce(
