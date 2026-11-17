@@ -1451,6 +1451,16 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(comments[0]?.body).toContain("[Terminal workspace cleanup escalation]");
     expect(comments[0]?.body).toContain(seeded.executionWorkspaceId);
     expect(comments[0]?.body).toContain("the git worktree changed after delivery was verified");
+    // The comment states only what is true today and names no hand remedy.
+    expect(comments[0]?.body).toContain(
+      "What this means: the workspace stays in cleanup_failed. Its worktree, branch and files stay as they are.",
+    );
+    expect(comments[0]?.body).toContain("Who looks at it: the board and the assignee of this issue.");
+    expect(comments[0]?.body).toContain(
+      "How it is removed: only the terminal workspace sweep removes a stranded worktree, and only when its cleanup gate proves that the work landed and the worktree is clean.",
+    );
+    expect(comments[0]?.body).toContain("This comment does not ask anyone to delete, archive or return the workspace.");
+    expect(comments[0]?.body).not.toMatch(/discard|delivered again|must decide/i);
     expect(await terminalCleanupEscalations(seeded.executionWorkspaceId)).toEqual([
       {
         action: "execution_workspace.issue_terminal_cleanup_escalated",
@@ -1937,12 +1947,15 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     }, 30_000);
   });
 
-  it("does not let already-escalated stranded rows fill the escalation batch", async () => {
+  it.each([
+    { name: "already-escalated stranded rows", olderSourceStatus: "done", olderEscalated: true },
+    { name: "stranded rows whose source issue reopened", olderSourceStatus: "in_progress", olderEscalated: false },
+  ])("does not let $name fill the escalation batch", async ({ olderSourceStatus, olderEscalated }) => {
     const seeded = await seedTerminalWorkspace();
     const determinateReason =
       "issue_terminal | Refusing terminal workspace cleanup because the git worktree changed after delivery was verified";
     const generationOne = { [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 1 };
-    // A full batch of older stranded rows that were escalated before.
+    // A full batch of older stranded rows that the escalation must skip.
     const older = Array.from({ length: TERMINAL_CLEANUP_ESCALATION_BATCH_LIMIT }, (_, index) => ({
       workspaceId: randomUUID(),
       issueId: randomUUID(),
@@ -1958,7 +1971,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectId: seeded.projectId,
       identifier: `${company!.issuePrefix}-${row.index + 100}`,
       title: `Escalated source ${row.index}`,
-      status: "done",
+      status: olderSourceStatus,
       priority: "medium",
     })));
     await db.insert(executionWorkspaces).values(older.map((row) => ({
@@ -1975,15 +1988,17 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       metadata: generationOne,
       updatedAt: new Date("2019-01-01T00:00:00Z"),
     })));
-    await db.insert(activityLog).values(older.map((row) => ({
-      companyId: seeded.companyId,
-      actorType: "system",
-      actorId: "workspace_terminality_reaper",
-      action: "execution_workspace.issue_terminal_cleanup_escalated",
-      entityType: "execution_workspace",
-      entityId: row.workspaceId,
-      details: { sourceIssueId: row.issueId, lifecycleGeneration: 1 },
-    })));
+    if (olderEscalated) {
+      await db.insert(activityLog).values(older.map((row) => ({
+        companyId: seeded.companyId,
+        actorType: "system",
+        actorId: "workspace_terminality_reaper",
+        action: "execution_workspace.issue_terminal_cleanup_escalated",
+        entityType: "execution_workspace",
+        entityId: row.workspaceId,
+        details: { sourceIssueId: row.issueId, lifecycleGeneration: 1 },
+      })));
+    }
     // The newest stranded row sorts after the whole older batch.
     await db
       .update(executionWorkspaces)
@@ -1999,6 +2014,19 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(await sourceIssueComments(seeded.sourceIssueId)).toHaveLength(1);
     expect(await terminalCleanupEscalations(seeded.executionWorkspaceId)).toHaveLength(1);
   });
+
+  // Postgres exposes no event for "a session is waiting on this lock", so poll
+  // pg_locks until another session's advisory lock request is queued.
+  async function waitForAdvisoryLockWaiter(): Promise<boolean> {
+    for (let attempt = 0; attempt < 400; attempt += 1) {
+      const rows = Array.from(await db.execute(
+        sql`select count(*)::int as waiting from pg_locks where locktype = 'advisory' and not granted`,
+      )) as Array<{ waiting: number }>;
+      if ((rows[0]?.waiting ?? 0) > 0) return true;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return false;
+  }
 
   it("does not escalate a row that leaves the stranded state while the escalation waits for its lock", async () => {
     const seeded = await seedTerminalWorkspace();
@@ -2038,16 +2066,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     // The escalation still selects the row (the archive is uncommitted), then
     // waits for the lock.
     const escalation = svc.escalateStrandedTerminalCleanups();
-    // Postgres exposes no event for "a session is waiting on this lock", so poll
-    // pg_locks until the escalation's lock request is queued.
-    let sawWaiter = false;
-    for (let attempt = 0; attempt < 400 && !sawWaiter; attempt += 1) {
-      const rows = Array.from(await db.execute(
-        sql`select count(*)::int as waiting from pg_locks where locktype = 'advisory' and not granted`,
-      )) as Array<{ waiting: number }>;
-      sawWaiter = (rows[0]?.waiting ?? 0) > 0;
-      if (!sawWaiter) await new Promise((resolve) => setTimeout(resolve, 25));
-    }
+    const sawWaiter = await waitForAdvisoryLockWaiter();
     releaseLock();
     await holder;
 
@@ -2055,6 +2074,144 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(await escalation).toEqual({ escalated: 0, failed: 0 });
     expect(await sourceIssueComments(seeded.sourceIssueId)).toEqual([]);
     expect(await terminalCleanupEscalations(seeded.executionWorkspaceId)).toEqual([]);
+  });
+
+  it("does not escalate a row whose source issue reopens while the escalation waits for its lock", async () => {
+    const seeded = await seedTerminalWorkspace();
+    await db
+      .update(executionWorkspaces)
+      .set({
+        status: "cleanup_failed",
+        cleanupReason:
+          "issue_terminal | Refusing terminal workspace cleanup because the git worktree changed after delivery was verified",
+        metadata: { [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 1 },
+      })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    let signalLocked!: () => void;
+    const locked = new Promise<void>((resolve) => {
+      signalLocked = resolve;
+    });
+    let releaseLock!: () => void;
+    const released = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    // Hold the workspace lifecycle lock without changing the workspace row.
+    const holder = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${seeded.executionWorkspaceId}`}, 0))`,
+      );
+      signalLocked();
+      await released;
+    });
+    await locked;
+
+    // The escalation selects the row while the source issue is done, then waits.
+    const escalation = svc.escalateStrandedTerminalCleanups();
+    const sawWaiter = await waitForAdvisoryLockWaiter();
+    // The source issue reopens before the escalation gets the lock.
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, seeded.sourceIssueId));
+    releaseLock();
+    await holder;
+
+    expect(sawWaiter).toBe(true);
+    expect(await escalation).toEqual({ escalated: 0, failed: 0 });
+    expect(await sourceIssueComments(seeded.sourceIssueId)).toEqual([]);
+    // No marker, so the generation can still be escalated if the issue closes again.
+    expect(await terminalCleanupEscalations(seeded.executionWorkspaceId)).toEqual([]);
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, seeded.sourceIssueId));
+    expect(await svc.escalateStrandedTerminalCleanups()).toEqual({ escalated: 1, failed: 0 });
+  });
+
+  // A cleanup that returns cleaned: false with no warning records the bare
+  // reason "issue_terminal" (no " | " suffix).
+  async function strandWithBareReason(executionWorkspaceId: string) {
+    await db
+      .update(executionWorkspaces)
+      .set({
+        status: "cleanup_failed",
+        closedAt: new Date("2026-01-02T00:00:00Z"),
+        updatedAt: new Date("2026-01-02T00:00:00Z"),
+        cleanupReason: "issue_terminal",
+        metadata: { [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 1 },
+      })
+      .where(eq(executionWorkspaces.id, executionWorkspaceId));
+  }
+
+  async function insertTaggedCleanupFailures(seeded: { companyId: string; executionWorkspaceId: string; sourceIssueId: string }) {
+    await db.insert(activityLog).values(Array.from({ length: TERMINAL_CLEANUP_MAX_ATTEMPTS }, () => ({
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "workspace_terminality_reaper",
+      action: "execution_workspace.issue_terminal_cleanup_failed",
+      entityType: "execution_workspace",
+      entityId: seeded.executionWorkspaceId,
+      details: { sourceIssueId: seeded.sourceIssueId, failure: "cleanup did not complete", lifecycleGeneration: 1 },
+    })));
+  }
+
+  it("retries a cleanup_failed row whose reason is the bare issue_terminal", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
+    await strandWithBareReason(seeded.executionWorkspaceId);
+    let cleanupAttempts = 0;
+    const refusingService = executionWorkspaceService(db, {
+      workspaceReaperCooldownDays: 0,
+      beforeTerminalWorkspaceCleanup: async () => {
+        cleanupAttempts += 1;
+        throw new Error("git worktree cleanup lock is already held");
+      },
+    });
+
+    const sweep = await refusingService.sweepTerminalWorkspaces();
+
+    expect(sweep).toMatchObject({ checked: 1, cleanupFailed: 1, archived: 0 });
+    expect(cleanupAttempts).toBe(1);
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  });
+
+  it("escalates a cleanup_failed row whose reason is the bare issue_terminal at the attempt ceiling", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
+    await strandWithBareReason(seeded.executionWorkspaceId);
+    await insertTaggedCleanupFailures(seeded);
+
+    expect(await svc.escalateStrandedTerminalCleanups()).toEqual({ escalated: 1, failed: 0 });
+    const comments = await sourceIssueComments(seeded.sourceIssueId);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Refusal: cleanup did not complete");
+    expect((await terminalCleanupEscalations(seeded.executionWorkspaceId)).map((row) => row.details)).toEqual([
+      {
+        sourceIssueId: seeded.sourceIssueId,
+        failure: "cleanup did not complete",
+        cause: "attempt_ceiling",
+        lifecycleGeneration: 1,
+        commentId: comments[0]?.id,
+      },
+    ]);
+  });
+
+  it.each([
+    { name: "an archived row with the bare issue_terminal reason", status: "archived", cleanupReason: "issue_terminal" as string | null },
+    { name: "a cleanup_failed row with another reason prefix", status: "cleanup_failed", cleanupReason: "issue_terminal_other" },
+    { name: "a cleanup_failed row with no reason", status: "cleanup_failed", cleanupReason: null },
+  ])("does not newly retry or escalate $name", async (row) => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true, publish: true });
+    await db
+      .update(executionWorkspaces)
+      .set({
+        status: row.status,
+        closedAt: new Date("2026-01-02T00:00:00Z"),
+        updatedAt: new Date("2026-01-02T00:00:00Z"),
+        cleanupReason: row.cleanupReason,
+        metadata: { [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]: 1 },
+      })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    await insertTaggedCleanupFailures(seeded);
+
+    const sweep = await svc.sweepTerminalWorkspaces();
+
+    expect(sweep).toMatchObject({ checked: 0, escalated: 0 });
+    expect(await svc.escalateStrandedTerminalCleanups()).toEqual({ escalated: 0, failed: 0 });
+    expect(await sourceIssueComments(seeded.sourceIssueId)).toEqual([]);
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   });
 
   it("retries a determinate refusal again after the recorded cleanup state changes", async () => {

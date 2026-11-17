@@ -117,6 +117,18 @@ export const TERMINAL_CLEANUP_ESCALATION_MARKER = "[Terminal workspace cleanup e
 // they never fill the batch and starve a newly stranded row.
 export const TERMINAL_CLEANUP_ESCALATION_BATCH_LIMIT = 100;
 const TERMINAL_CLEANUP_ACTOR_ID = "workspace_terminality_reaper";
+// Failure text for a cleanup that returns cleaned: false with no warning. That
+// refusal records the bare reason "issue_terminal".
+const TERMINAL_CLEANUP_NO_DETAIL_FAILURE = "cleanup did not complete";
+
+// A terminal cleanup failure reason: "issue_terminal | <failure>", or the bare
+// "issue_terminal" that a refusal with no warning records.
+function terminalCleanupFailureReasonSql() {
+  return sql<boolean>`(
+    ${executionWorkspaces.cleanupReason} = ${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON}
+    OR ${executionWorkspaces.cleanupReason} LIKE 'issue_terminal | %'
+  )`;
+}
 
 // The row's lifecycle generation as jsonb, read the same way as
 // readExecutionWorkspaceLifecycleGeneration: a missing or non-number value is 0.
@@ -184,8 +196,10 @@ function buildTerminalCleanupEscalationComment(input: {
   if (input.branchName) lines.push(`Branch: ${input.branchName}`);
   lines.push(
     "",
-    "A person or agent must decide if the worktree is kept, delivered again, or discarded.",
-    "Paperclip did not change, clean, remove, return or discard the workspace or its worktree.",
+    "What this means: the workspace stays in cleanup_failed. Its worktree, branch and files stay as they are.",
+    "Who looks at it: the board and the assignee of this issue.",
+    "How it is removed: only the terminal workspace sweep removes a stranded worktree, and only when its cleanup gate proves that the work landed and the worktree is clean.",
+    "This comment does not ask anyone to delete, archive or return the workspace.",
   );
   return lines.join("\n");
 }
@@ -2449,8 +2463,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   }): Promise<boolean> {
     // issues.ts imports this module, so a static import would form a cycle.
     const { issueService } = await import("./issues.js");
-    const prefix = `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | `;
-    const failure = candidate.cleanupReason.slice(prefix.length);
+    const failure = candidate.cleanupReason === ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON
+      ? TERMINAL_CLEANUP_NO_DETAIL_FAILURE
+      : candidate.cleanupReason.slice(`${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | `.length);
     const cause = candidate.cleanupReason === TERMINAL_CLEANUP_WORKTREE_CHANGED_REASON
       ? "determinate_refusal" as const
       : "attempt_ceiling" as const;
@@ -2480,6 +2495,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       ) {
         return false;
       }
+      // Re-read the source issue under the same lock: a reopen after candidate
+      // selection must not post a comment or use this generation's marker.
+      const [source] = await tx
+        .select({ status: issues.status })
+        .from(issues)
+        .where(and(eq(issues.id, candidate.sourceIssueId), eq(issues.companyId, candidate.companyId)));
+      if (!source || !TERMINAL_ISSUE_STATUSES.has(source.status)) return false;
       const escalations = await countTerminalCleanupActivity(txDb, {
         companyId: candidate.companyId,
         workspaceId: candidate.id,
@@ -2543,7 +2565,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       ))
       .where(and(
         eq(executionWorkspaces.status, "cleanup_failed"),
-        sql<boolean>`${executionWorkspaces.cleanupReason} LIKE 'issue_terminal | %'`,
+        terminalCleanupFailureReasonSql(),
         inArray(issues.status, ["done", "cancelled"]),
         or(
           eq(executionWorkspaces.cleanupReason, TERMINAL_CLEANUP_WORKTREE_CHANGED_REASON),
@@ -3511,7 +3533,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       // measured from the row's last write.
       // One narrow exception (terminalCleanupBranchMismatchRetryFilter): a
       // determinate refusal on a row that records a branch and a merged PR, and
-      // has no escalation in this lifecycle, gets one more attempt. The refusal
+      // has no escalation in this lifecycle, gets a cleanup attempt on each sweep
+      // until the end-of-sweep escalation records its marker. The refusal
       // can come from the recorded branch alone (the branch is gone after the
       // merge), which the cleanup gate may accept only when it proves the
       // HEAD landed and the worktree clean; otherwise it refuses and nothing is
@@ -3535,7 +3558,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       );
       const terminalCleanupRetryFilter = and(
         eq(executionWorkspaces.status, "cleanup_failed"),
-        sql<boolean>`${executionWorkspaces.cleanupReason} LIKE 'issue_terminal | %'`,
+        terminalCleanupFailureReasonSql(),
         sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
         or(
           and(
@@ -3902,10 +3925,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         }
         if (workspace.status === "cleanup_failed") {
           if (workspace.cleanupReason === TERMINAL_CLEANUP_WORKTREE_CHANGED_REASON) {
-            // The retry filter lets a determinate refusal through once. Attempt
-            // it only when the checked-out branch differs from the recorded
-            // branch, the one cause that a later cleanup gate can accept. Any
-            // other cause stands, and the end-of-sweep escalation surfaces it.
+            // The retry filter lets a determinate refusal through until it is
+            // escalated. Attempt it only when the checked-out branch differs from
+            // the recorded branch (a detached HEAD or a failed read gives null),
+            // the one cause that the cleanup gate can accept; the gate checks the
+            // branch again. Any other cause stands, and the end-of-sweep
+            // escalation surfaces it.
             const checkedOutBranch = git?.repoRoot && git.workspacePath
               ? await readGitStdout(["symbolic-ref", "--quiet", "--short", "HEAD"], git.workspacePath).catch(() => null)
               : undefined;
@@ -3940,7 +3965,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               result.cleanupFailed += 1;
               await logTerminalCleanupFailure(
                 workspace,
-                cleanup.warnings.join(" | ") || "cleanup did not complete",
+                cleanup.warnings.join(" | ") || TERMINAL_CLEANUP_NO_DETAIL_FAILURE,
                 capturedGeneration,
               );
               continue;
@@ -4149,7 +4174,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             result.cleanupFailed += 1;
             await logTerminalCleanupFailure(
               archived,
-              cleanup.warnings.join(" | ") || "cleanup did not complete",
+              cleanup.warnings.join(" | ") || TERMINAL_CLEANUP_NO_DETAIL_FAILURE,
               capturedGeneration,
             );
           }

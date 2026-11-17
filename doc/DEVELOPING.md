@@ -1686,8 +1686,12 @@ Environment overrides:
   delivery was verified: the sweep records it once and reconsiders it only after
   the row's status or cleanup reason changes. One exception: when the row records
   a branch and a merged PR, has no escalation yet, and the checked-out branch
-  differs from the recorded branch, the sweep makes one more attempt under the
-  same gates before it escalates. By owner decision 2026-11-16, that attempt may remove a
+  differs from the recorded branch (a detached HEAD or a failed branch read counts
+  as different; the cleanup gate then checks the branch again), the sweep makes a
+  cleanup attempt under the same gates. The sweep selects that row again on each
+  sweep until the end-of-sweep escalation records its marker; one escalation pass
+  marks at most 100 rows, so with more than 100 stranded rows a row can get an
+  attempt on more than one sweep. By owner decision 2026-11-16, that attempt may remove a
   stranded worktree only when the cleanup gate proves it landed and clean: a recorded merged PR,
   the recorded branch absent as a local ref, HEAD landed (an ancestor of the base ref, or equal to
   the head SHA of a recorded merged PR), 0 commits missing from every remote, no tracked changes,
@@ -1696,11 +1700,16 @@ Environment overrides:
   row is refused and escalated and is never removed. The escalation runs after candidate selection
   on purpose, so a row this attempt removes is intentionally not escalated. Other refusals are retried at most
   5 times per archive lifecycle, with a backoff of 10 minutes doubling after each
-  attempt. A stranded row gets one system comment on its source issue and one
+  attempt. A `cleanup_failed` row whose reason is the bare `issue_terminal` (a
+  cleanup that kept the directory without a warning) counts as such a refusal. A
+  stranded row gets one system comment on its source issue and one
   `execution_workspace.issue_terminal_cleanup_escalated` activity row; the
   escalation and the backfill never write the workspace row and never call a cleanup, removal,
-  release or return function. Services remain running while deletion is
-  refused.
+  release or return function. The escalation re-reads the source issue under the
+  workspace lifecycle lock and skips a reopened issue. Runtime services stay running
+  when the git-state checks refuse the cleanup, because those checks run before the
+  services stop; a refusal raised later, such as a runtime-created local directory
+  that artifact cleanup keeps, comes after the services were stopped.
   Turning the flag off prevents further widened deletion; it cannot restore
   directories or runtime-owned branches already removed.
 - `PAPERCLIP_WORKSPACE_REAPER_DRY_RUN=1` (or `true`, `yes`) runs the reaper
