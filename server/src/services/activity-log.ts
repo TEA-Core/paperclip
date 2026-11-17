@@ -190,9 +190,9 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
   // agent API key can only claim a run through the unauthenticated
   // x-paperclip-run-id header, so that header is never copied into an
   // issue.updated activity row. Other actions keep their attribution.
-  const authenticatedRun = run?.row && input.action === "issue.updated" && (input.actorType === "user" || input.agentApiKeyId)
-    ? null
-    : run;
+  const authenticatedRun = run?.row
+    ? (input.action === "issue.updated" && (input.actorType === "user" || input.agentApiKeyId) ? null : run)
+    : null;
   const responsibleUserId = input.responsibleUserIdOverride !== undefined
     ? readNonEmptyString(input.responsibleUserIdOverride)
     : input.actorType === "user"
