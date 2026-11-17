@@ -5924,8 +5924,11 @@ export async function createAuthorityGuard(
  *   - nothing else in the company can claim the branch: no other execution-workspace
  *     row carries it (case-insensitive), and no other issue binds the card's row while
  *     it is sourceless (that issue would own it too); and
- *   - the branch is not protected (`isProtectedDeliveryBranch`): not the fold branch
- *     family, the row's base ref, or a default/repo ref of the project's workspaces.
+ *   - the branch is not protected (`isProtectedDeliveryBranch`): never main, master,
+ *     release/*, releases/*, hotfix/*, fold/* or fold-sync/*, never a branch on a
+ *     project_primary row, and never the row's base ref or a default/repo ref of the
+ *     card's or the row's project, read in the same snapshot (RA round 2: a separate
+ *     read let a default ref changed in between slip through).
  * Every accept here is also a mint-time accept at the snapshot: resolveDeliveryIdentity
  * resolves the same row's repo and branch, and its branchIsOwn is this row's. A rebind
  * after the snapshot changes the authority fingerprint, which stops the arm before the
@@ -5944,7 +5947,12 @@ async function isOnOwnExecutionWorkspaceBranch(
       sourceIssueId: executionWorkspaces.sourceIssueId,
       repoUrl: executionWorkspaces.repoUrl,
       baseRef: executionWorkspaces.baseRef,
-      projectId: executionWorkspaces.projectId,
+      mode: executionWorkspaces.mode,
+      projectRefs: sql<Array<string | null>>`ARRAY(
+        SELECT ref FROM project_workspaces pw, unnest(ARRAY[pw.default_ref, pw.repo_ref]) AS ref
+        WHERE pw.company_id = ${companyId}
+          AND pw.project_id IN (${issues.projectId}, ${executionWorkspaces.projectId})
+      )`,
       claimedElsewhere: sql<boolean>`(
         EXISTS (
           SELECT 1 FROM execution_workspaces o
@@ -5971,11 +5979,11 @@ async function isOnOwnExecutionWorkspaceBranch(
   if (pr.headRefName !== branch) return false;
   if (pr.headRepoFullName?.toLowerCase() !== `${repo.owner}/${repo.repo}`.toLowerCase()) return false;
   if (snapshot.claimedElsewhere) return false;
-  const projectRefs = await db
-    .select({ defaultRef: projectWorkspaces.defaultRef, repoRef: projectWorkspaces.repoRef })
-    .from(projectWorkspaces)
-    .where(and(eq(projectWorkspaces.companyId, companyId), eq(projectWorkspaces.projectId, snapshot.projectId)));
-  return !isProtectedDeliveryBranch(branch, [snapshot.baseRef, ...projectRefs.flatMap((ref) => [ref.defaultRef, ref.repoRef])]);
+  return !isProtectedDeliveryBranch({
+    branch,
+    defaultRefs: [snapshot.baseRef, ...snapshot.projectRefs],
+    workspaceMode: snapshot.mode,
+  });
 }
 
 export async function armMergeOnApproval(

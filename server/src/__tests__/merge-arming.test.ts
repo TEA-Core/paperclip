@@ -3327,11 +3327,10 @@ describeEmbeddedPostgres(
     // ---- RA no-go on PR 1214 (head 94e3e21bb8): each "RA" case below armed on that head ----
 
     /**
-     * A deterministic barrier inside ONE arm call: right after resolveDeliveryIdentity reads the card's
-     * row (the only select in the arm path that asks for both projectWorkspaceId and executionState),
-     * `rebind` runs before any later read.
+     * A deterministic barrier inside ONE arm call: right after the first select whose projection
+     * `matches`, `action` runs before any later read.
      */
-    function rebindAfterDeliveryRead(rebind: () => Promise<void>): Db {
+    function actAfterSelect(matches: (fields: Record<string, unknown>) => boolean, action: () => Promise<void>): Db {
       let fired = false;
       const afterRows = (value: object): object => new Proxy(value, {
         get(target, prop) {
@@ -3339,7 +3338,7 @@ describeEmbeddedPostgres(
           if (typeof member !== "function") return member;
           if (prop === "then") {
             return (onFulfilled?: (rows: unknown) => unknown, onRejected?: (error: unknown) => unknown) =>
-              (member.call(target, async (rows: unknown) => { await rebind(); return rows; }) as Promise<unknown>)
+              (member.call(target, async (rows: unknown) => { await action(); return rows; }) as Promise<unknown>)
                 .then(onFulfilled, onRejected);
           }
           return (...args: unknown[]) => {
@@ -3355,13 +3354,20 @@ describeEmbeddedPostgres(
           if (prop !== "select") return member.bind(target);
           return (fields?: Record<string, unknown>) => {
             const builder = member.call(target, fields) as object;
-            if (fired || !fields || !("projectWorkspaceId" in fields) || !("executionState" in fields)) return builder;
+            if (fired || !fields || !matches(fields)) return builder;
             fired = true;
             return afterRows(builder);
           };
         },
       });
     }
+
+    /** After resolveDeliveryIdentity reads the card's row (the only arm-path select with projectWorkspaceId and executionState). */
+    const rebindAfterDeliveryRead = (rebind: () => Promise<void>) =>
+      actAfterSelect((fields) => "projectWorkspaceId" in fields && "executionState" in fields, rebind);
+    /** After the owner fallback's one ownership snapshot (its projection carries claimedElsewhere). */
+    const actAfterOwnershipSnapshot = (action: () => Promise<void>) =>
+      actAfterSelect((fields) => "claimedElsewhere" in fields, action);
 
     const HEAD_OID = "d".repeat(40);
     /** A guard that never reports a change, so only the ownership step can stop the arm. */
@@ -3404,9 +3410,9 @@ describeEmbeddedPostgres(
       await expectRefused(NOT_OWNER);
     });
 
-    it("RA: refuses when the card's row claims its own base ref (origin/main -> main)", async () => {
-      await bindWorkspace(issueId, await insertWorkspace({ branchName: "main", baseRef: "origin/main" }));
-      await mentionPr({ headRefName: "main" });
+    it("RA: refuses when the card's row claims its own base ref (origin/trunk -> trunk)", async () => {
+      await bindWorkspace(issueId, await insertWorkspace({ branchName: "trunk", baseRef: "origin/trunk" }));
+      await mentionPr({ headRefName: "trunk" });
       await expectRefused(NOT_OWNER);
     });
 
@@ -3496,6 +3502,86 @@ describeEmbeddedPostgres(
       });
       await mentionPr();
       await expectArmed();
+    });
+
+    // ---- RA round 2 on PR 1214 (head 1349c901e9): the protected-branch classes at the arm site ----
+
+    /** Another project of the company, with one workspace carrying `refs`. */
+    async function insertProject(refs: { defaultRef?: string | null } = {}): Promise<string> {
+      const [project] = await db
+        .insert(projects)
+        .values({ id: randomUUID(), companyId, name: "Second project", status: "in_progress" })
+        .returning();
+      await db.insert(projectWorkspaces).values({
+        id: randomUUID(), companyId, projectId: project!.id, name: "second", repoUrl: REPO_URL, isPrimary: true,
+        defaultRef: refs.defaultRef ?? null,
+      });
+      return project!.id;
+    }
+
+    it.each([
+      "main", "master", "release/1.2", "releases/v1", "hotfix/urgent", "fold/anything", "fold-sync/2026.11",
+    ])("refuses a card row on the protected branch %s with no configuration naming it", async (branch) => {
+      await seedOwnWorkspace(branch);
+      await mentionPr({ headRefName: branch });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("refuses a project_primary row even on a feature branch", async () => {
+      await bindWorkspace(issueId, await insertWorkspace({ branchName: OWN_BRANCH, mode: "project_primary" }));
+      await mentionPr();
+      await expectRefused(NOT_OWNER);
+    });
+
+    it.each(["refs/heads/trunk", "refs/remotes/origin/trunk", "upstream/trunk", " trunk "])(
+      "refuses the repo default branch when the project stores it as %j",
+      async (stored) => {
+        await db.update(projectWorkspaces).set({ defaultRef: stored }).where(eq(projectWorkspaces.projectId, projectId));
+        await seedOwnWorkspace("trunk");
+        await mentionPr({ headRefName: "trunk" });
+        await expectRefused(NOT_OWNER);
+      },
+    );
+
+    it("refuses the card's own project default even when the row sits in another project", async () => {
+      await db.update(projectWorkspaces).set({ defaultRef: "trunk" }).where(eq(projectWorkspaces.projectId, projectId));
+      await bindWorkspace(issueId, await insertWorkspace({ branchName: "trunk", projectId: await insertProject() }));
+      await mentionPr({ headRefName: "trunk" });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("refuses the row's project default when the card sits in another project", async () => {
+      await bindWorkspace(issueId, await insertWorkspace({ branchName: "trunk", projectId: await insertProject({ defaultRef: "trunk" }) }));
+      await mentionPr({ headRefName: "trunk" });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("RA round 2: a default ref changed after the ownership snapshot does not let the snapshot's default branch arm", async () => {
+      await db.update(projectWorkspaces).set({ defaultRef: "trunk" }).where(eq(projectWorkspaces.projectId, projectId));
+      await seedOwnWorkspace("trunk");
+      await mentionPr({ headRefName: "trunk" });
+
+      const raced = actAfterOwnershipSnapshot(async () => {
+        await db.update(projectWorkspaces).set({ defaultRef: "other" }).where(eq(projectWorkspaces.projectId, projectId));
+      });
+      const result = await armMergeOnApprovalReal(raced, companyId, issueId, DECISION, undefined, { expectedHeadOid: HEAD_OID, authorityGuard: ALWAYS_HOLDS });
+
+      expect(result).toEqual({ kind: "skipped", message: NOT_OWNER });
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("decides ownership from the one snapshot: a row edit after it cannot make the fallback own the PR", async () => {
+      const wsId = await insertWorkspace({ branchName: "fm/old-branch" });
+      await bindWorkspace(issueId, wsId);
+      await mentionPr();
+
+      const raced = actAfterOwnershipSnapshot(async () => {
+        await db.update(executionWorkspaces).set({ branchName: OWN_BRANCH }).where(eq(executionWorkspaces.id, wsId));
+      });
+      const result = await armMergeOnApprovalReal(raced, companyId, issueId, DECISION, undefined, { expectedHeadOid: HEAD_OID, authorityGuard: ALWAYS_HOLDS });
+
+      expect(result).toEqual({ kind: "skipped", message: NOT_OWNER });
+      expect(mockGhFetch).not.toHaveBeenCalled();
     });
   },
 );

@@ -803,5 +803,35 @@ describe("execution workspace routes", () => {
       expect(res.status).toBe(200);
       expect(mockExecutionWorkspaceService.update).toHaveBeenCalledWith("workspace-1", { branchName: null });
     });
+
+    // RA round 2: the standard protected classes hold with no configuration naming them.
+    it.each([
+      "main", "master", "release/1.2", "releases/v1", "hotfix/urgent", "fold/anything", "fold-sync/2026.11",
+    ])("refuses %s with 422 even when no ref configuration names it", async (branchName) => {
+      givenWorkspace({ baseRef: null });
+
+      const res = await patchBranch({ branchName });
+
+      expect(res.status).toBe(422);
+      expect(mockExecutionWorkspaceService.update).not.toHaveBeenCalled();
+    });
+
+    it("refuses a branch change on a project_primary row, which is never a delivery row", async () => {
+      givenWorkspace({ mode: "project_primary", baseRef: null, branchName: null });
+
+      const res = await patchBranch({ branchName: "PAP-1-own-work" });
+
+      expect(res.status).toBe(422);
+      expect(mockExecutionWorkspaceService.update).not.toHaveBeenCalled();
+    });
+
+    it("refuses the project default branch stored as refs/heads/<branch>", async () => {
+      givenWorkspace({ baseRef: null });
+
+      const res = await patchBranch({ branchName: "trunk" }, [{ defaultRef: "refs/heads/trunk", repoRef: null }]);
+
+      expect(res.status).toBe(422);
+      expect(mockExecutionWorkspaceService.update).not.toHaveBeenCalled();
+    });
   });
 });

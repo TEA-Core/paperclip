@@ -262,28 +262,56 @@ export function inheritedExecutionWorkspaceBranchExempt(input: {
   });
 }
 
-/** The fork's fold branch family (`fold/tea-patches-<release>`): the integration branch every PR lands on. */
-const FOLD_BRANCH_PREFIX = "fold/tea-patches-";
+/** Release and integration branch families no card may deliver on, whatever the project configures. */
+const PROTECTED_BRANCH_PREFIXES = ["release/", "releases/", "hotfix/", "fold/", "fold-sync/"];
+
+/** A branch or ref name in comparable form: trimmed, lowercased, without `refs/heads/` or trailing slashes. */
+function comparableBranchName(name: string): string {
+  const lowered = name.trim().toLowerCase();
+  const local = lowered.startsWith("refs/heads/") ? lowered.slice("refs/heads/".length) : lowered;
+  return local.replace(/\/+$/, "");
+}
 
 /**
- * SUP-24409 (RA on PR 1214): a branch no card may claim as its own delivery branch. The arm-time
- * owner fallback trusts the branch on a card's own execution-workspace row, so a row naming the
- * fork's fold branch or a project/base default branch would let one card's approval arm the PR
- * that lands that branch. True for any `fold/tea-patches-*` branch and for any of `defaultRefs`
- * (a remote-tracking `origin/` prefix on a ref is ignored). Case-insensitive, so a case variant
- * of a protected branch is protected too.
+ * The branch names a stored default ref can denote. The control plane stores refs in several
+ * forms (`main`, `origin/main`, `upstream/main`, `refs/heads/main`, `refs/remotes/origin/main`),
+ * so the ref itself, the ref without a `refs/remotes/<remote>/` prefix, and the ref without its
+ * first path segment (a remote name) all count.
  */
-export function isProtectedDeliveryBranch(
-  branch: string,
-  defaultRefs: ReadonlyArray<string | null | undefined>,
-): boolean {
-  const candidate = branch.toLowerCase();
-  if (candidate.startsWith(FOLD_BRANCH_PREFIX)) return true;
-  return defaultRefs.some((ref) => {
-    if (!ref) return false;
-    const normalized = ref.toLowerCase();
-    return (normalized.startsWith("origin/") ? normalized.slice("origin/".length) : normalized) === candidate;
-  });
+function branchNamesOfRef(ref: string): string[] {
+  const comparable = comparableBranchName(ref);
+  const names = [comparable];
+  const remoteTracking = /^refs\/remotes\/[^/]+\/(.+)$/.exec(comparable);
+  if (remoteTracking) names.push(remoteTracking[1]!);
+  // Without the first path segment (a remote name); a ref with no slash yields itself again.
+  names.push(comparable.slice(comparable.indexOf("/") + 1));
+  return names;
+}
+
+/**
+ * SUP-24409 (RA rounds 1 and 2 on PR 1214): a branch no card may claim as its own delivery
+ * branch. The arm-time owner fallback trusts the branch on a card's own execution-workspace row,
+ * so a row naming an integration branch would let one card's approval arm the PR that lands that
+ * branch. This one predicate guards every place such a branch could reach a card's row: the
+ * arm-time fallback, exact-branch and templated realization, and the board PATCH of a row.
+ *
+ * True, independent of any configuration, for `main`, `master`, `release/*`, `releases/*`,
+ * `hotfix/*`, `fold/*` and `fold-sync/*`, and for any branch on a `project_primary` row (the
+ * project's own checkout is never a card's delivery row). Also true for any of `defaultRefs`, the
+ * repo default/base refs the caller knows (project workspace default and repo refs, a row's base
+ * ref, the remote's default branch), in whatever form they are stored. Case-insensitive, and
+ * blind to a `refs/heads/` prefix, surrounding whitespace and trailing slashes.
+ */
+export function isProtectedDeliveryBranch(input: {
+  branch: string;
+  defaultRefs?: ReadonlyArray<string | null | undefined>;
+  workspaceMode?: string | null;
+}): boolean {
+  if (input.workspaceMode === "project_primary") return true;
+  const candidate = comparableBranchName(input.branch);
+  if (candidate === "main" || candidate === "master") return true;
+  if (PROTECTED_BRANCH_PREFIXES.some((prefix) => candidate.startsWith(prefix))) return true;
+  return (input.defaultRefs ?? []).some((ref) => !!ref && branchNamesOfRef(ref).includes(candidate));
 }
 
 /**

@@ -5999,13 +5999,13 @@ export async function realizeExecutionWorkspace(input: {
     // resets it, and any mismatch below fails closed instead of falling back
     // to a derived branch or the shared checkout.
     // SUP-24409 (RA on PR 1214): the attached branch becomes the card's own delivery
-    // branch, which the arm-time owner fallback trusts. The fork's fold branch and the
-    // repo's default refs are never a card's delivery branch.
+    // branch, which the arm-time owner fallback trusts. An integration or release
+    // branch, or the repo's default refs, are never a card's delivery branch.
     const remoteDefaultBranch = await detectRemoteDefaultBranch(repoRoot);
-    if (isProtectedDeliveryBranch(requestedExistingBranch, [remoteDefaultBranch, input.base.repoRef])) {
+    if (isProtectedDeliveryBranch({ branch: requestedExistingBranch, defaultRefs: [remoteDefaultBranch, input.base.repoRef] })) {
       throw new WorkspaceRuntimeValidationFailure(
-        `Workspace strategy pins existing branch "${requestedExistingBranch}", which is a protected base branch `
-        + "(the fold branch or a default branch of the repository). A card cannot deliver on it; "
+        `Workspace strategy pins existing branch "${requestedExistingBranch}", which is a protected branch `
+        + "(main, master, a release, hotfix or fold branch, or a default branch of the repository). A card cannot deliver on it; "
         + "pin the card's own branch instead.",
         {
           workspaceValidation: {
@@ -6043,10 +6043,12 @@ export async function realizeExecutionWorkspace(input: {
     });
     branchName = sanitizeBranchName(renderedBranch);
     const remoteDefaultBranch = await detectRemoteDefaultBranch(repoRoot);
-    if (remoteDefaultBranch && branchName === remoteDefaultBranch) {
+    // SUP-24409 (RA round 2): the same protected set as exact-branch mode, not only the default.
+    if (isProtectedDeliveryBranch({ branch: branchName, defaultRefs: [remoteDefaultBranch, input.base.repoRef] })) {
       throw new WorkspaceRuntimeValidationFailure(
-        `Execution workspace branch name "${branchName}" matches the repo's default branch. `
-        + "Creating a worktree on the default branch would permanently strand the primary clone. "
+        `Execution workspace branch name "${branchName}" is a protected branch (main, master, a release, hotfix `
+        + "or fold branch, or a default branch of the repository). Creating a worktree on it would strand the "
+        + "primary clone and make an integration branch a card's delivery branch. "
         + 'Use a branch template that produces a unique name (e.g., "{{issue.identifier}}-{{slug}}").',
         {
           workspaceValidation: {
