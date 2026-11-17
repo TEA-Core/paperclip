@@ -209,6 +209,7 @@ function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
       // Absent => unrestricted; only carry through an explicit policy.
       ...(parsed.data.executionMode ? { executionMode: parsed.data.executionMode } : {}),
       enableBlockedWithoutBlockersAutoHeal: parsed.data.enableBlockedWithoutBlockersAutoHeal ?? false,
+      liveRunCap: parsed.data.liveRunCap ?? null,
     };
   }
   return {
@@ -216,6 +217,7 @@ function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
     feedbackDataSharingPreference: DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
     backupRetention: DEFAULT_BACKUP_RETENTION,
     enableBlockedWithoutBlockersAutoHeal: false,
+    liveRunCap: null,
   };
 }
 

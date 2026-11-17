@@ -94,6 +94,7 @@ import {
   toolAccessService,
   workspaceOperationService,
 } from "./services/index.js";
+import { startLiveRunCapRouterPoller, type LiveRunCapRouterPoller } from "./services/live-run-cap.js";
 import { formatTerminalWorkspaceReaperSkipLogLine } from "./services/execution-workspaces.js";
 import { deliverNativeQuestionResponse } from "./services/native-runtime/native-question-bridge.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
@@ -1191,6 +1192,7 @@ async function startServerWithDatabaseTeardown(
   }>) | null = null;
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  let liveRunCapRouterPoller: LiveRunCapRouterPoller | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   // SUP-14227: arm the process-wide sweep-liveness registry so the /health
   // surface exposes a last-run-per-sweep timestamp/counter readable without a
@@ -2040,6 +2042,19 @@ async function startServerWithDatabaseTeardown(
     };
     await runRetentionSweep();
 
+    // SUP-24563: the router's run cap is a lower-only input to the global
+    // live-run cap. Admission reads the cached sample and never awaits a poll;
+    // a rise (higher value, or the sample went stale) drives the queue at once.
+    if (config.liveRunCapRouterUrl) {
+      liveRunCapRouterPoller = startLiveRunCapRouterPoller({
+        url: config.liveRunCapRouterUrl,
+        onRaise: () => {
+          if (heartbeatSchedulerStopped || isWarmStandby()) return;
+          trackHeartbeatSchedulerWork(heartbeat.redriveQueueForLiveRunCap());
+        },
+      });
+    }
+
     startHeartbeatSchedulerInterval(() => {
       // Track the outer async callback as well as the work it starts. Shutdown
       // can then wait through an already-running suppression check before it
@@ -2513,6 +2528,7 @@ async function startServerWithDatabaseTeardown(
   ) => {
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
     heartbeatSchedulerStopped = true;
+    liveRunCapRouterPoller?.stop();
     // SUP-14227: surface the latch in the liveness snapshot so a reader can
     // tell "scheduler stopped (all sweeps frozen)" from "ran, found nothing".
     sweepLivenessTracker.setSchedulerStopped(true);

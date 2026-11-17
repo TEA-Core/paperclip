@@ -107,6 +107,19 @@ Notes:
 - It is not a substitute for `status: paused` or `heartbeat.wakeOnDemand: false`. Both of those also stop the noise, but by removing the agent from scheduling entirely; a pull agent should stay wakeable so assignment still reaches it.
 - Every other agent is `invoked` by default, and nothing about its recovery behaviour changes.
 
+## 3.6 Instance-wide live-run cap
+
+The instance general setting `liveRunCap` (`PATCH /api/instance/settings/general`, instance admins only) limits how many runs may be `running` at once across the whole instance. `null` (the default) turns it off, and admission is unchanged.
+
+- **Admission only.** The cap is checked only before a queued run is started. Lowering it below the live count never stops, cancels or pauses a running session. New work stays `queued` until enough runs finish, and raising the cap (or turning it off) starts the waiting queue at once.
+- **Numbers.** The setting accepts an integer from 1 to 15. 15 is a hard ceiling; a larger value is rejected, not clamped. 2 slots of the cap are reserved for human/board and review/recovery work: general work waits once the live count reaches the cap minus 2. A cap below 3 shrinks the reserve so general work always keeps one slot.
+- **Router input.** When `PAPERCLIP_LIVE_RUN_CAP_ROUTER_URL` points at the router's `/api/runcap`, the server polls it every 15 s (2 s timeout). A fresh router value can only lower the cap, never above the setting and never below a floor of 6 in total (4 general + 2 reserved). A router that is unreachable, answers garbage or has not answered for 60 s is ignored, so the cap falls back to the setting, never to 1 or 0.
+- **Order.** Waiting runs start in this order: human/board-initiated runs, then review and recovery work, then everything else; inside each class the oldest run starts first. A run that cannot start for its own reasons (its agent's `maxConcurrentRuns`, a blocker, another run holding the issue) does not hold up the line.
+- **Not counted.** External agent sessions neither count toward the cap nor wait on it: agents on the `process`, `http`, `hermes_gateway` or `openclaw_gateway` adapters, and agents declared `workDelivery: "external_pull"` (section 3.5). Every other run counts, in every company.
+- **Status.** `GET /api/instance/live-run-cap` (board users) returns counts only: the setting, the router value and its freshness, the effective cap, the live run count, and how many runs are queued and waiting on the cap.
+
+Rollback: `PATCH /api/instance/settings/general` with `{"liveRunCap": null}` takes effect immediately and starts the waiting queue. Reverting the code needs no migration; the setting lives in the existing settings JSON.
+
 ## 4. Session resume behavior
 
 Paperclip stores session IDs for resumable adapters.

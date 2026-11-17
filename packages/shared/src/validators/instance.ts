@@ -22,6 +22,12 @@ export const backupRetentionPolicySchema = z.object({
   monthlyMonths: presetSchema(MONTHLY_RETENTION_PRESETS, "monthlyMonths").default(DEFAULT_BACKUP_RETENTION.monthlyMonths),
 });
 
+// SUP-24563. The hard instance ceiling on counted live (`running`) heartbeat
+// runs. The `liveRunCap` setting may be lower, never higher: a larger value is
+// rejected rather than clamped, so an operator never believes a value is live
+// that is not. Router input can only lower the effective cap further.
+export const LIVE_RUN_CAP_CEILING = 15;
+
 export const instanceGeneralSettingsSchema = z.object({
   censorUsernameInLogs: z.boolean().default(false),
   feedbackDataSharingPreference: feedbackDataSharingPreferenceSchema.default(
@@ -32,6 +38,10 @@ export const instanceGeneralSettingsSchema = z.object({
   // Kubernetes sandbox provider and denies local/ssh execution (cloud_tenant).
   executionMode: z.enum(["kubernetes", "any"]).optional(),
   enableBlockedWithoutBlockersAutoHeal: z.boolean().default(false),
+  // SUP-24563. Global live-run cap. null = off (admission unchanged). An
+  // integer 1..LIVE_RUN_CAP_CEILING caps how many counted runs may be running
+  // instance-wide; it only gates new starts and never touches a running run.
+  liveRunCap: z.number().int().min(1).max(LIVE_RUN_CAP_CEILING).nullable().default(null),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = z

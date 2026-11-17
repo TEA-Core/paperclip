@@ -76,6 +76,7 @@ vi.mock("../sentry.js", async () => {
 
 import { heartbeatService } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { invalidateLiveRunCapSettingCache, liveRunCapAdmission } from "../services/live-run-cap.js";
 
 describe("P6-25 pre-result native session recovery", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -955,6 +956,8 @@ describe.each(["unchanged", "newer_active", "stale_idle"] as const)(
     }, 30_000);
 
     afterAll(async () => {
+      // SUP-24563: the settings cache is module state shared by every variant.
+      invalidateLiveRunCapSettingCache();
       if (
         staleProviderProcess &&
         staleProviderProcess.exitCode === null &&
@@ -1170,6 +1173,17 @@ describe.each(["unchanged", "newer_active", "stale_idle"] as const)(
         })
         .where(eq(nativeRunFinalizations.runId, runId));
 
+      // SUP-24563 (h): the persisted resume re-attaches this already-running
+      // run, so the global live-run cap must not gate it. With cap 1 the
+      // resumed run alone fills the cap; only the variant without a newer
+      // request carries the precondition (a newer request is a new admission).
+      const liveRunCapRegisterWaiter = vi.spyOn(liveRunCapAdmission, "registerWaiter");
+      const liveRunCapReserve = vi.spyOn(liveRunCapAdmission, "reserve");
+      if (!newerRequest) {
+        await instanceSettingsService(db).updateGeneral({ liveRunCap: 1 });
+        invalidateLiveRunCapSettingCache();
+      }
+
       await expect(
         heartbeat.reapOrphanedRuns({ staleThresholdMs: 0 }),
       ).resolves.not.toContain(runId);
@@ -1245,6 +1259,8 @@ describe.each(["unchanged", "newer_active", "stale_idle"] as const)(
       expect(startTurn).not.toHaveBeenCalled();
       expect(close).toHaveBeenCalledOnce();
       expect(legacyAdapterExecute).not.toHaveBeenCalled();
+      expect(liveRunCapReserve.mock.calls.map(([id]) => id)).not.toContain(runId);
+      expect(liveRunCapRegisterWaiter.mock.calls.map(([entry]) => entry.runId)).not.toContain(runId);
 
       await expect(
         db

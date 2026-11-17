@@ -104,6 +104,8 @@ export interface Config {
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
   selfDeclaredRunTtlMs: number;
+  /** SUP-24563: router `/api/runcap` URL polled as a lower-only live-run cap input; null = no router input. */
+  liveRunCapRouterUrl: string | null;
   resolvedDependencyWakeRearmWindowMs: number;
   resolvedDependencyWakeRearmMaxCount: number;
   pendingReviewRearmWindowMs: number;
@@ -471,6 +473,7 @@ export function loadConfig(): Config {
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
     selfDeclaredRunTtlMs: Math.max(60_000, Number(process.env.SELF_DECLARED_RUN_TTL_MS) || 15 * 60 * 1000),
+    liveRunCapRouterUrl: process.env.PAPERCLIP_LIVE_RUN_CAP_ROUTER_URL?.trim() || null,
     recoveryActionWakeIntervalMs: Math.max(60000, Number(process.env.RECOVERY_ACTION_WAKE_INTERVAL_MS) || 300000),
     resolvedDependencyWakeRearmWindowMs: Math.max(30 * 60 * 1000, Number(process.env.RESOLVED_DEPENDENCY_WAKE_REARM_WINDOW_MS) || 6 * 60 * 60 * 1000),
     resolvedDependencyWakeRearmMaxCount: Math.max(1, Number(process.env.RESOLVED_DEPENDENCY_WAKE_REARM_MAX_COUNT) || 3),
