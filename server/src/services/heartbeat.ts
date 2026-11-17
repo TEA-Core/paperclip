@@ -23714,8 +23714,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileUndispatchableAssignedIssues({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
 
-  async function sweepStaleIssueLocks() {
-    return recovery.sweepStaleIssueLocks();
+  async function sweepStaleIssueLocks(opts?: { now?: Date }) {
+    return recovery.sweepStaleIssueLocks(opts);
   }
 
   async function reconcileBlockedWithoutBlockers() {
@@ -36491,8 +36491,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       patch?: Partial<typeof heartbeatRuns.$inferInsert>,
     ) => setRunStatusIfRunning(runId, status, patch),
 
-    releaseIssueExecutionAndPromote: (run: typeof heartbeatRuns.$inferSelect, options: { suppressImmediateRecovery?: boolean } = {}) =>
-      releaseIssueExecutionAndPromote(run, options),
+    releaseIssueExecutionAndPromote: (run: typeof heartbeatRuns.$inferSelect, options: { suppressImmediateRecovery?: boolean } = {}, promotionIssueId?: string) =>
+      releaseIssueExecutionAndPromote(run, options, promotionIssueId),
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) => cancelRunInternal(runId, reason, options),
 

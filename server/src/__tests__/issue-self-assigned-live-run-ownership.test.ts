@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,9 +8,13 @@ import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
+  agentApiKeys,
   agentWakeupRequests,
   agents,
+  authUsers,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRuns,
   issues,
@@ -23,8 +27,10 @@ import {
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { runningProcesses } from "../adapters/index.js";
 import { errorHandler } from "../middleware/index.js";
+import { actorMiddleware } from "../middleware/auth.js";
 import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { findLiveIssueExecutionHolder } from "../services/issue-execution-lease.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -516,7 +522,7 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     expect((await cardRow(issueId)).executionRunId).not.toBe(writerRunId);
   });
 
-  async function seedHeldCard(opts: { authorStatus: string }) {
+  async function seedHeldCard(opts: { authorStatus: string; stampLock?: boolean }) {
     const seeded = await seed();
     const { companyId, issuePrefix, writerAgentId, writerRunId } = seeded;
     const issueId = randomUUID();
@@ -527,7 +533,8 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
       status: "in_progress",
       priority: "medium",
       assigneeAgentId: writerAgentId,
-      executionRunId: writerRunId,
+      originRunId: writerRunId,
+      executionRunId: opts.stampLock === false ? null : writerRunId,
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
     });
@@ -582,5 +589,246 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
     expect(wake?.status).not.toBe("deferred_issue_execution");
     expect(wake?.runId).toBe(successors[0]!.id);
+  });
+
+  async function expectWakePromoted(issueId: string, agentId: string, authorRunId: string, wakeId: string) {
+    const successors = await otherRunsForCard(issueId, agentId, authorRunId);
+    expect(successors).toHaveLength(1);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(wake?.status).not.toBe("deferred_issue_execution");
+    expect(wake?.runId).toBe(successors[0]!.id);
+  }
+
+  it("the silent-run hard-stop promotes a held wake on a card whose lock is not stamped", async () => {
+    const { companyId, writerAgentId, writerRunId, issueId, wakeId } = await seedHeldCard({ authorStatus: "running", stampLock: false });
+    await db.update(agents).set({ adapterType: "codex_local" }).where(eq(agents.id, writerAgentId));
+    const startedAt = new Date(Date.now() - 91 * 60 * 1000);
+    await db.update(heartbeatRuns)
+      .set({ processStartedAt: startedAt, processPid: 2_000_000_000, lastOutputAt: null, startedAt })
+      .where(eq(heartbeatRuns.id, writerRunId));
+    runningProcesses.delete(writerRunId);
+    expect((await cardRow(issueId)).executionRunId).toBeNull();
+
+    const result = await heartbeat.scanTerminableSilentActiveRuns({ now: new Date(), companyId });
+    expect(result.terminated).toBe(1);
+    await expectWakePromoted(issueId, writerAgentId, writerRunId, wakeId);
+  });
+
+  it("a refused checkout that clears a terminal author's lock promotes the held wake", async () => {
+    const { companyId, writerAgentId, peerAgentId, writerRunId, issueId, wakeId } = await seedHeldCard({ authorStatus: "failed" });
+    runningProcesses.delete(writerRunId);
+    const peerRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: peerRunId,
+      companyId,
+      agentId: peerAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { wakeReason: "heartbeat_timer" },
+      startedAt: new Date(),
+    });
+    runningProcesses.set(peerRunId, { child: {} as never, graceSec: 0, processGroupId: null });
+
+    const res = await request(appFor(agentActor(companyId, peerAgentId, peerRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId: peerAgentId, expectedStatuses: ["in_progress"] });
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    await expectWakePromoted(issueId, writerAgentId, writerRunId, wakeId);
+  });
+
+  it("releasing a terminal author's lock promotes the held wake", async () => {
+    const { companyId, writerAgentId, writerRunId, issueId, wakeId } = await seedHeldCard({ authorStatus: "failed" });
+    runningProcesses.delete(writerRunId);
+
+    const res = await request(appFor(boardActor(companyId))).post(`/api/issues/${issueId}/release`).send({});
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await expectWakePromoted(issueId, writerAgentId, writerRunId, wakeId);
+  });
+
+  it("an admin force-release of a terminal author's lock promotes the held wake", async () => {
+    const { companyId, writerAgentId, writerRunId, issueId, wakeId } = await seedHeldCard({ authorStatus: "failed" });
+    runningProcesses.delete(writerRunId);
+
+    const res = await request(appFor(boardActor(companyId))).post(`/api/issues/${issueId}/admin/force-release`).send({});
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await expectWakePromoted(issueId, writerAgentId, writerRunId, wakeId);
+  });
+
+  it("the stale-lock sweep lapses a stamped hold whose author has been silent past the bound", async () => {
+    const { writerAgentId, writerRunId, issueId, wakeId } = await seedHeldCard({ authorStatus: "running" });
+    const staleAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await db.update(heartbeatRuns)
+      .set({ startedAt: staleAt, createdAt: staleAt, lastOutputAt: null })
+      .where(eq(heartbeatRuns.id, writerRunId));
+    // The author still has a live in-memory handle; silence alone lapses the hold.
+    expect(runningProcesses.has(writerRunId)).toBe(true);
+
+    const result = await heartbeat.sweepStaleIssueLocks();
+    expect(result.cleared).toBe(1);
+    await expectWakePromoted(issueId, writerAgentId, writerRunId, wakeId);
+  });
+
+  function authApp(opts: Parameters<typeof actorMiddleware>[1]) {
+    const app = express();
+    app.use(express.json());
+    app.use(actorMiddleware(db, opts));
+    app.use("/api", issueRoutes(db, {} as Parameters<typeof issueRoutes>[1], {}));
+    app.use(errorHandler);
+    return app;
+  }
+
+  async function seedForgedHeaderCard() {
+    const seeded = await seed();
+    const { companyId, issuePrefix, writerAgentId, writerRunId } = seeded;
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Forged header card",
+      status: "blocked",
+      priority: "medium",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    return { ...seeded, issueId, forgedRunId: writerRunId };
+  }
+
+  async function expectNoForgedHolder(companyId: string, issueId: string, forgedRunId: string) {
+    expect(await findLiveIssueExecutionHolder(db, companyId, issueId)).toBeNull();
+    // The ownership proof reads issue.updated rows; none may carry the forged run.
+    const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    const proofRows = rows.filter((row) => row.action === "issue.updated");
+    expect(proofRows.length).toBeGreaterThan(0);
+    expect(proofRows.map((row) => row.runId)).not.toContain(forgedRunId);
+  }
+
+  it("an agent API key naming another running run of the same agent does not forge the proof", async () => {
+    const { companyId, writerAgentId, issueId, forgedRunId } = await seedForgedHeaderCard();
+    const token = `forge-test-${randomUUID()}`;
+    await db.insert(authUsers).values({
+      id: "responsible-user",
+      name: "Responsible",
+      email: "responsible@example.com",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "operator",
+    });
+    await db.insert(agentApiKeys).values({
+      companyId,
+      agentId: writerAgentId,
+      name: "forge-test",
+      keyHash: createHash("sha256").update(token).digest("hex"),
+      responsibleUserId: "responsible-user",
+    });
+
+    const res = await request(authApp({ deploymentMode: "authenticated", resolveSession: async () => null }))
+      .patch(`/api/issues/${issueId}`)
+      .set("authorization", `Bearer ${token}`)
+      .set("x-paperclip-run-id", forgedRunId)
+      .send({ assigneeAgentId: writerAgentId });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await expectNoForgedHolder(companyId, issueId, forgedRunId);
+  });
+
+  it("an authenticated board session naming a hung run of another agent does not forge the proof", async () => {
+    const { companyId, writerAgentId, issueId, forgedRunId } = await seedForgedHeaderCard();
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "board-user",
+      status: "active",
+      membershipRole: "operator",
+    });
+
+    const res = await request(authApp({
+      deploymentMode: "authenticated",
+      resolveSession: async () => ({
+        session: { id: "session-1", userId: "board-user" },
+        user: { id: "board-user", name: "Board", email: "board@example.com" },
+      }),
+    }))
+      .patch(`/api/issues/${issueId}`)
+      .set("x-paperclip-run-id", forgedRunId)
+      .send({ assigneeAgentId: writerAgentId });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await expectNoForgedHolder(companyId, issueId, forgedRunId);
+  });
+
+  it.each(["done", "cancelled"] as const)("a held board comment is promoted when its card reaches a terminal status (%s)", async (terminalStatus) => {
+    const { companyId, writerAgentId, writerRunId } = await seed();
+    const writer = appFor(agentActor(companyId, writerAgentId, writerRunId));
+    const created = await request(writer)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Close with held comment", status: "in_progress", assigneeAgentId: writerAgentId });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    const issueId = created.body.id as string;
+
+    const comment = await request(appFor(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Board follow-up." });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+    await expectAuthorKeepsCard(issueId, writerAgentId, writerRunId);
+    const held = await wakesForCard(issueId, writerAgentId);
+    expect(held).toHaveLength(1);
+
+    // The author cancels its own card; a board user closes it (the done-tier
+    // guard needs a repository fixture this suite does not build).
+    const close = terminalStatus === "done"
+      ? await request(appFor(boardActor(companyId))).patch(`/api/issues/${issueId}`).send({ status: terminalStatus, comment: "Closing." })
+      : await request(writer).patch(`/api/issues/${issueId}`).send({ status: terminalStatus });
+    expect(close.status, JSON.stringify(close.body)).toBe(200);
+
+    await vi.waitFor(
+      async () => {
+        expect(await otherRunsForCard(issueId, writerAgentId, writerRunId)).toHaveLength(1);
+      },
+      { timeout: WAKE_SETTLE_MS * 2, interval: 50 },
+    );
+    const wakes = await wakesForCard(issueId, writerAgentId);
+    expect(wakes.map((wake) => wake.status)).not.toContain("deferred_issue_execution");
+  });
+
+  it("the stale-lock sweep promotes wakes on unlocked authored cards when it terminalizes a dead author", async () => {
+    const { companyId, issuePrefix, writerAgentId, writerRunId, issueId, wakeId } = await seedHeldCard({ authorStatus: "running", stampLock: false });
+    // A second card still stamps the dead author, so the sweep pre-pass sees it.
+    const lockerId = randomUUID();
+    await db.insert(issues).values({
+      id: lockerId,
+      companyId,
+      title: "Locking card",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: writerAgentId,
+      executionRunId: writerRunId,
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
+    await db.update(heartbeatRuns)
+      .set({ processPid: 2_000_000_000, processStartedAt: new Date(Date.now() - 10 * 60 * 1000) })
+      .where(eq(heartbeatRuns.id, writerRunId));
+    runningProcesses.delete(writerRunId);
+    expect((await cardRow(issueId)).executionRunId).toBeNull();
+
+    const result = await heartbeat.sweepStaleIssueLocks();
+    expect(result.terminalizedRunIds).toContain(writerRunId);
+    await expectWakePromoted(issueId, writerAgentId, writerRunId, wakeId);
+  });
+
+  it("a local_trusted request with only a run header does not forge the proof", async () => {
+    const { companyId, writerAgentId, issueId, forgedRunId } = await seedForgedHeaderCard();
+
+    const res = await request(authApp({ deploymentMode: "local_trusted" }))
+      .patch(`/api/issues/${issueId}`)
+      .set("x-paperclip-run-id", forgedRunId)
+      .send({ assigneeAgentId: writerAgentId });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await expectNoForgedHolder(companyId, issueId, forgedRunId);
   });
 });

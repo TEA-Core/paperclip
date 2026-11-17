@@ -153,6 +153,7 @@ export async function findLiveIssueExecutionHolder(
         and(
           eq(heartbeatRuns.status, "running"),
           eq(heartbeatRuns.agentId, issues.assigneeAgentId),
+          notInArray(issues.status, ["done", "cancelled"]),
           sql`nullif(btrim(${heartbeatRuns.contextSnapshot} ->> 'issueId'), '') is null`,
           sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) > clock_timestamp() - interval '90 minutes'`,
           runAuthoredIssueAssignment(heartbeatRuns.id),

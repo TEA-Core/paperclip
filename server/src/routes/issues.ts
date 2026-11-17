@@ -4527,12 +4527,16 @@ export function issueRoutes(
   } = {},
 ) {
   const router = Router();
-  const svc = issueService(db);
   const runRedactions = createRunSecretRedactionRegistry(db);
   const access = accessService(db);
   const secretProposals = createSecretProposalsService(db);
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
+  });
+  const svc = issueService(db, {
+    onExecutionLockCleared: async ({ run, issueId }) => {
+      await heartbeat.releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true }, issueId);
+    },
   });
   const commentWasCreatedByAssigneeRun = async (
     comment: { companyId: string; createdByRunId?: string | null },

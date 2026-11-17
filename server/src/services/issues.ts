@@ -322,6 +322,10 @@ export type IssuePostCommitAction = {
   runId: string;
   issueId: string;
   issueStatus: string;
+} | {
+  type: "promote_deferred_wakes";
+  runId: string;
+  issueId: string;
 };
 
 /** Execute side effects that must never run before the issue transaction commits. */
@@ -334,6 +338,20 @@ export async function executeIssuePostCommitActions(
   const heartbeat = heartbeatService(db);
   const cancelledRunIds = new Set<string>();
   for (const action of actions) {
+    if (action.type === "promote_deferred_wakes") {
+      try {
+        const run = await heartbeat.getRun(action.runId);
+        if (run) {
+          await heartbeat.releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true }, action.issueId);
+        }
+      } catch (err) {
+        logger.warn(
+          { err, runId: action.runId, issueId: action.issueId },
+          "deferred wake promotion deferred to recovery sweep",
+        );
+      }
+      continue;
+    }
     if (cancelledRunIds.has(action.runId)) continue;
     cancelledRunIds.add(action.runId);
     try {
@@ -7401,9 +7419,32 @@ export async function readIssueCommentRunLogText(run: {
   return content;
 }
 
-export function issueService(db: Db) {
+export function issueService(
+  db: Db,
+  opts: {
+    /** Called after a helper clears an execution lock outside the normal release. */
+    onExecutionLockCleared?: (info: {
+      companyId: string;
+      issueId: string;
+      run: typeof heartbeatRuns.$inferSelect;
+    }) => Promise<void>;
+  } = {},
+) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
+
+  async function notifyExecutionLockCleared(companyId: string, issueId: string, runId: string | null) {
+    if (!opts.onExecutionLockCleared || !runId) return;
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (!run) return;
+    await opts.onExecutionLockCleared({ companyId, issueId, run }).catch((err) => {
+      logger.error({ err, issueId, runId }, "failed to promote wakes after an execution lock was cleared");
+    });
+  }
 
   function provisionalTitleFromDescription(description: string) {
     const simpleTitle = description.trim().replace(/\s+/g, " ").slice(0, 120);
@@ -8540,7 +8581,7 @@ export function issueService(db: Db) {
   async function clearExecutionRunIfTerminal(
     issueId: string,
   ): Promise<boolean> {
-    return db.transaction(async (tx) => {
+    const cleared = await db.transaction(async (tx) => {
       await tx.execute(
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
@@ -8581,8 +8622,10 @@ export function issueService(db: Db) {
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
 
-      return Boolean(updated);
+      return updated ? { companyId: issue.companyId, runId: issue.executionRunId } : null;
     });
+    if (cleared) await notifyExecutionLockCleared(cleared.companyId, issueId, cleared.runId);
+    return Boolean(cleared);
   }
 
   // Symmetric to clearExecutionRunIfTerminal. Clears checkoutRunId (and the
@@ -8590,7 +8633,7 @@ export function issueService(db: Db) {
   // heartbeat run that is terminal or no longer exists. No assignee/status
   // precondition. Explicit retry claims remain owned by queue-first settlement.
   async function clearCheckoutRunIfTerminal(issueId: string): Promise<boolean> {
-    return db.transaction(async (tx) => {
+    const cleared = await db.transaction(async (tx) => {
       await tx.execute(
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
@@ -8660,8 +8703,10 @@ export function issueService(db: Db) {
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
 
-      return Boolean(updated);
+      return updated ? { companyId: issue.companyId, runId: issue.executionRunId ?? issue.checkoutRunId } : null;
     });
+    if (cleared) await notifyExecutionLockCleared(cleared.companyId, issueId, cleared.runId);
+    return Boolean(cleared);
   }
 
   async function addStopRelayCommentIfNeeded(
@@ -13019,6 +13064,17 @@ export function issueService(db: Db) {
       const result = await (!isTransactionHandle(dbOrTx)
         ? db.transaction(runUpdate)
         : runUpdate(dbOrTx));
+      if (result && existing.executionRunId && !result.executionRunId) {
+        if (!isTransactionHandle(dbOrTx)) {
+          await notifyExecutionLockCleared(existing.companyId, id, existing.executionRunId);
+        } else if (postCommitActions) {
+          postCommitActions.push({
+            type: "promote_deferred_wakes",
+            runId: existing.executionRunId,
+            issueId: id,
+          });
+        }
+      }
       if (!isTransactionHandle(dbOrTx) && !postCommitActivityPublications) {
         for (const publication of ownedActivityPublications)
           publishActivity(publication);
@@ -13705,8 +13761,9 @@ export function issueService(db: Db) {
       id: string,
       actorAgentId?: string,
       actorRunId?: string | null,
-    ) =>
-      db.transaction(async (tx) => {
+    ) => {
+      const clearedLock: { value: { companyId: string; runId: string | null } | null } = { value: null };
+      const released = await db.transaction(async (tx) => {
         await tx.execute(
           sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
         );
@@ -13765,15 +13822,19 @@ export function issueService(db: Db) {
           .returning()
           .then((rows) => rows[0] ?? null);
         if (!updated) return null;
+        clearedLock.value = { companyId: existing.companyId, runId: existing.executionRunId ?? existing.checkoutRunId };
         const [enriched] = await withIssueLabels(tx, [updated]);
         return enriched;
-      }),
+      });
+      if (clearedLock.value) await notifyExecutionLockCleared(clearedLock.value.companyId, id, clearedLock.value.runId);
+      return released;
+    },
 
     adminForceRelease: async (
       id: string,
       options: { clearAssignee?: boolean } = {},
-    ) =>
-      db.transaction(async (tx) => {
+    ) => {
+      const forced = await db.transaction(async (tx) => {
         await tx.execute(
           sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
         );
@@ -13815,7 +13876,16 @@ export function issueService(db: Db) {
             executionRunId: existing.executionRunId,
           },
         };
-      }),
+      });
+      if (forced) {
+        await notifyExecutionLockCleared(
+          forced.issue.companyId,
+          id,
+          forced.previous.executionRunId ?? forced.previous.checkoutRunId,
+        );
+      }
+      return forced;
+    },
 
     listLabels: (companyId: string) =>
       db

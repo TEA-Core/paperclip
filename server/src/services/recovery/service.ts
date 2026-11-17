@@ -206,6 +206,7 @@ import {
   type ContinuationPathDisjuncts,
 } from "../issue-continuation-path.js";
 import {
+  ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS,
   listUnlockedIssuesWithDeferredWakesForRun,
   resolveLiveExecutionLeases,
   type LiveExecutionLease,
@@ -9460,12 +9461,13 @@ export function recoveryService(
   // still claims to be live but can no longer reach a terminal status on its
   // own, so a stuck "running" run can no longer block the sweep. Idempotent and
   // safe: clears at most one row's worth of lock columns per candidate.
-  async function sweepStaleIssueLocks() {
+  async function sweepStaleIssueLocks(opts?: { now?: Date }) {
     const result = {
       cleared: 0,
       issueIds: [] as string[],
       terminalizedRunIds: [] as string[],
     };
+    const sweepNow = opts?.now ?? new Date();
 
     const candidates = await db
       .select({
@@ -9547,14 +9549,55 @@ export function recoveryService(
         runReferencedByActiveIssue: runIdsReferencedByActiveIssue.has(row.id),
       });
       runStatusById.set(row.id, outcome.status);
-      if (outcome.terminalized) result.terminalizedRunIds.push(row.id);
+      if (outcome.terminalized) {
+        result.terminalizedRunIds.push(row.id);
+        // The dead author may also hold wakes on authored cards that carry no
+        // lock stamp; those cards are never cleared below, so promote here.
+        const unlockedIssueIds = await listUnlockedIssuesWithDeferredWakesForRun(db, {
+          companyId: row.companyId,
+          runId: row.id,
+          agentId: row.agentId,
+        }).catch((err) => {
+          logger.error({ err, runId: row.id }, "failed to list cards held behind a terminalized author");
+          return [] as string[];
+        });
+        await promoteDeferredWakesAfterLockClear({ ...row, status: outcome.status }, unlockedIssueIds);
+      }
     }
 
-    const isCleanable = (runId: string | null) => {
+    // A stamped hold also lapses when its author has produced no output past
+    // the silence bound and a wake is held behind it: the author may still
+    // have a live in-memory handle, so no terminal path will ever clear it.
+    // A run with recent output is active and never lapses here.
+    const silentRunIds = new Set<string>();
+    for (const row of runRows) {
+      if (row.status !== "running") continue;
+      const lastActivityAt = row.lastOutputAt ?? row.startedAt ?? row.createdAt;
+      if (lastActivityAt && sweepNow.getTime() - new Date(lastActivityAt).getTime() > ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS) {
+        silentRunIds.add(row.id);
+      }
+    }
+    const deferredWakeIssueIds = new Set<string>();
+    if (candidates.length > 0) {
+      const deferredRows = await db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          inArray(agentWakeupRequests.companyId, [...new Set(candidates.map((issue) => issue.companyId))]),
+        ));
+      const candidateIssueIds = new Set(candidates.map((issue) => issue.id));
+      for (const row of deferredRows) {
+        const wakeIssueId = readWakeIssueIdFromPayload(row.payload);
+        if (wakeIssueId && candidateIssueIds.has(wakeIssueId)) deferredWakeIssueIds.add(wakeIssueId);
+      }
+    }
+    const isCleanable = (runId: string | null, issueId?: string) => {
       if (!runId) return true;
       const status = runStatusById.get(runId);
       if (!status) return true; // missing run row → no real claim
-      return TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);
+      if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(status)) return true;
+      return Boolean(issueId && silentRunIds.has(runId) && deferredWakeIssueIds.has(issueId));
     };
 
     for (const issue of candidates) {
@@ -9572,8 +9615,8 @@ export function recoveryService(
       }
       await runRecoverySweepIssue(issue, "recovery.sweep_stale_issue_locks", async () => {
       if (
-        !isCleanable(issue.checkoutRunId) ||
-        !isCleanable(issue.executionRunId)
+        !isCleanable(issue.checkoutRunId, issue.id) ||
+        !isCleanable(issue.executionRunId, issue.id)
       ) {
         return;
       }
