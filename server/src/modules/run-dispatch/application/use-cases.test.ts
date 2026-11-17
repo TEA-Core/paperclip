@@ -204,4 +204,43 @@ describe("createExpireStaleQueuedRuns", () => {
     expect(listCalls).toBe(MAX_EXPIRY_PAGES_PER_SWEEP);
     expect(result).toMatchObject({ expired: 0, pageCapReached: true, pagesScanned: MAX_EXPIRY_PAGES_PER_SWEEP });
   });
+
+  it("keeps committed cancellations and their effects when one candidate throws mid-sweep", async () => {
+    const candidates = Array.from({ length: 100 }, (_, i): ExpiredQueuedRunCandidate => ({
+      runId: `run-${i}`,
+      companyId: "company-1",
+      cursor: { createdAtText: `2026-01-01 00:00:00.${String(i).padStart(6, "0")}+00`, runId: `run-${i}` },
+    }));
+    const expiry: QueuedRunExpiry = {
+      async listExpiredQueuedRuns(input) {
+        return input.after ? [] : candidates;
+      },
+      async expireQueuedRun(input) {
+        if (input.runId === "run-49") throw new Error("invalid input syntax for type uuid");
+        return {
+          outcome: "cancelled",
+          reason: "expired",
+          errorCode: "queued_run_expired",
+          postCommitEffects: [{
+            kind: "run_queued",
+            companyId: input.companyId,
+            runId: input.runId,
+            agentId: "agent-1",
+            invocationSource: "automation",
+            triggerDetail: null,
+            wakeupRequestId: null,
+          }],
+        };
+      },
+    };
+
+    const result = await createExpireStaleQueuedRuns({ expiry })({ now: new Date("2026-01-03T00:00:00.000Z") });
+
+    expect(result.expired).toBe(99);
+    expect(result.postCommitEffects).toHaveLength(99);
+    expect(result.postCommitEffects.map((effect) => effect.runId)).toEqual(
+      candidates.filter((candidate) => candidate.runId !== "run-49").map((candidate) => candidate.runId),
+    );
+    expect(result.failures).toEqual([{ runId: "run-49", error: expect.any(Error) }]);
+  });
 });

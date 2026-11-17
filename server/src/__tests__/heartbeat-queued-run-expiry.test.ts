@@ -424,6 +424,119 @@ describeEmbeddedPostgres("heartbeat queued-run age bound", () => {
     expect((await readIssueLock(issueId)).executionRunId).toBeNull();
   });
 
+  it("reaches newer expirable runs on the first sweep behind 2,100 older runs with a numeric issueId", { timeout: 120_000 }, async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const oldest = Date.now() - QUEUED_RUN_BOUND_MS - 48 * HOUR_MS;
+    const placeholderIssueId = await seedIssue(companyId, agentId, 1);
+    const numeric = oldQueuedRunRows({
+      companyId, agentId, issueId: placeholderIssueId, count: 2_100, firstCreatedAtMs: oldest,
+    }).map((row) => ({ ...row, contextSnapshot: { issueId: 12345 } }));
+    for (let i = 0; i < numeric.length; i += 500) {
+      await db.insert(heartbeatRuns).values(numeric.slice(i, i + 500));
+    }
+    const issueId = await seedIssue(companyId, agentId, 2);
+    const expirable = oldQueuedRunRows({
+      companyId, agentId, issueId, count: 20, firstCreatedAtMs: oldest + 10_000,
+    });
+    await db.insert(heartbeatRuns).values(expirable);
+
+    const result = await heartbeatService(db).expireStaleQueuedRuns();
+
+    expect(result).toMatchObject({ expired: 20, pageCapReached: false });
+    expect([...result.runIds].sort()).toEqual(expirable.map((row) => row.id).sort());
+  });
+
+  it("completes a sweep past a run whose issueId is padded text and expires the run behind it", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const oldest = Date.now() - QUEUED_RUN_BOUND_MS - 10 * HOUR_MS;
+    const issueId = await seedIssue(companyId, agentId, 1);
+    const [poison] = oldQueuedRunRows({ companyId, agentId, issueId, count: 1, firstCreatedAtMs: oldest })
+      .map((row) => ({ ...row, contextSnapshot: { issueId: ` ${issueId} ` } }));
+    await db.insert(heartbeatRuns).values(poison!);
+    const [expirable] = oldQueuedRunRows({ companyId, agentId, issueId, count: 1, firstCreatedAtMs: oldest + 1_000 });
+    await db.insert(heartbeatRuns).values(expirable!);
+
+    const result = await heartbeatService(db).expireStaleQueuedRuns();
+
+    expect(result).toEqual({ expired: 1, runIds: [expirable!.id], pageCapReached: false });
+    expect((await readRun(poison!.id)).status).toBe("queued");
+  });
+
+  it("treats a malformed issueId inside the locked decision as a missing issue instead of throwing", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedIssue(companyId, agentId, 1);
+    const [poison] = oldQueuedRunRows({
+      companyId, agentId, issueId, count: 1, firstCreatedAtMs: Date.now() - QUEUED_RUN_BOUND_MS - HOUR_MS,
+    }).map((row) => ({ ...row, contextSnapshot: { issueId: ` ${issueId} ` } }));
+    await db.insert(heartbeatRuns).values(poison!);
+
+    const outcome = await createPostgresRunDispatchAdapter(db).expireQueuedRun({
+      runId: poison!.id,
+      companyId,
+      now: new Date(),
+    });
+
+    expect(outcome).toMatchObject({ outcome: "cancelled", errorCode: "issue_not_found" });
+    expect(await readIssueLock(issueId)).toEqual({ executionRunId: null, executionLockedAt: null, checkoutRunId: null });
+  });
+
+  it("does not cancel a listed run once its company is paused", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedIssue(companyId, agentId, 1);
+    const stale = await seedQueuedLockHolder({
+      companyId,
+      agentId,
+      issueId,
+      createdAt: new Date(Date.now() - QUEUED_RUN_BOUND_MS - HOUR_MS),
+    });
+    const adapter = createPostgresRunDispatchAdapter(db);
+    const now = new Date();
+    const listed = await adapter.listExpiredQueuedRuns({
+      createdAtOrBefore: new Date(now.getTime() - QUEUED_RUN_BOUND_MS), now, limit: 100,
+    });
+    expect(listed.map((candidate) => candidate.runId)).toEqual([stale.runId]);
+
+    await db.update(companies).set({ status: "paused" }).where(eq(companies.id, companyId));
+    const outcome = await adapter.expireQueuedRun({ runId: stale.runId, companyId, now });
+
+    expect(outcome).toEqual({ outcome: "not_stale" });
+    expect((await readRun(stale.runId)).status).toBe("queued");
+    expect((await readIssueLock(issueId)).executionRunId).toBe(stale.runId);
+  });
+
+  it("expires a run whose retry alarm is due exactly now", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedIssue(companyId, agentId, 1);
+    const now = new Date();
+    const [due] = oldQueuedRunRows({
+      companyId, agentId, issueId, count: 1, firstCreatedAtMs: now.getTime() - QUEUED_RUN_BOUND_MS - HOUR_MS,
+      scheduledRetryAt: now,
+    });
+    await db.insert(heartbeatRuns).values(due!);
+
+    expect(await heartbeatService(db).expireStaleQueuedRuns({ now }))
+      .toEqual({ expired: 1, runIds: [due!.id], pageCapReached: false });
+  });
+
+  it("leaves out a run whose upper-case issueId names an issue held by another running run", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedIssue(companyId, agentId, 1);
+    const holderRunId = await seedRunningRun(companyId, agentId, issueId, new Date());
+    await db.update(issues).set({ executionRunId: holderRunId, executionLockedAt: new Date() })
+      .where(eq(issues.id, issueId));
+    const [upper] = oldQueuedRunRows({
+      companyId, agentId, issueId, count: 1, firstCreatedAtMs: Date.now() - QUEUED_RUN_BOUND_MS - HOUR_MS,
+    }).map((row) => ({ ...row, contextSnapshot: { issueId: issueId.toUpperCase() } }));
+    await db.insert(heartbeatRuns).values(upper!);
+    const now = new Date();
+
+    const listed = await createPostgresRunDispatchAdapter(db).listExpiredQueuedRuns({
+      createdAtOrBefore: new Date(now.getTime() - QUEUED_RUN_BOUND_MS), now, limit: 100,
+    });
+
+    expect(listed).toEqual([]);
+  });
+
   it("leaves a running run older than the bound untouched", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = await seedIssue(companyId, agentId, 1);

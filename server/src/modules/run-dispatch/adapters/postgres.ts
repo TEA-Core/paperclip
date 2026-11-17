@@ -96,6 +96,13 @@ const QUEUED_RUN_EXPIRY_ERROR_CODES: Partial<Record<QueuedRunStalenessErrorCode,
   execution_reconciliation_required: true,
 };
 
+/**
+ * The canonical form of an issue id. A context issueId in any other shape (a
+ * number, padded text, a non-UUID string) cannot name an issue row, and
+ * casting it to uuid in a query throws, so callers check it first.
+ */
+const ISSUE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 type LoadGateFactsInput = {
   conversationContinuation: boolean;
   runId: string;
@@ -246,7 +253,9 @@ export function createPostgresRunDispatchAdapter(
       const result: { kind: "missing" | "retry" } | { kind: "value"; value: T } =
         await db.transaction(async (tx) => {
           const typedTx = tx as unknown as Db;
-          if (hintedIssueId || lockCheckoutIssue) {
+          // A malformed issueId names no issue row; locking by it would throw.
+          const lockableIssueId = hintedIssueId && ISSUE_ID_PATTERN.test(hintedIssueId) ? hintedIssueId : null;
+          if (lockableIssueId || lockCheckoutIssue) {
             await typedTx
               .select({ id: issues.id })
               .from(issues)
@@ -254,7 +263,7 @@ export function createPostgresRunDispatchAdapter(
                 and(
                   eq(issues.companyId, input.companyId),
                   or(
-                    hintedIssueId ? eq(issues.id, hintedIssueId) : undefined,
+                    lockableIssueId ? eq(issues.id, lockableIssueId) : undefined,
                     lockCheckoutIssue ? eq(issues.checkoutRunId, input.runId) : undefined,
                   ),
                 ),
@@ -1057,6 +1066,18 @@ export function createPostgresRunDispatchAdapter(
           : { stale: false as const },
       };
     }
+    if (!ISSUE_ID_PATTERN.test(issueId)) {
+      return {
+        issueId: null,
+        facts: null,
+        decision: {
+          stale: true as const,
+          errorCode: "issue_not_found" as const,
+          reason: "Cancelled because the run's issue reference is not a valid issue id",
+          details: { issueId },
+        },
+      };
+    }
     const recovery = await getExecutionBlocker(tx, run.companyId, issueId, { conversationResetCommentId: deriveCommentId(contextSnapshot) });
     if (recovery) return { issueId, facts: null, decision: { stale: true as const,
       errorCode: "execution_reconciliation_required" as const, reason: recovery.nextAction,
@@ -1158,7 +1179,8 @@ export function createPostgresRunDispatchAdapter(
               )
           : initialDecision;
 
-      if (decision.stale && issueId) {
+      // A stale run with no valid issue id (malformed reference) must not dispatch either.
+      if (decision.stale) {
         const cancellation = await cancelStaleRunInTx(
           tx,
           run,
@@ -1195,8 +1217,10 @@ export function createPostgresRunDispatchAdapter(
 
   async function listExpiredQueuedRuns(input: ListExpiredQueuedRunsInput): Promise<ExpiredQueuedRunCandidate[]> {
     // Issue-bound queued runs only: those are the runs that hold an issue
-    // execution lock. Paused companies dispatch nothing, so their queue is left
-    // alone, matching resumeQueuedRuns.
+    // execution lock. Only a canonical UUID issueId can name an issue row; a
+    // numeric or otherwise malformed issueId would never expire and would fill
+    // the pages, so such rows are not listed. Companies that are not active
+    // dispatch nothing, so their queue is left alone, matching resumeQueuedRuns.
     //
     // The last two predicates mirror the age rule's refusals in
     // decideQueuedRunStaleness (retry alarm not yet due; issue held by another
@@ -1219,7 +1243,8 @@ export function createPostgresRunDispatchAdapter(
           input.after
             ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${input.after.createdAtText}::timestamptz, ${input.after.runId}::uuid)`
             : undefined,
-          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' is not null`,
+          sql`jsonb_typeof(${heartbeatRuns.contextSnapshot} -> 'issueId') = 'string'`,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' ~* ${ISSUE_ID_PATTERN.source}`,
           or(isNull(heartbeatRuns.scheduledRetryAt), lte(heartbeatRuns.scheduledRetryAt, input.now)),
           sql`not exists (
             select 1
@@ -1229,7 +1254,7 @@ export function createPostgresRunDispatchAdapter(
              and lease_holder.status = 'running'
              and lease_holder.id in (lease_issue.execution_run_id, lease_issue.checkout_run_id)
             where lease_issue.company_id = ${heartbeatRuns.companyId}
-              and lease_issue.id::text = ${heartbeatRuns.contextSnapshot} ->> 'issueId'
+              and lease_issue.id::text = lower(${heartbeatRuns.contextSnapshot} ->> 'issueId')
               and lease_holder.id <> ${heartbeatRuns.id}
           )`,
         ),
@@ -1250,6 +1275,12 @@ export function createPostgresRunDispatchAdapter(
       () => ({ outcome: "lost_race" as const }),
       async (tx, run): Promise<CancelStaleQueuedRunOutcome> => {
         if (run.status !== "queued") return { outcome: "lost_race" };
+        // The company can be paused after the list query read it as active.
+        const [company] = await tx
+          .select({ status: companies.status })
+          .from(companies)
+          .where(eq(companies.id, run.companyId));
+        if (company?.status !== "active") return { outcome: "not_stale" };
         const { issueId, decision } = await decideCurrentRunStaleness(tx, run, input.now);
         // The age bound decides; the two verdicts the policy reaches before it
         // (issue gone, issue under a recovery hold) also mean the run can never

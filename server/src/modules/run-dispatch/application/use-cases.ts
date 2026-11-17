@@ -1,11 +1,16 @@
 import { MAX_QUEUED_ISSUE_RUN_AGE_MS } from "../domain/policy.js";
 import type {
+  ExpiredQueuedRunCandidate,
   ExpiredQueuedRunCursor,
   QueuedRunExpiry,
   RunDispatchWriter,
   ScheduledRetryReader,
 } from "./ports.js";
-import type { PostCommitEffect, PromoteScheduledRetryOutcome } from "./types.js";
+import type {
+  CancelStaleQueuedRunOutcome,
+  PostCommitEffect,
+  PromoteScheduledRetryOutcome,
+} from "./types.js";
 
 export function createEvaluateScheduledRetryGate(deps: { reader: ScheduledRetryReader }) {
   return (input: {
@@ -84,6 +89,9 @@ export function createExpireStaleQueuedRuns(deps: { expiry: QueuedRunExpiry }) {
     const createdAtOrBefore = new Date(now.getTime() - MAX_QUEUED_ISSUE_RUN_AGE_MS);
     const runIds: string[] = [];
     const postCommitEffects: PostCommitEffect[] = [];
+    // A failure on one candidate (or one page read) is recorded and skipped:
+    // it must not abort the sweep or drop the effects of committed cancels.
+    const failures: Array<{ runId: string | null; error: unknown }> = [];
     let after: ExpiredQueuedRunCursor | undefined;
     let pagesScanned = 0;
     let pageCapReached = false;
@@ -97,19 +105,31 @@ export function createExpireStaleQueuedRuns(deps: { expiry: QueuedRunExpiry }) {
         break;
       }
       pagesScanned += 1;
-      const page = await deps.expiry.listExpiredQueuedRuns({
-        createdAtOrBefore,
-        now,
-        limit: EXPIRY_PAGE_SIZE,
-        after,
-      });
+      let page: ExpiredQueuedRunCandidate[];
+      try {
+        page = await deps.expiry.listExpiredQueuedRuns({
+          createdAtOrBefore,
+          now,
+          limit: EXPIRY_PAGE_SIZE,
+          after,
+        });
+      } catch (error) {
+        failures.push({ runId: null, error });
+        break;
+      }
       for (const candidate of page) {
         if (runIds.length >= MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP) break sweep;
-        const result = await deps.expiry.expireQueuedRun({
-          runId: candidate.runId,
-          companyId: candidate.companyId,
-          now,
-        });
+        let result: CancelStaleQueuedRunOutcome;
+        try {
+          result = await deps.expiry.expireQueuedRun({
+            runId: candidate.runId,
+            companyId: candidate.companyId,
+            now,
+          });
+        } catch (error) {
+          failures.push({ runId: candidate.runId, error });
+          continue;
+        }
         if (result.outcome !== "cancelled") continue;
         runIds.push(candidate.runId);
         postCommitEffects.push(...result.postCommitEffects);
@@ -122,7 +142,7 @@ export function createExpireStaleQueuedRuns(deps: { expiry: QueuedRunExpiry }) {
       after = last.cursor;
     }
 
-    return { expired: runIds.length, runIds, postCommitEffects, pagesScanned, pageCapReached };
+    return { expired: runIds.length, runIds, postCommitEffects, pagesScanned, pageCapReached, failures };
   };
 }
 

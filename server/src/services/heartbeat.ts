@@ -23721,6 +23721,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     const result = await runDispatch.expireStaleQueuedRuns({ now: opts?.now });
     applyRunDispatchPostCommitEffects(result.postCommitEffects);
+    for (const failure of result.failures) {
+      logger.warn(
+        { err: failure.error, runId: failure.runId },
+        "queued-run age bound skipped a candidate after an error; the sweep continued",
+      );
+    }
     return { expired: result.expired, runIds: result.runIds, pageCapReached: result.pageCapReached };
   }
 
