@@ -171,7 +171,7 @@ export async function findLiveIssueExecutionHolder(
 }
 
 /**
- * SUP-20121: open cards an issue-less run of `agentId` owned through
+ * SUP-20121: cards an issue-less run of `agentId` owned through
  * `findLiveIssueExecutionHolder` (it created or self-assigned them) that no
  * longer carry an execution lock but still hold that agent's deferred wakes.
  * A status write clears the lock while the run is live, and the finishing
@@ -189,7 +189,6 @@ export async function listUnlockedIssuesWithDeferredWakesForRun(
       eq(issues.companyId, input.companyId),
       eq(issues.assigneeAgentId, input.agentId),
       isNull(issues.executionRunId),
-      notInArray(issues.status, ["done", "cancelled"]),
       runAuthoredIssueAssignment(input.runId),
       sql`exists (
         select 1 from ${agentWakeupRequests}

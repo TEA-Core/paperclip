@@ -795,6 +795,35 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     expect(wakes.map((wake) => wake.status)).not.toContain("deferred_issue_execution");
   });
 
+  it("a held wake on a card closed outside the update route is promoted when the author finishes", async () => {
+    const { companyId, writerAgentId, writerRunId } = await seed();
+    const writer = appFor(agentActor(companyId, writerAgentId, writerRunId));
+    const created = await request(writer)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Closed outside route", status: "in_progress", assigneeAgentId: writerAgentId });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    const issueId = created.body.id as string;
+    const comment = await request(appFor(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Board follow-up." });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+    await expectAuthorKeepsCard(issueId, writerAgentId, writerRunId);
+
+    // The card reaches done without the route update promotion (a direct write).
+    await db.update(issues)
+      .set({ status: "done", executionRunId: null, executionAgentNameKey: null, executionLockedAt: null })
+      .where(eq(issues.id, issueId));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, writerRunId));
+    runningProcesses.delete(writerRunId);
+    const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, writerRunId));
+    await heartbeat.releaseIssueExecutionAndPromote(finished!, { suppressImmediateRecovery: true });
+
+    expect(await otherRunsForCard(issueId, writerAgentId, writerRunId)).toHaveLength(1);
+    const wakes = await wakesForCard(issueId, writerAgentId);
+    expect(wakes.map((wake) => wake.status)).not.toContain("deferred_issue_execution");
+  });
+
   it("the stale-lock sweep promotes wakes on unlocked authored cards when it terminalizes a dead author", async () => {
     const { companyId, issuePrefix, writerAgentId, writerRunId, issueId, wakeId } = await seedHeldCard({ authorStatus: "running", stampLock: false });
     // A second card still stamps the dead author, so the sweep pre-pass sees it.
