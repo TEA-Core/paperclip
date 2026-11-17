@@ -1382,6 +1382,11 @@ The current app also exposes V1-supporting surfaces for:
   sweep selects terminal source issues in SQL before inspecting Git, and still requires a terminal
   subtree, cooldown, and no active run. A row with a recorded merged pull request also needs a clean
   worktree; it is archived with reason `issue_terminal` and its worktree is cleaned up.
+  Before deletion the cleanup re-checks a clean worktree at the assessed HEAD on the recorded
+  branch. A recorded branch that differs from the checked-out branch (the runtime's own branch,
+  or a detached HEAD after a squash merge) passes only when no local ref has the recorded name,
+  HEAD is an ancestor of the base ref or equals the `headSha` of a recorded merged pull request,
+  and no HEAD commit is missing from every remote. A git error in these checks refuses cleanup.
   By default, every other archive changes the database row and no work-tree file:
   no worktree removal, file removal, branch deletion or runtime-service stop, and
   the issues are detached from the closed row. Open linked issues prevent an
