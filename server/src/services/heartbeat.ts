@@ -24137,6 +24137,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }).finally(() => cancelRejectedQueuedRuns(rejectedClaims));
   }
 
+  // SUP-24238: when a run's executor settles, another agent's queued run on the
+  // same issue may be waiting behind it (live-holder deferral or the claim
+  // fence). executeRun re-drives only the settled run's own agent, so the next
+  // owner used to wait for the scheduler tick. Start the next owner's queue
+  // through the same call the tick makes; claimQueuedRun still re-checks
+  // eligibility, the live-holder deferral and the claim fence. Detached so a
+  // failure never fails the settle; tracked so drainActiveRunExecutions waits.
+  function startQueuedRunsOfNextIssueOwners(
+    settledRun: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "contextSnapshot">,
+  ) {
+    const issueId = readNonEmptyString(parseObject(settledRun.contextSnapshot).issueId);
+    if (!issueId) return;
+    const kick = (async () => {
+      const waiting = await db
+        .selectDistinct({ agentId: heartbeatRuns.agentId })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, settledRun.companyId),
+          eq(heartbeatRuns.status, "queued"),
+          ne(heartbeatRuns.agentId, settledRun.agentId),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+        ));
+      for (const { agentId } of waiting) {
+        await startNextQueuedRunForAgent(agentId).catch((err) => {
+          logger.warn(
+            { err, runId: settledRun.id, issueId, agentId },
+            "failed to start the next owner's queued run after execution cleanup",
+          );
+        });
+      }
+    })().catch((err) => {
+      logger.warn(
+        { err, runId: settledRun.id, issueId },
+        "failed to find the next owner's queued run after execution cleanup",
+      );
+    });
+    activeRunExecutionPromises.add(kick);
+    void kick.finally(() => {
+      activeRunExecutionPromises.delete(kick);
+    });
+  }
+
   // Await every background heartbeat execution that is currently in flight. A
   // draining run can, in its finally block, promote and dispatch the next queued
   // run for the same agent — that follow-up execution is registered in the set
@@ -30717,6 +30759,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .catch(err => {
               logger.warn({ err, runId: run.id }, "failed to deliver settled tool reviews after execution cleanup");
             });
+          startQueuedRunsOfNextIssueOwners(latestRun);
         }
         await startNextQueuedRunForAgent(run.agentId);
       }

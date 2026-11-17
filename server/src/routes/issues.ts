@@ -2682,6 +2682,13 @@ function executionPrincipalsEqual(
     : left.userId === right.userId;
 }
 
+/**
+ * Whether the request actor IS the seated participant, used to gate the
+ * `## Review: APPROVED` comment auto-approval. The compare is exact, by design:
+ * an agent id that matches the seat only by letter case does not match. The
+ * stale-snapshot compares fold agent-id case to detect a changed row, but
+ * folding this actor-versus-seat compare would widen who may approve.
+ */
 function actorMatchesExecutionParticipant(
   actor: { actorType: "user" | "agent"; actorId: string },
   participant: ParsedExecutionState["currentParticipant"] | null,
@@ -4814,6 +4821,11 @@ export function issueRoutes(
     return { ...snapshot, binding, resolution: await resolveFinalDeliveryResolution(issue) };
   }
 
+  /**
+   * Issue row with execution-policy and seated agent ids case-folded, for the
+   * pre-certificate stale compare only. Assignee columns and user ids keep
+   * their exact values.
+   */
   function issueRowWithFoldedDecisionAgentIds(row: object): Record<string, unknown> {
     const record = row as Record<string, unknown>;
     return {
@@ -5738,7 +5750,7 @@ export function issueRoutes(
       if (persistRefusalComment) {
         await postTerminalStatusRefusalComment(svc, issue.id, {
           httpStatus: 422,
-          code: "done_transition_missing_tier_declaration",
+          code: tierResult.code ?? "done_transition_missing_tier_declaration",
           error: tierResult.reason,
           remedy,
           runId,
@@ -5749,7 +5761,7 @@ export function issueRoutes(
         status: 422,
         body: {
           error: tierResult.reason,
-          code: "done_transition_missing_tier_declaration",
+          code: tierResult.code ?? "done_transition_missing_tier_declaration",
           details: {
             issueId: issue.id,
             identifier: issue.identifier ?? null,
@@ -14246,6 +14258,7 @@ export function issueRoutes(
         // threaded out of the transaction so the post-commit merge-arming hook can
         // run the same approved-decision arming every other door runs.
         let recordedRecoveryDecision: {
+          id: string;
           stageId: string;
           stageType: string;
           outcome: string;
@@ -14607,6 +14620,7 @@ export function issueRoutes(
               // SUP-17163: remember the recorded decision so the post-commit
               // merge-arming hook can stamp/arm on an approved outcome.
               recordedRecoveryDecision = {
+                id: decisionId,
                 stageId: transition.decision.stageId,
                 stageType: transition.decision.stageType,
                 outcome: transition.decision.outcome,
@@ -14982,6 +14996,18 @@ export function issueRoutes(
           activeRecoveryAction: null,
         },
         recoveryAction: result.recoveryAction,
+        // The execution decision this resolution recorded, or null when it
+        // recorded none (for example, the resolving actor was not the seated
+        // participant exactly and the stage was re-seated instead). A 200 does
+        // not by itself mean a decision was written.
+        executionDecision: result.recordedRecoveryDecision
+          ? {
+              id: result.recordedRecoveryDecision.id,
+              stageId: result.recordedRecoveryDecision.stageId,
+              stageType: result.recordedRecoveryDecision.stageType,
+              outcome: result.recordedRecoveryDecision.outcome,
+            }
+          : null,
       });
     },
   );
