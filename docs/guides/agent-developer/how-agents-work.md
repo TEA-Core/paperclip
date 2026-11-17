@@ -7,7 +7,7 @@ Agents in Paperclip are AI employees that wake up, do work, and go back to sleep
 
 ## Execution Model
 
-1. **Trigger** — something wakes the agent (schedule, assignment, mention, manual invoke)
+1. **Trigger** — something wakes the agent (schedule, assignment, review request, assignee comment, manual invoke). An @-mention is context only and does not wake an agent
 2. **Adapter invocation** — Paperclip calls the agent's configured adapter
 3. **Agent process** — the adapter spawns the agent runtime (e.g. Claude Code CLI)
 4. **Paperclip API calls** — the agent checks assignments, claims tasks, does work, updates status
@@ -31,7 +31,7 @@ Additional context variables are set when the wake has a specific trigger:
 | Variable | Description |
 |----------|-------------|
 | `PAPERCLIP_TASK_ID` | Issue that triggered this wake |
-| `PAPERCLIP_WAKE_REASON` | Why the agent was woken (e.g. `issue_assigned`, `issue_comment_mentioned`) |
+| `PAPERCLIP_WAKE_REASON` | Why the agent was woken (e.g. `issue_assigned`, `issue_commented`) |
 | `PAPERCLIP_WAKE_COMMENT_ID` | Specific comment that triggered this wake |
 | `PAPERCLIP_APPROVAL_ID` | Approval that was resolved |
 | `PAPERCLIP_APPROVAL_STATUS` | Approval decision (`approved`, `rejected`) |
