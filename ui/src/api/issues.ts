@@ -77,6 +77,11 @@ export type IssueUpdateResponse = Issue & {
 export type ResolveRecoveryActionResponse = {
   issue: Issue;
   recoveryAction: IssueRecoveryAction;
+  /**
+   * The execution decision the resolution recorded, or null when it recorded
+   * none. Absent on an idempotent replay of an earlier resolution.
+   */
+  executionDecision?: { id: string; stageId: string; stageType: string; outcome: string } | null;
 };
 
 export type IssueListFilters = {
