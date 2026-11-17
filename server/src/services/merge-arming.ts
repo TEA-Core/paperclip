@@ -586,9 +586,10 @@ export interface WorkspaceDiscoveryResult {
   terminalFailure: WorkspaceDiscoveryFailure | null;
   /**
    * SUP-24033: lower-cased `owner/repo` of every repo whose open PRs were read
-   * COMPLETELY (the one 100-entry page was not full). A cached draft mention whose
-   * repo is absent here was never fully live-checked by this discovery (drafts do
-   * not contribute repo pairs; a full page may hide a live draft on a later page),
+   * COMPLETELY (the one 100-entry page was neither full nor followed by a `Link`
+   * rel="next"). A cached draft mention whose repo is absent here was never fully
+   * live-checked by this discovery (drafts do not contribute repo pairs; an
+   * incomplete page may hide a live draft on a later page),
    * so its draft bit cannot be called stale.
    */
   scannedRepos: string[];
@@ -779,9 +780,10 @@ async function discoverCardPullRequestByWorkspace(
         break;
       }
 
-      // SUP-24033: a full page means open PRs past it were never read, so the repo
-      // is NOT fully scanned and a live draft past the page stays invisible.
-      if (!listResult.pageFull) scannedRepos.push(`${pair.owner}/${pair.repo}`.toLowerCase());
+      // SUP-24033: a full page, or a Link header that advertises a next page, means
+      // open PRs past it were never read, so the repo is NOT fully scanned and a
+      // live draft past the page stays invisible.
+      if (!listResult.mayHaveMore) scannedRepos.push(`${pair.owner}/${pair.repo}`.toLowerCase());
       for (const item of listResult.items) {
         if (!includeDrafts && item.draft === true) continue;
         const headRef = (item.headRef ?? "").toLowerCase();
@@ -4650,6 +4652,29 @@ async function fetchPullRequestHeadSha(
 /** The open-PR list is read as one page of this size; there is no pagination. */
 const OPEN_PULL_REQUESTS_PAGE_SIZE = 100;
 
+/**
+ * SUP-24033: true when an RFC 8288 `Link` header may point at a next page.
+ * Absent (null) means no next page. A present header that is empty, or any part
+ * that is not `<uri-reference>` followed by `;`-parameters, is malformed and
+ * counts as having a next page (fail closed). `rel` is matched
+ * case-insensitively, quoted or bare, and may carry several space-separated
+ * relation types.
+ */
+export function linkHeaderAdvertisesNextPage(header: string | null): boolean {
+  if (header === null) return false;
+  if (header.trim() === "") return true;
+  for (const part of header.split(/,\s*(?=<)/)) {
+    const match = /^\s*<[^<>]*>\s*((?:;[^;]*)*)\s*$/.exec(part);
+    if (!match) return true;
+    for (const param of match[1]!.split(";")) {
+      const rel = /^\s*rel\s*=\s*(?:"([^"]*)"|([^\s"]+))\s*$/i.exec(param);
+      if (!rel) continue;
+      if ((rel[1] ?? rel[2] ?? "").toLowerCase().split(/\s+/).includes("next")) return true;
+    }
+  }
+  return false;
+}
+
 export interface OpenPullRequestListItem {
   number: number;
   draft: boolean | null;
@@ -4662,11 +4687,13 @@ export interface OpenPullRequestsSuccess extends GitHubFetchResult {
   ok: true;
   items: OpenPullRequestListItem[];
   /**
-   * SUP-24033: true when the raw response filled the whole page
-   * (`OPEN_PULL_REQUESTS_PAGE_SIZE` entries), so open PRs past this page were
-   * not read. Counted on the raw array, before malformed entries are dropped.
+   * SUP-24033: true when open PRs past this page may exist, so the list is not
+   * proven complete. Either the raw response filled the whole page
+   * (`OPEN_PULL_REQUESTS_PAGE_SIZE` entries, counted before malformed entries are
+   * dropped) or the `Link` header advertises a next page (a malformed or empty
+   * `Link` header counts as advertising one: fail closed).
    */
-  pageFull: boolean;
+  mayHaveMore: boolean;
 }
 
 export interface OpenPullRequestsFailure extends GitHubFetchResult {
@@ -4740,7 +4767,13 @@ async function fetchOpenPullRequestsOnce(
       body: typeof pr.body === "string" ? pr.body : null,
     });
   }
-  return { ok: true, status: response.status, message: null, items, pageFull: body.length >= OPEN_PULL_REQUESTS_PAGE_SIZE };
+  return {
+    ok: true,
+    status: response.status,
+    message: null,
+    items,
+    mayHaveMore: body.length >= OPEN_PULL_REQUESTS_PAGE_SIZE || linkHeaderAdvertisesNextPage(response.headers?.get("link") ?? null),
+  };
 }
 
 async function writeCommitStatus(

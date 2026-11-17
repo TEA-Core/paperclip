@@ -53,6 +53,7 @@ import {
   isTransientReadStatus,
   ladderIncompleteStageIds,
   ladderIsTerminallyApproved,
+  linkHeaderAdvertisesNextPage,
   pickMostRecentMergeQueueEjection,
   narrowToDelivered,
   preflightFinalDelivery,
@@ -682,7 +683,7 @@ function prHeadBody(sha: string, headRef = "SUP-42-branch") {
 }
 
 function installRoutes(
-  routes: Array<{ url: string | RegExp; body?: unknown; ok?: boolean; status?: number }>,
+  routes: Array<{ url: string | RegExp; body?: unknown; ok?: boolean; status?: number; headers?: Record<string, string> }>,
 ) {
   mockGhFetch.mockImplementation(async (url: string) => {
     for (const route of routes) {
@@ -692,6 +693,7 @@ function installRoutes(
           ok: route.ok ?? true,
           status: route.status ?? 200,
           json: async () => route.body ?? {},
+          headers: new Headers(route.headers ?? {}),
         } as unknown as Response;
       }
     }
@@ -2491,9 +2493,9 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       const fillerPage = (count: number) =>
         Array.from({ length: count }, (_, i) =>
           openPrsListItem({ number: 1000 + i, head: { ref: `unrelated-${i}` }, title: `Unrelated ${i}`, body: null }));
-      type TestRoute = { url: string | RegExp; body?: unknown; ok?: boolean; status?: number };
-      const pageRoutes = (page: unknown[]): TestRoute[] => [
-        { url: OPEN_PRS_LIST_URL, body: page },
+      type TestRoute = { url: string | RegExp; body?: unknown; ok?: boolean; status?: number; headers?: Record<string, string> };
+      const pageRoutes = (page: unknown[], headers?: Record<string, string>): TestRoute[] => [
+        { url: OPEN_PRS_LIST_URL, body: page, headers },
         { url: PR_URL, body: mergedMentionBody() },
         { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
         { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
@@ -2552,6 +2554,69 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         if (expected === "unresolvable") {
           expect(mockGhFetch.mock.calls.filter(([url]) => /\/pulls\/\d+$/.test(String(url)))).toHaveLength(0);
         }
+      });
+
+      // R4L: GitHub only returns a non-final page that is full, but the scan must
+      // not rely on that. A SHORT page that still advertises Link rel="next" is an
+      // incomplete scan: an owned live draft that sits only on the next page is
+      // invisible, so the base head_draft refusal stands.
+      describe("Link rel=next on the open-PR page (R4L)", () => {
+        const next = '<https://api.github.com/repositories/1/pulls?state=open&per_page=100&page=2>; rel="next", <https://api.github.com/repositories/1/pulls?state=open&per_page=100&page=2>; rel="last"';
+        const run = async (headers?: Record<string, string>) => {
+          const issueId = await insertIssue();
+          await insertMention(issueId, { number: 42, state: "open", draft: true });
+          installRoutes(pageRoutes(fillerPage(50), headers));
+          return preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+        };
+
+        it("refuses a short page that carries Link rel=next (live draft only on the next page)", async () => {
+          const result = await run({ link: next });
+          expect(result.kind).toBe("unresolvable");
+          if (result.kind === "unresolvable") {
+            expect(result.reason).toMatch(/^head_draft:/);
+            expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
+          }
+        });
+
+        it.each([
+          ["short page with no Link header is still scanned (legit admit unchanged)", undefined],
+          ["Link with only rel=prev/first is still scanned", { link: '<https://api.github.com/x?page=1>; rel="prev", <https://api.github.com/x?page=1>; rel="first"' }],
+        ] as const)("%s", async (_label, headers) => {
+          const result = await run(headers as Record<string, string> | undefined);
+          expect(result.kind).toBe("resolved");
+        });
+
+        it.each([
+          ["empty Link header", ""],
+          ["garbage Link header", "this is not a link header"],
+          ["unterminated target", '<https://api.github.com/x?page=2; rel="next"'],
+          ["target missing its angle brackets", 'https://api.github.com/x?page=2; rel="next"'],
+        ] as const)("refuses on a malformed Link header: %s (fail closed)", async (_label, link) => {
+          const result = await run({ link });
+          expect(result.kind).toBe("unresolvable");
+          if (result.kind === "unresolvable") expect(result.reason).toMatch(/^head_draft:/);
+        });
+      });
+
+      it.each([
+        ['rel="next"', true],
+        ["rel=next", true],
+        ['REL="NEXT"', true],
+        ['rel="prev next"', true],
+        ['rel="Last NEXT"', true],
+        ['title="a, b"; rel="next"', true],
+        ['rel="prev"', false],
+        ['rel="nextish"', false],
+        ['rel="last"', false],
+        ["", false],
+      ])("linkHeaderAdvertisesNextPage parses a single link with %s", (params, expected) => {
+        expect(linkHeaderAdvertisesNextPage(`<https://api.github.com/x?page=2>; ${params}`)).toBe(expected);
+      });
+
+      it("linkHeaderAdvertisesNextPage reads every comma-separated link and a comma inside a target", () => {
+        expect(linkHeaderAdvertisesNextPage('<https://a.test/x?q=a,b&page=1>; rel="prev", <https://a.test/x?q=a,b&page=3>; rel="next"')).toBe(true);
+        expect(linkHeaderAdvertisesNextPage('<https://a.test/x?q=a,b&page=1>; rel="prev", <https://a.test/x?page=0>; rel="first"')).toBe(false);
+        expect(linkHeaderAdvertisesNextPage(null)).toBe(false);
       });
 
       it("refuses when only some cached drafts are the card's own delivery", async () => {

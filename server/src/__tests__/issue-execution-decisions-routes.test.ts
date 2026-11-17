@@ -295,6 +295,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     deliveryRequirement,
     assigneeAgentId = null,
     mentionState,
+    openListLink,
   }: {
     draft?: boolean;
     missing?: boolean;
@@ -306,7 +307,13 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     deliveryRequirement?: IssueDeliveryRequirement;
     assigneeAgentId?: string | null;
     /** SUP-22346: cache the mentioned PR as merged/closed out-of-band ("merged" | "ambiguous") or closed-unmerged. */
-    mentionState?: "merged" | "ambiguous" | "closed-unmerged";
+    mentionState?: "merged" | "ambiguous" | "closed-unmerged" | "stale-draft-merged";
+    /**
+     * SUP-24033: only with mentionState "stale-draft-merged". The cached mention
+     * is a stale open draft of the delivery PR that has since merged; the live
+     * open-PR list is a SHORT page of unrelated PRs, optionally with this Link header.
+     */
+    openListLink?: string;
   } = {}) {
     const company = await seedCompany(db);
     if (mergeArmingEnabled) {
@@ -354,7 +361,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     // SUP-22346: mentionState models the out-of-band-merged carrier — the
     // cached mention is closed, so every open-PR resolver sees nothing and the
     // live open-PR list is empty.
-    const mergedMention = mentionState === "merged" || mentionState === "ambiguous";
+    const mergedMention = mentionState === "merged" || mentionState === "ambiguous" || mentionState === "stale-draft-merged";
     const pr = {
       number: 42, state: "open", draft, merged: false, node_id: "sandbox-pr",
       title: identifier, head: { ref: branch, sha: "a".repeat(40), repo: { full_name: "TEA-Core/paperclip" } },
@@ -371,7 +378,8 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         companyId: company.id, providerKey: "github", objectType: "pull_request",
         externalId: "TEA-Core/paperclip#pull/42", displayKey: "42", displayTitle: identifier,
         sanitizedCanonicalUrl: "https://github.com/TEA-Core/paperclip/pull/42",
-        canonicalIdentityHash: randomUUID(), data: pr,
+        canonicalIdentityHash: randomUUID(),
+        data: mentionState === "stale-draft-merged" ? { ...pr, state: "open", draft: true, merged: false } : pr,
       }).returning();
       if (!unmentioned) {
         await db.insert(externalObjectMentions).values({
@@ -445,7 +453,15 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
           ? { ...pr.head, sha: "b".repeat(40) } : pr.head;
         return Response.json({ ...pr, head });
       }
-      if (url.includes("/pulls?")) return Response.json(mentionState ? [] : missing ? [] : [pr]);
+      if (url.includes("/pulls?")) {
+        if (mentionState === "stale-draft-merged") {
+          const unrelated = Array.from({ length: 50 }, (_, i) => ({
+            number: 1000 + i, draft: false, title: `Unrelated ${i}`, body: null, head: { ref: `unrelated-${i}` },
+          }));
+          return Response.json(unrelated, openListLink ? { headers: { link: openListLink } } : undefined);
+        }
+        return Response.json(mentionState ? [] : missing ? [] : [pr]);
+      }
       if (url.includes("/compare/")) {
         return Response.json(mergedMention ? { status: "behind", ahead_by: 0 } : { ahead_by: 1 });
       }
@@ -663,6 +679,66 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     // Publication stays open-PR-only: a merged carrier gets no status write.
     expect(fixture.writes).toEqual([]);
     expect(fixture.armCalls).toEqual([]);
+  });
+
+  // SUP-24033 R4L: the cached mention is a stale open draft of the delivery PR
+  // (merged since). The open-PR list read is a SHORT page, but it advertises a
+  // next page, so an owned live draft could sit there unseen. Every terminal
+  // door must keep the base head_draft refusal; a short page with no next page is
+  // a complete scan and the verified merged carrier is accepted as before.
+  describe("stale cached draft with a merged live carrier and a short open-PR page (SUP-24033)", () => {
+    const nextPage = '<https://api.github.com/repositories/1/pulls?state=open&per_page=100&page=2>; rel="next"';
+    const expectHeadDraftRefusal = (response: request.Response) => {
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(response.body).toMatchObject({
+        details: { code: "approval_final_delivery_preflight", reason: expect.stringMatching(/^head_draft:/) },
+      });
+    };
+
+    it("PATCH final verdict refuses head_draft when the page advertises a next page", async () => {
+      const fixture = await pendingDelivery({ mentionState: "stale-draft-merged", openListLink: nextPage });
+      expectHeadDraftRefusal(await fixture.approve());
+      expect((await fixture.read()).status).toBe("in_review");
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+      expect(fixture.writes).toEqual([]);
+    });
+
+    it("board stage-decision refuses head_draft when the page advertises a next page", async () => {
+      const previous = process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+      process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "true";
+      try {
+        const fixture = await pendingDelivery({ mentionState: "stale-draft-merged", openListLink: nextPage });
+        const response = await request(createApp(db, boardActor(fixture.company)))
+          .post(`/api/issues/${fixture.issue.id}/execution-stage/board-decision`)
+          .send({ decision: "approved", comment: "Independent final approval." });
+        expectHeadDraftRefusal(response);
+        expect((await fixture.read()).status).toBe("in_review");
+        expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+        expect(fixture.writes).toEqual([]);
+      } finally {
+        if (previous === undefined) delete process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
+        else process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = previous;
+      }
+    });
+
+    it("approval comment refuses head_draft when the page advertises a next page and records nothing", async () => {
+      const fixture = await pendingDelivery({ mentionState: "stale-draft-merged", openListLink: nextPage });
+      const response = await request(createApp(db, boardActor(fixture.company)))
+        .post(`/api/issues/${fixture.issue.id}/comments`)
+        .send({ body: "## Review: APPROVED\n\nIndependent final review." });
+      expectHeadDraftRefusal(response);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, fixture.issue.id))).toEqual([]);
+      expect((await fixture.read()).status).toBe("in_review");
+      expect(fixture.writes).toEqual([]);
+    });
+
+    it("accepts the verified merged carrier on a short page with no Link header (legit admit unchanged)", async () => {
+      const fixture = await pendingDelivery({ mentionState: "stale-draft-merged" });
+      const response = await fixture.approve();
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect((await fixture.read()).status).toBe("done");
+      expect(fixture.writes).toEqual([]);
+    });
   });
 
   it("keeps the merged-carrier gate fail-closed when the mentioned PR is closed but NOT merged (SUP-22346)", async () => {
