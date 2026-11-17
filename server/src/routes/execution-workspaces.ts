@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { accessSync, constants as fsConstants, existsSync, readFileSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync } from "node:fs";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { Router, type Request, type Response } from "express";
@@ -62,7 +62,8 @@ import { environmentRuntimeService } from "../services/environment-runtime.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { runExclusiveWorkspaceRuntimeControl } from "../services/workspace-operations.js";
 import { resolveManagedWorkspaceInstanceId } from "../services/managed-workspace-identity.js";
-import { isVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
+import { readLegacySeedManifestObject } from "../worktree-seed-manifest.js";
+import { isVerifiedWorktreeSeedManifest } from "@paperclipai/shared/worktree-initialization-manifest";
 import {
   issueWorkspaceLoginHandoff,
   workspaceLoginHandoffFailureStatus,
@@ -395,15 +396,15 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         source?: { configPath?: unknown; instanceId?: unknown };
         targetInstanceId?: unknown;
       };
-      try {
-        manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-      } catch {
+      const boundedManifest = readLegacySeedManifestObject(manifestPath);
+      if (!boundedManifest) {
         throw unprocessable("Workspace seed manifest is malformed; repair source identity cannot be trusted.", {
           code: "workspace_repair_precondition_failed",
           reason: "seed_manifest_malformed",
           repairPhase: "precondition_validation",
         });
       }
+      manifest = boundedManifest;
 
       try {
         if (!projectWorkspace?.cwd) {
@@ -736,12 +737,13 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
             const manifestPoll = setInterval(() => {
               if (reseedObserved || !existsSync(manifestPath)) return;
               try {
-                const current = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+                const current = readLegacySeedManifestObject(manifestPath) as {
                   attemptId?: unknown;
                   state?: unknown;
-                };
+                } | null;
                 if (
-                  typeof current.attemptId === "string"
+                  current
+                  && typeof current.attemptId === "string"
                   && current.attemptId !== repairPreviousAttemptId
                   && (current.state === "pending" || current.state === "running" || current.state === "failed")
                 ) {
@@ -768,11 +770,11 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
             if (exitCode !== 0) {
               let seedFailurePhase: string | null = null;
               try {
-                const failedManifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+                const failedManifest = readLegacySeedManifestObject(manifestPath) as {
                   phase?: unknown;
                   state?: unknown;
-                };
-                seedFailurePhase = failedManifest.state === "failed" && typeof failedManifest.phase === "string"
+                } | null;
+                seedFailurePhase = failedManifest && failedManifest.state === "failed" && typeof failedManifest.phase === "string"
                   ? failedManifest.phase
                   : null;
               } catch {
@@ -793,8 +795,8 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
               await reportRepairPhase("full_reseed", "started");
             }
 
-            const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
-            if (!isVerifiedWorktreeSeedManifest(manifest)) {
+            const manifest = readLegacySeedManifestObject(manifestPath);
+            if (!manifest || !isVerifiedWorktreeSeedManifest(manifest)) {
               throw new Error("Workspace reseed returned without a verified terminal manifest.");
             }
             const expectedInstanceId = resolveManagedWorkspaceInstanceId(workspaceCwd);

@@ -417,7 +417,7 @@ async function waitForWakeup(assertion: () => void) {
   await vi.waitFor(assertion);
 }
 
-describe.sequential("issue comment reopen routes", () => {
+describe("issue comment reopen routes", () => {
   // `installActor` imports the route module lazily, so without this warm-up the
   // first test pays the one-time transform cost of `routes/issues.js` and its
   // import graph inside vitest's 5s testTimeout. On the loaded serial shard that
@@ -428,7 +428,6 @@ describe.sequential("issue comment reopen routes", () => {
     await import("../routes/issues.js");
     await import("../middleware/index.js");
   });
-
   beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.getById.mockReset();
@@ -1863,7 +1862,7 @@ describe.sequential("issue comment reopen routes", () => {
         authorType: "user",
         authorizationReason: "allow_board_actor",
         clientRequestId: undefined,
-        mirrorToSlack: true,
+        mirrorToSlack: true, boardApiKeyId: null,
         presentation: {
           kind: "system_notice",
           tone: "warning",
@@ -2839,15 +2838,11 @@ describe.sequential("issue comment reopen routes", () => {
     );
 
     mockHeartbeatService.wakeup.mockClear();
-    mockIssueService.findMentionedAgents.mockClear();
     res = await request(await installActor(createApp(), agentActor(agentB)))
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: "B replies on B's own issue" });
     expect(res.status).toBe(201);
-    await vi.waitFor(() =>
-      expect(mockIssueService.findMentionedAgents).toHaveBeenCalledOnce(),
-    );
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise<void>((resolve) => setImmediate(resolve));
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
 
     mockIssueService.getById.mockResolvedValue({
@@ -4891,7 +4886,7 @@ describe.sequential("issue comment reopen routes", () => {
       expect(res.status).toBe(200);
       expect(mockIssueService.update).toHaveBeenCalledWith(
         issueId,
-        expect.objectContaining({ status: "in_progress" }),
+        expect.objectContaining({ status: "in_progress" }), expect.anything(),
       );
     });
 

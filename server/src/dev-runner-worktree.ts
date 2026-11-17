@@ -1,7 +1,8 @@
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { hasVerifiedWorktreeSeedManifest } from "./worktree-seed-manifest.js";
+import { resolveWorktreeSchemaLineage } from "@paperclipai/shared/worktree-initialization-identity";
+import { readWorktreeInitializationKey, readWorktreeSeedManifestStatus } from "./worktree-seed-manifest.js";
 
 function parseEnvFile(contents: string): Record<string, string> {
   const entries: Record<string, string> = {};
@@ -67,16 +68,43 @@ export function resolveWorktreeEnvFilePath(rootDir: string): string {
   return path.join(resolveWorktreeStateDir(rootDir), ".env");
 }
 
-export function isWorktreeSeedPending(rootDir: string): boolean {
+export type WorktreeSeedGate =
+  | { kind: "ready" }
+  | { kind: "pending" }
+  | { kind: "refused"; message: string };
+
+/**
+ * Boot gate for `pnpm dev` in a worktree. A v3 initialization manifest opens
+ * the gate only when it is verified for the instance this process runs as
+ * (`PAPERCLIP_INSTANCE_ID`, loaded from the worktree `.env` by
+ * {@link bootstrapDevRunnerWorktreeEnv}), for a revision of this checkout's
+ * migration lineage, and under the initialization key next to it.
+ */
+export function resolveWorktreeSeedGate(rootDir: string, env: NodeJS.ProcessEnv = process.env): WorktreeSeedGate {
   // SUP-14087 partitions the marker dir per uid; upstream's seed-manifest
   // verification runs inside that partition rather than a fixed `.paperclip`.
   const markerDir = resolveWorktreeStateDir(rootDir);
-  const manifestPath = path.join(markerDir, "seed-manifest.json");
-  if (existsSync(manifestPath)) {
-    return !hasVerifiedWorktreeSeedManifest(manifestPath);
+  const manifest = readWorktreeSeedManifestStatus(path.join(markerDir, "seed-manifest.json"), {
+    targetInstanceId: env.PAPERCLIP_INSTANCE_ID?.trim() || null,
+    schema: resolveWorktreeSchemaLineage(path.join(rootDir, "packages", "db", "src", "migrations")),
+    bindingKey: readWorktreeInitializationKey(markerDir),
+  });
+  switch (manifest.kind) {
+    case "verified":
+      return { kind: "ready" };
+    case "incomplete":
+      return { kind: "pending" };
+    case "refused":
+      return { kind: "refused", message: manifest.message };
+    case "absent":
+      return existsSync(path.join(markerDir, "seed-pending")) && !existsSync(path.join(markerDir, "seed-complete"))
+        ? { kind: "pending" }
+        : { kind: "ready" };
   }
-  return existsSync(path.join(markerDir, "seed-pending"))
-    && !existsSync(path.join(markerDir, "seed-complete"));
+}
+
+export function isWorktreeSeedPending(rootDir: string): boolean {
+  return resolveWorktreeSeedGate(rootDir).kind !== "ready";
 }
 
 function expandHomePrefix(value: string): string {

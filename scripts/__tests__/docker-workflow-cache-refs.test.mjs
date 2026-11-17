@@ -10,6 +10,12 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 // so docker.yml is the only one today. Any workflow that pushes to ghcr
 // belongs in this list.
 const workflowPaths = [".github/workflows/docker.yml"];
+// Registry cache refs that never derive from `github.repository`, so the
+// mixed-case owner cannot reach them. docker-runner-check.yml's manual_image
+// job (upstream, fold-s3a) names the literal lowercase upstream image
+// `ghcr.io/paperclipai/paperclip-daytona-runner` and runs only on
+// paperclipai/paperclip (authorize_manual fails closed on the fork).
+const literalLowercaseRegistryWorkflows = new Set([".github/workflows/docker-runner-check.yml"]);
 const workflows = workflowPaths.map(relativePath => ({
   path: relativePath,
   text: readFileSync(path.join(repoRoot, relativePath), "utf8"),
@@ -129,6 +135,7 @@ test("every workflow with a registry-backed build cache is covered", () => {
     .filter(name => name.endsWith(".yml") || name.endsWith(".yaml"))
     .map(name => `.github/workflows/${name}`)
     .filter(relativePath => !covered.has(relativePath))
+    .filter(relativePath => !literalLowercaseRegistryWorkflows.has(relativePath))
     .filter(relativePath =>
       /type=registry,ref=ghcr\.io/.test(readFileSync(path.join(repoRoot, relativePath), "utf8")),
     );

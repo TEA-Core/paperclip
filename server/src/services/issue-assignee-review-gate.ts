@@ -213,6 +213,33 @@ function isWorkflowControlledPendingReviewParticipant(input: {
   });
 }
 
+/**
+ * SUP-24280: the one write the Wiki handoff guard admits without the canonical
+ * Maintainer as the resulting assignee. The emitter must be able to cancel a
+ * half-emitted handoff stub that nobody owns, and the cancellation must leave
+ * the row unowned. All conditions hold together:
+ * - the write persists status `cancelled`;
+ * - the write carries no assignee field (`assigneeAgentId`/`assigneeUserId`),
+ *   including one a workflow transition adds;
+ * - the stored row has no agent and no user assignee (both exactly null).
+ * With no assignee field written, the resulting row keeps the stored null
+ * assignees. Any assignee write, any other status, any owned row, and any
+ * unknown (undefined) stored assignee stay guarded.
+ */
+export function isUnassignedWikiHandoffCancellation(input: {
+  requestedStatus: unknown;
+  assigneeFieldWritten: boolean;
+  currentAssigneeAgentId: string | null | undefined;
+  currentAssigneeUserId: string | null | undefined;
+}): boolean {
+  return (
+    input.requestedStatus === "cancelled" &&
+    input.assigneeFieldWritten === false &&
+    input.currentAssigneeAgentId === null &&
+    input.currentAssigneeUserId === null
+  );
+}
+
 export async function assertWikiHandoffWriteIntegrity(input: {
   db: Db | { select: unknown };
   companyId: string;
@@ -227,6 +254,16 @@ export async function assertWikiHandoffWriteIntegrity(input: {
   currentAssigneeAgentId?: string | null;
   checkReviewStage?: boolean;
   workflowControlledAssignment?: boolean;
+  /**
+   * SUP-24280: the persisted status and assignee shape of this write, so the
+   * guard can admit an unassigned-stub cancellation. Omit it at doors that
+   * cannot cancel; without it the exemption never applies.
+   */
+  cancellation?: {
+    requestedStatus: unknown;
+    assigneeFieldWritten: boolean;
+    currentAssigneeUserId: string | null | undefined;
+  };
   refusalContext?: { caller: RefusalCaller; issue: RefusalIssue | null };
 }): Promise<void> {
   const canonicalMaintainerAgentId = await resolveCanonicalWikiMaintainerAgentId(
@@ -249,6 +286,15 @@ export async function assertWikiHandoffWriteIntegrity(input: {
     workflowControlledAssignment: input.workflowControlledAssignment,
   });
   if (!violation) return;
+  if (
+    input.cancellation &&
+    isUnassignedWikiHandoffCancellation({
+      requestedStatus: input.cancellation.requestedStatus,
+      assigneeFieldWritten: input.cancellation.assigneeFieldWritten,
+      currentAssigneeAgentId: input.currentAssigneeAgentId,
+      currentAssigneeUserId: input.cancellation.currentAssigneeUserId,
+    })
+  ) return;
   if (
     violation.reason === "wiki_handoff_self_satisfy" &&
     input.workflowControlledAssignment !== true &&
