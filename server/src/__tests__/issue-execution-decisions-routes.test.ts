@@ -1978,6 +1978,27 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       expect(fixture.armCalls).toEqual([]);
     });
 
+    // Pinned (SUP-24085): an own PR closed unmerged resolves as `no-pr`, so a
+    // stage approval that does not complete the card is admitted and tagged
+    // uncertified, exactly like a card with no PR at all. Nothing is stamped.
+    // The final approval still refuses (see the closed-unmerged final test).
+    it.each(stageDoors)("%s: records a stage-1 approve when the own PR is closed unmerged (pinned no-pr)", async (door) => {
+      const fixture = await pendingDelivery({ adr072: true, mentionState: "closed-unmerged" });
+      const stored = await expectAdvanced(fixture, await approveAtDoor(fixture, door), door, 0);
+      const approvalStatus = approvalStatusOf(stored);
+      expect(approvalStatus.finalDelivery).toBeUndefined();
+      expect(approvalStatus.approvedHeadSha).toBeUndefined();
+      expect(approvalStatus.publishSkipped).toMatchObject({ reason: expect.stringContaining("head_uncertified"), headSha: null });
+      expect(fixture.writes).toEqual([]);
+      expect((await receiptsOf(fixture)).map((receipt) => receipt.state)).toEqual(["ready"]);
+    });
+
+    it.each(stageDoors)("%s: still refuses the final-stage approve when the own PR is closed unmerged", async (door) => {
+      const fixture = await pendingDelivery({ adr072: true, mentionState: "closed-unmerged", atStage: 2 });
+      const before = await fixture.read();
+      await expectRefusedUnchanged(fixture, await approveAtDoor(fixture, door), before, "approval_final_delivery_preflight", "no-pr");
+    });
+
     it.each(stageDoors)("%s: still refuses a stage-1 approve whose delivery head moves during the preflight and keeps its ready receipt", async (door) => {
       const fixture = await pendingDelivery({ adr072: true, mergeArmingEnabled: true });
       moveHeadDuringPreflight(fixture);

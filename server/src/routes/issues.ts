@@ -213,6 +213,7 @@ import {
   publishApprovalStatus,
   recordApprovalAnchor,
   readCertifiedFinalDelivery,
+  readUncertifiedFinalDelivery,
   recordApprovalPublishOutcome,
   resolveApprovalDecisionHead,
   preflightFinalDelivery,
@@ -4836,16 +4837,9 @@ export function issueRoutes(
     };
   }
 
-  // SUP-24085: the reason the current decision's final-delivery preflight left no
-  // certified head, when it admitted a stage approval over a card with no open PR.
-  function readUncertifiedFinalDelivery(executionState: Record<string, unknown> | null | undefined): string | undefined {
-    const approvalStatus = executionState?.approvalStatus;
-    if (!approvalStatus || typeof approvalStatus !== "object" || !("finalDeliveryUncertified" in approvalStatus)) return undefined;
-    const uncertified = approvalStatus.finalDeliveryUncertified;
-    if (!uncertified || typeof uncertified !== "object" || !("decisionId" in uncertified) || !("reason" in uncertified)) return undefined;
-    if (typeof executionState.lastDecisionId !== "string" || uncertified.decisionId !== executionState.lastDecisionId) return undefined;
-    return typeof uncertified.reason === "string" ? uncertified.reason : "no certified head";
-  }
+  // SUP-24085: readUncertifiedFinalDelivery is shared from merge-arming.ts so
+  // every later stamp writer (this hook, merge-arming republish, and the
+  // approval-status reconciler) reads the tag the same way.
 
   // SUP-13904 / SUP-17163: shared post-transition merge-arming hook, run by every
   // door that records an approved review decision:
@@ -11992,6 +11986,19 @@ export function issueRoutes(
         outcome: "rejected",
         reason: "no_approved_decision",
         message: "This card has no recorded 'approved' decision; there is nothing to re-stamp.",
+      });
+      return;
+    }
+
+    // SUP-24085 F1-later: the current decision was admitted over a card with
+    // no open PR and certified no head. Re-resolving a later-linked PR here
+    // would stamp a head the final-delivery preflight never certified.
+    const uncertifiedReason = readUncertifiedFinalDelivery(state);
+    if (uncertifiedReason !== undefined) {
+      res.status(409).json({
+        outcome: "rejected",
+        reason: "head_uncertified",
+        message: `status:skipped:head_uncertified: the final-delivery preflight certified no head for this decision (${uncertifiedReason}); refusing to stamp a head it never saw`,
       });
       return;
     }
