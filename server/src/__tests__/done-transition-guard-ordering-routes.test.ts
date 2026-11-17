@@ -987,10 +987,11 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
 
     const notes = allRows.filter((r) => r.action === "issue.done_transition_guard_note");
     expect(notes).toHaveLength(1);
-    // Upstream's activity redaction (folded in slice 2b) text-redacts every string value, and
-    // `secretName=` matches its secret-field pattern, so the stored note masks the secret's NAME.
-    // The guard's own skipReason still carries it (done-transition-guard.test.ts).
-    expect(notes[0]!.details?.skipReason).toBe("auth_failed:compare:401:scope=repo:secretName=***REDACTED***");
+    // Upstream's activity redaction (folded in slice 2b) text-redacts secret-named fields. Upstream
+    // #14937 narrowed the field pattern to the secret value names, so `secretName=` (the NAME of a
+    // secret, not its value) is no longer masked and the stored note keeps it, like the guard's
+    // own skipReason (done-transition-guard.test.ts).
+    expect(notes[0]!.details?.skipReason).toBe("auth_failed:compare:401:scope=repo:secretName=GITHUB_TOKEN");
     expect(notes[0]!.details?.decisionCarried).toBe(false);
     expect(allRows.every((r) => r.action !== "issue.done_transition_guard_skipped")).toBe(true);
 

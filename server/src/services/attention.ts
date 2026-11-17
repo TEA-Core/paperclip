@@ -2040,11 +2040,17 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         companyId,
         generatedAt: new Date().toISOString(),
         totalCount: rankedItems.length,
-        // Desk badge: distinct items that surfaced
-        // today OR carry an explicit decide-by deadline due today/past. Counted
-        // over the full ranked set (pre-pagination) so the sidebar badge stays
-        // company-wide accurate even on a small first page.
-        deskBadgeCount: rankedItems.filter((item) => isNewToday(item, now) || isDecideNow(item, now)).length,
+        // Desk badge: distinct items that surfaced today, carry an explicit
+        // decide-by deadline due today/past, or are still-pending thread
+        // interactions (counted regardless of arrival day, because agents cannot
+        // set `decideBy`; SUP-24337). Counted over the full ranked set
+        // (pre-pagination) so the sidebar badge stays company-wide accurate
+        // even on a small first page.
+        deskBadgeCount: rankedItems.filter((item) =>
+          isNewToday(item, now)
+          || isDecideNow(item, now)
+          || (item.sourceKind === "issue_thread_interaction" && item.subject.status === "pending")
+        ).length,
         nextCursor,
         countsBySourceKind,
         items,

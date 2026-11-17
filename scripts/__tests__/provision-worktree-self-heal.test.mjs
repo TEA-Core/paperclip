@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { randomBytes, randomUUID } from "node:crypto";
 import test from "node:test";
 import fs from "node:fs";
 import os from "node:os";
@@ -252,7 +253,9 @@ test("uses the base CLI when its import graph boots", () => {
 // absent source instead; "provisions a self-contained worktree when no seed source
 // config exists on disk" and "runtime provisioning exits 0 when no seed source
 // config exists on disk" below pin that behavior. Present-but-malformed sources are
-// still refused (the symlink and non-regular cases that follow).
+// still refused (the symlink and non-regular cases that follow). Upstream #14810
+// later changed the absent-default-source case to a config-less "plain checkout";
+// its tests encode that upstream contract and are not carried for the same reason.
 
 test("rejects a dangling base workspace config symlink instead of falling back", () => {
   const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
@@ -981,6 +984,89 @@ test("runtime provisioning skips complete minimal and full seed manifests", () =
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stderr, /verified seed manifest; skipping runtime provisioning/);
     assert.deepEqual(readCliInvocations(baseCwd), []);
+  }
+});
+
+/**
+ * A verified v3 fresh manifest for this checkout's migration lineage head and
+ * its 0600 initialization key, as the real writer stores them. `forge` keeps
+ * the key but writes a binding the key did not produce.
+ */
+async function verifiedFreshFiles(targetInstanceId, { schemaOverride = {}, forge = false } = {}) {
+  const { computeWorktreeSchemaLineage } = await import(
+    new URL("../../packages/shared/src/worktree-initialization-identity.ts", import.meta.url).href
+  );
+  const { computeWorktreeInitializationBinding } = await import(
+    new URL("../../packages/shared/src/worktree-initialization-manifest.ts", import.meta.url).href
+  );
+  const head = computeWorktreeSchemaLineage(new URL("../../packages/db/src/migrations/", import.meta.url).pathname).at(-1);
+  const generationId = randomUUID();
+  const attemptId = randomUUID();
+  const body = {
+    version: 3,
+    kind: "worktree-initialization",
+    profile: "fresh",
+    policyVersion: 1,
+    schemaFingerprint: head.schemaFingerprint,
+    migrationRevision: head.migrationRevision,
+    ...schemaOverride,
+    targetInstanceId,
+    generationId,
+    attemptId,
+    state: "verified",
+    phase: "complete",
+    startedAt: "2026-11-16T10:00:00.000Z",
+    finishedAt: "2026-11-16T10:00:05.000Z",
+    source: null,
+    diagnostics: [{ phase: "complete", code: "fresh_ready", status: "succeeded", at: "2026-11-16T10:00:05.000Z" }],
+    validation: { kind: "fresh-ready", attemptId, generationId, completedAt: "2026-11-16T10:00:05.000Z" },
+  };
+  const key = randomBytes(32);
+  const binding = forge
+    ? `hmac-sha256:${randomBytes(32).toString("hex")}`
+    : computeWorktreeInitializationBinding(key, body);
+  return { manifest: JSON.stringify({ ...body, binding }), key };
+}
+
+function writeFreshFiles(manifestPath, files, env) {
+  fs.writeFileSync(manifestPath, files.manifest);
+  fs.writeFileSync(path.join(path.dirname(manifestPath), "initialization.key"), files.key, { mode: 0o600 });
+  if (env !== null) fs.writeFileSync(path.join(path.dirname(manifestPath), ".env"), env);
+}
+
+test("runtime provisioning skips a verified fresh initialization for this worktree instance and schema", async () => {
+  const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+  const files = await verifiedFreshFiles("wt-fresh");
+  const worktreeCwd = makeManifestWorktree("paperclip-provision-runtime-fresh-", (manifestPath) => {
+    writeFreshFiles(manifestPath, files, "PAPERCLIP_INSTANCE_ID=wt-fresh\n");
+  });
+  const result = runRuntimeProvision(baseCwd, worktreeCwd);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /verified seed manifest; skipping runtime provisioning/);
+  assert.deepEqual(readCliInvocations(baseCwd), [], "a fresh worktree is never seeded from a parent");
+});
+
+test("runtime provisioning refuses a forged fresh initialization, or one for another instance or schema, without reseeding", async () => {
+  const cases = [
+    ["forged", await verifiedFreshFiles("wt-fresh", { forge: true }), "PAPERCLIP_INSTANCE_ID=wt-fresh\n", /not bound to this worktree's initialization key/],
+    ["other-instance", await verifiedFreshFiles("wt-fresh"), "PAPERCLIP_INSTANCE_ID=wt-other\n", /different target instance/],
+    ["no-env", await verifiedFreshFiles("wt-fresh"), null, /cannot confirm the target identity/],
+    [
+      "diverged-schema",
+      await verifiedFreshFiles("wt-fresh", { schemaOverride: { schemaFingerprint: `sha256:${"0".repeat(64)}` } }),
+      "PAPERCLIP_INSTANCE_ID=wt-fresh\n",
+      /different destination schema/,
+    ],
+  ];
+  for (const [label, files, env, reason] of cases) {
+    const baseCwd = makeBaseWorkspace({ helpExit: 0, initExit: 0 });
+    const worktreeCwd = makeManifestWorktree(`paperclip-provision-runtime-fresh-refuse-${label}-`, (manifestPath) => {
+      writeFreshFiles(manifestPath, files, env);
+    });
+    const result = runRuntimeProvision(baseCwd, worktreeCwd);
+    assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+    assert.match(result.stderr, reason, label);
+    assert.deepEqual(readCliInvocations(baseCwd), [], `${label}: the seed CLI must not run`);
   }
 });
 

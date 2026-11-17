@@ -19,7 +19,7 @@ import { attentionService } from "../services/attention.js";
 import { companySearchQuerySchema } from "@paperclipai/shared";
 import { companySearchService } from "../services/company-search.js";
 import { recoveryService } from "../services/recovery/service.js";
-import { issueService } from "../services/issues.js";
+import { issueService } from "../services/issues.js"; import { heartbeatService } from "../services/heartbeat.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("Slack conversation idle lifecycle", () => {
@@ -88,6 +88,22 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(results.results.find((result) => result.issue?.id === f.issueId)?.issue?.externalConversationState).toBe("waiting");
     expect((await issueService(db).list(f.companyId, { q: "you there" }))[0]?.externalConversationState).toBe("waiting");
     expect((await issueService(db).listReviewAttention(f.companyId, [{ id: f.issueId, companyId: f.companyId, status: "in_review" }])).get(f.issueId)?.state).toBe("none");
+  });
+
+  // SUP-23998 (mutant m5): settlement must run AFTER the release transaction commits.
+  // The settlement refuses while `executionRunId` is still set, so a settle that moved
+  // inside the transaction never settles. Only the real run-finalization path shows it.
+  it("settles once through run finalization, after the execution lock is released", async () => {
+    const f = await fixture();
+    await db.update(issues).set({ executionRunId: f.runId, executionAgentNameKey: "carl", executionLockedAt: new Date() })
+      .where(eq(issues.id, f.issueId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const heartbeat = heartbeatService(db);
+    await heartbeat.releaseIssueExecutionAndPromote(run!, { suppressImmediateRecovery: true });
+    expect(await state(f)).toEqual({ status: "in_review", externalConversationState: "waiting" });
+    expect((await db.select({ executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, f.issueId)))[0]?.executionRunId).toBeNull();
+    await heartbeat.releaseIssueExecutionAndPromote(run!, { suppressImmediateRecovery: true });
+    expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId), eq(activityLog.action, "issue.updated")))).toHaveLength(1);
   });
 
   it("preserves waiting state in compact list responses used by the Inbox", async () => {

@@ -664,13 +664,16 @@ export function normalizeIssueExecutionPolicy(
  * - an explicitly empty `stages` array (`executionPolicy.stages: []`), unless
  *   the stored policy is *already* stage-less, in which case the array removes
  *   nothing (SUP-13925);
- * - an explicit `executionPolicy: null` on an issue whose stored policy is
- *   non-null;
+ * - an explicit `executionPolicy: null` on an issue whose stored policy holds
+ *   stages, a monitor, or other content that normalization keeps (SUP-24000);
  * - any other body over an issue that currently has stages, where the body
  *   normalizes back to null (e.g. `{}` or `{mode: "normal"}`) so it cannot
  *   silently clear the ladder.
  *
- * `null` over a `null` stored policy stays a no-op and is allowed. A
+ * `null` over a `null` stored policy stays a no-op and is allowed. SUP-24000:
+ * `null` over a stored `stages: []` policy with no other content is also
+ * allowed. That policy normalizes to null without the explicit-empty preserve,
+ * so the null removes nothing that this guard protects. A
  * monitor-only policy (or a policy with authorization/review-preset content
  * but no stages) can still be cleared or replaced with a body that is not
  * null-as-is and that omits the `stages` field.
@@ -741,7 +744,11 @@ export function assertPatchableExecutionPolicyWrite(input: {
     throw unprocessable("executionPolicy.stages must not be empty");
   }
 
-  if (raw === null && currentPolicy !== null) {
+  // SUP-24000: the stored explicit-empty policy (SUP-22135) is non-null, but
+  // when it holds nothing else, a normalization without the preserve option
+  // returns null. A null body removes no content from it, so allow the null,
+  // as for a null stored policy.
+  if (raw === null && currentPolicy !== null && normalizeIssueExecutionPolicy(currentPolicy) !== null) {
     throw unprocessable(
       "executionPolicy must not be set to null on an issue that currently has a policy; send the full replacement policy instead",
     );
@@ -1118,6 +1125,15 @@ function actorPrincipal(actor: ActorLike): IssueExecutionStagePrincipal | null {
   return null;
 }
 
+/**
+ * Exact principal identity: same type and byte-equal agent or user id. This is
+ * the authorization compare (actor versus seat, return-assignee exclusion,
+ * stage membership) and it deliberately does NOT fold agent-id case. The
+ * stale-snapshot compares (`executionDecisionParticipantSignature`,
+ * `stallHoldSignature`, `foldExecutionStateAgentIds`,
+ * `foldExecutionPolicyAgentIds`) fold agent-id case only to decide whether a
+ * row changed under the lock; folding here would widen who may act on a stage.
+ */
 function principalsEqual(a: IssueExecutionStagePrincipal | null, b: IssueExecutionStagePrincipal | null): boolean {
   if (!a || !b) return false;
   if (a.type !== b.type) return false;
@@ -1185,15 +1201,19 @@ function isStallArbiterHold(input: {
  * the decision snapshot compare and the route's raw-row compares. The seated
  * participant folds trim + lowercase; the policy's participant list and
  * `stallEscalation.toAgentId` fold lowercase only. User ids are never folded.
+ * These folds only decide whether a row is stale; they never decide who may
+ * act (see `principalsEqual`).
  */
 function foldSeatedAgentId(agentId: string | null | undefined): string {
   return (agentId ?? "").trim().toLowerCase();
 }
 
+/** Policy-side agent-id fold (stage participants and `stallEscalation.toAgentId`): lowercase only. */
 function foldPolicyAgentId(agentId: string | null | undefined): string {
   return (agentId ?? "").toLowerCase();
 }
 
+/** True for a non-null, non-array object (a jsonb record). */
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -1289,6 +1309,11 @@ export function deliveryBindingDiffers(
   );
 }
 
+/**
+ * Comparable form of the seated participant for the stale-snapshot compare.
+ * Agent ids fold trim + lowercase. User ids are trimmed but keep their case.
+ * Not an authorization compare: actor-versus-seat stays exact.
+ */
 function executionDecisionParticipantSignature(
   participant: IssueExecutionStagePrincipal | null | undefined,
 ): string | null {
@@ -1301,6 +1326,13 @@ function executionDecisionParticipantSignature(
   return userId.length > 0 ? `user:${userId}` : "user:";
 }
 
+/**
+ * Refuses (409 `review_stall_policy_changed`) a decision computed from a read
+ * whose execution state or stall-hold policy controls no longer match the row
+ * under the lock. Agent ids compare case-insensitively here, so a case-only
+ * rewrite of a stored agent id is not stale; whether the actor holds the seat
+ * is decided separately and exactly by the transition.
+ */
 export function assertExecutionDecisionSnapshotCurrent(
   readState: IssueExecutionState | null,
   readPolicy: IssueExecutionPolicy | null,
@@ -1321,7 +1353,7 @@ export function assertExecutionDecisionSnapshotCurrent(
     deliveryBindingDiffers(readState, lockedState)
   ) {
     throw conflict(
-      "The delivered head, the delivery binding (pull request number, URL or head), the execution policy (round ceiling, stall arbiter or stages), the review stage, the seated participant, the last decision, the review-round counter or the issue status changed while this decision was in flight; this decision was not recorded and the stage was not handed off. Re-read the issue before deciding.",
+      "The delivered head, the delivery binding (pull request number, URL or head), the execution policy (round ceiling, stall arbiter or stages), the review stage, the seated participant, the last decision, the review-round counter or the issue status changed while this decision was in flight; this decision was not recorded and the stage was not handed off. A concurrent decision on this stage, including another accept or reject of the same escalation, also causes this refusal. Re-read the issue before deciding; if the decision you intended is already recorded, do not repeat it.",
       {
         code: "review_stall_policy_changed",
         issueId,
@@ -1495,6 +1527,11 @@ function selectStageParticipant(
   return first ? { type: first.type, agentId: first.agentId ?? null, userId: first.userId ?? null } : null;
 }
 
+/**
+ * Exact stage membership through `principalsEqual`: a seat whose agent id
+ * matches a configured participant only by letter case is not a member, so the
+ * membership repair re-seats the configured participant instead.
+ */
 function stageHasParticipant(stage: IssueExecutionStage, participant: IssueExecutionStagePrincipal | null): boolean {
   if (!participant) return false;
   return stage.participants.some((candidate) => principalsEqual(candidate, participant));

@@ -72,13 +72,13 @@ describe("AgentContextualSidebar", () => {
     expect(markup).not.toContain("Plugins");
   });
 
-  it.each([false, true])("shows agent Channels only when chat connectors are enabled (%s)", (enabled) => {
+  it.each([false, true])("keeps Channels available for default email regardless of the chat setting (%s)", (enabled) => {
     const client = new QueryClient();
     client.setQueryData(queryKeys.instance.experimentalSettings, { enableChatConnectors: enabled });
     const markup = renderToStaticMarkup(<QueryClientProvider client={client}><MemoryRouter>
       <AgentContextualSidebar agentRef="agent" agentId="agent-1" agentName="Agent" />
     </MemoryRouter></QueryClientProvider>);
-    expect(markup.includes('href="/agents/agent/channels"')).toBe(enabled);
+    expect(markup.includes('href="/agents/agent/channels"')).toBe(true);
     expect(markup).toContain('href="/agents/agent/tools"');
     client.clear();
   });

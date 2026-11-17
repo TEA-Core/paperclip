@@ -22,9 +22,11 @@ import {
   classifyWorktreeStateManifest,
   isVerifiedWorktreeSeedManifest,
 } from "@paperclipai/shared/worktree-initialization-manifest";
+import { resolveWorktreeSchemaLineage } from "@paperclipai/shared/worktree-initialization-identity";
+import { readWorktreeInitializationKey } from "../worktree-seed-manifest.js";
 import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { authUsers, companies, companyMemberships, issues } from "@paperclipai/db";
+import { authUsers, companies, companyMemberships, issues, MIGRATIONS_FOLDER } from "@paperclipai/db";
 import type {
   WorkspaceReadiness,
   WorkspaceReadinessState,
@@ -73,11 +75,12 @@ function readSeedManifestSummary(markerDir: string): SeedManifestSummary {
     return { state: "failed", phase: null, mode: null, failurePhase: "seed_manifest_unreadable" };
   }
   if (bytes !== null) {
-    // This probe cannot confirm a destination schema, so no v3 initialization
-    // manifest is accepted here yet.
+    // A v3 manifest is confirmed for this running instance, a revision of this
+    // build's migration lineage, and the initialization key next to it.
     const classification = classifyWorktreeStateManifest(bytes, {
       targetInstanceId: resolvePaperclipInstanceId(),
-      schema: null,
+      schema: resolveWorktreeSchemaLineage(MIGRATIONS_FOLDER),
+      bindingKey: readWorktreeInitializationKey(markerDir),
     });
     if (classification.kind === "refused") {
       // A manifest we cannot parse is evidence of an interrupted write, which is
@@ -90,7 +93,11 @@ function readSeedManifestSummary(markerDir: string): SeedManifestSummary {
       return { state: "failed", phase: null, mode: null, failurePhase };
     }
     if (classification.kind === "initialization") {
-      return { state: "verified", phase: "complete", mode: null, failurePhase: null };
+      // A fresh or synthetic-fixture preview holds no cloned company, issue or
+      // membership, so the managed "open this clone" contract can never be met
+      // here. It reports its own phase and is never `ready`, and never a
+      // degraded clone that a repair (a reseed from the parent) would "fix".
+      return { state: "failed", phase: "complete", mode: null, failurePhase: "seed_manifest_fresh_preview" };
     }
     const manifest = classification.manifest;
     const rawState = typeof manifest.state === "string" ? manifest.state : null;
