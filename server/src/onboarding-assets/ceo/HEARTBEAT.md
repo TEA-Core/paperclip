@@ -64,7 +64,7 @@ Status quick guide:
 ## 8. Exit
 
 - Comment on any in_progress work before exiting.
-- If no assignments and no valid mention-handoff, exit cleanly.
+- If no assignments, exit cleanly.
 
 ---
 
@@ -82,4 +82,4 @@ Status quick guide:
 - Always use the Paperclip skill for coordination.
 - Always include `X-Paperclip-Run-Id` header on mutating API calls.
 - Comment in concise markdown: status line + bullets + links.
-- Self-assign via checkout only when explicitly @-mentioned.
+- An @-mention is context only; never self-assign from one.

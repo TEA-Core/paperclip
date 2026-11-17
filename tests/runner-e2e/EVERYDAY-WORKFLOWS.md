@@ -134,7 +134,8 @@ Delegation now submits feedback through the existing child task composer and
 records the delivered comment ID. The child must consume the message and deliver
 the revised program. This does not require a lead to relay a parent comment.
 The separate issue-update-comment-wakeup route tests exercise exact supported
-mention routing, including access, dependency, identity, and duplicate-wake gates.
+comment wake routing, including access, dependency, identity, and duplicate-wake gates;
+mentions stay context only and wake no one.
 
 The approval case provisions an authenticated local service through the public
 API, with a random server-held credential that never enters the agent environment

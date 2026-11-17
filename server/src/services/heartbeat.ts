@@ -33187,9 +33187,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     if (issueId) {
-      // Mention-triggered wakes can request input from another agent, but they must
-      // still respect the issue execution lock so a second agent cannot start on the
-      // same issue workspace while the assignee already has a live run.
+      // Wakes for a non-assignee agent (for example a review or interaction request)
+      // must still respect the issue execution lock so a second agent cannot start on
+      // the same issue workspace while the assignee already has a live run.
       const agentNameKey = normalizeAgentNameKey(agent.name);
 
       const cancelledRunsToEmit: (typeof heartbeatRuns.$inferSelect)[] = [];
