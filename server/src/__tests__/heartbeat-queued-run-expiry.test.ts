@@ -211,7 +211,7 @@ describeEmbeddedPostgres("heartbeat queued-run age bound", () => {
 
     const result = await heartbeatService(db).expireStaleQueuedRuns();
 
-    expect(result).toEqual({ expired: 1, runIds: [stale.runId] });
+    expect(result).toEqual({ expired: 1, runIds: [stale.runId], pageCapReached: false });
     const run = await readRun(stale.runId);
     expect(run).toMatchObject({ status: "cancelled", errorCode: "queued_run_expired", startedAt: null });
     expect(run.finishedAt).toBeInstanceOf(Date);
@@ -260,7 +260,7 @@ describeEmbeddedPostgres("heartbeat queued-run age bound", () => {
 
     const result = await heartbeatService(db).expireStaleQueuedRuns();
 
-    expect(result).toEqual({ expired: 0, runIds: [] });
+    expect(result).toEqual({ expired: 0, runIds: [], pageCapReached: false });
     expect((await readRun(fresh.runId)).status).toBe("queued");
     expect(await readIssueLock(issueId)).toEqual(lockBefore);
     expect(await expiryActivityRows()).toHaveLength(0);
@@ -301,6 +301,78 @@ describeEmbeddedPostgres("heartbeat queued-run age bound", () => {
     expect((await readIssueLock(issueId)).executionRunId).toBeNull();
   });
 
+  function oldQueuedRunRows(opts: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    count: number;
+    firstCreatedAtMs: number;
+    scheduledRetryAt?: Date;
+  }) {
+    return Array.from({ length: opts.count }, (_, i) => ({
+      id: randomUUID(),
+      companyId: opts.companyId,
+      agentId: opts.agentId,
+      invocationSource: "automation" as const,
+      triggerDetail: "system",
+      status: "queued",
+      scheduledRetryAt: opts.scheduledRetryAt ?? null,
+      contextSnapshot: { issueId: opts.issueId, taskId: opts.issueId },
+      createdAt: new Date(opts.firstCreatedAtMs + i),
+      updatedAt: new Date(opts.firstCreatedAtMs + i),
+    }));
+  }
+
+  it("pages past 100+ non-expirable runs that share one created_at microsecond and still returns", { timeout: 60_000 }, async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const oldest = Date.now() - QUEUED_RUN_BOUND_MS - 10 * HOUR_MS;
+    const blockerIssueId = await seedIssue(companyId, agentId, 1);
+    const blockers = oldQueuedRunRows({
+      companyId, agentId, issueId: blockerIssueId, count: 120, firstCreatedAtMs: oldest,
+      scheduledRetryAt: new Date(Date.now() + HOUR_MS),
+    });
+    await db.insert(heartbeatRuns).values(blockers);
+    // One insert transaction's timestamp: every blocker on the same
+    // microsecond, below the millisecond a JavaScript Date can carry.
+    await db.execute(sql`
+      update heartbeat_runs
+      set created_at = to_timestamp(${Math.floor(oldest / 1000)}) + interval '123456 microseconds'
+      where id in (${sql.join(blockers.map((row) => sql`${row.id}::uuid`), sql`, `)})
+    `);
+    const staleIssueId = await seedIssue(companyId, agentId, 2);
+    const stale = oldQueuedRunRows({
+      companyId, agentId, issueId: staleIssueId, count: 20, firstCreatedAtMs: oldest + HOUR_MS,
+    });
+    await db.insert(heartbeatRuns).values(stale);
+
+    const result = await heartbeatService(db).expireStaleQueuedRuns();
+
+    expect(result).toMatchObject({ expired: 20, pageCapReached: false });
+    expect([...result.runIds].sort()).toEqual(stale.map((row) => row.id).sort());
+    const blockerStatuses = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(sql`${heartbeatRuns.id} in (${sql.join(blockers.map((row) => sql`${row.id}::uuid`), sql`, `)})`);
+    expect(new Set(blockerStatuses.map((row) => row.status))).toEqual(new Set(["queued"]));
+  });
+
+  it("expires at most 100 runs per sweep and the rest on the next sweep", { timeout: 60_000 }, async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedIssue(companyId, agentId, 1);
+    const rows = oldQueuedRunRows({
+      companyId, agentId, issueId, count: 150, firstCreatedAtMs: Date.now() - QUEUED_RUN_BOUND_MS - 10 * HOUR_MS,
+    });
+    await db.insert(heartbeatRuns).values(rows);
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.expireStaleQueuedRuns();
+    expect(first.expired).toBe(100);
+    expect(first.runIds).toEqual(rows.slice(0, 100).map((row) => row.id));
+
+    const second = await heartbeat.expireStaleQueuedRuns();
+    expect(second.expired).toBe(50);
+    expect(second.runIds).toEqual(rows.slice(100).map((row) => row.id));
+    expect(await expiryActivityRows()).toHaveLength(150);
+  });
+
   it("leaves a running run older than the bound untouched", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = await seedIssue(companyId, agentId, 1);
@@ -316,7 +388,7 @@ describeEmbeddedPostgres("heartbeat queued-run age bound", () => {
 
     const result = await heartbeatService(db).expireStaleQueuedRuns();
 
-    expect(result).toEqual({ expired: 0, runIds: [] });
+    expect(result).toEqual({ expired: 0, runIds: [], pageCapReached: false });
     expect((await readRun(runningRunId)).status).toBe("running");
     expect(await readIssueLock(issueId)).toEqual(lockBefore);
     expect(await expiryActivityRows()).toHaveLength(0);
@@ -342,7 +414,7 @@ describeEmbeddedPostgres("heartbeat queued-run age bound", () => {
 
     const result = await heartbeatService(db).expireStaleQueuedRuns();
 
-    expect(result).toEqual({ expired: 1, runIds: [stale.runId] });
+    expect(result).toEqual({ expired: 1, runIds: [stale.runId], pageCapReached: false });
     expect((await readIssueLock(staleIssueId)).executionRunId).toBeNull();
     expect((await readRun(other.runId)).status).toBe("queued");
     expect(await readIssueLock(otherIssueId)).toEqual(otherLockBefore);
@@ -359,10 +431,10 @@ describeEmbeddedPostgres("heartbeat queued-run age bound", () => {
     });
     const heartbeat = heartbeatService(db);
 
-    expect(await heartbeat.expireStaleQueuedRuns()).toEqual({ expired: 1, runIds: [stale.runId] });
+    expect(await heartbeat.expireStaleQueuedRuns()).toEqual({ expired: 1, runIds: [stale.runId], pageCapReached: false });
     const runAfterFirst = await readRun(stale.runId);
 
-    expect(await heartbeat.expireStaleQueuedRuns()).toEqual({ expired: 0, runIds: [] });
+    expect(await heartbeat.expireStaleQueuedRuns()).toEqual({ expired: 0, runIds: [], pageCapReached: false });
     expect(await readRun(stale.runId)).toEqual(runAfterFirst);
     expect(await expiryActivityRows()).toHaveLength(1);
     expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, stale.runId)))
@@ -405,7 +477,7 @@ describeEmbeddedPostgres("heartbeat queued-run age bound", () => {
       const { issueId, waiting } = await seedAssignmentRunBehindBusyAgent(status);
       const heartbeat = heartbeatService(db);
 
-      expect(await heartbeat.expireStaleQueuedRuns()).toEqual({ expired: 1, runIds: [waiting.runId] });
+      expect(await heartbeat.expireStaleQueuedRuns()).toEqual({ expired: 1, runIds: [waiting.runId], pageCapReached: false });
       expect((await readRun(waiting.runId)).resultJson).toMatchObject({
         executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
       });
@@ -440,7 +512,7 @@ describeEmbeddedPostgres("heartbeat queued-run age bound", () => {
     });
     const heartbeat = heartbeatService(db);
 
-    expect(await heartbeat.expireStaleQueuedRuns()).toEqual({ expired: 1, runIds: [stale.runId] });
+    expect(await heartbeat.expireStaleQueuedRuns()).toEqual({ expired: 1, runIds: [stale.runId], pageCapReached: false });
     const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
     await heartbeat.drainActiveRunExecutions();
 

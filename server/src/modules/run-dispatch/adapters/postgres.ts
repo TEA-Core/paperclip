@@ -1198,7 +1198,11 @@ export function createPostgresRunDispatchAdapter(
     // execution lock. Paused companies dispatch nothing, so their queue is left
     // alone, matching resumeQueuedRuns.
     const rows = await db
-      .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, createdAt: heartbeatRuns.createdAt })
+      .select({
+        id: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        createdAtText: sql<string>`${heartbeatRuns.createdAt}::text`,
+      })
       .from(heartbeatRuns)
       .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
       .where(
@@ -1207,14 +1211,18 @@ export function createPostgresRunDispatchAdapter(
           eq(companies.status, "active"),
           lte(heartbeatRuns.createdAt, input.createdAtOrBefore),
           input.after
-            ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${input.after.createdAt.toISOString()}::timestamptz, ${input.after.runId}::uuid)`
+            ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${input.after.createdAtText}::timestamptz, ${input.after.runId}::uuid)`
             : undefined,
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' is not null`,
         ),
       )
       .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
       .limit(input.limit);
-    return rows.map((row) => ({ runId: row.id, companyId: row.companyId, createdAt: row.createdAt }));
+    return rows.map((row) => ({
+      runId: row.id,
+      companyId: row.companyId,
+      cursor: { createdAtText: row.createdAtText, runId: row.id },
+    }));
   }
 
   async function expireQueuedRun(input: ExpireQueuedRunInput): Promise<CancelStaleQueuedRunOutcome> {

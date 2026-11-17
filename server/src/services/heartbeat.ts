@@ -23716,10 +23716,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // a queued run as the issue's execution holder, so without this bound a run
   // that can never be claimed holds the issue lock indefinitely.
   async function expireStaleQueuedRuns(opts?: { now?: Date }) {
-    if ((await getSchedulingSuppression()).suppressed) return { expired: 0, runIds: [] as string[] };
+    if ((await getSchedulingSuppression()).suppressed) {
+      return { expired: 0, runIds: [] as string[], pageCapReached: false };
+    }
     const result = await runDispatch.expireStaleQueuedRuns({ now: opts?.now });
     applyRunDispatchPostCommitEffects(result.postCommitEffects);
-    return { expired: result.expired, runIds: result.runIds };
+    return { expired: result.expired, runIds: result.runIds, pageCapReached: result.pageCapReached };
   }
 
   async function reconcileBlockedWithoutBlockers() {

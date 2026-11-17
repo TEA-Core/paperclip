@@ -1,12 +1,21 @@
+import { setImmediate } from "node:timers/promises";
 import { describe, expect, it, vi } from "vitest";
 import {
+  MAX_EXPIRY_PAGES_PER_SWEEP,
   createCancelStaleQueuedRun,
   createDispatchResolvedInteractionIfCurrent,
   createEvaluateScheduledRetryGate,
+  createExpireStaleQueuedRuns,
   createPromoteDueScheduledRetries,
   createPromoteScheduledRetry,
 } from "./use-cases.js";
-import type { DueRetryRun, RunDispatchWriter, ScheduledRetryReader } from "./ports.js";
+import type {
+  DueRetryRun,
+  ExpiredQueuedRunCandidate,
+  QueuedRunExpiry,
+  RunDispatchWriter,
+  ScheduledRetryReader,
+} from "./ports.js";
 
 function fakeReader(dueRuns: DueRetryRun[] = []): ScheduledRetryReader & { evaluateCalls: unknown[] } {
   const evaluateCalls: unknown[] = [];
@@ -166,5 +175,33 @@ describe("createDispatchResolvedInteractionIfCurrent", () => {
 
     expect(result.dispatched).toBe(true);
     expect(writer.dispatchCalls).toHaveLength(1);
+  });
+});
+
+describe("createExpireStaleQueuedRuns", () => {
+  it("stops after the page cap when every page is full of runs it may not expire", { timeout: 10_000 }, async () => {
+    let listCalls = 0;
+    // An endless queue of old runs whose verdict is never an expiry.
+    const expiry: QueuedRunExpiry = {
+      async listExpiredQueuedRuns(input) {
+        listCalls += 1;
+        // Yield a macrotask so a sweep without a page cap fails by timeout
+        // instead of starving the event loop.
+        await setImmediate();
+        return Array.from({ length: input.limit }, (_, i): ExpiredQueuedRunCandidate => ({
+          runId: `run-${listCalls}-${i}`,
+          companyId: "company-1",
+          cursor: { createdAtText: `2026-01-01 00:00:00.${String(listCalls).padStart(6, "0")}+00`, runId: `run-${listCalls}-${i}` },
+        }));
+      },
+      async expireQueuedRun() {
+        return { outcome: "not_stale" };
+      },
+    };
+
+    const result = await createExpireStaleQueuedRuns({ expiry })({ now: new Date("2026-01-03T00:00:00.000Z") });
+
+    expect(listCalls).toBe(MAX_EXPIRY_PAGES_PER_SWEEP);
+    expect(result).toMatchObject({ expired: 0, pageCapReached: true, pagesScanned: MAX_EXPIRY_PAGES_PER_SWEEP });
   });
 });

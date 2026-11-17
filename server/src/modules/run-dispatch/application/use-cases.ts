@@ -1,5 +1,10 @@
 import { MAX_QUEUED_ISSUE_RUN_AGE_MS } from "../domain/policy.js";
-import type { QueuedRunExpiry, RunDispatchWriter, ScheduledRetryReader } from "./ports.js";
+import type {
+  ExpiredQueuedRunCursor,
+  QueuedRunExpiry,
+  RunDispatchWriter,
+  ScheduledRetryReader,
+} from "./ports.js";
 import type { PostCommitEffect, PromoteScheduledRetryOutcome } from "./types.js";
 
 export function createEvaluateScheduledRetryGate(deps: { reader: ScheduledRetryReader }) {
@@ -59,7 +64,14 @@ export function createCancelStaleQueuedRun(deps: { writer: RunDispatchWriter }) 
   }) => deps.writer.cancelStaleQueuedRun({ ...input, now: input.now ?? new Date() });
 }
 
-const MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP = 100;
+/** At most this many runs are expired by one sweep; the next sweep takes the rest. */
+export const MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP = 100;
+const EXPIRY_PAGE_SIZE = 100;
+/**
+ * Hard bound on candidate pages read by one sweep (2,000 runs), so a sweep
+ * awaited at startup and on every heartbeat tick always returns.
+ */
+export const MAX_EXPIRY_PAGES_PER_SWEEP = 20;
 
 /**
  * The queued-run age bound. A run still `queued` MAX_QUEUED_ISSUE_RUN_AGE_MS
@@ -72,17 +84,25 @@ export function createExpireStaleQueuedRuns(deps: { expiry: QueuedRunExpiry }) {
     const createdAtOrBefore = new Date(now.getTime() - MAX_QUEUED_ISSUE_RUN_AGE_MS);
     const runIds: string[] = [];
     const postCommitEffects: PostCommitEffect[] = [];
-    let after: { createdAt: Date; runId: string } | undefined;
+    let after: ExpiredQueuedRunCursor | undefined;
+    let pagesScanned = 0;
+    let pageCapReached = false;
 
     // Page past runs that are old but not expirable (active lease, future
     // retry) so they cannot starve newer stuck runs behind them.
-    while (runIds.length < MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP) {
+    sweep: while (runIds.length < MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP) {
+      if (pagesScanned >= MAX_EXPIRY_PAGES_PER_SWEEP) {
+        pageCapReached = true;
+        break;
+      }
+      pagesScanned += 1;
       const page = await deps.expiry.listExpiredQueuedRuns({
         createdAtOrBefore,
-        limit: MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP,
+        limit: EXPIRY_PAGE_SIZE,
         after,
       });
       for (const candidate of page) {
+        if (runIds.length >= MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP) break sweep;
         const result = await deps.expiry.expireQueuedRun({
           runId: candidate.runId,
           companyId: candidate.companyId,
@@ -92,12 +112,15 @@ export function createExpireStaleQueuedRuns(deps: { expiry: QueuedRunExpiry }) {
         runIds.push(candidate.runId);
         postCommitEffects.push(...result.postCommitEffects);
       }
-      const last = page[page.length - 1];
-      if (page.length < MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP || !last) break;
-      after = { createdAt: last.createdAt, runId: last.runId };
+      const last = page.at(-1);
+      if (page.length < EXPIRY_PAGE_SIZE || !last) break;
+      // The keyset is strict, so the cursor always moves; stop rather than
+      // re-read a page if an adapter ever returns the same position.
+      if (after && last.cursor.createdAtText === after.createdAtText && last.cursor.runId === after.runId) break;
+      after = last.cursor;
     }
 
-    return { expired: runIds.length, runIds, postCommitEffects };
+    return { expired: runIds.length, runIds, postCommitEffects, pagesScanned, pageCapReached };
   };
 }
 
