@@ -17,6 +17,7 @@ const ORIGINAL_PAPERCLIP_LISTEN_PORT = process.env.PAPERCLIP_LISTEN_PORT;
 const embeddedPostgresSupported = (await getEmbeddedPostgresTestSupport()).supported;
 
 const {
+  completionSweepMock,
   createAppMock,
   createBetterAuthInstanceMock,
   createDbMock,
@@ -40,9 +41,13 @@ const {
   routineServiceFactoryMock,
   routineServiceMock,
 } = vi.hoisted(() => {
+  const completionSweepMock = vi.fn(async () => undefined);
   const createAppMock = vi.fn(async () => Object.assign((_: unknown, __: unknown) => {}, {
     locals: {
-      toolGateway: { sweepActionReviews: vi.fn(async () => ({ scanned: 0 })) },
+      toolGateway: {
+        sweepActionReviews: vi.fn(async () => ({ scanned: 0 })),
+        cleanupExpiredSessions: vi.fn(async () => ({ deletedCount: 0 })),
+      },
       toolActionDeliveries: { sweepPending: vi.fn(async () => ({ scanned: 0, delivered: 0 })) },
     },
   }) as never);
@@ -195,6 +200,7 @@ const {
   const loadConfigMock = vi.fn();
 
   return {
+    completionSweepMock,
     createAppMock,
     createBetterAuthInstanceMock,
     createDbMock,
@@ -469,6 +475,8 @@ vi.mock("../services/index.js", () => ({
   })),
 }));
 
+vi.mock("../services/chat-completion-delivery.js", () => ({ chatCompletionDeliveryService: () => ({ sweepPending: completionSweepMock }) }));
+
 vi.mock("../services/connection-intent-delivery.js", () => ({
   connectionIntentDeliveryService: vi.fn(() => ({
     sweepPending: vi.fn(async () => ({ scanned: 0, failed: 0 })),
@@ -667,6 +675,13 @@ describe("startServer feedback export wiring", () => {
       storageService: { id: "storage-service" },
       serverPort: 3210,
     });
+  });
+
+  it("keeps startup available when completion delivery recovery fails", async () => {
+    completionSweepMock.mockRejectedValueOnce(new Error("temporary delivery failure"));
+    const { startServer } = await import("../index.js");
+    await expect(startServer()).resolves.toBeDefined();
+    expect(completionSweepMock).toHaveBeenCalled();
   });
 
   it("never invokes the retired review detector at startup or on periodic recovery", async () => {
@@ -882,12 +897,15 @@ describe("startServer feedback export wiring", () => {
             .catch(() => { response.writeHead(503); response.end("database closed"); });
         },
         { locals: {
-          toolGateway: { sweepActionReviews: vi.fn(async () => ({ scanned: 0 })) },
+          toolGateway: {
+            sweepActionReviews: vi.fn(async () => ({ scanned: 0 })),
+            cleanupExpiredSessions: vi.fn(async () => ({ deletedCount: 0 })),
+          },
           toolActionDeliveries: { sweepPending: vi.fn(async () => ({ scanned: 0, delivered: 0 })) },
         } },
       ) as never);
-      vi.mocked(createServer).mockImplementationOnce((app) => {
-        listener = realCreateServer(app);
+      vi.mocked(createServer).mockImplementationOnce((options, app) => {
+        listener = realCreateServer(options as never, app as never);
         return listener;
       });
       vi.mocked(bootstrapExecutionPolicyFromEnv).mockImplementationOnce(async () => {

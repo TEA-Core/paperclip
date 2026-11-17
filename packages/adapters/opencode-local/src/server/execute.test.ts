@@ -100,6 +100,7 @@ vi.mock("./models.js", async (importOriginal) => {
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { isSpawnEnvelopeTooLargeError, runningProcesses, sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 import * as serverUtils from "@paperclipai/adapter-utils/server-utils";
+import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixtures/prompt-context";
 
 import {
   buildOpenCodeFailureLogLine,
@@ -550,9 +551,37 @@ describe("OpenCode local chat policy", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(prompt).toContain(directive);
-    expect(prompt).toContain(custom ? "Custom agent instruction." : "Continue your Paperclip conversation");
+    expect(prompt).toContain(custom ? "Custom agent instruction." : "You are agent agent-1");
     expect(prompt).not.toContain("Execution contract:");
     expect(prompt).not.toContain("Create child issues");
+  });
+
+  // Upstream's resume-fallback context test. The fork's resolveOpenCodeSessionResume
+  // declines a saved session with no recorded cwd (unknown_cwd), so the runtime
+  // carries the session's cwd to keep the first attempt a resume.
+  it("delivers assignment context on an ordinary task turn and rebuilds it after resume fallback", async () => {
+    const commandPath = path.join(configHome, "fake-opencode-context");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const prompts: string[] = [];
+    runAdapterExecutionTargetProcessMock
+      .mockReset()
+      .mockResolvedValueOnce(probeResult({ stdout: JSON.stringify({ type: "error", error: "unknown session" }) }))
+      .mockResolvedValueOnce(probeResult({ stdout: JSON.stringify({ type: "text", sessionID: "fresh", part: { text: "done" } }) }));
+    await execute({
+      runId: "run-context-fallback",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: "previous", sessionParams: { sessionId: "previous", cwd: configHome }, sessionDisplayId: null, taskKey: null },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: createPromptContextFixture(),
+      onLog: async () => {},
+      onMeta: async (meta) => { prompts.push(String(meta.prompt ?? "")); },
+    });
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]).toContain("## Compact assignment");
+    expect(prompts[1]).toContain("## Owned assignment");
+    for (const prompt of prompts) expect(prompt).not.toContain("Execution contract:");
+    expect(prompts[1]).toContain("You are agent agent-1 (OpenCode).");
+    expect(prompts[1]).toContain("Connection tools:");
   });
 });
 
@@ -1086,7 +1115,7 @@ describe("execute — OpenCode V2 serve transport", () => {
     expect(requests.some((entry) => entry.path === "/api/session/ses_fake/prompt")).toBe(true);
     expect(metadata[0]?.commandArgs?.slice(0, 5)).toEqual(["serve", "--hostname", "127.0.0.1", "--port", "0"]);
     expect(metadata[0]?.commandNotes?.join("\n")).toContain("opencode serve");
-    expect(metadata[0]?.commandNotes?.join("\n")).toContain("waits for mcp.resources.changed from 1 injected MCP server(s)");
+    expect(metadata[0]?.commandNotes?.join("\n")).toContain("waits for 1 injected MCP server(s) to report connected and remain quiet");
     expect(logs).not.toContain("one-shot");
     expect(JSON.stringify({ logs, result })).not.toContain(token);
   });
@@ -1106,14 +1135,16 @@ describe("execute — OpenCode V2 serve transport", () => {
     expect(metadata[0]?.commandNotes?.join("\n")).not.toContain("PAPERCLIP_OPENCODE_PRINT_LOGS");
   });
 
-  it("does not describe a readiness gate when no MCP server was injected", async () => {
-    const { result, metadata } = await runServe({}, { mcp: false });
+  it("does not touch or wait on the readiness gate when no MCP server was injected", async () => {
+    const { result, metadata, requests } = await runServe({}, { mcp: false });
 
     expect(result.exitCode).toBe(0);
     const notes = metadata[0]?.commandNotes?.join("\n") ?? "";
     expect(notes).toContain("opencode serve");
     expect(notes).toContain("no MCP server was injected");
-    expect(notes).not.toContain("mcp.resources.changed");
+    expect(notes).not.toContain("remain quiet");
+    expect(requests.some((entry) => entry.path === "/api/mcp")).toBe(false);
+    expect(requests.some((entry) => entry.method === "POST" && entry.path === "/api/session")).toBe(true);
   });
 
   it("reports a failed turn's provider message as the errorMessage", async () => {
@@ -1840,7 +1871,7 @@ describe("execute — SUP-14939 router admission refusal classification", () => 
     expect(result.errorMeta?.routerAbort).toBeUndefined();
   }, 15000);
 
-  it("keeps PAPERCLIP_WAKE_PAYLOAD_JSON under the env cap even when executionContinuation is huge", async () => {
+  it("keeps the launch env small even when executionContinuation is huge", async () => {
     let capturedEnv: Record<string, string> | undefined;
     runAdapterExecutionTargetProcessMock.mockImplementation(
       async (_runId, _target, _command, _args, options) => {
@@ -1887,16 +1918,10 @@ describe("execute — SUP-14939 router admission refusal classification", () => 
     await execute(makeCtx({ context: { paperclipWake: wake } }));
 
     expect(capturedEnv).toBeTruthy();
-    const envValue = capturedEnv!.PAPERCLIP_WAKE_PAYLOAD_JSON;
-    expect(typeof envValue).toBe("string");
-    expect(Buffer.byteLength(envValue, "utf8")).toBeLessThanOrEqual(32 * 1024);
-    const parsed = JSON.parse(envValue);
-    expect(parsed.executionContinuation).toMatchObject({
-      omitted: true,
-      reason: "delivered_in_prompt",
-    });
-    // the heavy history stays out of the env value
-    expect(envValue).not.toContain("e2big sentinel body 59");
+    // Wake context travels in the prompt; the retired env copy must not reappear.
+    expect(capturedEnv!.PAPERCLIP_WAKE_PAYLOAD_JSON).toBeUndefined();
+    const envBytes = Object.values(capturedEnv!).reduce((n, v) => n + Buffer.byteLength(String(v), "utf8"), 0);
+    expect(envBytes).toBeLessThan(64 * 1024);
   }, 15000);
 });
 

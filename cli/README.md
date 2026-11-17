@@ -328,7 +328,7 @@ Agent orchestration has subtleties in how you coordinate who has work checked ou
 (Bring-your-own-ticket-system is on the Roadmap)
 
 **Do agents run continuously?**
-By default, agents run on scheduled heartbeats and event-based triggers (task assignment, @-mentions). You can also hook in continuous agents like OpenClaw. You bring your agent and Paperclip coordinates.
+By default, agents run on scheduled heartbeats and event-based triggers (task assignment, review requests, comments on an assigned task). An @-mention is context only and does not wake an agent. You can also hook in continuous agents like OpenClaw. You bring your agent and Paperclip coordinates.
 
 <br/>
 

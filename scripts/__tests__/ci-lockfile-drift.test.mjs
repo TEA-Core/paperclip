@@ -6,7 +6,8 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const prWorkflow = readFileSync(path.join(repoRoot, ".github/workflows/pr.yml"), "utf8");
-const dockerWorkflows = [".github/workflows/docker.yml", ".github/workflows/docker-cloud.yml"].map(
+// Upstream #13827 retired docker-cloud.yml; docker.yml is the only image workflow.
+const dockerWorkflows = [".github/workflows/docker.yml"].map(
   relativePath => ({ path: relativePath, text: readFileSync(path.join(repoRoot, relativePath), "utf8") }),
 );
 
@@ -105,10 +106,7 @@ test("every install-bearing pr.yml job restores the regenerated lockfile before 
   }
 });
 
-// Both image workflows: upstream 5c660a32f relocated the cloud image build
-// out of docker.yml into docker-cloud.yml, which left this guard reading a
-// file the cloud build no longer lives in — green, and blind to the job it
-// was written for.
+// Every image workflow (docker.yml since upstream #13827 retired docker-cloud.yml).
 test("every job that builds an image refreshes the lockfile for the build context", () => {
   const imageJobs = dockerWorkflows.flatMap(workflow =>
     [...jobs(workflow.text)].map(([name, body]) => [`${workflow.path}:${name}`, body]),

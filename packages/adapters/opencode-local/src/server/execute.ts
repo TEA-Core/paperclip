@@ -1,3 +1,4 @@
+import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -44,10 +45,10 @@ import {
   ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
   renderTemplate,
-  renderPaperclipWakePrompt,
-  selectPaperclipTaskMarkdown,
+  hydrateFreshSessionHandoff,
+  selectPaperclipPromptSections,
+  selectInitialCommunicationGuidance,
   isPaperclipRecoveryWakePayload,
-  stringifyPaperclipWakePayloadForEnv,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   isPaperclipSkillSourceMissing,
@@ -69,8 +70,10 @@ import {
   parseOpenCodeJsonl,
 } from "./parse.js";
 import {
-  OPENCODE_SERVE_MCP_READY_TIMEOUT_MS,
-  OPENCODE_SERVE_MCP_SETTLE_MS,
+  OPENCODE_MCP_QUIESCENCE_MS,
+  OPENCODE_MCP_READY_DEADLINE_MS,
+} from "./mcp-readiness-gate.js";
+import {
   buildOpenCodeServeArgs,
   runOpenCodeServeProcess,
 } from "./serve-transport.js";
@@ -747,6 +750,7 @@ export function buildOpenCodeRunArgs(input: {
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  const providerStop = createProviderStoppedBoundary(ctx.onProviderStopped);
   const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
   const executionTarget = readAdapterExecutionTarget({
     executionTarget: ctx.executionTarget,
@@ -883,7 +887,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
-  const wakePayloadJson = stringifyPaperclipWakePayloadForEnv(context.paperclipWake);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
   const issueIdentifier = readPaperclipIssueIdentifierFromContext(context);
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
@@ -896,7 +899,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   refreshPaperclipWorkspaceEnvForExecution({
     env,
     envConfig,
@@ -1352,45 +1354,46 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       run: { id: runId, source: "on_demand" },
       context,
     };
-    const renderedBootstrapPrompt =
-      !sessionId && bootstrapPromptTemplate.trim().length > 0
-        ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
-        : "";
-    const taskContextNote = context.conversationMode === true
-      ? selectPaperclipTaskMarkdown(context, { resumedSession: Boolean(sessionId) })
-      : "";
-    const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
-      conversationMode: context.conversationMode === true,
-      resumedSession: Boolean(sessionId),
-      suppressIssueDescription: taskContextNote.length > 0,
-    });
-    const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
-    const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
-      ? ""
-      : renderTemplate(promptTemplate, templateData);
-    const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
     const deadlineNotice = renderRunDeadlineNotice(
       timeoutSec,
       Number(deadlineEnv.PAPERCLIP_RUN_DEADLINE_EPOCH ?? 0),
     );
-    const prompt = joinPromptSections([
-      instructionsPrefix,
-      renderedBootstrapPrompt,
-      deadlineNotice,
-      wakePrompt,
-      taskContextNote,
-      sessionHandoffNote,
-      renderedPrompt,
-    ]);
-    const promptMetrics = {
-      promptChars: prompt.length,
-      instructionsChars: instructionsPrefix.length,
-      deadlineNoticeChars: deadlineNotice.length,
-      bootstrapPromptChars: renderedBootstrapPrompt.length,
-      wakePromptChars: wakePrompt.length,
-      taskContextChars: taskContextNote.length,
-      sessionHandoffChars: sessionHandoffNote.length,
-      heartbeatPromptChars: renderedPrompt.length,
+    const buildPrompt = (resumedSession: boolean) => {
+      const renderedBootstrapPrompt =
+        !resumedSession && bootstrapPromptTemplate.trim().length > 0
+          ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
+          : "";
+      const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(context, {
+        resumedSession,
+        includeCommunicationGuidance: false,
+      });
+      const shouldUseResumeDeltaPrompt = resumedSession && wakePrompt.length > 0;
+      const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
+        ? ""
+        : renderTemplate(promptTemplate, templateData);
+      const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+      const basePrompt = joinPromptSections([
+        instructionsPrefix,
+        renderedBootstrapPrompt,
+        deadlineNotice,
+        wakePrompt,
+        taskContextNote,
+        sessionHandoffNote,
+        renderedPrompt,
+      ]);
+      return {
+        basePrompt,
+        promptMetrics: {
+          promptChars: basePrompt.length,
+          instructionsChars: instructionsPrefix.length,
+          deadlineNoticeChars: deadlineNotice.length,
+          bootstrapPromptChars: renderedBootstrapPrompt.length,
+          wakePromptChars: wakePrompt.length,
+          taskContextChars: taskContextNote.length,
+          sessionHandoffChars: sessionHandoffNote.length,
+          heartbeatPromptChars: renderedPrompt.length,
+        },
+      };
     };
 
     // Optional diagnostic: surface OpenCode's own logs on stderr (captured into the
@@ -1456,8 +1459,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       commandNotes.push(
         `Running OpenCode V2 through a private \`opencode serve\` (loopback, per-run port and password); ` +
           (runtimeMcpServers.length > 0
-            ? `the first prompt waits for mcp.resources.changed from ${runtimeMcpServers.length} injected MCP server(s) plus ` +
-              `${OPENCODE_SERVE_MCP_SETTLE_MS} ms (timer-based gate, fails the run after ${OPENCODE_SERVE_MCP_READY_TIMEOUT_MS / 1000}s).`
+            ? `the first prompt waits for ${runtimeMcpServers.length} injected MCP server(s) to report connected and remain quiet for ` +
+              `${OPENCODE_MCP_QUIESCENCE_MS}ms (fails after ${OPENCODE_MCP_READY_DEADLINE_MS / 1000}s).`
             : `no MCP server was injected, so the first prompt does not wait.`),
       );
       if (printLogs) {
@@ -1476,6 +1479,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     const runAttempt = async (resumeSessionId: string | null) => {
+      await hydrateFreshSessionHandoff(ctx, { resumedSession: Boolean(resumeSessionId) });
+      const { basePrompt, promptMetrics } = buildPrompt(Boolean(resumeSessionId));
+      const prompt = joinPromptSections([
+        selectInitialCommunicationGuidance(context, { resumedSession: Boolean(resumeSessionId) }),
+        basePrompt,
+      ]);
       const args = useServeTransport ? buildOpenCodeServeArgs() : buildArgs(resumeSessionId);
       if (onMeta) {
         await onMeta({
@@ -1492,7 +1501,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             : [...args, `<stdin prompt ${prompt.length} chars>`],
           env: loggedEnv,
           prompt,
-          promptMetrics,
+          promptMetrics: { ...promptMetrics, promptChars: prompt.length },
           context,
         });
       }
@@ -1574,6 +1583,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               onLog: earlyAbortOnLog,
             })
           : await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
+              onProcessStopped: providerStop.beginInvocation(),
               cwd,
               env: preparedRuntimeConfig.env,
               stdin: prompt,
@@ -1879,12 +1889,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       return toResult(initial);
     } finally {
-      await Promise.all([
-        paperclipBridge?.stop(),
-        restoreRemoteWorkspace?.(),
-        localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
-        isolatedSkillsHome ? fs.rm(isolatedSkillsHome, { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
-      ]);
+      try {
+        await providerStop.collectBeforeRestore();
+      } finally {
+        await Promise.all([
+          paperclipBridge?.stop(),
+          restoreRemoteWorkspace?.(),
+          localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
+          isolatedSkillsHome ? fs.rm(isolatedSkillsHome, { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
+        ]);
+      }
     }
   } finally {
     await preparedRuntimeConfig.cleanup();

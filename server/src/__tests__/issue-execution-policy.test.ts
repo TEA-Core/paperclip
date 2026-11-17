@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BASE_MAX_REVIEW_ROUNDS, DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, isReviewChangesRequestedTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { BASE_MAX_REVIEW_ROUNDS, DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertExecutionDecisionSnapshotCurrent, assertPatchableExecutionPolicyWrite, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, foldExecutionPolicyAgentIds, foldExecutionStateAgentIds, isReviewChangesRequestedTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
 import { HttpError } from "../errors.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
@@ -348,10 +348,70 @@ describe("assertPatchableExecutionPolicyWrite (SUP-13634)", () => {
     );
   });
 
-  it("allows a body that normalizes to null over an issue with no close ladder", () => {
+  // SUP-22890: the null-clear allowance is scoped to stored policies with
+  // nothing to destroy. A monitor-only watcher previously fell through the
+  // stages-only gate: `{mode, commentRequired, stages: []}` — the SUP-13925
+  // round-trip with `monitor` dropped — normalized to null and silently wiped
+  // the card's only wake path. The backstop now protects a stored monitor.
+  it("rejects a body that normalizes to null over a stored monitor-only policy, naming the monitor", () => {
     const monitorOnly = normalizeIssueExecutionPolicy({ monitor, stages: [] });
     expect(monitorOnly).not.toBeNull();
-    expect(() => assertWrite({ raw: { mode: "normal" }, currentPolicy: monitorOnly })).not.toThrow();
+    expect(() => assertWrite({ raw: { mode: "normal" }, currentPolicy: monitorOnly })).toThrowError(
+      "executionPolicy must not clear the issue's monitor",
+    );
+    // The field repro: explicit `stages: []` with the `monitor` key omitted.
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw: { mode: "normal", commentRequired: true, stages: [] },
+        currentPolicy: monitorOnly,
+        stagesKeyAbsent: false,
+        stagesExplicitlyEmpty: true,
+      }),
+    ).toThrowError("executionPolicy must not clear the issue's monitor");
+  });
+
+  it("still allows a body that normalizes to null over a stored policy with nothing to destroy", () => {
+    const noLadder = normalizeIssueExecutionPolicy({ stages: [] }, { preserveEmptyPolicy: true });
+    expect(noLadder).not.toBeNull();
+    expect(noLadder!.stages).toEqual([]);
+    expect(noLadder!.monitor).toBeUndefined();
+    expect(() => assertWrite({ raw: { mode: "normal" }, currentPolicy: noLadder })).not.toThrow();
+  });
+
+  it("rejects an explicit empty stages write that drops a monitor even when another field preserves normalization", () => {
+    const monitorOnly = normalizeIssueExecutionPolicy({ monitor, stages: [] });
+    expect(monitorOnly).not.toBeNull();
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw: { stages: [], baseRef: "main" },
+        currentPolicy: monitorOnly,
+        stagesKeyAbsent: false,
+        stagesExplicitlyEmpty: true,
+      }),
+    ).toThrowError("executionPolicy must not clear the issue's monitor");
+  });
+
+  // SUP-22890 AC2: a stage-less body that carries a monitor must never
+  // normalize to null — neither with `stages` omitted (SUP-15377 preserve
+  // shape) nor with an explicit `stages: []` (SUP-13925 round-trip shape).
+  it("never collapses a stage-less monitor-bearing body to null, with or without explicit stages", () => {
+    const stored = normalizeIssueExecutionPolicy({ stages: [], monitor })!;
+    expect(normalizeIssueExecutionPolicy({ mode: "normal", commentRequired: true, monitor })).not.toBeNull();
+    expect(normalizeIssueExecutionPolicy({ mode: "normal", commentRequired: true, stages: [], monitor })).not.toBeNull();
+    const partial = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, monitor },
+      currentPolicy: stored,
+      stagesKeyAbsent: true,
+    });
+    expect(partial).not.toBeNull();
+    expect(partial!.monitor?.nextCheckAt).toBe(monitor.nextCheckAt);
+    const roundTrip = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [], monitor },
+      currentPolicy: stored,
+      stagesKeyAbsent: false,
+    });
+    expect(roundTrip).not.toBeNull();
+    expect(roundTrip!.monitor?.nextCheckAt).toBe(monitor.nextCheckAt);
   });
 
   it("allows a full replacement policy over a non-null stored policy", () => {
@@ -396,6 +456,7 @@ describe("resolvePatchExecutionPolicy (SUP-15377)", () => {
       raw: { mode: "normal", commentRequired: true, monitor },
       currentPolicy: stored,
       stagesKeyAbsent: true,
+      storedStagesExplicitlyEmpty: false,
     });
     expect(resolved).not.toBeNull();
     expect(resolved!.stages.length).toBe(1);
@@ -412,6 +473,7 @@ describe("resolvePatchExecutionPolicy (SUP-15377)", () => {
       raw: { mode: "normal", commentRequired: true, monitor },
       currentPolicy: stored,
       stagesKeyAbsent: true,
+      storedStagesExplicitlyEmpty: false,
     });
     expect(resolved!.stages).toEqual([]);
     expect(resolved!.monitor?.nextCheckAt).toBe(monitor.nextCheckAt);
@@ -449,6 +511,87 @@ describe("resolvePatchExecutionPolicy (SUP-15377)", () => {
     expect(resolvePatchExecutionPolicy({ raw: "nope", currentPolicy: reviewOnlyPolicy(), stagesKeyAbsent: true })).toBeNull();
     expect(resolvePatchExecutionPolicy({ raw: null, currentPolicy: reviewOnlyPolicy(), stagesKeyAbsent: true })).toBeNull();
     expect(resolvePatchExecutionPolicy({ raw: [1, 2], currentPolicy: reviewOnlyPolicy(), stagesKeyAbsent: true })).toBeNull();
+  });
+});
+
+describe("resolvePatchExecutionPolicy explicit-empty preservation (SUP-22135)", () => {
+  const stageLessPolicy = () =>
+    normalizeIssueExecutionPolicy({ mode: "normal", commentRequired: true, stages: [] }, { preserveEmptyPolicy: true })!;
+
+  it("keeps an explicit `stages: []` round-trip over a stored stage-less policy non-null", () => {
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [] },
+      currentPolicy: stageLessPolicy(),
+      stagesKeyAbsent: false,
+      storedStagesExplicitlyEmpty: true,
+    });
+    // Before SUP-22135 the normalizer collapsed the bare-empty body to null,
+    // silently wiping the stored SUP-22098 shape.
+    expect(resolved).not.toBeNull();
+    expect(resolved!.stages).toEqual([]);
+    expect(resolved!.mode).toBe("normal");
+  });
+
+  it("keeps a stage-less partial write (stages key absent) non-null", () => {
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "auto", commentRequired: true },
+      currentPolicy: stageLessPolicy(),
+      stagesKeyAbsent: true,
+      storedStagesExplicitlyEmpty: true,
+    });
+    expect(resolved).not.toBeNull();
+    expect(resolved!.stages).toEqual([]);
+    expect(resolved!.mode).toBe("auto");
+  });
+
+  it("still collapses a bare-empty body over a null stored policy (default inheritance unchanged)", () => {
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [] },
+      currentPolicy: null,
+      stagesKeyAbsent: false,
+      storedStagesExplicitlyEmpty: false,
+    });
+    expect(resolved).toBeNull();
+  });
+
+  it("still carries the stored ladder forward on stages omission (SUP-15377 unchanged)", () => {
+    const stored = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+    })!;
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true },
+      currentPolicy: stored,
+      stagesKeyAbsent: true,
+      storedStagesExplicitlyEmpty: false,
+    });
+    expect(resolved!.stages.length).toBe(1);
+    expect(resolved!.stages[0]!.id).toBe(stored.stages[0]!.id);
+  });
+
+  it("does not preserve a legacy monitor-only policy without a raw stages key", () => {
+    const stored = normalizeIssueExecutionPolicy({ monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" } })!;
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "auto", commentRequired: true, stages: [] },
+      currentPolicy: stored,
+      stagesKeyAbsent: false,
+      storedStagesExplicitlyEmpty: false,
+    });
+    expect(resolved).toBeNull();
+  });
+
+  it("preserves a stored policy only when the raw stages key was explicitly empty", () => {
+    const stored = normalizeIssueExecutionPolicy(
+      { mode: "normal", monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" }, stages: [] },
+      { preserveEmptyPolicy: true },
+    )!;
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [] },
+      currentPolicy: stored,
+      stagesKeyAbsent: false,
+      storedStagesExplicitlyEmpty: true,
+    });
+    expect(resolved).not.toBeNull();
+    expect(resolved!.stages).toEqual([]);
   });
 });
 
@@ -1107,7 +1250,7 @@ describe("issue execution policy transitions", () => {
           assigneeAgentId: qaAgentId,
           assigneeUserId: null,
           executionPolicy: policy,
-          executionState: rearm.patch.executionState,
+          executionState: rearm.patch.executionState as IssueExecutionState,
         },
         policy,
         requestedStatus: "done",
@@ -3379,6 +3522,7 @@ describe("issue execution policy transitions", () => {
         completedStageIds: [],
         lastDecisionId: null,
         lastDecisionOutcome: null,
+        reviewRequest: null,
       };
     }
 
@@ -3577,7 +3721,7 @@ describe("return-assignee exclusion is absolute (reverses SUP-10602 allowSelfAsF
             assigneeAgentId: qaAgentId,
             assigneeUserId: null,
             executionPolicy: policy,
-            executionState: result.patch.executionState,
+            executionState: result.patch.executionState as IssueExecutionState,
           },
           policy,
           requestedStatus: "done",
@@ -5359,5 +5503,95 @@ describe("approvalStatus preservation across monitor transitions (SUP-16977)", (
     });
     // No approvalStatus key is invented on a blank card.
     expect(state.approvalStatus).toBeUndefined();
+  });
+});
+
+describe("raw execution-row agent-id fold agrees with the decision snapshot compare", () => {
+  const stageId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const otherAgentId = "44444444-4444-4444-8444-444444444444";
+  type Principal = { type: "agent" | "user"; agentId?: string; userId?: string };
+
+  const stateWithSeat = (currentParticipant: Principal) => ({
+    status: "pending",
+    currentStageId: stageId,
+    currentStageIndex: 0,
+    currentStageType: "review",
+    currentParticipant,
+    returnAssignee: null,
+    completedStageIds: [],
+    lastDecisionId: null,
+    lastDecisionOutcome: null,
+  });
+  const policyWith = (participants: Principal[], toAgentId: string) => ({
+    mode: "normal",
+    commentRequired: true,
+    stages: [{ id: stageId, type: "review", phase: "pre_merge", approvalsNeeded: 1, participants }],
+    stallEscalation: { afterRounds: 2, toAgentId },
+  });
+  const seatedAgent = (agentId: string): Principal => ({ type: "agent", agentId });
+  const seatedUser = (userId: string): Principal => ({ type: "user", userId });
+
+  function decisionCompareAccepts(read: { state: unknown; policy: unknown }, locked: { state: unknown; policy: unknown }) {
+    try {
+      assertExecutionDecisionSnapshotCurrent(
+        parseIssueExecutionState(read.state),
+        normalizeIssueExecutionPolicy(read.policy),
+        { executionState: locked.state, executionPolicy: locked.policy },
+        "issue-1",
+      );
+      return true;
+    } catch (error) {
+      expect(error).toBeInstanceOf(HttpError);
+      return false;
+    }
+  }
+
+  const cases: Array<{ name: string; read: Principal | string; locked: Principal | string; part: "seat" | "participant" | "arbiter"; same: boolean }> = [
+    { name: "seated agent id differs only in case", part: "seat", read: seatedAgent(qaAgentId), locked: seatedAgent(qaAgentId.toUpperCase()), same: true },
+    { name: "seated agent is a different agent", part: "seat", read: seatedAgent(qaAgentId), locked: seatedAgent(otherAgentId), same: false },
+    { name: "seated user id differs only in case", part: "seat", read: seatedUser(boardUserId), locked: seatedUser(boardUserId.toUpperCase()), same: false },
+    { name: "policy participant agent id differs only in case", part: "participant", read: seatedAgent(qaAgentId), locked: seatedAgent(qaAgentId.toUpperCase()), same: true },
+    { name: "policy participant is a different agent", part: "participant", read: seatedAgent(qaAgentId), locked: seatedAgent(otherAgentId), same: false },
+    { name: "policy participant user id differs only in case", part: "participant", read: seatedUser(boardUserId), locked: seatedUser(boardUserId.toUpperCase()), same: false },
+    { name: "stall arbiter id differs only in case", part: "arbiter", read: ctoAgentId, locked: ctoAgentId.toUpperCase(), same: true },
+    { name: "stall arbiter is a different agent", part: "arbiter", read: ctoAgentId, locked: otherAgentId, same: false },
+  ];
+
+  it.each(cases)("$name", ({ part, read, locked, same }) => {
+    const build = (value: Principal | string) => {
+      if (part === "seat") return { state: stateWithSeat(value as Principal), policy: policyWith([seatedAgent(qaAgentId)], ctoAgentId) };
+      if (part === "participant") return { state: stateWithSeat(seatedAgent(qaAgentId)), policy: policyWith([value as Principal], ctoAgentId) };
+      return { state: stateWithSeat(seatedAgent(qaAgentId)), policy: policyWith([seatedAgent(qaAgentId)], value as string) };
+    };
+    const readRow = build(read);
+    const lockedRow = build(locked);
+
+    // Plain jsonb shapes built by one builder: JSON text equality is deep equality here.
+    const sameJson = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+    const foldEqual =
+      sameJson(foldExecutionStateAgentIds(readRow.state), foldExecutionStateAgentIds(lockedRow.state)) &&
+      sameJson(foldExecutionPolicyAgentIds(readRow.policy), foldExecutionPolicyAgentIds(lockedRow.policy));
+
+    expect(foldEqual).toBe(same);
+    expect(decisionCompareAccepts(readRow, lockedRow)).toBe(foldEqual);
+  });
+
+  it("folds the seat with trim + lowercase and a policy id with lowercase only", () => {
+    expect(foldExecutionStateAgentIds(stateWithSeat(seatedAgent(` ${qaAgentId.toUpperCase()} `)))).toMatchObject({
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+    });
+    const policy = foldExecutionPolicyAgentIds(policyWith([seatedAgent(` ${qaAgentId.toUpperCase()} `)], ctoAgentId.toUpperCase())) as ReturnType<typeof policyWith>;
+    expect(policy.stages[0].participants[0]).toMatchObject({ agentId: ` ${qaAgentId} ` });
+    expect(policy.stallEscalation.toAgentId).toBe(ctoAgentId);
+  });
+
+  it("leaves user ids and non-execution shapes untouched", () => {
+    const userState = stateWithSeat(seatedUser("Board-User"));
+    expect(foldExecutionStateAgentIds(userState)).toBe(userState);
+    expect(foldExecutionStateAgentIds(null)).toBeNull();
+    expect(foldExecutionPolicyAgentIds(undefined)).toBeNull();
+    expect(foldExecutionPolicyAgentIds(policyWith([seatedUser("Board-User")], ctoAgentId))).toMatchObject({
+      stages: [{ participants: [{ type: "user", userId: "Board-User" }] }],
+    });
   });
 });

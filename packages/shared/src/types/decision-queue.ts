@@ -3,7 +3,8 @@ import type { AttentionSourceKind } from "./attention.js";
 export type DecisionQueueSeedRuleSignal =
   | "issue_has_pull_request_work_product"
   | "plan_document_confirmation"
-  | "ask_user_questions";
+  | "ask_user_questions"
+  | "recovery_rate_alert";
 
 export interface DecisionQueueSeedRule {
   key: string;
