@@ -70,6 +70,7 @@ import type {
   ExpireQueuedRunInput,
   ListDueRetriesInput,
   ListExpiredQueuedRunsInput,
+  ExpiredQueuedRunCandidate,
   PromoteOrCancelDueRetryInput,
   QueuedRunExpiry,
   RunDispatchWriter,
@@ -1192,12 +1193,12 @@ export function createPostgresRunDispatchAdapter(
 
   }
 
-  async function listExpiredQueuedRuns(input: ListExpiredQueuedRunsInput): Promise<DueRetryRun[]> {
+  async function listExpiredQueuedRuns(input: ListExpiredQueuedRunsInput): Promise<ExpiredQueuedRunCandidate[]> {
     // Issue-bound queued runs only: those are the runs that hold an issue
     // execution lock. Paused companies dispatch nothing, so their queue is left
     // alone, matching resumeQueuedRuns.
     const rows = await db
-      .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId })
+      .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, createdAt: heartbeatRuns.createdAt })
       .from(heartbeatRuns)
       .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
       .where(
@@ -1205,12 +1206,15 @@ export function createPostgresRunDispatchAdapter(
           eq(heartbeatRuns.status, "queued"),
           eq(companies.status, "active"),
           lte(heartbeatRuns.createdAt, input.createdAtOrBefore),
+          input.after
+            ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${input.after.createdAt.toISOString()}::timestamptz, ${input.after.runId}::uuid)`
+            : undefined,
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' is not null`,
         ),
       )
       .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
       .limit(input.limit);
-    return rows.map((row) => ({ runId: row.id, companyId: row.companyId }));
+    return rows.map((row) => ({ runId: row.id, companyId: row.companyId, createdAt: row.createdAt }));
   }
 
   async function expireQueuedRun(input: ExpireQueuedRunInput): Promise<CancelStaleQueuedRunOutcome> {

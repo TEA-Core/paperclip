@@ -63,7 +63,11 @@ export type ListExpiredQueuedRunsInput = {
   /** Runs created at or before this instant are past the queued-run age bound. */
   createdAtOrBefore: Date;
   limit: number;
+  /** Keyset cursor: only runs ordered after this (createdAt, runId) pair. */
+  after?: { createdAt: Date; runId: string };
 };
+
+export type ExpiredQueuedRunCandidate = DueRetryRun & { createdAt: Date };
 
 export type ExpireQueuedRunInput = {
   runId: string;
@@ -77,6 +81,6 @@ export type ExpireQueuedRunInput = {
  * stale-run gates take.
  */
 export interface QueuedRunExpiry {
-  listExpiredQueuedRuns(input: ListExpiredQueuedRunsInput): Promise<DueRetryRun[]>;
+  listExpiredQueuedRuns(input: ListExpiredQueuedRunsInput): Promise<ExpiredQueuedRunCandidate[]>;
   expireQueuedRun(input: ExpireQueuedRunInput): Promise<CancelStaleQueuedRunOutcome>;
 }

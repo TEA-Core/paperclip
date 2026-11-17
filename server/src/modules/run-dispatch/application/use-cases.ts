@@ -69,18 +69,32 @@ const MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP = 100;
 export function createExpireStaleQueuedRuns(deps: { expiry: QueuedRunExpiry }) {
   return async function expireStaleQueuedRuns(input: { now?: Date } = {}) {
     const now = input.now ?? new Date();
-    const candidates = await deps.expiry.listExpiredQueuedRuns({
-      createdAtOrBefore: new Date(now.getTime() - MAX_QUEUED_ISSUE_RUN_AGE_MS),
-      limit: MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP,
-    });
+    const createdAtOrBefore = new Date(now.getTime() - MAX_QUEUED_ISSUE_RUN_AGE_MS);
     const runIds: string[] = [];
     const postCommitEffects: PostCommitEffect[] = [];
+    let after: { createdAt: Date; runId: string } | undefined;
 
-    for (const candidate of candidates) {
-      const result = await deps.expiry.expireQueuedRun({ ...candidate, now });
-      if (result.outcome !== "cancelled") continue;
-      runIds.push(candidate.runId);
-      postCommitEffects.push(...result.postCommitEffects);
+    // Page past runs that are old but not expirable (active lease, future
+    // retry) so they cannot starve newer stuck runs behind them.
+    while (runIds.length < MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP) {
+      const page = await deps.expiry.listExpiredQueuedRuns({
+        createdAtOrBefore,
+        limit: MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP,
+        after,
+      });
+      for (const candidate of page) {
+        const result = await deps.expiry.expireQueuedRun({
+          runId: candidate.runId,
+          companyId: candidate.companyId,
+          now,
+        });
+        if (result.outcome !== "cancelled") continue;
+        runIds.push(candidate.runId);
+        postCommitEffects.push(...result.postCommitEffects);
+      }
+      const last = page[page.length - 1];
+      if (page.length < MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP || !last) break;
+      after = { createdAt: last.createdAt, runId: last.runId };
     }
 
     return { expired: runIds.length, runIds, postCommitEffects };
