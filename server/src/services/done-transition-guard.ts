@@ -326,6 +326,10 @@ export interface DoneTierDeclarationResult {
   // and re-checks that inside the write (verifyNoRepositoryLandingAtTransition).
   landing?: "noRepositoryLanding";
   noRepositoryMeasurement?: NoRepositoryLandingMeasurement;
+  // SUP-24402: set when the accepted declaration is a zero-delta
+  // repository_delivery close, with what it measured. The accepting door
+  // re-checks that inside its status write (verifyZeroDeltaCloseAtTransition).
+  zeroDeltaMeasurement?: ZeroDeltaCloseMeasurement;
   // A remedy specific to this refusal. A door that builds its own generic remedy
   // for a refused declaration uses this one instead when it is set.
   remedy?: string;
@@ -2216,14 +2220,19 @@ async function attributeTier2EvidenceToClosingRun(
 const ZERO_DELTA_CLOSE_CONDITIONS =
   "A repository_delivery card with no pull request and no recorded merge commit closes at Tier 2 only when the " +
   "server proves its own recorded worktree, on its recorded branch, has zero commits ahead of the base ref, a HEAD " +
-  "that is an ancestor of the base ref (in the worktree and on the remote), no tracked changes and no untracked " +
-  "files, and the declaration's probe head names that HEAD.";
+  "that is an ancestor of the base ref (in the worktree and on the remote), no tracked changes, no untracked " +
+  "files, no ignored entries outside the regenerated-artefact directories, no stash, and no other branch or " +
+  "worktree of the same repository holding work, and the declaration's probe head names that HEAD.";
 
 /** What a zero-delta close measured; recorded on the Tier 2 close audit row. */
 export interface ZeroDeltaCloseMeasurement {
   executionWorkspaceId: string;
+  workspaceProjectWorkspaceId: string;
   repository: string;
+  /** The workspace row's recorded path, verbatim; the close write compares its re-read against this. */
+  recordedWorktreePath: string;
   worktreePath: string;
+  commonDir: string;
   branch: string;
   baseBranch: string;
   baseRef: string;
@@ -2239,7 +2248,7 @@ type ZeroDeltaCloseProof =
 
 async function proveZeroDeltaRepositoryClose(
   db: Db,
-  issue: { id: string; companyId: string },
+  issue: { id: string; companyId: string; identifier: string | null },
   executionWorkspaceId: string | null,
   deliveryRepository: { hostname: string; owner: string; repo: string },
 ): Promise<ZeroDeltaCloseProof> {
@@ -2334,8 +2343,49 @@ async function proveZeroDeltaRepositoryClose(
   if (!projectBranches.has(baseBranch)) {
     return refuse(`the base ref ${workspace.baseRef} is not one of the project's branches`);
   }
-
-  const probe = await probeZeroDeltaWorktree({ recordedWorktreePath: worktreePath, branch: workspace.branchName, baseBranch });
+  if (!issue.identifier) return refuse("the card has no identifier to tie its worktree's branches to it");
+  // Branches registered to ANOTHER issue's execution workspace in this company
+  // and project belong to that card (branchName is board-only for agents);
+  // the probe refuses every other branch that is neither this card's nor one
+  // of the project's own branches.
+  const attributedBranches = await db
+    .select({ branchName: executionWorkspaces.branchName })
+    .from(executionWorkspaces)
+    .where(
+      and(
+        eq(executionWorkspaces.companyId, issue.companyId),
+        eq(executionWorkspaces.projectId, workspace.projectId),
+        isNotNull(executionWorkspaces.sourceIssueId),
+        ne(executionWorkspaces.sourceIssueId, issue.id),
+        isNotNull(executionWorkspaces.branchName),
+      ),
+    )
+    .then((rows) => rows.map((row) => row.branchName!).sort());
+  const probe = await probeZeroDeltaWorktree({
+    recordedWorktreePath: worktreePath,
+    managedProjectRoot: path.dirname(
+      resolveManagedProjectWorkspaceDir({ companyId: issue.companyId, projectId: workspace.projectId }),
+    ),
+    branch: workspace.branchName,
+    baseBranch,
+    issueIdentifier: issue.identifier,
+    projectBranches,
+    attributedBranches: new Set(attributedBranches),
+    existingOtherCardIdentifiers: async (candidates) =>
+      new Set(
+        await db
+          .select({ identifier: issues.identifier })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, issue.companyId),
+              ne(issues.id, issue.id),
+              inArray(issues.identifier, [...candidates]),
+            ),
+          )
+          .then((rows) => rows.flatMap((row) => (row.identifier ? [row.identifier] : []))),
+      ),
+  });
   if (!probe.ok) return refuse(probe.reason);
 
   let headAheadBy: number | null;
@@ -2378,8 +2428,11 @@ async function proveZeroDeltaRepositoryClose(
     token,
     measurement: {
       executionWorkspaceId,
+      workspaceProjectWorkspaceId: workspace.projectWorkspaceId,
       repository: `${hostname}/${owner}/${repo}`,
+      recordedWorktreePath: worktreePath,
       worktreePath: probe.worktreePath,
+      commonDir: probe.commonDir,
       branch: probe.branch,
       baseBranch,
       baseRef: probe.baseRef,
@@ -2392,7 +2445,7 @@ async function proveZeroDeltaRepositoryClose(
 
 async function proveZeroDeltaTier2Live(
   db: Db,
-  issue: { id: string; companyId: string },
+  issue: { id: string; companyId: string; identifier: string | null },
   executionWorkspaceId: string | null,
   deliveryRepository: { hostname: string; owner: string; repo: string },
   evidence: string,
@@ -2436,16 +2489,112 @@ async function proveZeroDeltaTier2Live(
     );
   }
   const probeCommand = shape[1]!.trim();
-  return acceptTier2(evidence.trim(), sameRun, {
-    probeCommand,
-    probeTarget: /https?:\/\/[^\s<>"']+/.exec(probeCommand)?.[0] ?? null,
-    observed: null,
-    observedRangeEnd: null,
-    tierForm: "live",
-    probeHead,
-    mergeCommit: null,
-    zeroDelta: measurement,
+  return {
+    ...acceptTier2(evidence.trim(), sameRun, {
+      probeCommand,
+      probeTarget: /https?:\/\/[^\s<>"']+/.exec(probeCommand)?.[0] ?? null,
+      observed: null,
+      observedRangeEnd: null,
+      tierForm: "live",
+      probeHead,
+      mergeCommit: null,
+      zeroDelta: measurement,
+    }),
+    zeroDeltaMeasurement: measurement,
+  };
+}
+
+export type ZeroDeltaCloseVerdict = { ok: true } | { ok: false; reason: string };
+
+/**
+ * SUP-24402 compare-and-set, inside the status write that lands a zero-delta
+ * close and against the row it holds `FOR UPDATE`. It makes no network call:
+ * it re-reads the database half of the proof and requires it to match what
+ * was measured, then re-checks the one measured worktree (index, status,
+ * ignored entries and stash on the measured branch and commit, one shared
+ * 15 s budget), so dirt written after the measurement refuses.
+ */
+export async function verifyZeroDeltaCloseAtTransition(
+  tx: Db,
+  lockedIssue: {
+    id: string;
+    companyId: string;
+    status?: string | null;
+    deliveryRequirement?: IssueDeliveryRequirement | null;
+    executionWorkspaceId?: string | null;
+    projectWorkspaceId?: string | null;
+  },
+  measurement: ZeroDeltaCloseMeasurement,
+): Promise<ZeroDeltaCloseVerdict> {
+  const refuse = (reason: string): ZeroDeltaCloseVerdict => ({ ok: false, reason });
+  if (lockedIssue.status === "done" || lockedIssue.status === "cancelled") {
+    return refuse("the issue's status changed after the close was measured");
+  }
+  if (lockedIssue.deliveryRequirement !== "repository_delivery") {
+    return refuse("is accepted only on an issue already stored as repository_delivery at the close write");
+  }
+  if ((lockedIssue.executionWorkspaceId ?? null) !== measurement.executionWorkspaceId) {
+    return refuse("the issue's execution workspace changed after the close was measured");
+  }
+  try {
+    const workspace = await tx
+      .select({
+        sourceIssueId: executionWorkspaces.sourceIssueId,
+        projectId: executionWorkspaces.projectId,
+        projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
+        providerRef: executionWorkspaces.providerRef,
+        cwd: executionWorkspaces.cwd,
+        branchName: executionWorkspaces.branchName,
+        baseRef: executionWorkspaces.baseRef,
+      })
+      .from(executionWorkspaces)
+      .where(and(eq(executionWorkspaces.id, measurement.executionWorkspaceId), eq(executionWorkspaces.companyId, lockedIssue.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!workspace || workspace.sourceIssueId !== lockedIssue.id) {
+      return refuse("the card's execution workspace is not one this card owns in this company at the close write");
+    }
+    if (workspace.projectWorkspaceId !== measurement.workspaceProjectWorkspaceId) {
+      return refuse("the execution workspace's project workspace changed after the close was measured");
+    }
+    if ((workspace.providerRef ?? workspace.cwd) !== measurement.recordedWorktreePath) {
+      return refuse("the recorded worktree path changed after the close was measured");
+    }
+    if (workspace.branchName !== measurement.branch) {
+      return refuse("the recorded branch changed after the close was measured");
+    }
+    if (normalizeBaseBranch(workspace.baseRef) !== measurement.baseBranch) {
+      return refuse("the recorded base ref changed after the close was measured");
+    }
+    const projectWorkspace = await tx
+      .select({ defaultRef: projectWorkspaces.defaultRef, repoRef: projectWorkspaces.repoRef, repoUrl: projectWorkspaces.repoUrl })
+      .from(projectWorkspaces)
+      .where(
+        and(
+          eq(projectWorkspaces.id, measurement.workspaceProjectWorkspaceId),
+          eq(projectWorkspaces.companyId, lockedIssue.companyId),
+          eq(projectWorkspaces.projectId, workspace.projectId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    const projectRepository = parseRepoUrl(projectWorkspace?.repoUrl ?? null);
+    if (
+      !projectRepository ||
+      `${projectRepository.hostname}/${projectRepository.owner}/${projectRepository.repo}`.toLowerCase() !==
+        measurement.repository.toLowerCase()
+    ) {
+      return refuse("the project's repository changed after the close was measured");
+    }
+  } catch (err) {
+    return refuse(`could not be verified at the close write (${err instanceof Error ? err.message : "unknown"})`);
+  }
+  const recheck = await recheckRecordedWorktree({
+    worktreePath: measurement.worktreePath,
+    commonDir: measurement.commonDir,
+    branch: measurement.branch,
+    headSha: measurement.headSha,
   });
+  if (!recheck.ok) return refuse(`refused at the close write: ${recheck.reason}`);
+  return { ok: true };
 }
 
 async function proveTier2Live(
@@ -2453,6 +2602,7 @@ async function proveTier2Live(
   issue: {
     id: string;
     companyId: string;
+    identifier?: string | null;
     projectId?: string | null;
     projectWorkspaceId?: string | null;
     executionWorkspaceId?: string | null;
@@ -2537,7 +2687,7 @@ async function proveTier2Live(
     if (deliveryRequirement !== "repository_delivery") {
       return refuseTier2(`${unrecorded}Accepted form: ${tier2Forms}`);
     }
-    return proveZeroDeltaTier2Live(db, issue, executionWorkspaceId, parsed, evidence, shape, sameRun, unrecorded, tier2Forms);
+    return proveZeroDeltaTier2Live(db, { ...issue, identifier: issue.identifier ?? null }, executionWorkspaceId, parsed, evidence, shape, sameRun, unrecorded, tier2Forms);
   }
   let token: string | null;
   try {

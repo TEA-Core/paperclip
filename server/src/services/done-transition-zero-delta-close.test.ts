@@ -1,16 +1,18 @@
 import { execFileSync, type SpawnOptions } from "node:child_process";
 import type * as ChildProcess from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { executionWorkspaces, issueWorkProducts, projectWorkspaces } from "@paperclipai/db";
+import { executionWorkspaces, issues, issueWorkProducts, projectWorkspaces } from "@paperclipai/db";
+import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
   evaluateDoneTierDeclaration,
   type DoneTierDeclarationResult,
   TIER2_FORM,
   TIER2_RECORD_ONLY_FORM,
 } from "./done-transition-guard.js";
+import * as doneTransitionGuard from "./done-transition-guard.js";
 import { zeroDeltaWorktreeRefusal } from "./hardened-git-probe.js";
 import type * as MergeArming from "./merge-arming.js";
 
@@ -90,6 +92,7 @@ const db = {
       where: () => {
         if (table === executionWorkspaces) return Promise.resolve([rows.executionWorkspace]);
         if (table === projectWorkspaces) return Promise.resolve([rows.projectWorkspace]);
+        if (table === issues) return Promise.resolve([]);
         if (table === issueWorkProducts) {
           return Promise.resolve(
             columns && "type" in columns
@@ -184,18 +187,24 @@ const UNRECORDED =
   "`mergeCommitSha` on the most recent merged pull_request work product, and there is no " +
   "fallback to the live branch tip. ";
 
+let previousHome: string | undefined;
+
 beforeEach(() => {
   root = mkdtempSync(path.join(os.tmpdir(), "paperclip-zero-delta-"));
+  previousHome = process.env.PAPERCLIP_HOME;
+  process.env.PAPERCLIP_HOME = root;
   origin = path.join(root, "origin.git");
   git(root, "init", "-q", "--bare", "-b", "main", origin);
   seed = path.join(root, "seed");
   mkdirSync(seed);
   git(seed, "init", "-q", "-b", "main");
   writeFileSync(path.join(seed, "a.txt"), "hello\n");
-  git(seed, "add", "a.txt");
+  writeFileSync(path.join(seed, ".gitignore"), "ignored.txt\nbuild/\n");
+  git(seed, "add", "a.txt", ".gitignore");
   git(seed, "commit", "-qm", "init");
   git(seed, "push", "-q", origin, "main");
-  repoRoot = path.join(root, "projects", "paperclip");
+  repoRoot = resolveManagedProjectWorkspaceDir({ companyId: "company-1", projectId: "project-1", repoName: "paperclip" });
+  mkdirSync(path.dirname(repoRoot), { recursive: true });
   git(root, "clone", "-q", origin, repoRoot);
   worktree = path.join(repoRoot, ".paperclip", "worktrees", BRANCH);
   git(repoRoot, "worktree", "add", "-q", "-b", BRANCH, worktree, "origin/main");
@@ -229,6 +238,8 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
+  if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+  else process.env.PAPERCLIP_HOME = previousHome;
 });
 
 function expectZeroDeltaRefusal(result: DoneTierDeclarationResult, why: string) {
@@ -524,6 +535,150 @@ describe("zero-delta repository_delivery Tier 2 close (SUP-24402)", () => {
     });
     expect(mockGhFetch).not.toHaveBeenCalled();
     expect(mockResolveLinkedPullRequestsWithState).not.toHaveBeenCalled();
+  });
+});
+
+describe("zero-delta NO-GO regressions (RA 1213)", () => {
+  it("refuses an ignored file the committed .gitignore hides from status", async () => {
+    writeFileSync(path.join(worktree, "ignored.txt"), "undelivered\n");
+    expect(git(worktree, "status", "--porcelain")).toBe("");
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("A zero-delta close was not proven: the recorded worktree has an ignored entry");
+  });
+
+  it("still accepts a regenerated-artefact directory a committed rule ignores", async () => {
+    mkdirSync(path.join(worktree, "build"), { recursive: true });
+    writeFileSync(path.join(worktree, "build", "output.txt"), "artefact\n");
+    const result = await close();
+    expect(result.allowed).toBe(true);
+  });
+
+  it("refuses a populated stash of the card's own repository", async () => {
+    writeFileSync(path.join(worktree, "a.txt"), "parked\n");
+    git(worktree, "stash", "push", "-q", "-m", "parked work");
+    expect(git(worktree, "status", "--porcelain")).toBe("");
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("stash");
+  });
+
+  it("refuses a hidden local branch holding commits while HEAD sits at the base", async () => {
+    git(worktree, "checkout", "-q", "-b", "SUP-24395-hidden");
+    writeFileSync(path.join(worktree, "work.txt"), "work\n");
+    git(worktree, "add", "work.txt");
+    git(worktree, "commit", "-qm", "SUP-24395 hidden work");
+    git(worktree, "checkout", "-q", BRANCH);
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("SUP-24395-hidden");
+  });
+
+  it("refuses a local branch that belongs to no card", async () => {
+    git(worktree, "checkout", "-q", "-b", "unrelated-work");
+    writeFileSync(path.join(worktree, "work.txt"), "work\n");
+    git(worktree, "add", "work.txt");
+    git(worktree, "commit", "-qm", "unrelated work");
+    git(worktree, "checkout", "-q", BRANCH);
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("unrelated-work");
+  });
+
+  it("refuses a foreign remote branch naming this card that holds commits", async () => {
+    writeFileSync(path.join(worktree, "work.txt"), "work\n");
+    git(worktree, "add", "work.txt");
+    git(worktree, "commit", "-qm", "SUP-24395 side work");
+    git(worktree, "push", "-q", "origin", "HEAD:refs/heads/SUP-24395-side");
+    git(worktree, "reset", "-q", "--hard", "HEAD~1");
+    git(repoRoot, "fetch", "-q", "origin");
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("SUP-24395-side");
+  });
+
+  it("refuses a second linked worktree of the same repository holding uncommitted work", async () => {
+    const other = path.join(repoRoot, ".paperclip", "worktrees", "SUP-24395-other");
+    git(repoRoot, "worktree", "add", "-q", "-b", "SUP-24395-other", other, "origin/main");
+    writeFileSync(path.join(other, "draft.txt"), "undelivered\n");
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("SUP-24395-other");
+  });
+
+  it("refuses a recorded path symlinked to a clean foreign repository", async () => {
+    const foreign = path.join(root, "foreign");
+    git(root, "clone", "-q", origin, foreign);
+    git(foreign, "checkout", "-q", "-b", BRANCH, headSha());
+    const link = path.join(root, "recorded-link");
+    symlinkSync(foreign, link);
+    rows.executionWorkspace.providerRef = link;
+    rows.executionWorkspace.cwd = link;
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("the recorded worktree path is outside the project's managed worktree directory");
+  });
+
+  it("refuses an in-worktree .git file redirected to a foreign gitdir", async () => {
+    const foreign = path.join(root, "foreign");
+    git(root, "clone", "-q", origin, foreign);
+    const foreignWorktree = path.join(foreign, "wt");
+    git(foreign, "worktree", "add", "-q", "-b", BRANCH, foreignWorktree, headSha());
+    git(foreign, "config", "core.worktree", worktree);
+    writeFileSync(path.join(worktree, ".git"), `gitdir: ${path.join(foreign, ".git", "worktrees", "wt")}\n`);
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("the recorded worktree is not a linked worktree of the managed checkout");
+  });
+
+  it("re-checks the measured worktree at the close write (dirt after measurement refuses)", async () => {
+    const result = await close();
+    expect(result.allowed).toBe(true);
+    const measurement = (result as unknown as Record<string, unknown>).zeroDeltaMeasurement;
+    expect(measurement).toBeDefined();
+    const verify = (doneTransitionGuard as unknown as Record<string, unknown>).verifyZeroDeltaCloseAtTransition as
+      | ((tx: unknown, locked: unknown, measurement: unknown) => Promise<{ ok: boolean; reason?: string }>)
+      | undefined;
+    expect(typeof verify).toBe("function");
+    const locked = { ...CARD, deliveryRequirement: "repository_delivery" as const, status: "in_progress" };
+    const clean = await verify!(db, locked, measurement);
+    expect(clean.ok).toBe(true);
+    writeFileSync(path.join(worktree, "late.txt"), "added after measurement\n");
+    const dirty = await verify!(db, locked, measurement);
+    expect(dirty.ok).toBe(false);
+  });
+
+  it("refuses a shallow worktree (pin)", async () => {
+    git(worktree, "fetch", "-q", "--depth=1", "origin");
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("shallow");
+  });
+
+  it("refuses a skip-worktree index entry (pin)", async () => {
+    git(worktree, "update-index", "--skip-worktree", "a.txt");
+    writeFileSync(path.join(worktree, "a.txt"), "hidden\n");
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("skip-worktree");
+  });
+
+  it("refuses a submodule index entry (pin)", async () => {
+    git(worktree, "update-index", "--add", "--cacheinfo", `160000,${headSha()},submod`);
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("submodules");
+  });
+
+  it("refuses an unmerged index entry (pin)", async () => {
+    const blob = git(worktree, "rev-parse", "HEAD:a.txt");
+    execFileSync("git", ["-C", worktree, "update-index", "--index-info"], {
+      env: fixtureEnv,
+      input: `100644 ${blob} 1\tconflict.txt\n`,
+    });
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("unmerged");
   });
 });
 
