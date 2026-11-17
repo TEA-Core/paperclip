@@ -266,6 +266,41 @@ describeEmbeddedPostgres("heartbeat queued-run age bound", () => {
     expect(await expiryActivityRows()).toHaveLength(0);
   });
 
+  it("pages past 100 old-but-not-expirable queued runs to reach a stale run behind them", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const oldest = Date.now() - QUEUED_RUN_BOUND_MS - 10 * HOUR_MS;
+    const blockerIssueId = await seedIssue(companyId, agentId, 2);
+    const blockers = [];
+    for (let i = 0; i < 100; i += 1) {
+      blockers.push({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation" as const,
+        triggerDetail: "system",
+        status: "queued",
+        scheduledRetryAt: new Date(Date.now() + HOUR_MS),
+        contextSnapshot: { issueId: blockerIssueId, taskId: blockerIssueId },
+        createdAt: new Date(oldest + i),
+        updatedAt: new Date(oldest + i),
+      });
+    }
+    await db.insert(heartbeatRuns).values(blockers);
+    const issueId = await seedIssue(companyId, agentId, 1);
+    const stale = await seedQueuedLockHolder({
+      companyId,
+      agentId,
+      issueId,
+      createdAt: new Date(Date.now() - QUEUED_RUN_BOUND_MS - HOUR_MS),
+    });
+
+    const result = await heartbeatService(db).expireStaleQueuedRuns();
+
+    expect(result.runIds).toContain(stale.runId);
+    expect((await readRun(stale.runId)).status).toBe("cancelled");
+    expect((await readIssueLock(issueId)).executionRunId).toBeNull();
+  });
+
   it("leaves a running run older than the bound untouched", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = await seedIssue(companyId, agentId, 1);
