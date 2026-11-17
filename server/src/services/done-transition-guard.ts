@@ -110,6 +110,8 @@ const ADR072_CLOSE_LADDER: {
 const TIER_2_PREFIX = "Closed at Tier 2 (live):";
 const TIER_1_PREFIX = "Closed at Tier 1 (landed, not liveness-probed):";
 const TIER_1_SUFFIX = "Liveness unverified.";
+// SUP-24299: refusal code for a Tier 2 declaration that also carries TIER_1_SUFFIX.
+export const DONE_TRANSITION_TIER_CONFLICT_CODE = "done_transition_tier_conflict";
 // Machine-checkable accepted forms, embedded verbatim in every rejection message so the
 // 422 remedy and the parser always agree on the exact literal (SUP-15787).
 // SUP-21902: the Tier 2 form is self-verifying — the evidence must name the probe
@@ -326,6 +328,10 @@ export interface DoneTierDeclarationResult {
   // A remedy specific to this refusal. A door that builds its own generic remedy
   // for a refused declaration uses this one instead when it is set.
   remedy?: string;
+  // Set when the refusal carries its own route error code. A door that maps every
+  // refused declaration to done_transition_missing_tier_declaration uses this one
+  // instead when it is set.
+  code?: typeof DONE_TRANSITION_TIER_CONFLICT_CODE;
 }
 
 function appendSkipReason(current: string | null, piece: string): string {
@@ -691,20 +697,39 @@ const LADDER_REFUSAL_REPEATED_ACTION = "issue.done_transition_ladder_refusal_rep
  * (`postTerminalStatusRefusalComment`), so a repeated refusal posts no second
  * comment and this row is the only per-write machine trace. Never throws, so the
  * HTTP result of the refusal is unchanged by a failed audit write.
+ *
+ * SUP-24429: a 409 `done_transition_record_only_flip_refused` (a close request that
+ * also relabels a stored repository_delivery card record_only) writes the same
+ * refusal-class row, naming the stored and requested requirements and recording
+ * that the landing check was not skipped.
  */
 export const DONE_TRANSITION_REFUSED_ACTION = "issue.done_transition_refused";
 
 export async function writeDoneTransitionRefusedAuditLog(
   db: Db,
   issue: { id: string; companyId: string; identifier: string | null },
-  details: {
-    code: "done_transition_missing_tier_declaration";
-    httpStatus: 422;
-    reason: string;
-    decisionCarried: boolean;
-    runId: string | null;
-    stage?: string;
-  },
+  details:
+    | {
+        code: "done_transition_missing_tier_declaration";
+        httpStatus: 422;
+        reason: string;
+        decisionCarried: boolean;
+        runId: string | null;
+        stage?: string;
+      }
+    | {
+        code: "done_transition_record_only_flip_refused";
+        httpStatus: 409;
+        reason: string;
+        decisionCarried: boolean;
+        runId: string | null;
+        storedDeliveryRequirement: IssueDeliveryRequirement;
+        requestedDeliveryRequirement: "record_only";
+        landingCheckSkipped: false;
+        // `request`: refused against the unlocked read; `locked_recheck`:
+        // refused under the issue row lock in the write transaction.
+        stage: "request" | "locked_recheck";
+      },
 ): Promise<void> {
   await writeAuditLog(db, issue, DONE_TRANSITION_REFUSED_ACTION, {
     ...details,
@@ -3085,6 +3110,40 @@ function describeTierRejection(tier2: Tier2Parse, tier1: Tier1Parse, tier2Forms:
   return null;
 }
 
+/**
+ * SUP-24299: the Tier 1 marker "Liveness unverified." disclaims the probe that
+ * a Tier 2 (live) declaration claims, so one declaration cannot carry both. The
+ * Tier 2 matchers end in a catch-all (`(.+)$`), which accepted the marker as
+ * part of the predicate text. Returns the refusal, or null when the Tier 2
+ * evidence does not carry the marker. The check reads only the matched evidence
+ * line, so a separate Tier 1 line elsewhere in the same comment is unaffected.
+ */
+function refuseTier2LivenessConflict(
+  evidence: string,
+  tier2Forms: string,
+  tier1Forms: string,
+): DoneTierDeclarationResult | null {
+  if (!evidence.toLowerCase().includes(TIER_1_SUFFIX.toLowerCase())) {
+    return null;
+  }
+  return {
+    allowed: false,
+    reason:
+      `A Tier 2 declaration also carries the Tier 1 marker "${TIER_1_SUFFIX}". The two are mutually ` +
+      'exclusive: "Closed at Tier 2 (live)" claims the running surface was probed, and ' +
+      `"${TIER_1_SUFFIX}" says it was not. ` +
+      `Accepted Tier 2 form: ${tier2Forms} — per SUP-12693.`,
+    tier: null,
+    skipped: false,
+    skipReason: null,
+    code: DONE_TRANSITION_TIER_CONFLICT_CODE,
+    remedy:
+      `If you probed the running surface, remove "${TIER_1_SUFFIX}" from the Tier 2 line and keep the ` +
+      `probe evidence: ${tier2Forms}. If you did not probe it, do not claim Tier 2: close at Tier 1 ` +
+      `with the marker as the suffix of the Tier 1 line: ${tier1Forms} — per SUP-12693.`,
+  };
+}
+
 export async function evaluateDoneTierDeclaration(
   db: Db,
   issue: {
@@ -3133,6 +3192,8 @@ export async function evaluateDoneTierDeclaration(
   if (accompanyingComment && accompanyingComment.trim().length > 0) {
     const tier2 = parseTier2Declaration(accompanyingComment);
     if (tier2.kind === "matched") {
+      const conflict = refuseTier2LivenessConflict(tier2.evidence, tier2Forms, tier1Forms);
+      if (conflict) return conflict;
       // SUP-21902: a matched Tier 2 sentence is no longer accepted on its face —
       // the origin predicate resolves the named probe head and compares it with
       // the delivery merge head before the close is allowed. SUP-22801: on a
@@ -3228,6 +3289,8 @@ export async function evaluateDoneTierDeclaration(
 
   const tier2 = parseTier2Declaration(sameRunComment.body);
   if (tier2.kind === "matched") {
+    const conflict = refuseTier2LivenessConflict(tier2.evidence, tier2Forms, tier1Forms);
+    if (conflict) return conflict;
     // SUP-21902: same-run Tier 2 declarations face the same origin predicate as
     // accompanying-comment ones — a pre-merge or unresolvable head is refused
     // identically on both doors. SUP-23490: the same closing-run lifetime gate
@@ -3677,7 +3740,10 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
     }
   | {
       allowed: false;
-      code: "done_transition_missing_delivery" | "done_transition_missing_tier_declaration";
+      code:
+        | "done_transition_missing_delivery"
+        | "done_transition_missing_tier_declaration"
+        | typeof DONE_TRANSITION_TIER_CONFLICT_CODE;
       reason: string;
     }
 > {
@@ -3702,7 +3768,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
     if (!tierResult.allowed) {
       return {
         allowed: false,
-        code: "done_transition_missing_tier_declaration",
+        code: tierResult.code ?? "done_transition_missing_tier_declaration",
         reason: tierResult.reason,
       };
     }
@@ -4656,6 +4722,9 @@ async function evaluateDoneTransitionGuardCore(
     executionPolicy?: unknown;
     executionState?: unknown;
     deliveryRequirement?: IssueDeliveryRequirement | null;
+    // The status version before this close; it binds a requirement-change
+    // marker to the close (SUP-24429).
+    statusVersion?: number;
   },
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
@@ -4663,6 +4732,9 @@ async function evaluateDoneTransitionGuardCore(
   // exported wrapper can audit a below-threshold carve-out on a successful close
   // without issuing a second countLadderedChildren query.
   observer?: { census?: DoneTransitionCensus },
+  // SUP-24429: the requirement stored before the close request; undefined when
+  // the caller's request does not change it.
+  storedDeliveryRequirement?: IssueDeliveryRequirement | null,
 ): Promise<DoneTransitionGuardResult> {
   const fallback = (reason: string, skipped = false, skipReason: string | null = null): DoneTransitionGuardResult => ({
     allowed: true,
@@ -4919,7 +4991,14 @@ async function evaluateDoneTransitionGuardCore(
     };
   }
 
-  if (issue.deliveryRequirement === "record_only") {
+  // SUP-24429: the skip follows the requirement stored before this request.
+  // A close request that just relabelled a repository_delivery card record_only
+  // falls through to the repository landing check below. A caller that passes
+  // no stored requirement changes nothing in that request.
+  if (
+    issue.deliveryRequirement === "record_only" &&
+    (storedDeliveryRequirement === undefined || storedDeliveryRequirement === "record_only")
+  ) {
     return {
       allowed: true,
       reason: "Record-only delivery requirement: repository/PR delivery is not required; transition allowed",
@@ -5144,6 +5223,17 @@ async function evaluateDoneTransitionGuardCore(
         reason: `open_linked_prs_decision_carried:${openPrs.length}`,
         skipReason: `open_linked_prs_decision_carried:${openPrs.length}`,
         prs: prNames,
+        // SUP-24429: this row is a landing-backstop candidate. When the close
+        // request relabelled the stored requirement, name both sides and the
+        // status version this close produces, so the backstop keeps sweeping
+        // the card under a live record_only label until a later close.
+        ...(storedDeliveryRequirement !== undefined && storedDeliveryRequirement !== issue.deliveryRequirement
+          ? {
+              storedDeliveryRequirement,
+              requestedDeliveryRequirement: issue.deliveryRequirement ?? null,
+              ...(issue.statusVersion !== undefined ? { closeStatusVersion: issue.statusVersion + 1 } : {}),
+            }
+          : {}),
       });
       return {
         allowed: true,
@@ -5700,9 +5790,20 @@ export async function evaluateDoneTransitionGuard(
   issue: Parameters<typeof evaluateDoneTransitionGuardCore>[1],
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
+  // SUP-24429: the requirement stored before this request, passed by a door that
+  // lets the close request change it. The record-only skip applies only when this
+  // is record_only too; omitted means the request did not change the requirement.
+  storedDeliveryRequirement?: IssueDeliveryRequirement | null,
 ): Promise<DoneTransitionGuardResult> {
   const observer: { census?: DoneTransitionCensus } = {};
-  const result = await evaluateDoneTransitionGuardCore(db, issue, override, decisionCarried, observer);
+  const result = await evaluateDoneTransitionGuardCore(
+    db,
+    issue,
+    override,
+    decisionCarried,
+    observer,
+    storedDeliveryRequirement,
+  );
   const census = observer.census;
   if (
     result.allowed

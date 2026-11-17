@@ -123,7 +123,7 @@ function makeArchiveDb(opts: { identifier?: string | null } = {}) {
   return { db, inserts };
 }
 
-describe.sequential("execution workspace routes", () => {
+describe("execution workspace routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockAccessService.decide.mockResolvedValue({
