@@ -3745,6 +3745,43 @@ function evaluateReviewLadderSatisfaction(
   };
 }
 
+type ReviewLadderEvaluation = NonNullable<ReturnType<typeof evaluateReviewLadderSatisfaction>>;
+
+/** Race-free identity of the ladder state a refusal evaluated: no clocks. */
+export function reviewLadderStateKey(evaluation: ReviewLadderEvaluation): string {
+  const sorted = (values: string[]) => [...new Set(values)].sort();
+  return JSON.stringify({
+    stages: sorted([
+      ...evaluation.completedStageIds,
+      ...evaluation.skippedStageIds,
+      ...evaluation.unsatisfiedStageIds,
+    ]),
+    completedStageIds: sorted(evaluation.completedStageIds),
+    skippedStageIds: sorted(evaluation.skippedStageIds),
+    unsatisfiedStageIds: sorted(evaluation.unsatisfiedStageIds),
+  });
+}
+
+/** Current ladder-state key for an issue, or null when it carries no ladder. */
+export async function getReviewLadderStateKey(
+  db: Db,
+  issue: { id: string; companyId: string; executionPolicy?: unknown; executionState?: unknown },
+): Promise<string | null> {
+  let evaluation = evaluateReviewLadderSatisfaction(issue.executionPolicy, issue.executionState, false);
+  if (evaluation === null) return null;
+  if (!evaluation.satisfied) {
+    const decisionSatisfiedStageIds = await listDecisionSatisfiedStageIds(db, issue.companyId, issue.id);
+    const recovered = evaluateReviewLadderSatisfaction(
+      issue.executionPolicy,
+      issue.executionState,
+      false,
+      decisionSatisfiedStageIds,
+    );
+    if (recovered !== null) evaluation = recovered;
+  }
+  return reviewLadderStateKey(evaluation);
+}
+
 /**
  * SUP-14561 (mechanism A) + SUP-15233: count this issue's child issues that
  * each ran a review ladder — the child carries a non-null execution policy
@@ -4486,6 +4523,7 @@ async function evaluateDoneTransitionGuardCore(
       unsatisfiedStageIds: reviewLadder.unsatisfiedStageIds,
       completedStageIds: reviewLadder.completedStageIds,
       skippedStageIds: reviewLadder.skippedStageIds,
+      ladderStateKey: reviewLadderStateKey(reviewLadder),
       decisionCarried,
     });
     return {
