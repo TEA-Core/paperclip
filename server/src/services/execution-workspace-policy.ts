@@ -262,6 +262,30 @@ export function inheritedExecutionWorkspaceBranchExempt(input: {
   });
 }
 
+/** The fork's fold branch family (`fold/tea-patches-<release>`): the integration branch every PR lands on. */
+const FOLD_BRANCH_PREFIX = "fold/tea-patches-";
+
+/**
+ * SUP-24409 (RA on PR 1214): a branch no card may claim as its own delivery branch. The arm-time
+ * owner fallback trusts the branch on a card's own execution-workspace row, so a row naming the
+ * fork's fold branch or a project/base default branch would let one card's approval arm the PR
+ * that lands that branch. True for any `fold/tea-patches-*` branch and for any of `defaultRefs`
+ * (a remote-tracking `origin/` prefix on a ref is ignored). Case-insensitive, so a case variant
+ * of a protected branch is protected too.
+ */
+export function isProtectedDeliveryBranch(
+  branch: string,
+  defaultRefs: ReadonlyArray<string | null | undefined>,
+): boolean {
+  const candidate = branch.toLowerCase();
+  if (candidate.startsWith(FOLD_BRANCH_PREFIX)) return true;
+  return defaultRefs.some((ref) => {
+    if (!ref) return false;
+    const normalized = ref.toLowerCase();
+    return (normalized.startsWith("origin/") ? normalized.slice("origin/".length) : normalized) === candidate;
+  });
+}
+
 /**
  * SUP-15205 (narrowed by SUP-15231): should a `reuse_existing` binding be
  * declined because it would restore this issue onto another issue's delivery

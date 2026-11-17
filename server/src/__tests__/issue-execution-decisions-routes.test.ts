@@ -358,6 +358,8 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     const pr = {
       number: 42, state: "open", draft, merged: false, node_id: "sandbox-pr",
       title: identifier, head: { ref: branch, sha: "a".repeat(40), repo: { full_name: "TEA-Core/paperclip" } },
+      // The GitHub provider caches the head repository flat; the arm-time owner fallback requires it.
+      headRepoFullName: "TEA-Core/paperclip",
       ...(mentionState
         ? {
             state: "closed" as const,

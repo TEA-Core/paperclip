@@ -35,7 +35,7 @@ import {
   type WorkspaceRuntimeLeaseClaim,
 } from "../services/index.js";
 import { mergeExecutionWorkspaceConfig, readExecutionWorkspaceConfig } from "../services/execution-workspaces.js";
-import { parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
+import { isProtectedDeliveryBranch, parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
 import { createGitRemoteAuthProvider } from "../services/git-credentials.js";
 import { readProjectWorkspaceRuntimeConfig } from "../services/project-workspace-runtime-config.js";
 import {
@@ -1164,6 +1164,21 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       }),
     );
     assertNoAgentExecutionWorkspaceIdentityMutation(req, collectExecutionWorkspaceIdentityPaths(req.body));
+    // SUP-24409 (RA on PR 1214): a row's branch is the delivery branch the arm-time owner fallback
+    // trusts, so it cannot be pointed at the fork's fold branch or at a base/default ref of the
+    // row or its project. An unchanged branch is left alone (a project_primary row sits on its default).
+    if (typeof req.body.branchName === "string" && req.body.branchName !== existing.branchName) {
+      const projectRefs = await db
+        .select({ defaultRef: projectWorkspaces.defaultRef, repoRef: projectWorkspaces.repoRef })
+        .from(projectWorkspaces)
+        .where(and(eq(projectWorkspaces.companyId, existing.companyId), eq(projectWorkspaces.projectId, existing.projectId)));
+      const baseRefs = [existing.baseRef, req.body.baseRef, ...projectRefs.flatMap((ref) => [ref.defaultRef, ref.repoRef])];
+      if (isProtectedDeliveryBranch(req.body.branchName, baseRefs)) {
+        throw unprocessable(
+          `Branch "${req.body.branchName}" is a protected base branch (the fold branch or a default branch of this workspace's project) and cannot be an execution workspace's delivery branch`,
+        );
+      }
+    }
     const patch: Record<string, unknown> = {
       ...(req.body.name === undefined ? {} : { name: req.body.name }),
       ...(req.body.cwd === undefined ? {} : { cwd: req.body.cwd }),

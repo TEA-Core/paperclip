@@ -16,7 +16,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { armMergeOnApproval as armMergeOnApprovalReal, enableAutoMerge, isGitHubTokenResolution, publishApprovalStatus, resolveLinkedPullRequests, shouldPublishApprovalStatus, type MergeArmingDecision } from "../services/merge-arming.js";
+import { armMergeOnApproval as armMergeOnApprovalReal, enableAutoMerge, isGitHubTokenResolution, publishApprovalStatus, resolveLinkedPullRequests, shouldPublishApprovalStatus, type AuthorityGuard, type MergeArmingDecision } from "../services/merge-arming.js";
 // The arm gate names the head it is written to. These cases do not model a head read, so an arm that names none is given one;
 // the case about an unbound arm passes `{}` itself and models the read.
 const armMergeOnApproval: typeof armMergeOnApprovalReal = (db, companyId, issueId, decision, pr, options) =>
@@ -3063,6 +3063,7 @@ describeEmbeddedPostgres(
       values: {
         branchName: string | null;
         repoUrl?: string | null;
+        baseRef?: string | null;
         sourceIssueId?: string | null;
         mode?: string;
         companyId?: string;
@@ -3082,6 +3083,7 @@ describeEmbeddedPostgres(
           status: "active",
           branchName: values.branchName,
           repoUrl: values.repoUrl === undefined ? REPO_URL : values.repoUrl,
+          baseRef: values.baseRef ?? null,
         })
         .returning();
       return row!.id;
@@ -3106,12 +3108,23 @@ describeEmbeddedPostgres(
     }
 
     async function mentionPr(
-      overrides: { owner?: string; repo?: string; headRefName?: string | null; title?: string | null } = {},
+      overrides: {
+        owner?: string;
+        repo?: string;
+        headRefName?: string | null;
+        title?: string | null;
+        headRepoFullName?: string | null;
+      } = {},
     ) {
-      const obj = createPRExternalObject(companyId, overrides.owner ?? "TEA-Core", overrides.repo ?? "paperclip", 1210, {
+      const owner = overrides.owner ?? "TEA-Core";
+      const repo = overrides.repo ?? "paperclip";
+      const obj = createPRExternalObject(companyId, owner, repo, 1210, {
         headRefName: overrides.headRefName === undefined ? OWN_BRANCH : overrides.headRefName,
         title: overrides.title === undefined ? PR_TITLE : overrides.title,
       });
+      // The GitHub provider caches the head repository (body.head.repo.full_name) as headRepoFullName.
+      const headRepoFullName = overrides.headRepoFullName === undefined ? `${owner}/${repo}` : overrides.headRepoFullName;
+      if (headRepoFullName !== null) obj.data.headRepoFullName = headRepoFullName;
       const [externalObj] = await db.insert(externalObjects).values(obj).returning();
       await db.insert(externalObjectMentions).values({
         companyId,
@@ -3309,6 +3322,180 @@ describeEmbeddedPostgres(
       await expectRefused(
         "status:skipped:delivery_identity_unresolved: recorded delivery identity has no branch; refusing to stamp a PR this card cannot be proven to have delivered (ADR-091 D4, fail closed)",
       );
+    });
+
+    // ---- RA no-go on PR 1214 (head 94e3e21bb8): each "RA" case below armed on that head ----
+
+    /**
+     * A deterministic barrier inside ONE arm call: right after resolveDeliveryIdentity reads the card's
+     * row (the only select in the arm path that asks for both projectWorkspaceId and executionState),
+     * `rebind` runs before any later read.
+     */
+    function rebindAfterDeliveryRead(rebind: () => Promise<void>): Db {
+      let fired = false;
+      const afterRows = (value: object): object => new Proxy(value, {
+        get(target, prop) {
+          const member: unknown = Reflect.get(target, prop, target);
+          if (typeof member !== "function") return member;
+          if (prop === "then") {
+            return (onFulfilled?: (rows: unknown) => unknown, onRejected?: (error: unknown) => unknown) =>
+              (member.call(target, async (rows: unknown) => { await rebind(); return rows; }) as Promise<unknown>)
+                .then(onFulfilled, onRejected);
+          }
+          return (...args: unknown[]) => {
+            const out: unknown = member.apply(target, args);
+            return out !== null && typeof out === "object" ? afterRows(out) : out;
+          };
+        },
+      });
+      return new Proxy(db, {
+        get(target, prop) {
+          const member: unknown = Reflect.get(target, prop, target);
+          if (typeof member !== "function") return member;
+          if (prop !== "select") return member.bind(target);
+          return (fields?: Record<string, unknown>) => {
+            const builder = member.call(target, fields) as object;
+            if (fired || !fields || !("projectWorkspaceId" in fields) || !("executionState" in fields)) return builder;
+            fired = true;
+            return afterRows(builder);
+          };
+        },
+      });
+    }
+
+    const HEAD_OID = "d".repeat(40);
+    /** A guard that never reports a change, so only the ownership step can stop the arm. */
+    const ALWAYS_HOLDS: AuthorityGuard = { baseline: "test", requireApprovedLadder: true, headSha: HEAD_OID, stillHolds: async () => null };
+
+    it("RA rebind race: a rebind to another repo's row between the delivery read and the ownership read does not arm", async () => {
+      await bindWorkspace(issueId, await insertWorkspace({ branchName: "fm/old-branch" }));
+      const newWs = await insertWorkspace({ branchName: OWN_BRANCH, repoUrl: "https://github.com/Other/forkrepo" });
+      await mentionPr();
+
+      const raced = rebindAfterDeliveryRead(() => bindWorkspace(issueId, newWs));
+      const result = await armMergeOnApprovalReal(raced, companyId, issueId, DECISION, undefined, { expectedHeadOid: HEAD_OID, authorityGuard: ALWAYS_HOLDS });
+
+      expect(result).toEqual({ kind: "skipped", message: NOT_OWNER });
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("RA rebind race: a card rebound mid-arm to a row that owns the PR stops as authority-changed", async () => {
+      await bindWorkspace(issueId, await insertWorkspace({ branchName: "fm/old-branch" }));
+      const newWs = await insertWorkspace({ branchName: OWN_BRANCH });
+      await mentionPr();
+
+      const raced = rebindAfterDeliveryRead(() => bindWorkspace(issueId, newWs));
+      const result = await armMergeOnApprovalReal(raced, companyId, issueId, DECISION, undefined, { expectedHeadOid: HEAD_OID });
+
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toMatch(/^skipped:authority-changed: TEA-Core\/paperclip#1210 — /);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("RA: refuses when the card's row claims the fold branch", async () => {
+      await seedOwnWorkspace("fold/tea-patches-v2026.722.0");
+      await mentionPr({ headRefName: "fold/tea-patches-v2026.722.0" });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("RA: refuses when the card's row claims a fold branch in another letter case", async () => {
+      await seedOwnWorkspace("FOLD/Tea-Patches-v1");
+      await mentionPr({ headRefName: "FOLD/Tea-Patches-v1" });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("RA: refuses when the card's row claims its own base ref (origin/main -> main)", async () => {
+      await bindWorkspace(issueId, await insertWorkspace({ branchName: "main", baseRef: "origin/main" }));
+      await mentionPr({ headRefName: "main" });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("RA: refuses when the card's row claims the project's default ref", async () => {
+      await db.update(projectWorkspaces).set({ defaultRef: "release" }).where(eq(projectWorkspaces.projectId, projectId));
+      await seedOwnWorkspace("release");
+      await mentionPr({ headRefName: "release" });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("RA: refuses when the card's row claims the project's repo ref", async () => {
+      await db.update(projectWorkspaces).set({ repoRef: "Trunk" }).where(eq(projectWorkspaces.projectId, projectId));
+      await seedOwnWorkspace("trunk");
+      await mentionPr({ headRefName: "trunk" });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("RA: refuses a fork PR whose head repository differs even though the branch name matches", async () => {
+      await seedOwnWorkspace();
+      await mentionPr({ headRepoFullName: "attacker/paperclip" });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("RA: refuses when the PR's head repository is unknown", async () => {
+      await seedOwnWorkspace();
+      await mentionPr({ headRepoFullName: null });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it("arms when the head repository matches the delivery repo in another letter case", async () => {
+      await seedOwnWorkspace();
+      await mentionPr({ headRepoFullName: "tea-core/PAPERCLIP" });
+      await expectArmed();
+    });
+
+    it("refuses a PR into another base repo even when its head repository is the delivery repo", async () => {
+      await seedOwnWorkspace();
+      await mentionPr({ repo: "other-repo", headRepoFullName: "TEA-Core/paperclip" });
+      await expectRefused(NOT_OWNER);
+    });
+
+    it.each([
+      ["branch", { branchName: "fm/old-branch" }, { branchName: OWN_BRANCH }],
+      ["repo", { repoUrl: "https://github.com/Other/forkrepo" }, { repoUrl: REPO_URL }],
+      ["owner", { borrowed: true }, { sourceIssueId: null }],
+    ] as const)("RA rebind race: an edit of the bound row's %s mid-arm stops as authority-changed", async (_label, before, after) => {
+      const wsId = await insertWorkspace({
+        branchName: "branchName" in before ? before.branchName : OWN_BRANCH,
+        repoUrl: "repoUrl" in before ? before.repoUrl : undefined,
+        sourceIssueId: "borrowed" in before ? await insertIssue({ identifier: "SUP-30010" }) : null,
+      });
+      await bindWorkspace(issueId, wsId);
+      await mentionPr();
+
+      const raced = rebindAfterDeliveryRead(async () => {
+        await db.update(executionWorkspaces).set(after).where(eq(executionWorkspaces.id, wsId));
+      });
+      const result = await armMergeOnApprovalReal(raced, companyId, issueId, DECISION, undefined, { expectedHeadOid: HEAD_OID });
+
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toMatch(/^skipped:authority-changed: TEA-Core\/paperclip#1210 — /);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("RA rebind race: a rebind to an identical row (old row removed) mid-arm still stops as authority-changed", async () => {
+      const oldWs = await insertWorkspace({ branchName: OWN_BRANCH });
+      await bindWorkspace(issueId, oldWs);
+      await mentionPr();
+
+      const raced = rebindAfterDeliveryRead(async () => {
+        const newWs = await insertWorkspace({ branchName: OWN_BRANCH });
+        await bindWorkspace(issueId, newWs);
+        await db.delete(executionWorkspaces).where(eq(executionWorkspaces.id, oldWs));
+      });
+      const result = await armMergeOnApprovalReal(raced, companyId, issueId, DECISION, undefined, { expectedHeadOid: HEAD_OID });
+
+      expect(result.kind).toBe("skipped");
+      expect(result.message).toMatch(/^skipped:authority-changed: TEA-Core\/paperclip#1210 — /);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+    });
+
+    it("ignores another company's project-workspace row when deciding the project's default refs", async () => {
+      await seedOwnWorkspace();
+      const other = await insertCompanyWithProject("OTH");
+      await db.insert(projectWorkspaces).values({
+        id: randomUUID(), companyId: other.companyId, projectId, name: "foreign", repoUrl: REPO_URL, defaultRef: OWN_BRANCH,
+      });
+      await mentionPr();
+      await expectArmed();
     });
   },
 );

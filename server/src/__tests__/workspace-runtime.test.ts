@@ -13953,6 +13953,44 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
     ).toBe(false);
   });
 
+  // SUP-24409 (RA on PR 1214): a card's workspace row names the branch the arm-time owner fallback
+  // trusts, so exact-branch realization refuses the fork's fold branch and the repo's default refs.
+  const protectedBranchRefusal = (requestedExistingBranch: string) => ({
+    code: "workspace_validation_failed",
+    resultJson: {
+      workspaceValidation: expect.objectContaining({ reason: "existing_branch_is_protected", requestedExistingBranch }),
+    },
+  });
+
+  it("refuses to attach the fork's fold branch and creates no worktree", async () => {
+    const repoRoot = await createTempRepo();
+    await createBranchWithCommit(repoRoot, "fold/tea-patches-v2026.722.0", "fold.txt");
+
+    await expect(realizeExistingBranch(repoRoot, "fold/tea-patches-v2026.722.0"))
+      .rejects.toMatchObject(protectedBranchRefusal("fold/tea-patches-v2026.722.0"));
+    expect(existsSync(path.join(repoRoot, ".paperclip", "worktrees", "fold"))).toBe(false);
+  });
+
+  it("refuses to attach the remote's default branch", async () => {
+    const { repoRoot } = await createTempRepoWithRemote("trunk");
+    await runGit(repoRoot, ["remote", "set-head", "origin", "trunk"]);
+    await runGit(repoRoot, ["checkout", "-b", "work"]);
+
+    await expect(realizeExistingBranch(repoRoot, "trunk")).rejects.toMatchObject(protectedBranchRefusal("trunk"));
+  });
+
+  it("refuses to attach the project workspace's repo ref", async () => {
+    const repoRoot = await createTempRepo();
+    await createBranchWithCommit(repoRoot, "develop", "develop.txt");
+
+    await expect(realizeExecutionWorkspace({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "develop" },
+      config: { workspaceStrategy: { type: "git_worktree", existingBranch: "develop" } },
+      issue: { id: "issue-pr-prep", identifier: "PAP-9001", title: "Prepare pull request for an existing branch" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    })).rejects.toMatchObject(protectedBranchRefusal("develop"));
+  });
+
   it("fails closed instead of reconciling when the managed worktree path holds another branch", async () => {
     const repoRoot = await createTempRepo();
     const branchTip = await createBranchWithCommit(repoRoot, "feature/pinned", "pinned.txt");

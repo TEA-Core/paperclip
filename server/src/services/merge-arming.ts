@@ -24,7 +24,7 @@ import {
   resolveGitHubTokenForRepo,
   type GitHubTokenResolution,
 } from "./github-credential.js";
-import { inheritedExecutionWorkspaceBranchExempt } from "./execution-workspace-policy.js";
+import { inheritedExecutionWorkspaceBranchExempt, isProtectedDeliveryBranch } from "./execution-workspace-policy.js";
 import { isValidGitBranchName } from "./execution-workspace-branch-ownership.js";
 import { isStrictAncestorIssueIdOf } from "./issues.js";
 import {
@@ -5731,8 +5731,20 @@ export async function postPullRequestComment(
  */
 export async function computeAuthorityFingerprint(db: Db, companyId: string, issueId: string, headSha?: string | null): Promise<string> {
   const [row] = await db
-    .select({ status: issues.status, executionPolicy: issues.executionPolicy, executionState: issues.executionState })
+    .select({
+      status: issues.status,
+      executionPolicy: issues.executionPolicy,
+      executionState: issues.executionState,
+      // SUP-24409 (RA on PR 1214): the delivery-workspace binding is part of the authority. The arm-time
+      // owner fallback trusts the bound row's repo and branch, so a rebind (or an edit of that row's
+      // repo, branch or owner) between the guard's baseline and the enable call must stop the arm.
+      workspaceId: issues.executionWorkspaceId,
+      workspaceRepoUrl: executionWorkspaces.repoUrl,
+      workspaceBranch: executionWorkspaces.branchName,
+      workspaceSourceIssueId: executionWorkspaces.sourceIssueId,
+    })
     .from(issues)
+    .leftJoin(executionWorkspaces, eq(executionWorkspaces.id, issues.executionWorkspaceId))
     .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
     .limit(1);
   if (!row) return "missing";
@@ -5795,6 +5807,7 @@ export async function computeAuthorityFingerprint(db: Db, companyId: string, iss
     decisions,
     agentStanding,
     memberRows,
+    [row.workspaceId, row.workspaceRepoUrl, row.workspaceBranch, row.workspaceSourceIssueId],
   ]);
 }
 
@@ -5889,58 +5902,80 @@ export async function createAuthorityGuard(
       if (standing) return standing;
       return (await computeAuthorityFingerprint(db, companyId, issueId, options.headSha)) === baseline
         ? null
-        : "the card's approval record, its decisions or a decider's standing changed";
+        : "the card's approval record, its decisions, a decider's standing or its delivery workspace binding changed";
     },
   };
 }
 
 /**
  * SUP-24409: the arm-time form of the control-plane ownership fact the mint-time
- * gate already accepts. True only when ALL hold:
- *   - the card's delivery repo (its project repo) resolves;
- *   - the card's OWN execution-workspace row (sourceless or self-sourced, never a
- *     carrier's borrowed row) carries a branch, and the PR head ref IS that branch
- *     (exact; git refs are case-sensitive);
- *   - `isDeliveredByCard` accepts the PR against that repo and branch — the
- *     mint-time predicate itself, which adds the ADR-091 D5 same-repo half; and
- *   - nothing else in the company can claim the branch: no other
- *     execution-workspace row carries it (case-insensitive), and no other issue
- *     binds the card's row while it is sourceless (that issue would own it too).
- * Every accept here is also a mint-time accept: with the card's row present,
- * resolveDeliveryIdentity's branch is that row's branch (a recorded branch must
- * equal it exactly) and its branchIsOwn is this row's. The PR title, the agent's
- * text and the recorded delivery identity are never read. Missing data or doubt
- * returns false, so the caller's textual refusal stands.
+ * gate already accepts. Everything is read from ONE snapshot of the card's current
+ * binding: the execution-workspace row the card is bound to, with that row's repo,
+ * branch and owner read together (RA on PR 1214: reading the repo and the branch in
+ * two queries let a rebind between them pair an old repo with a new branch). True
+ * only when ALL hold:
+ *   - the row is the card's OWN row (sourceless or self-sourced, never a carrier's
+ *     borrowed row) and carries a branch, and its repo resolves;
+ *   - `isDeliveredByCard` accepts the PR against that repo and branch (the mint-time
+ *     predicate itself, with the ADR-091 D5 same-repo half), and the PR head ref IS
+ *     that branch (exact; git refs are case-sensitive);
+ *   - the PR's head repository is that repo (case-insensitive); a fork head with the
+ *     same branch name, or an unknown head repository, refuses;
+ *   - nothing else in the company can claim the branch: no other execution-workspace
+ *     row carries it (case-insensitive), and no other issue binds the card's row while
+ *     it is sourceless (that issue would own it too); and
+ *   - the branch is not protected (`isProtectedDeliveryBranch`): not the fold branch
+ *     family, the row's base ref, or a default/repo ref of the project's workspaces.
+ * Every accept here is also a mint-time accept at the snapshot: resolveDeliveryIdentity
+ * resolves the same row's repo and branch, and its branchIsOwn is this row's. A rebind
+ * after the snapshot changes the authority fingerprint, which stops the arm before the
+ * enable call. The PR title, the agent's text and the recorded delivery identity are
+ * never read. Missing data or doubt returns false, so the caller's textual refusal stands.
  */
 async function isOnOwnExecutionWorkspaceBranch(
   db: Db,
   companyId: string,
   issueId: string,
-  pr: { owner: string; repo: string; headRefName: string | null },
-  deliveryRepo: { owner: string; repo: string } | null,
+  pr: { owner: string; repo: string; headRefName: string | null; headRepoFullName?: string | null },
 ): Promise<boolean> {
-  if (!deliveryRepo) return false;
-  const ownership = await resolveCardDeliveryBranchOwnership(db, companyId, issueId);
-  const branch = ownership.branch;
-  if (!ownership.branchIsOwn || branch === null) return false;
-  if (!isDeliveredByCard(pr, deliveryRepo, branch)) return false;
-  if (pr.headRefName !== branch) return false;
-  const [claim] = await db
-    .select({ id: executionWorkspaces.id })
-    .from(executionWorkspaces)
-    .where(and(
-      eq(executionWorkspaces.companyId, companyId),
-      sql`lower(${executionWorkspaces.branchName}) = lower(${branch})`,
-      sql`(
-        ${executionWorkspaces.id} <> (SELECT i.execution_workspace_id FROM issues i WHERE i.id = ${issueId})
+  const [snapshot] = await db
+    .select({
+      branch: executionWorkspaces.branchName,
+      sourceIssueId: executionWorkspaces.sourceIssueId,
+      repoUrl: executionWorkspaces.repoUrl,
+      baseRef: executionWorkspaces.baseRef,
+      projectId: executionWorkspaces.projectId,
+      claimedElsewhere: sql<boolean>`(
+        EXISTS (
+          SELECT 1 FROM execution_workspaces o
+          WHERE o.company_id = ${companyId}
+            AND lower(o.branch_name) = lower(${executionWorkspaces.branchName})
+            AND o.id <> ${executionWorkspaces.id}
+        )
         OR (
           ${executionWorkspaces.sourceIssueId} IS NULL
           AND EXISTS (SELECT 1 FROM issues x WHERE x.execution_workspace_id = ${executionWorkspaces.id} AND x.id <> ${issueId})
         )
       )`,
-    ))
+    })
+    .from(issues)
+    .innerJoin(executionWorkspaces, eq(executionWorkspaces.id, issues.executionWorkspaceId))
+    .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
     .limit(1);
-  return claim === undefined;
+  if (!snapshot) return false;
+  const branch = snapshot.branch;
+  if (branch === null || (snapshot.sourceIssueId !== null && snapshot.sourceIssueId !== issueId)) return false;
+  const repo = parseRepoUrl(snapshot.repoUrl);
+  if (!repo) return false;
+  if (!isDeliveredByCard(pr, repo, branch)) return false;
+  if (pr.headRefName !== branch) return false;
+  if (pr.headRepoFullName?.toLowerCase() !== `${repo.owner}/${repo.repo}`.toLowerCase()) return false;
+  if (snapshot.claimedElsewhere) return false;
+  const projectRefs = await db
+    .select({ defaultRef: projectWorkspaces.defaultRef, repoRef: projectWorkspaces.repoRef })
+    .from(projectWorkspaces)
+    .where(and(eq(projectWorkspaces.companyId, companyId), eq(projectWorkspaces.projectId, snapshot.projectId)));
+  return !isProtectedDeliveryBranch(branch, [snapshot.baseRef, ...projectRefs.flatMap((ref) => [ref.defaultRef, ref.repoRef])]);
 }
 
 export async function armMergeOnApproval(
@@ -6073,7 +6108,7 @@ export async function armMergeOnApproval(
   // unambiguous execution-workspace branch qualifies; every other shape keeps the
   // textual refusal below.
   if (!ownerRow) {
-    const ownsBranch = await isOnOwnExecutionWorkspaceBranch(db, companyId, issueId, pr, deliveryIdentity.repo);
+    const ownsBranch = await isOnOwnExecutionWorkspaceBranch(db, companyId, issueId, pr);
     [ownerRow] = ownsBranch
       ? await db
         .select({ id: issues.id, executionPolicy: issues.executionPolicy, executionState: issues.executionState })

@@ -74,6 +74,7 @@ import {
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { executionWorkspaceService, readExecutionWorkspaceConfig, type ExecutionWorkspaceBranchReconcileMode } from "./execution-workspaces.js";
 import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
+import { isProtectedDeliveryBranch } from "./execution-workspace-policy.js";
 import { logActivity } from "./activity-log.js";
 import {
   buildDivergenceAlertText,
@@ -5865,6 +5866,24 @@ export async function realizeExecutionWorkspace(input: {
     // The branch must already exist; realization never creates, renames, or
     // resets it, and any mismatch below fails closed instead of falling back
     // to a derived branch or the shared checkout.
+    // SUP-24409 (RA on PR 1214): the attached branch becomes the card's own delivery
+    // branch, which the arm-time owner fallback trusts. The fork's fold branch and the
+    // repo's default refs are never a card's delivery branch.
+    const remoteDefaultBranch = await detectRemoteDefaultBranch(repoRoot);
+    if (isProtectedDeliveryBranch(requestedExistingBranch, [remoteDefaultBranch, input.base.repoRef])) {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Workspace strategy pins existing branch "${requestedExistingBranch}", which is a protected base branch `
+        + "(the fold branch or a default branch of the repository). A card cannot deliver on it; "
+        + "pin the card's own branch instead.",
+        {
+          workspaceValidation: {
+            reason: "existing_branch_is_protected",
+            requestedExistingBranch,
+            remoteDefaultBranch,
+          },
+        },
+      );
+    }
     const existingBranchSha = await runGit(
       ["rev-parse", "--verify", "--quiet", `refs/heads/${requestedExistingBranch}`],
       repoRoot,
