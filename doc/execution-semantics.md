@@ -256,6 +256,14 @@ retry producers retain valid queued intent behind a different running holder;
 a former assignee cannot use a comment retry or a sibling binding to reclaim
 the next stage.
 
+A successor that is already a queued run, not a deferred intent, is not
+promoted. When the previous run's executor finishes its cleanup, Paperclip
+starts the queue of every other agent with a queued run on the same issue,
+using the same queue-start call as the scheduler. Admission still applies the
+agent, budget and scheduling checks, the live-holder deferral and the claim
+fence. A run that they refuse stays queued for the next scheduler pass. A
+failure to start that queue is logged and does not change the settled run.
+
 The existing `reapOrphanedRuns` sweep can also finalize a lost run after its
 process-liveness and controller-ownership checks allow recovery. It marks that
 orphan failed and uses the same release/promotion path unless a process-loss
