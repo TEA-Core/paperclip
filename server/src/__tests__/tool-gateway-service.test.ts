@@ -621,7 +621,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
             if (!armed || table !== toolActionRequests) return builder;
             return {
               set: (values: Parameters<typeof builder.set>[0]) => {
-                if (values.status !== "executing") return builder.set(values);
+                if (!("status" in values) || values.status !== "executing") return builder.set(values);
                 armed = false;
                 return {
                   where: (condition: Parameters<ReturnType<typeof builder.set>["where"]>[0]) => ({
