@@ -2205,6 +2205,9 @@ describe("issue execution policy transitions", () => {
     });
 
     it("drops a self-approval by the return assignee, matched case-insensitively", () => {
+      // The decider is listed on the stage with exactly its recorded letter
+      // case, so stage membership holds; only the case-folded self-approval
+      // exclusion (the stricter direction) can drop it.
       const returnAgentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
       const policy = normalizeIssueExecutionPolicy({
         returnAssigneeAgentId: returnAgentId,
@@ -2213,7 +2216,7 @@ describe("issue execution policy transitions", () => {
             type: "review",
             participants: [
               { type: "agent", agentId: qaAgentId },
-              { type: "agent", agentId: returnAgentId },
+              { type: "agent", agentId: returnAgentId.toUpperCase() },
             ],
           },
         ],
@@ -2224,6 +2227,33 @@ describe("issue execution policy transitions", () => {
           policy,
           decisions: [row({ stageId: review.id, actorAgentId: returnAgentId.toUpperCase() })],
           issue: { assigneeAgentId: otherAgentId },
+        }),
+      ).toEqual([]);
+    });
+
+    it("compares stage membership exactly: a decider that matches a participant only by letter case does not count", () => {
+      const participantId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      const policy = ladder([{ type: "agent", agentId: participantId }]);
+      const [review] = policy.stages;
+      expect(approvedIds({ policy, decisions: [row({ stageId: review.id, actorAgentId: participantId })] })).toEqual([review.id]);
+      expect(
+        approvedIds({ policy, decisions: [row({ stageId: review.id, actorAgentId: participantId.toUpperCase() })] }),
+      ).toEqual([]);
+    });
+
+    it("compares a board stage decision's participant exactly", () => {
+      const participantId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      const policy = ladder([{ type: "agent", agentId: participantId }]);
+      const [review] = policy.stages;
+      const boardReview = row({ id: "board-review", stageId: review.id, actorUserId: boardDeciderUserId });
+      expect(
+        approvedIds({ policy, decisions: [boardReview], board: [["board-review", { type: "agent", agentId: participantId }]] }),
+      ).toEqual([review.id]);
+      expect(
+        approvedIds({
+          policy,
+          decisions: [boardReview],
+          board: [["board-review", { type: "agent", agentId: participantId.toUpperCase() }]],
         }),
       ).toEqual([]);
     });

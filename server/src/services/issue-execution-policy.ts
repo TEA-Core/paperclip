@@ -2767,14 +2767,17 @@ export type DurableApprovalIssue = AssigneeLike & {
  * - a row for a stage the current policy no longer carries proves the policy
  *   was edited after that decision, so no approval counts;
  * - the row's stage type differs from the current stage type;
- * - the row's actor is not a current participant of the stage. A board
- *   stage-decision row (SUP-15805) is checked through the participant it was
- *   recorded for (`boardDecisionParticipants`, keyed by decision id); a user row
- *   that is neither a participant nor a board stage decision does not count;
+ * - the row's actor is not a current participant of the stage. Membership is
+ *   exact (`stageHasParticipant`): an agent id that matches a participant only
+ *   by letter case is not a member. A board stage-decision row (SUP-15805) is
+ *   checked through the participant it was recorded for
+ *   (`boardDecisionParticipants`, keyed by decision id); a user row that is
+ *   neither a participant nor a board stage decision does not count;
  * - the row's actor, or the participant a board stage decision was recorded
  *   for, is a self-approval principal: `resolveSelfApprovalPrincipals`, the
  *   current assignee (the delivery author of the `done`) and the `closer` (the
- *   principal requesting the `done`).
+ *   principal requesting the `done`). Agent ids match here case-insensitively,
+ *   which refuses more.
  * A shrink that removed a stage with no decision row leaves the rows and the
  * policy identical to a legit shorter ladder; this check cannot tell them apart.
  */
@@ -2802,13 +2805,6 @@ export function listCurrentPolicyApprovedStageIds(input: {
     (principal.type === "agent"
       ? [...selfPrincipals.agentIds].some((agentId) => sameAgentId(agentId, principal.agentId))
       : selfPrincipals.userIds.has(principal.userId ?? ""));
-  const isCurrentParticipant = (stage: IssueExecutionStage, principal: IssueExecutionStagePrincipal | null) =>
-    principal !== null &&
-    stage.participants.some((participant) =>
-      principal.type === "agent"
-        ? principalIsAgent(participant, principal.agentId ?? "")
-        : participant.type === "user" && participant.userId === principal.userId,
-    );
 
   const approved: string[] = [];
   for (const [stageId, latest] of latestDecisionPerStage(input.decisions)) {
@@ -2823,7 +2819,7 @@ export function listCurrentPolicyApprovedStageIds(input: {
     const decidedFor = input.boardDecisionParticipants.has(latest.id)
       ? input.boardDecisionParticipants.get(latest.id) ?? null
       : decider;
-    if (isSelf(decidedFor) || !isCurrentParticipant(stage, decidedFor)) continue;
+    if (isSelf(decidedFor) || !stageHasParticipant(stage, decidedFor)) continue;
     approved.push(stageId);
   }
   return approved;

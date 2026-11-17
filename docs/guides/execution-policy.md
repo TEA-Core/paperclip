@@ -133,8 +133,8 @@ interface IssueExecutionDecision {
 Each stage decision is also stored as a row in `issue_execution_decisions`. A reopen (`done` or `cancelled` back to an open status) sets `executionState` to `null`, but the decision rows stay. A `done` request on a card with no active stage (`PATCH /api/issues/:id`, or a recovery-action resolve to `done`) reads these rows. For that request, a stage is decided when its latest decision row is `approved` and that row still holds under the current policy:
 
 - The row's stage type is the stage's current type.
-- The decider is a current participant of the stage. For a board stage decision, the participant that the board decided for must still be a participant of the stage.
-- The decider is not the return assignee, the delivery author, the creator agent, the current assignee, or the user or agent that requests the `done`. For a board stage decision, the participant that the board decided for must not be one of these principals either.
+- The decider is a current participant of the stage. For a board stage decision, the participant that the board decided for must still be a participant of the stage. This membership compare is exact, as for the other membership compares (see the case-fold boundary below): an agent id that matches a participant only by letter case is not a participant.
+- The decider is not the return assignee, the delivery author, the creator agent, the current assignee, or the user or agent that requests the `done`. For a board stage decision, the participant that the board decided for must not be one of these principals either. This check compares agent ids case-insensitively, so it refuses more.
 - No decision row exists for a stage that the policy no longer has. One such row cancels every approval.
 
 A later `changes_requested` row cancels the approval. If a row does not hold, the stage is not decided, and the `done` request arms review again.
