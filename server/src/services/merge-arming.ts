@@ -2642,6 +2642,30 @@ function normalizeCardDeliveryBaseRef(raw: string): string | null {
   return branch;
 }
 
+/**
+ * SUP-22658: true when this card's cached GitHub snapshot of the bound PR
+ * recorded the bound branch as its head ref. The cached `data.headRef` is
+ * written only from GitHub-sourced payloads (the external-object provider
+ * refresh, the connector pull_request events, and delivery-receipt recovery,
+ * which copies the live head ref after verifying it), never from the
+ * agent-asserted delivery record, so it is the control-plane evidence that the
+ * PR was this card's delivery before its head ref changed.
+ */
+async function cachedPullRequestRecordsBoundBranch(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  repo: { owner: string; repo: string },
+  binding: DeliveryBinding,
+): Promise<boolean> {
+  const linked = await resolveLinkedPullRequestsWithState(db, companyId, issueId, { includeDrafts: true });
+  return linked.some((pr) => pr.owner.toLowerCase() === repo.owner.toLowerCase()
+    && pr.repo.toLowerCase() === repo.repo.toLowerCase()
+    && pr.number === binding.prNumber
+    // Git refs are case-sensitive: the cached head ref must equal the bound branch exactly.
+    && pr.headRefName === binding.branch);
+}
+
 async function resolveExactBoundPullRequest(
   db: Db,
   companyId: string,
@@ -2673,6 +2697,7 @@ async function resolveExactBoundPullRequest(
       };
     }
     const closedAndMerged = result.state === "closed" && result.merged === true;
+    let mergedProven = false;
     if (result.open !== true || result.draft === true) {
       // SUP-21513: a MERGED delivery PR whose merge commit is proven on the
       // recorded base branch is a completed delivery, not an unresolved one.
@@ -2706,6 +2731,7 @@ async function resolveExactBoundPullRequest(
               : `recorded delivery identity PR is merged but not proven on its base branch: ${verified.reason}`,
           };
         }
+        mergedProven = true;
       } else {
         return { pr: null, reason: result.draft === true ? "recorded delivery identity PR is a draft" : "recorded delivery identity PR is not open" };
       }
@@ -2716,11 +2742,25 @@ async function resolveExactBoundPullRequest(
         reason: "recorded delivery identity PR is not merged; a delivery without a live control-plane branch (terminal ADR-083 carrier or no execution workspace) is accepted only once its PR is merged and proven on its base branch",
       };
     }
+    // SUP-22658: a merged PR's head ref is not a live delivery branch any more
+    // and can change after merge. The ref mismatch alone does not refuse only
+    // when the merge commit is proven on base, the live head SHA is still
+    // exactly the reviewed head, AND this card's GitHub-sourced cached snapshot
+    // of the same PR recorded the bound branch as its head ref. binding.headSha
+    // and prNumber are writer claims, so the cached ref is what ties the PR to
+    // this card: an unrelated merged PR claimed with its exact head SHA still
+    // refuses. The head-SHA equality below, the fork-head refusal above, and
+    // every open-PR check stay unchanged.
     if (result.headRef !== binding.branch) {
-      return {
-        pr: null,
-        reason: `recorded delivery identity branch ${binding.branch} does not match the bound PR's live branch ${result.headRef ?? "(unreadable)"}`,
-      };
+      const renamedAfterMerge = mergedProven
+        && result.headSha === binding.headSha
+        && await cachedPullRequestRecordsBoundBranch(db, companyId, issueId, repo, binding);
+      if (!renamedAfterMerge) {
+        return {
+          pr: null,
+          reason: `recorded delivery identity branch ${binding.branch} does not match the bound PR's live branch ${result.headRef ?? "(unreadable)"}`,
+        };
+      }
     }
     if (result.headSha !== binding.headSha) {
       return {

@@ -2095,6 +2095,188 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
     });
   });
 
+  // SUP-22658: a proven-merged recorded delivery PR whose live head REF no
+  // longer equals the recorded branch (renamed or unreadable after merge) is
+  // accepted only when the live head SHA is still exactly the reviewed head.
+  // The decision head stays the reviewed head, never the merge commit. A moved
+  // head, a fork head repo, an unproven merge, closed-unmerged and draft PRs
+  // keep refusing.
+  describe("SUP-22658 merged recorded delivery PR with a renamed or unreadable head ref", () => {
+    const MERGE_SHA = "mergec000000000000000000000000000000000001";
+    const COMPARE_URL = `https://api.github.com/repos/${OWNER}/${REPO}/compare/main...${MERGE_SHA}`;
+    const PROVEN = { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } };
+
+    function livePr(overrides: { ref?: string | null; sha?: string; repo?: string | null; state?: string; merged?: boolean; draft?: boolean } = {}) {
+      const head: Record<string, unknown> = { sha: overrides.sha ?? APPROVED_HEAD };
+      if (overrides.ref !== null) head.ref = overrides.ref ?? "SUP-42-renamed-after-merge";
+      if (overrides.repo !== null) head.repo = { full_name: overrides.repo ?? `${OWNER}/${REPO}` };
+      return {
+        state: overrides.state ?? "closed",
+        draft: overrides.draft ?? false,
+        merged: overrides.merged ?? true,
+        title: "Fix thing (SUP-42)",
+        merge_commit_sha: MERGE_SHA,
+        base: { ref: "main" },
+        head,
+      };
+    }
+
+    // The card's cached GitHub snapshot of PR 42 (the control-plane record the
+    // exemption requires) records `cachedHeadRef` as the PR's head ref; null
+    // links no cached PR row at all.
+    async function insertBoundCard(cachedHeadRef: string | null = "SUP-42-branch") {
+      const issueId = await insertIssue({
+        delivery: {
+          repo: { owner: OWNER, repo: REPO },
+          prNumber: 42,
+          prUrl: `https://github.com/${OWNER}/${REPO}/pull/42`,
+          branch: "SUP-42-branch",
+          headSha: APPROVED_HEAD,
+        },
+      });
+      if (cachedHeadRef !== null) {
+        await insertMention(issueId, { state: "closed", headRefName: cachedHeadRef, headSha: APPROVED_HEAD });
+      }
+      return issueId;
+    }
+
+    it("(i) resolves the REVIEWED head when the merged PR's head ref was renamed and its head SHA is unchanged", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([{ url: PR_URL, body: livePr() }, PROVEN]);
+
+      const decision = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(decision).toMatchObject({ kind: "resolved", headSha: APPROVED_HEAD, displayName: `${OWNER}/${REPO}#42` });
+
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight).toMatchObject({ kind: "resolved", headSha: APPROVED_HEAD });
+      if (preflight.kind === "resolved") expect(preflight.headSha).not.toBe(MERGE_SHA);
+    });
+
+    // An unreadable head ref or an absent head repo is admitted at decision
+    // time; the final preflight's live schema still requires both fields, so it
+    // keeps refusing head_unverifiable exactly as at base.
+    it("(i) resolves the REVIEWED head at decision time when the merged PR's head ref is unreadable", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([{ url: PR_URL, body: livePr({ ref: null }) }, PROVEN]);
+
+      const decision = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(decision).toMatchObject({ kind: "resolved", headSha: APPROVED_HEAD });
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight).toMatchObject({ kind: "unresolvable", reason: "head_unverifiable: incomplete live PR response" });
+    });
+
+    it("(i) resolves the REVIEWED head at decision time when the renamed merged PR's head repo is absent", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([{ url: PR_URL, body: livePr({ repo: null }) }, PROVEN]);
+
+      const decision = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(decision).toMatchObject({ kind: "resolved", headSha: APPROVED_HEAD });
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight).toMatchObject({ kind: "unresolvable", reason: "head_unverifiable: incomplete live PR response" });
+    });
+
+    it("(ii) still refuses delivery_identity_unresolved when the merged PR's head SHA moved (same ref)", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([{ url: PR_URL, body: livePr({ ref: "SUP-42-branch", sha: LIVE_HEAD }) }, PROVEN]);
+
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight.kind).toBe("unresolvable");
+      if (preflight.kind === "unresolvable") {
+        expect(preflight.reason).toMatch(/^delivery_identity_unresolved:/);
+        expect(preflight.reason).toContain(`does not match the bound PR's current head ${LIVE_HEAD}`);
+      }
+    });
+
+    it("(ii) still refuses delivery_identity_unresolved when the merged PR's head SHA moved and its ref was renamed", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([{ url: PR_URL, body: livePr({ sha: LIVE_HEAD }) }, PROVEN]);
+
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight.kind).toBe("unresolvable");
+      if (preflight.kind === "unresolvable") expect(preflight.reason).toMatch(/^delivery_identity_unresolved:/);
+    });
+
+    it("(iii) still refuses an unrelated merged PR claimed through an own-branch binding with a different head", async () => {
+      const issueId = await insertBoundCard("SUP-99-unrelated");
+      installRoutes([{ url: PR_URL, body: livePr({ ref: "SUP-99-unrelated", sha: LIVE_HEAD }) }, PROVEN]);
+
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight.kind).toBe("unresolvable");
+      if (preflight.kind === "unresolvable") expect(preflight.reason).toMatch(/^delivery_identity_unresolved:/);
+    });
+
+    it("(iii) still refuses an unrelated merged PR whose exact head SHA the own-branch binding claims", async () => {
+      const issueId = await insertBoundCard("SUP-99-unrelated");
+      installRoutes([{ url: PR_URL, body: livePr({ ref: "SUP-99-unrelated" }) }, PROVEN]);
+
+      const decision = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(decision.kind).toBe("unresolvable");
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight.kind).toBe("unresolvable");
+      if (preflight.kind === "unresolvable") {
+        expect(preflight.reason).toContain("does not match the bound PR's live branch SUP-99-unrelated");
+      }
+    });
+
+    it("still refuses a renamed same-head merged PR the card holds no cached snapshot of", async () => {
+      const issueId = await insertBoundCard(null);
+      installRoutes([{ url: PR_URL, body: livePr() }, PROVEN]);
+
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight.kind).toBe("unresolvable");
+      if (preflight.kind === "unresolvable") expect(preflight.reason).toMatch(/^delivery_identity_unresolved:/);
+    });
+
+    it("(iv) still refuses a proven-merged same-head PR whose head repo is a fork", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([{ url: PR_URL, body: livePr({ repo: "fork-owner/fork-repo" }) }, PROVEN]);
+
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight.kind).toBe("unresolvable");
+      if (preflight.kind === "unresolvable") {
+        expect(preflight.reason).toContain("recorded delivery identity PR head belongs to fork-owner/fork-repo");
+      }
+    });
+
+    it("(v) still refuses a renamed-ref merged PR whose merge commit is not proven on base", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([{ url: PR_URL, body: livePr() }, { url: COMPARE_URL, body: { status: "ahead", ahead_by: 2 } }]);
+
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight.kind).toBe("unresolvable");
+      if (preflight.kind === "unresolvable") expect(preflight.reason).toContain("merged but not proven on its base branch");
+    });
+
+    it("(v) still refuses a renamed-ref closed-UNMERGED PR", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([{ url: PR_URL, body: livePr({ merged: false }) }, PROVEN]);
+
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight.kind).toBe("unresolvable");
+      if (preflight.kind === "unresolvable") expect(preflight.reason).toContain("recorded delivery identity PR is not open");
+    });
+
+    it("(v) still refuses a renamed-ref draft PR", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([{ url: PR_URL, body: livePr({ state: "open", merged: false, draft: true }) }, PROVEN]);
+
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight.kind).toBe("unresolvable");
+      if (preflight.kind === "unresolvable") expect(preflight.reason).toContain("recorded delivery identity PR is a draft");
+    });
+
+    it("still refuses an OPEN PR whose head ref differs from the recorded branch", async () => {
+      const issueId = await insertBoundCard();
+      installRoutes([{ url: PR_URL, body: livePr({ state: "open", merged: false }) }]);
+
+      const preflight = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+      expect(preflight.kind).toBe("unresolvable");
+      if (preflight.kind === "unresolvable") {
+        expect(preflight.reason).toContain("does not match the bound PR's live branch SUP-42-renamed-after-merge");
+      }
+    });
+  });
+
   // SUP-22346: the carrier PR can merge out-of-band between final review and
   // the close. The merged PR is cached closed, so every open-PR resolver
   // (cached mentions, live workspace discovery) legitimately returns nothing
