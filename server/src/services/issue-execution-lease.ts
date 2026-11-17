@@ -89,10 +89,15 @@ export async function resolveLiveExecutionLeases(
   return leases;
 }
 
+/** A silent author holds a card for at most the no-output hard-stop window. */
+export const ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS = 90 * 60 * 1000;
+
 /**
  * SUP-20121: `runId` created the `issues` row in scope (`originRunId`) or
- * assigned it to its current assignee (its `issue.updated` activity names that
- * assignee). Callers add the agent and issue-scope conditions.
+ * changed its assignee to the current assignee (its `issue.updated` activity
+ * records an `assigneeAgentId` change to that assignee). A write that only
+ * names the current assignee, with no change, is not proof. Callers add the
+ * agent and issue-scope conditions.
  */
 function runAuthoredIssueAssignment(runId: SQLWrapper | string): SQL {
   return sql`(
@@ -104,7 +109,7 @@ function runAuthoredIssueAssignment(runId: SQLWrapper | string): SQL {
         and ${activityLog.entityType} = 'issue'
         and ${activityLog.entityId} = ${issues.id}::text
         and ${activityLog.action} = 'issue.updated'
-        and ${activityLog.details} ->> 'assigneeAgentId' = ${issues.assigneeAgentId}::text
+        and ${activityLog.details} -> 'changes' -> 'assigneeAgentId' ->> 'to' = ${issues.assigneeAgentId}::text
     )
   )`;
 }
@@ -116,9 +121,9 @@ function runAuthoredIssueAssignment(runId: SQLWrapper | string): SQL {
  * Do not exclude the caller: its running issuer must win over an older queue.
  *
  * SUP-20121: a running run of the card's assignee that has no issue scope of
- * its own also owns the card when it created it (`originRunId`) or assigned
- * it to its own agent (its `issue.updated` activity names the current
- * assignee). Neither pointer is set for such a run, so without this term every
+ * its own also owns the card when it created it (`originRunId`) or changed
+ * the assignee to its own agent (its `issue.updated` activity records that
+ * change), and it has not been silent past the bound above. Neither pointer is set for such a run, so without this term every
  * start gate saw the card as unowned and started a second run of the same
  * agent, which took the checkout and locked the author out of its own card.
  * A run whose context names another issue is not included (SUP-16052).
@@ -149,6 +154,7 @@ export async function findLiveIssueExecutionHolder(
           eq(heartbeatRuns.status, "running"),
           eq(heartbeatRuns.agentId, issues.assigneeAgentId),
           sql`nullif(btrim(${heartbeatRuns.contextSnapshot} ->> 'issueId'), '') is null`,
+          sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) > clock_timestamp() - interval '90 minutes'`,
           runAuthoredIssueAssignment(heartbeatRuns.id),
         ),
       ),

@@ -10806,6 +10806,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // instance-level dispatch suppression that skipped the wake has cleared.
     resolveSchedulingSuppression: getSchedulingSuppression,
     settleExplicitContinuationRetry: releaseIssueExecutionAndPromote,
+    promoteDeferredWakesAfterLockClear: (run, issueId) =>
+      releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true }, issueId),
     scheduleRecoveryRetry: async (runId) => {
       const [run] = await db
         .select()

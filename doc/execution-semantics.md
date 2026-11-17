@@ -205,15 +205,18 @@ assignment that does not set `in_progress`, and a claim from a run scoped to a
 different issue still wake the assignee.
 
 A `running` run whose context names no issue also owns a card it created
-(`originRunId`) or assigned to its own agent (its `issue.updated` activity names
-the current assignee), as long as that agent is still the assignee. Every
+(`originRunId`) or reassigned to its own agent (its `issue.updated` activity
+records an `assigneeAgentId` change to that agent; a write that only names the
+current assignee is not proof), as long as that agent is still the assignee and
+the run has not been silent for 90 minutes. Every
 execution gate treats that run as the card's live holder: a wake for the same
 agent on the card (assignment, monitor, comment, stage, recovery) is held behind
 it instead of starting a second run, the run is stamped as the card's execution
 holder, a queued run for the card is not claimed, and checkout by another run is
 refused. A held wake is never merged into that run, because merging would scope
 the run to the card. Held wakes are promoted when the run finishes, including
-wakes on cards whose lock a status write cleared while the run was live. Wakes
+wakes on cards whose lock a status write cleared while the run was live, and
+when the silent-run hard-stop or the stale-lock sweep clears the lock. Wakes
 for a different agent, and wakes after the run has finished, start normally. A
 run whose context names a different issue does not own the cards it creates or
 assigns.

@@ -447,4 +447,140 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     expect(own.status, JSON.stringify(own.body)).toBe(201);
     expect(await cardRow(issueId)).toMatchObject({ checkoutRunId: writerRunId, executionRunId: writerRunId });
   });
+
+  it("an echo-assignee PATCH by a board-assigned agent does not create the hold", async () => {
+    const { companyId, issuePrefix, writerAgentId, writerRunId } = await seed();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Board-assigned card",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: writerAgentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    const writer = appFor(agentActor(companyId, writerAgentId, writerRunId));
+
+    // The assignee field is present but equal to the current assignee: the
+    // PATCH changed no assignee, so it must not prove this run assigned the card.
+    const echo = await request(writer).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: writerAgentId });
+    expect(echo.status, JSON.stringify(echo.body)).toBe(200);
+
+    await heartbeat.wakeup(writerAgentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "board_wake",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "board_wake" },
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+    });
+
+    await vi.waitFor(
+      async () => {
+        expect(await wakesForCard(issueId, writerAgentId)).not.toEqual([]);
+      },
+      { timeout: WAKE_SETTLE_MS * 2, interval: 50 },
+    );
+    await sleep(WAKE_SETTLE_MS);
+    const wakes = await wakesForCard(issueId, writerAgentId);
+    expect(wakes.map((wake) => wake.status)).not.toContain("deferred_issue_execution");
+    expect((await cardRow(issueId)).executionRunId).not.toBe(writerRunId);
+  });
+
+  it("a silent author past the output bound does not hold the card", async () => {
+    const { companyId, writerAgentId, writerRunId } = await seed();
+    const staleAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await db.update(heartbeatRuns)
+      .set({ startedAt: staleAt, createdAt: staleAt, lastOutputAt: null })
+      .where(eq(heartbeatRuns.id, writerRunId));
+    const created = await request(appFor(agentActor(companyId, writerAgentId, writerRunId)))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Stale author card", status: "in_progress", assigneeAgentId: writerAgentId });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    const issueId = created.body.id as string;
+
+    const comment = await request(appFor(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Board wake." });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+
+    await vi.waitFor(
+      async () => {
+        expect(await otherRunsForCard(issueId, writerAgentId, writerRunId)).toHaveLength(1);
+      },
+      { timeout: WAKE_SETTLE_MS * 2, interval: 50 },
+    );
+    expect((await cardRow(issueId)).executionRunId).not.toBe(writerRunId);
+  });
+
+  async function seedHeldCard(opts: { authorStatus: string }) {
+    const seeded = await seed();
+    const { companyId, issuePrefix, writerAgentId, writerRunId } = seeded;
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Held card",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: writerAgentId,
+      executionRunId: writerRunId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    await db.update(heartbeatRuns)
+      .set({ status: opts.authorStatus, finishedAt: opts.authorStatus === "running" ? null : new Date() })
+      .where(eq(heartbeatRuns.id, writerRunId));
+    const wakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeId,
+      companyId,
+      agentId: writerAgentId,
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "issue_commented",
+      payload: { issueId },
+      status: "deferred_issue_execution",
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+    });
+    return { ...seeded, issueId, wakeId };
+  }
+
+  it("the stale-lock sweep promotes the held wake when it clears the lock", async () => {
+    const { writerAgentId, writerRunId, issueId, wakeId } = await seedHeldCard({ authorStatus: "failed" });
+    runningProcesses.delete(writerRunId);
+
+    const result = await heartbeat.sweepStaleIssueLocks();
+    expect(result.cleared).toBe(1);
+
+    const successors = await otherRunsForCard(issueId, writerAgentId, writerRunId);
+    expect(successors).toHaveLength(1);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(wake?.status).not.toBe("deferred_issue_execution");
+    expect(wake?.runId).toBe(successors[0]!.id);
+  });
+
+  it("the silent-run hard-stop promotes the held wake when it clears the lock", async () => {
+    const { companyId, writerAgentId, writerRunId, issueId, wakeId } = await seedHeldCard({ authorStatus: "running" });
+    await db.update(agents).set({ adapterType: "codex_local" }).where(eq(agents.id, writerAgentId));
+    const startedAt = new Date(Date.now() - 91 * 60 * 1000);
+    await db.update(heartbeatRuns)
+      .set({ processStartedAt: startedAt, processPid: 2_000_000_000, lastOutputAt: null, startedAt })
+      .where(eq(heartbeatRuns.id, writerRunId));
+    runningProcesses.delete(writerRunId);
+
+    const result = await heartbeat.scanTerminableSilentActiveRuns({ now: new Date(), companyId });
+    expect(result.terminated).toBe(1);
+
+    const successors = await otherRunsForCard(issueId, writerAgentId, writerRunId);
+    expect(successors).toHaveLength(1);
+    expect((await cardRow(issueId)).executionRunId).toBe(successors[0]!.id);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(wake?.status).not.toBe("deferred_issue_execution");
+    expect(wake?.runId).toBe(successors[0]!.id);
+  });
 });

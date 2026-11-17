@@ -206,6 +206,7 @@ import {
   type ContinuationPathDisjuncts,
 } from "../issue-continuation-path.js";
 import {
+  listUnlockedIssuesWithDeferredWakesForRun,
   resolveLiveExecutionLeases,
   type LiveExecutionLease,
 } from "../issue-execution-lease.js";
@@ -1575,6 +1576,11 @@ export function recoveryService(
     ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
     /** Settle retained explicit retry claims through the queue-first release policy. */
     settleExplicitContinuationRetry?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>;
+    /** Promote wakes held behind a run on one card after its lock is cleared. */
+    promoteDeferredWakesAfterLockClear?: (
+      run: typeof heartbeatRuns.$inferSelect,
+      issueId: string,
+    ) => Promise<void>;
     /**
      * Whether a failed or interrupted run has consumed every bounded
      * transient retry, so `scheduleRecoveryRetry` can no longer produce a
@@ -3492,6 +3498,20 @@ export function recoveryService(
     return result;
   }
 
+  async function promoteDeferredWakesAfterLockClear(
+    run: typeof heartbeatRuns.$inferSelect,
+    issueIds: string[],
+  ) {
+    if (!deps.promoteDeferredWakesAfterLockClear) return;
+    for (const issueId of issueIds) {
+      try {
+        await deps.promoteDeferredWakesAfterLockClear(run, issueId);
+      } catch (err) {
+        logger.error({ err, runId: run.id, issueId }, "failed to promote wakes held behind a cleared lock");
+      }
+    }
+  }
+
   async function terminateSilentActiveRun(input: {
     run: typeof heartbeatRuns.$inferSelect;
     cleanup: Awaited<ReturnType<typeof cleanupSourceResolvedRunProcess>>;
@@ -3511,6 +3531,7 @@ export function recoveryService(
       },
     };
 
+    let clearedIssueIds: string[] = [];
     const finalizedRun = await db.transaction(async (tx) => {
       const [updatedRun] = await tx
         .update(heartbeatRuns)
@@ -3549,7 +3570,7 @@ export function recoveryService(
           );
       }
 
-      await tx
+      clearedIssueIds = await tx
         .update(issues)
         .set({
           executionRunId: null,
@@ -3557,7 +3578,9 @@ export function recoveryService(
           executionLockedAt: null,
           updatedAt: input.now,
         })
-        .where(and(eq(issues.companyId, input.run.companyId), eq(issues.executionRunId, input.run.id)));
+        .where(and(eq(issues.companyId, input.run.companyId), eq(issues.executionRunId, input.run.id)))
+        .returning({ id: issues.id })
+        .then((rows) => rows.map((row) => row.id));
 
       await tx.insert(heartbeatRunWatchdogDecisions).values({
         companyId: input.run.companyId,
@@ -3601,6 +3624,23 @@ export function recoveryService(
     // wedged child is not a reason to make the agent need manual clearing before
     // it can take new work. Paused/terminated agents are left as they are.
     await finalizeAgentAfterSourceResolvedRun(finalizedRun, "cancelled");
+    // This hard-stop clears the lock itself, so the normal release never
+    // promotes the wakes held behind the run. Promote them here.
+    const promotionIssueIds = [...clearedIssueIds];
+    if (!issueIdFromRunContext(finalizedRun.contextSnapshot)) {
+      const unlockedIssueIds = await listUnlockedIssuesWithDeferredWakesForRun(db, {
+        companyId: finalizedRun.companyId,
+        runId: finalizedRun.id,
+        agentId: finalizedRun.agentId,
+      }).catch((err) => {
+        logger.error({ err, runId: finalizedRun.id }, "failed to list cards held behind a terminated silent run");
+        return [] as string[];
+      });
+      for (const issueId of unlockedIssueIds) {
+        if (!promotionIssueIds.includes(issueId)) promotionIssueIds.push(issueId);
+      }
+    }
+    await promoteDeferredWakesAfterLockClear(finalizedRun, promotionIssueIds);
     return true;
   }
 
@@ -9582,6 +9622,17 @@ export function recoveryService(
           referencedRunStatuses: Object.fromEntries(runStatusById),
         },
       });
+
+      // This sweep clears the lock itself, so the normal release never
+      // promotes the wakes held behind the cleared run. Promote them here.
+      const clearedRun = (issue.executionRunId ? runById.get(issue.executionRunId) : undefined)
+        ?? (issue.checkoutRunId ? runById.get(issue.checkoutRunId) : undefined);
+      if (clearedRun) {
+        await promoteDeferredWakesAfterLockClear(
+          { ...clearedRun, status: runStatusById.get(clearedRun.id) ?? clearedRun.status },
+          [updated.id],
+        );
+      }
       });
     }
 
