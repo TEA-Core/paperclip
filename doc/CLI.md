@@ -567,7 +567,7 @@ npx paperclipai agent instructions-file:put <agent-id> --path AGENTS.md --conten
 npx paperclipai agent instructions-file:delete <agent-id> --path AGENTS.md
 ```
 
-`permissions:update` requires `canCreateAgents`. `canAssignTasks` is optional: omit it, or send the agent's current `access.canAssignTasks` value, to leave its task-assignment grant untouched. Only a different value writes or removes the `tasks:assign` grant.
+`permissions:update` requires `canCreateAgents`. `canAssignTasks` is optional. Omit it to leave the agent's `tasks:assign` grant and membership unchanged; omission is the only unconditional way to do that. When you send `canAssignTasks`, the server compares it with the value the agent will have after this update (with the new `canCreateAgents` and the current grant and membership), not with the old `access.canAssignTasks`. A different value writes or removes the grant. For example, turning `canCreateAgents` off with `canAssignTasks: true` on an agent with a suspended membership and no grant writes the grant. A `false` value also removes a stored grant on an agent that has no membership.
 
 Agent config, instructions, skills, project env, environment, secret, and workspace edits affect the next run. Active runs finish with the config they started with. When a saved session, reused workspace, or sandbox lease no longer matches the effective next-run config, Paperclip may start fresh execution and records non-sensitive freshness categories in run result JSON and workspace operation logs.
 

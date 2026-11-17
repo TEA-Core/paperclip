@@ -341,7 +341,106 @@ describeEmbeddedPostgres("PATCH /agents/:id/permissions task-assign grant handli
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.access).toMatchObject({ canAssignTasks: true, taskAssignSource: "simple_default" });
     const [activity] = await readPermissionsActivity(db, agent.id);
-    expect(activity?.details).toMatchObject({ canAssignTasks: true, canCreateAgents: false });
+    expect(activity?.details).toMatchObject({
+      canAssignTasks: true,
+      requestedCanAssignTasks: false,
+      canCreateAgents: false,
+    });
+  });
+
+  it("records an omitted canAssignTasks as null beside the derived value", async () => {
+    const { agent } = await seedTarget(db);
+    const app = createApp(db, boardActor());
+
+    const res = await patchPermissions(app, agent.id, { canCreateAgents: false, canCreateSkills: false });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [activity] = await readPermissionsActivity(db, agent.id);
+    expect(activity?.details).toMatchObject({ canAssignTasks: true, requestedCanAssignTasks: null });
+  });
+
+  it("revokes a stored grant on an agent without a membership row, as before", async () => {
+    const { company, agent } = await seedTarget(db, { membershipStatus: null, explicitGrant: true });
+    const app = createApp(db, boardActor());
+
+    const res = await patchPermissions(app, agent.id, {
+      canCreateAgents: false,
+      canCreateSkills: false,
+      canAssignTasks: false,
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await readTaskAssignGrants(db, company.id, agent.id)).toEqual([]);
+    expect((await readMembership(db, company.id, agent.id))?.status).toBe("active");
+    expect((await readStoredPermissions(db, agent.id)).canAssignTasks).toBe(false);
+  });
+
+  it("leaves a stored grant on an agent without a membership row untouched when canAssignTasks is omitted", async () => {
+    const { company, agent } = await seedTarget(db, { membershipStatus: null, explicitGrant: true });
+    const before = await readTaskAssignGrants(db, company.id, agent.id);
+    const app = createApp(db, boardActor());
+
+    const res = await patchPermissions(app, agent.id, { canCreateAgents: false, canCreateSkills: false });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await readTaskAssignGrants(db, company.id, agent.id)).toEqual(before);
+    expect(await readMembership(db, company.id, agent.id)).toBeNull();
+  });
+
+  it("serializes concurrent permission updates so the grant always matches one sequential order", async () => {
+    // A turns creator on (grant written true); B turns it off and revokes.
+    // In either sequential order the final grant exists exactly when the final
+    // canCreateAgents is true. Without a membership row, B alone projects
+    // "none" and skips its write, so a B that decided before A committed would
+    // keep A's grant under B's canCreateAgents=false.
+    for (const membershipStatus of ["active", null] as const) {
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const { company, agent } = await seedTarget(db, { membershipStatus });
+        const app = createApp(db, boardActor());
+
+        const [a, b] = await Promise.all([
+          patchPermissions(app, agent.id, { canCreateAgents: true, canAssignTasks: false }),
+          patchPermissions(app, agent.id, { canCreateAgents: false, canAssignTasks: false }),
+        ]);
+
+        expect(a.status, JSON.stringify(a.body)).toBe(200);
+        expect(b.status, JSON.stringify(b.body)).toBe(200);
+        const stored = await readStoredPermissions(db, agent.id);
+        const grants = await readTaskAssignGrants(db, company.id, agent.id);
+        expect({ membershipStatus, attempt, creator: stored.canCreateAgents, grant: grants.length === 1 })
+          .toEqual({ membershipStatus, attempt, creator: stored.canCreateAgents, grant: stored.canCreateAgents === true });
+      }
+    }
+  }, 240_000);
+
+  it("does not create a membership when a false request meets only unrelated grants", async () => {
+    const { company, agent } = await seedTarget(db, { membershipStatus: null });
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: agent.id,
+      permissionKey: "agents:create",
+    });
+    const app = createApp(db, boardActor());
+
+    const res = await patchPermissions(app, agent.id, { canCreateAgents: false, canAssignTasks: false });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.access).toMatchObject({ canAssignTasks: false, taskAssignSource: "none" });
+    expect(await readMembership(db, company.id, agent.id)).toBeNull();
+  });
+
+  it("rejects an agent actor whose agent row belongs to another company", async () => {
+    const { company, agent } = await seedTarget(db);
+    const other = await seedTarget(db, { role: "ceo" });
+    const app = createApp(db, agentActor(company.id, other.agent.id));
+
+    const res = await patchPermissions(app, agent.id, { canCreateAgents: true, canAssignTasks: true });
+
+    expect(res.status).toBe(403);
+    expect(await readStoredPermissions(db, agent.id)).toMatchObject({ canCreateAgents: false });
+    expect(await readTaskAssignGrants(db, company.id, agent.id)).toEqual([]);
+    expect(await readPermissionsActivity(db, agent.id)).toEqual([]);
   });
 
   it("rejects a non-CEO agent actor even when canAssignTasks is omitted", async () => {
