@@ -417,7 +417,7 @@ async function waitForWakeup(assertion: () => void) {
   await vi.waitFor(assertion);
 }
 
-describe.sequential("issue comment reopen routes", () => {
+describe("issue comment reopen routes", () => {
   // `installActor` imports the route module lazily, so without this warm-up the
   // first test pays the one-time transform cost of `routes/issues.js` and its
   // import graph inside vitest's 5s testTimeout. On the loaded serial shard that
@@ -428,7 +428,6 @@ describe.sequential("issue comment reopen routes", () => {
     await import("../routes/issues.js");
     await import("../middleware/index.js");
   });
-
   beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.getById.mockReset();
@@ -1863,7 +1862,7 @@ describe.sequential("issue comment reopen routes", () => {
         authorType: "user",
         authorizationReason: "allow_board_actor",
         clientRequestId: undefined,
-        mirrorToSlack: true,
+        mirrorToSlack: true, boardApiKeyId: null,
         presentation: {
           kind: "system_notice",
           tone: "warning",

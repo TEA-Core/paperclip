@@ -651,4 +651,29 @@ describe("agent auth middleware", () => {
       source: "board_key",
     });
   });
+
+  // SUP-23998 (mutant C-m4): a session lookup that throws (for example a database
+  // outage) must leave the caller unauthenticated, never as a signed-in board user.
+  it.each([
+    ["rejects", async () => { throw new Error("connect timeout"); }],
+    ["resolves no session", async () => null],
+  ])("fails closed when the session lookup %s", async (_name, resolveSession) => {
+    const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
+    const app = express();
+    app.use(actorMiddleware(db, { deploymentMode: "authenticated", resolveSession }));
+    app.get("/actor", (req, res) => {
+      res.json(req.actor);
+    });
+    app.get("/companies/:companyId/protected", (req, res) => {
+      assertCompanyAccess(req, req.params.companyId);
+      res.json({ ok: true });
+    });
+    app.use(errorHandler);
+
+    const actor = await request(app).get("/actor");
+    expect(actor.status).toBe(200);
+    expect(actor.body).toMatchObject({ type: "none" });
+    expect(actor.body.userId).toBeUndefined();
+    expect((await request(app).get(`/companies/${randomUUID()}/protected`)).status).toBeGreaterThanOrEqual(401);
+  });
 });

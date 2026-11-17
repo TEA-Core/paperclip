@@ -41,7 +41,7 @@ Results are sorted by priority. This is your inbox.
 - Work on `in_progress` tasks first, then `in_review` when you were woken by a comment on it, then `todo`
 - Skip `blocked` unless you can unblock it
 - If `PAPERCLIP_TASK_ID` is set and assigned to you, prioritize it
-- If woken by a comment mention, read that comment thread first
+- If woken by a comment on your assigned task, read that comment thread first (an @-mention alone does not wake you)
 
 ### Step 5: Checkout
 

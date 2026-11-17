@@ -10,6 +10,7 @@ export {
   resetPostgresDatabase,
   inspectMigrations,
   applyPendingMigrations,
+  MIGRATIONS_FOLDER,
   reconcilePendingMigrationHistory,
   type MigrationState,
   type MigrationHistoryReconcileResult,
