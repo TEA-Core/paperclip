@@ -97,11 +97,25 @@ const QUEUED_RUN_EXPIRY_ERROR_CODES: Partial<Record<QueuedRunStalenessErrorCode,
 };
 
 /**
- * The canonical form of an issue id. A context issueId in any other shape (a
- * number, padded text, a non-UUID string) cannot name an issue row, and
- * casting it to uuid in a query throws, so callers check it first.
+ * The canonical form of a UUID. The expiry list query only takes an issueId in
+ * exactly this form; a number, padded text, or any other string cannot name an
+ * issue row there.
  */
 const ISSUE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Normalizes an id read from run context before it reaches a uuid comparison.
+ * Postgres also accepts a UUID in braces, in upper case, or without hyphens,
+ * so those forms keep naming their row; any other value returns null instead
+ * of making the query throw `invalid input syntax for type uuid`.
+ */
+function canonicalUuid(value: string | null): string | null {
+  if (!value) return null;
+  const unbraced = value.startsWith("{") && value.endsWith("}") ? value.slice(1, -1) : value;
+  const hex = unbraced.replaceAll("-", "").toLowerCase();
+  if (!/^[0-9a-f]{32}$/.test(hex)) return null;
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 
 type LoadGateFactsInput = {
   conversationContinuation: boolean;
@@ -254,7 +268,7 @@ export function createPostgresRunDispatchAdapter(
         await db.transaction(async (tx) => {
           const typedTx = tx as unknown as Db;
           // A malformed issueId names no issue row; locking by it would throw.
-          const lockableIssueId = hintedIssueId && ISSUE_ID_PATTERN.test(hintedIssueId) ? hintedIssueId : null;
+          const lockableIssueId = canonicalUuid(hintedIssueId);
           if (lockableIssueId || lockCheckoutIssue) {
             await typedTx
               .select({ id: issues.id })
@@ -628,7 +642,8 @@ export function createPostgresRunDispatchAdapter(
       continuationParksExecutor = continuationSummaryParksExecutor(continuationSummaryBody);
     }
 
-    const recoveryActionId = readNonEmptyString(context.recoveryActionId);
+    // A malformed recovery action id names no action; comparing it would throw.
+    const recoveryActionId = canonicalUuid(readNonEmptyString(context.recoveryActionId));
     const isAuthorizedSourceScopedRecovery =
       issue && wakeReason === "source_scoped_recovery_action" && recoveryActionId
         ? await dbOrTx
@@ -938,7 +953,6 @@ export function createPostgresRunDispatchAdapter(
   async function cancelStaleRunInTx(
     tx: Db,
     run: HeartbeatRun,
-    issueId: string | null,
     decision: Extract<ReturnType<typeof decideQueuedRunStaleness>, { stale: true }>,
     expectedStatus: "queued" | "running",
     now: Date,
@@ -990,23 +1004,23 @@ export function createPostgresRunDispatchAdapter(
           );
       }
 
-      if (issueId) {
-        await tx
-          .update(issues)
-          .set({
-            executionRunId: null,
-            executionAgentNameKey: null,
-            executionLockedAt: null,
-            updatedAt: now,
-          })
-          .where(
-            and(
-              eq(issues.companyId, row.companyId),
-              eq(issues.id, issueId),
-              eq(issues.executionRunId, row.id),
-            ),
-          );
-      }
+      // Release every execution lock that names this run. Matching on the run
+      // id, not the context issueId, also covers a run whose context issue
+      // reference is malformed or written in a non-canonical form.
+      await tx
+        .update(issues)
+        .set({
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(issues.companyId, row.companyId),
+            eq(issues.executionRunId, row.id),
+          ),
+        );
 
       await tx
         .update(issues)
@@ -1044,8 +1058,9 @@ export function createPostgresRunDispatchAdapter(
     worktreeExecutionCutoff?: Date | null,
   ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
-    const issueId = readNonEmptyString(contextSnapshot.issueId);
-    if (!issueId) {
+    const rawIssueId = readNonEmptyString(contextSnapshot.issueId);
+    const issueId = canonicalUuid(rawIssueId);
+    if (!rawIssueId) {
       const predatesCutoff =
         worktreeExecutionCutoff && run.createdAt && run.createdAt.getTime() < worktreeExecutionCutoff.getTime();
       return {
@@ -1066,7 +1081,7 @@ export function createPostgresRunDispatchAdapter(
           : { stale: false as const },
       };
     }
-    if (!ISSUE_ID_PATTERN.test(issueId)) {
+    if (!issueId) {
       return {
         issueId: null,
         facts: null,
@@ -1074,7 +1089,7 @@ export function createPostgresRunDispatchAdapter(
           stale: true as const,
           errorCode: "issue_not_found" as const,
           reason: "Cancelled because the run's issue reference is not a valid issue id",
-          details: { issueId },
+          details: { issueId: rawIssueId },
         },
       };
     }
@@ -1127,7 +1142,7 @@ export function createPostgresRunDispatchAdapter(
         }
         return { outcome: "not_stale" as const };
       }
-      return cancelStaleRunInTx(tx, run, issueId, decision, input.expectedStatus, input.now);
+      return cancelStaleRunInTx(tx, run, decision, input.expectedStatus, input.now);
     };
 
     return withIssueThenRunLocks(
@@ -1184,7 +1199,6 @@ export function createPostgresRunDispatchAdapter(
         const cancellation = await cancelStaleRunInTx(
           tx,
           run,
-          issueId,
           decision,
           input.expectedStatus,
           input.now,
@@ -1296,7 +1310,6 @@ export function createPostgresRunDispatchAdapter(
         const cancelled = await cancelStaleRunInTx(
           tx,
           run,
-          issueId,
           decision,
           "queued",
           input.now,

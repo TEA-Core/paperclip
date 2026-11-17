@@ -537,6 +537,98 @@ describeEmbeddedPostgres("heartbeat queued-run age bound", () => {
     expect(listed).toEqual([]);
   });
 
+  it("drains 2,100 older runs whose decision used to throw and reaches the newer stuck run within the stated sweeps", { timeout: 300_000 }, async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const oldest = Date.now() - QUEUED_RUN_BOUND_MS - 48 * HOUR_MS;
+    // Shape 1: a valid issueId with a malformed recovery action id on a
+    // source-scoped recovery wake.
+    const recoveryIssueId = await seedIssue(companyId, agentId, 1);
+    const malformedRecovery = oldQueuedRunRows({
+      companyId, agentId, issueId: recoveryIssueId, count: 1_050, firstCreatedAtMs: oldest,
+    }).map((row) => ({
+      ...row,
+      contextSnapshot: {
+        issueId: recoveryIssueId,
+        wakeReason: "source_scoped_recovery_action",
+        recoveryActionId: "not-a-uuid",
+      },
+    }));
+    // Shape 2: a malformed wake comment id on a conversation issue.
+    const conversationIssueId = await seedIssue(companyId, agentId, 2);
+    await db.update(issues)
+      .set({ conversationAgentId: agentId, conversationUserId: "local-board", conversationState: "active" })
+      .where(eq(issues.id, conversationIssueId));
+    const malformedComment = oldQueuedRunRows({
+      companyId, agentId, issueId: conversationIssueId, count: 1_050, firstCreatedAtMs: oldest + 1_050,
+    }).map((row) => ({ ...row, contextSnapshot: { issueId: conversationIssueId, wakeCommentId: "not-a-uuid" } }));
+    const backlog = [...malformedRecovery, ...malformedComment];
+    for (let i = 0; i < backlog.length; i += 500) {
+      await db.insert(heartbeatRuns).values(backlog.slice(i, i + 500));
+    }
+    const targetIssueId = await seedIssue(companyId, agentId, 3);
+    const target = await seedQueuedLockHolder({
+      companyId,
+      agentId,
+      issueId: targetIssueId,
+      createdAt: new Date(Date.now() - QUEUED_RUN_BOUND_MS - HOUR_MS),
+    });
+    const heartbeat = heartbeatService(db);
+    // The bound for this shape: at most 100 cancellations per sweep, so the
+    // 2,101st run is reached by sweep ceil(2,101 / 100) = 22.
+    let sweeps = 0;
+    while (sweeps < 22 && (await readRun(target.runId)).status === "queued") {
+      await heartbeat.expireStaleQueuedRuns();
+      sweeps += 1;
+    }
+
+    expect((await readRun(target.runId)).status).toBe("cancelled");
+    expect((await readIssueLock(targetIssueId)).executionRunId).toBeNull();
+    const stillQueued = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"));
+    expect(stillQueued).toEqual([]);
+  });
+
+  it.each([
+    { label: "braces", format: (id: string) => `{${id}}` },
+    { label: "no hyphens, upper case", format: (id: string) => id.replaceAll("-", "").toUpperCase() },
+  ])("keeps a fresh run whose issueId names an existing issue in a castable form ($label)", async ({ format }) => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedIssue(companyId, agentId, 1);
+    const [fresh] = oldQueuedRunRows({ companyId, agentId, issueId, count: 1, firstCreatedAtMs: Date.now() })
+      .map((row) => ({ ...row, contextSnapshot: { issueId: format(issueId) } }));
+    await db.insert(heartbeatRuns).values(fresh!);
+
+    const outcome = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+      runId: fresh!.id,
+      companyId,
+      expectedStatus: "queued",
+      now: new Date(),
+    });
+
+    expect(outcome).toEqual({ outcome: "not_stale" });
+    expect((await readRun(fresh!.id)).status).toBe("queued");
+  });
+
+  it("releases the execution lock that names a cancelled run whose issueId is malformed", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedIssue(companyId, agentId, 1);
+    const [poison] = oldQueuedRunRows({ companyId, agentId, issueId, count: 1, firstCreatedAtMs: Date.now() })
+      .map((row) => ({ ...row, contextSnapshot: { issueId: ` ${issueId} ` } }));
+    await db.insert(heartbeatRuns).values(poison!);
+    await db.update(issues).set({ executionRunId: poison!.id, executionLockedAt: new Date() })
+      .where(eq(issues.id, issueId));
+
+    const outcome = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+      runId: poison!.id,
+      companyId,
+      expectedStatus: "queued",
+      now: new Date(),
+    });
+
+    expect(outcome).toMatchObject({ outcome: "cancelled", errorCode: "issue_not_found" });
+    expect(await readIssueLock(issueId)).toEqual({ executionRunId: null, executionLockedAt: null, checkoutRunId: null });
+  });
+
   it("leaves a running run older than the bound untouched", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = await seedIssue(companyId, agentId, 1);

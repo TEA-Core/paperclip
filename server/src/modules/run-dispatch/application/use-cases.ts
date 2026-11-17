@@ -84,6 +84,14 @@ export const MAX_EXPIRY_PAGES_PER_SWEEP = 20;
  * younger queued runs are never selected.
  */
 export function createExpireStaleQueuedRuns(deps: { expiry: QueuedRunExpiry }) {
+  // Where the previous sweep stopped. A sweep that ends at a cap resumes after
+  // the last run it visited, so runs it can only skip (a decision that keeps
+  // throwing) cannot hold the page budget: every listed run is visited within
+  // ceil(listed / 2,000) sweeps. A sweep that reaches the end of the list
+  // starts the next one from the oldest run again. Process memory only; a
+  // restart begins at the oldest run.
+  let resumeAfter: ExpiredQueuedRunCursor | undefined;
+
   return async function expireStaleQueuedRuns(input: { now?: Date } = {}) {
     const now = input.now ?? new Date();
     const createdAtOrBefore = new Date(now.getTime() - MAX_QUEUED_ISSUE_RUN_AGE_MS);
@@ -92,18 +100,22 @@ export function createExpireStaleQueuedRuns(deps: { expiry: QueuedRunExpiry }) {
     // A failure on one candidate (or one page read) is recorded and skipped:
     // it must not abort the sweep or drop the effects of committed cancels.
     const failures: Array<{ runId: string | null; error: unknown }> = [];
-    let after: ExpiredQueuedRunCursor | undefined;
+    let after = resumeAfter;
     let pagesScanned = 0;
     let pageCapReached = false;
+    // Reset to the oldest run unless the sweep stops early below.
+    let nextResume: ExpiredQueuedRunCursor | undefined;
 
     // The list query already drops runs the policy will not expire (future
     // retry alarm, issue held by another running run). Paging covers the rest:
     // a run whose verdict changes between the list and its locked decision.
-    sweep: while (runIds.length < MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP) {
+    sweep: while (true) {
       if (pagesScanned >= MAX_EXPIRY_PAGES_PER_SWEEP) {
         pageCapReached = true;
+        nextResume = after;
         break;
       }
+      const pageStart = after;
       pagesScanned += 1;
       let page: ExpiredQueuedRunCandidate[];
       try {
@@ -115,10 +127,15 @@ export function createExpireStaleQueuedRuns(deps: { expiry: QueuedRunExpiry }) {
         });
       } catch (error) {
         failures.push({ runId: null, error });
+        nextResume = after;
         break;
       }
       for (const candidate of page) {
-        if (runIds.length >= MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP) break sweep;
+        if (runIds.length >= MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP) {
+          nextResume = after;
+          break sweep;
+        }
+        after = candidate.cursor;
         let result: CancelStaleQueuedRunOutcome;
         try {
           result = await deps.expiry.expireQueuedRun({
@@ -134,14 +151,18 @@ export function createExpireStaleQueuedRuns(deps: { expiry: QueuedRunExpiry }) {
         runIds.push(candidate.runId);
         postCommitEffects.push(...result.postCommitEffects);
       }
-      const last = page.at(-1);
-      if (page.length < EXPIRY_PAGE_SIZE || !last) break;
-      // The keyset is strict, so the cursor always moves; stop rather than
-      // re-read a page if an adapter ever returns the same position.
-      if (after && last.cursor.createdAtText === after.createdAtText && last.cursor.runId === after.runId) break;
-      after = last.cursor;
+      if (page.length < EXPIRY_PAGE_SIZE) break;
+      // The keyset is strict, so the cursor always moves; stop (and start
+      // from the oldest run next time) rather than re-read a page if an
+      // adapter ever returns the same position.
+      if (pageStart && after && after.createdAtText === pageStart.createdAtText && after.runId === pageStart.runId) break;
+      if (runIds.length >= MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP) {
+        nextResume = after;
+        break;
+      }
     }
 
+    resumeAfter = nextResume;
     return { expired: runIds.length, runIds, postCommitEffects, pagesScanned, pageCapReached, failures };
   };
 }
