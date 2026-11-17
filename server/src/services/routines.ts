@@ -56,6 +56,7 @@ import {
   isValidRoutineDateString,
   normalizeAgentUrlKey,
   pluginOperationIssueOriginKind,
+  isUuidLike,
   routineRevisionSnapshotSchema,
   stringifyRoutineVariableValue,
   syncRoutineVariablesWithTemplate,
@@ -1631,10 +1632,18 @@ export function routineService(
             )
           )`,
           // The routine's own card-creation rows are not outside activity: without
-          // this a webhook/manual-fired routine would re-arm its own gate.
+          // this a webhook/manual-fired routine would re-arm its own gate. Only a
+          // string routineId that equals this routine id exactly is excluded; a row
+          // with no routineId (NULL details, JSON null, `{}`, a non-string value) is
+          // ordinary activity. The coalesce keeps the predicate two-valued so NOT
+          // never turns an unknown into a dropped row.
           sql`not (
             ${activityLog.action} in (${sql.join(ROUTINE_ISSUE_CREATED_ACTIONS.map((action) => sql`${action}`), sql`, `)})
-            and (${activityLog.details} ->> 'routineId') = ${routine.id}
+            and coalesce(
+              jsonb_typeof(${activityLog.details} -> 'routineId') = 'string'
+                and (${activityLog.details} ->> 'routineId') = ${routine.id},
+              false
+            )
           )`,
           sql`not exists (
             select 1
@@ -1984,7 +1993,9 @@ export function routineService(
    * no parent, `issue.created_without_parent`) rows the issue POST route writes, so a
    * routine-created card's audit trail starts at its creation and names the routine
    * execution that minted it. Runs inside the dispatch transaction; publications are
-   * deferred to the caller so nothing is announced for a card that is rolled back.
+   * deferred to the caller so nothing is announced for a card that is rolled back. A
+   * failing audit write is logged and skipped (see `bestEffort`): the dispatch proceeds
+   * exactly as it did before these rows existed.
    */
   async function recordRoutineIssueCreated(
     txDb: Db,
@@ -1999,14 +2010,46 @@ export function routineService(
     publications: ActivityPublication[],
   ) {
     const manualActor = input.source === "manual" ? input.actor : undefined;
-    const actorUserId = manualActor?.userId ?? null;
+    const actorUserId = manualActor?.userId?.trim() || null;
     const actorAgentId = actorUserId ? null : manualActor?.agentId ?? null;
-    const actorRunId = actorUserId ? null : manualActor?.runId ?? null;
     const systemActorId = input.source === "schedule"
       ? "routine-scheduler"
       : input.source === "webhook"
         ? "routine-webhook"
         : `routine-${input.source}`;
+    // The audit rows are a best-effort record: each write runs in its own savepoint so a
+    // failing insert (a constraint violation, a dangling key) rolls back only itself and
+    // can never abort the dispatch transaction or strand the card it describes.
+    const bestEffort = async (label: string, write: (sp: Db) => Promise<unknown>) => {
+      try {
+        await txDb.transaction(async (sp) => {
+          await write(sp as unknown as Db);
+        });
+      } catch (err) {
+        logger.warn(
+          { err, routineId: input.routine.id, issueId: input.issue.id, routineRunId: input.routineRunId },
+          `failed to record ${label} for routine-created issue`,
+        );
+      }
+    };
+
+    // Stamp a caller run id only when it names a real run in this company, the same rule
+    // the activity column enforces; an unknown, foreign or malformed id is dropped.
+    let actorRunId: string | null = null;
+    const rawRunId = actorUserId ? null : manualActor?.runId?.trim() || null;
+    if (rawRunId && isUuidLike(rawRunId)) {
+      try {
+        const run = await txDb
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.companyId, input.routine.companyId), eq(heartbeatRuns.id, rawRunId)))
+          .then((rows) => rows[0] ?? null);
+        actorRunId = run?.id ?? null;
+      } catch (err) {
+        logger.warn({ err, routineId: input.routine.id }, "failed to resolve caller run for routine-created issue audit");
+      }
+    }
+
     const base = {
       companyId: input.routine.companyId,
       actorType: actorUserId ? "user" : actorAgentId ? "agent" : "system",
@@ -2026,7 +2069,7 @@ export function routineService(
       source: input.source,
       ...(actorRunId ? { runId: actorRunId } : {}),
     };
-    await logActivityInTransaction(txDb, {
+    await bestEffort("issue.created", (sp) => logActivityInTransaction(sp, {
       ...base,
       action: "issue.created",
       details: {
@@ -2035,9 +2078,9 @@ export function routineService(
         status: input.issue.status,
         ...routineReference,
       },
-    }, publications);
+    }, publications));
     if (actorAgentId && !input.issue.parentId) {
-      await logActivityInTransaction(txDb, {
+      await bestEffort("issue.created_without_parent", (sp) => logActivityInTransaction(sp, {
         ...base,
         action: "issue.created_without_parent",
         details: {
@@ -2049,7 +2092,7 @@ export function routineService(
           hasBlockedByIssueIds: false,
           ...routineReference,
         },
-      }, publications);
+      }, publications));
     }
   }
 

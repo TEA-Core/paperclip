@@ -2,7 +2,7 @@ import { createHmac, randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -3128,6 +3128,148 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
         .from(activityLog)
         .where(eq(activityLog.action, "issue.created"));
       expect(rows).toHaveLength(0);
+    });
+
+    describe("activity gate exclusion is limited to the routine's own creation rows", () => {
+      type OutsideRow = { label: string; action: string; details: string | null; fires: boolean };
+      const cases = (ownId: string, otherId: string): OutsideRow[] => [
+        { label: "POST-route issue.created with no routineId", action: "issue.created", details: JSON.stringify({ title: "x", identifier: "T-1" }), fires: true },
+        { label: "SQL NULL details", action: "issue.created", details: null, fires: true },
+        { label: "JSON null details", action: "issue.created", details: "null", fires: true },
+        { label: "empty object details", action: "issue.created", details: "{}", fires: true },
+        { label: "routineId null", action: "issue.created", details: JSON.stringify({ routineId: null }), fires: true },
+        { label: "created_without_parent without routineId", action: "issue.created_without_parent", details: JSON.stringify({ issueId: "x" }), fires: true },
+        { label: "another routine's id", action: "issue.created", details: JSON.stringify({ routineId: otherId }), fires: true },
+        { label: "numeric routineId", action: "issue.created", details: JSON.stringify({ routineId: 7 }), fires: true },
+        { label: "object routineId", action: "issue.created", details: JSON.stringify({ routineId: { id: ownId } }), fires: true },
+        { label: "boolean routineId", action: "issue.created", details: JSON.stringify({ routineId: true }), fires: true },
+        { label: "upper-cased own id", action: "issue.created", details: JSON.stringify({ routineId: ownId.toUpperCase() }), fires: true },
+        { label: "own routineId on a different action", action: "issue.comment_added", details: JSON.stringify({ routineId: ownId }), fires: true },
+        { label: "own routineId on issue.created", action: "issue.created", details: JSON.stringify({ routineId: ownId }), fires: false },
+        { label: "own routineId on issue.created_without_parent", action: "issue.created_without_parent", details: JSON.stringify({ routineId: ownId }), fires: false },
+      ];
+
+      it("counts every outside row shape as external activity and drops only the exact own routineId", async () => {
+        const { companyId, projectId, routine, svc } = await seedFixture();
+        const otherId = randomUUID();
+        const windowStart = new Date(Date.now() - 60_000);
+        await insertDispatchedRun({ companyId, routineId: routine.id, triggeredAt: windowStart });
+        const issueId = randomUUID();
+        await db.insert(issues).values({ id: issueId, companyId, projectId, title: "Board task" });
+        const at = new Date(windowStart.getTime() + 1_000);
+        for (const row of cases(routine.id, otherId)) {
+          await db.delete(activityLog);
+          await db.execute(sql`
+            insert into activity_log (company_id, actor_type, actor_id, action, entity_type, entity_id, details, created_at)
+            values (${companyId}, 'user', 'user-1', ${row.action}, 'issue', ${issueId},
+              ${row.details === null ? null : row.details}::jsonb, ${at.toISOString()}::timestamptz)
+          `);
+          const verdict = await svc.evaluateActivityGate(routine as unknown as Parameters<typeof svc.evaluateActivityGate>[0], new Date());
+          expect(verdict.fire, row.label).toBe(row.fires);
+        }
+      });
+
+      it("fires a real scheduler tick on an ordinary issue.created row that carries no routineId", async () => {
+        const { companyId, projectId, routine, svc } = await seedFixture();
+        await db.update(routines).set({ activityGatePolicy: "require_external_activity" }).where(eq(routines.id, routine.id));
+        const { trigger } = await svc.createTrigger(routine.id, {
+          kind: "schedule",
+          enabled: true,
+          cronExpression: "* * * * *",
+          timezone: "UTC",
+        }, {});
+        const firstTick = new Date();
+        await db.update(routineTriggers).set({ nextRunAt: new Date(firstTick.getTime() - 1_000) }).where(eq(routineTriggers.id, trigger.id));
+        expect(await svc.tickScheduledTriggers(firstTick)).toEqual({ triggered: 1 });
+        const [firstRun] = await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id));
+
+        const secondTick = new Date(firstTick.getTime() + 60_000);
+        await db.update(routineTriggers).set({ nextRunAt: new Date(secondTick.getTime() - 1_000) }).where(eq(routineTriggers.id, trigger.id));
+        // Only the routine's own scheduler rows exist: the gate stays closed.
+        expect(await svc.tickScheduledTriggers(secondTick)).toEqual({ triggered: 0 });
+
+        const otherIssueId = randomUUID();
+        await db.insert(issues).values({ id: otherIssueId, companyId, projectId, title: "Board task" });
+        await db.insert(activityLog).values({
+          companyId,
+          actorType: "user",
+          actorId: "user-1",
+          action: "issue.created",
+          entityType: "issue",
+          entityId: otherIssueId,
+          details: { title: "Board task" },
+          createdAt: new Date(firstRun!.triggeredAt.getTime() + 30_000),
+        });
+        await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, firstRun!.linkedIssueId!));
+        const thirdTick = new Date(secondTick.getTime() + 60_000);
+        await db.update(routineTriggers).set({ nextRunAt: new Date(thirdTick.getTime() - 1_000) }).where(eq(routineTriggers.id, trigger.id));
+        expect(await svc.tickScheduledTriggers(thirdTick)).toEqual({ triggered: 1 });
+        const runs = await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id));
+        expect(runs.filter((run) => run.status === "issue_created")).toHaveLength(2);
+      });
+    });
+
+    describe("a failing audit write never aborts the dispatch", () => {
+      afterEach(async () => {
+        await db.execute(sql.raw("alter table activity_log drop constraint if exists activity_log_force_failure"));
+      });
+
+      async function expectDispatchSurvived(routineId: string, run: { status: string; linkedIssueId: string | null; id: string }) {
+        expect(run.status).toBe("issue_created");
+        expect(run.linkedIssueId).toBeTruthy();
+        const kept = await db.select({ id: routineRuns.id }).from(routineRuns).where(eq(routineRuns.id, run.id));
+        expect(kept).toHaveLength(1);
+        const cards = await db.select({ id: issues.id }).from(issues).where(eq(issues.originId, routineId));
+        expect(cards.map((card) => card.id)).toEqual([run.linkedIssueId]);
+      }
+
+      it("keeps the run and the card when the issue.created insert violates a check constraint", async () => {
+        const { companyId, routine, svc } = await seedFixture();
+        await db.execute(sql.raw(
+          "alter table activity_log add constraint activity_log_force_failure check (action <> 'issue.created') not valid",
+        ));
+
+        const run = await svc.runRoutine(routine.id, { source: "manual" }, { userId: "board-user" });
+
+        await expectDispatchSurvived(routine.id, run);
+        expect(await activityService(db).list({ companyId, entityId: run.linkedIssueId!, limit: 100 })).toEqual([]);
+      });
+
+      it("keeps the run and the card when the board api key id is a dangling foreign key", async () => {
+        const { companyId, routine, svc } = await seedFixture();
+
+        const run = await svc.runRoutine(routine.id, { source: "manual" }, { userId: "board-user", boardApiKeyId: randomUUID() });
+
+        await expectDispatchSurvived(routine.id, run);
+        expect(await activityService(db).list({ companyId, entityId: run.linkedIssueId!, limit: 100 })).toEqual([]);
+      });
+
+      it("keeps issue.created when only the created_without_parent insert fails", async () => {
+        const { agentId, companyId, routine, svc } = await seedFixture();
+        await db.execute(sql.raw(
+          "alter table activity_log add constraint activity_log_force_failure check (action <> 'issue.created_without_parent') not valid",
+        ));
+
+        const run = await svc.runRoutine(routine.id, { source: "manual" }, { agentId });
+
+        await expectDispatchSurvived(routine.id, run);
+        const rows = await activityService(db).list({ companyId, entityId: run.linkedIssueId!, limit: 100 });
+        expect(rows.map((row) => row.action)).toEqual(["issue.created"]);
+      });
+
+      it("drops a caller run id that names no run in this company instead of storing it verbatim", async () => {
+        const { agentId, companyId, routine, svc } = await seedFixture();
+        const badIds = [randomUUID(), "not-a-uuid", `<b>${"x".repeat(16_000)}</b>`];
+        for (const badId of badIds) {
+          const run = await svc.runRoutine(routine.id, { source: "manual" }, { agentId, runId: badId });
+          const rows = await activityService(db).list({ companyId, entityId: run.linkedIssueId!, limit: 100 });
+          const created = rows.filter((row) => row.action === "issue.created");
+          expect(created).toHaveLength(1);
+          expect(created[0]!.runId).toBeNull();
+          expect(created[0]!.details).not.toHaveProperty("runId");
+          await db.update(issues).set({ status: "done" }).where(eq(issues.id, run.linkedIssueId!));
+        }
+      });
     });
 
     it("does not let a routine's own issue.created row re-fire its activity gate", async () => {
