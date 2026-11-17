@@ -102,6 +102,45 @@ describe("paperclip MCP tools", () => {
     );
   });
 
+  it("forwards a top-level monitor alias as the PATCH alias (SUP-21447)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "PAP-1135", status: "in_progress" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipUpdateIssue");
+    const response = await tool.execute({
+      issueId: "PAP-1135",
+      monitor: { nextCheckAt: "2026-12-01T12:00:00.000Z" },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe("http://localhost:3100/api/issues/PAP-1135");
+    expect(init.method).toBe("PATCH");
+    const body = JSON.parse(String(init.body));
+    expect(body.monitor).toMatchObject({ nextCheckAt: "2026-12-01T12:00:00.000Z" });
+    expect(body).not.toHaveProperty("executionPolicy");
+    expect(response.content[0]?.text).toContain("PAP-1135");
+  });
+
+  it("rejects monitor combined with executionPolicy before any request (SUP-21447)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipUpdateIssue");
+    const response = await tool.execute({
+      issueId: "PAP-1135",
+      monitor: { nextCheckAt: "2026-12-01T12:00:00.000Z" },
+      executionPolicy: { monitor: { nextCheckAt: "2027-01-01T00:00:00.000Z" } },
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(response.content[0]?.text).toContain(
+      "monitor cannot be combined with executionPolicy",
+    );
+  });
+
   it("lists the company skill library with the default company id", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse([{ key: "paperclipai/bundled/product/wireframe", name: "wireframe" }]),

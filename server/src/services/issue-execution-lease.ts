@@ -1,4 +1,4 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issues } from "@paperclipai/db";
 
@@ -87,4 +87,44 @@ export async function resolveLiveExecutionLeases(
     });
   }
   return leases;
+}
+
+/**
+ * Finds the owner before acquiring an issue execution lock. The caller must
+ * hold the issue row lock until its stamp commits. Include legacy
+ * context-only owners and queued reservations, not just running direct leases.
+ * Do not exclude the caller: its running issuer must win over an older queue.
+ */
+export async function findLiveIssueExecutionHolder(
+  db: Pick<Db, "select">,
+  companyId: string,
+  issueId: string,
+): Promise<LiveExecutionLease | null> {
+  return db
+    .select({
+      runId: heartbeatRuns.id,
+      agentId: heartbeatRuns.agentId,
+      status: heartbeatRuns.status,
+      startedAt: heartbeatRuns.startedAt,
+    })
+    .from(issues)
+    .innerJoin(heartbeatRuns, eq(heartbeatRuns.companyId, issues.companyId))
+    .where(and(
+      eq(issues.companyId, companyId),
+      eq(issues.id, issueId),
+      inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+      or(
+        eq(heartbeatRuns.id, issues.executionRunId),
+        eq(heartbeatRuns.id, issues.checkoutRunId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+      ),
+    ))
+    .orderBy(
+      sql`case when ${heartbeatRuns.status} = 'running' then 0 else 1 end`,
+      sql`case when ${heartbeatRuns.id} = ${issues.executionRunId} then 0 when ${heartbeatRuns.id} = ${issues.checkoutRunId} then 1 else 2 end`,
+      asc(heartbeatRuns.createdAt),
+      asc(heartbeatRuns.id),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
 }

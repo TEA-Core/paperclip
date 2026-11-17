@@ -1,3 +1,4 @@
+import type { SetIssueTitle } from "@paperclipai/shared";
 import type { ExecutionReconciliation } from "@paperclipai/shared";
 import type {
   AcceptedPlanDecompositionSummary,
@@ -76,6 +77,11 @@ export type IssueUpdateResponse = Issue & {
 export type ResolveRecoveryActionResponse = {
   issue: Issue;
   recoveryAction: IssueRecoveryAction;
+  /**
+   * The execution decision the resolution recorded, or null when it recorded
+   * none. Absent on an idempotent replay of an earlier resolution.
+   */
+  executionDecision?: { id: string; stageId: string; stageType: string; outcome: string } | null;
 };
 
 export type IssueListFilters = {
@@ -105,9 +111,11 @@ export type IssueListFilters = {
   q?: string;
   limit?: number;
   offset?: number;
-  sortField?: "created" | "updated" | "id";
+  sortField?: "created" | "updated" | "id" | "completed";
   afterId?: string;
   sortDir?: "asc" | "desc";
+  completedAfter?: string;
+  completedBefore?: string;
 };
 
 function issueListSearchParams(filters?: IssueListFilters) {
@@ -155,6 +163,9 @@ function issueListSearchParams(filters?: IssueListFilters) {
   if (filters?.sortField) params.set("sortField", filters.sortField);
   if (filters?.sortDir) params.set("sortDir", filters.sortDir);
   if (filters?.afterId) params.set("afterId", filters.afterId);
+  if (filters?.completedAfter) params.set("completedAfter", filters.completedAfter);
+  if (filters?.completedBefore)
+    params.set("completedBefore", filters.completedBefore);
   return params;
 }
 
@@ -256,6 +267,8 @@ export const issuesApi = {
     api.delete<{ id: string; archivedAt: Date } | { ok: true }>(
       `/issues/${id}/inbox-archive`,
     ),
+  setTitle: (id: string, data: SetIssueTitle) =>
+    api.put<{ id: string; title: string; titleNeedsGeneration: boolean; changed: boolean }>(`/issues/${id}/title`, data),
   create: (companyId: string, data: Record<string, unknown>) =>
     api.post<Issue>(`/companies/${companyId}/issues`, data),
   update: (id: string, data: Record<string, unknown>) => {
@@ -271,6 +284,8 @@ export const issuesApi = {
       `/issues/${id}/stalled-review-decision`,
       data,
     ),
+  retryWorkspaceExport: (id: string, data: { actionId: string; runId: string; repairNote: string }) =>
+    api.post<{ runId: string; resultId: string; leaseId: string; status: "queued" }>(`/issues/${id}/recovery-actions/retry-workspace-export`, data),
   resolveRecoveryAction: (
     id: string,
     data: {

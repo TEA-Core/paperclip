@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -25,7 +25,12 @@ import {
   workspaceOperations,
   workspaceRuntimeServices,
 } from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
+import {
+  buildExecutionWorkspaceAdapterConfig,
+  parseIssueExecutionWorkspaceSettings,
+  parseProjectExecutionWorkspacePolicy,
+} from "../services/execution-workspace-policy.ts";
 import {
   assertGitHeadResolvable,
   assertGitIndexIntegrity,
@@ -78,6 +83,7 @@ import {
 } from "../services/local-service-supervisor.ts";
 import { logger } from "../middleware/logger.js";
 import type { EnsureSharedGroupOwnershipOptions } from "../services/shared-group-ownership.js";
+import { readLegacySeedManifestObject } from "../worktree-seed-manifest.js";
 import {
   buildWorkspaceRealizationRecord,
   buildWorkspaceRealizationRequest,
@@ -487,7 +493,9 @@ async function closeNetServer(server: net.Server) {
 }
 
 async function listenOnPort(port: number) {
-  const server = net.createServer();
+  // These listeners only hold a port. Drop inbound connections (for example a
+  // local port watcher probing new listeners) so close() never waits on them.
+  const server = net.createServer((socket) => socket.destroy());
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, "127.0.0.1", resolve);
@@ -505,9 +513,11 @@ async function findFreePort() {
 }
 
 async function reserveContiguousPorts(count: number) {
+  // Draw the base from 20000-31999, below the Linux and macOS ephemeral port
+  // ranges. Outbound connections hold ephemeral ports, so on a busy host a run
+  // of free ports there is often broken and every attempt failed.
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const basePort = await findFreePort();
-    if (basePort + count - 1 > 65_535) continue;
+    const basePort = 20_000 + Math.floor(Math.random() * (12_000 - count));
     const servers: net.Server[] = [];
     try {
       for (let offset = 0; offset < count; offset += 1) {
@@ -1193,6 +1203,40 @@ describe("resolveManagedPaperclipRuntimePublicOrigin", () => {
   });
 });
 
+const BUILTIN_SEED_COMMAND = "bash ./scripts/provision-worktree-runtime.sh";
+/** The uid whose `.paperclip/uid-<uid>/` state the seed decision and evidence use. */
+const RUNTIME_UID = process.getuid?.() ?? -1;
+
+/** A complete v2 seed manifest, the only v2 shape that is a verified seed. */
+function completeSeedManifest(overrides: Record<string, unknown> = {}) {
+  return JSON.stringify({
+    version: 2,
+    source: { instanceId: "source", configPath: "/source/config.json" },
+    snapshotAt: "2026-08-18T00:00:00.000Z",
+    seedMode: "full",
+    migrationRevision: "0001",
+    targetInstanceId: "target",
+    phase: "complete",
+    state: "verified",
+    attemptId: "attempt",
+    startedAt: "2026-08-18T00:00:00.000Z",
+    finishedAt: "2026-08-18T00:01:00.000Z",
+    diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-08-18T00:01:00.000Z" }],
+    ...overrides,
+  });
+}
+
+/** A managed git worktree whose base checkout has the built-in seed script. */
+async function createSeedWorktree(prefix: string) {
+  const baseCwd = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  const cwd = path.join(baseCwd, "worktree");
+  await fs.mkdir(path.join(baseCwd, "scripts"), { recursive: true });
+  await fs.writeFile(path.join(baseCwd, "scripts", "provision-worktree-runtime.sh"), "#!/usr/bin/env bash\n");
+  await fs.mkdir(path.join(cwd, ".paperclip"), { recursive: true });
+  const workspace = { ...buildWorkspace(cwd), baseCwd, strategy: "git_worktree" as const, worktreePath: cwd };
+  return { baseCwd, cwd, workspace };
+}
+
 describe("resolveRuntimeProvisionCommand", () => {
   it("backfills deferred seeding for legacy managed git worktrees", async () => {
     const baseCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-provision-"));
@@ -1268,6 +1312,27 @@ describe("resolveRuntimeProvisionCommand", () => {
         }),
       );
       expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
+      // Complete minimal manifests keep skipping provisioning alongside full.
+      const fullManifest = JSON.parse(await fs.readFile(path.join(cwd, ".paperclip", "seed-manifest.json"), "utf8"));
+      await fs.writeFile(
+        path.join(cwd, ".paperclip", "seed-manifest.json"),
+        JSON.stringify({ ...fullManifest, seedMode: "minimal" }),
+      );
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
+      // A legacy-unsafe manifest is not verified, so the provisioner runs and
+      // refuses it loudly; a FIFO manifest is refused without blocking.
+      await fs.writeFile(
+        path.join(cwd, ".paperclip", "seed-manifest.json"),
+        JSON.stringify({ ...fullManifest, seedMode: "minimal-no-secrets" }),
+      );
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(
+        "bash ./scripts/provision-worktree-runtime.sh",
+      );
+      await fs.rm(path.join(cwd, ".paperclip", "seed-manifest.json"));
+      expect(spawnSync("mkfifo", [path.join(cwd, ".paperclip", "seed-manifest.json")]).status).toBe(0);
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(
+        "bash ./scripts/provision-worktree-runtime.sh",
+      );
     } finally {
       await fs.rm(baseCwd, { recursive: true, force: true });
     }
@@ -1275,9 +1340,10 @@ describe("resolveRuntimeProvisionCommand", () => {
 
   it("surfaces the runtime provision command for a pending uid-scoped worktree state dir", async () => {
     // SUP-14087: on a cross-uid worktree each uid keeps its state under
-    // .paperclip/uid-<uid>/. When a scoped seed-pending has no sibling
-    // seed-complete, the command must be returned even though the canonical
-    // markers say nothing is pending.
+    // .paperclip/uid-<uid>/, and this uid uses its scoped dir once it holds an
+    // .env. When that scoped seed-pending has no sibling seed-complete, the
+    // command must be returned even though the canonical markers say nothing
+    // is pending.
     const baseCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-provision-scoped-"));
     const cwd = path.join(baseCwd, "worktree");
     try {
@@ -1286,8 +1352,10 @@ describe("resolveRuntimeProvisionCommand", () => {
         path.join(baseCwd, "scripts", "provision-worktree-runtime.sh"),
         "#!/usr/bin/env bash\n",
       );
-      await fs.mkdir(path.join(cwd, ".paperclip", "uid-1001"), { recursive: true });
-      await fs.writeFile(path.join(cwd, ".paperclip", "uid-1001", "seed-pending"), "{}\n");
+      const scopedDir = path.join(cwd, ".paperclip", `uid-${RUNTIME_UID}`);
+      await fs.mkdir(scopedDir, { recursive: true });
+      await fs.writeFile(path.join(scopedDir, ".env"), "");
+      await fs.writeFile(path.join(scopedDir, "seed-pending"), "{}\n");
       const workspace = {
         ...buildWorkspace(cwd),
         baseCwd,
@@ -1299,7 +1367,7 @@ describe("resolveRuntimeProvisionCommand", () => {
         "bash ./scripts/provision-worktree-runtime.sh",
       );
 
-      await fs.writeFile(path.join(cwd, ".paperclip", "uid-1001", "seed-complete"), "{}\n");
+      await fs.writeFile(path.join(scopedDir, "seed-complete"), "{}\n");
       expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
     } finally {
       await fs.rm(baseCwd, { recursive: true, force: true });
@@ -1340,8 +1408,10 @@ describe("resolveRuntimeProvisionCommand", () => {
 
       // A scoped uid state dir with its own recorded skip is complete too.
       const scopedCwd = path.join(baseCwd, "scoped-worktree");
-      await fs.mkdir(path.join(scopedCwd, ".paperclip", "uid-1001"), { recursive: true });
-      await fs.writeFile(path.join(scopedCwd, ".paperclip", "uid-1001", "seed-skip-no-source"), "{}\n");
+      const scopedDir = path.join(scopedCwd, ".paperclip", `uid-${RUNTIME_UID}`);
+      await fs.mkdir(scopedDir, { recursive: true });
+      await fs.writeFile(path.join(scopedDir, ".env"), "");
+      await fs.writeFile(path.join(scopedDir, "seed-skip-no-source"), "{}\n");
       const scopedWorkspace = {
         ...buildWorkspace(scopedCwd),
         baseCwd,
@@ -1353,9 +1423,107 @@ describe("resolveRuntimeProvisionCommand", () => {
       await fs.rm(baseCwd, { recursive: true, force: true });
     }
   });
+
+  it("runs the seed command for a refused manifest even when a no-source skip is recorded", async () => {
+    const { baseCwd, cwd, workspace } = await createSeedWorktree("paperclip-runtime-provision-refused-skip-");
+    try {
+      const manifestPath = path.join(cwd, ".paperclip", "seed-manifest.json");
+      await fs.writeFile(path.join(cwd, ".paperclip", "seed-skip-no-source"), "{}\n");
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
+
+      // The provisioner reads the same manifest and refuses it loudly; the
+      // marker must not skip it.
+      await fs.writeFile(manifestPath, completeSeedManifest({ seedMode: "minimal-no-secrets" }));
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(BUILTIN_SEED_COMMAND);
+      await fs.rm(manifestPath);
+      expect(spawnSync("mkfifo", [manifestPath]).status).toBe(0);
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(BUILTIN_SEED_COMMAND);
+
+      // A `.paperclip` link to another instance is refused, although the
+      // target holds a verified manifest and a skip marker.
+      const otherState = path.join(baseCwd, "other-instance", ".paperclip");
+      await fs.mkdir(otherState, { recursive: true });
+      await fs.writeFile(path.join(otherState, "seed-manifest.json"), completeSeedManifest());
+      await fs.writeFile(path.join(otherState, "seed-skip-no-source"), "{}\n");
+      await fs.rm(path.join(cwd, ".paperclip"), { recursive: true, force: true });
+      await fs.symlink(otherState, path.join(cwd, ".paperclip"));
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(BUILTIN_SEED_COMMAND);
+
+      // The same holds in this uid's scoped state dir, for a refused manifest
+      // and for a scoped dir that is a link.
+      const scoped = await createSeedWorktree("paperclip-runtime-provision-refused-scoped-");
+      try {
+        const scopedDir = path.join(scoped.cwd, ".paperclip", `uid-${RUNTIME_UID}`);
+        await fs.mkdir(scopedDir);
+        await fs.writeFile(path.join(scopedDir, ".env"), "");
+        await fs.writeFile(path.join(scopedDir, "seed-skip-no-source"), "{}\n");
+        await fs.writeFile(path.join(scopedDir, "seed-manifest.json"), "{ torn");
+        expect(resolveRuntimeProvisionCommand({ config: {}, workspace: scoped.workspace })).toBe(BUILTIN_SEED_COMMAND);
+
+        await fs.rm(scopedDir, { recursive: true, force: true });
+        await fs.writeFile(path.join(otherState, ".env"), "");
+        await fs.symlink(otherState, scopedDir);
+        expect(resolveRuntimeProvisionCommand({ config: {}, workspace: scoped.workspace })).toBe(BUILTIN_SEED_COMMAND);
+      } finally {
+        await fs.rm(scoped.baseCwd, { recursive: true, force: true });
+      }
+    } finally {
+      await fs.rm(baseCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("decides on this uid's state dir and ignores another uid's scoped state", async () => {
+    // SUP-14087: the built-in seed command works in this uid's state dir, so
+    // another uid's scoped manifest or markers must neither start it nor skip it.
+    const { baseCwd, cwd, workspace } = await createSeedWorktree("paperclip-runtime-provision-other-uid-");
+    try {
+      const otherDir = path.join(cwd, ".paperclip", `uid-${RUNTIME_UID + 1}`);
+      await fs.mkdir(otherDir);
+      await fs.writeFile(path.join(otherDir, ".env"), "");
+      await fs.writeFile(path.join(cwd, ".paperclip", "seed-manifest.json"), completeSeedManifest());
+      await fs.writeFile(path.join(otherDir, "seed-manifest.json"), completeSeedManifest({ seedMode: "minimal-no-secrets" }));
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
+
+      await fs.rm(path.join(cwd, ".paperclip", "seed-manifest.json"));
+      await fs.rm(path.join(otherDir, "seed-manifest.json"));
+      await fs.writeFile(path.join(otherDir, "seed-skip-no-source"), "{}\n");
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(BUILTIN_SEED_COMMAND);
+    } finally {
+      await fs.rm(baseCwd, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("readWorkspaceSeedOperationEvidence", () => {
+  it("does not block on a FIFO manifest and refuses a v2 minimal-no-secrets manifest", async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-seed-evidence-bounded-"));
+    try {
+      await fs.mkdir(path.join(cwd, ".paperclip"), { recursive: true });
+      const manifestPath = path.join(cwd, ".paperclip", "seed-manifest.json");
+      expect(spawnSync("mkfifo", [manifestPath]).status).toBe(0);
+      const startedAt = Date.now();
+      expect(readLegacySeedManifestObject(manifestPath)).toBeNull();
+      expect(readWorkspaceSeedOperationEvidence(cwd).verified).toBe(false);
+      expect(Date.now() - startedAt).toBeLessThan(2000);
+      await fs.rm(manifestPath);
+
+      await fs.writeFile(
+        manifestPath,
+        JSON.stringify({
+          version: 2,
+          seedMode: "minimal-no-secrets",
+          state: "verified",
+          phase: "validation",
+          diagnostics: [{ phase: "validation", status: "verified", at: "2026-09-10T00:00:00.000Z" }],
+        }),
+      );
+      expect(readLegacySeedManifestObject(manifestPath)).toBeNull();
+      expect(readWorkspaceSeedOperationEvidence(cwd).verified).toBe(false);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("accepts a recorded no-source seed skip as verified seed evidence", async () => {
     // SUP-15609: the runtime recorder marks a workspace_seed operation failed
     // when the worktree has no verified seed manifest. An env-only worktree
@@ -1399,6 +1567,85 @@ describe("readWorkspaceSeedOperationEvidence", () => {
       const evidence = readWorkspaceSeedOperationEvidence(cwd);
       expect(evidence.verified).toBe(false);
       expect(evidence.error).toMatch(/without a verified manifest/);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("pairs the skip marker with the manifest in this uid's state dir", async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-seed-evidence-scoped-"));
+    const otherCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-seed-evidence-other-uid-"));
+    const linkedCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-seed-evidence-linked-"));
+    try {
+      // The root manifest is absent; this uid's scoped dir holds a skip marker
+      // next to a refused manifest. The refusal wins.
+      const scopedDir = path.join(cwd, ".paperclip", `uid-${RUNTIME_UID}`);
+      await fs.mkdir(scopedDir, { recursive: true });
+      await fs.writeFile(path.join(scopedDir, ".env"), "");
+      await fs.writeFile(path.join(scopedDir, "seed-skip-no-source"), "{}\n");
+      await fs.writeFile(path.join(scopedDir, "seed-manifest.json"), completeSeedManifest({ seedMode: "minimal-no-secrets" }));
+      let evidence = readWorkspaceSeedOperationEvidence(cwd);
+      expect(evidence.verified).toBe(false);
+      expect(evidence.error).toContain(path.join(scopedDir, "seed-manifest.json"));
+      expect(evidence.metadata).toMatchObject({ seedState: "unreadable", seedFailurePhase: "seed_manifest_unreadable" });
+      expect(evidence.metadata.seedSkippedNoSource).toBeUndefined();
+
+      // Without a manifest in that dir its own marker is the evidence.
+      await fs.rm(path.join(scopedDir, "seed-manifest.json"));
+      evidence = readWorkspaceSeedOperationEvidence(cwd);
+      expect(evidence.verified).toBe(true);
+      expect(evidence.metadata).toMatchObject({ seedState: "skipped-no-source", seedSkippedNoSource: true });
+
+      // Another uid's skip marker is not evidence for this uid's state dir.
+      const otherDir = path.join(otherCwd, ".paperclip", `uid-${RUNTIME_UID + 1}`);
+      await fs.mkdir(otherDir, { recursive: true });
+      await fs.writeFile(path.join(otherDir, ".env"), "");
+      await fs.writeFile(path.join(otherDir, "seed-skip-no-source"), "{}\n");
+      evidence = readWorkspaceSeedOperationEvidence(otherCwd);
+      expect(evidence.verified).toBe(false);
+      expect(evidence.metadata.seedState).toBe("absent");
+
+      // A `.paperclip` link is refused, so the marker behind it is not evidence.
+      await fs.symlink(path.join(otherCwd, ".paperclip"), path.join(linkedCwd, ".paperclip"));
+      await fs.writeFile(path.join(otherCwd, ".paperclip", "seed-skip-no-source"), "{}\n");
+      evidence = readWorkspaceSeedOperationEvidence(linkedCwd);
+      expect(evidence.verified).toBe(false);
+      expect(evidence.metadata.seedState).toBe("unreadable");
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+      await fs.rm(otherCwd, { recursive: true, force: true });
+      await fs.rm(linkedCwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("readWorkspaceSeedOperationEvidence refused manifests with a stale skip marker", () => {
+  it.each(["minimal_no_secrets", "fifo"] as const)("refuses a %s manifest quickly", async (variant) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), `paperclip-runtime-seed-evidence-refused-${variant}-`));
+    try {
+      await fs.mkdir(path.join(cwd, ".paperclip"), { recursive: true });
+      await fs.writeFile(path.join(cwd, ".paperclip", "seed-skip-no-source"), "{}\n");
+      const manifestPath = path.join(cwd, ".paperclip", "seed-manifest.json");
+      if (variant === "fifo") {
+        expect(spawnSync("mkfifo", [manifestPath]).status).toBe(0);
+      } else {
+        await fs.writeFile(
+          manifestPath,
+          JSON.stringify({
+            version: 2,
+            seedMode: "minimal-no-secrets",
+            state: "verified",
+            phase: "validation",
+            diagnostics: [{ phase: "validation", status: "verified", at: "2026-09-10T00:00:00.000Z" }],
+          }),
+        );
+      }
+      const startedAt = Date.now();
+      const evidence = readWorkspaceSeedOperationEvidence(cwd);
+      expect(Date.now() - startedAt).toBeLessThan(2000);
+      expect(evidence.verified).toBe(false);
+      expect(evidence.metadata.seedFailurePhase).toBe("seed_manifest_unreadable");
+      expect(evidence.metadata.seedSkippedNoSource).toBeUndefined();
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -1653,6 +1900,52 @@ describe("realizeExecutionWorkspace", () => {
     expect(second.branchCreatedByRuntime).toBe(true);
     expect(second.cwd).toBe(first.cwd);
     expect(second.branchName).toBe(first.branchName);
+  });
+
+  it("retains the project provision command when an issue overrides its base branch", async () => {
+    const repoRoot = await createTempRepo();
+    await fs.mkdir(path.join(repoRoot, "scripts"));
+    await fs.writeFile(
+      path.join(repoRoot, "scripts", "provision-worktree.sh"),
+      "#!/usr/bin/env bash\necho 'Unexpected repository provision fallback' >&2\nexit 1\n",
+    );
+    await runGit(repoRoot, ["add", "scripts/provision-worktree.sh"]);
+    await runGit(repoRoot, ["commit", "-m", "Add fallback provisioner"]);
+    await runGit(repoRoot, ["branch", "release"]);
+    const config = buildExecutionWorkspaceAdapterConfig({
+      agentConfig: {},
+      projectPolicy: parseProjectExecutionWorkspacePolicy({
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        workspaceStrategy: { type: "git_worktree", baseRef: "main", provisionCommand: "true" },
+      }),
+      issueSettings: parseIssueExecutionWorkspaceSettings({
+        mode: "isolated_workspace",
+        workspaceStrategy: { type: "git_worktree", baseRef: "release" },
+      }),
+      mode: "isolated_workspace",
+      legacyUseProjectWorkspace: null,
+    });
+    try {
+      const workspace = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config,
+        issue: { id: "issue-1", identifier: "TEST-1", title: "Keep project setup" },
+        agent: { id: "agent-1", name: "Test agent", companyId: "company-1" },
+      });
+      expect(workspace.created).toBe(true);
+      expect(workspace.baseRefSha).toBe(await readGit(repoRoot, ["rev-parse", "release"]));
+      await expect(fs.stat(path.join(workspace.cwd, ".git"))).resolves.toBeTruthy();
+    } finally {
+      await fs.rm(repoRoot, { recursive: true, force: true });
+    }
   });
 
   it("defaults the repo-provided worktree provisioner for git worktree strategies", async () => {
@@ -9812,17 +10105,24 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     // that references the deleted project, which raises an unhandled foreign-key
     // error in the next test.
     await resetRuntimeServicesForTests({ terminateProcesses: true });
-    // Service control writes activity_log rows. Delete them before the company
-    // delete so a lingering foreign-key row cannot block the company delete and
-    // leak rows into the next test.
-    await db.delete(activityLog);
-    await db.delete(workspaceRuntimeServices);
-    await db.delete(executionWorkspaces);
-    await db.delete(projectWorkspaces);
-    await db.delete(issues);
-    await db.delete(projects);
-    await db.delete(agents);
-    await db.delete(companies);
+    // Delete in one transaction that first locks workspace_runtime_services, so
+    // an unawaited child `exit` persist cannot re-insert a row between the
+    // runtime-service delete and the company delete (see the startup
+    // reconciliation afterEach below).
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`lock table workspace_runtime_services in exclusive mode`);
+      // Service control writes activity_log rows. Delete them before the company
+      // delete so a lingering foreign-key row cannot block the company delete and
+      // leak rows into the next test.
+      await tx.delete(activityLog);
+      await tx.delete(workspaceRuntimeServices);
+      await tx.delete(executionWorkspaces);
+      await tx.delete(projectWorkspaces);
+      await tx.delete(issues);
+      await tx.delete(projects);
+      await tx.delete(agents);
+      await tx.delete(companies);
+    });
   });
 
   it("persists provisioning before starting and excludes provision time from readiness timeout", async () => {
@@ -9981,35 +10281,44 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
         executionWorkspaceId,
         serviceName: "web",
         status: "provisioning",
+        healthStatus: "unknown",
         providerRef: null,
       });
       expect(existsSync(markerPath)).toBe(false);
 
       await waitForMarker(markerPath);
-      const startingRow = await waitForPersistedStatus("starting");
-      expect(startingRow).toMatchObject({
+      // Readiness begins before the PID-bearing transaction commits. Keep the
+      // listener independent of DB reads and verify the completed records.
+      const services = await startPromise;
+      expect(services).toHaveLength(1);
+      expect(services[0]).toMatchObject({
+        id: provisioningRow.id,
         companyId,
         projectId,
         projectWorkspaceId,
         executionWorkspaceId,
         issueId,
         serviceName: "web",
-        status: "starting",
-        healthStatus: "unknown",
-      });
-      expect(startingRow.providerRef).toMatch(/^\d+$/);
-      expect(startingRow.port).toEqual(expect.any(Number));
-
-      const services = await startPromise;
-      expect(services).toHaveLength(1);
-      expect(services[0]).toMatchObject({
-        id: startingRow.id,
         status: "running",
         healthStatus: "healthy",
       });
+      expect(services[0]!.providerRef).toMatch(/^\d+$/);
+      expect(services[0]!.port).toEqual(expect.any(Number));
 
       const runningRow = await waitForPersistedStatus("running");
-      expect(runningRow.id).toBe(startingRow.id);
+      expect(runningRow).toMatchObject({
+        id: provisioningRow.id,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        executionWorkspaceId,
+        issueId,
+        serviceName: "web",
+        status: "running",
+        healthStatus: "healthy",
+        providerRef: services[0]!.providerRef,
+        port: services[0]!.port,
+      });
       await expect(fetch(services[0]!.url!)).resolves.toMatchObject({ ok: true });
       const runtimeProvisionOperations = await db
         .select()
@@ -10582,24 +10891,31 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     const basePort = await findFreePort();
     const markerPath = path.join(workspace.cwd, "bind-race.marker");
     const blockerPidPath = path.join(workspace.cwd, "bind-race.pid");
+    const blockerReadyPath = path.join(workspace.cwd, "bind-race.ready");
     const blockerScript = [
       "const net=require('node:net');",
       "const port=Number(process.argv[1]);",
-      "net.createServer((socket)=>socket.destroy()).listen(port,'127.0.0.1');",
+      "net.createServer((socket)=>socket.destroy()).listen(port,'127.0.0.1',",
+      "()=>require('node:fs').writeFileSync(process.argv[2],'ready'));",
     ].join("");
+    // The first start binds only after the blocker owns the port. A fixed delay
+    // let a slow blocker start lose that race on a loaded runner, so the first
+    // start bound the base port and the test saw no bind race at all.
     const raceScript = [
       "const fs=require('node:fs');",
       "const http=require('node:http');",
       "const {spawn}=require('node:child_process');",
       `const marker=${JSON.stringify(markerPath)};`,
       `const pidFile=${JSON.stringify(blockerPidPath)};`,
+      `const readyFile=${JSON.stringify(blockerReadyPath)};`,
       `const blockerScript=${JSON.stringify(blockerScript)};`,
       "const port=Number(process.env.PORT);",
       "const start=()=>http.createServer((_req,res)=>res.end('ok')).listen(port,'127.0.0.1');",
+      "const startWhenBlocked=()=>fs.existsSync(readyFile)?start():setTimeout(startWhenBlocked,10);",
       "if(!fs.existsSync(marker)){",
       "fs.writeFileSync(marker,String(port));",
-      "const blocker=spawn(process.execPath,['-e',blockerScript,String(port)],{detached:true,stdio:'ignore'});",
-      "fs.writeFileSync(pidFile,String(blocker.pid));blocker.unref();setTimeout(start,200);",
+      "const blocker=spawn(process.execPath,['-e',blockerScript,String(port),readyFile],{detached:true,stdio:'ignore'});",
+      "fs.writeFileSync(pidFile,String(blocker.pid));blocker.unref();startWhenBlocked();",
       "}else{start();}",
       "setInterval(()=>{},1000);",
     ].join("");
@@ -10649,7 +10965,16 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     const fixture = await createRuntimeFixture();
     const cleanupRuntimeHome = await createRuntimeHome();
     const workspace = fixture.workspaces[0]!;
-    const basePort = await findFreePort();
+    // Hold every port in the bounded range except the preferred one. The child
+    // binds the preferred port, its listener ownership cannot be attributed, and
+    // the start must refuse it. The retry then finds the rest of the range taken
+    // and returns the bounded conflict. One real child start proves the refusal;
+    // refusing a fresh child on every port of the range costs one child start
+    // per port and ran past the test timeout on a loaded CI runner.
+    const reservation = await reserveContiguousPorts(WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS);
+    const [baseReservation, ...otherReservations] = reservation.servers;
+    await closeNetServer(baseReservation!);
+    const basePort = reservation.basePort;
     const fakeBin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-no-lsof-"));
     const fakeLsof = path.join(fakeBin, "lsof");
     const previousPath = process.env.PATH;
@@ -10682,6 +11007,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
         workspaceCwd: workspace.cwd,
       }).catch(() => undefined);
       await fs.rm(fakeBin, { recursive: true, force: true });
+      await Promise.all(otherReservations.map((server) => closeNetServer(server).catch(() => undefined)));
       await cleanupRuntimeHome();
       await fixture.cleanup();
     }
@@ -10857,23 +11183,33 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     // writes a workspace_runtime_services row that references the deleted
     // project, which raises an unhandled foreign-key error in the next test.
     await resetRuntimeServicesForTests({ terminateProcesses: true });
-    // Startup reconciliation writes activity_log rows (for example, exposure
-    // reservation drift). Delete those rows before the company delete. A stale
-    // activity_log row holds a foreign key to the company and makes the company
-    // delete fail, which leaks rows into the next test.
-    await db.delete(activityLog);
-    await db.delete(workspaceRuntimeServices);
-    await db.delete(executionWorkspaces);
-    await db.delete(projectWorkspaces);
-    await db.delete(projects);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
-    // The runtime service control path writes activity_log rows through
-    // logActivity. Those rows reference the company. Delete them before the
-    // company to respect the activity_log.company_id foreign key.
-    await db.delete(activityLog);
-    await db.delete(agents);
-    await db.delete(companies);
+    // Stopping a runtime child fires its `exit` listener, which persists the
+    // service row without being awaited. Under load that write can land between
+    // the runtime-service delete and the company delete below and re-insert the
+    // row, so the company delete fails its foreign key. Delete in one
+    // transaction that first locks workspace_runtime_services: a late write
+    // waits for the commit and then fails its own foreign key, which the runtime
+    // catches and logs.
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`lock table workspace_runtime_services in exclusive mode`);
+      // Startup reconciliation writes activity_log rows (for example, exposure
+      // reservation drift). Delete those rows before the company delete. A stale
+      // activity_log row holds a foreign key to the company and makes the company
+      // delete fail, which leaks rows into the next test.
+      await tx.delete(activityLog);
+      await tx.delete(workspaceRuntimeServices);
+      await tx.delete(executionWorkspaces);
+      await tx.delete(projectWorkspaces);
+      await tx.delete(projects);
+      await tx.delete(heartbeatRunEvents);
+      await tx.delete(heartbeatRuns);
+      // The runtime service control path writes activity_log rows through
+      // logActivity. Those rows reference the company. Delete them before the
+      // company to respect the activity_log.company_id foreign key.
+      await tx.delete(activityLog);
+      await tx.delete(agents);
+      await tx.delete(companies);
+    });
   });
 
   it("restores desired services when one row is stopped and a live registered service has no row", async () => {

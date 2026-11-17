@@ -15,6 +15,7 @@ import { heartbeatService } from "../heartbeat.js";
 import { normalizeIssueExecutionPolicy } from "../issue-execution-policy.js";
 import {
   RECOVERY_BOUNCE_CONSECUTIVE_WAKE_FAILURES,
+  canExecuteRecoveryDelivery,
   hasConsecutiveWakeFailures,
   isRecoveryBounceTargetLive,
   recoveryBounceStatusRank,
@@ -94,6 +95,33 @@ describe("SUP-17884: recovery bounce eligibility (pure helpers)", () => {
 
     it("treats a single failure as not-dead at K=3", () => {
       expect(hasConsecutiveWakeFailures(["failed"], 3)).toBe(false);
+    });
+  });
+
+  describe("canExecuteRecoveryDelivery", () => {
+    it.each([
+      null,
+      undefined,
+      "",
+      "Read-only. NOT: implement, never reviewer.",
+      "NOT: feature implementation. Code allowed: surgical unblock fix.",
+      "Documentation only; no repository changes.",
+      "Advisory only; implementation recommendations are allowed.",
+      "No-code analysis and review.",
+    ])("rejects missing, non-executing, or negated capabilities: %s", (capabilities) => {
+      expect(canExecuteRecoveryDelivery("repository_delivery", capabilities)).toBe(false);
+    });
+
+    it.each([
+      "Implement and verify repository changes.",
+      "Writes code and verifies bug fixes.",
+      "Software implementation and testing.",
+    ])("accepts an affirmative implementation capability: %s", (capabilities) => {
+      expect(canExecuteRecoveryDelivery("repository_delivery", capabilities)).toBe(true);
+    });
+
+    it("does not constrain record-only recovery by implementation capabilities", () => {
+      expect(canExecuteRecoveryDelivery("record_only", null)).toBe(true);
     });
   });
 
@@ -561,7 +589,7 @@ const postgresSupport = await getEmbeddedPostgresTestSupport();
     await db.insert(agents).values([
       { id: managerId, companyId, name: "Manager", role: "cto", status: "idle", adapterType: "codex_local", permissions: { canAssignTasks: true } },
       { id: participantId, companyId, name: "Reviewer", role: "engineer", status: status === "budget_paused" ? "paused" : status === "over_budget" || status === "active_wake_fail" ? "active" : status as typeof agents.$inferInsert.status, pauseReason: status === "budget_paused" ? "budget" : null, reportsTo: managerId, adapterType: "codex_local" },
-      { id: authorId, companyId, name: "Author", role: "engineer", status: "idle", reportsTo: managerId, adapterType: "codex_local" },
+      { id: authorId, companyId, name: "Author", role: "engineer", status: "idle", reportsTo: managerId, adapterType: "codex_local", capabilities: "Implement and verify repository changes." },
     ]);
     const policy = normalizeIssueExecutionPolicy({ mode: "normal", stages: [{ id: stageId, type: "review", participants: [participant] }] });
     await db.insert(issues).values({ id: issueId, companyId, title: "Review pending", issueNumber: 1, identifier: "PRR-1", status: "in_review", assigneeAgentId: participantId, createdByAgentId: authorId, executionPolicy: policy ? { ...policy } : null, executionState: state, createdAt: old, updatedAt: old });
