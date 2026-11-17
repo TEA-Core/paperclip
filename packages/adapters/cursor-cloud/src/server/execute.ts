@@ -20,6 +20,7 @@ import {
   joinPromptSections,
   parseObject,
   readPaperclipIssueWorkModeFromContext,
+  hydrateFreshSessionHandoff,
   selectPaperclipPromptSections,
   selectInitialCommunicationGuidance,
   isPaperclipRecoveryWakePayload,
@@ -418,6 +419,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     context,
   };
   const instructions = await buildInstructionsPrefix(config, onLog, asString(workspace.cwd, ""));
+  await hydrateFreshSessionHandoff(ctx, { resumedSession: canReuseSession });
   const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(context, {
     resumedSession: canReuseSession,
     includeCommunicationGuidance: false,

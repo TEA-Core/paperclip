@@ -17,6 +17,7 @@ import { logger } from "../../middleware/logger.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { reportRunFailure } from "../run-failure-report.js";
 import { isNativeRunnerOwnershipHeld } from "./native-runner-ownership.js";
+import { nativeRestartInterruptedTurnId, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 
 export type NativeControllerIdentity = {
   bootId: string;
@@ -774,7 +775,8 @@ export async function claimNativeRestartRecoveries(input: {
         hasProviderEvidence,
         checkpointFailed:
           (checkpointRecord.terminal as Record<string, unknown> | undefined)
-            ?.runTerminalState === "failed",
+            ?.runTerminalState === "failed" &&
+          nativeRestartInterruptedTurnId(checkpointRecord as unknown as PersistedNativeSession) === null,
         providerAttempt: row.coordinator.attempt,
       });
       const ownershipChanged =
