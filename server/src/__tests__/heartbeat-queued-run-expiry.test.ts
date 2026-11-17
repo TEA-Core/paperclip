@@ -18,6 +18,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { issueService } from "../services/issues.ts";
 
@@ -323,35 +324,31 @@ describeEmbeddedPostgres("heartbeat queued-run age bound", () => {
     }));
   }
 
-  it("pages past 100+ non-expirable runs that share one created_at microsecond and still returns", { timeout: 60_000 }, async () => {
+  it("pages listed runs that share one created_at microsecond without re-reading a page", { timeout: 60_000 }, async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const oldest = Date.now() - QUEUED_RUN_BOUND_MS - 10 * HOUR_MS;
-    const blockerIssueId = await seedIssue(companyId, agentId, 1);
-    const blockers = oldQueuedRunRows({
-      companyId, agentId, issueId: blockerIssueId, count: 120, firstCreatedAtMs: oldest,
-      scheduledRetryAt: new Date(Date.now() + HOUR_MS),
-    });
-    await db.insert(heartbeatRuns).values(blockers);
-    // One insert transaction's timestamp: every blocker on the same
-    // microsecond, below the millisecond a JavaScript Date can carry.
+    const issueId = await seedIssue(companyId, agentId, 1);
+    const sameInstant = oldQueuedRunRows({ companyId, agentId, issueId, count: 120, firstCreatedAtMs: oldest });
+    await db.insert(heartbeatRuns).values(sameInstant);
+    // One insert transaction's timestamp: every run on the same microsecond,
+    // below the millisecond a JavaScript Date can carry.
     await db.execute(sql`
       update heartbeat_runs
       set created_at = to_timestamp(${Math.floor(oldest / 1000)}) + interval '123456 microseconds'
-      where id in (${sql.join(blockers.map((row) => sql`${row.id}::uuid`), sql`, `)})
+      where id in (${sql.join(sameInstant.map((row) => sql`${row.id}::uuid`), sql`, `)})
     `);
-    const staleIssueId = await seedIssue(companyId, agentId, 2);
-    const stale = oldQueuedRunRows({
-      companyId, agentId, issueId: staleIssueId, count: 20, firstCreatedAtMs: oldest + HOUR_MS,
-    });
-    await db.insert(heartbeatRuns).values(stale);
+    const adapter = createPostgresRunDispatchAdapter(db);
+    const now = new Date();
+    const listInput = { createdAtOrBefore: new Date(now.getTime() - QUEUED_RUN_BOUND_MS), now, limit: 100 };
 
-    const result = await heartbeatService(db).expireStaleQueuedRuns();
+    const first = await adapter.listExpiredQueuedRuns(listInput);
+    const second = await adapter.listExpiredQueuedRuns({ ...listInput, after: first.at(-1)!.cursor });
 
-    expect(result).toMatchObject({ expired: 20, pageCapReached: false });
-    expect([...result.runIds].sort()).toEqual(stale.map((row) => row.id).sort());
-    const blockerStatuses = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
-      .where(sql`${heartbeatRuns.id} in (${sql.join(blockers.map((row) => sql`${row.id}::uuid`), sql`, `)})`);
-    expect(new Set(blockerStatuses.map((row) => row.status))).toEqual(new Set(["queued"]));
+    expect(first).toHaveLength(100);
+    expect(second).toHaveLength(20);
+    const listed = [...first, ...second].map((candidate) => candidate.runId);
+    expect(new Set(listed).size).toBe(120);
+    expect([...listed].sort()).toEqual(sameInstant.map((row) => row.id).sort());
   });
 
   it("expires at most 100 runs per sweep and the rest on the next sweep", { timeout: 60_000 }, async () => {
@@ -371,6 +368,60 @@ describeEmbeddedPostgres("heartbeat queued-run age bound", () => {
     expect(second.expired).toBe(50);
     expect(second.runIds).toEqual(rows.slice(100).map((row) => row.id));
     expect(await expiryActivityRows()).toHaveLength(150);
+  });
+
+  it("reaches a newer expirable run on the first sweep behind 2,500 older runs it may not expire", { timeout: 120_000 }, async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const oldest = Date.now() - QUEUED_RUN_BOUND_MS - 48 * HOUR_MS;
+    // Shape 1: retry alarm still in the future.
+    const futureRetryIssueId = await seedIssue(companyId, agentId, 1);
+    const futureRetry = oldQueuedRunRows({
+      companyId, agentId, issueId: futureRetryIssueId, count: 1_250, firstCreatedAtMs: oldest,
+      scheduledRetryAt: new Date(Date.now() + HOUR_MS),
+    });
+    // Shape 2: the issue is held by another live (running) run.
+    const leasedIssueId = await seedIssue(companyId, agentId, 2);
+    const holderRunId = await seedRunningRun(companyId, agentId, leasedIssueId, new Date());
+    await db.update(issues).set({ executionRunId: holderRunId, executionLockedAt: new Date() })
+      .where(eq(issues.id, leasedIssueId));
+    const leased = oldQueuedRunRows({
+      companyId, agentId, issueId: leasedIssueId, count: 1_250, firstCreatedAtMs: oldest + 1_250,
+    });
+    for (let i = 0; i < 2_500; i += 500) {
+      await db.insert(heartbeatRuns).values([...futureRetry, ...leased].slice(i, i + 500));
+    }
+    const staleIssueId = await seedIssue(companyId, agentId, 3);
+    const stale = await seedQueuedLockHolder({
+      companyId,
+      agentId,
+      issueId: staleIssueId,
+      createdAt: new Date(Date.now() - QUEUED_RUN_BOUND_MS - HOUR_MS),
+    });
+
+    const result = await heartbeatService(db).expireStaleQueuedRuns();
+
+    expect(result).toEqual({ expired: 1, runIds: [stale.runId], pageCapReached: false });
+    expect((await readIssueLock(staleIssueId)).executionRunId).toBeNull();
+    const stillQueued = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"));
+    expect(stillQueued).toHaveLength(2_500);
+    expect((await readIssueLock(leasedIssueId)).executionRunId).toBe(holderRunId);
+  });
+
+  it("expires a paused agent's queued run past the bound, so a paused backlog cannot fill the scan", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+    const issueId = await seedIssue(companyId, agentId, 1);
+    const stale = await seedQueuedLockHolder({
+      companyId,
+      agentId,
+      issueId,
+      createdAt: new Date(Date.now() - QUEUED_RUN_BOUND_MS - HOUR_MS),
+    });
+
+    expect(await heartbeatService(db).expireStaleQueuedRuns())
+      .toEqual({ expired: 1, runIds: [stale.runId], pageCapReached: false });
+    expect((await readIssueLock(issueId)).executionRunId).toBeNull();
   });
 
   it("leaves a running run older than the bound untouched", async () => {

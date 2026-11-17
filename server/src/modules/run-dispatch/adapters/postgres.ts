@@ -1,7 +1,7 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
-import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -1197,6 +1197,12 @@ export function createPostgresRunDispatchAdapter(
     // Issue-bound queued runs only: those are the runs that hold an issue
     // execution lock. Paused companies dispatch nothing, so their queue is left
     // alone, matching resumeQueuedRuns.
+    //
+    // The last two predicates mirror the age rule's refusals in
+    // decideQueuedRunStaleness (retry alarm not yet due; issue held by another
+    // running run, as resolveLiveExecutionLeases reads it), so runs the policy
+    // will not expire never use the page budget and cannot hide newer stuck
+    // runs. The policy decision inside expireQueuedRun stays the authority.
     const rows = await db
       .select({
         id: heartbeatRuns.id,
@@ -1214,6 +1220,18 @@ export function createPostgresRunDispatchAdapter(
             ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${input.after.createdAtText}::timestamptz, ${input.after.runId}::uuid)`
             : undefined,
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' is not null`,
+          or(isNull(heartbeatRuns.scheduledRetryAt), lte(heartbeatRuns.scheduledRetryAt, input.now)),
+          sql`not exists (
+            select 1
+            from issues lease_issue
+            join heartbeat_runs lease_holder
+              on lease_holder.company_id = lease_issue.company_id
+             and lease_holder.status = 'running'
+             and lease_holder.id in (lease_issue.execution_run_id, lease_issue.checkout_run_id)
+            where lease_issue.company_id = ${heartbeatRuns.companyId}
+              and lease_issue.id::text = ${heartbeatRuns.contextSnapshot} ->> 'issueId'
+              and lease_holder.id <> ${heartbeatRuns.id}
+          )`,
         ),
       )
       .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))

@@ -70,6 +70,8 @@ export type ExpiredQueuedRunCursor = { createdAtText: string; runId: string };
 export type ListExpiredQueuedRunsInput = {
   /** Runs created at or before this instant are past the queued-run age bound. */
   createdAtOrBefore: Date;
+  /** Retry alarms due at or before this instant; a run with a later alarm is not listed. */
+  now: Date;
   limit: number;
   /** Only runs ordered strictly after this (created_at, id) position. */
   after?: ExpiredQueuedRunCursor;

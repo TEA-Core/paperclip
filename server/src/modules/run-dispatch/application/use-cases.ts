@@ -88,8 +88,9 @@ export function createExpireStaleQueuedRuns(deps: { expiry: QueuedRunExpiry }) {
     let pagesScanned = 0;
     let pageCapReached = false;
 
-    // Page past runs that are old but not expirable (active lease, future
-    // retry) so they cannot starve newer stuck runs behind them.
+    // The list query already drops runs the policy will not expire (future
+    // retry alarm, issue held by another running run). Paging covers the rest:
+    // a run whose verdict changes between the list and its locked decision.
     sweep: while (runIds.length < MAX_EXPIRED_QUEUED_RUNS_PER_SWEEP) {
       if (pagesScanned >= MAX_EXPIRY_PAGES_PER_SWEEP) {
         pageCapReached = true;
@@ -98,6 +99,7 @@ export function createExpireStaleQueuedRuns(deps: { expiry: QueuedRunExpiry }) {
       pagesScanned += 1;
       const page = await deps.expiry.listExpiredQueuedRuns({
         createdAtOrBefore,
+        now,
         limit: EXPIRY_PAGE_SIZE,
         after,
       });

@@ -1035,7 +1035,7 @@ The queued-run age bound (`MAX_QUEUED_ISSUE_RUN_AGE_MS`, 24 hours) covers a run 
 
 An expired legacy run records that provider work never started. Stranded-work recovery then treats its issue like any other lost wake: an ordinary assigned `todo` or `in_progress` issue gets a bounded dispatch or continuation retry, and an exhausted automatic continuation escalates as before. An expired automatic continuation whose chat-control source cannot be verified is not re-dispatched; its issue stays unlocked until the next wake.
 
-One pass expires at most 100 runs and reads at most 20 pages of 100 candidates, oldest first. Paging uses the stored `created_at` value and the run id, so runs that share one timestamp are read once. Runs past the bound that the pass does not reach wait for the next pass.
+One pass expires at most 100 runs and reads at most 20 pages of 100 candidates, oldest first. The candidate query leaves out runs the bound does not expire: a run whose retry alarm is in the future, and a run whose issue another running run holds. So older runs that must wait cannot fill the pages and hide a newer stuck run; it is reached on the first pass. Paging uses the stored `created_at` value and the run id, so runs that share one timestamp are read once. Runs past the bound that the pass does not reach wait for the next pass.
 
 Issues in `in_review` are not exempt. A queued approval, review, or wake run on an issue in review expires at the same 24-hour bound as any other queued run (owner decision 2026-11-17).
 
