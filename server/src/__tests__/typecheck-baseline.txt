@@ -1016,11 +1016,6 @@ server/src/__tests__/routines-service.test.ts(2813,7): TS2345
 server/src/__tests__/routines-service.test.ts(2899,61): TS2345
 server/src/__tests__/routines-service.test.ts(2944,43): TS2345
 server/src/__tests__/routines-service.test.ts(2954,61): TS2345
-server/src/__tests__/routines-service.test.ts(3015,54): TS2322
-server/src/__tests__/routines-service.test.ts(3101,56): TS2322
-server/src/__tests__/routines-service.test.ts(3102,57): TS2322
-server/src/__tests__/routines-service.test.ts(3120,54): TS2322
-server/src/__tests__/routines-service.test.ts(3141,34): TS2345
 server/src/__tests__/routines-service.test.ts(466,7): TS2741
 server/src/__tests__/routines-service.test.ts(506,40): TS2741
 server/src/__tests__/routines-service.test.ts(531,43): TS2345

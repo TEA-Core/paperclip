@@ -3004,6 +3004,9 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
   });
 
   describe("issue.created audit rows for routine-created cards (SUP-24205)", () => {
+    // The service accepts "schedule" at runtime; the exported input type only lists manual/api.
+    const scheduledRun = { source: "schedule" } as unknown as { source: "manual" };
+
     async function issueActivity(companyId: string, issueId: string, action: string) {
       const rows = await activityService(db).list({ companyId, entityId: issueId, limit: 100 });
       return rows.filter((row) => row.action === action);
@@ -3012,7 +3015,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     it("writes exactly one system issue.created row carrying the routine execution for a scheduled card", async () => {
       const { companyId, routine, svc } = await seedFixture();
 
-      const run = await svc.runRoutine(routine.id, { source: "schedule" });
+      const run = await svc.runRoutine(routine.id, scheduledRun);
 
       expect(run.status).toBe("issue_created");
       const issueId = run.linkedIssueId!;
@@ -3098,8 +3101,8 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     it("writes one row per card: a coalesced run adds none", async () => {
       const { routine, svc } = await seedFixture();
 
-      const first = await svc.runRoutine(routine.id, { source: "schedule" });
-      const second = await svc.runRoutine(routine.id, { source: "schedule" });
+      const first = await svc.runRoutine(routine.id, scheduledRun);
+      const second = await svc.runRoutine(routine.id, scheduledRun);
 
       expect(second.status).toBe("coalesced");
       expect(second.linkedIssueId).toBe(first.linkedIssueId);
@@ -3117,7 +3120,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
         },
       });
 
-      const run = await svc.runRoutine(routine.id, { source: "schedule" });
+      const run = await svc.runRoutine(routine.id, scheduledRun);
 
       expect(run.status).toBe("failed");
       const rows = await db
@@ -3138,7 +3141,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
         .where(eq(activityLog.entityId, run.linkedIssueId!));
 
       await expect(
-        svc.evaluateActivityGate(routine, new Date(windowStart.getTime() + 5_000)),
+        svc.evaluateActivityGate(routine as unknown as Parameters<typeof svc.evaluateActivityGate>[0], new Date(windowStart.getTime() + 5_000)),
       ).resolves.toMatchObject({ fire: false, matchedActivity: null });
     });
   });
