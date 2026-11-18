@@ -6,9 +6,7 @@ import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { and, eq, is, sql } from "drizzle-orm";
-import { getTableConfig, PgTable } from "drizzle-orm/pg-core";
-import * as dbExports from "@paperclipai/db";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -18,21 +16,19 @@ import {
   documentRevisions,
   documents,
   environmentLeases,
-  executionWorkspaceRuntimeLeases,
   executionWorkspaces,
   externalObjectMentions,
   externalObjects,
   heartbeatRuns,
-  instanceUserRoles,
   issueComments,
   issueDocuments,
   issues,
   issueWorkProducts,
+  instanceUserRoles,
   projectWorkspaces,
   projects,
   toolRuntimeSlots,
   workspaceOperations,
-  workspaceRuntimeServices,
   type Db,
 } from "@paperclipai/db";
 import {
@@ -46,12 +42,13 @@ import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
   evaluateDoneTransitionGuardForBackstopClose,
-  NO_WORKSPACE_REFERENCE_TABLES,
+  NO_WORKSPACE_RECORD_ONLY_CLOSE_REMEDY,
   type evaluateDoneTierDeclaration,
   type measureNoRepositoryLandingForClose,
 } from "../services/done-transition-guard.js";
 import type { recheckRecordedWorktree } from "../services/hardened-git-probe.js";
 import type { StorageService } from "../storage/types.js";
+import { issueService } from "../services/issues.js";
 
 // SUP-22570: the record_only no-repository close, end to end through
 // PATCH /api/issues/{id}, against a real Postgres and a real git checkout laid
@@ -266,8 +263,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
   async function insertRuling(input: {
     companyId: string;
     issueId: string;
-    authorAgentId?: string;
-    authorUserId?: string;
+    authorAgentId: string;
     body?: string;
     key?: string;
     linkCompanyId?: string;
@@ -281,18 +277,15 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       format: "markdown",
       latestBody: input.body ?? "Ruling: this card's deliverable is this recorded decision; no repository change.",
       latestRevisionNumber: 1,
-      createdByAgentId: input.authorAgentId ?? null,
-      updatedByAgentId: input.authorAgentId ?? null,
-      createdByUserId: input.authorUserId ?? null,
-      updatedByUserId: input.authorUserId ?? null,
+      createdByAgentId: input.authorAgentId,
+      updatedByAgentId: input.authorAgentId,
     });
     await db.insert(documentRevisions).values({
       companyId: input.documentCompanyId ?? input.companyId,
       documentId,
       revisionNumber: 1,
       body: input.body ?? "Ruling: this card's deliverable is this recorded decision; no repository change.",
-      createdByAgentId: input.authorAgentId ?? null,
-      createdByUserId: input.authorUserId ?? null,
+      createdByAgentId: input.authorAgentId,
     });
     await db.insert(issueDocuments).values({
       companyId: input.linkCompanyId ?? input.companyId,
@@ -747,7 +740,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(res.body.error).toContain("a no-repository close carries no repository evidence");
   });
 
-  async function insertPullRequestProduct(fixture: Pick<SeededIssue, "companyId" | "issueId">, metadata?: Record<string, unknown>) {
+  async function insertPullRequestProduct(fixture: SeededIssue, metadata?: Record<string, unknown>) {
     await db.insert(issueWorkProducts).values({
       companyId: fixture.companyId,
       issueId: fixture.issueId,
@@ -1947,14 +1940,19 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(verdict).toMatchObject({ allowed: false, code: "done_transition_missing_tier_declaration" });
   });
 
-  // SUP-24547: a record_only card with no project, no project workspace and no
-  // execution workspace, that the control plane shows never had one, closes
-  // with the no-repository form without a worktree. Every neighbouring shape
-  // keeps today's refusal.
-  describe("a card that never had an execution workspace (SUP-24547)", () => {
+  // SUP-24547: a record_only card with no project and no execution workspace
+  // keeps the refusal of an agent's no-repository close; only its remedy says
+  // that a board user closes the card. Every shape the earlier review rounds
+  // built keeps that refusal, whatever the card's history holds.
+  describe("a record_only card with no project and no execution workspace (SUP-24547)", () => {
     const NO_WORKSPACE_REFUSAL = `Tier 1 "no-repository-landing" requires this issue's own execution workspace.`;
+    const PINNED_REMEDY =
+      "This record_only card has no project and no execution workspace, so an agent's close cannot carry a no-repository proof: " +
+      "there is no worktree to measure. An authorized board user closes this card: PATCH /api/issues/{id} " +
+      '{ "status": "done" } as a board user, with a comment that records the ruling.';
+    const BOARD_USER_ID = "cloud-user-1";
 
-    interface NoWorkspaceIssue {
+    interface Card {
       companyId: string;
       closerAgentId: string;
       rulerAgentId: string;
@@ -1969,512 +1967,138 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       return projectId;
     }
 
-    async function insertWorkspace(
-      companyId: string,
-      options: { sourceIssueId?: string | null; status?: string; projectId?: string } = {},
-    ) {
-      const projectId = options.projectId ?? (await insertProject(companyId));
+    async function insertWorkspace(companyId: string, sourceIssueId: string | null = null, status = "active") {
+      const projectId = await insertProject(companyId);
       const workspaceId = randomUUID();
       await db.insert(executionWorkspaces).values({
         id: workspaceId,
         companyId,
         projectId,
-        sourceIssueId: options.sourceIssueId ?? null,
+        sourceIssueId,
         mode: "isolated_workspace",
         strategyType: "git_worktree",
         providerType: "git_worktree",
         name: "prior-workspace",
-        status: options.status ?? "active",
+        status,
       });
       return { projectId, workspaceId };
     }
 
-    /** A record_only card with no project and no workspace, held by the closer, on a run that named no workspace. */
-    async function seedNoWorkspace(
-      options: {
-        deliveryRequirement?: "record_only" | "repository_delivery";
-        withProject?: boolean;
-        withProjectWorkspace?: boolean;
-      } = {},
-    ): Promise<NoWorkspaceIssue> {
+    /** A record_only card with no project and no workspace, held by the closer in a running run, with a ruling another agent wrote. */
+    async function seedCard(deliveryRequirement: "record_only" | "repository_delivery" = "record_only"): Promise<Card> {
       seedSequence += 1;
       const prefix = `NWS${seedSequence}`;
       const companyId = await insertCompany(prefix);
       const closerAgentId = await insertAgent(companyId, "Closer");
       const rulerAgentId = await insertAgent(companyId, "Ruler");
-      let projectId: string | null = null;
-      let projectWorkspaceId: string | null = null;
-      if (options.withProject || options.withProjectWorkspace) {
-        projectId = await insertProject(companyId);
-      }
-      if (options.withProjectWorkspace) {
-        projectWorkspaceId = randomUUID();
-        await db.insert(projectWorkspaces).values({
-          id: projectWorkspaceId,
-          companyId,
-          projectId: projectId!,
-          name: "Primary",
-          repoUrl: "https://github.com/TEA-Core/records",
-          isPrimary: true,
-        });
-      }
       const issueId = randomUUID();
       const identifier = `${prefix}-1`;
       await db.insert(issues).values({
         id: issueId,
         companyId,
-        projectId: options.withProjectWorkspace ? null : projectId,
-        projectWorkspaceId,
         identifier,
         title: "Record the ruling",
         status: "in_progress",
         priority: "medium",
         assigneeAgentId: closerAgentId,
-        createdByUserId: "cloud-user-1",
-        executionWorkspaceId: null,
-        deliveryRequirement: options.deliveryRequirement ?? "record_only",
+        createdByUserId: BOARD_USER_ID,
+        deliveryRequirement,
       });
+      await insertRuling({ companyId, issueId, authorAgentId: rulerAgentId });
       const runId = randomUUID();
-      await db.insert(heartbeatRuns).values({
-        id: runId,
-        companyId,
-        agentId: closerAgentId,
-        status: "running",
-        contextSnapshot: { issueId },
-      });
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId: closerAgentId, status: "running", contextSnapshot: { issueId } });
       currentActor = { type: "agent", agentId: closerAgentId, companyId, source: "agent_key", runId };
       return { companyId, closerAgentId, rulerAgentId, issueId, identifier, actor: currentActor };
     }
 
-    // An owner of the company: the board user who writes the ruling.
-    const BOARD_USER_ID = "cloud-user-1";
-
-    async function seedAdmissible(options: Parameters<typeof seedNoWorkspace>[0] = {}) {
-      const fixture = await seedNoWorkspace(options);
-      const rulingId = await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorUserId: BOARD_USER_ID });
-      return { ...fixture, rulingId };
-    }
-
-    async function expectRefused(fixture: NoWorkspaceIssue, res: request.Response, expected: string) {
+    async function expectAgentCloseRefused(card: Card) {
+      currentActor = card.actor;
+      const verifiedBefore = await activityCount(card.issueId, "issue.done_transition_no_repository_landing_verified");
+      const res = await close(card.identifier);
       expect(res.status, JSON.stringify(res.body)).toBe(422);
-      expect(res.body.error).toBe(expected);
-      expect(await statusOf(fixture.issueId)).toBe("in_progress");
-      expect(await activityCount(fixture.issueId, "issue.done_transition_no_repository_landing_verified")).toBe(0);
+      expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+      expect(res.body.error).toBe(NO_WORKSPACE_REFUSAL);
+      expect(await statusOf(card.issueId)).toBe("in_progress");
+      expect(await activityCount(card.issueId, "issue.done_transition_no_repository_landing_verified")).toBe(verifiedBefore);
+      return res;
     }
 
-    it("closes the card on the independent ruling alone, records the proof used, and makes no repository call", async () => {
-      const fixture = await seedAdmissible();
+    it("refuses the holder's close as before and names the board close in the remedy", async () => {
+      const card = await seedCard();
 
-      const res = await close(fixture.identifier);
+      const res = await expectAgentCloseRefused(card);
 
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(await statusOf(fixture.issueId)).toBe("done");
-      const verified = await activityRows(fixture.issueId, "issue.done_transition_no_repository_landing_verified");
-      expect(verified).toHaveLength(1);
-      expect(verified[0]!.details).toEqual({
-        proof: "never_had_execution_workspace",
-        rulingDocumentId: fixture.rulingId,
-        rulingRevisionNumber: 1,
-        projectId: null,
-        projectWorkspaceId: null,
-        executionWorkspaceId: null,
-        checkedRecords: expect.arrayContaining([
-          "external_object_mentions (none)",
-          "issue_comments (none deleted, no repository reference)",
-          "documents of the issue (every revision, no repository reference)",
-        ]),
-      });
-      const bodies = await db
+      expect(NO_WORKSPACE_RECORD_ONLY_CLOSE_REMEDY).toBe(PINNED_REMEDY);
+      expect(res.body.details.remedy).toBe(PINNED_REMEDY);
+      expect(mockGhFetch).not.toHaveBeenCalled();
+      const remedyComments = await db
         .select({ body: issueComments.body })
         .from(issueComments)
-        .where(eq(issueComments.issueId, fixture.issueId))
-        .then((rows) => rows.map((row) => row.body));
-      expect(bodies.some((body) => body.includes("Closed at Tier 1 (landed, not liveness-probed): no-repository-landing"))).toBe(true);
-      expect(mockGhFetch).not.toHaveBeenCalled();
-      expect(mockRecheckRecordedWorktree).not.toHaveBeenCalled();
+        .where(eq(issueComments.issueId, card.issueId))
+        .then((rows) => rows.filter((row) => row.body.includes(PINNED_REMEDY)));
+      expect(remedyComments).toHaveLength(1);
     });
 
-    it.each([
-      ["has a project", { withProject: true }],
-      ["has a project workspace", { withProjectWorkspace: true }],
-    ] as const)("keeps today's refusal for a card that %s", async (_label, options) => {
-      const fixture = await seedNoWorkspace(options);
-      await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    it("keeps the existing remedy, byte for byte, on a card with a project or a project workspace", async () => {
+      const reference = await seed();
+      const referenceRes = await close(reference.identifier);
+      expect(referenceRes.status, JSON.stringify(referenceRes.body)).toBe(422);
+      const existingRemedy = referenceRes.body.details.remedy as string;
+      expect(existingRemedy).not.toBe(PINNED_REMEDY);
 
-      await expectRefused(fixture, await close(fixture.identifier), NO_WORKSPACE_REFUSAL);
+      const withProject = await seedCard();
+      await db.update(issues).set({ projectId: await insertProject(withProject.companyId) }).where(eq(issues.id, withProject.issueId));
+      expect((await expectAgentCloseRefused(withProject)).body.details.remedy).toBe(existingRemedy);
+
+      const withProjectWorkspace = await seedCard();
+      const projectId = await insertProject(withProjectWorkspace.companyId);
+      const projectWorkspaceId = randomUUID();
+      await db.insert(projectWorkspaces).values({
+        id: projectWorkspaceId,
+        companyId: withProjectWorkspace.companyId,
+        projectId,
+        name: "Primary",
+        isPrimary: true,
+      });
+      await db.update(issues).set({ projectWorkspaceId }).where(eq(issues.id, withProjectWorkspace.issueId));
+      expect((await expectAgentCloseRefused(withProjectWorkspace)).body.details.remedy).toBe(existingRemedy);
     });
 
-    it("keeps refusing a repository_delivery card with no workspace", async () => {
-      const fixture = await seedNoWorkspace({ deliveryRequirement: "repository_delivery" });
-      await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    it("keeps the repository_delivery refusal and its reclassify remedy", async () => {
+      const card = await seedCard("repository_delivery");
+      currentActor = card.actor;
 
-      const res = await close(fixture.identifier);
-
-      await expectRefused(fixture, res, `Tier 1 "no-repository-landing" is accepted only on a record_only issue.`);
-      expect(res.body.details.remedy).toContain("authorized board user");
-    });
-
-    it("keeps refusing a card bound to an execution workspace it does not own", async () => {
-      const fixture = await seedNoWorkspace();
-      await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
-      const { workspaceId } = await insertWorkspace(fixture.companyId);
-      await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, fixture.issueId));
-
-      await expectRefused(
-        fixture,
-        await close(fixture.identifier),
-        `Tier 1 "no-repository-landing" requires an execution workspace this issue owns in this company.`,
-      );
-    });
-
-    // Each record on its own: removing any one of these checks admits a card
-    // that had a workspace.
-    it.each([
-      ["an owned workspace that was closed", async (fixture: NoWorkspaceIssue) => {
-        await insertWorkspace(fixture.companyId, { sourceIssueId: fixture.issueId, status: "closed" });
-      }],
-      ["an owned workspace that was archived", async (fixture: NoWorkspaceIssue) => {
-        await insertWorkspace(fixture.companyId, { sourceIssueId: fixture.issueId, status: "archived" });
-      }],
-      ["an owned workspace whose cleanup failed", async (fixture: NoWorkspaceIssue) => {
-        await insertWorkspace(fixture.companyId, { sourceIssueId: fixture.issueId, status: "cleanup_failed" });
-      }],
-      ["a provisioning operation that named a workspace", async (fixture: NoWorkspaceIssue) => {
-        const { workspaceId } = await insertWorkspace(fixture.companyId);
-        await db.insert(workspaceOperations).values({
-          companyId: fixture.companyId,
-          executionWorkspaceId: workspaceId,
-          issueId: fixture.issueId,
-          phase: "worktree_prepare",
-          status: "succeeded",
-        });
-      }],
-      ["a run whose context named a workspace that no longer exists", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(heartbeatRuns).values({
-          companyId: fixture.companyId,
-          agentId: fixture.closerAgentId,
-          status: "succeeded",
-          contextSnapshot: { issueId: fixture.issueId, executionWorkspaceId: randomUUID() },
-        });
-      }],
-      ["an audit row of a workspace bind that was later undone", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(activityLog).values({
-          companyId: fixture.companyId,
-          actorType: "agent",
-          actorId: fixture.closerAgentId,
-          action: "issue.updated",
-          entityType: "issue",
-          entityId: fixture.issueId,
-          details: { changes: { executionWorkspaceId: { from: randomUUID(), to: null } } },
-        });
-      }],
-      ["a work product recorded against a workspace", async (fixture: NoWorkspaceIssue) => {
-        const { workspaceId } = await insertWorkspace(fixture.companyId);
-        await db.insert(issueWorkProducts).values({
-          companyId: fixture.companyId,
-          issueId: fixture.issueId,
-          executionWorkspaceId: workspaceId,
-          type: "document",
-          provider: "paperclip",
-          title: "Notes",
-          status: "active",
-        });
-      }],
-    ] as const)("keeps today's refusal for a card with %s", async (_label, record) => {
-      const fixture = await seedAdmissible();
-      await record(fixture);
-
-      await expectRefused(fixture, await close(fixture.identifier), NO_WORKSPACE_REFUSAL);
-    });
-
-    it("keeps today's refusal for a card whose holder detached its own workspace and project", async () => {
-      const fixture = await seed();
-      await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
-
-      const detach = await request(app)
-        .patch(`/api/issues/${fixture.identifier}`)
-        .send({ executionWorkspaceId: null, projectWorkspaceId: null, projectId: null });
-      expect(detach.status, JSON.stringify(detach.body)).toBe(200);
-      const detached = await db.select().from(issues).where(eq(issues.id, fixture.issueId)).then((rows) => rows[0]!);
-      expect(detached).toMatchObject({ projectId: null, projectWorkspaceId: null, executionWorkspaceId: null });
-
-      const res = await close(fixture.identifier);
+      const res = await close(card.identifier);
 
       expect(res.status, JSON.stringify(res.body)).toBe(422);
-      expect(res.body.error).toBe(NO_WORKSPACE_REFUSAL);
-      expect(await statusOf(fixture.issueId)).toBe("in_progress");
+      expect(res.body.error).toBe(`Tier 1 "no-repository-landing" is accepted only on a record_only issue.`);
+      expect(res.body.details.remedy).toContain("authorized board user to reclassify it");
     });
 
-    it.each([
-      ["mentions a GitHub pull request", async (fixture: NoWorkspaceIssue) => {
-        const [object] = await db
-          .insert(externalObjects)
-          .values({
-            companyId: fixture.companyId,
-            providerKey: "github",
-            objectType: "pull_request",
-            externalId: "TEA-Core/other#pull/77",
-            data: { state: "open" },
-          })
-          .returning({ id: externalObjects.id });
-        await db.insert(externalObjectMentions).values({
-          companyId: fixture.companyId,
-          sourceIssueId: fixture.issueId,
-          sourceKind: "comment",
-          objectId: object!.id,
-          providerKey: "github",
-          objectType: "pull_request",
-        });
-      }, `Tier 1 "no-repository-landing" cannot be declared on an issue that mentions an external object (github pull_request).`],
-      ["records a pull request work product", async (fixture: NoWorkspaceIssue) => {
-        await insertPullRequestProduct(fixture);
-      }, `Tier 1 "no-repository-landing" cannot be declared on an issue that records a repository work product (pull_request).`],
-    ] as const)("refuses a card that %s", async (_label, link, expected) => {
-      const fixture = await seedAdmissible();
-      await link(fixture);
-
-      await expectRefused(fixture, await close(fixture.identifier), expected);
-    });
-
-    it.each([
-      ["no ruling", async (_fixture: NoWorkspaceIssue) => {}, `Tier 1 "no-repository-landing" requires a non-empty "entry-ruling" document on this issue.`],
-      ["a ruling the closer wrote", async (fixture: NoWorkspaceIssue) => {
-        await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.closerAgentId });
-      }, `Tier 1 "no-repository-landing" requires an "entry-ruling" document written by someone other than the closing actor; the closer wrote at least one revision of it.`],
-      ["a placeholder ruling", async (fixture: NoWorkspaceIssue) => {
-        await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId, body: "TODO" });
-      }, `Tier 1 "no-repository-landing" requires an "entry-ruling" document that states a ruling; this one is a placeholder (it opens with the placeholder "todo").`],
-    ] as const)("refuses a card with %s", async (_label, rule, expected) => {
-      const fixture = await seedNoWorkspace();
-      await rule(fixture);
-
-      await expectRefused(fixture, await close(fixture.identifier), expected);
-    });
-
-    it("refuses a declaration that names another card", async () => {
-      const fixture = await seedAdmissible();
-
-      const res = await close(fixture.identifier, { ...NO_REPOSITORY_DONE_TIER, reason: "Settled together with OTHER-7" });
-
-      expect(res.status, JSON.stringify(res.body)).toBe(422);
-      expect(res.body.error).toContain("the declaration names another card (OTHER-7)");
-      expect(await statusOf(fixture.issueId)).toBe("in_progress");
-    });
-
-    it("does not let an agent that does not hold the card close it", async () => {
-      const fixture = await seedAdmissible();
-      const outsiderId = await insertAgent(fixture.companyId, "Outsider");
-      currentActor = { type: "agent", agentId: outsiderId, companyId: fixture.companyId, source: "agent_key" } as Express.Request["actor"];
-
-      const res = await close(fixture.identifier);
-
-      expect(res.status, JSON.stringify(res.body)).toBe(403);
-      expect(await statusOf(fixture.issueId)).toBe("in_progress");
-    });
-
-    it("refuses a close request that also attaches a project", async () => {
-      const fixture = await seedAdmissible();
-      const projectId = await insertProject(fixture.companyId);
+    it("still lets a board user close the card", async () => {
+      const card = await seedCard();
+      currentActor = { type: "board", userId: BOARD_USER_ID, source: "local_implicit" } as Express.Request["actor"];
 
       const res = await request(app)
-        .patch(`/api/issues/${fixture.identifier}`)
-        .send({ status: "done", doneTier: NO_REPOSITORY_DONE_TIER, projectId });
+        .patch(`/api/issues/${card.identifier}`)
+        .send({ status: "done", comment: "Board ruling recorded; closing." });
 
-      await expectRefused(fixture, res, `Tier 1 "no-repository-landing" cannot ride a request that changes the issue's project.`);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(card.issueId)).toBe("done");
     });
 
-    it.each([
-      ["the card is bound to a workspace", async (fixture: NoWorkspaceIssue) => {
-        const { workspaceId } = await insertWorkspace(fixture.companyId);
-        await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, fixture.issueId));
-      }, `Tier 1 "no-repository-landing" refused: the issue's execution workspace changed after the declaration was checked.`],
-      ["the card gains a project", async (fixture: NoWorkspaceIssue) => {
-        const projectId = await insertProject(fixture.companyId);
-        await db.update(issues).set({ projectId }).where(eq(issues.id, fixture.issueId));
-      }, `Tier 1 "no-repository-landing" refused: the issue's workspace binding changed after the close was measured.`],
-      ["a run provisions a workspace for the card", async (fixture: NoWorkspaceIssue) => {
-        await insertWorkspace(fixture.companyId, { sourceIssueId: fixture.issueId });
-      }, NO_WORKSPACE_REFUSAL],
-      ["the board revises the ruling", async (fixture: NoWorkspaceIssue) => {
-        const [document] = await db
-          .select({ id: issueDocuments.documentId })
-          .from(issueDocuments)
-          .where(eq(issueDocuments.issueId, fixture.issueId));
-        await db.update(documents).set({ latestRevisionNumber: 2, updatedAt: new Date() }).where(eq(documents.id, document!.id));
-        await db.insert(documentRevisions).values({
-          companyId: fixture.companyId,
-          documentId: document!.id,
-          revisionNumber: 2,
-          body: "Ruling: the deliverable is this decision, restated by the board.",
-          createdByUserId: BOARD_USER_ID,
-        });
-      }, `Tier 1 "no-repository-landing" refused: the "entry-ruling" document changed after the close was measured.`],
-    ] as const)("refuses at the status write when %s after the measurement", async (_label, mutate, expected) => {
-      const fixture = await seedAdmissible();
-      mockMeasureNoRepositoryLanding.mockImplementation(async (...args: Parameters<typeof measureNoRepositoryLandingForClose>) => {
-        const verdict = await realMeasureNoRepositoryLandingRef.current!(...args);
-        expect(verdict.ok, JSON.stringify(verdict)).toBe(true);
-        await mutate(fixture);
-        return verdict;
-      });
-
-      await expectRefused(fixture, await close(fixture.identifier), expected);
-    });
-
-    // ── Round 2: every shape below closed at the first head and is refused
-    // now. Each names the check that refuses it.
-
-    function asBoard() {
-      currentActor = { type: "board", userId: BOARD_USER_ID, source: "local_implicit" } as Express.Request["actor"];
+    async function insertRun(card: Card, values: Partial<typeof heartbeatRuns.$inferInsert>) {
+      await db.insert(heartbeatRuns).values({ companyId: card.companyId, agentId: card.closerAgentId, status: "succeeded", ...values });
     }
 
-    async function attachProject(fixture: NoWorkspaceIssue, withProjectWorkspace: boolean) {
-      const projectId = await insertProject(fixture.companyId);
-      let projectWorkspaceId: string | null = null;
-      if (withProjectWorkspace) {
-        projectWorkspaceId = randomUUID();
-        await db.insert(projectWorkspaces).values({
-          id: projectWorkspaceId,
-          companyId: fixture.companyId,
-          projectId,
-          name: "Primary",
-          repoUrl: "https://example.invalid/records",
-          isPrimary: true,
-        });
-      }
-      await db.update(issues).set({ projectId, projectWorkspaceId }).where(eq(issues.id, fixture.issueId));
-    }
-
-    it.each([
-      ["the project", false, { projectId: null }],
-      ["the project and its project workspace", true, { projectId: null, projectWorkspaceId: null }],
-    ] as const)("keeps today's refusal after the holder strips %s in one request and closes in the next", async (_label, withProjectWorkspace, strip) => {
-      const fixture = await seedAdmissible();
-      await attachProject(fixture, withProjectWorkspace);
-
-      const stripped = await request(app).patch(`/api/issues/${fixture.identifier}`).send(strip);
-      expect(stripped.status, JSON.stringify(stripped.body)).toBe(200);
-      expect(stripped.body).toMatchObject({ projectId: null, projectWorkspaceId: null, executionWorkspaceId: null });
-
-      await expectRefused(fixture, await close(fixture.identifier), NO_WORKSPACE_REFUSAL);
-    });
-
-    it.each([
-      ["after the holder also strips its project", true],
-      ["on a card that never had a project", false],
-    ] as const)("keeps today's refusal for a board reclassification from repository_delivery %s", async (_label, hadProject) => {
-      const fixture = await seedAdmissible({ deliveryRequirement: "repository_delivery" });
-      if (hadProject) await attachProject(fixture, false);
-      asBoard();
-      const flipped = await request(app)
-        .patch(`/api/issues/${fixture.identifier}`)
-        .send({ deliveryRequirement: "record_only" });
-      expect(flipped.status, JSON.stringify(flipped.body)).toBe(200);
-      currentActor = fixture.actor;
-      if (hadProject) {
-        const stripped = await request(app).patch(`/api/issues/${fixture.identifier}`).send({ projectId: null });
-        expect(stripped.status, JSON.stringify(stripped.body)).toBe(200);
-      }
-
-      await expectRefused(fixture, await close(fixture.identifier), NO_WORKSPACE_REFUSAL);
-    });
-
-    it.each([
-      ["an environment lease that named a workspace", async (fixture: NoWorkspaceIssue) => {
-        const { workspaceId } = await insertWorkspace(fixture.companyId);
-        await db.insert(environmentLeases).values({
-          companyId: fixture.companyId,
-          executionWorkspaceId: workspaceId,
-          issueId: fixture.issueId,
-          status: "released",
-        });
-      }],
-      ["an audit row that names a project workspace while its executionWorkspaceId is null", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(activityLog).values({
-          companyId: fixture.companyId,
-          actorType: "agent",
-          actorId: fixture.closerAgentId,
-          action: "issue.updated",
-          entityType: "issue",
-          entityId: fixture.issueId,
-          details: {
-            executionWorkspaceId: null,
-            workspaceChange: {
-              from: { label: "No workspace", projectWorkspaceId: null, executionWorkspaceId: null, mode: null },
-              to: { label: "Primary", projectWorkspaceId: randomUUID(), executionWorkspaceId: null, mode: "shared_workspace" },
-            },
-          },
-        });
-      }],
-      ["a run whose nested context named an execution workspace", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(heartbeatRuns).values({
-          companyId: fixture.companyId,
-          agentId: fixture.closerAgentId,
-          status: "succeeded",
-          contextSnapshot: { issueId: fixture.issueId, paperclipWorkspace: { executionWorkspaceId: randomUUID() } },
-        });
-      }],
-      ["a run that ran in a project workspace", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(heartbeatRuns).values({
-          companyId: fixture.companyId,
-          agentId: fixture.closerAgentId,
-          status: "succeeded",
-          contextSnapshot: {
-            paperclipIssue: { id: fixture.issueId },
-            paperclipWorkspace: { cwd: "/srv/checkout", projectId: randomUUID(), workspaceId: randomUUID() },
-          },
-        });
-      }],
-      ["a runtime service started for it", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(workspaceRuntimeServices).values({
-          id: randomUUID(),
-          companyId: fixture.companyId,
-          issueId: fixture.issueId,
-          scopeType: "execution_workspace",
-          serviceName: "preview",
-          status: "stopped",
-          lifecycle: "ephemeral",
-          provider: "local_process",
-        });
-      }],
-      ["a workspace runtime lease it owned", async (fixture: NoWorkspaceIssue) => {
-        const { workspaceId } = await insertWorkspace(fixture.companyId);
-        await db.insert(executionWorkspaceRuntimeLeases).values({
-          companyId: fixture.companyId,
-          executionWorkspaceId: workspaceId,
-          ownerKey: `issue:${fixture.issueId}`,
-          ownerIssueId: fixture.issueId,
-          lastAction: "released",
-          expiresAt: new Date(),
-        });
-      }],
-      ["a work product recorded against a project", async (fixture: NoWorkspaceIssue) => {
-        const projectId = await insertProject(fixture.companyId);
-        await db.insert(issueWorkProducts).values({
-          companyId: fixture.companyId,
-          projectId,
-          issueId: fixture.issueId,
-          type: "document",
-          provider: "paperclip",
-          title: "Notes",
-          status: "active",
-        });
-      }],
-    ] as const)("keeps today's refusal for a card with %s", async (_label, record) => {
-      const fixture = await seedAdmissible();
-      await record(fixture);
-
-      await expectRefused(fixture, await close(fixture.identifier), NO_WORKSPACE_REFUSAL);
-    });
-
-    async function insertMention(fixture: NoWorkspaceIssue, providerKey: string, objectType: string, externalId: string) {
+    async function insertMention(card: Card, providerKey: string, objectType: string, externalId: string) {
       const [object] = await db
         .insert(externalObjects)
-        .values({ companyId: fixture.companyId, providerKey, objectType, externalId, data: { state: "merged" } })
+        .values({ companyId: card.companyId, providerKey, objectType, externalId, data: { state: "merged" } })
         .returning({ id: externalObjects.id });
       await db.insert(externalObjectMentions).values({
-        companyId: fixture.companyId,
-        sourceIssueId: fixture.issueId,
+        companyId: card.companyId,
+        sourceIssueId: card.issueId,
         sourceKind: "comment",
         objectId: object!.id,
         providerKey,
@@ -2482,456 +2106,158 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       });
     }
 
-    async function insertComment(fixture: NoWorkspaceIssue, body: string) {
-      await db.insert(issueComments).values({
-        companyId: fixture.companyId,
-        issueId: fixture.issueId,
-        authorAgentId: fixture.closerAgentId,
-        body,
-      });
-    }
-
-    it.each([
-      ["a comment that carries a pull request URL with no mention record", async (fixture: NoWorkspaceIssue) => {
-        await insertComment(fixture, "Landed in https://github.com/TEA-Core/records/pull/12 earlier today.");
-      }, `Tier 1 "no-repository-landing" cannot be declared on an issue whose thread cites repository work (a pull request URL).`],
-      ["a comment that carries a GitLab merge request URL", async (fixture: NoWorkspaceIssue) => {
-        await insertComment(fixture, "See https://gitlab.example.com/team/records/-/merge_requests/4 for the change.");
-      }, `Tier 1 "no-repository-landing" cannot be declared on an issue whose thread cites repository work (a merge request URL).`],
-      ["a description that cites a pull request number", async (fixture: NoWorkspaceIssue) => {
-        await db.update(issues).set({ description: "Follow-up of PR #77." }).where(eq(issues.id, fixture.issueId));
-      }, `Tier 1 "no-repository-landing" cannot be declared on an issue whose thread cites repository work (a pull request number).`],
-      ["a pull request mention with a non-canonical external id", async (fixture: NoWorkspaceIssue) => {
-        await insertMention(fixture, "github", "pull_request", "records-pr-twelve");
-      }, `Tier 1 "no-repository-landing" cannot be declared on an issue that mentions an external object (github pull_request).`],
-      ["a GitLab merge request mention", async (fixture: NoWorkspaceIssue) => {
-        await insertMention(fixture, "gitlab", "merge_request", "team/records!4");
-      }, `Tier 1 "no-repository-landing" cannot be declared on an issue that mentions an external object (gitlab merge_request).`],
-      ["a branch work product", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(issueWorkProducts).values({
-          companyId: fixture.companyId,
-          issueId: fixture.issueId,
-          type: "branch",
-          provider: "github",
-          title: "records-ruling",
-          status: "active",
-        });
-      }, `Tier 1 "no-repository-landing" cannot be declared on an issue that records a repository work product (branch).`],
-      ["a commit work product", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(issueWorkProducts).values({
-          companyId: fixture.companyId,
-          issueId: fixture.issueId,
-          type: "commit",
-          provider: "github",
-          title: "Record the ruling",
-          status: "active",
-        });
-      }, `Tier 1 "no-repository-landing" cannot be declared on an issue that records a repository work product (commit).`],
-    ] as const)("refuses a card with %s", async (_label, record, expected) => {
-      const fixture = await seedAdmissible();
-      await record(fixture);
-
-      await expectRefused(fixture, await close(fixture.identifier), expected);
-    });
-
-    const BOARD_AUTHOR_REFUSAL =
-      `Tier 1 "no-repository-landing" requires an "entry-ruling" document whose every revision was written by a board member of this company ` +
-      "(an active, non-viewer member) when the issue has no execution workspace.";
-
-    it.each([
-      ["a second agent of the company", async (fixture: NoWorkspaceIssue) => {
-        await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
-      }],
-      ["an agent of another company", async (fixture: NoWorkspaceIssue) => {
-        const otherCompanyId = await insertCompany(`NWX${seedSequence}`);
-        const foreignAgentId = await insertAgent(otherCompanyId, "Foreign");
-        await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: foreignAgentId });
-      }],
-      ["a user who is not a member of the company", async (fixture: NoWorkspaceIssue) => {
-        await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorUserId: "outside-user-1" });
-      }],
-      ["a viewer member of the company", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(companyMemberships).values({
-          companyId: fixture.companyId,
-          principalType: "user",
-          principalId: "viewer-user-1",
-          status: "active",
-          membershipRole: "viewer",
-          updatedAt: new Date(),
-        });
-        await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorUserId: "viewer-user-1" });
-      }],
-      ["a board user, with a later revision by an agent", async (fixture: NoWorkspaceIssue) => {
-        const documentId = await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorUserId: BOARD_USER_ID });
-        await db.insert(documentRevisions).values({
-          companyId: fixture.companyId,
-          documentId,
-          revisionNumber: 2,
-          body: "Ruling: restated by an agent of the company.",
-          createdByAgentId: fixture.rulerAgentId,
-        });
-      }],
-      ["an instance admin who is not a member of the company", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(instanceUserRoles).values({ userId: `admin-${fixture.companyId}`, role: "instance_admin" });
-        await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorUserId: `admin-${fixture.companyId}` });
-      }],
-    ] as const)("refuses a ruling written by %s", async (_label, rule) => {
-      const fixture = await seedNoWorkspace();
-      await rule(fixture);
-
-      await expectRefused(fixture, await close(fixture.identifier), BOARD_AUTHOR_REFUSAL);
-    });
-
-    it("reads the card's history before its ruling", async () => {
-      const fixture = await seedNoWorkspace();
-      await insertPullRequestProduct(fixture);
-
-      await expectRefused(
-        fixture,
-        await close(fixture.identifier),
-        `Tier 1 "no-repository-landing" cannot be declared on an issue that records a repository work product (pull_request).`,
-      );
-    });
-
-    // ── Round 3: the proof reads only what cannot be scrubbed. Each cell below
-    // admitted at the round-2 head.
-
-    const THREAD_CITES = (label: string) =>
-      `Tier 1 "no-repository-landing" cannot be declared on an issue whose thread cites repository work (${label}).`;
-    const HISTORY_CITES = (label: string) =>
-      `Tier 1 "no-repository-landing" cannot be declared on an issue whose history cites repository work (${label}).`;
-    const DELETED_COMMENT_REFUSAL =
-      `Tier 1 "no-repository-landing" cannot be declared on an issue with a deleted comment: its text can no longer be checked for repository work.`;
-    const TRUNCATED_HISTORY_REFUSAL =
-      `Tier 1 "no-repository-landing" cannot be declared on an issue whose recorded title or description history is truncated: the earlier text can no longer be checked for repository work.`;
-
-    async function postComment(identifier: string, body: string) {
-      const res = await request(app).patch(`/api/issues/${identifier}`).send({ comment: body });
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    async function insertComment(card: Card, body: string) {
       const [comment] = await db
-        .select({ id: issueComments.id })
-        .from(issueComments)
-        .where(eq(issueComments.body, body));
+        .insert(issueComments)
+        .values({ companyId: card.companyId, issueId: card.issueId, authorAgentId: card.closerAgentId, body })
+        .returning({ id: issueComments.id });
       return comment!.id;
     }
 
-    async function deleteComment(fixture: NoWorkspaceIssue, commentId: string) {
-      const res = await request(app).delete(`/api/issues/${fixture.identifier}/comments/${commentId}`);
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
-    }
-
-    async function patchIssue(identifier: string, body: Record<string, unknown>) {
-      const res = await request(app).patch(`/api/issues/${identifier}`).send(body);
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
-    }
-
-    const LONG_PREFIX = "Notes on the retention decision. ".repeat(5);
-
-    it.each([
-      ["a comment citing a pull request URL, then deleted", async (fixture: NoWorkspaceIssue) => {
-        const commentId = await postComment(fixture.identifier, "Landed in https://github.com/TEA-Core/records/pull/12 today.");
-        await deleteComment(fixture, commentId);
-      }, HISTORY_CITES("a pull request URL")],
-      ["a comment citing a pull request URL past the recorded snippet, then deleted", async (fixture: NoWorkspaceIssue) => {
-        const commentId = await postComment(fixture.identifier, `${LONG_PREFIX}Landed in https://github.com/TEA-Core/records/pull/12 today.`);
-        await deleteComment(fixture, commentId);
-      }, DELETED_COMMENT_REFUSAL],
-      ["a title citing a pull request, then cleaned", async (fixture: NoWorkspaceIssue) => {
-        await patchIssue(fixture.identifier, { title: "Follow-up of PR #77" });
-        await patchIssue(fixture.identifier, { title: "Record the ruling" });
-      }, HISTORY_CITES("a pull request number")],
-      ["a description citing a pull request URL, then cleaned", async (fixture: NoWorkspaceIssue) => {
-        await patchIssue(fixture.identifier, { description: "See https://github.com/TEA-Core/records/pull/12" });
-        await patchIssue(fixture.identifier, { description: "Decide the retention policy." });
-      }, HISTORY_CITES("a pull request URL")],
-      ["a long description citing a pull request past the recorded text, then cleaned", async (fixture: NoWorkspaceIssue) => {
-        await patchIssue(fixture.identifier, { description: `${LONG_PREFIX}${LONG_PREFIX}See PR #77.` });
-        await patchIssue(fixture.identifier, { description: "Decide the retention policy." });
-      }, TRUNCATED_HISTORY_REFUSAL],
-    ] as const)("refuses a card with %s", async (_label, scrub, expected) => {
-      const fixture = await seedAdmissible();
-      await scrub(fixture);
-
-      await expectRefused(fixture, await close(fixture.identifier), expected);
-    });
-
-    it("refuses a card whose board ruling cited a pull request in an earlier revision", async () => {
-      const fixture = await seedNoWorkspace();
-      asBoard();
-      const first = await request(app)
-        .put(`/api/issues/${fixture.identifier}/documents/entry-ruling`)
-        .send({ format: "markdown", body: "Ruling: the decision landed in https://github.com/TEA-Core/records/pull/12." });
-      expect(first.status, JSON.stringify(first.body)).toBeLessThan(300);
-      const [document] = await db
-        .select({ id: documents.id })
-        .from(issueDocuments)
-        .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
-        .where(eq(issueDocuments.issueId, fixture.issueId));
-      const [latest] = await db
-        .select({ id: documentRevisions.id })
-        .from(documentRevisions)
-        .where(eq(documentRevisions.documentId, document!.id));
-      const second = await request(app)
-        .put(`/api/issues/${fixture.identifier}/documents/entry-ruling`)
-        .send({ format: "markdown", body: "Ruling: this card's deliverable is this recorded decision.", baseRevisionId: latest!.id });
-      expect(second.status, JSON.stringify(second.body)).toBeLessThan(300);
-      currentActor = fixture.actor;
-
-      const res = await close(fixture.identifier);
-
-      expect(res.status, JSON.stringify(res.body)).toBe(422);
-      expect(res.body.error).toMatch(/cites repository work \(a pull request URL\)/);
-      expect(await statusOf(fixture.issueId)).toBe("in_progress");
-    });
-
-    it.each([
-      ["a comment with an SSH GitHub address", "Mirror at git@github.com:TEA-Core/records.git for reference.", "a GitHub address"],
-      ["a comment with an Azure DevOps pull request URL", "Reviewed in https://dev.azure.com/tea/records/_git/records/pullrequest/12.", "a pull request URL"],
-      ["a comment with a bare owner/repo pull reference", "Follows TEA-Core/records#12 closely.", "a repository issue or pull request reference"],
-      ["a comment with a GitLab SSH address", "Pushed to git@gitlab.example.com:team/records.git.", "a GitLab address"],
-    ] as const)("refuses a card with %s", async (_label, body, label) => {
-      const fixture = await seedAdmissible();
-      await db.insert(issueComments).values({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.closerAgentId, body });
-
-      await expectRefused(fixture, await close(fixture.identifier), THREAD_CITES(label));
-    });
-
-    it("refuses a card with an artifact work product that names an SSH repository address", async () => {
-      const fixture = await seedAdmissible();
-      await db.insert(issueWorkProducts).values({
-        companyId: fixture.companyId,
-        issueId: fixture.issueId,
-        type: "artifact",
-        provider: "paperclip",
-        title: "Export",
-        url: "git@example.org:team/records.git",
-        status: "active",
+    async function insertActivity(card: Card, action: string, details: Record<string, unknown>) {
+      await db.insert(activityLog).values({
+        companyId: card.companyId,
+        actorType: "agent",
+        actorId: card.closerAgentId,
+        action,
+        entityType: "issue",
+        entityId: card.issueId,
+        details,
       });
+    }
 
-      await expectRefused(
-        fixture,
-        await close(fixture.identifier),
-        `Tier 1 "no-repository-landing" cannot be declared on an issue that records a repository work product (artifact).`,
-      );
-    });
+    const asBoard = () => {
+      currentActor = { type: "board", userId: BOARD_USER_ID, source: "local_implicit" } as Express.Request["actor"];
+    };
 
+    // Every shape the review rounds built against this card shape. Each one
+    // closed at some intermediate head; at the base and now, all refuse.
     it.each([
-      ["a tool runtime slot naming an execution workspace", async (fixture: NoWorkspaceIssue) => {
-        const { workspaceId } = await insertWorkspace(fixture.companyId);
-        await db.insert(toolRuntimeSlots).values({
-          companyId: fixture.companyId,
-          issueId: fixture.issueId,
-          executionWorkspaceId: workspaceId,
-          slotKey: `slot-${fixture.issueId}`,
+      ["round 1: the holder strips its project in one request and closes in the next", async (card: Card) => {
+        await db.update(issues).set({ projectId: await insertProject(card.companyId) }).where(eq(issues.id, card.issueId));
+        currentActor = card.actor;
+        const strip = await request(app).patch(`/api/issues/${card.identifier}`).send({ projectId: null });
+        expect(strip.status, JSON.stringify(strip.body)).toBe(200);
+      }],
+      ["round 1: a board reclassification from repository_delivery, then a strip", async (card: Card) => {
+        await db.update(issues).set({ deliveryRequirement: "repository_delivery", projectId: await insertProject(card.companyId) }).where(eq(issues.id, card.issueId));
+        asBoard();
+        const flip = await request(app).patch(`/api/issues/${card.identifier}`).send({ deliveryRequirement: "record_only" });
+        expect(flip.status, JSON.stringify(flip.body)).toBe(200);
+        currentActor = card.actor;
+        const strip = await request(app).patch(`/api/issues/${card.identifier}`).send({ projectId: null });
+        expect(strip.status, JSON.stringify(strip.body)).toBe(200);
+      }],
+      ["round 1: an owned workspace that was archived", async (card: Card) => {
+        await insertWorkspace(card.companyId, card.issueId, "archived");
+      }],
+      ["round 1: an environment lease naming a workspace", async (card: Card) => {
+        const { workspaceId } = await insertWorkspace(card.companyId);
+        await db.insert(environmentLeases).values({ companyId: card.companyId, executionWorkspaceId: workspaceId, issueId: card.issueId, status: "released" });
+      }],
+      ["round 1: a workspace operation naming a workspace", async (card: Card) => {
+        const { workspaceId } = await insertWorkspace(card.companyId);
+        await db.insert(workspaceOperations).values({ companyId: card.companyId, executionWorkspaceId: workspaceId, issueId: card.issueId, phase: "worktree_prepare", status: "succeeded" });
+      }],
+      ["round 1: an audit row whose executionWorkspaceId is null but names a workspace elsewhere", async (card: Card) => {
+        await insertActivity(card, "issue.updated", { executionWorkspaceId: null, workspaceChange: { to: { projectWorkspaceId: randomUUID() } } });
+      }],
+      ["round 1: a run with a nested executionWorkspaceId", async (card: Card) => {
+        await insertRun(card, { contextSnapshot: { issueId: card.issueId, paperclipWorkspace: { executionWorkspaceId: randomUUID() } } });
+      }],
+      ["round 1: a comment with a pull request URL and no mention", async (card: Card) => {
+        await insertComment(card, "Landed in https://github.com/TEA-Core/records/pull/12.");
+      }],
+      ["round 1: a pull request mention with a non-canonical external id", async (card: Card) => {
+        await insertMention(card, "github", "pull_request", "records-pr-twelve");
+      }],
+      ["round 1: a GitLab merge request mention", async (card: Card) => {
+        await insertMention(card, "gitlab", "merge_request", "team/records!4");
+      }],
+      ["round 1: a branch work product", async (card: Card) => {
+        await db.insert(issueWorkProducts).values({ companyId: card.companyId, issueId: card.issueId, type: "branch", provider: "github", title: "records-ruling", status: "active" });
+      }],
+      ["round 1: a ruling by a second agent of the company (the seeded ruler)", async (card: Card) => {
+        const rulings = await db.select({ id: issueDocuments.id }).from(issueDocuments).where(eq(issueDocuments.issueId, card.issueId));
+        expect(rulings).toHaveLength(1);
+      }],
+      ["round 2: a comment citing a pull request, then deleted", async (card: Card) => {
+        const commentId = await insertComment(card, "Landed in https://github.com/TEA-Core/records/pull/12.");
+        currentActor = card.actor;
+        const removed = await request(app).delete(`/api/issues/${card.identifier}/comments/${commentId}`);
+        expect(removed.status, JSON.stringify(removed.body)).toBeLessThan(500);
+      }],
+      ["round 2: a title citing a pull request, then restored", async (card: Card) => {
+        currentActor = card.actor;
+        expect((await request(app).patch(`/api/issues/${card.identifier}`).send({ title: "Follow-up of PR #77" })).status).toBe(200);
+        expect((await request(app).patch(`/api/issues/${card.identifier}`).send({ title: "Record the ruling" })).status).toBe(200);
+      }],
+      ["round 2: a tool runtime slot naming a workspace", async (card: Card) => {
+        const { workspaceId } = await insertWorkspace(card.companyId);
+        await db.insert(toolRuntimeSlots).values({ companyId: card.companyId, issueId: card.issueId, executionWorkspaceId: workspaceId, slotKey: `slot-${card.issueId}` });
+      }],
+      ["round 2: SSH and Azure DevOps references in a comment", async (card: Card) => {
+        await insertComment(card, "Mirror git@github.com:TEA-Core/records.git; reviewed in https://dev.azure.com/tea/records/_git/records/pullrequest/12.");
+      }],
+      ["round 2: a run naming the card only by nativeIssueId in its context", async (card: Card) => {
+        await insertRun(card, { contextSnapshot: { nativeIssueId: card.issueId, executionWorkspaceId: randomUUID() } });
+      }],
+      ["round 2: a ruling by an instance admin who is not a member", async (card: Card) => {
+        const adminUserId = `admin-${card.companyId}`;
+        await db.insert(instanceUserRoles).values({ userId: adminUserId, role: "instance_admin" });
+        const [link] = await db.select({ documentId: issueDocuments.documentId }).from(issueDocuments).where(eq(issueDocuments.issueId, card.issueId));
+        await db
+          .update(documents)
+          .set({ createdByAgentId: null, updatedByAgentId: null, createdByUserId: adminUserId, updatedByUserId: adminUserId })
+          .where(eq(documents.id, link!.documentId));
+        await db
+          .update(documentRevisions)
+          .set({ createdByAgentId: null, createdByUserId: adminUserId })
+          .where(eq(documentRevisions.documentId, link!.documentId));
+      }],
+      ["round 3 B1: a run linked only by the native_issue_id column", async (card: Card) => {
+        await insertRun(card, { nativeIssueId: card.issueId, contextSnapshot: { executionWorkspaceId: randomUUID() } });
+      }],
+      ["round 3 B2: workspace and pull request evidence in a run's result and output", async (card: Card) => {
+        await insertRun(card, {
+          contextSnapshot: { issueId: card.issueId },
+          resultJson: { executionWorkspaceId: randomUUID() },
+          stdoutExcerpt: "opened https://github.com/TEA-Core/records/pull/12",
         });
       }],
-      ["a run that names it only by nativeIssueId", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(heartbeatRuns).values({
-          companyId: fixture.companyId,
-          agentId: fixture.closerAgentId,
-          status: "succeeded",
-          contextSnapshot: { nativeIssueId: fixture.issueId, executionWorkspaceId: randomUUID() },
-        });
+      ["round 3 B3: workspace keys spelled outside any pattern", async (card: Card) => {
+        await insertRun(card, { contextSnapshot: { issueId: card.issueId, "execution-workspace-id": randomUUID(), workspace: "records", pullRequestNumber: 12, payload: JSON.stringify({ executionWorkspaceId: randomUUID() }) } });
       }],
-      ["a run that names it only by a task key", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(heartbeatRuns).values({
-          companyId: fixture.companyId,
-          agentId: fixture.closerAgentId,
-          status: "succeeded",
-          contextSnapshot: { taskKey: `issue:${fixture.issueId}`, executionWorkspaceId: randomUUID() },
-        });
+      ["round 3 B4: a comment citing only a commit SHA", async (card: Card) => {
+        await insertComment(card, "Done in 3f9c1e0a25b84d7c9e1f2a3b4c5d6e7f8a9b0c1d.");
       }],
-      ["a run that names it only by identifier", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(heartbeatRuns).values({
-          companyId: fixture.companyId,
-          agentId: fixture.closerAgentId,
-          status: "succeeded",
-          contextSnapshot: { taskKey: fixture.identifier, executionWorkspaceId: randomUUID() },
-        });
+      ["round 3 P-01: a description citing a pull request, cleaned through the issue service as the plugin host does", async (card: Card) => {
+        await db.update(issues).set({ description: "See https://github.com/TEA-Core/records/pull/12" }).where(eq(issues.id, card.issueId));
+        await issueService(db).update(card.issueId, { description: "Decide the retention policy." });
+        await insertActivity(card, "issue.updated", { patch: { description: "Decide the retention policy." } });
       }],
-      ["a run context whose workspace key is spelled ExecutionWorkspaceId", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(heartbeatRuns).values({
-          companyId: fixture.companyId,
-          agentId: fixture.closerAgentId,
-          status: "succeeded",
-          contextSnapshot: { issueId: fixture.issueId, ExecutionWorkspaceId: randomUUID() },
-        });
+      ["round 3 P-02: a project stripped through the issue service as the plugin host does", async (card: Card) => {
+        await db.update(issues).set({ projectId: await insertProject(card.companyId) }).where(eq(issues.id, card.issueId));
+        await issueService(db).update(card.issueId, { projectId: null });
+        await insertActivity(card, "issue.updated", { patch: { projectId: null } });
       }],
-      ["an audit row whose repository key holds a GitHub URL", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(activityLog).values({
-          companyId: fixture.companyId,
-          actorType: "system",
-          actorId: "system",
-          action: "issue.updated",
-          entityType: "issue",
-          entityId: fixture.issueId,
-          details: { repository: "https://github.com/TEA-Core/records" },
-        });
+      ["round 3: a reopened card that was closed before", async (card: Card) => {
+        await insertActivity(card, "issue.done_transition_no_repository_landing_verified", { proof: "never_had_execution_workspace" });
+        await insertActivity(card, "issue.checked_out", {});
       }],
-      ["a deleted document", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(activityLog).values({
-          companyId: fixture.companyId,
-          actorType: "agent",
-          actorId: fixture.closerAgentId,
-          action: "issue.document_deleted",
-          entityType: "issue",
-          entityId: fixture.issueId,
-          details: { key: "notes" },
-        });
-      }],
-      ...(["issue.comment_cancelled", "issue.queued_comment_discarded"] as const).map((action) => [
-        `a comment removed outright (${action})`,
-        async (fixture: NoWorkspaceIssue) => {
-          await db.insert(activityLog).values({
-            companyId: fixture.companyId,
-            actorType: "agent",
-            actorId: fixture.closerAgentId,
-            action,
-            entityType: "issue",
-            entityId: fixture.issueId,
-            details: { commentId: randomUUID() },
-          });
-        },
-      ] as const),
-      ["an audit action outside the allow-list", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(activityLog).values({
-          companyId: fixture.companyId,
-          actorType: "system",
-          actorId: "system",
-          action: "issue.unrecognised_event",
-          entityType: "issue",
-          entityId: fixture.issueId,
-          details: {},
-        });
-      }],
-      ["an audit row changing a field outside the allow-list", async (fixture: NoWorkspaceIssue) => {
-        await db.insert(activityLog).values({
-          companyId: fixture.companyId,
-          actorType: "agent",
-          actorId: fixture.closerAgentId,
-          action: "issue.updated",
-          entityType: "issue",
-          entityId: fixture.issueId,
-          details: { changes: { parentId: { from: null, to: randomUUID() } } },
-        });
-      }],
-    ] as const)("keeps today's refusal for a card with %s", async (_label, record) => {
-      const fixture = await seedAdmissible();
-      await record(fixture);
+    ] as const)("refuses the holder's close after %s", async (_label, shape) => {
+      const card = await seedCard();
+      await shape(card);
+      const stored = await db
+        .select({ projectId: issues.projectId, projectWorkspaceId: issues.projectWorkspaceId, executionWorkspaceId: issues.executionWorkspaceId })
+        .from(issues)
+        .where(eq(issues.id, card.issueId))
+        .then((rows) => rows[0]!);
+      expect(stored).toEqual({ projectId: null, projectWorkspaceId: null, executionWorkspaceId: null });
 
-      await expectRefused(fixture, await close(fixture.identifier), NO_WORKSPACE_REFUSAL);
-    });
+      const res = await expectAgentCloseRefused(card);
 
-    it("holds the ruling until the close commits: an edit during the status write waits for it", async () => {
-      const fixture = await seedAdmissible();
-      const lockKey = 424247;
-      await db.execute(sql.raw(
-        `create or replace function pc_test_hold_close() returns trigger language plpgsql as $$ ` +
-          `begin perform pg_advisory_xact_lock(${lockKey}); return new; end $$`,
-      ));
-      await db.execute(sql.raw(
-        "create trigger pc_test_hold_close before insert on activity_log for each row " +
-          "when (new.action = 'issue.done_transition_no_repository_landing_verified') execute function pc_test_hold_close()",
-      ));
-      try {
-        let editError: unknown = null;
-        let closing: Promise<request.Response> | null = null;
-        await db.transaction(async (holder) => {
-          await holder.execute(sql.raw(`select pg_advisory_xact_lock(${lockKey})`));
-          closing = Promise.resolve(close(fixture.identifier));
-          let waiting = false;
-          // Wait for the close's transaction to block on the advisory lock (a
-          // real cross-connection lock state, so there is no fake clock to drive).
-          for (let attempt = 0; attempt < 400 && !waiting; attempt += 1) {
-            const rows = await db.execute(sql.raw(
-              `select 1 from pg_locks where locktype = 'advisory' and objid = ${lockKey} and not granted`,
-            ));
-            waiting = (rows as unknown as unknown[]).length > 0;
-            if (!waiting) await new Promise((resolve) => setTimeout(resolve, 25));
-          }
-          expect(waiting).toBe(true);
-          try {
-            await db.transaction(async (editor) => {
-              await editor.execute(sql.raw("set local lock_timeout = '500ms'"));
-              await editor
-                .update(documents)
-                .set({ latestBody: "Ruling: replaced while the close was being written.", updatedAt: new Date() })
-                .where(eq(documents.id, fixture.rulingId));
-            });
-          } catch (err) {
-            editError = err;
-          }
-        });
-        const res = await closing!;
-
-        const editFailure = editError as (Error & { cause?: Error }) | null;
-        expect(`${editFailure?.message ?? ""} ${editFailure?.cause?.message ?? ""}`).toMatch(/lock timeout/);
-        expect(res.status, JSON.stringify(res.body)).toBe(200);
-        const [ruling] = await db.select({ body: documents.latestBody }).from(documents).where(eq(documents.id, fixture.rulingId));
-        expect(ruling!.body).toBe("Ruling: this card's deliverable is this recorded decision; no repository change.");
-      } finally {
-        await db.execute(sql.raw("drop trigger if exists pc_test_hold_close on activity_log"));
-        await db.execute(sql.raw("drop function if exists pc_test_hold_close()"));
-      }
-    });
-
-    it("reads every table that can name a workspace", () => {
-      const workspaceTables = new Map<string, string[]>();
-      for (const value of Object.values(dbExports)) {
-        if (!is(value, PgTable)) continue;
-        const config = getTableConfig(value);
-        const columns = config.columns.map((column) => column.name);
-        if (columns.includes("execution_workspace_id") || columns.includes("project_workspace_id")) {
-          workspaceTables.set(config.name, columns);
-        }
-      }
-      // The issue row itself is the subject: its pointers must be null.
-      workspaceTables.delete("issues");
-
-      expect([...workspaceTables.keys()].sort()).toEqual(Object.keys(NO_WORKSPACE_REFERENCE_TABLES).sort());
-      for (const [table, issueColumn] of Object.entries(NO_WORKSPACE_REFERENCE_TABLES)) {
-        expect(workspaceTables.get(table), table).toContain(issueColumn);
-      }
-    });
-
-    it("closes a card the board created without a project, after a refused attempt and a thread comment", async () => {
-      const fixture = await seedNoWorkspace();
-      asBoard();
-      const created = await request(app)
-        .post(`/api/companies/${fixture.companyId}/issues`)
-        .send({
-          title: "Decide the retention policy",
-          description: "Record the decision as the entry ruling.",
-          status: "todo",
-          deliveryRequirement: "record_only",
-          assigneeAgentId: fixture.closerAgentId,
-        });
-      expect(created.status, JSON.stringify(created.body)).toBe(201);
-      const card = created.body as { id: string; identifier: string };
-      // The holder's run on this card, in its agent home: no project, no workspace.
-      const [run] = await db.insert(heartbeatRuns).values({
-        companyId: fixture.companyId,
-        agentId: fixture.closerAgentId,
-        status: "running",
-        contextSnapshot: { issueId: card.id, paperclipWorkspace: { cwd: "/agents/home", source: "agent_home", projectId: null, workspaceId: null, repoUrl: null } },
-      }).returning({ id: heartbeatRuns.id });
-      currentActor = { type: "agent", agentId: fixture.closerAgentId, companyId: fixture.companyId, source: "agent_key", runId: run!.id };
-      const started = await request(app)
-        .patch(`/api/issues/${card.identifier}`)
-        .send({ status: "in_progress", comment: "Drafting the retention decision for the board." });
-      expect(started.status, JSON.stringify(started.body)).toBe(200);
-      const early = await close(card.identifier);
-      expect(early.status, JSON.stringify(early.body)).toBe(422);
-      expect(early.body.error).toBe(`Tier 1 "no-repository-landing" requires a non-empty "entry-ruling" document on this issue.`);
-      await insertRuling({ companyId: fixture.companyId, issueId: card.id, authorUserId: BOARD_USER_ID });
-
-      const res = await close(card.identifier);
-
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(await statusOf(card.id)).toBe("done");
-      const verified = await activityRows(card.id, "issue.done_transition_no_repository_landing_verified");
-      expect(verified).toHaveLength(1);
-      expect(verified[0]!.details).toMatchObject({ proof: "never_had_execution_workspace" });
+      expect(res.body.details.remedy).toBe(PINNED_REMEDY);
     });
   });
 });
