@@ -76,7 +76,7 @@ describe("OpenCode local skill injection", () => {
     const commandPath = path.join(root, "opencode");
     const skillSource = await createSkillDir(path.join(root, "runtime-skills"), "paperclip");
     await fs.mkdir(workspace, { recursive: true });
-    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", "utf8");
+    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '1.17.9\\n'; fi\nexit 0\n", "utf8");
     await fs.chmod(commandPath, 0o755);
 
     const previousHome = process.env.HOME;
@@ -194,7 +194,7 @@ describe("OpenCode local skillIsolation=desired-only", () => {
     const skillAlpha = await createSkillDir(path.join(root, "src-alpha"), "alpha");
     const skillBeta = await createSkillDir(path.join(root, "src-beta"), "beta");
     await fs.mkdir(workspace, { recursive: true });
-    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", "utf8");
+    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '1.17.9\\n'; fi\nexit 0\n", "utf8");
     await fs.chmod(commandPath, 0o755);
 
     const previousHome = process.env.HOME;
@@ -284,7 +284,7 @@ describe("OpenCode local skillIsolation=desired-only", () => {
     await fs.mkdir(sharedHome, { recursive: true });
     await fs.mkdir(processHome, { recursive: true });
     await fs.mkdir(workspace, { recursive: true });
-    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", "utf8");
+    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '1.17.9\\n'; fi\nexit 0\n", "utf8");
     await fs.chmod(commandPath, 0o755);
 
     const previousHome = process.env.HOME;
@@ -365,7 +365,7 @@ describe("OpenCode local skillIsolation=desired-only", () => {
     await fs.mkdir(configuredHome, { recursive: true });
     await fs.mkdir(processHome, { recursive: true });
     await fs.mkdir(workspace, { recursive: true });
-    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", "utf8");
+    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '1.17.9\\n'; fi\nexit 0\n", "utf8");
     await fs.chmod(commandPath, 0o755);
 
     const previousHome = process.env.HOME;
@@ -426,7 +426,7 @@ describe("OpenCode local exposure line names the exposed skills", () => {
     const workspace = path.join(input.root, "workspace");
     const commandPath = path.join(input.root, "opencode");
     await fs.mkdir(workspace, { recursive: true });
-    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", "utf8");
+    await fs.writeFile(commandPath, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '1.17.9\\n'; fi\nexit 0\n", "utf8");
     await fs.chmod(commandPath, 0o755);
     runProcessMock.mockReset();
     runProcessMock.mockResolvedValueOnce(probeResult({

@@ -31,7 +31,13 @@ describe("legacy environment tool access on resumed conversations", () => {
   ] as const)("refreshes %s without dropping its conversation", async (type, execute, resumeFlag) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cli-tool-refresh-")); roots.push(root);
     const command = path.join(root, "agent");
-    await fs.writeFile(command, "#!/bin/sh\nprintf 'provider  model\\nopenai  gpt-5\\n'\n", { mode: 0o755 });
+    // The opencode adapter refuses a binary whose `--version` is not a version,
+    // so the fake answers it; every other argument still gets the models table.
+    await fs.writeFile(
+      command,
+      "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '1.17.9\\n'; exit 0; fi\nprintf 'provider  model\\nopenai  gpt-5\\n'\n",
+      { mode: 0o755 },
+    );
     const sessionId = type === "pi_local" ? path.join(root, "session.jsonl") : "existing-session";
     if (type === "pi_local") await fs.writeFile(sessionId, JSON.stringify({ type: "session", cwd: root }) + "\n");
     const stdout = type === "kimi_local"
