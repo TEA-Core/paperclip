@@ -46,6 +46,8 @@ import {
   isPaperclipRuntimeEnvKey,
   refreshPaperclipWorkspaceEnvForExecution,
   renderTemplate,
+  hydrateFreshSessionHandoff,
+  selectInitialCommunicationGuidance,
   selectPaperclipPromptSections,
   isPaperclipRecoveryWakePayload,
   rewriteWorkspaceCwdEnvVarsForExecution,
@@ -784,7 +786,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     runtimeSessionId.length > 0 &&
     isValidUuid &&
     hasMatchingPromptBundle &&
-    hasMatchingMcpServers &&
+    // Each CLI invocation loads --mcp-config, including --resume invocations.
+    // Refreshing tools does not invalidate the saved conversation.
     claudeSessionCwdMatchesExecutionTarget({
       runtimeSessionCwd,
       effectiveExecutionCwd,
@@ -833,7 +836,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (runtimeSessionId && !hasMatchingMcpServers) {
     await onLog(
       "stdout",
-      `[paperclip] Claude session "${runtimeSessionId}" was saved with a different runtime MCP server set and will not be resumed.\n`,
+      `[paperclip] Claude runtime MCP server set changed; loading current tools when resuming session "${runtimeSessionId}".\n`,
     );
   }
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
@@ -902,12 +905,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   };
 
   const runAttempt = async (resumeSessionId: string | null) => {
+    await hydrateFreshSessionHandoff(ctx, { resumedSession: Boolean(resumeSessionId) });
     const renderedBootstrapPrompt =
       !resumeSessionId && bootstrapPromptTemplate.trim().length > 0
         ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
         : "";
     const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(context, {
       resumedSession: Boolean(resumeSessionId),
+      includeCommunicationGuidance: false,
     });
     const shouldUseResumeDeltaPrompt = Boolean(resumeSessionId) && wakePrompt.length > 0;
     const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
@@ -923,6 +928,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const prompt = joinPromptSections([
       renderedBootstrapPrompt,
       deadlineNotice,
+      selectInitialCommunicationGuidance(context, { resumedSession: Boolean(resumeSessionId) }),
       wakePrompt,
       sessionHandoffNote,
       taskContextNote,

@@ -120,6 +120,8 @@ const READINESS_FAILURE_COPY: Record<string, string> = {
     "The seed manifest is a version or profile this build does not accept, so the workspace cannot be trusted.",
   seed_manifest_incomplete:
     "The seed manifest reports a verified seed without its completion evidence, so the restore cannot be trusted.",
+  seed_manifest_fresh_preview:
+    "This workspace is a fresh preview with no cloned organization or login. Open it locally with its own board identity.",
 };
 
 /**

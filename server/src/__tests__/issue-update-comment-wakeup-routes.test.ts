@@ -223,7 +223,7 @@ async function createApp(
       type: "board",
       userId: "local-board",
       companyIds: ["company-1"],
-      source: "local_implicit",
+      source: req.header("x-test-board-key") ? "board_key" : "local_implicit", keyId: req.header("x-test-board-key") ?? undefined,
       runId: req.header("x-paperclip-run-id") ?? null,
       isInstanceAdmin: false,
     };
@@ -916,4 +916,24 @@ describe("issue update comment wakeups", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  // SUP-23998: the Slack mirror's `chat.publication_requested` audit row takes its
+  // board key from the route. Dropping `boardApiKeyId` there compiled and passed.
+  it.each([
+    ["POST comment", (id: string) => ({ method: "post" as const, path: `/api/issues/${id}/comments`, body: { body: "mirror me" } })],
+    ["PATCH comment", (id: string) => ({ method: "patch" as const, path: `/api/issues/${id}`, body: { comment: "mirror me" } })],
+  ])("threads the authenticated board key into the Slack mirror for a %s", async (_name, build) => {
+    const boardKeyId = "99999999-9999-4999-8999-999999999999";
+    const existing = makeIssue({});
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-k", issueId: existing.id, companyId: existing.companyId, body: "mirror me" });
+    const { method, path, body } = build(existing.id);
+    const keyed = await request(await createApp())[method](path).set("x-test-board-key", boardKeyId).send(body);
+    expect(keyed.status).toBeLessThan(300);
+    expect(mockIssueService.addComment.mock.calls[0]?.[3]).toMatchObject({ mirrorToSlack: true, boardApiKeyId: boardKeyId });
+    mockIssueService.addComment.mockClear();
+    const session = await request(await createApp())[method](path).send(body);
+    expect(session.status).toBeLessThan(300);
+    expect(mockIssueService.addComment.mock.calls[0]?.[3]).toMatchObject({ mirrorToSlack: true, boardApiKeyId: null });
+  });
 });
