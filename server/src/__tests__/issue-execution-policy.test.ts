@@ -6207,31 +6207,61 @@ describe("monitor re-arm after the bounds are exhausted (SUP-23786)", () => {
     });
   });
 
-  it.each(["max_attempts_exhausted", "timeout_exceeded"] as const)(
-    "refuses the same exhausted re-arm once a %s recovery already ran",
-    (clearReason) => {
-      const issue = firedMonitorIssue(1);
-      issue.executionState.monitor = {
-        ...issue.executionState.monitor,
-        status: "cleared",
-        clearedAt: firedAt,
-        clearReason,
-      };
-      const policy = normalizeIssueExecutionPolicy({
-        stages: [],
-        monitor: { nextCheckAt: rearmAt, scheduledBy: "assignee", maxAttempts: 1, timeoutAt: "2026-04-11T12:45:00.000Z", recoveryPolicy: "wake_owner" },
-      })!;
-      expect(() =>
-        applyIssueExecutionPolicyTransition({
-          issue,
-          policy,
-          requestedAssigneePatch: {},
-          actor: { agentId: coderAgentId },
-          monitorExplicitlyUpdated: true,
-        }),
-      ).toThrowError("Monitor bounds are already exhausted");
-    },
-  );
+  // The "a recovery already ran" fact is sticky: `exhaustionRecoveredAt` survives every
+  // clear reason and every bound change, and only a board-armed write ends it.
+  function rearmAfterRecovery(
+    clearReason: string,
+    monitor: Record<string, unknown>,
+    scheduledBy: "assignee" | "board" = "assignee",
+  ) {
+    const issue = firedMonitorIssue(1);
+    issue.executionState.monitor = {
+      ...issue.executionState.monitor,
+      status: "cleared",
+      clearedAt: firedAt,
+      clearReason,
+      exhaustionRecoveredAt: firedAt,
+    } as typeof issue.executionState.monitor;
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [],
+      monitor: { nextCheckAt: rearmAt, scheduledBy, recoveryPolicy: "wake_owner", ...monitor },
+    })!;
+    return applyIssueExecutionPolicyTransition({
+      issue,
+      policy,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      monitorExplicitlyUpdated: true,
+    });
+  }
+
+  describe.each([
+    "max_attempts_exhausted",
+    "timeout_exceeded",
+    "manual",
+    "invalid_status",
+    "invalid_assignee",
+    "dispatch_skipped",
+    "done",
+    "cancelled",
+  ] as const)("after a recovery ran and the monitor was cleared as %s", (clearReason) => {
+    it.each([
+      ["the same bounds", { maxAttempts: 1 }],
+      ["a higher maxAttempts", { maxAttempts: 5 }],
+      ["a lower maxAttempts", { maxAttempts: 1, timeoutAt: "2026-04-11T12:45:00.000Z" }],
+      ["no bounds", {}],
+    ] as const)("refuses an agent re-arm with %s", (_label, monitor) => {
+      expect(() => rearmAfterRecovery(clearReason, { ...monitor })).toThrowError("Monitor bounds are already exhausted");
+    });
+
+    it("lets a board-armed write end the epoch and drops the sticky fact", () => {
+      const { patch } = rearmAfterRecovery(clearReason, { maxAttempts: 5 }, "board");
+      expect(patch.monitorNextCheckAt).toEqual(new Date(rearmAt));
+      const state = parseIssueExecutionState(patch.executionState as Record<string, unknown>);
+      expect(state?.monitor).toMatchObject({ status: "scheduled", attemptCount: 1 });
+      expect(state?.monitor).not.toHaveProperty("exhaustionRecoveredAt");
+    });
+  });
 
   it("does not exhaust while attempts remain (control)", () => {
     const { patch } = rearm({ scheduledBy: "assignee", maxAttempts: 2, recoveryPolicy: "wake_owner" });
