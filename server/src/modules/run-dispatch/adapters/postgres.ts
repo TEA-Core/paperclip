@@ -1,12 +1,13 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
-import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
   agents,
   approvals,
+  companies,
   issueApprovals,
   issueThreadInteractions,
   heartbeatRuns,
@@ -24,6 +25,11 @@ import { collectDispositionRepairSourceState } from "../../../services/recovery/
 import { legacyDispositionEpisode, legacyDispositionFingerprint } from "../../../services/recovery/legacy-continuation.js";
 import { appendHeartbeatRunEvent } from "../../../services/heartbeat-run-events.js";
 import { emitAgentTaskRun } from "../../../services/agent-task-run-telemetry.js";
+import {
+  logActivityInTransaction,
+  publishActivity,
+  type ActivityPublication,
+} from "../../../services/activity-log.js";
 import { issueService } from "../../../services/issues.js";
 import {
   issueTreeControlService,
@@ -36,9 +42,14 @@ import {
 } from "../../../services/issue-continuation-summary.js";
 import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
 import { resolveLiveExecutionLeases } from "../../../services/issue-execution-lease.js";
-import { decideQueuedRunStaleness, decideScheduledRetryGate } from "../domain/policy.js";
+import {
+  MAX_QUEUED_ISSUE_RUN_AGE_MS,
+  decideQueuedRunStaleness,
+  decideScheduledRetryGate,
+} from "../domain/policy.js";
 import type {
   QueuedRunFacts,
+  QueuedRunStalenessErrorCode,
   ReviewParticipantFacts,
   RetryReasonKind,
   ScheduledRetryFacts,
@@ -56,8 +67,12 @@ import type {
   DispatchResolvedInteractionOutcome,
   DueRetryRun,
   EvaluateScheduledRetryGateInput,
+  ExpireQueuedRunInput,
   ListDueRetriesInput,
+  ListExpiredQueuedRunsInput,
+  ExpiredQueuedRunCandidate,
   PromoteOrCancelDueRetryInput,
+  QueuedRunExpiry,
   RunDispatchWriter,
   ScheduledRetryReader,
 } from "../application/ports.js";
@@ -69,6 +84,39 @@ import type {
 import { RunDispatchApplicationError } from "../application/types.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
+
+/**
+ * Staleness verdicts the queued-run age sweep may apply on its own: the age
+ * bound itself and the two verdicts the policy reaches before it. None of them
+ * needs a replacement wake, so a sweep can apply them outside the claim path.
+ */
+const QUEUED_RUN_EXPIRY_ERROR_CODES: Partial<Record<QueuedRunStalenessErrorCode, true>> = {
+  queued_run_expired: true,
+  issue_not_found: true,
+  execution_reconciliation_required: true,
+};
+
+/**
+ * The canonical form of a UUID. The expiry list query only takes an issueId in
+ * exactly this form; a number, padded text, or any other string cannot name an
+ * issue row there.
+ */
+const ISSUE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Normalizes an id read from run context before it reaches a uuid comparison.
+ * Postgres also accepts a UUID in braces, in upper case, or without hyphens,
+ * so those forms keep naming their row; any other value returns null instead
+ * of making the query throw `invalid input syntax for type uuid`.
+ */
+function canonicalUuid(value: string | null): string | null {
+  if (!value) return null;
+  const unbraced = value.startsWith("{") && value.endsWith("}") ? value.slice(1, -1) : value;
+  const hex = unbraced.replaceAll("-", "").toLowerCase();
+  if (!/^[0-9a-f]{32}$/.test(hex)) return null;
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 type LoadGateFactsInput = {
   conversationContinuation: boolean;
   runId: string;
@@ -188,7 +236,7 @@ function statusEffect(run: HeartbeatRun, previousStatus: string | null): PostCom
 
 export function createPostgresRunDispatchAdapter(
   db: Db,
-): ScheduledRetryReader & RunDispatchWriter {
+): ScheduledRetryReader & RunDispatchWriter & QueuedRunExpiry {
   const budgets = budgetService(db);
   const treeControlSvc = issueTreeControlService(db);
   const issuesSvc = issueService(db);
@@ -219,7 +267,9 @@ export function createPostgresRunDispatchAdapter(
       const result: { kind: "missing" | "retry" } | { kind: "value"; value: T } =
         await db.transaction(async (tx) => {
           const typedTx = tx as unknown as Db;
-          if (hintedIssueId || lockCheckoutIssue) {
+          // A malformed issueId names no issue row; locking by it would throw.
+          const lockableIssueId = canonicalUuid(hintedIssueId);
+          if (lockableIssueId || lockCheckoutIssue) {
             await typedTx
               .select({ id: issues.id })
               .from(issues)
@@ -227,7 +277,7 @@ export function createPostgresRunDispatchAdapter(
                 and(
                   eq(issues.companyId, input.companyId),
                   or(
-                    hintedIssueId ? eq(issues.id, hintedIssueId) : undefined,
+                    lockableIssueId ? eq(issues.id, lockableIssueId) : undefined,
                     lockCheckoutIssue ? eq(issues.checkoutRunId, input.runId) : undefined,
                   ),
                 ),
@@ -592,7 +642,8 @@ export function createPostgresRunDispatchAdapter(
       continuationParksExecutor = continuationSummaryParksExecutor(continuationSummaryBody);
     }
 
-    const recoveryActionId = readNonEmptyString(context.recoveryActionId);
+    // A malformed recovery action id names no action; comparing it would throw.
+    const recoveryActionId = canonicalUuid(readNonEmptyString(context.recoveryActionId));
     const isAuthorizedSourceScopedRecovery =
       issue && wakeReason === "source_scoped_recovery_action" && recoveryActionId
         ? await dbOrTx
@@ -902,10 +953,10 @@ export function createPostgresRunDispatchAdapter(
   async function cancelStaleRunInTx(
     tx: Db,
     run: HeartbeatRun,
-    issueId: string | null,
     decision: Extract<ReturnType<typeof decideQueuedRunStaleness>, { stale: true }>,
     expectedStatus: "queued" | "running",
     now: Date,
+    resultPatch: Record<string, unknown> = {},
   ): Promise<CancelStaleQueuedRunOutcome> {
       const [row] = await tx
         .update(heartbeatRuns)
@@ -924,6 +975,7 @@ export function createPostgresRunDispatchAdapter(
             timeoutConfigured: false,
             timeoutSource: "stale_queued_run_gate",
             timeoutFired: false,
+            ...resultPatch,
           },
           updatedAt: now,
         })
@@ -952,23 +1004,23 @@ export function createPostgresRunDispatchAdapter(
           );
       }
 
-      if (issueId) {
-        await tx
-          .update(issues)
-          .set({
-            executionRunId: null,
-            executionAgentNameKey: null,
-            executionLockedAt: null,
-            updatedAt: now,
-          })
-          .where(
-            and(
-              eq(issues.companyId, row.companyId),
-              eq(issues.id, issueId),
-              eq(issues.executionRunId, row.id),
-            ),
-          );
-      }
+      // Release every execution lock that names this run. Matching on the run
+      // id, not the context issueId, also covers a run whose context issue
+      // reference is malformed or written in a non-canonical form.
+      await tx
+        .update(issues)
+        .set({
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(issues.companyId, row.companyId),
+            eq(issues.executionRunId, row.id),
+          ),
+        );
 
       await tx
         .update(issues)
@@ -1006,8 +1058,9 @@ export function createPostgresRunDispatchAdapter(
     worktreeExecutionCutoff?: Date | null,
   ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
-    const issueId = readNonEmptyString(contextSnapshot.issueId);
-    if (!issueId) {
+    const rawIssueId = readNonEmptyString(contextSnapshot.issueId);
+    const issueId = canonicalUuid(rawIssueId);
+    if (!rawIssueId) {
       const predatesCutoff =
         worktreeExecutionCutoff && run.createdAt && run.createdAt.getTime() < worktreeExecutionCutoff.getTime();
       return {
@@ -1026,6 +1079,18 @@ export function createPostgresRunDispatchAdapter(
               },
             }
           : { stale: false as const },
+      };
+    }
+    if (!issueId) {
+      return {
+        issueId: null,
+        facts: null,
+        decision: {
+          stale: true as const,
+          errorCode: "issue_not_found" as const,
+          reason: "Cancelled because the run's issue reference is not a valid issue id",
+          details: { issueId: rawIssueId },
+        },
       };
     }
     const recovery = await getExecutionBlocker(tx, run.companyId, issueId, { conversationResetCommentId: deriveCommentId(contextSnapshot) });
@@ -1077,7 +1142,7 @@ export function createPostgresRunDispatchAdapter(
         }
         return { outcome: "not_stale" as const };
       }
-      return cancelStaleRunInTx(tx, run, issueId, decision, input.expectedStatus, input.now);
+      return cancelStaleRunInTx(tx, run, decision, input.expectedStatus, input.now);
     };
 
     return withIssueThenRunLocks(
@@ -1129,11 +1194,11 @@ export function createPostgresRunDispatchAdapter(
               )
           : initialDecision;
 
-      if (decision.stale && issueId) {
+      // A stale run with no valid issue id (malformed reference) must not dispatch either.
+      if (decision.stale) {
         const cancellation = await cancelStaleRunInTx(
           tx,
           run,
-          issueId,
           decision,
           input.expectedStatus,
           input.now,
@@ -1164,11 +1229,131 @@ export function createPostgresRunDispatchAdapter(
 
   }
 
+  async function listExpiredQueuedRuns(input: ListExpiredQueuedRunsInput): Promise<ExpiredQueuedRunCandidate[]> {
+    // Issue-bound queued runs only: those are the runs that hold an issue
+    // execution lock. Only a canonical UUID issueId can name an issue row; a
+    // numeric or otherwise malformed issueId would never expire and would fill
+    // the pages, so such rows are not listed. Companies that are not active
+    // dispatch nothing, so their queue is left alone, matching resumeQueuedRuns.
+    //
+    // The last two predicates mirror the age rule's refusals in
+    // decideQueuedRunStaleness (retry alarm not yet due; issue held by another
+    // running run, as resolveLiveExecutionLeases reads it), so runs the policy
+    // will not expire never use the page budget and cannot hide newer stuck
+    // runs. The policy decision inside expireQueuedRun stays the authority.
+    const rows = await db
+      .select({
+        id: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        createdAtText: sql<string>`${heartbeatRuns.createdAt}::text`,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
+      .where(
+        and(
+          eq(heartbeatRuns.status, "queued"),
+          eq(companies.status, "active"),
+          lte(heartbeatRuns.createdAt, input.createdAtOrBefore),
+          input.after
+            ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${input.after.createdAtText}::timestamptz, ${input.after.runId}::uuid)`
+            : undefined,
+          sql`jsonb_typeof(${heartbeatRuns.contextSnapshot} -> 'issueId') = 'string'`,
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' ~* ${ISSUE_ID_PATTERN.source}`,
+          or(isNull(heartbeatRuns.scheduledRetryAt), lte(heartbeatRuns.scheduledRetryAt, input.now)),
+          sql`not exists (
+            select 1
+            from issues lease_issue
+            join heartbeat_runs lease_holder
+              on lease_holder.company_id = lease_issue.company_id
+             and lease_holder.status = 'running'
+             and lease_holder.id in (lease_issue.execution_run_id, lease_issue.checkout_run_id)
+            where lease_issue.company_id = ${heartbeatRuns.companyId}
+              and lease_issue.id::text = lower(${heartbeatRuns.contextSnapshot} ->> 'issueId')
+              and lease_holder.id <> ${heartbeatRuns.id}
+          )`,
+        ),
+      )
+      .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+      .limit(input.limit);
+    return rows.map((row) => ({
+      runId: row.id,
+      companyId: row.companyId,
+      cursor: { createdAtText: row.createdAtText, runId: row.id },
+    }));
+  }
+
+  async function expireQueuedRun(input: ExpireQueuedRunInput): Promise<CancelStaleQueuedRunOutcome> {
+    const publications: ActivityPublication[] = [];
+    const outcome = await withIssueThenRunLocks(
+      input,
+      () => ({ outcome: "lost_race" as const }),
+      async (tx, run): Promise<CancelStaleQueuedRunOutcome> => {
+        if (run.status !== "queued") return { outcome: "lost_race" };
+        // The company can be paused after the list query read it as active.
+        const [company] = await tx
+          .select({ status: companies.status })
+          .from(companies)
+          .where(eq(companies.id, run.companyId));
+        if (company?.status !== "active") return { outcome: "not_stale" };
+        const { issueId, decision } = await decideCurrentRunStaleness(tx, run, input.now);
+        // The age bound decides; the two verdicts the policy reaches before it
+        // (issue gone, issue under a recovery hold) also mean the run can never
+        // start. Every other verdict carries a handoff the claim gate owns.
+        if (!decision.stale || !QUEUED_RUN_EXPIRY_ERROR_CODES[decision.errorCode]) {
+          return { outcome: "not_stale" };
+        }
+        // Same receipt the generic cancel path records for a never-started
+        // legacy queued run: without it stranded-work recovery reads the
+        // expired run as an uncertain provider execution and parks the issue
+        // behind a board reconciliation hold instead of re-dispatching it.
+        const neverStarted = run.runtimeMode !== "native" && !run.startedAt && !run.processPid;
+        const cancelled = await cancelStaleRunInTx(
+          tx,
+          run,
+          decision,
+          "queued",
+          input.now,
+          neverStarted ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } : {},
+        );
+        if (cancelled.outcome !== "cancelled") return cancelled;
+        await logActivityInTransaction(
+          tx,
+          {
+            companyId: run.companyId,
+            actorType: "system",
+            actorId: "heartbeat",
+            agentId: run.agentId,
+            runId: run.id,
+            action: "heartbeat.queued_run_expired",
+            entityType: "heartbeat_run",
+            entityId: run.id,
+            issueId,
+            details: {
+              ...decision.details,
+              source: "heartbeat.expire_stale_queued_runs",
+              errorCode: decision.errorCode,
+              reason: decision.reason,
+              runCreatedAt: run.createdAt.toISOString(),
+              maxQueuedAgeMs: MAX_QUEUED_ISSUE_RUN_AGE_MS,
+            },
+          },
+          publications,
+        );
+        return cancelled;
+      },
+      true,
+    );
+    for (const publication of publications) publishActivity(publication);
+    return outcome;
+  }
+
   return {
     evaluateScheduledRetryGate,
     listDueRetries,
     cancelStaleQueuedRun,
     dispatchResolvedInteractionIfCurrent,
     promoteOrCancelDueRetry,
+    listExpiredQueuedRuns,
+    expireQueuedRun,
   };
 }

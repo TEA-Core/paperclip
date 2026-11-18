@@ -3171,7 +3171,7 @@ describe("realizeExecutionWorkspace", () => {
       config: {
         workspaceStrategy: {
           type: "git_worktree",
-          branchTemplate: "release/{{issue.identifier}}.{{slug}}",
+          branchTemplate: "feature/{{issue.identifier}}.{{slug}}",
         },
       },
       issue: {
@@ -3186,7 +3186,7 @@ describe("realizeExecutionWorkspace", () => {
       },
     });
 
-    expect(realized.branchName).toBe("release/PAP-992.hotfix-april-1");
+    expect(realized.branchName).toBe("feature/PAP-992.hotfix-april-1");
     expect(path.basename(realized.cwd)).toBe("PAP-992.hotfix-april-1");
   });
 
@@ -14000,6 +14000,150 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
     ).toBe(false);
   });
 
+  // SUP-24409: a card's workspace row names its delivery branch, so exact-branch realization refuses
+  // integration and release branches and the repo's default/base refs.
+  const protectedBranchRefusal = (requestedExistingBranch: string) => ({
+    code: "workspace_validation_failed",
+    resultJson: {
+      workspaceValidation: expect.objectContaining({ reason: "existing_branch_is_protected", requestedExistingBranch }),
+    },
+  });
+
+  it("refuses to attach the fork's fold branch and creates no worktree", async () => {
+    const repoRoot = await createTempRepo();
+    await createBranchWithCommit(repoRoot, "fold/tea-patches-v2026.722.0", "fold.txt");
+
+    await expect(realizeExistingBranch(repoRoot, "fold/tea-patches-v2026.722.0"))
+      .rejects.toMatchObject(protectedBranchRefusal("fold/tea-patches-v2026.722.0"));
+    expect(existsSync(path.join(repoRoot, ".paperclip", "worktrees", "fold"))).toBe(false);
+  });
+
+  it("refuses to attach the remote's default branch", async () => {
+    const { repoRoot } = await createTempRepoWithRemote("trunk");
+    await runGit(repoRoot, ["remote", "set-head", "origin", "trunk"]);
+    await runGit(repoRoot, ["checkout", "-b", "work"]);
+
+    await expect(realizeExistingBranch(repoRoot, "trunk")).rejects.toMatchObject(protectedBranchRefusal("trunk"));
+  });
+
+  it("refuses to attach the project workspace's repo ref", async () => {
+    const repoRoot = await createTempRepo();
+    await createBranchWithCommit(repoRoot, "develop", "develop.txt");
+
+    await expect(realizeExecutionWorkspace({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "develop" },
+      config: { workspaceStrategy: { type: "git_worktree", existingBranch: "develop" } },
+      issue: { id: "issue-pr-prep", identifier: "PAP-9001", title: "Prepare pull request for an existing branch" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    })).rejects.toMatchObject(protectedBranchRefusal("develop"));
+  });
+
+  // SUP-24409 (RA round 2): the standard protected classes hold with no configuration naming them.
+  it.each([
+    "main", "master", "release/1.2", "releases/v1", "hotfix/urgent", "fold/anything", "fold-sync/2026.11",
+  ])("refuses to attach the protected branch %s even when no ref configuration names it", async (branch) => {
+    const repoRoot = await createTempRepo();
+    // `main` is the checked-out branch; `git init` may already have left `master` behind.
+    if (branch !== "main") await runGit(repoRoot, ["branch", "-f", branch]);
+
+    await expect(realizeExistingBranch(repoRoot, branch)).rejects.toMatchObject(protectedBranchRefusal(branch));
+  });
+
+  it("refuses to attach the repo ref when the project stores it as refs/heads/<branch>", async () => {
+    const repoRoot = await createTempRepo();
+    await createBranchWithCommit(repoRoot, "develop", "develop.txt");
+
+    await expect(realizeExecutionWorkspace({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "refs/heads/develop" },
+      config: { workspaceStrategy: { type: "git_worktree", existingBranch: "develop" } },
+      issue: { id: "issue-pr-prep", identifier: "PAP-9001", title: "Prepare pull request for an existing branch" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    })).rejects.toMatchObject(protectedBranchRefusal("develop"));
+  });
+
+  it("refuses to attach the strategy's configured base ref", async () => {
+    const repoRoot = await createTempRepo();
+    await createBranchWithCommit(repoRoot, "develop", "develop.txt");
+
+    await expect(realizeExistingBranch(repoRoot, "develop", { baseRef: "origin/develop" }))
+      .rejects.toMatchObject(protectedBranchRefusal("develop"));
+  });
+
+  it("refuses a branch template that renders the strategy's configured base ref", async () => {
+    const repoRoot = await createTempRepo();
+
+    await expect(realizeExecutionWorkspace({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "HEAD" },
+      config: { workspaceStrategy: { type: "git_worktree", branchTemplate: "develop", baseRef: "origin/develop" } },
+      issue: { id: "issue-pr-prep", identifier: "PAP-9001", title: "Prepare pull request for an existing branch" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: { workspaceValidation: expect.objectContaining({ reason: "branch_template_matches_default_branch", branchName: "develop" }) },
+    });
+  });
+
+  it("refuses a branch template that renders a protected branch and creates no worktree", async () => {
+    const repoRoot = await createTempRepo();
+
+    await expect(realizeExecutionWorkspace({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "HEAD" },
+      config: { workspaceStrategy: { type: "git_worktree", branchTemplate: "release/{{issue.identifier}}" } },
+      issue: { id: "issue-pr-prep", identifier: "PAP-9001", title: "Prepare pull request for an existing branch" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: { workspaceValidation: expect.objectContaining({ reason: "branch_template_matches_default_branch", branchName: "release/PAP-9001" }) },
+    });
+    expect(await readGit(repoRoot, ["branch", "--list", "release/PAP-9001"])).toBe("");
+  });
+
+  it.each([
+    "main", "master", "release/1.2", "releases/v1", "hotfix/urgent", "fold/anything", "fold-sync/2026.11",
+  ])("refuses a branch template that renders the protected branch %s with no ref configuration naming it", async (branch) => {
+    const repoRoot = await createTempRepo();
+
+    await expect(realizeExecutionWorkspace({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "HEAD" },
+      config: { workspaceStrategy: { type: "git_worktree", branchTemplate: branch } },
+      issue: { id: "issue-pr-prep", identifier: "PAP-9001", title: "Prepare pull request for an existing branch" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: { workspaceValidation: expect.objectContaining({ reason: "branch_template_matches_default_branch", branchName: branch }) },
+    });
+  });
+
+  it("refuses a branch template that renders the remote's default branch", async () => {
+    const { repoRoot } = await createTempRepoWithRemote("trunk");
+    await runGit(repoRoot, ["remote", "set-head", "origin", "trunk"]);
+
+    await expect(realizeExecutionWorkspace({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "HEAD" },
+      config: { workspaceStrategy: { type: "git_worktree", branchTemplate: "trunk" } },
+      issue: { id: "issue-pr-prep", identifier: "PAP-9001", title: "Prepare pull request for an existing branch" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: { workspaceValidation: expect.objectContaining({ reason: "branch_template_matches_default_branch", branchName: "trunk" }) },
+    });
+  });
+
+  it("refuses a branch template that renders the project workspace's repo ref", async () => {
+    const repoRoot = await createTempRepo();
+    await runGit(repoRoot, ["branch", "-f", "develop"]);
+
+    await expect(realizeExecutionWorkspace({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "develop" },
+      config: { workspaceStrategy: { type: "git_worktree", branchTemplate: "{{workspace.repoRef}}" } },
+      issue: { id: "issue-pr-prep", identifier: "PAP-9001", title: "Prepare pull request for an existing branch" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: { workspaceValidation: expect.objectContaining({ reason: "branch_template_matches_default_branch", branchName: "develop" }) },
+    });
+  });
+
   it("fails closed instead of reconciling when the managed worktree path holds another branch", async () => {
     const repoRoot = await createTempRepo();
     const branchTip = await createBranchWithCommit(repoRoot, "feature/pinned", "pinned.txt");
@@ -14023,9 +14167,9 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
   it("never fast-forwards an unstarted exact branch to a newer base ref", async () => {
     const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
     const oldMaster = await readGit(repoRoot, ["rev-parse", "origin/master"]);
-    await runGit(repoRoot, ["branch", "release/frozen", oldMaster]);
+    await runGit(repoRoot, ["branch", "feature/frozen", oldMaster]);
 
-    const first = await realizeExistingBranch(repoRoot, "release/frozen", { baseRef: "origin/master" });
+    const first = await realizeExistingBranch(repoRoot, "feature/frozen", { baseRef: "origin/master" });
     expect(await readGit(first.cwd, ["rev-parse", "HEAD"])).toBe(oldMaster);
 
     const newMaster = await advanceRemoteMaster(sourceRepo, remotePath, "advance.txt");
@@ -14036,7 +14180,7 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
 
     expect(reused?.cwd).toBe(first.cwd);
     expect(await readGit(first.cwd, ["rev-parse", "HEAD"])).toBe(oldMaster);
-    expect(await readGit(repoRoot, ["rev-parse", "release/frozen"])).toBe(oldMaster);
+    expect(await readGit(repoRoot, ["rev-parse", "feature/frozen"])).toBe(oldMaster);
     expect(newMaster).not.toBe(oldMaster);
   });
 

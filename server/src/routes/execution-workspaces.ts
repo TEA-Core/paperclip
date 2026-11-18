@@ -35,7 +35,7 @@ import {
   type WorkspaceRuntimeLeaseClaim,
 } from "../services/index.js";
 import { mergeExecutionWorkspaceConfig, readExecutionWorkspaceConfig } from "../services/execution-workspaces.js";
-import { parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
+import { isProtectedDeliveryBranch, parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
 import { createGitRemoteAuthProvider } from "../services/git-credentials.js";
 import { readProjectWorkspaceRuntimeConfig } from "../services/project-workspace-runtime-config.js";
 import {
@@ -1164,6 +1164,25 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       }),
     );
     assertNoAgentExecutionWorkspaceIdentityMutation(req, collectExecutionWorkspaceIdentityPaths(req.body));
+    // SUP-24409: a row's branch is a card's delivery branch, so it cannot be pointed at a protected
+    // branch (main, master, a release, hotfix or fold branch, a base/default ref of the row or its
+    // project), and a project_primary row never takes a new branch. An unchanged branch is left alone
+    // (a project_primary row sits on its default).
+    if (typeof req.body.branchName === "string" && req.body.branchName !== existing.branchName) {
+      const projectRefs = await db
+        .select({ defaultRef: projectWorkspaces.defaultRef, repoRef: projectWorkspaces.repoRef })
+        .from(projectWorkspaces)
+        .where(and(eq(projectWorkspaces.companyId, existing.companyId), eq(projectWorkspaces.projectId, existing.projectId)));
+      if (isProtectedDeliveryBranch({
+        branch: req.body.branchName,
+        defaultRefs: [existing.baseRef, req.body.baseRef, ...projectRefs.flatMap((ref) => [ref.defaultRef, ref.repoRef])],
+        workspaceMode: existing.mode,
+      })) {
+        throw unprocessable(
+          `Branch "${req.body.branchName}" is a protected branch (main, master, a release, hotfix or fold branch, or a default branch of this workspace's project), or this is a project_primary workspace; it cannot be an execution workspace's delivery branch`,
+        );
+      }
+    }
     const patch: Record<string, unknown> = {
       ...(req.body.name === undefined ? {} : { name: req.body.name }),
       ...(req.body.cwd === undefined ? {} : { cwd: req.body.cwd }),
