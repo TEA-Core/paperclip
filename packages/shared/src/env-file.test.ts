@@ -157,7 +157,24 @@ describe("env file editor", () => {
     },
   ])("refuses to rewrite a managed multiline value: $name", ({ original }) => {
     expect(() => updateEnvFileContents(original, { PAPERCLIP_HOME: "/new" })).toThrow(
-      /spanning multiple lines|multiple lines|unterminated/,
+      /spanning multiple lines|multiple lines|unterminated|loader/,
+    );
+  });
+
+  it("pre-condition: refuses an invisible opener even when the hidden line already holds the managed value", () => {
+    const original =
+      "FOO.BAR='alpha\nPAPERCLIP_DB_BACKUP_ENABLED=false\nomega'\nPAPERCLIP_DB_BACKUP_ENABLED=false\n";
+
+    expect(() => updateEnvFileContents(original, { PAPERCLIP_DB_BACKUP_ENABLED: "false" })).toThrow(
+      /no canonical assignment|loader key/,
+    );
+  });
+
+  it("post-condition: refuses when leaving a line would change the loader value of a managed key", () => {
+    const original = String.raw`PAPERCLIP_HOME="CANARY\tescape"` + "\n";
+
+    expect(() => updateEnvFileContents(original, { PAPERCLIP_HOME: "CANARY\tescape" })).toThrow(
+      /rewrite would change loader value/,
     );
   });
 

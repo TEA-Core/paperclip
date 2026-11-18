@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { parse as parseDotenv } from "dotenv";
 
 export type EnvValueEncoding = "minimal" | "json";
 
@@ -177,6 +178,65 @@ function splitEnvLines(contents: string): EnvLine[] {
  * the continuation behind as a top-level assignment. Continuation lines of
  * unmanaged multiline values are preserved and never matched as keys.
  */
+// The loader (dotenv) is the oracle for what a file means. The writer's
+// own segmentation only understands canonical `KEY=` openers, so any key
+// or decoded value dotenv sees that the segmentation cannot account for
+// makes the file ambiguous for this writer: refuse instead of guessing.
+function assertLoaderAgreement(
+  parsedByLoader: Record<string, string>,
+  lines: EnvLine[],
+  segments: EnvSegment[],
+): void {
+  const accounted = new Map<string, string | undefined>();
+  for (const segment of segments) {
+    if (!segment.key) continue;
+    const segmentText = lines
+      .slice(segment.start, segment.end + 1)
+      .map((line) => line.contents)
+      .join("\n");
+    accounted.set(segment.key, parseDotenv(segmentText)[segment.key]);
+  }
+
+  for (const [key, value] of Object.entries(parsedByLoader)) {
+    if (!accounted.has(key)) {
+      throw new Error(
+        `Refusing to update env file: loader key ${key} has no canonical assignment the writer understands`,
+      );
+    }
+    if (accounted.get(key) !== value) {
+      throw new Error(
+        `Refusing to update env file: writer and loader disagree on the value of ${key}`,
+      );
+    }
+  }
+}
+
+function assertRewriteMatchesLoader(
+  inputParsed: Record<string, string>,
+  output: string,
+  entries: Record<string, string>,
+): void {
+  const outputParsed = parseDotenv(output);
+  const expectedKeys = new Set([...Object.keys(inputParsed), ...Object.keys(entries)]);
+
+  for (const key of Object.keys(outputParsed)) {
+    if (!expectedKeys.has(key)) {
+      throw new Error(`Refusing to update env file: rewrite would add loader key ${key}`);
+    }
+  }
+  for (const key of expectedKeys) {
+    if (!Object.hasOwn(outputParsed, key)) {
+      throw new Error(`Refusing to update env file: rewrite would drop loader key ${key}`);
+    }
+  }
+  for (const [key, value] of Object.entries(outputParsed)) {
+    const expected = Object.hasOwn(entries, key) ? entries[key] : inputParsed[key];
+    if (value !== expected) {
+      throw new Error(`Refusing to update env file: rewrite would change loader value of ${key}`);
+    }
+  }
+}
+
 export function updateEnvFileContents(
   contents: string,
   entries: Record<string, string>,
@@ -186,6 +246,8 @@ export function updateEnvFileContents(
   const missingEntries = new Map(Object.entries(entries));
   const lines = splitEnvLines(contents);
   const segments = groupEnvSegments(lines);
+  const parsedByLoader = parseDotenv(contents);
+  assertLoaderAgreement(parsedByLoader, lines, segments);
 
   for (const segment of segments) {
     if (!segment.key || entries[segment.key] === undefined) continue;
@@ -238,7 +300,9 @@ export function updateEnvFileContents(
     lines.splice(trailingBlankIndex, 0, ...insertedLines);
   }
 
-  return lines.map((line) => `${line.contents}${line.ending}`).join("");
+  const output = lines.map((line) => `${line.contents}${line.ending}`).join("");
+  assertRewriteMatchesLoader(parsedByLoader, output, entries);
+  return output;
 }
 
 /** Writes a changed env file through a same-directory temporary file and rename. */

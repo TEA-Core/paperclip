@@ -1629,6 +1629,170 @@ describe("worktree config repair", () => {
     }
   });
 
+  it.each([
+    { name: "dotted double-quoted", opener: 'FOO.BAR="alpha', closer: 'omega"', newline: "\n", attacker: "DATABASE_URL=postgresql://attacker.invalid/db" },
+    { name: "dotted single-quoted", opener: "FOO.BAR='alpha", closer: "omega'", newline: "\n", attacker: "PAPERCLIP_SECRETS_MASTER_KEY=attacker-key" },
+    { name: "dotted backtick", opener: "FOO.BAR=`alpha", closer: "omega`", newline: "\n", attacker: "BETTER_AUTH_SECRET=attacker-secret" },
+    { name: "dashed double-quoted", opener: 'FOO-BAR="alpha', closer: 'omega"', newline: "\n", attacker: "PAPERCLIP_AGENT_JWT_SECRET=attacker-secret" },
+    { name: "dashed backtick", opener: "FOO-BAR=`alpha", closer: "omega`", newline: "\n", attacker: "DATABASE_URL=postgresql://attacker.invalid/db" },
+    { name: "digit-led double-quoted", opener: '9FOO="alpha', closer: 'omega"', newline: "\n", attacker: "PAPERCLIP_CONFIG=/attacker/config.json" },
+    { name: "digit-led backtick", opener: "9FOO=`alpha", closer: "omega`", newline: "\n", attacker: "DATABASE_URL=postgresql://attacker.invalid/db" },
+    { name: "colon double-quoted", opener: 'FOO: "alpha', closer: 'omega"', newline: "\n", attacker: "DATABASE_URL=postgresql://attacker.invalid/db" },
+    { name: "colon single-quoted", opener: "FOO: 'alpha", closer: "omega'", newline: "\n", attacker: "BETTER_AUTH_SECRET=attacker-secret" },
+    { name: "export dotted double-quoted", opener: 'export FOO.BAR="alpha', closer: 'omega"', newline: "\n", attacker: "DATABASE_URL=postgresql://attacker.invalid/db" },
+    { name: "leading tab dotted", opener: '\tFOO.BAR="alpha', closer: 'omega"', newline: "\n", attacker: "PAPERCLIP_SECRETS_MASTER_KEY=attacker-key" },
+    { name: "tab around equals dotted", opener: 'FOO.BAR\t=\t"alpha', closer: 'omega"', newline: "\n", attacker: "DATABASE_URL=postgresql://attacker.invalid/db" },
+    { name: "leading spaces dotted", opener: '  FOO.BAR="alpha', closer: 'omega"', newline: "\n", attacker: "DATABASE_URL=postgresql://attacker.invalid/db" },
+    { name: "CRLF dotted double-quoted", opener: 'FOO.BAR="alpha', closer: 'omega"', newline: "\r\n", attacker: "DATABASE_URL=postgresql://attacker.invalid/db" },
+    { name: "bare CR dotted double-quoted", opener: 'FOO.BAR="alpha', closer: 'omega"', newline: "\r", attacker: "PAPERCLIP_AGENT_JWT_SECRET=attacker-secret" },
+    { name: "BOM dotted double-quoted", opener: '\uFEFFFOO.BAR="alpha', closer: 'omega"', newline: "\n", attacker: "DATABASE_URL=postgresql://attacker.invalid/db", openerFirst: true },
+  ])("refuses a worktree env whose $name opener hides a managed line (SUP-24365)", async ({ opener, closer, newline, attacker, openerFirst }) => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-hidden-opener-"));
+    const name = "SUP-24365-hidden-opener";
+    const worktreeRoot = path.join(tempRoot, name);
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const envPath = path.join(paperclipDir, ".env");
+    const isolatedHome = path.join(tempRoot, ".paperclip-worktrees");
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    const block = [opener, "PAPERCLIP_DB_BACKUP_ENABLED=true", attacker, closer];
+    const lines = openerFirst
+      ? [...block, "PAPERCLIP_IN_WORKTREE=true", ""]
+      : ["PAPERCLIP_IN_WORKTREE=true", ...block, ""];
+    const originalEnv = lines.join(newline);
+    await fs.writeFile(envPath, originalEnv, "utf8");
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
+    process.env.PAPERCLIP_WORKTREE_NAME = name;
+    process.env.PAPERCLIP_CONFIG = path.join(paperclipDir, "config.json");
+    delete process.env.PORT;
+    delete process.env.DATABASE_URL;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_CONTEXT;
+    delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+
+    expect(parseEnvFile(originalEnv).DATABASE_URL).toBeUndefined();
+    let thrown: unknown = null;
+    try {
+      maybeRepairLegacyWorktreeConfigAndEnvFiles();
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect(await fs.readFile(envPath, "utf8")).toBe(originalEnv);
+  });
+
+  it("randomized differential: repair never gains a loader key (seed 24365, SUP-24365)", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-differential-"));
+    const name = "SUP-24365-differential";
+    const worktreeRoot = path.join(tempRoot, name);
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const envPath = path.join(paperclipDir, ".env");
+    const configPath = path.join(paperclipDir, "config.json");
+    const isolatedHome = path.join(tempRoot, ".paperclip-worktrees");
+    const instanceId = "sup-24365-differential";
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+
+    // Deterministic PRNG so the generated grammar is reproducible.
+    let state = 24365;
+    const rand = () => {
+      state |= 0; state = (state + 0x6d2b79f5) | 0;
+      let t = Math.imul(state ^ (state >>> 15), 1 | state);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const pick = <T,>(items: readonly T[]): T => items[Math.floor(rand() * items.length)]!;
+
+    const openers = [
+      { open: (q: string) => `FOO.BAR=${q}alpha`, close: (q: string) => `omega${q}` },
+      { open: (q: string) => `FOO-BAR=${q}alpha`, close: (q: string) => `omega${q}` },
+      { open: (q: string) => `9FOO=${q}alpha`, close: (q: string) => `omega${q}` },
+      { open: (q: string) => `FOO: ${q}alpha`, close: (q: string) => `omega${q}` },
+      { open: (q: string) => `export FOO.BAR=${q}alpha`, close: (q: string) => `omega${q}` },
+      { open: (q: string) => `\tFOO.BAR=${q}alpha`, close: (q: string) => `omega${q}` },
+      { open: (q: string) => `UNRELATED=${q}alpha`, close: (q: string) => `omega${q}` },
+      { open: (q: string) => `UNRELATED=${q}alpha`, close: (q: string) => `omega${q} # note` },
+    ];
+    const attackerKeys = [
+      "DATABASE_URL=postgresql://attacker.invalid/db",
+      "PAPERCLIP_SECRETS_MASTER_KEY=attacker-key",
+      "BETTER_AUTH_SECRET=attacker-secret",
+      "PAPERCLIP_AGENT_JWT_SECRET=attacker-secret",
+    ];
+    const deterministicManaged: Record<string, string> = {
+      PAPERCLIP_HOME: isolatedHome,
+      PAPERCLIP_INSTANCE_ID: instanceId,
+      PAPERCLIP_CONFIG: configPath,
+      PAPERCLIP_CONTEXT: path.join(isolatedHome, "context.json"),
+      PAPERCLIP_IN_WORKTREE: "true",
+      PAPERCLIP_DB_BACKUP_ENABLED: "false",
+      PAPERCLIP_WORKTREE_NAME: name,
+    };
+
+    for (let iteration = 0; iteration < 48; iteration += 1) {
+      const quote = pick(['"', "'", "`"] as const);
+      const opener = pick(openers);
+      const newline = pick(["\n", "\r\n", "\r"] as const);
+      const lines = [
+        ...(rand() < 0.5 ? ["# generated operator comment", ""] : []),
+        "PAPERCLIP_IN_WORKTREE=true",
+        ...(rand() < 0.5 ? [`PLAIN_UNRELATED=${iteration}`] : []),
+        opener.open(quote),
+        pick(["PAPERCLIP_DB_BACKUP_ENABLED=true", "PAPERCLIP_HOME=/evil", "PLAIN_INNER=1"] as const),
+        pick(attackerKeys),
+        opener.close(quote),
+        ...(rand() < 0.5 ? [`DUP=value-${iteration}`, `DUP=value-${iteration}`] : []),
+        "",
+      ];
+      const originalEnv = lines.join(newline);
+      await fs.writeFile(envPath, originalEnv, "utf8");
+
+      process.chdir(worktreeRoot);
+      process.env.PAPERCLIP_IN_WORKTREE = "true";
+      process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
+      process.env.PAPERCLIP_WORKTREE_NAME = name;
+      process.env.PAPERCLIP_CONFIG = configPath;
+      delete process.env.PORT;
+      delete process.env.DATABASE_URL;
+      delete process.env.PAPERCLIP_HOME;
+      delete process.env.PAPERCLIP_INSTANCE_ID;
+      delete process.env.PAPERCLIP_CONTEXT;
+      delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+
+      const before = parseEnvFile(originalEnv);
+      let thrown: unknown = null;
+      try {
+        maybeRepairLegacyWorktreeConfigAndEnvFiles();
+      } catch (error) {
+        thrown = error;
+      }
+      const afterContents = await fs.readFile(envPath, "utf8");
+      if (thrown) {
+        expect(afterContents).toBe(originalEnv);
+        continue;
+      }
+      const after = parseEnvFile(afterContents);
+      for (const [key, value] of Object.entries(after)) {
+        if (Object.hasOwn(deterministicManaged, key)) {
+          expect(value).toBe(deterministicManaged[key]);
+        } else if (key === "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET") {
+          expect(value).toMatch(/^[0-9a-f]{64}$/);
+        } else {
+          expect(before[key]).toBe(value);
+        }
+      }
+      expect(after.DATABASE_URL).toBeUndefined();
+      expect(after.PAPERCLIP_SECRETS_MASTER_KEY).toBeUndefined();
+      expect(after.BETTER_AUTH_SECRET).toBeUndefined();
+      expect(after.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
+    }
+  });
+
   it("reads quoted and commented worktree markers and identity the same way the server loads them (SUP-24365)", async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-quoted-identity-"));
     const worktreeRoot = path.join(tempRoot, "SUP-24365-quoted-identity");

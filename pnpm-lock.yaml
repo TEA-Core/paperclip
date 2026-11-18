@@ -833,6 +833,9 @@ importers:
 
   packages/shared:
     dependencies:
+      dotenv:
+        specifier: ^17.4.2
+        version: 17.4.2
       three:
         specifier: 0.185.1
         version: 0.185.1
