@@ -692,7 +692,10 @@ const LADDER_REFUSAL_REPEATED_ACTION = "issue.done_transition_ladder_refusal_rep
 
 /**
  * SUP-24298: a done write refused with 422 `done_transition_missing_tier_declaration`
- * leaves its own refusal-class row, countable like `LADDER_REFUSED_ACTION`. The row
+ * or `done_transition_tier_conflict` leaves its own refusal-class row, countable like
+ * `LADDER_REFUSED_ACTION`. The row carries the verdict's own code (SUP-24299 F6), the
+ * one the response and the thread comment name, so a contradiction refusal is not
+ * counted under the generic code. The row
  * is written per refused write: the thread remedy comment is deduped per guard code
  * (`postTerminalStatusRefusalComment`), so a repeated refusal posts no second
  * comment and this row is the only per-write machine trace. Never throws, so the
@@ -710,7 +713,10 @@ export async function writeDoneTransitionRefusedAuditLog(
   issue: { id: string; companyId: string; identifier: string | null },
   details:
     | {
-        code: "done_transition_missing_tier_declaration";
+        // The tier-declaration refusal's own code: the generic missing-declaration
+        // code, or the verdict's code (SUP-24299 F6) so the row matches the response
+        // and the thread comment.
+        code: "done_transition_missing_tier_declaration" | typeof DONE_TRANSITION_TIER_CONFLICT_CODE;
         httpStatus: 422;
         reason: string;
         decisionCarried: boolean;

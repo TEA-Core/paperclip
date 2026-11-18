@@ -5742,7 +5742,7 @@ export function issueRoutes(
       // thread comment (a coalesced remedy comment must not erase the write's own
       // trace) and whether or not this door persists the comment.
       await writeDoneTransitionRefusedAuditLog(db, issue, {
-        code: "done_transition_missing_tier_declaration",
+        code: tierResult.code ?? "done_transition_missing_tier_declaration",
         httpStatus: 422,
         reason: tierResult.reason,
         decisionCarried,

@@ -1221,6 +1221,107 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       expect(await statusOf(issueId)).toBe("in_review");
     }
     expect(await auditRows(companyId, issueId, "issue.done_transition_tier2_close")).toHaveLength(0);
+    // SUP-24299 F6: the activity row carries the same code as the response and the
+    // thread comment, so a contradiction refusal is countable by details.code. One
+    // row per refused write (two writes above); the comment is deduped per code.
+    const refusals = await auditRows(companyId, issueId, "issue.done_transition_refused");
+    expect(refusals).toHaveLength(2);
+    for (const row of refusals) {
+      expect(row.details).toMatchObject({
+        code: "done_transition_tier_conflict",
+        httpStatus: 422,
+        source: "done_transition_guard",
+        reason: expect.stringContaining("mutually exclusive"),
+      });
+    }
+    const threadComments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(threadComments.filter((c) => c.body.includes("done_transition_tier_conflict"))).toHaveLength(1);
+  });
+
+  it("POST comment: a record_only approval whose Tier 2 evidence ends in the Tier 1 marker logs the refusal row as done_transition_tier_conflict (SUP-24299 F6)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D24299B", { deliveryRequirement: "record_only" });
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({ body: `## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): ${RECORD_ONLY_EVIDENCE}. Liveness unverified.` });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_tier_conflict");
+    expect(await statusOf(issueId)).toBe("in_review");
+    const refusals = await auditRows(companyId, issueId, "issue.done_transition_refused");
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]!.details).toMatchObject({
+      code: "done_transition_tier_conflict",
+      httpStatus: 422,
+      decisionCarried: true,
+    });
+  });
+
+  it("POST comment: a genuine missing declaration still logs the generic refusal code (SUP-24299 F6)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D24299C", { deliveryRequirement: "record_only" });
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({ body: "## Review: APPROVED\n\nShip it." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    const refusals = await auditRows(companyId, issueId, "issue.done_transition_refused");
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]!.details).toMatchObject({
+      code: "done_transition_missing_tier_declaration",
+      httpStatus: 422,
+    });
+  });
+
+  it("PATCH: both tier refusals keep the 422 body and thread comment; only the contradiction row's details.code is the conflict code (SUP-24299 F6)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D24299D", { deliveryRequirement: "record_only" });
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockNoOpenPulls();
+
+    const missing = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "The sweep consumed everything on schedule." });
+    const conflicted = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({ status: "done", comment: "Closing.", doneTier: { tier: "tier2", probeEvidence: `${RECORD_ONLY_EVIDENCE}. Liveness unverified.` } });
+
+    const threadComments = (await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId))).map((c) => c.body);
+    const refusals = await auditRows(companyId, issueId, "issue.done_transition_refused");
+    expect(refusals).toHaveLength(2);
+
+    for (const [res, code] of [
+      [missing, "done_transition_missing_tier_declaration"],
+      [conflicted, "done_transition_tier_conflict"],
+    ] as const) {
+      // Status and wire body: exactly error / code / details {issueId, identifier, remedy}.
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body).toEqual({
+        error: expect.any(String),
+        code,
+        details: { issueId, identifier, remedy: expect.any(String) },
+      });
+      // Thread comment: the marker names the same code and carries the body's reason and remedy verbatim.
+      const comment = threadComments.filter((body) => body.includes(`(\`${code}\`)`));
+      expect(comment).toHaveLength(1);
+      expect(comment[0]).toContain(`Reason: ${res.body.error}`);
+      expect(comment[0]).toContain(`Remedy: ${res.body.details.remedy}`);
+      // Activity row: code and reason match the response.
+      const rows = refusals.filter((row) => row.details?.code === code);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.details).toMatchObject({ httpStatus: 422, reason: res.body.error });
+    }
   });
 
   it("PATCH: the record_only missing-tier 422 remedy names both record-only forms and no merge head (SUP-22801)", async () => {
@@ -1894,6 +1995,28 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       expect(res.status, JSON.stringify(res.body)).toBe(409);
       expect(res.body.code).toBe("approval_final_delivery_preflight");
       expect(await statusOf(issueId)).toBe("in_review");
+    });
+
+    it("logs a contradictory Tier 2 close declaration as done_transition_tier_conflict in the activity row (SUP-24299 F6)", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("R24299A", { deliveryRequirement: "record_only" });
+      const runId = await seedRun(companyId, reviewerAgentId, issueId);
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockNoOpenPulls();
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          ...closeBody,
+          doneTier: { tier: "tier2", probeEvidence: `${RECORD_ONLY_EVIDENCE}. Liveness unverified.` },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_tier_conflict");
+      expect(await statusOf(issueId)).toBe("in_review");
+      const refusals = await auditRows(companyId, issueId, "issue.done_transition_refused");
+      expect(refusals).toHaveLength(1);
+      expect(refusals[0]!.details).toMatchObject({ code: "done_transition_tier_conflict", httpStatus: 422 });
     });
 
     it("refuses the recovery close when the provider answer is contradictory (state open, merged true)", async () => {
