@@ -363,6 +363,41 @@ describeEmbeddedPostgres("Wiki handoff board stage decision on an unassigned car
     });
   });
 
+  it("rejects the internal marker (flat or nested) on PATCH for board and agent callers and changes nothing", async () => {
+    const { company, reviewer, intruder } = await seedWikiCompany();
+    const card = await seedInReviewHandoff({
+      companyId: company.id,
+      reviewerId: reviewer.id,
+      assigneeAgentId: null,
+      returnAssigneeAgentId: null,
+    });
+    const agentActor = {
+      type: "agent",
+      agentId: intruder.id,
+      companyId: company.id,
+      source: "agent_key",
+      runId: randomUUID(),
+    } as unknown as Express.Request["actor"];
+    const nested = { assigneeFieldWritten: false, currentAssigneeUserId: null };
+    const markers = [{ boardStageDecision: true }, { boardStageDecision: nested }];
+    const writes = [{ assigneeAgentId: intruder.id }, { assigneeAgentId: null }, { status: "todo" }];
+
+    for (const actor of [boardActor(company.id), agentActor]) {
+      const app = createApp(actor);
+      for (const marker of markers) {
+        for (const write of writes) {
+          const res = await request(app).patch(`/api/issues/${card.id}`).send({ ...write, ...marker });
+          expect(res.status, JSON.stringify({ actor: actor.type, marker, write, body: res.body })).toBe(400);
+        }
+      }
+    }
+    await expect(readBack(card.id)).resolves.toMatchObject({
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    });
+  });
+
   it("keeps refusing a service-level stage-shaped write without the board decision marker", async () => {
     const { company, reviewer, intruder } = await seedWikiCompany();
     const card = await seedInReviewHandoff({
