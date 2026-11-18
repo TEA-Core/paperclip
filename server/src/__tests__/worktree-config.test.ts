@@ -17,6 +17,7 @@ import {
   maybeRepairLegacyWorktreeConfigAndEnvFiles,
 } from "../worktree-config.js";
 import { parse as parseEnvFile } from "dotenv";
+import { updateEnvFileContents } from "@paperclipai/shared/env-file";
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
 
 const ORIGINAL_ENV = { ...process.env };
@@ -1511,6 +1512,121 @@ describe("worktree config repair", () => {
     maybeRepairLegacyWorktreeConfigAndEnvFiles();
     expect(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBe(value);
     expect(await fs.readFile(envPath, "utf8")).toBe(repairedEnv);
+  });
+
+  it.each([
+    "PAPERCLIP_HOME",
+    "PAPERCLIP_INSTANCE_ID",
+    "PAPERCLIP_CONFIG",
+    "PAPERCLIP_CONTEXT",
+    "PAPERCLIP_IN_WORKTREE",
+    "PAPERCLIP_DB_BACKUP_ENABLED",
+    "PAPERCLIP_WORKTREE_NAME",
+  ])("does not split a quoted multiline %s into a loadable key during repair (SUP-24365)", async (managedKey) => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-managed-multiline-"));
+    const name = "SUP-24365-managed-multiline";
+    const instanceId = "sup-24365-managed-multiline";
+    const worktreeRoot = path.join(tempRoot, name);
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const configPath = path.join(paperclipDir, "config.json");
+    const envPath = path.join(paperclipDir, ".env");
+    const isolatedHome = path.join(tempRoot, ".paperclip-worktrees");
+    const instanceRoot = path.join(isolatedHome, "instances", instanceId);
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    await fs.writeFile(
+      configPath,
+      JSON.stringify(buildIsolatedConfig(instanceRoot, 45439, 55439), null, 2) + "\n",
+      "utf8",
+    );
+    const baseLines = [
+      "PAPERCLIP_IN_WORKTREE=true",
+      `PAPERCLIP_HOME=${JSON.stringify(isolatedHome)}`,
+      `PAPERCLIP_INSTANCE_ID=${JSON.stringify(instanceId)}`,
+      `PAPERCLIP_CONFIG=${JSON.stringify(configPath)}`,
+      `PAPERCLIP_CONTEXT=${JSON.stringify(path.join(isolatedHome, "context.json"))}`,
+      'PAPERCLIP_DB_BACKUP_ENABLED="false"',
+      `PAPERCLIP_WORKTREE_NAME=${JSON.stringify(name)}`,
+    ];
+    const hostileBlock = [
+      `${managedKey}="alpha`,
+      "DATABASE_URL=postgresql://attacker:secret@evil.invalid/db",
+      'omega"',
+    ].join("\n");
+    const envLines = baseLines.filter((line) => !line.startsWith(`${managedKey}=`));
+    envLines.push(hostileBlock, "");
+    const originalEnv = envLines.join("\n");
+    await fs.writeFile(envPath, originalEnv, "utf8");
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
+    process.env.PAPERCLIP_WORKTREE_NAME = name;
+    process.env.PAPERCLIP_CONFIG = configPath;
+    delete process.env.PORT;
+    delete process.env.DATABASE_URL;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_CONTEXT;
+
+    let thrown: unknown = null;
+    try {
+      maybeRepairLegacyWorktreeConfigAndEnvFiles();
+    } catch (error) {
+      thrown = error;
+    }
+
+    // Refusal is acceptable: the env file must be left byte-identical and
+    // the loader must gain no key. The gate-blocked marker key is the one
+    // case that returns without throwing.
+    if (managedKey !== "PAPERCLIP_IN_WORKTREE") {
+      expect(thrown).toBeInstanceOf(Error);
+    }
+    expect(await fs.readFile(envPath, "utf8")).toBe(originalEnv);
+    expect(parseEnvFile(originalEnv).DATABASE_URL).toBeUndefined();
+  });
+
+  it("loader gains no key from quoted multiline shapes after the writer runs (SUP-24365)", () => {
+    const managed = {
+      PAPERCLIP_HOME: "/managed/home",
+      PAPERCLIP_DB_BACKUP_ENABLED: "false",
+      PAPERCLIP_WORKTREE_NAME: "wt",
+    };
+    const shapes = [
+      'PAPERCLIP_HOME="alpha\nDATABASE_URL=postgresql://a/b\nomega"\n',
+      "PAPERCLIP_HOME='alpha\nBETTER_AUTH_SECRET=x\nomega'\n",
+      'PAPERCLIP_DB_BACKUP_ENABLED="alpha\r\nPAPERCLIP_SECRETS_MASTER_KEY=x\r\nomega"\r\n',
+      'UNRELATED="alpha\nPAPERCLIP_HOME=/evil\nomega"\n',
+      'PAPERCLIP_HOME="alpha\\"\nPAPERCLIP_AGENT_JWT_SECRET=x\nomega"\n',
+      'PAPERCLIP_HOME="/old"\nPAPERCLIP_HOME="alpha\nDATABASE_URL=postgresql://a/b\nomega"\n',
+      'PAPERCLIP_WORKTREE_NAME="alpha\nDATABASE_URL=postgresql://a/b',
+    ];
+
+    for (const shape of shapes) {
+      const beforeKeys = new Set(Object.keys(parseEnvFile(shape)));
+      let updated: string | null = null;
+      try {
+        updated = updateEnvFileContents(shape, managed, { valueEncoding: "json" });
+      } catch {
+        updated = null;
+      }
+      if (updated === null) continue;
+      const after = parseEnvFile(updated);
+      for (const key of Object.keys(after)) {
+        if (beforeKeys.has(key)) continue;
+        expect(Object.hasOwn(managed, key)).toBe(true);
+      }
+      for (const [key, value] of Object.entries(managed)) {
+        if (after[key] !== undefined && !shape.includes(`${key}=${value}`)) {
+          // A managed key that was present may only hold a managed value.
+          if (beforeKeys.has(key)) expect([value, after[key]]).toContain(after[key]);
+        }
+      }
+      expect(after.DATABASE_URL).toBeUndefined();
+      expect(after.BETTER_AUTH_SECRET).toBeUndefined();
+      expect(after.PAPERCLIP_SECRETS_MASTER_KEY).toBeUndefined();
+      expect(after.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
+    }
   });
 
   it("reads quoted and commented worktree markers and identity the same way the server loads them (SUP-24365)", async () => {

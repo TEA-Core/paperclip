@@ -78,6 +78,71 @@ function parseComparableEnvValue(rawValue: string): string | null {
   return encodedValue;
 }
 
+type EnvQuote = '"' | "'" | "`";
+
+function closingQuoteIndex(text: string, quote: EnvQuote, start: number): number | null {
+  for (let index = start; index < text.length; index += 1) {
+    // dotenv's lexer treats a backslash immediately before the quote as an
+    // escaped quote for single, double and backtick quotes alike.
+    if (text[index] === "\\" && text[index + 1] === quote) {
+      index += 1;
+      continue;
+    }
+    if (text[index] === quote) return index;
+  }
+  return null;
+}
+
+type EnvSegment = {
+  key: string | null;
+  start: number;
+  end: number;
+  quoted: boolean;
+  quoteClosed: boolean;
+};
+
+// Groups physical lines into logical assignments. A quoted value may span
+// physical lines; its continuation lines are part of the same assignment
+// and must never be treated as assignments of their own.
+function groupEnvSegments(lines: EnvLine[]): EnvSegment[] {
+  const segments: EnvSegment[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = lines[index].contents.match(ENV_ASSIGNMENT_PATTERN);
+    if (!match) {
+      segments.push({ key: null, start: index, end: index, quoted: false, quoteClosed: true });
+      continue;
+    }
+
+    const [, , key, , rawValue] = match;
+    const valueStart = rawValue.length - rawValue.trimStart().length;
+    const quote = rawValue[valueStart] as EnvQuote | undefined;
+    if (quote !== '"' && quote !== "'" && quote !== "`") {
+      segments.push({ key, start: index, end: index, quoted: false, quoteClosed: true });
+      continue;
+    }
+
+    if (closingQuoteIndex(rawValue, quote, valueStart + 1) !== null) {
+      segments.push({ key, start: index, end: index, quoted: true, quoteClosed: true });
+      continue;
+    }
+
+    let end = lines.length - 1;
+    let quoteClosed = false;
+    for (let next = index + 1; next < lines.length; next += 1) {
+      if (closingQuoteIndex(lines[next].contents, quote, 0) !== null) {
+        end = next;
+        quoteClosed = true;
+        break;
+      }
+    }
+    segments.push({ key, start: index, end, quoted: true, quoteClosed });
+    index = end;
+  }
+
+  return segments;
+}
+
 function splitEnvLines(contents: string): EnvLine[] {
   const lines: EnvLine[] = [];
   const newlinePattern = /\r\n|\n|\r/g;
@@ -105,6 +170,12 @@ function splitEnvLines(contents: string): EnvLine[] {
  * Duplicate managed keys are intentional: every occurrence is checked and any
  * stale occurrence is updated. Occurrences that already decode to the desired
  * value retain their original quoting and spacing.
+ *
+ * Refuses (throws, leaving the caller's file untouched) when a named
+ * assignment has a quoted value spanning multiple physical lines, or an
+ * unterminated quote: rewriting only the first physical line would leave
+ * the continuation behind as a top-level assignment. Continuation lines of
+ * unmanaged multiline values are preserved and never matched as keys.
  */
 export function updateEnvFileContents(
   contents: string,
@@ -114,8 +185,26 @@ export function updateEnvFileContents(
   const valueEncoding = options.valueEncoding ?? "json";
   const missingEntries = new Map(Object.entries(entries));
   const lines = splitEnvLines(contents);
+  const segments = groupEnvSegments(lines);
 
-  for (const line of lines) {
+  for (const segment of segments) {
+    if (!segment.key || entries[segment.key] === undefined) continue;
+    if (segment.end > segment.start) {
+      throw new Error(
+        `Refusing to update env file: ${segment.key} has a quoted value spanning multiple lines`,
+      );
+    }
+    if (segment.quoted && !segment.quoteClosed) {
+      throw new Error(
+        `Refusing to update env file: ${segment.key} has an unterminated quoted value`,
+      );
+    }
+  }
+
+  for (const segment of segments) {
+    if (segment.end > segment.start || !segment.key) continue;
+
+    const line = lines[segment.start];
     const match = line.contents.match(ENV_ASSIGNMENT_PATTERN);
     if (!match) continue;
 

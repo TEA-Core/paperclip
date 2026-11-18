@@ -95,4 +95,88 @@ describe("env file editor", () => {
 
     expect(updateEnvFileContents(original, { PAPERCLIP_HOME: "/same path" })).toBe(original);
   });
+
+  // The worktree repair manages these keys through this writer. A quoted
+  // value that spans physical lines must never be rewritten by its first
+  // line: the continuation would become a top-level assignment.
+  const managedKeys = [
+    "PAPERCLIP_HOME",
+    "PAPERCLIP_INSTANCE_ID",
+    "PAPERCLIP_CONFIG",
+    "PAPERCLIP_CONTEXT",
+    "PAPERCLIP_IN_WORKTREE",
+    "PAPERCLIP_DB_BACKUP_ENABLED",
+    "PAPERCLIP_WORKTREE_NAME",
+    "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
+  ];
+
+  it.each(managedKeys.flatMap((key) => [
+    { key, quote: '"' as const },
+    { key, quote: "'" as const },
+  ]))("refuses to rewrite a quoted multiline value for $key ($quote)", ({ key, quote }) => {
+    const original = [
+      `${key}=${quote}alpha`,
+      "DATABASE_URL=postgresql://attacker:secret@evil.invalid/db",
+      `omega${quote}`,
+      "",
+    ].join("\n");
+
+    expect(() => updateEnvFileContents(original, { [key]: "managed-new-value" })).toThrow(
+      /spanning multiple lines|multiple lines/,
+    );
+  });
+
+  it.each([
+    {
+      name: "escaped quote does not close the value",
+      original: 'PAPERCLIP_HOME="alpha\\"\nDATABASE_URL=postgresql://attacker:secret@evil.invalid/db\nomega"\n',
+    },
+    {
+      name: "escaped backslash at end of first line",
+      original: 'PAPERCLIP_HOME="alpha\\\\\nDATABASE_URL=postgresql://attacker:secret@evil.invalid/db\nomega"\n',
+    },
+    {
+      name: "CRLF multiline value",
+      original: 'PAPERCLIP_HOME="alpha\r\nDATABASE_URL=postgresql://attacker:secret@evil.invalid/db\r\nomega"\r\n',
+    },
+    {
+      name: "trailing comment after the closing quote",
+      original: 'PAPERCLIP_HOME="alpha\nomega" # managed note\n',
+    },
+    {
+      name: "multiline duplicate after a single-line duplicate",
+      original: 'PAPERCLIP_HOME="/old"\nPAPERCLIP_HOME="alpha\nDATABASE_URL=postgresql://attacker:secret@evil.invalid/db\nomega"\n',
+    },
+    {
+      name: "multiline duplicate before a single-line duplicate",
+      original: 'PAPERCLIP_HOME="alpha\nDATABASE_URL=postgresql://attacker:secret@evil.invalid/db\nomega"\nPAPERCLIP_HOME="/old"\n',
+    },
+    {
+      name: "unterminated multiline value as the last line without a newline",
+      original: 'PAPERCLIP_HOME="alpha\nDATABASE_URL=postgresql://attacker:secret@evil.invalid/db',
+    },
+  ])("refuses to rewrite a managed multiline value: $name", ({ original }) => {
+    expect(() => updateEnvFileContents(original, { PAPERCLIP_HOME: "/new" })).toThrow(
+      /spanning multiple lines|multiple lines|unterminated/,
+    );
+  });
+
+  it("does not rewrite a managed-looking line inside an unmanaged multiline value", () => {
+    const original = [
+      'UNRELATED="alpha',
+      "PAPERCLIP_HOME=/evil",
+      'omega"',
+      "",
+    ].join("\n");
+
+    const updated = updateEnvFileContents(original, { PAPERCLIP_HOME: "/good" });
+
+    expect(updated).toBe([
+      'UNRELATED="alpha',
+      "PAPERCLIP_HOME=/evil",
+      'omega"',
+      'PAPERCLIP_HOME="/good"',
+      "",
+    ].join("\n"));
+  });
 });
