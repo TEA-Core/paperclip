@@ -6,7 +6,9 @@ import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, is, sql } from "drizzle-orm";
+import { getTableConfig, PgTable } from "drizzle-orm/pg-core";
+import * as dbExports from "@paperclipai/db";
 import {
   activityLog,
   agents,
@@ -21,12 +23,14 @@ import {
   externalObjectMentions,
   externalObjects,
   heartbeatRuns,
+  instanceUserRoles,
   issueComments,
   issueDocuments,
   issues,
   issueWorkProducts,
   projectWorkspaces,
   projects,
+  toolRuntimeSlots,
   workspaceOperations,
   workspaceRuntimeServices,
   type Db,
@@ -42,6 +46,7 @@ import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
   evaluateDoneTransitionGuardForBackstopClose,
+  NO_WORKSPACE_REFERENCE_TABLES,
   type evaluateDoneTierDeclaration,
   type measureNoRepositoryLandingForClose,
 } from "../services/done-transition-guard.js";
@@ -2054,11 +2059,9 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
         projectWorkspaceId: null,
         executionWorkspaceId: null,
         checkedRecords: expect.arrayContaining([
-          "execution_workspaces.source_issue_id",
-          "environment_leases.execution_workspace_id",
-          "heartbeat_runs.context_snapshot (project or workspace keys, any depth)",
-          "activity_log.details (project, workspace, repository or delivery-requirement keys, any depth)",
-          "external_object_mentions.source_issue_id",
+          "external_object_mentions (none)",
+          "issue_comments (none deleted, no repository reference)",
+          "documents of the issue (every revision, no repository reference)",
         ]),
       });
       const bodies = await db
@@ -2202,10 +2205,10 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
           providerKey: "github",
           objectType: "pull_request",
         });
-      }, `Tier 1 "no-repository-landing" cannot be declared on an issue that links pull requests (TEA-Core/other#77).`],
+      }, `Tier 1 "no-repository-landing" cannot be declared on an issue that mentions an external object (github pull_request).`],
       ["records a pull request work product", async (fixture: NoWorkspaceIssue) => {
         await insertPullRequestProduct(fixture);
-      }, `Tier 1 "no-repository-landing" cannot be declared on an issue that records a pull request work product.`],
+      }, `Tier 1 "no-repository-landing" cannot be declared on an issue that records a repository work product (pull_request).`],
     ] as const)("refuses a card that %s", async (_label, link, expected) => {
       const fixture = await seedAdmissible();
       await link(fixture);
@@ -2512,8 +2515,8 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     });
 
     const BOARD_AUTHOR_REFUSAL =
-      `Tier 1 "no-repository-landing" requires an "entry-ruling" document whose every revision was written by a board user of this company ` +
-      "(an active, non-viewer member or an instance admin) when the issue has no execution workspace.";
+      `Tier 1 "no-repository-landing" requires an "entry-ruling" document whose every revision was written by a board member of this company ` +
+      "(an active, non-viewer member) when the issue has no execution workspace.";
 
     it.each([
       ["a second agent of the company", async (fixture: NoWorkspaceIssue) => {
@@ -2548,6 +2551,10 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
           createdByAgentId: fixture.rulerAgentId,
         });
       }],
+      ["an instance admin who is not a member of the company", async (fixture: NoWorkspaceIssue) => {
+        await db.insert(instanceUserRoles).values({ userId: `admin-${fixture.companyId}`, role: "instance_admin" });
+        await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorUserId: `admin-${fixture.companyId}` });
+      }],
     ] as const)("refuses a ruling written by %s", async (_label, rule) => {
       const fixture = await seedNoWorkspace();
       await rule(fixture);
@@ -2555,15 +2562,244 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       await expectRefused(fixture, await close(fixture.identifier), BOARD_AUTHOR_REFUSAL);
     });
 
-    it("checks the ruling before linked repository work", async () => {
+    it("reads the card's history before its ruling", async () => {
       const fixture = await seedNoWorkspace();
       await insertPullRequestProduct(fixture);
 
       await expectRefused(
         fixture,
         await close(fixture.identifier),
-        `Tier 1 "no-repository-landing" requires a non-empty "entry-ruling" document on this issue.`,
+        `Tier 1 "no-repository-landing" cannot be declared on an issue that records a repository work product (pull_request).`,
       );
+    });
+
+    // ── Round 3: the proof reads only what cannot be scrubbed. Each cell below
+    // admitted at the round-2 head.
+
+    const THREAD_CITES = (label: string) =>
+      `Tier 1 "no-repository-landing" cannot be declared on an issue whose thread cites repository work (${label}).`;
+    const HISTORY_CITES = (label: string) =>
+      `Tier 1 "no-repository-landing" cannot be declared on an issue whose history cites repository work (${label}).`;
+    const DELETED_COMMENT_REFUSAL =
+      `Tier 1 "no-repository-landing" cannot be declared on an issue with a deleted comment: its text can no longer be checked for repository work.`;
+    const TRUNCATED_HISTORY_REFUSAL =
+      `Tier 1 "no-repository-landing" cannot be declared on an issue whose recorded title or description history is truncated: the earlier text can no longer be checked for repository work.`;
+
+    async function postComment(identifier: string, body: string) {
+      const res = await request(app).patch(`/api/issues/${identifier}`).send({ comment: body });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const [comment] = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.body, body));
+      return comment!.id;
+    }
+
+    async function deleteComment(fixture: NoWorkspaceIssue, commentId: string) {
+      const res = await request(app).delete(`/api/issues/${fixture.identifier}/comments/${commentId}`);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    }
+
+    async function patchIssue(identifier: string, body: Record<string, unknown>) {
+      const res = await request(app).patch(`/api/issues/${identifier}`).send(body);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    }
+
+    const LONG_PREFIX = "Notes on the retention decision. ".repeat(5);
+
+    it.each([
+      ["a comment citing a pull request URL, then deleted", async (fixture: NoWorkspaceIssue) => {
+        const commentId = await postComment(fixture.identifier, "Landed in https://github.com/TEA-Core/records/pull/12 today.");
+        await deleteComment(fixture, commentId);
+      }, HISTORY_CITES("a pull request URL")],
+      ["a comment citing a pull request URL past the recorded snippet, then deleted", async (fixture: NoWorkspaceIssue) => {
+        const commentId = await postComment(fixture.identifier, `${LONG_PREFIX}Landed in https://github.com/TEA-Core/records/pull/12 today.`);
+        await deleteComment(fixture, commentId);
+      }, DELETED_COMMENT_REFUSAL],
+      ["a title citing a pull request, then cleaned", async (fixture: NoWorkspaceIssue) => {
+        await patchIssue(fixture.identifier, { title: "Follow-up of PR #77" });
+        await patchIssue(fixture.identifier, { title: "Record the ruling" });
+      }, HISTORY_CITES("a pull request number")],
+      ["a description citing a pull request URL, then cleaned", async (fixture: NoWorkspaceIssue) => {
+        await patchIssue(fixture.identifier, { description: "See https://github.com/TEA-Core/records/pull/12" });
+        await patchIssue(fixture.identifier, { description: "Decide the retention policy." });
+      }, HISTORY_CITES("a pull request URL")],
+      ["a long description citing a pull request past the recorded text, then cleaned", async (fixture: NoWorkspaceIssue) => {
+        await patchIssue(fixture.identifier, { description: `${LONG_PREFIX}${LONG_PREFIX}See PR #77.` });
+        await patchIssue(fixture.identifier, { description: "Decide the retention policy." });
+      }, TRUNCATED_HISTORY_REFUSAL],
+    ] as const)("refuses a card with %s", async (_label, scrub, expected) => {
+      const fixture = await seedAdmissible();
+      await scrub(fixture);
+
+      await expectRefused(fixture, await close(fixture.identifier), expected);
+    });
+
+    it("refuses a card whose board ruling cited a pull request in an earlier revision", async () => {
+      const fixture = await seedNoWorkspace();
+      asBoard();
+      const first = await request(app)
+        .put(`/api/issues/${fixture.identifier}/documents/entry-ruling`)
+        .send({ format: "markdown", body: "Ruling: the decision landed in https://github.com/TEA-Core/records/pull/12." });
+      expect(first.status, JSON.stringify(first.body)).toBeLessThan(300);
+      const [document] = await db
+        .select({ id: documents.id })
+        .from(issueDocuments)
+        .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
+        .where(eq(issueDocuments.issueId, fixture.issueId));
+      const [latest] = await db
+        .select({ id: documentRevisions.id })
+        .from(documentRevisions)
+        .where(eq(documentRevisions.documentId, document!.id));
+      const second = await request(app)
+        .put(`/api/issues/${fixture.identifier}/documents/entry-ruling`)
+        .send({ format: "markdown", body: "Ruling: this card's deliverable is this recorded decision.", baseRevisionId: latest!.id });
+      expect(second.status, JSON.stringify(second.body)).toBeLessThan(300);
+      currentActor = fixture.actor;
+
+      const res = await close(fixture.identifier);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toMatch(/cites repository work \(a pull request URL\)/);
+      expect(await statusOf(fixture.issueId)).toBe("in_progress");
+    });
+
+    it.each([
+      ["a comment with an SSH GitHub address", "Mirror at git@github.com:TEA-Core/records.git for reference.", "a GitHub address"],
+      ["a comment with an Azure DevOps pull request URL", "Reviewed in https://dev.azure.com/tea/records/_git/records/pullrequest/12.", "a pull request URL"],
+      ["a comment with a bare owner/repo pull reference", "Follows TEA-Core/records#12 closely.", "a repository issue or pull request reference"],
+      ["a comment with a GitLab SSH address", "Pushed to git@gitlab.example.com:team/records.git.", "a GitLab address"],
+    ] as const)("refuses a card with %s", async (_label, body, label) => {
+      const fixture = await seedAdmissible();
+      await db.insert(issueComments).values({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.closerAgentId, body });
+
+      await expectRefused(fixture, await close(fixture.identifier), THREAD_CITES(label));
+    });
+
+    it("refuses a card with an artifact work product that names an SSH repository address", async () => {
+      const fixture = await seedAdmissible();
+      await db.insert(issueWorkProducts).values({
+        companyId: fixture.companyId,
+        issueId: fixture.issueId,
+        type: "artifact",
+        provider: "paperclip",
+        title: "Export",
+        url: "git@example.org:team/records.git",
+        status: "active",
+      });
+
+      await expectRefused(
+        fixture,
+        await close(fixture.identifier),
+        `Tier 1 "no-repository-landing" cannot be declared on an issue that records a repository work product (artifact).`,
+      );
+    });
+
+    it.each([
+      ["a tool runtime slot naming an execution workspace", async (fixture: NoWorkspaceIssue) => {
+        const { workspaceId } = await insertWorkspace(fixture.companyId);
+        await db.insert(toolRuntimeSlots).values({
+          companyId: fixture.companyId,
+          issueId: fixture.issueId,
+          executionWorkspaceId: workspaceId,
+          slotKey: `slot-${fixture.issueId}`,
+        });
+      }],
+      ["a run that names it only by nativeIssueId", async (fixture: NoWorkspaceIssue) => {
+        await db.insert(heartbeatRuns).values({
+          companyId: fixture.companyId,
+          agentId: fixture.closerAgentId,
+          status: "succeeded",
+          contextSnapshot: { nativeIssueId: fixture.issueId, executionWorkspaceId: randomUUID() },
+        });
+      }],
+      ["a run that names it only by a task key", async (fixture: NoWorkspaceIssue) => {
+        await db.insert(heartbeatRuns).values({
+          companyId: fixture.companyId,
+          agentId: fixture.closerAgentId,
+          status: "succeeded",
+          contextSnapshot: { taskKey: `issue:${fixture.issueId}`, executionWorkspaceId: randomUUID() },
+        });
+      }],
+      ["a run that names it only by identifier", async (fixture: NoWorkspaceIssue) => {
+        await db.insert(heartbeatRuns).values({
+          companyId: fixture.companyId,
+          agentId: fixture.closerAgentId,
+          status: "succeeded",
+          contextSnapshot: { taskKey: fixture.identifier, executionWorkspaceId: randomUUID() },
+        });
+      }],
+      ["a run context whose workspace key is spelled ExecutionWorkspaceId", async (fixture: NoWorkspaceIssue) => {
+        await db.insert(heartbeatRuns).values({
+          companyId: fixture.companyId,
+          agentId: fixture.closerAgentId,
+          status: "succeeded",
+          contextSnapshot: { issueId: fixture.issueId, ExecutionWorkspaceId: randomUUID() },
+        });
+      }],
+      ["an audit row whose repository key holds a GitHub URL", async (fixture: NoWorkspaceIssue) => {
+        await db.insert(activityLog).values({
+          companyId: fixture.companyId,
+          actorType: "system",
+          actorId: "system",
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: fixture.issueId,
+          details: { repository: "https://github.com/TEA-Core/records" },
+        });
+      }],
+      ["a deleted document", async (fixture: NoWorkspaceIssue) => {
+        await db.insert(activityLog).values({
+          companyId: fixture.companyId,
+          actorType: "agent",
+          actorId: fixture.closerAgentId,
+          action: "issue.document_deleted",
+          entityType: "issue",
+          entityId: fixture.issueId,
+          details: { key: "notes" },
+        });
+      }],
+      ...(["issue.comment_cancelled", "issue.queued_comment_discarded"] as const).map((action) => [
+        `a comment removed outright (${action})`,
+        async (fixture: NoWorkspaceIssue) => {
+          await db.insert(activityLog).values({
+            companyId: fixture.companyId,
+            actorType: "agent",
+            actorId: fixture.closerAgentId,
+            action,
+            entityType: "issue",
+            entityId: fixture.issueId,
+            details: { commentId: randomUUID() },
+          });
+        },
+      ] as const),
+      ["an audit action outside the allow-list", async (fixture: NoWorkspaceIssue) => {
+        await db.insert(activityLog).values({
+          companyId: fixture.companyId,
+          actorType: "system",
+          actorId: "system",
+          action: "issue.unrecognised_event",
+          entityType: "issue",
+          entityId: fixture.issueId,
+          details: {},
+        });
+      }],
+      ["an audit row changing a field outside the allow-list", async (fixture: NoWorkspaceIssue) => {
+        await db.insert(activityLog).values({
+          companyId: fixture.companyId,
+          actorType: "agent",
+          actorId: fixture.closerAgentId,
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: fixture.issueId,
+          details: { changes: { parentId: { from: null, to: randomUUID() } } },
+        });
+      }],
+    ] as const)("keeps today's refusal for a card with %s", async (_label, record) => {
+      const fixture = await seedAdmissible();
+      await record(fixture);
+
+      await expectRefused(fixture, await close(fixture.identifier), NO_WORKSPACE_REFUSAL);
     });
 
     it("holds the ruling until the close commits: an edit during the status write waits for it", async () => {
@@ -2616,6 +2852,25 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       } finally {
         await db.execute(sql.raw("drop trigger if exists pc_test_hold_close on activity_log"));
         await db.execute(sql.raw("drop function if exists pc_test_hold_close()"));
+      }
+    });
+
+    it("reads every table that can name a workspace", () => {
+      const workspaceTables = new Map<string, string[]>();
+      for (const value of Object.values(dbExports)) {
+        if (!is(value, PgTable)) continue;
+        const config = getTableConfig(value);
+        const columns = config.columns.map((column) => column.name);
+        if (columns.includes("execution_workspace_id") || columns.includes("project_workspace_id")) {
+          workspaceTables.set(config.name, columns);
+        }
+      }
+      // The issue row itself is the subject: its pointers must be null.
+      workspaceTables.delete("issues");
+
+      expect([...workspaceTables.keys()].sort()).toEqual(Object.keys(NO_WORKSPACE_REFERENCE_TABLES).sort());
+      for (const [table, issueColumn] of Object.entries(NO_WORKSPACE_REFERENCE_TABLES)) {
+        expect(workspaceTables.get(table), table).toContain(issueColumn);
       }
     });
 
