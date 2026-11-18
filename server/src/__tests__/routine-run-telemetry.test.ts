@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agents,
   companies,
   createDb,
@@ -56,6 +57,7 @@ describeEmbeddedPostgres("routine run telemetry", () => {
 
   afterEach(async () => {
     vi.clearAllMocks();
+    await db.delete(activityLog);
     await db.delete(routineRuns);
     await db.delete(routineTriggers);
     await db.delete(routineDocuments);
