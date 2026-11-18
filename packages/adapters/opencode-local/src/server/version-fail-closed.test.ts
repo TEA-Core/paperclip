@@ -152,6 +152,21 @@ describe("opencode version probe fails closed", () => {
     }, outcome.timeoutMs ?? 5_000);
   });
 
+  // A fixture-style fake that answers every argument with the same text (here a
+  // models table) has no determinable version. It must be refused, not run as V1.
+  it("refuses a fake binary that prints the same non-version text for every argument", async () => {
+    const commandPath = path.join(root, "opencode");
+    await fs.writeFile(commandPath, `#!/bin/sh\ntouch '${markerDir}/launched'\nprintf 'provider  model\\nopenai  gpt-5\\n'\n`, "utf8");
+    await fs.chmod(commandPath, 0o755);
+
+    await expect(runExecute(commandPath)).rejects.toThrow(/unrecognized --version output "provider model openai gpt-5".*Refusing to assume V1/);
+    const result = await testEnvironment(envTestContext(commandPath));
+
+    expect(result.status).toBe("fail");
+    expect(result.checks.map((check) => check.code)).toContain("opencode_cli_version_unknown");
+    expect(await launched("run-args")).toBe(false);
+  });
+
   it("execute gives a slow --version probe time when the run has no timeout (timeoutSec 0)", async () => {
     // Slower than the old one-second probe floor, then reports a refused 2.x.
     const command = await writeStub("sleep 2; printf '2.3.0\\n'");
