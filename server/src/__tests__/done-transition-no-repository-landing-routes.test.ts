@@ -1068,6 +1068,26 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     });
   });
 
+  it("does not let another company's project-workspace refs block a board branch change (SUP-24409)", async () => {
+    const fixture = await seed();
+    currentActor = { type: "board", userId: "local-board", source: "local_implicit" } as Express.Request["actor"];
+    const otherCompanyId = await insertCompany(`OTH${seedSequence}`);
+    await db.insert(projectWorkspaces).values({
+      id: randomUUID(),
+      companyId: otherCompanyId,
+      projectId: fixture.projectId,
+      name: "Foreign",
+      repoUrl: "https://github.com/TEA-Core/records",
+      defaultRef: "board-chosen",
+    });
+
+    const res = await request(app)
+      .patch(`/api/execution-workspaces/${fixture.executionWorkspaceId}`)
+      .send({ branchName: "board-chosen" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+  });
+
   it("does not let the closing agent redirect the probe to a clean decoy worktree while its deliverable sits in the real one", async () => {
     const fixture = await seed();
     await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
