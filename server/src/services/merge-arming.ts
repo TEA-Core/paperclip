@@ -586,11 +586,11 @@ export interface WorkspaceDiscoveryResult {
   terminalFailure: WorkspaceDiscoveryFailure | null;
   /**
    * SUP-24033: lower-cased `owner/repo` of every repo whose open PRs were read
-   * COMPLETELY (the one 100-entry page was neither full nor followed by a `Link`
-   * rel="next"). A cached draft mention whose repo is absent here was never fully
-   * live-checked by this discovery (drafts do not contribute repo pairs; an
-   * incomplete page may hide a live draft on a later page),
-   * so its draft bit cannot be called stale.
+   * COMPLETELY: the response was a short page with an absent (or `self`-only)
+   * `Link` header and no malformed entry (see `OpenPullRequestsSuccess.incomplete`).
+   * A cached draft mention whose repo is absent here was never fully live-checked
+   * by this discovery (drafts do not contribute repo pairs; an incomplete page may
+   * hide a live draft), so its draft bit cannot be called stale.
    */
   scannedRepos: string[];
 }
@@ -780,10 +780,11 @@ async function discoverCardPullRequestByWorkspace(
         break;
       }
 
-      // SUP-24033: a full page, or a Link header that advertises a next page, means
+      // SUP-24033: an incomplete list (full page, any Link other than absent/self-only, or a
+      // malformed entry) means
       // open PRs past it were never read, so the repo is NOT fully scanned and a
       // live draft past the page stays invisible.
-      if (!listResult.mayHaveMore) scannedRepos.push(`${pair.owner}/${pair.repo}`.toLowerCase());
+      if (!listResult.incomplete) scannedRepos.push(`${pair.owner}/${pair.repo}`.toLowerCase());
       for (const item of listResult.items) {
         if (!includeDrafts && item.draft === true) continue;
         const headRef = (item.headRef ?? "").toLowerCase();
@@ -4652,22 +4653,28 @@ async function fetchPullRequestHeadSha(
 /** The open-PR list is read as one page of this size; there is no pagination. */
 const OPEN_PULL_REQUESTS_PAGE_SIZE = 100;
 
-/** `rel` relation types that cannot point at a following page. Anything else counts as "may have a next page". */
-const HARMLESS_LINK_RELS = new Set(["prev", "previous", "first", "last", "self"]);
 const LINK_TOKEN_CHAR = /[!#$%&'*+\-.^_`|~0-9A-Za-z]/;
 
 /**
- * SUP-24033: true unless an RFC 8288 `Link` header is PROVEN to carry no next page.
- * Fail closed by construction: only (a) an absent header (null) or (b) a header
- * that parses completely as `<uri>` links with `;`-separated `token=token|"quoted"`
- * parameters, where every `rel` token (case-insensitive, space-separated) is in
- * HARMLESS_LINK_RELS, returns false. Everything else returns true: an empty
- * header, a trailing comma or semicolon, a stray character, an unterminated,
- * single-quoted or backslash-escaped value, a flag parameter with no `=`, any
- * extended `name*` parameter (RFC 8187), and any unknown `rel` token (including
- * `next`). One left-to-right scan, no backtracking: linear in the header length.
+ * SUP-24033: true unless the `Link` header of the open-PR list response PROVES the
+ * page is a complete list. A WHITELIST, not a blacklist: false (complete) only for
+ *  (a) an absent header (null), or
+ *  (b) a header in which EVERY link-value parses fully as `<uri>` plus `;`-separated
+ *      `token=token|"quoted"` parameters, carries a `rel` parameter, has no other
+ *      parameter, and has only the relation `self` among its rel tokens.
+ * Everything else is true: an empty header, a link-value with no `rel`, any
+ * parameter other than `rel` (title, rev, anchor, name*, a flag), a trailing comma
+ * or semicolon, a stray character, a single-quoted, unterminated or escaped value,
+ * and every other relation (`next`, `last`, `prev`, `previous`, `first`, `canonical`, ...).
+ *
+ * Why `prev`, `first` and `last` are NOT harmless: this scan reads only page 1 (no
+ * `page` parameter). A real GitHub page-1 response never carries `prev` or `first`
+ * (they appear only on later pages) and carries `next` plus `last` when more pages
+ * exist, so those relations on a page-1 response mean more pages or an altered
+ * response, never a final page. `self` is the one relation consistent with a
+ * complete list. One left-to-right scan, no backtracking: linear in the header.
  */
-export function linkHeaderAdvertisesNextPage(header: string | null): boolean {
+export function linkHeaderLeavesPagesUnread(header: string | null): boolean {
   if (header === null) return false;
   const n = header.length;
   let i = 0;
@@ -4686,10 +4693,12 @@ export function linkHeaderAdvertisesNextPage(header: string | null): boolean {
     const end = header.indexOf(">", i + 1);
     if (end === -1 || header.slice(i + 1, end).includes("<")) return true;
     i = end + 1;
+    let sawRel = false;
     for (;;) {
       skipOws();
-      if (i >= n) return false;
+      if (i >= n) return !sawRel;
       if (header[i] === ",") {
+        if (!sawRel) return true;
         i += 1;
         skipOws();
         if (i >= n) return true;
@@ -4698,8 +4707,7 @@ export function linkHeaderAdvertisesNextPage(header: string | null): boolean {
       if (header[i] !== ";") return true;
       i += 1;
       skipOws();
-      const name = readToken().toLowerCase();
-      if (name === "" || name.endsWith("*")) return true;
+      if (readToken().toLowerCase() !== "rel") return true;
       skipOws();
       if (header[i] !== "=") return true;
       i += 1;
@@ -4719,10 +4727,9 @@ export function linkHeaderAdvertisesNextPage(header: string | null): boolean {
         value = readToken();
         if (value === "") return true;
       }
-      if (name === "rel") {
-        const tokens = value.toLowerCase().split(/[ \t]+/).filter((token) => token !== "");
-        if (tokens.length === 0 || tokens.some((token) => !HARMLESS_LINK_RELS.has(token))) return true;
-      }
+      const tokens = value.toLowerCase().split(/[ \t]+/).filter((token) => token !== "");
+      if (tokens.length === 0 || tokens.some((token) => token !== "self")) return true;
+      sawRel = true;
     }
   }
 }
@@ -4739,13 +4746,15 @@ export interface OpenPullRequestsSuccess extends GitHubFetchResult {
   ok: true;
   items: OpenPullRequestListItem[];
   /**
-   * SUP-24033: true when open PRs past this page may exist, so the list is not
-   * proven complete. Either the raw response filled the whole page
-   * (`OPEN_PULL_REQUESTS_PAGE_SIZE` entries, counted before malformed entries are
-   * dropped) or the `Link` header advertises a next page (a malformed or empty
-   * `Link` header counts as advertising one: fail closed).
+   * SUP-24033: true unless this response is PROVEN to be the complete, well-formed
+   * open-PR list. Incomplete when ANY of: the raw page filled
+   * `OPEN_PULL_REQUESTS_PAGE_SIZE` entries (counted before malformed entries are
+   * dropped); the `Link` header is anything other than absent or `self`-only (see
+   * `linkHeaderLeavesPagesUnread`); or an entry is not a well-formed open-PR record
+   * (not an object, number not a positive integer, or `head.ref` not a string),
+   * because it may have been an owned live draft.
    */
-  mayHaveMore: boolean;
+  incomplete: boolean;
 }
 
 export interface OpenPullRequestsFailure extends GitHubFetchResult {
@@ -4806,11 +4815,24 @@ async function fetchOpenPullRequestsOnce(
   }
 
   const items: OpenPullRequestListItem[] = [];
+  // SUP-24033: an entry that is not a well-formed open-PR record is dropped from
+  // `items` as before, but it also makes the list `incomplete`: it may have been an
+  // owned live draft, and a page with an unreadable entry is not a complete scan.
+  let malformedEntry = false;
   for (const raw of body) {
-    if (typeof raw !== "object" || raw === null) continue;
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      malformedEntry = true;
+      continue;
+    }
     const pr = raw as Record<string, unknown>;
-    if (typeof pr.number !== "number") continue;
+    if (typeof pr.number !== "number" || !Number.isSafeInteger(pr.number) || pr.number <= 0) {
+      malformedEntry = true;
+      continue;
+    }
     const head = pr.head as Record<string, unknown> | undefined | null;
+    if (typeof head !== "object" || head === null || typeof head.ref !== "string") {
+      malformedEntry = true;
+    }
     items.push({
       number: pr.number,
       draft: typeof pr.draft === "boolean" ? pr.draft : null,
@@ -4824,7 +4846,10 @@ async function fetchOpenPullRequestsOnce(
     status: response.status,
     message: null,
     items,
-    mayHaveMore: body.length >= OPEN_PULL_REQUESTS_PAGE_SIZE || linkHeaderAdvertisesNextPage(response.headers?.get("link") ?? null),
+    incomplete:
+      malformedEntry ||
+      body.length >= OPEN_PULL_REQUESTS_PAGE_SIZE ||
+      linkHeaderLeavesPagesUnread(response.headers?.get("link") ?? null),
   };
 }
 

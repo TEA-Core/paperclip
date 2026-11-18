@@ -296,6 +296,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     assigneeAgentId = null,
     mentionState,
     openListLink,
+    openListEntries,
   }: {
     draft?: boolean;
     missing?: boolean;
@@ -314,6 +315,8 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
      * open-PR list is a SHORT page of unrelated PRs, optionally with this Link header.
      */
     openListLink?: string;
+    /** SUP-24033: replaces the 50 unrelated well-formed entries of the open-PR list (malformed-entry cells). */
+    openListEntries?: unknown[];
   } = {}) {
     const company = await seedCompany(db);
     if (mergeArmingEnabled) {
@@ -455,7 +458,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       }
       if (url.includes("/pulls?")) {
         if (mentionState === "stale-draft-merged") {
-          const unrelated = Array.from({ length: 50 }, (_, i) => ({
+          const unrelated = openListEntries ?? Array.from({ length: 50 }, (_, i) => ({
             number: 1000 + i, draft: false, title: `Unrelated ${i}`, body: null, head: { ref: `unrelated-${i}` },
           }));
           return Response.json(unrelated, openListLink ? { headers: { link: openListLink } } : undefined);
@@ -687,78 +690,86 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
   // door must keep the base head_draft refusal; a short page with no next page is
   // a complete scan and the verified merged carrier is accepted as before.
   describe("stale cached draft with a merged live carrier and a short open-PR page (SUP-24033)", () => {
-    const nextPage = '<https://api.github.com/repositories/1/pulls?state=open&per_page=100&page=2>; rel="next"';
+    const U = "<https://api.github.com/repositories/1/pulls?state=open&per_page=100&page=2>";
+    type Door = "PATCH final verdict" | "board stage-decision" | "approval comment";
+    const DOORS: Door[] = ["PATCH final verdict", "board stage-decision", "approval comment"];
     const expectHeadDraftRefusal = (response: request.Response) => {
       expect(response.status, JSON.stringify(response.body)).toBe(409);
       expect(response.body).toMatchObject({
         details: { code: "approval_final_delivery_preflight", reason: expect.stringMatching(/^head_draft:/) },
       });
     };
-
-    it("PATCH final verdict refuses head_draft when the page advertises a next page", async () => {
-      const fixture = await pendingDelivery({ mentionState: "stale-draft-merged", openListLink: nextPage });
-      expectHeadDraftRefusal(await fixture.approve());
-      expect((await fixture.read()).status).toBe("in_review");
-      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
-      expect(fixture.writes).toEqual([]);
-    });
-
-    // Round-6: spellings of a next page that the first Link parser read as "no
-    // next page" (the PATCH door then returned 200 and the card went done).
-    it.each([
-      ["single-quoted rel", `<https://api.github.com/repositories/1/pulls?page=2>; rel='next'`],
-      ["trailing comma", `<https://api.github.com/repositories/1/pulls?page=2>; rel="next",`],
-      ["unterminated quote", `<https://api.github.com/repositories/1/pulls?page=2>; rel="next`],
-      ["escaped value", `<https://api.github.com/repositories/1/pulls?page=2>; rel="\\next"`],
-      ["rel* extended parameter", `<https://api.github.com/repositories/1/pulls?page=2>; rel*=UTF-8''next`],
-    ])("PATCH final verdict refuses head_draft when the Link header spells next as: %s", async (_label, link) => {
-      const fixture = await pendingDelivery({ mentionState: "stale-draft-merged", openListLink: link });
-      expectHeadDraftRefusal(await fixture.approve());
-      expect((await fixture.read()).status).toBe("in_review");
-      expect(fixture.writes).toEqual([]);
-    });
-
-    it("PATCH final verdict still accepts the verified merged carrier when the Link header carries only rel=prev/first/last", async () => {
-      const fixture = await pendingDelivery({
-        mentionState: "stale-draft-merged",
-        openListLink: '<https://api.github.com/repositories/1/pulls?page=1>; rel="prev", <https://api.github.com/repositories/1/pulls?page=1>; rel="first"',
-      });
-      const response = await fixture.approve();
-      expect(response.status, JSON.stringify(response.body)).toBe(200);
-      expect((await fixture.read()).status).toBe("done");
-    });
-
-    it("board stage-decision refuses head_draft when the page advertises a next page", async () => {
+    type Fixture = Awaited<ReturnType<typeof pendingDelivery>>;
+    async function attempt(door: Door, fixture: Fixture): Promise<request.Response> {
+      if (door === "PATCH final verdict") return fixture.approve();
+      if (door === "approval comment") {
+        return request(createApp(db, boardActor(fixture.company)))
+          .post(`/api/issues/${fixture.issue.id}/comments`)
+          .send({ body: "## Review: APPROVED\n\nIndependent final review." });
+      }
       const previous = process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
       process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "true";
       try {
-        const fixture = await pendingDelivery({ mentionState: "stale-draft-merged", openListLink: nextPage });
-        const response = await request(createApp(db, boardActor(fixture.company)))
+        return await request(createApp(db, boardActor(fixture.company)))
           .post(`/api/issues/${fixture.issue.id}/execution-stage/board-decision`)
           .send({ decision: "approved", comment: "Independent final approval." });
-        expectHeadDraftRefusal(response);
-        expect((await fixture.read()).status).toBe("in_review");
-        expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
-        expect(fixture.writes).toEqual([]);
       } finally {
         if (previous === undefined) delete process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
         else process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = previous;
       }
+    }
+    async function expectRefusedAtEveryDoor(options: { openListLink?: string; openListEntries?: unknown[] }) {
+      for (const door of DOORS) {
+        const fixture = await pendingDelivery({ mentionState: "stale-draft-merged", ...options });
+        expectHeadDraftRefusal(await attempt(door, fixture));
+        expect((await fixture.read()).status, door).toBe("in_review");
+        expect(await db.select().from(issueExecutionDecisions), door).toEqual([]);
+        expect(await db.select().from(issueComments).where(eq(issueComments.issueId, fixture.issue.id)), door).toEqual([]);
+        expect(fixture.writes, door).toEqual([]);
+      }
+    }
+
+    // A short page whose Link header is anything but absent or self-only is not a
+    // proven complete list: the owned live draft that may sit past it was never read.
+    it.each([
+      ["rel=next", `${U}; rel="next"`],
+      ["rel=next and rel=last", `${U}; rel="next", ${U}; rel="last"`],
+      ["a link-value with no rel", U],
+      ["only title=", `${U}; title="t"`],
+      ["no rel in the second link-value after rel=self", `<https://api.github.com/x?page=1>; rel="self", ${U}`],
+      ["rel=last alone", `${U}; rel="last"`],
+      ["rel=prev alone", `${U}; rel="prev"`],
+      ["rel=first alone", `${U}; rel="first"`],
+      ["rel=previous alone", `${U}; rel="previous"`],
+      ["single-quoted rel='next'", `${U}; rel='next'`],
+      ["a trailing comma after rel=next", `${U}; rel="next",`],
+      ["an unterminated quote", `${U}; rel="next`],
+      ["an escaped rel value", `${U}; rel="\\next"`],
+      ["a rel* extended parameter", `${U}; rel*=UTF-8''next`],
+    ])("every door refuses head_draft when the Link header is %s", async (_label, openListLink) => {
+      await expectRefusedAtEveryDoor({ openListLink });
     });
 
-    it("approval comment refuses head_draft when the page advertises a next page and records nothing", async () => {
-      const fixture = await pendingDelivery({ mentionState: "stale-draft-merged", openListLink: nextPage });
-      const response = await request(createApp(db, boardActor(fixture.company)))
-        .post(`/api/issues/${fixture.issue.id}/comments`)
-        .send({ body: "## Review: APPROVED\n\nIndependent final review." });
-      expectHeadDraftRefusal(response);
-      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, fixture.issue.id))).toEqual([]);
-      expect((await fixture.read()).status).toBe("in_review");
-      expect(fixture.writes).toEqual([]);
+    // Owner ruling (fail closed): an entry the code cannot read may have been an
+    // owned live draft, so the list is not a complete scan.
+    const OWNED = { number: 50, draft: true, head: { ref: "R-delivery" }, title: "Owned draft", body: null };
+    it.each([
+      ["a number as a string", [{ ...OWNED, number: "50" }]],
+      ["a null number", [{ ...OWNED, number: null }]],
+      ["an absent number", [{ draft: true, head: { ref: "R-delivery" }, title: "Owned draft" }]],
+      ["an entry that is a JSON string", ["50"]],
+      ["a null entry", [null]],
+      ["an entry that is an array", [[OWNED]]],
+      ["99 malformed entries", Array.from({ length: 99 }, () => null)],
+    ])("every door refuses head_draft when the open-PR list holds %s", async (_label, openListEntries) => {
+      await expectRefusedAtEveryDoor({ openListEntries });
     });
 
-    it("accepts the verified merged carrier on a short page with no Link header (legit admit unchanged)", async () => {
-      const fixture = await pendingDelivery({ mentionState: "stale-draft-merged" });
+    it.each([
+      ["no Link header", undefined],
+      ["Link rel=self alone", `${U}; rel="self"`],
+    ])("PATCH final verdict accepts the verified merged carrier on a short page with %s", async (_label, openListLink) => {
+      const fixture = await pendingDelivery({ mentionState: "stale-draft-merged", openListLink });
       const response = await fixture.approve();
       expect(response.status, JSON.stringify(response.body)).toBe(200);
       expect((await fixture.read()).status).toBe("done");

@@ -53,7 +53,7 @@ import {
   isTransientReadStatus,
   ladderIncompleteStageIds,
   ladderIsTerminallyApproved,
-  linkHeaderAdvertisesNextPage,
+  linkHeaderLeavesPagesUnread,
   pickMostRecentMergeQueueEjection,
   narrowToDelivered,
   preflightFinalDelivery,
@@ -2572,51 +2572,78 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         }
       });
 
-      // R4L: GitHub only returns a non-final page that is full, but the scan must
-      // not rely on that. A SHORT page that still advertises Link rel="next" is an
-      // incomplete scan: an owned live draft that sits only on the next page is
-      // invisible, so the base head_draft refusal stands.
-      describe("Link rel=next on the open-PR page (R4L)", () => {
-        const next = '<https://api.github.com/repositories/1/pulls?state=open&per_page=100&page=2>; rel="next", <https://api.github.com/repositories/1/pulls?state=open&per_page=100&page=2>; rel="last"';
-        const run = async (headers?: Record<string, string>) => {
+      // R4L / round 7: the scan reads ONLY page 1 (no page parameter). A page counts
+      // as scanned only when it is short, well-formed, and its Link header is
+      // absent or carries nothing but rel=self. A real GitHub page-1 response never
+      // carries prev/first and carries next+last when more pages exist, so any
+      // other Link relation, a link-value with no rel, or an extra parameter means
+      // the list may be longer than what was read: the base head_draft stands.
+      describe("Link header and malformed entries on the open-PR page (R4L, R7)", () => {
+        const U = "<https://api.github.com/repositories/1/pulls?state=open&per_page=100&page=2>";
+        const run = async (headers?: Record<string, string>, entries: unknown[] = fillerPage(50)) => {
           const issueId = await insertIssue();
           await insertMention(issueId, { number: 42, state: "open", draft: true });
-          installRoutes(pageRoutes(fillerPage(50), headers));
+          installRoutes(pageRoutes(entries, headers));
           return preflightFinalDelivery(db, companyId, issueId, "SUP-42");
         };
-
-        it("refuses a short page that carries Link rel=next (live draft only on the next page)", async () => {
-          const result = await run({ link: next });
+        const expectRefused = (result: Awaited<ReturnType<typeof run>>) => {
           expect(result.kind).toBe("unresolvable");
           if (result.kind === "unresolvable") {
             expect(result.reason).toMatch(/^head_draft:/);
             expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
           }
+        };
+
+        it("refuses a short page that carries Link rel=next and rel=last", async () => {
+          expectRefused(await run({ link: `${U}; rel="next", ${U.replace("page=2", "page=9")}; rel="last"` }));
         });
 
         it.each([
-          ["short page with no Link header is still scanned (legit admit unchanged)", undefined],
-          ["Link with only rel=prev/first is still scanned", { link: '<https://api.github.com/x?page=1>; rel="prev", <https://api.github.com/x?page=1>; rel="first"' }],
-        ] as const)("%s", async (_label, headers) => {
-          const result = await run(headers as Record<string, string> | undefined);
-          expect(result.kind).toBe("resolved");
+          ["no Link header (a short list that fit one page)", undefined],
+          ["Link rel=self alone", { link: `${U}; rel="self"` }],
+          ["Link rel=self unquoted, mixed case", { link: `${U}; REL=Self` }],
+        ] as const)("admits the verified merged carrier on a short page with %s", async (_label, headers) => {
+          expect((await run(headers as Record<string, string> | undefined)).kind).toBe("resolved");
         });
 
-        // Round-6: each of these spellings advertises a next page and the first
-        // parser read them as "no next" (admitting the stale-draft carrier).
+        // Round 6: spellings of a next page that an earlier parser read as none.
         it.each([
-          ["single-quoted rel", `<https://api.github.com/x?page=2>; rel='next'`],
-          ["trailing comma after rel=next", `<https://api.github.com/x?page=2>; rel="next",`],
-          ["unterminated quote", `<https://api.github.com/x?page=2>; rel="next`],
-          ["escaped rel value", `<https://api.github.com/x?page=2>; rel="\\next"`],
-          ["rel* extended parameter", `<https://api.github.com/x?page=2>; rel*=UTF-8''next`],
+          ["single-quoted rel", `${U}; rel='next'`],
+          ["trailing comma after rel=next", `${U}; rel="next",`],
+          ["unterminated quote", `${U}; rel="next`],
+          ["escaped rel value", `${U}; rel="\\next"`],
+          ["rel* extended parameter", `${U}; rel*=UTF-8''next`],
         ] as const)("refuses a short page whose Link header spells next as: %s", async (_label, link) => {
-          const result = await run({ link });
-          expect(result.kind).toBe("unresolvable");
-          if (result.kind === "unresolvable") {
-            expect(result.reason).toMatch(/^head_draft:/);
-            expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
-          }
+          expectRefused(await run({ link }));
+        });
+
+        // Round 7 (R7-1): a link-value with no rel proves nothing about the list.
+        it.each([
+          ["no rel at all", U],
+          ["only title=", `${U}; title="page two"`],
+          ["only rev=", `${U}; rev="next"`],
+          ["only foo=", `${U}; foo=bar`],
+          ["no rel as the second link-value after a valid rel=self", `<https://api.github.com/x?page=1>; rel="self", ${U}`],
+          ["an extra parameter beside rel=self", `${U}; rel="self"; title="t"`],
+        ] as const)("refuses a short page whose Link has a link-value with %s", async (_label, link) => {
+          expectRefused(await run({ link }));
+        });
+
+        // Round 7 (R7-2): none of these is a page-1 response of a complete list.
+        it.each([
+          ["rel=last alone", `${U.replace("page=2", "page=5")}; rel="last"`],
+          ["rel=LAST alone", `${U.replace("page=2", "page=5")}; REL="LAST"`],
+          ["rel=last with anchor=", `${U}; rel="last"; anchor="#x"`],
+          ["rel=last with rev=next", `${U}; rel="last"; rev="next"`],
+          ["rel=prev alone", `${U}; rel="prev"`],
+          ["rel=first alone", `${U}; rel="first"`],
+          ["rel=previous alone", `${U}; rel="previous"`],
+          ["the final-page shape prev + first", `${U}; rel="prev", ${U}; rel="first"`],
+          ["a self link beside a last link", `${U}; rel="self", ${U}; rel="last"`],
+          ["two Link header lines joined (one empty)", `${U}; rel="self", `],
+          ["an unknown relation (a proxy-added canonical)", `${U}; rel="canonical"`],
+        ] as const)("refuses a short page whose Link header is %s", async (_label, link) => {
+          expectRefused(await run({ link }));
         });
 
         it.each([
@@ -2625,111 +2652,157 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           ["unterminated target", '<https://api.github.com/x?page=2; rel="next"'],
           ["target missing its angle brackets", 'https://api.github.com/x?page=2; rel="next"'],
         ] as const)("refuses on a malformed Link header: %s (fail closed)", async (_label, link) => {
-          const result = await run({ link });
+          expectRefused(await run({ link }));
+        });
+
+        // Round 7 (R7-3, owner ruling): an entry the code cannot read may have been
+        // an owned live draft, so the page is not a complete scan and must refuse.
+        const OWNED = { number: 50, draft: true, head: { ref: "SUP-42-branch" }, title: "Owned draft", body: null };
+        it.each([
+          ["a number as a string", { ...OWNED, number: "50" }],
+          ["a null number", { ...OWNED, number: null }],
+          ["an absent number", { draft: true, head: { ref: "SUP-42-branch" }, title: "Owned draft" }],
+          ["a fractional number", { ...OWNED, number: 1.5 }],
+          ["a zero number", { ...OWNED, number: 0 }],
+          ["an absent head", { number: 50, draft: true, title: "Owned draft" }],
+          ["a head with no ref", { ...OWNED, head: {} }],
+          ["a head ref that is not a string", { ...OWNED, head: { ref: 7 } }],
+          ["an entry that is a JSON string", "50"],
+          ["a null entry", null],
+          ["an entry that is an array", [OWNED]],
+        ] as const)("refuses a short page that holds an entry with %s", async (_label, entry) => {
+          expectRefused(await run(undefined, [...fillerPage(10), entry]));
+        });
+
+        // A non-boolean draft flag on an owned entry makes it a ready (non-draft) candidate,
+        // so the resolver takes the ordinary path, never the stale-draft revalidation: its
+        // own head read or live verification then refuses (never an admit), with its own reason.
+        it.each([
+          ["a string draft flag", { ...OWNED, draft: "true" }],
+          ["an absent draft flag", { number: 50, head: { ref: "SUP-42-branch" }, title: "Owned draft" }],
+        ] as const)("refuses a short page that holds an entry with %s", async (_label, entry) => {
+          const result = await run(undefined, [...fillerPage(10), entry]);
           expect(result.kind).toBe("unresolvable");
-          if (result.kind === "unresolvable") expect(result.reason).toMatch(/^head_draft:/);
+        });
+
+        it("refuses a short page that holds 99 malformed entries", async () => {
+          expectRefused(await run(undefined, Array.from({ length: 99 }, () => null)));
+        });
+
+        it("still admits a short page of well-formed entries with no Link header (control)", async () => {
+          expect((await run(undefined, fillerPage(10))).kind).toBe("resolved");
         });
       });
 
       const U = "<https://api.github.com/x?page=2>";
-      // Canonical spellings that name a next page.
+      // The only headers proven to be a complete page-1 list.
       it.each([
-        'rel="next"', "rel=next", 'REL="NEXT"', 'Rel="Next"', 'rel="prev next"', 'rel="Last NEXT"',
-        'rel = "next"', 'title="a, b"; rel="next"', 'rel="next"; title="x"',
-      ])("linkHeaderAdvertisesNextPage: next-page spelling %s", (params) => {
-        expect(linkHeaderAdvertisesNextPage(`${U}; ${params}`)).toBe(true);
+        ["rel=self", `${U}; rel="self"`],
+        ["rel=self unquoted", `${U}; rel=self`],
+        ["rel=SELF quoted upper case", `${U}; REL="SELF"`],
+        ["rel list of self tokens", `${U}; rel="self self"`],
+        ["spacing around separators", `${U} ; rel = "self" ,  ${U} ;rel=self`],
+        ["tabs as whitespace", `${U};\trel="self"`],
+        ["a comma inside a target", '<https://a.test/x?q=a,b&page=1>; rel="self"'],
+        ["two self links", `${U}; rel="self", ${U}; rel="self"`],
+        ["a repeated rel parameter, all self", `${U}; rel="self"; rel=self`],
+      ])("linkHeaderLeavesPagesUnread proves a complete list for %s", (_label, header) => {
+        expect(linkHeaderLeavesPagesUnread(header)).toBe(false);
       });
 
-      // Round-6 spellings the first parser failed open on, plus related shapes.
+      it("linkHeaderLeavesPagesUnread: only an absent header is no header", () => {
+        expect(linkHeaderLeavesPagesUnread(null)).toBe(false);
+        expect(linkHeaderLeavesPagesUnread("")).toBe(true);
+        expect(linkHeaderLeavesPagesUnread("   ")).toBe(true);
+      });
+
+      // Everything else leaves the page unread.
       it.each([
+        // next-page spellings (canonical and decorated)
+        ["rel=next", `${U}; rel="next"`],
+        ["rel=next unquoted", `${U}; rel=next`],
+        ["REL=NEXT", `${U}; REL="NEXT"`],
+        ["rel token list with next", `${U}; rel="prev next"`],
+        ["rel=self next", `${U}; rel="self next"`],
+        ["next in the second link", `${U}; rel="self", ${U}; rel="next"`],
         ["single-quoted rel", `${U}; rel='next'`],
         ["trailing comma", `${U}; rel="next",`],
-        ["trailing comma and spaces", `${U}; rel="next" , `],
+        ["trailing comma after self", `${U}; rel="self",`],
         ["unterminated quote", `${U}; rel="next`],
         ["escaped value", `${U}; rel="\\next"`],
-        ["escaped quote", `${U}; rel="a\\"next"`],
+        ["escaped quote hiding a self rel", `${U}; title="a\\"; rel="self"`],
         ["rel* extended parameter", `${U}; rel*=UTF-8''next`],
-        ["any other extended parameter", `${U}; rel="prev"; title*=UTF-8''x`],
-        ["trailing comma after a harmless link", `${U}; rel="prev",`],
-        ["escaped quote that hides a harmless-looking rel", `${U}; title="a\\"; rel="prev"`],
-        ["empty parameter name with a value", `${U}; ="prev"`],
-        ["single-quoted harmless rel", `${U}; rel='prev'`],
-        ["flag parameter before a harmless rel", `${U}; flag; rel="prev"`],
-        ["trailing semicolon", `${U}; rel="prev";`],
-        ["empty parameter", `${U};; rel="prev"`],
-        ["flag parameter without =", `${U}; rel="prev"; flag`],
-        ["empty parameter value", `${U}; rel="prev"; title=`],
+        ["trailing NUL after the value", `${U}; rel="self"\u0000`],
+        // round 7: no rel / non-self relations / extra parameters
+        ["no rel", U],
+        ["a title only", `${U}; title="t"`],
+        ["rev only", `${U}; rev="next"`],
+        ["foo only", `${U}; foo=bar`],
+        ["no rel in the second link-value", `${U}; rel="self", ${U}`],
+        ["no rel in the first link-value", `${U}, ${U}; rel="self"`],
+        ["rel=last", `${U}; rel="last"`],
+        ["rel=prev", `${U}; rel="prev"`],
+        ["rel=first", `${U}; rel="first"`],
+        ["rel=previous", `${U}; rel="previous"`],
+        ["rel=canonical", `${U}; rel="canonical"`],
+        ["a self rel beside a last token", `${U}; rel="self last"`],
+        ["extra non-rel parameter beside self", `${U}; rel="self"; title="t"`],
+        ["a non-rel parameter whose value is self", `${U}; rel="self"; title="self"`],
+        ["a non-rel parameter named like rel", `${U}; rel="self"; relx=self`],
+        ["extra extended parameter beside self", `${U}; rel="self"; title*=UTF-8''t`],
+        ["flag parameter", `${U}; rel="self"; flag`],
+        ["flag parameter before rel", `${U}; flag; rel="self"`],
+        ["empty parameter name with a value", `${U}; ="self"`],
+        ["trailing semicolon", `${U}; rel="self";`],
+        ["empty parameter", `${U};; rel="self"`],
+        ["empty parameter value", `${U}; rel="self"; title=`],
         ["empty rel value", `${U}; rel=""`],
         ["blank rel value", `${U}; rel="  "`],
-        ["unknown rel token", `${U}; rel="nextish"`],
-        ["unknown rel token beside a harmless one", `${U}; rel="prev bookmark"`],
-        ["garbage after the target", `${U} rel="prev"`],
-        ["unterminated target", "<https://api.github.com/x?page=2; rel=\"prev\""],
-        ["no angle brackets", 'https://api.github.com/x?page=2; rel="prev"'],
-        ["nested angle bracket", '<a<b>; rel="prev"'],
-        ["target then garbage link", `${U}; rel="prev", garbage`],
-        ["trailing NUL after the value", `${U}; rel="next"\u0000`],
+        ["single-quoted harmless rel", `${U}; rel='self'`],
+        ["garbage after the target", `${U} rel="self"`],
+        ["unterminated target", '<https://api.github.com/x?page=2; rel="self"'],
+        ["no angle brackets", 'https://api.github.com/x?page=2; rel="self"'],
+        ["nested angle bracket", '<a<b>; rel="self"'],
+        ["garbage link after a valid one", `${U}; rel="self", garbage`],
         ["empty header", ""],
         ["blank header", "   "],
         ["comma only", ","],
-      ])("linkHeaderAdvertisesNextPage fails closed on %s", (_label, header) => {
-        expect(linkHeaderAdvertisesNextPage(header)).toBe(true);
+      ])("linkHeaderLeavesPagesUnread leaves the page unread on %s", (_label, header) => {
+        expect(linkHeaderLeavesPagesUnread(header)).toBe(true);
       });
 
-      // The only headers proven to carry no next page.
-      it.each([
-        ["no parameters at all", U],
-        ["rel=prev", `${U}; rel="prev"`],
-        ["rel=last", `${U}; rel="last"`],
-        ["rel=first unquoted", `${U}; rel=first`],
-        ["rel=self", `${U}; rel=self`],
-        ["rel token list of harmless types", `${U}; rel="prev first last"`],
-        ["mixed-case harmless rel", `${U}; REL="PREV"`],
-        ["a non-rel parameter", `${U}; title="a, b"; rel="prev"; type="text/plain"`],
-        ["spacing around separators", `${U} ; rel = "prev" ,  ${U} ;rel=first`],
-        ["tabs as whitespace", `${U};\trel="prev"`],
-        ["prev, first, last together", `${U}; rel="prev", ${U}; rel="first", ${U}; rel="last"`],
-        ["a comma inside a target", '<https://a.test/x?q=a,b&page=1>; rel="prev", <https://a.test/x?q=a,b&page=0>; rel="first"'],
-      ])("linkHeaderAdvertisesNextPage proves no next page for %s", (_label, header) => {
-        expect(linkHeaderAdvertisesNextPage(header)).toBe(false);
-      });
-
-      it("linkHeaderAdvertisesNextPage treats only an absent header as no header", () => {
-        expect(linkHeaderAdvertisesNextPage(null)).toBe(false);
-        expect(linkHeaderAdvertisesNextPage("")).toBe(true);
-      });
-
-      it("linkHeaderAdvertisesNextPage reads every comma-separated link, next in the second included", () => {
-        expect(linkHeaderAdvertisesNextPage(`${U}; rel="prev", ${U.replace("2", "3")}; rel="next"`)).toBe(true);
-        expect(linkHeaderAdvertisesNextPage('<https://a.test/x?q=a,b&page=1>; rel="prev", <https://a.test/x?q=a,b&page=3>; rel="next"')).toBe(true);
-      });
-
-      // Property over a small grammar: any next-page spelling under any decoration
-      // that keeps it parseable-or-not must advertise a next page; any harmless
-      // spelling under benign decorations must not.
-      it("linkHeaderAdvertisesNextPage: no decoration turns a next-page spelling into no-next", () => {
-        const nextSpellings = ['rel="next"', "rel=next", 'REL="NEXT"', 'rel="prev next"', "rel='next'", 'rel="next', 'rel="\\next"', "rel*=UTF-8''next", 'rel="next"x'];
-        const before = ["", ` ; title="t"`, ` ; type=a`];
-        const after = ["", ",", " ,", "; ", ' ; title="t"', `, ${U}; rel="prev"`, `, ${U}`, "\u0000", ",,"];
-        for (const spelling of nextSpellings) {
-          for (const pre of before) {
-            for (const post of after) {
-              const header = `${U}${pre}; ${spelling}${post}`;
-              expect(linkHeaderAdvertisesNextPage(header), header).toBe(true);
-            }
+      // Exhaustive property over a small grammar: up to two link-values, each with up
+      // to two parameters from a mixed alphabet. The header proves a complete list
+      // exactly when every link-value is made only of rel parameters whose tokens are
+      // all `self`, with at least one rel in each, and no empty parameter.
+      it("linkHeaderLeavesPagesUnread: whitelist oracle over every header of the grammar", () => {
+        const alphabet = [
+          'rel="self"', "rel=self", 'rel="prev"', 'rel="last"', 'rel="next"', 'rel="first"',
+          'title="t"', "rev=next", "foo=bar", "",
+        ];
+        const isSelfRel = (param: string) => param === 'rel="self"' || param === "rel=self";
+        const paramLists: string[][] = [[]];
+        for (const a of alphabet) {
+          paramLists.push([a]);
+          for (const b of alphabet) paramLists.push([a, b]);
+        }
+        const linkOk = (params: string[]) =>
+          params.length > 0 && params.every(isSelfRel);
+        const render = (params: string[]) => `${U}${params.map((param) => `; ${param}`).join("")}`;
+        let checked = 0;
+        for (const first of paramLists) {
+          expect(linkHeaderLeavesPagesUnread(render(first)), render(first)).toBe(!linkOk(first));
+          checked += 1;
+          for (const second of paramLists) {
+            const header = `${render(first)}, ${render(second)}`;
+            expect(linkHeaderLeavesPagesUnread(header), header).toBe(!(linkOk(first) && linkOk(second)));
+            checked += 1;
           }
         }
-        const harmless = ['rel="prev"', "rel=last", 'rel="first last"', 'REL="Self"'];
-        const benign = ["", " ", "\t"];
-        for (const spelling of harmless) {
-          for (const gap of benign) {
-            const header = `${U}${gap};${gap}${spelling}${gap}`;
-            expect(linkHeaderAdvertisesNextPage(header), header).toBe(false);
-          }
-        }
+        expect(checked).toBeGreaterThan(8000);
       });
 
-      it("linkHeaderAdvertisesNextPage stays linear-time on hostile input", () => {
+      it("linkHeaderLeavesPagesUnread stays linear-time on hostile input", () => {
         const started = Date.now();
         for (const hostile of [
           ";".repeat(1_000_000),
@@ -2738,9 +2811,9 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           `${U}; rel="${"x ".repeat(300_000)}"`,
           `${U}, `.repeat(100_000),
         ]) {
-          linkHeaderAdvertisesNextPage(hostile);
+          linkHeaderLeavesPagesUnread(hostile);
         }
-        expect(Date.now() - started).toBeLessThan(3_000);
+        expect(Date.now() - started).toBeLessThan(10_000);
       });
 
       it("refuses when only some cached drafts are the card's own delivery", async () => {
