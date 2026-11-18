@@ -6040,7 +6040,7 @@ describeGuardRoute(
 
       const res = await request(app)
         .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-        .send({ decision: "approved", comment: "Approved by board" });
+        .send({ decision: "approved", comment: "Approved by board", displacementReason: "Board approves for the pending reviewer" });
 
       expect(res.status).toBe(200);
       // The guard refusal happens post-commit: the decision still succeeds (the card
@@ -6066,7 +6066,7 @@ describeGuardRoute(
 
       const res = await request(app)
         .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-        .send({ decision: "approved", comment: "Approved by board" });
+        .send({ decision: "approved", comment: "Approved by board", displacementReason: "Board approves for the pending reviewer" });
 
       expect(res.status).toBe(200);
       expect(res.body.outcome).toBe("approved");
@@ -6090,7 +6090,7 @@ describeGuardRoute(
 
       const res = await request(app)
         .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-        .send({ decision: "approved", comment: "Approved by board" });
+        .send({ decision: "approved", comment: "Approved by board", displacementReason: "Board approves for the pending reviewer" });
 
       expect(res.status).toBe(200);
       expect(res.body.outcome).toBe("approved");
@@ -6118,7 +6118,7 @@ describeGuardRoute(
 
       const res = await request(app)
         .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-        .send({ decision: "approved", comment: "Approved by board" });
+        .send({ decision: "approved", comment: "Approved by board", displacementReason: "Board approves for the pending reviewer" });
 
       expect(res.status).toBe(200);
       expect(res.body.outcome).toBe("approved");
@@ -6146,7 +6146,7 @@ describeGuardRoute(
 
       const res = await request(app)
         .post(`/api/issues/${issueId}/execution-stage/board-decision`)
-        .send({ decision: "approved", comment: "Approved by board" });
+        .send({ decision: "approved", comment: "Approved by board", displacementReason: "Board approves for the pending reviewer" });
 
       expect(res.status).toBe(200);
       expect(res.body.outcome).toBe("approved");
