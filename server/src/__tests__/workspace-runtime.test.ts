@@ -14000,8 +14000,8 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
     ).toBe(false);
   });
 
-  // SUP-24409 (RA on PR 1214): a card's workspace row names the branch the arm-time owner fallback
-  // trusts, so exact-branch realization refuses the fork's fold branch and the repo's default refs.
+  // SUP-24409: a card's workspace row names its delivery branch, so exact-branch realization refuses
+  // integration and release branches and the repo's default/base refs.
   const protectedBranchRefusal = (requestedExistingBranch: string) => ({
     code: "workspace_validation_failed",
     resultJson: {
@@ -14059,6 +14059,28 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
       issue: { id: "issue-pr-prep", identifier: "PAP-9001", title: "Prepare pull request for an existing branch" },
       agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
     })).rejects.toMatchObject(protectedBranchRefusal("develop"));
+  });
+
+  it("refuses to attach the strategy's configured base ref", async () => {
+    const repoRoot = await createTempRepo();
+    await createBranchWithCommit(repoRoot, "develop", "develop.txt");
+
+    await expect(realizeExistingBranch(repoRoot, "develop", { baseRef: "origin/develop" }))
+      .rejects.toMatchObject(protectedBranchRefusal("develop"));
+  });
+
+  it("refuses a branch template that renders the strategy's configured base ref", async () => {
+    const repoRoot = await createTempRepo();
+
+    await expect(realizeExecutionWorkspace({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "HEAD" },
+      config: { workspaceStrategy: { type: "git_worktree", branchTemplate: "develop", baseRef: "origin/develop" } },
+      issue: { id: "issue-pr-prep", identifier: "PAP-9001", title: "Prepare pull request for an existing branch" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: { workspaceValidation: expect.objectContaining({ reason: "branch_template_matches_default_branch", branchName: "develop" }) },
+    });
   });
 
   it("refuses a branch template that renders a protected branch and creates no worktree", async () => {

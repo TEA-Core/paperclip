@@ -1069,4 +1069,13 @@ describe("isProtectedDeliveryBranch", () => {
     expect(isProtectedDeliveryBranch({ branch: "SUP-1-own-work", workspaceMode: "isolated_workspace" })).toBe(false);
     expect(isProtectedDeliveryBranch({ branch: "SUP-1-own-work", workspaceMode: null })).toBe(false);
   });
+
+  it("reads a refs/heads/<x> ref as exactly the local branch x, not its last segment", () => {
+    expect(isProtectedDeliveryBranch({ branch: "team/trunk", defaultRefs: ["refs/heads/team/trunk"] })).toBe(true);
+    expect(isProtectedDeliveryBranch({ branch: "trunk", defaultRefs: ["refs/heads/team/trunk"] })).toBe(false);
+    expect(isProtectedDeliveryBranch({ branch: "trunk", defaultRefs: ["refs/remotes/origin/team/trunk"] })).toBe(false);
+    expect(isProtectedDeliveryBranch({ branch: "team/trunk", defaultRefs: ["refs/remotes/origin/team/trunk"] })).toBe(true);
+    // A bare ref with a slash may be a remote-tracking name or a namespaced local branch: both read as protected.
+    expect(isProtectedDeliveryBranch({ branch: "team/trunk", defaultRefs: ["team/trunk"] })).toBe(true);
+  });
 });

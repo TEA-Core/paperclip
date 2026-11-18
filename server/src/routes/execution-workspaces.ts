@@ -1164,10 +1164,10 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       }),
     );
     assertNoAgentExecutionWorkspaceIdentityMutation(req, collectExecutionWorkspaceIdentityPaths(req.body));
-    // SUP-24409 (RA rounds 1 and 2 on PR 1214): a row's branch is the delivery branch the arm-time
-    // owner fallback trusts, so it cannot be pointed at a protected branch (main, master, a release,
-    // hotfix or fold branch, a base/default ref of the row or its project), and a project_primary row
-    // never takes a new branch. An unchanged branch is left alone (a project_primary row sits on its default).
+    // SUP-24409: a row's branch is a card's delivery branch, so it cannot be pointed at a protected
+    // branch (main, master, a release, hotfix or fold branch, a base/default ref of the row or its
+    // project), and a project_primary row never takes a new branch. An unchanged branch is left alone
+    // (a project_primary row sits on its default).
     if (typeof req.body.branchName === "string" && req.body.branchName !== existing.branchName) {
       const projectRefs = await db
         .select({ defaultRef: projectWorkspaces.defaultRef, repoRef: projectWorkspaces.repoRef })

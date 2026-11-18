@@ -209,15 +209,15 @@ function makeDb(state: DbState) {
           }),
         };
       }
-      // Round 9: the authority guard reads the card (status, policy, state, and, SUP-24409, its
-      // workspace binding through a left join) and its decision rows.
+      // Round 9: the authority guard reads the card (status, policy, state) and its decision rows.
       if ("executionPolicy" in cols) {
-        const authorityRead = {
-          where: () => ({
-            limit: () => Promise.resolve([{ status: "done", executionPolicy: null, executionState: state.issueExecutionState ?? null }]),
+        return {
+          from: () => ({
+            where: () => ({
+              limit: () => Promise.resolve([{ status: "done", executionPolicy: null, executionState: state.issueExecutionState ?? null }]),
+            }),
           }),
         };
-        return { from: () => ({ ...authorityRead, leftJoin: () => authorityRead }) };
       }
       if ("actorAgentId" in cols) {
         return { from: () => ({ where: () => Promise.resolve(state.decisionRows ?? []) }) };

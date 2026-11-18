@@ -274,33 +274,31 @@ function comparableBranchName(name: string): string {
 
 /**
  * The branch names a stored default ref can denote. The control plane stores refs in several
- * forms (`main`, `origin/main`, `upstream/main`, `refs/heads/main`, `refs/remotes/origin/main`),
- * so the ref itself, the ref without a `refs/remotes/<remote>/` prefix, and the ref without its
- * first path segment (a remote name) all count.
+ * forms (`main`, `origin/main`, `upstream/main`, `refs/heads/main`, `refs/remotes/origin/main`).
+ * A `refs/heads/<x>` ref names exactly the local branch `x`; a `refs/remotes/<remote>/<x>` ref
+ * names `x`; a bare ref names itself or, when its first segment is a remote, the rest.
  */
 function branchNamesOfRef(ref: string): string[] {
-  const comparable = comparableBranchName(ref);
-  const names = [comparable];
-  const remoteTracking = /^refs\/remotes\/[^/]+\/(.+)$/.exec(comparable);
-  if (remoteTracking) names.push(remoteTracking[1]!);
+  const lowered = ref.trim().toLowerCase().replace(/\/+$/, "");
+  if (lowered.startsWith("refs/heads/")) return [lowered.slice("refs/heads/".length)];
+  const remoteTracking = /^refs\/remotes\/[^/]+\/(.+)$/.exec(lowered);
+  if (remoteTracking) return [remoteTracking[1]!];
   // Without the first path segment (a remote name); a ref with no slash yields itself again.
-  names.push(comparable.slice(comparable.indexOf("/") + 1));
-  return names;
+  return [lowered, lowered.slice(lowered.indexOf("/") + 1)];
 }
 
 /**
- * SUP-24409 (RA rounds 1 and 2 on PR 1214): a branch no card may claim as its own delivery
- * branch. The arm-time owner fallback trusts the branch on a card's own execution-workspace row,
- * so a row naming an integration branch would let one card's approval arm the PR that lands that
- * branch. This one predicate guards every place such a branch could reach a card's row: the
- * arm-time fallback, exact-branch and templated realization, and the board PATCH of a row.
+ * SUP-24409: a branch no card may claim as its own delivery branch, because it lands
+ * integration or release work. One predicate guards every place such a branch could reach a
+ * card's execution-workspace row: exact-branch and templated realization, and the board PATCH
+ * of a row's branch.
  *
  * True, independent of any configuration, for `main`, `master`, `release/*`, `releases/*`,
  * `hotfix/*`, `fold/*` and `fold-sync/*`, and for any branch on a `project_primary` row (the
  * project's own checkout is never a card's delivery row). Also true for any of `defaultRefs`, the
- * repo default/base refs the caller knows (project workspace default and repo refs, a row's base
- * ref, the remote's default branch), in whatever form they are stored. Case-insensitive, and
- * blind to a `refs/heads/` prefix, surrounding whitespace and trailing slashes.
+ * repo default/base refs the caller knows (project workspace default and repo refs, a row's or
+ * strategy's base ref, the remote's default branch), in whatever form they are stored.
+ * Case-insensitive, and blind to a `refs/heads/` prefix, surrounding whitespace and trailing slashes.
  */
 export function isProtectedDeliveryBranch(input: {
   branch: string;

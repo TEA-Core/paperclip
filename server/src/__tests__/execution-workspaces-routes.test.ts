@@ -733,7 +733,7 @@ describe("execution workspace routes", () => {
     expect(mockEnvironmentRuntimeService.destroyReusableSandboxLeases).not.toHaveBeenCalled();
   });
 
-  describe("SUP-24409 (RA on PR 1214): a workspace row cannot be pointed at a protected base branch", () => {
+  describe("SUP-24409: a workspace row cannot be pointed at a protected base branch", () => {
     /** A fake db whose only read is the project-workspace ref lookup. */
     function refsDb(refs: Array<{ defaultRef: string | null; repoRef: string | null }>) {
       return { select: () => ({ from: () => ({ where: () => Promise.resolve(refs) }) }) };
@@ -804,7 +804,7 @@ describe("execution workspace routes", () => {
       expect(mockExecutionWorkspaceService.update).toHaveBeenCalledWith("workspace-1", { branchName: null });
     });
 
-    // RA round 2: the standard protected classes hold with no configuration naming them.
+    // The standard protected classes hold with no configuration naming them.
     it.each([
       "main", "master", "release/1.2", "releases/v1", "hotfix/urgent", "fold/anything", "fold-sync/2026.11",
     ])("refuses %s with 422 even when no ref configuration names it", async (branchName) => {
@@ -832,6 +832,14 @@ describe("execution workspace routes", () => {
 
       expect(res.status).toBe(422);
       expect(mockExecutionWorkspaceService.update).not.toHaveBeenCalled();
+    });
+
+    it("does not protect a bare name that is only the last segment of a namespaced local ref", async () => {
+      givenWorkspace({ baseRef: null });
+
+      const res = await patchBranch({ branchName: "trunk" }, [{ defaultRef: "refs/heads/team/trunk", repoRef: null }]);
+
+      expect(res.status).toBe(200);
     });
   });
 });
