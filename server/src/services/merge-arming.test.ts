@@ -2330,9 +2330,23 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       const issueId = await insertIssue();
       await insertMention(issueId, { number: 42, state: "open", draft: true });
       await insertMention(issueId, { number: 50, state: "closed", headRefName: "SUP-50-branch" });
-      installRoutes(mergedCarrierRoutes());
+      // PR 50 is a LIVE OPEN DRAFT. It sits in the checked list, so it is read and
+      // it blocks the merged carrier (42). The injected mentions are not in the
+      // checked list and must never be read. A mocked read of PR 50 (instead of an
+      // unmocked throw) makes the head_draft refusal below a real guard result.
+      const routes50 = [
+        ...mergedCarrierRoutes(),
+        {
+          url: `https://api.github.com/repos/${OWNER}/${REPO}/pulls/50`,
+          body: {
+            state: "open", draft: true, merged: false, title: "Fix thing (SUP-42)",
+            head: { ref: "SUP-50-branch", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+          },
+        },
+      ];
+      installRoutes(routes50);
       mockGhFetch.mockClear();
-      installRoutes(mergedCarrierRoutes());
+      installRoutes(routes50);
 
       let mentionQueries = 0;
       let injected = false;
@@ -2382,9 +2396,11 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
 
       const result = await preflightFinalDelivery(racingDb, companyId, issueId, "SUP-42");
 
-      expect(result.kind).toBe("resolved");
-      const injectedReads = mockGhFetch.mock.calls.filter(([url]) => /\/pulls\/6\d$/.test(String(url)));
-      expect(injectedReads).toHaveLength(0);
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") expect(result.reason).toMatch(/^head_draft:/);
+      const reads = (pattern: RegExp) => mockGhFetch.mock.calls.filter(([url]) => pattern.test(String(url)));
+      expect(reads(/\/pulls\/50$/).length).toBeGreaterThan(0);
+      expect(reads(/\/pulls\/6\d$/)).toHaveLength(0);
     });
 
     // Release-assurance NO-GO N1: drafts never contribute repo pairs to the live
@@ -2586,6 +2602,23 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           expect(result.kind).toBe("resolved");
         });
 
+        // Round-6: each of these spellings advertises a next page and the first
+        // parser read them as "no next" (admitting the stale-draft carrier).
+        it.each([
+          ["single-quoted rel", `<https://api.github.com/x?page=2>; rel='next'`],
+          ["trailing comma after rel=next", `<https://api.github.com/x?page=2>; rel="next",`],
+          ["unterminated quote", `<https://api.github.com/x?page=2>; rel="next`],
+          ["escaped rel value", `<https://api.github.com/x?page=2>; rel="\\next"`],
+          ["rel* extended parameter", `<https://api.github.com/x?page=2>; rel*=UTF-8''next`],
+        ] as const)("refuses a short page whose Link header spells next as: %s", async (_label, link) => {
+          const result = await run({ link });
+          expect(result.kind).toBe("unresolvable");
+          if (result.kind === "unresolvable") {
+            expect(result.reason).toMatch(/^head_draft:/);
+            expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
+          }
+        });
+
         it.each([
           ["empty Link header", ""],
           ["garbage Link header", "this is not a link header"],
@@ -2598,25 +2631,116 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         });
       });
 
+      const U = "<https://api.github.com/x?page=2>";
+      // Canonical spellings that name a next page.
       it.each([
-        ['rel="next"', true],
-        ["rel=next", true],
-        ['REL="NEXT"', true],
-        ['rel="prev next"', true],
-        ['rel="Last NEXT"', true],
-        ['title="a, b"; rel="next"', true],
-        ['rel="prev"', false],
-        ['rel="nextish"', false],
-        ['rel="last"', false],
-        ["", false],
-      ])("linkHeaderAdvertisesNextPage parses a single link with %s", (params, expected) => {
-        expect(linkHeaderAdvertisesNextPage(`<https://api.github.com/x?page=2>; ${params}`)).toBe(expected);
+        'rel="next"', "rel=next", 'REL="NEXT"', 'Rel="Next"', 'rel="prev next"', 'rel="Last NEXT"',
+        'rel = "next"', 'title="a, b"; rel="next"', 'rel="next"; title="x"',
+      ])("linkHeaderAdvertisesNextPage: next-page spelling %s", (params) => {
+        expect(linkHeaderAdvertisesNextPage(`${U}; ${params}`)).toBe(true);
       });
 
-      it("linkHeaderAdvertisesNextPage reads every comma-separated link and a comma inside a target", () => {
-        expect(linkHeaderAdvertisesNextPage('<https://a.test/x?q=a,b&page=1>; rel="prev", <https://a.test/x?q=a,b&page=3>; rel="next"')).toBe(true);
-        expect(linkHeaderAdvertisesNextPage('<https://a.test/x?q=a,b&page=1>; rel="prev", <https://a.test/x?page=0>; rel="first"')).toBe(false);
+      // Round-6 spellings the first parser failed open on, plus related shapes.
+      it.each([
+        ["single-quoted rel", `${U}; rel='next'`],
+        ["trailing comma", `${U}; rel="next",`],
+        ["trailing comma and spaces", `${U}; rel="next" , `],
+        ["unterminated quote", `${U}; rel="next`],
+        ["escaped value", `${U}; rel="\\next"`],
+        ["escaped quote", `${U}; rel="a\\"next"`],
+        ["rel* extended parameter", `${U}; rel*=UTF-8''next`],
+        ["any other extended parameter", `${U}; rel="prev"; title*=UTF-8''x`],
+        ["trailing comma after a harmless link", `${U}; rel="prev",`],
+        ["escaped quote that hides a harmless-looking rel", `${U}; title="a\\"; rel="prev"`],
+        ["empty parameter name with a value", `${U}; ="prev"`],
+        ["single-quoted harmless rel", `${U}; rel='prev'`],
+        ["flag parameter before a harmless rel", `${U}; flag; rel="prev"`],
+        ["trailing semicolon", `${U}; rel="prev";`],
+        ["empty parameter", `${U};; rel="prev"`],
+        ["flag parameter without =", `${U}; rel="prev"; flag`],
+        ["empty parameter value", `${U}; rel="prev"; title=`],
+        ["empty rel value", `${U}; rel=""`],
+        ["blank rel value", `${U}; rel="  "`],
+        ["unknown rel token", `${U}; rel="nextish"`],
+        ["unknown rel token beside a harmless one", `${U}; rel="prev bookmark"`],
+        ["garbage after the target", `${U} rel="prev"`],
+        ["unterminated target", "<https://api.github.com/x?page=2; rel=\"prev\""],
+        ["no angle brackets", 'https://api.github.com/x?page=2; rel="prev"'],
+        ["nested angle bracket", '<a<b>; rel="prev"'],
+        ["target then garbage link", `${U}; rel="prev", garbage`],
+        ["trailing NUL after the value", `${U}; rel="next"\u0000`],
+        ["empty header", ""],
+        ["blank header", "   "],
+        ["comma only", ","],
+      ])("linkHeaderAdvertisesNextPage fails closed on %s", (_label, header) => {
+        expect(linkHeaderAdvertisesNextPage(header)).toBe(true);
+      });
+
+      // The only headers proven to carry no next page.
+      it.each([
+        ["no parameters at all", U],
+        ["rel=prev", `${U}; rel="prev"`],
+        ["rel=last", `${U}; rel="last"`],
+        ["rel=first unquoted", `${U}; rel=first`],
+        ["rel=self", `${U}; rel=self`],
+        ["rel token list of harmless types", `${U}; rel="prev first last"`],
+        ["mixed-case harmless rel", `${U}; REL="PREV"`],
+        ["a non-rel parameter", `${U}; title="a, b"; rel="prev"; type="text/plain"`],
+        ["spacing around separators", `${U} ; rel = "prev" ,  ${U} ;rel=first`],
+        ["tabs as whitespace", `${U};\trel="prev"`],
+        ["prev, first, last together", `${U}; rel="prev", ${U}; rel="first", ${U}; rel="last"`],
+        ["a comma inside a target", '<https://a.test/x?q=a,b&page=1>; rel="prev", <https://a.test/x?q=a,b&page=0>; rel="first"'],
+      ])("linkHeaderAdvertisesNextPage proves no next page for %s", (_label, header) => {
+        expect(linkHeaderAdvertisesNextPage(header)).toBe(false);
+      });
+
+      it("linkHeaderAdvertisesNextPage treats only an absent header as no header", () => {
         expect(linkHeaderAdvertisesNextPage(null)).toBe(false);
+        expect(linkHeaderAdvertisesNextPage("")).toBe(true);
+      });
+
+      it("linkHeaderAdvertisesNextPage reads every comma-separated link, next in the second included", () => {
+        expect(linkHeaderAdvertisesNextPage(`${U}; rel="prev", ${U.replace("2", "3")}; rel="next"`)).toBe(true);
+        expect(linkHeaderAdvertisesNextPage('<https://a.test/x?q=a,b&page=1>; rel="prev", <https://a.test/x?q=a,b&page=3>; rel="next"')).toBe(true);
+      });
+
+      // Property over a small grammar: any next-page spelling under any decoration
+      // that keeps it parseable-or-not must advertise a next page; any harmless
+      // spelling under benign decorations must not.
+      it("linkHeaderAdvertisesNextPage: no decoration turns a next-page spelling into no-next", () => {
+        const nextSpellings = ['rel="next"', "rel=next", 'REL="NEXT"', 'rel="prev next"', "rel='next'", 'rel="next', 'rel="\\next"', "rel*=UTF-8''next", 'rel="next"x'];
+        const before = ["", ` ; title="t"`, ` ; type=a`];
+        const after = ["", ",", " ,", "; ", ' ; title="t"', `, ${U}; rel="prev"`, `, ${U}`, "\u0000", ",,"];
+        for (const spelling of nextSpellings) {
+          for (const pre of before) {
+            for (const post of after) {
+              const header = `${U}${pre}; ${spelling}${post}`;
+              expect(linkHeaderAdvertisesNextPage(header), header).toBe(true);
+            }
+          }
+        }
+        const harmless = ['rel="prev"', "rel=last", 'rel="first last"', 'REL="Self"'];
+        const benign = ["", " ", "\t"];
+        for (const spelling of harmless) {
+          for (const gap of benign) {
+            const header = `${U}${gap};${gap}${spelling}${gap}`;
+            expect(linkHeaderAdvertisesNextPage(header), header).toBe(false);
+          }
+        }
+      });
+
+      it("linkHeaderAdvertisesNextPage stays linear-time on hostile input", () => {
+        const started = Date.now();
+        for (const hostile of [
+          ";".repeat(1_000_000),
+          `${U}${"; a=b".repeat(150_000)}`,
+          "<".repeat(500_000),
+          `${U}; rel="${"x ".repeat(300_000)}"`,
+          `${U}, `.repeat(100_000),
+        ]) {
+          linkHeaderAdvertisesNextPage(hostile);
+        }
+        expect(Date.now() - started).toBeLessThan(3_000);
       });
 
       it("refuses when only some cached drafts are the card's own delivery", async () => {

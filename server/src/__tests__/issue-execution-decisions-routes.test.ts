@@ -703,6 +703,31 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       expect(fixture.writes).toEqual([]);
     });
 
+    // Round-6: spellings of a next page that the first Link parser read as "no
+    // next page" (the PATCH door then returned 200 and the card went done).
+    it.each([
+      ["single-quoted rel", `<https://api.github.com/repositories/1/pulls?page=2>; rel='next'`],
+      ["trailing comma", `<https://api.github.com/repositories/1/pulls?page=2>; rel="next",`],
+      ["unterminated quote", `<https://api.github.com/repositories/1/pulls?page=2>; rel="next`],
+      ["escaped value", `<https://api.github.com/repositories/1/pulls?page=2>; rel="\\next"`],
+      ["rel* extended parameter", `<https://api.github.com/repositories/1/pulls?page=2>; rel*=UTF-8''next`],
+    ])("PATCH final verdict refuses head_draft when the Link header spells next as: %s", async (_label, link) => {
+      const fixture = await pendingDelivery({ mentionState: "stale-draft-merged", openListLink: link });
+      expectHeadDraftRefusal(await fixture.approve());
+      expect((await fixture.read()).status).toBe("in_review");
+      expect(fixture.writes).toEqual([]);
+    });
+
+    it("PATCH final verdict still accepts the verified merged carrier when the Link header carries only rel=prev/first/last", async () => {
+      const fixture = await pendingDelivery({
+        mentionState: "stale-draft-merged",
+        openListLink: '<https://api.github.com/repositories/1/pulls?page=1>; rel="prev", <https://api.github.com/repositories/1/pulls?page=1>; rel="first"',
+      });
+      const response = await fixture.approve();
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect((await fixture.read()).status).toBe("done");
+    });
+
     it("board stage-decision refuses head_draft when the page advertises a next page", async () => {
       const previous = process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE;
       process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "true";

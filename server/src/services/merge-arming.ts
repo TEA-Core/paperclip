@@ -4652,27 +4652,79 @@ async function fetchPullRequestHeadSha(
 /** The open-PR list is read as one page of this size; there is no pagination. */
 const OPEN_PULL_REQUESTS_PAGE_SIZE = 100;
 
+/** `rel` relation types that cannot point at a following page. Anything else counts as "may have a next page". */
+const HARMLESS_LINK_RELS = new Set(["prev", "previous", "first", "last", "self"]);
+const LINK_TOKEN_CHAR = /[!#$%&'*+\-.^_`|~0-9A-Za-z]/;
+
 /**
- * SUP-24033: true when an RFC 8288 `Link` header may point at a next page.
- * Absent (null) means no next page. A present header that is empty, or any part
- * that is not `<uri-reference>` followed by `;`-parameters, is malformed and
- * counts as having a next page (fail closed). `rel` is matched
- * case-insensitively, quoted or bare, and may carry several space-separated
- * relation types.
+ * SUP-24033: true unless an RFC 8288 `Link` header is PROVEN to carry no next page.
+ * Fail closed by construction: only (a) an absent header (null) or (b) a header
+ * that parses completely as `<uri>` links with `;`-separated `token=token|"quoted"`
+ * parameters, where every `rel` token (case-insensitive, space-separated) is in
+ * HARMLESS_LINK_RELS, returns false. Everything else returns true: an empty
+ * header, a trailing comma or semicolon, a stray character, an unterminated,
+ * single-quoted or backslash-escaped value, a flag parameter with no `=`, any
+ * extended `name*` parameter (RFC 8187), and any unknown `rel` token (including
+ * `next`). One left-to-right scan, no backtracking: linear in the header length.
  */
 export function linkHeaderAdvertisesNextPage(header: string | null): boolean {
   if (header === null) return false;
-  if (header.trim() === "") return true;
-  for (const part of header.split(/,\s*(?=<)/)) {
-    const match = /^\s*<[^<>]*>\s*((?:;[^;]*)*)\s*$/.exec(part);
-    if (!match) return true;
-    for (const param of match[1]!.split(";")) {
-      const rel = /^\s*rel\s*=\s*(?:"([^"]*)"|([^\s"]+))\s*$/i.exec(param);
-      if (!rel) continue;
-      if ((rel[1] ?? rel[2] ?? "").toLowerCase().split(/\s+/).includes("next")) return true;
+  const n = header.length;
+  let i = 0;
+  const skipOws = () => {
+    while (i < n && (header[i] === " " || header[i] === "\t")) i += 1;
+  };
+  const readToken = () => {
+    const start = i;
+    while (i < n && LINK_TOKEN_CHAR.test(header[i]!)) i += 1;
+    return header.slice(start, i);
+  };
+  skipOws();
+  if (i >= n) return true;
+  for (;;) {
+    if (header[i] !== "<") return true;
+    const end = header.indexOf(">", i + 1);
+    if (end === -1 || header.slice(i + 1, end).includes("<")) return true;
+    i = end + 1;
+    for (;;) {
+      skipOws();
+      if (i >= n) return false;
+      if (header[i] === ",") {
+        i += 1;
+        skipOws();
+        if (i >= n) return true;
+        break;
+      }
+      if (header[i] !== ";") return true;
+      i += 1;
+      skipOws();
+      const name = readToken().toLowerCase();
+      if (name === "" || name.endsWith("*")) return true;
+      skipOws();
+      if (header[i] !== "=") return true;
+      i += 1;
+      skipOws();
+      let value: string;
+      if (header[i] === '"') {
+        i += 1;
+        const start = i;
+        while (i < n && header[i] !== '"') {
+          if (header[i] === "\\") return true;
+          i += 1;
+        }
+        if (i >= n) return true;
+        value = header.slice(start, i);
+        i += 1;
+      } else {
+        value = readToken();
+        if (value === "") return true;
+      }
+      if (name === "rel") {
+        const tokens = value.toLowerCase().split(/[ \t]+/).filter((token) => token !== "");
+        if (tokens.length === 0 || tokens.some((token) => !HARMLESS_LINK_RELS.has(token))) return true;
+      }
     }
   }
-  return false;
 }
 
 export interface OpenPullRequestListItem {
