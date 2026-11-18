@@ -3514,12 +3514,12 @@ export function issueThreadInteractionService(
 
       if (
         normalizedData.kind === "request_confirmation" &&
-        !normalizedData.addresseeAgentId &&
+        policy.effectiveResolverPolicy === "human_only" &&
         !normalizedData.addresseeUserId
       ) {
         const details = {
           code: "interaction_unaddressable",
-          reason: "missing_addressee",
+          reason: "missing_human_addressee",
           kind: normalizedData.kind,
           idempotencyKey: normalizedData.idempotencyKey ?? null,
         };

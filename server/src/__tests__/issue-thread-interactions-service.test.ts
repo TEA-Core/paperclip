@@ -6063,48 +6063,59 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     };
   }
 
-  it.each(["ordinary", "review-escalation"])(
-    "refuses an unaddressed %s confirmation and records one activity per refused attempt",
-    async (context) => {
-      const { companyId, issueId } = await seedConfirmationIssue("Unaddressable confirmation");
-      const agentId = await seedAgent(companyId);
-      const input: RequestConfirmationInput = {
-        kind: "request_confirmation",
-        continuationPolicy: "none",
-        payload: confirmationPayload(),
-        addresseeUserId: null,
-        addresseeAgentId: null,
-        idempotencyKey: `${context}:${issueId}`,
-      };
-      const create = () => interactionsSvc.create({ id: issueId, companyId }, input, { agentId });
+  it("refuses human-only confirmations addressed only to an agent and records the refusal", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Unaddressable human-only confirmation");
+    const agentId = await seedAgent(companyId);
+    const addresseeAgentId = await seedAgent(companyId);
+    const input: RequestConfirmationInput = {
+      kind: "request_confirmation",
+      resolverPolicy: "human_only",
+      continuationPolicy: "none",
+      payload: confirmationPayload(),
+      addresseeAgentId,
+      idempotencyKey: `human-only:${issueId}`,
+    };
 
-      await expect(create()).rejects.toMatchObject({
-        status: 422,
-        details: {
-          code: "interaction_unaddressable",
-          reason: "missing_addressee",
-          kind: "request_confirmation",
-        },
-      });
-      await expect(create()).rejects.toMatchObject({ status: 422 });
-      expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId))).toHaveLength(0);
-      const refusals = await db.select().from(activityLog).where(and(
-        eq(activityLog.entityId, issueId),
-        eq(activityLog.action, "issue.thread_interaction_create_refused"),
-      ));
-      expect(refusals).toHaveLength(2);
-      expect(refusals[0]?.details).toMatchObject({
+    await expect(interactionsSvc.create({ id: issueId, companyId }, input, { agentId })).rejects.toMatchObject({
+      status: 422,
+      details: {
         code: "interaction_unaddressable",
-        reason: "missing_addressee",
+        reason: "missing_human_addressee",
         kind: "request_confirmation",
-        idempotencyKey: input.idempotencyKey,
-      });
-      expect(await db.select().from(activityLog).where(and(
-        eq(activityLog.entityId, issueId),
-        eq(activityLog.action, "issue.thread_interaction_created"),
-      ))).toHaveLength(0);
-    },
-  );
+      },
+    });
+    expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId))).toHaveLength(0);
+    expect(await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, issueId),
+      eq(activityLog.action, "issue.thread_interaction_create_refused"),
+    ))).toHaveLength(1);
+  });
+
+  it("creates an unaddressed confirmation when its effective resolver policy is anyone", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Unaddressed anyone confirmation");
+    const agentId = await seedAgent(companyId);
+
+    const created = await interactionsSvc.create({ id: issueId, companyId }, {
+      kind: "request_confirmation",
+      resolverPolicy: "anyone",
+      continuationPolicy: "none",
+      payload: confirmationPayload(),
+      addresseeUserId: null,
+      addresseeAgentId: null,
+    }, { agentId });
+
+    expect(created).toMatchObject({
+      kind: "request_confirmation",
+      status: "pending",
+      addresseeUserId: null,
+      addresseeAgentId: null,
+      effectiveResolverPolicy: "anyone",
+    });
+    expect(await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, issueId),
+      eq(activityLog.action, "issue.thread_interaction_create_refused"),
+    ))).toHaveLength(0);
+  });
 
   it.each(["toolAction", "secretProposal"] as const)(
     "refuses an unaddressed governed confirmation containing %s",
@@ -6124,7 +6135,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         { agentId },
       )).rejects.toMatchObject({
         status: 422,
-        details: { code: "interaction_unaddressable", reason: "missing_addressee" },
+        details: { code: "interaction_unaddressable", reason: "missing_human_addressee" },
       });
       expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId))).toHaveLength(0);
       expect(await db.select().from(activityLog).where(and(

@@ -1035,7 +1035,8 @@ describeEmbeddedPostgres("review stall escalation through the routes (R20)", () 
     expect(refusals).toHaveLength(1);
     expect(refusals[0]?.details).toMatchObject({
       code: "interaction_unaddressable",
-      reason: "missing_addressee",
+      reason: "missing_human_addressee",
+      kind: "request_confirmation",
     });
   }, 60_000);
 
