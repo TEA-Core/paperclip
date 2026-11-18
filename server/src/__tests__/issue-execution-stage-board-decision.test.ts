@@ -1870,6 +1870,57 @@ describeEmbeddedPostgres("POST /issues/:id/execution-stage/board-decision (SUP-1
       expect(rows.activity).toHaveLength(0);
     });
 
+    it("still refuses a non-owner/admin board caller and an unopted route even with a reason", async () => {
+      const { companyId, issueId } = await seedIssue({ membershipRole: "operator" });
+      currentActor = boardActor(companyId);
+      const body = { decision: "approved", comment: "lgtm", displacementReason: "board reason" };
+
+      const notAdmin = await request(app).post(`/api/issues/${issueId}/execution-stage/board-decision`).send(body);
+      expect(notAdmin.status).toBe(403);
+      expect(notAdmin.body.error).toBe("Company owner or admin required to decide an execution stage");
+
+      process.env.PAPERCLIP_BOARD_STAGE_OVERRIDE = "0";
+      const flagOff = await request(app).post(`/api/issues/${issueId}/execution-stage/board-decision`).send(body);
+      expect(flagOff.status).toBe(404);
+
+      const rows = await overrideRows(issueId);
+      expect(rows.decisions).toHaveLength(0);
+      expect(rows.comments).toHaveLength(0);
+      expect(rows.activity).toHaveLength(0);
+    });
+
+    it("does not accept displacementReason on the PATCH path from a board user or the reviewer agent", async () => {
+      const { companyId, issueId, reviewerAgentId } = await seedWithUserReturnAssignee();
+      const [before] = await db.select().from(issues).where(eq(issues.id, issueId));
+      currentActor = boardActor(companyId);
+      // The PATCH body schema rejects the field outright, so it can neither
+      // satisfy nor bypass any PATCH-path guard.
+      const boardClose = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "done",
+          doneTransitionOverride: { disposition: "upstream-equivalent-fix-no-deliverable-head", reason: "Tier 1" },
+          comment: "Closed at Tier 2 (live): board close attempt on a pending stage.",
+          displacementReason: "board reason",
+        });
+      expect(boardClose.status, JSON.stringify(boardClose.body)).toBe(400);
+
+      await db.insert(heartbeatRuns).values({ id: REVIEWER_RUN_ID, companyId, agentId: reviewerAgentId, status: "running" });
+      currentActor = agentActor(companyId, reviewerAgentId);
+      const agentVerdict = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_progress", comment: "Request changes: missing test.", displacementReason: "agent reason" });
+      expect(agentVerdict.status, JSON.stringify(agentVerdict.body)).toBe(400);
+
+      const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(after!.status).toBe(before!.status);
+      expect(after!.executionState).toEqual(before!.executionState);
+      const rows = await overrideRows(issueId);
+      expect(rows.decisions).toHaveLength(0);
+      expect(rows.comments).toHaveLength(0);
+      expect(rows.activity).toHaveLength(0);
+    });
+
     it("keeps the displaced reviewer's late verdict refused and its later comment on the closed card a plain comment", async () => {
       const { companyId, issueId, reviewerAgentId } = await seedWithUserReturnAssignee();
       // The reviewer filed the card, so it keeps the creator's comment grant after
