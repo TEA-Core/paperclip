@@ -29,12 +29,7 @@ import {
 import { dispatchQuiesce } from "../services/dispatch-quiesce.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.ts";
-import {
-  applyIssueExecutionPolicyTransition,
-  normalizeIssueExecutionPolicy,
-  parseIssueExecutionState,
-  setIssueExecutionPolicyMonitorScheduledBy,
-} from "../services/issue-execution-policy.ts";
+import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, setIssueExecutionPolicyMonitorScheduledBy } from "../services/issue-execution-policy.ts";
 
 const recoveryActionHook = vi.hoisted(() => ({
   afterUpsert: null as null | (() => Promise<void>),
