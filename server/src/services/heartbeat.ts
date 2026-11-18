@@ -12847,39 +12847,67 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runId: string | null;
     activitySource: "manual" | "scheduled";
   }) {
-    await db
-      .update(issues)
-      .set({
-        ...buildIssueMonitorClearedPatch({
-          issue: input.claimed,
-          policy: input.policy,
-          clearReason: input.clearReason,
-          clearedAt: input.now,
-        }),
-        updatedAt: input.now,
-      })
-      .where(eq(issues.id, input.claimed.id));
+    // The clear and the exhaustion row commit together, and the clear is
+    // guarded by the claimed schedule: a duplicate claim or a re-arm that
+    // landed after the claim leaves zero rows, so exactly one exhaustion is
+    // recorded and recovery runs at most once per exhaustion (SUP-23786).
+    const recoveryOutcome = {
+      wake_owner: "owner_wake_queued",
+      create_recovery_issue: "recovery_issue_created",
+      escalate_to_board: "escalated_to_board",
+    }[input.recoveryPolicy];
+    const cleared = await db.transaction(async (tx) => {
+      const rows = await tx
+        .update(issues)
+        .set({
+          ...buildIssueMonitorClearedPatch({
+            issue: input.claimed,
+            policy: input.policy,
+            clearReason: input.clearReason,
+            clearedAt: input.now,
+          }),
+          updatedAt: input.now,
+        })
+        .where(
+          and(
+            eq(issues.id, input.claimed.id),
+            input.claimed.monitorNextCheckAt
+              ? eq(issues.monitorNextCheckAt, input.claimed.monitorNextCheckAt)
+              : isNull(issues.monitorNextCheckAt),
+          ),
+        )
+        .returning({ id: issues.id });
+      if (rows.length === 0) return false;
 
-    await logActivity(db, {
-      companyId: input.claimed.companyId,
-      actorType: input.actorType,
-      actorId: input.actorId,
-      boardApiKeyId: input.boardApiKeyId ?? null,
-      agentId: input.agentId,
-      runId: input.runId,
-      action: "issue.monitor_exhausted",
-      entityType: "issue",
-      entityId: input.claimed.id,
-      details: monitorRecoveryDetails({
-        claimed: input.claimed,
-        scheduledAtIso: input.scheduledAtIso,
-        nextAttemptCount: input.nextAttemptCount,
-        clearReason: input.clearReason,
-        recoveryPolicy: input.recoveryPolicy,
-        monitor: input.monitor,
-        source: input.activitySource,
-      }),
+      await logActivityInTransaction(tx as unknown as Db, {
+        companyId: input.claimed.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        boardApiKeyId: input.boardApiKeyId ?? null,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_exhausted",
+        entityType: "issue",
+        entityId: input.claimed.id,
+        details: {
+          ...monitorRecoveryDetails({
+            claimed: input.claimed,
+            scheduledAtIso: input.scheduledAtIso,
+            nextAttemptCount: input.nextAttemptCount,
+            clearReason: input.clearReason,
+            recoveryPolicy: input.recoveryPolicy,
+            monitor: input.monitor,
+            source: input.activitySource,
+          }),
+          attemptCount: input.claimed.monitorAttemptCount ?? 0,
+          recoveryOutcome,
+        },
+      });
+      return true;
     });
+    if (!cleared) {
+      return { outcome: "skipped" as const, reason: "monitor_rearmed" };
+    }
 
     await performIssueMonitorRecovery({
       claimed: input.claimed,

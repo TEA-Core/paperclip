@@ -6098,3 +6098,143 @@ describe("actor-versus-seat and stage membership compare principal ids exactly",
     ).toThrow("Only the active reviewer or approver can advance");
   });
 });
+
+// SUP-23786: the re-arm that follows the last permitted fire used to be refused
+// (MONITOR_BOUNDS_EXHAUSTED) even when the owner configured a recoveryPolicy, and
+// the due dispatch that runs recovery could then never occur. An agent re-arm
+// that carries an explicit recoveryPolicy is now persisted as a normal schedule,
+// so the existing due dispatch performs the exhaustion + recovery.
+describe("monitor re-arm after the bounds are exhausted (SUP-23786)", () => {
+  const firedAt = "2026-04-11T12:31:00.000Z";
+  const rearmAt = "2026-04-11T13:00:00.000Z";
+
+  function firedMonitorIssue(attemptCount: number) {
+    return {
+      status: "in_progress",
+      assigneeAgentId: coderAgentId,
+      assigneeUserId: null,
+      // The triggered patch strips the monitor from the policy and nulls the schedule.
+      executionPolicy: { mode: "normal", commentRequired: true, stages: [] },
+      executionState: {
+        status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: {
+          status: "triggered",
+          nextCheckAt: null,
+          lastTriggeredAt: firedAt,
+          attemptCount,
+          notes: null,
+          scheduledBy: "assignee",
+          serviceName: null,
+          externalRef: null,
+          timeoutAt: null,
+          maxAttempts: 1,
+          recoveryPolicy: "wake_owner",
+          clearedAt: null,
+          clearReason: null,
+        },
+      },
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date(firedAt),
+      monitorAttemptCount: attemptCount,
+      monitorScheduledBy: "assignee",
+    };
+  }
+
+  function rearm(
+    monitor: Record<string, unknown>,
+    attemptCount = 1,
+  ) {
+    const policy = normalizeIssueExecutionPolicy({ stages: [], monitor: { nextCheckAt: rearmAt, ...monitor } })!;
+    return applyIssueExecutionPolicyTransition({
+      issue: firedMonitorIssue(attemptCount),
+      policy,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      monitorExplicitlyUpdated: true,
+    });
+  }
+
+  it.each(["wake_owner", "create_recovery_issue", "escalate_to_board"] as const)(
+    "persists an agent re-arm at maxAttempts with recoveryPolicy %s so the due dispatch can recover",
+    (recoveryPolicy) => {
+      const { patch } = rearm({ scheduledBy: "assignee", maxAttempts: 1, recoveryPolicy });
+      expect(patch.monitorNextCheckAt).toEqual(new Date(rearmAt));
+      expect(patch.monitorScheduledBy).toBe("assignee");
+      expect(parseIssueExecutionState(patch.executionState as Record<string, unknown>)?.monitor).toMatchObject({
+        status: "scheduled",
+        nextCheckAt: rearmAt,
+        attemptCount: 1,
+        maxAttempts: 1,
+        recoveryPolicy,
+        clearReason: null,
+      });
+    },
+  );
+
+  it("persists an agent re-arm after the timeout with an explicit recoveryPolicy", () => {
+    const { patch } = rearm({
+      scheduledBy: "assignee",
+      timeoutAt: "2026-04-11T12:45:00.000Z",
+      recoveryPolicy: "escalate_to_board",
+    });
+    expect(patch.monitorNextCheckAt).toEqual(new Date(rearmAt));
+  });
+
+  it.each([
+    ["board-armed", { scheduledBy: "board", maxAttempts: 1, recoveryPolicy: "wake_owner" }, 1],
+    ["no recoveryPolicy", { scheduledBy: "assignee", maxAttempts: 1 }, 1],
+    ["initial arm of an already timed-out monitor", { scheduledBy: "assignee", timeoutAt: "2026-04-11T12:00:00.000Z", recoveryPolicy: "wake_owner" }, 0],
+  ] as const)("still refuses an exhausted re-arm: %s", (_label, monitor, attemptCount) => {
+    let thrown: unknown;
+    try {
+      rearm({ ...monitor }, attemptCount);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(HttpError);
+    expect(thrown).toMatchObject({
+      status: 422,
+      message: "Monitor bounds are already exhausted",
+      details: { clearReason: expect.stringMatching(/^(max_attempts_exhausted|timeout_exceeded)$/) },
+    });
+  });
+
+  it.each(["max_attempts_exhausted", "timeout_exceeded"] as const)(
+    "refuses the same exhausted re-arm once a %s recovery already ran",
+    (clearReason) => {
+      const issue = firedMonitorIssue(1);
+      issue.executionState.monitor = {
+        ...issue.executionState.monitor,
+        status: "cleared",
+        clearedAt: firedAt,
+        clearReason,
+      };
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: { nextCheckAt: rearmAt, scheduledBy: "assignee", maxAttempts: 1, timeoutAt: "2026-04-11T12:45:00.000Z", recoveryPolicy: "wake_owner" },
+      })!;
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue,
+          policy,
+          requestedAssigneePatch: {},
+          actor: { agentId: coderAgentId },
+          monitorExplicitlyUpdated: true,
+        }),
+      ).toThrowError("Monitor bounds are already exhausted");
+    },
+  );
+
+  it("does not exhaust while attempts remain (control)", () => {
+    const { patch } = rearm({ scheduledBy: "assignee", maxAttempts: 2, recoveryPolicy: "wake_owner" });
+    expect(patch.monitorNextCheckAt).toEqual(new Date(rearmAt));
+  });
+});

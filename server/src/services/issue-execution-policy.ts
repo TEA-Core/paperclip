@@ -2518,7 +2518,27 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
         attemptCount: currentMonitorState?.attemptCount ?? 0,
         now: new Date(),
       });
-      if (exhaustedReason) {
+      // Recovery is evaluated only by a due dispatch, and after the last
+      // permitted fire the owner's re-arm is the only way a later dispatch can
+      // exist. So an agent-armed re-arm of a monitor that has fired before and
+      // names a `recoveryPolicy` is persisted like any other schedule (refusing
+      // it would leave the configured recovery unreachable): the due dispatch
+      // sees attemptCount + 1 over the bounds and runs exhaustion + recovery
+      // instead of a check. Board-armed monitors, monitors without an explicit
+      // recoveryPolicy, and the initial arm (nothing fired) keep the refusal.
+      // A monitor already cleared by an exhaustion has had its recovery, and the
+      // clear keeps attemptCount, so the same exhausted write is refused again:
+      // an agent cannot cycle re-arm -> exhaustion -> recovery without bound.
+      const recoveryAlreadyRan =
+        currentMonitorState?.status === "cleared" &&
+        (currentMonitorState.clearReason === "max_attempts_exhausted" ||
+          currentMonitorState.clearReason === "timeout_exceeded");
+      const exhaustionReachesRecovery =
+        (currentMonitorState?.attemptCount ?? 0) > 0 &&
+        !recoveryAlreadyRan &&
+        input.policy.monitor.scheduledBy === "assignee" &&
+        input.policy.monitor.recoveryPolicy != null;
+      if (exhaustedReason && !exhaustionReachesRecovery) {
         throw unprocessable(MONITOR_BOUNDS_EXHAUSTED_MESSAGE, { clearReason: exhaustedReason });
       }
       patch.monitorNextCheckAt = new Date(input.policy.monitor.nextCheckAt);
