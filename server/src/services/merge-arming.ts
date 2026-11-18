@@ -780,10 +780,10 @@ async function discoverCardPullRequestByWorkspace(
         break;
       }
 
-      // SUP-24033: an incomplete list (full page, any Link other than absent/self-only, or a
-      // malformed entry) means
-      // open PRs past it were never read, so the repo is NOT fully scanned and a
-      // live draft past the page stays invisible.
+      // SUP-24033: an incomplete list (full page, a Link header that is not absent or a
+      // page-1 self link, or a malformed entry) means open PRs may be unread or
+      // unreadable, so the repo is NOT fully scanned and an owned live draft can stay
+      // invisible.
       if (!listResult.incomplete) scannedRepos.push(`${pair.owner}/${pair.repo}`.toLowerCase());
       for (const item of listResult.items) {
         if (!includeDrafts && item.draft === true) continue;
@@ -4650,10 +4650,85 @@ async function fetchPullRequestHeadSha(
   return withTransientReadRetry(() => fetchPullRequestHeadShaOnce(token, owner, repo, number, signal), { signal });
 }
 
+/**
+ * SUP-24033: read the entries of one open-PR list page. ALLOW-LIST RULE: every field
+ * that a consumer reads to decide ownership, liveness, draft state or anchoring is
+ * validated here, and an entry that violates any of them is dropped from `items`
+ * AND marks the whole list `malformed` (the caller then treats the list as
+ * incomplete: unscanned, the base behaviour). The consumers are
+ * `discoverCardPullRequestByWorkspace` (this file) and the open-PR probe in
+ * done-transition-guard.ts; both read exactly `number`, `head.ref`, `title` and
+ * `draft`. Validated per field:
+ *   entry     a non-null object (an array has no `number`, so the number check covers it)
+ *   number    a safe positive integer          (identity of the PR)
+ *   head.ref  a string, `head` a non-null object (ownership anchor: branch)
+ *   title     a string                         (ownership anchor: title-led identifier)
+ *   draft     a boolean                        (draft state; `draft === true` is what
+ *                                               consumers test, so a non-boolean would
+ *                                               silently read as "ready")
+ * `body` is stored on the item but read by no consumer, so it is not validated.
+ */
+export function readOpenPullRequestEntries(
+  body: unknown[],
+): { items: OpenPullRequestListItem[]; malformed: boolean } {
+  const items: OpenPullRequestListItem[] = [];
+  let malformed = false;
+  for (const raw of body) {
+    if (typeof raw !== "object" || raw === null) {
+      malformed = true;
+      continue;
+    }
+    const pr = raw as Record<string, unknown>;
+    if (typeof pr.number !== "number" || !Number.isSafeInteger(pr.number) || pr.number <= 0) {
+      malformed = true;
+      continue;
+    }
+    const head = pr.head as Record<string, unknown> | undefined | null;
+    if (
+      typeof head !== "object" ||
+      head === null ||
+      typeof head.ref !== "string" ||
+      typeof pr.title !== "string" ||
+      typeof pr.draft !== "boolean"
+    ) {
+      malformed = true;
+    }
+    items.push({
+      number: pr.number,
+      draft: typeof pr.draft === "boolean" ? pr.draft : null,
+      headRef: typeof head?.ref === "string" ? head.ref : null,
+      title: typeof pr.title === "string" ? pr.title : null,
+      body: typeof pr.body === "string" ? pr.body : null,
+    });
+  }
+  return { items, malformed };
+}
+
 /** The open-PR list is read as one page of this size; there is no pagination. */
 const OPEN_PULL_REQUESTS_PAGE_SIZE = 100;
 
 const LINK_TOKEN_CHAR = /[!#$%&'*+\-.^_`|~0-9A-Za-z]/;
+
+/**
+ * SUP-24033: true when a `rel=self` link target is page 1 of THIS EXACT request: an
+ * absolute URL with the same origin and path, no fragment, the same query
+ * parameters, and a `page` parameter that is absent or exactly `1`. A relative,
+ * empty, other-host or other-page target describes some other list.
+ */
+function selfTargetIsPageOneOfRequest(target: string, requestUrl: string): boolean {
+  try {
+    const self = new URL(target);
+    const request = new URL(requestUrl);
+    if (self.origin !== request.origin || self.pathname !== request.pathname || self.hash !== "") return false;
+    const pageOfSelf = self.searchParams.getAll("page");
+    if (pageOfSelf.length > 1 || (pageOfSelf.length === 1 && pageOfSelf[0] !== "1")) return false;
+    const rest = (params: URLSearchParams) =>
+      [...params.entries()].filter(([key]) => key !== "page").map(([key, value]) => `${key}=${value}`).sort().join("&");
+    return rest(self.searchParams) === rest(request.searchParams);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * SUP-24033: true unless the `Link` header of the open-PR list response PROVES the
@@ -4661,7 +4736,8 @@ const LINK_TOKEN_CHAR = /[!#$%&'*+\-.^_`|~0-9A-Za-z]/;
  *  (a) an absent header (null), or
  *  (b) a header in which EVERY link-value parses fully as `<uri>` plus `;`-separated
  *      `token=token|"quoted"` parameters, carries a `rel` parameter, has no other
- *      parameter, and has only the relation `self` among its rel tokens.
+ *      parameter, has only the relation `self` among its rel tokens, and whose
+ *      target is page 1 of THIS request (`selfTargetIsPageOneOfRequest`).
  * Everything else is true: an empty header, a link-value with no `rel`, any
  * parameter other than `rel` (title, rev, anchor, name*, a flag), a trailing comma
  * or semicolon, a stray character, a single-quoted, unterminated or escaped value,
@@ -4674,7 +4750,7 @@ const LINK_TOKEN_CHAR = /[!#$%&'*+\-.^_`|~0-9A-Za-z]/;
  * response, never a final page. `self` is the one relation consistent with a
  * complete list. One left-to-right scan, no backtracking: linear in the header.
  */
-export function linkHeaderLeavesPagesUnread(header: string | null): boolean {
+export function linkHeaderLeavesPagesUnread(header: string | null, requestUrl: string): boolean {
   if (header === null) return false;
   const n = header.length;
   let i = 0;
@@ -4692,6 +4768,7 @@ export function linkHeaderLeavesPagesUnread(header: string | null): boolean {
     if (header[i] !== "<") return true;
     const end = header.indexOf(">", i + 1);
     if (end === -1 || header.slice(i + 1, end).includes("<")) return true;
+    const target = header.slice(i + 1, end);
     i = end + 1;
     let sawRel = false;
     for (;;) {
@@ -4729,6 +4806,7 @@ export function linkHeaderLeavesPagesUnread(header: string | null): boolean {
       }
       const tokens = value.toLowerCase().split(/[ \t]+/).filter((token) => token !== "");
       if (tokens.length === 0 || tokens.some((token) => token !== "self")) return true;
+      if (!selfTargetIsPageOneOfRequest(target, requestUrl)) return true;
       sawRel = true;
     }
   }
@@ -4751,8 +4829,9 @@ export interface OpenPullRequestsSuccess extends GitHubFetchResult {
    * `OPEN_PULL_REQUESTS_PAGE_SIZE` entries (counted before malformed entries are
    * dropped); the `Link` header is anything other than absent or `self`-only (see
    * `linkHeaderLeavesPagesUnread`); or an entry is not a well-formed open-PR record
-   * (not an object, number not a positive integer, or `head.ref` not a string),
-   * because it may have been an owned live draft.
+   * (see `readOpenPullRequestEntries`: an object with a positive-integer `number`, a
+   * string `head.ref` and `title`, and a boolean `draft`), because it may have been
+   * an owned live draft.
    */
   incomplete: boolean;
 }
@@ -4814,42 +4893,16 @@ async function fetchOpenPullRequestsOnce(
     return { ok: false, status: response.status, message: "empty_response", items: [] };
   }
 
-  const items: OpenPullRequestListItem[] = [];
-  // SUP-24033: an entry that is not a well-formed open-PR record is dropped from
-  // `items` as before, but it also makes the list `incomplete`: it may have been an
-  // owned live draft, and a page with an unreadable entry is not a complete scan.
-  let malformedEntry = false;
-  for (const raw of body) {
-    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-      malformedEntry = true;
-      continue;
-    }
-    const pr = raw as Record<string, unknown>;
-    if (typeof pr.number !== "number" || !Number.isSafeInteger(pr.number) || pr.number <= 0) {
-      malformedEntry = true;
-      continue;
-    }
-    const head = pr.head as Record<string, unknown> | undefined | null;
-    if (typeof head !== "object" || head === null || typeof head.ref !== "string") {
-      malformedEntry = true;
-    }
-    items.push({
-      number: pr.number,
-      draft: typeof pr.draft === "boolean" ? pr.draft : null,
-      headRef: typeof head?.ref === "string" ? head.ref : null,
-      title: typeof pr.title === "string" ? pr.title : null,
-      body: typeof pr.body === "string" ? pr.body : null,
-    });
-  }
+  const { items, malformed } = readOpenPullRequestEntries(body);
   return {
     ok: true,
     status: response.status,
     message: null,
     items,
     incomplete:
-      malformedEntry ||
+      malformed ||
       body.length >= OPEN_PULL_REQUESTS_PAGE_SIZE ||
-      linkHeaderLeavesPagesUnread(response.headers?.get("link") ?? null),
+      linkHeaderLeavesPagesUnread(response.headers?.get("link") ?? null, url),
   };
 }
 

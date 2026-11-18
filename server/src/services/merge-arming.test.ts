@@ -54,6 +54,7 @@ import {
   ladderIncompleteStageIds,
   ladderIsTerminallyApproved,
   linkHeaderLeavesPagesUnread,
+  readOpenPullRequestEntries,
   pickMostRecentMergeQueueEjection,
   narrowToDelivered,
   preflightFinalDelivery,
@@ -2579,7 +2580,8 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       // other Link relation, a link-value with no rel, or an extra parameter means
       // the list may be longer than what was read: the base head_draft stands.
       describe("Link header and malformed entries on the open-PR page (R4L, R7)", () => {
-        const U = "<https://api.github.com/repositories/1/pulls?state=open&per_page=100&page=2>";
+        // The page-1 self link of this exact request: the only Link the scan accepts.
+        const U = `<${OPEN_PRS_LIST_URL}>`;
         const run = async (headers?: Record<string, string>, entries: unknown[] = fillerPage(50)) => {
           const issueId = await insertIssue();
           await insertMention(issueId, { number: 42, state: "open", draft: true });
@@ -2655,34 +2657,88 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           expectRefused(await run({ link }));
         });
 
-        // Round 7 (R7-3, owner ruling): an entry the code cannot read may have been
-        // an owned live draft, so the page is not a complete scan and must refuse.
-        const OWNED = { number: 50, draft: true, head: { ref: "SUP-42-branch" }, title: "Owned draft", body: null };
+        // Round 9: a rel=self link must name page 1 of THIS request. A self link to
+        // another page, a relative, empty or other-host target, or any other query,
+        // describes some other list.
         it.each([
-          ["a number as a string", { ...OWNED, number: "50" }],
-          ["a null number", { ...OWNED, number: null }],
-          ["an absent number", { draft: true, head: { ref: "SUP-42-branch" }, title: "Owned draft" }],
-          ["a fractional number", { ...OWNED, number: 1.5 }],
-          ["a zero number", { ...OWNED, number: 0 }],
-          ["an absent head", { number: 50, draft: true, title: "Owned draft" }],
-          ["a head with no ref", { ...OWNED, head: {} }],
-          ["a head ref that is not a string", { ...OWNED, head: { ref: 7 } }],
+          ["page 1 of this request", `<${OPEN_PRS_LIST_URL}>`],
+          ["page=1 given explicitly", `<${OPEN_PRS_LIST_URL}&page=1>`],
+          ["the same query in another order, page=1", `<https://api.github.com/repos/${OWNER}/${REPO}/pulls?per_page=100&page=1&state=open>`],
+          ["an upper-case host", `<https://API.GITHUB.COM/repos/${OWNER}/${REPO}/pulls?state=open&per_page=100>`],
+        ] as const)("admits a short page whose rel=self target is %s", async (_label, target) => {
+          expect((await run({ link: `${target}; rel="self"` })).kind).toBe("resolved");
+        });
+
+        it.each([
+          ["page 2 of this request", `<${OPEN_PRS_LIST_URL}&page=2>`],
+          ["page 3", `<${OPEN_PRS_LIST_URL}&page=3>`],
+          ["page=01", `<${OPEN_PRS_LIST_URL}&page=01>`],
+          ["page given twice", `<${OPEN_PRS_LIST_URL}&page=1&page=1>`],
+          ["a relative target", `</repos/${OWNER}/${REPO}/pulls?state=open&per_page=100>`],
+          ["an empty target", "<>"],
+          ["another host", `<https://example.test/repos/${OWNER}/${REPO}/pulls?state=open&per_page=100>`],
+          ["another scheme", `<http://api.github.com/repos/${OWNER}/${REPO}/pulls?state=open&per_page=100>`],
+          ["another repository path", `<https://api.github.com/repos/${OWNER}/other/pulls?state=open&per_page=100>`],
+          ["another per_page", `<https://api.github.com/repos/${OWNER}/${REPO}/pulls?state=open&per_page=50>`],
+          ["another state", `<https://api.github.com/repos/${OWNER}/${REPO}/pulls?state=closed&per_page=100>`],
+          ["an extra query parameter", `<${OPEN_PRS_LIST_URL}&sort=updated>`],
+          ["a fragment", `<${OPEN_PRS_LIST_URL}#x>`],
+          ["a target that is not a URL", "<not a url>"],
+        ] as const)("refuses a short page whose rel=self target is %s", async (_label, target) => {
+          expectRefused(await run({ link: `${target}; rel="self"` }));
+        });
+
+        it("refuses a short page with self links for page 1 and page 2", async () => {
+          expectRefused(await run({ link: `<${OPEN_PRS_LIST_URL}>; rel="self", <${OPEN_PRS_LIST_URL}&page=2>; rel="self"` }));
+        });
+
+        // Round 7 / round 9 (owner ruling, allow-list rule): every field of a list
+        // entry that a consumer reads to decide ownership, liveness, draft state or
+        // anchoring (number, head.ref, title, draft) is validated. A violation marks the
+        // list incomplete even when the entry is otherwise unowned, so each cell below
+        // isolates ONE field check: the entry is well-formed in every other field and
+        // owned by nothing, so only the parser's validation can refuse it.
+        const UNOWNED = { number: 7, draft: false, head: { ref: "unrelated-7" }, title: "Unrelated 7", body: null };
+        const ABSENT = Symbol("absent");
+        const withField = (field: string, value: unknown): unknown => {
+          const entry: Record<string, unknown> = { ...UNOWNED, head: { ...UNOWNED.head } };
+          const set = (target: Record<string, unknown>, key: string) => {
+            if (value === ABSENT) delete target[key];
+            else target[key] = value;
+          };
+          if (field === "head.ref") set(entry.head as Record<string, unknown>, "ref");
+          else set(entry, field);
+          return entry;
+        };
+        const NOT_A_STRING = [["null", null], ["absent", ABSENT], ["a number", 7], ["a boolean", true], ["an array", ["x"]], ["an object", { a: 1 }]] as const;
+        it.each([
+          ...NOT_A_STRING.map(([label, v]) => ["title", label, v] as const),
+          ...NOT_A_STRING.map(([label, v]) => ["head.ref", label, v] as const),
+          ...[["null", null], ["absent", ABSENT], ["a string", "7"], ["a boolean", true], ["an array", [7]], ["an object", { a: 1 }],
+            ["fractional", 1.5], ["negative", -1], ["zero", 0], ["unsafe", 2 ** 60]].map(([label, v]) => ["number", label, v] as const),
+          ...[["null", null], ["absent", ABSENT], ["a string", "false"], ["a number", 0], ["an array", [false]], ["an object", { a: 1 }]].map(([label, v]) => ["draft", label, v] as const),
+          ...[["null", null], ["absent", ABSENT], ["a string", "x"], ["a number", 7], ["an array", []]].map(([label, v]) => ["head", label, v] as const),
+        ] as const)("refuses a short page holding an otherwise unowned entry whose %s is %s", async (field, _label, value) => {
+          expectRefused(await run(undefined, [...fillerPage(10), withField(field, value)]));
+        });
+
+        it.each([
           ["an entry that is a JSON string", "50"],
           ["a null entry", null],
-          ["an entry that is an array", [OWNED]],
-        ] as const)("refuses a short page that holds an entry with %s", async (_label, entry) => {
+          ["an entry that is an array", [UNOWNED]],
+          ["an entry that is a number", 50],
+          ["an entry that is a boolean", true],
+        ] as const)("refuses a short page that holds %s", async (_label, entry) => {
           expectRefused(await run(undefined, [...fillerPage(10), entry]));
         });
 
-        // A non-boolean draft flag on an owned entry makes it a ready (non-draft) candidate,
-        // so the resolver takes the ordinary path, never the stale-draft revalidation: its
-        // own head read or live verification then refuses (never an admit), with its own reason.
-        it.each([
-          ["a string draft flag", { ...OWNED, draft: "true" }],
-          ["an absent draft flag", { number: 50, head: { ref: "SUP-42-branch" }, title: "Owned draft" }],
-        ] as const)("refuses a short page that holds an entry with %s", async (_label, entry) => {
-          const result = await run(undefined, [...fillerPage(10), entry]);
-          expect(result.kind).toBe("unresolvable");
+        it("admits a short page whose only extra entries are well-formed and unowned, with every other field varied (control)", async () => {
+          const varied = [
+            { ...UNOWNED, body: null }, { ...UNOWNED, number: 8, body: "text", draft: true },
+            { ...UNOWNED, number: 9, title: "", head: { ref: "", sha: 3 } },
+            { ...UNOWNED, number: 10, user: null, state: 7, merged_at: ["x"] },
+          ];
+          expect((await run(undefined, varied)).kind).toBe("resolved");
         });
 
         it("refuses a short page that holds 99 malformed entries", async () => {
@@ -2694,7 +2750,10 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         });
       });
 
-      const U = "<https://api.github.com/x?page=2>";
+      // Unit cells run against the request the scan issues; U is its page-1 self link.
+      const REQ_URL = OPEN_PRS_LIST_URL;
+      const U = `<${REQ_URL}>`;
+      const leaves = (header: string | null) => linkHeaderLeavesPagesUnread(header, REQ_URL);
       // The only headers proven to be a complete page-1 list.
       it.each([
         ["rel=self", `${U}; rel="self"`],
@@ -2703,17 +2762,18 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         ["rel list of self tokens", `${U}; rel="self self"`],
         ["spacing around separators", `${U} ; rel = "self" ,  ${U} ;rel=self`],
         ["tabs as whitespace", `${U};\trel="self"`],
-        ["a comma inside a target", '<https://a.test/x?q=a,b&page=1>; rel="self"'],
         ["two self links", `${U}; rel="self", ${U}; rel="self"`],
+        ["a self link with page=1 given explicitly", `<${REQ_URL}&page=1>; rel="self"`],
+        ["the same query in another order, page=1", `<https://api.github.com/repos/${OWNER}/${REPO}/pulls?per_page=100&page=1&state=open>; rel="self"`],
         ["a repeated rel parameter, all self", `${U}; rel="self"; rel=self`],
       ])("linkHeaderLeavesPagesUnread proves a complete list for %s", (_label, header) => {
-        expect(linkHeaderLeavesPagesUnread(header)).toBe(false);
+        expect(leaves(header)).toBe(false);
       });
 
       it("linkHeaderLeavesPagesUnread: only an absent header is no header", () => {
-        expect(linkHeaderLeavesPagesUnread(null)).toBe(false);
-        expect(linkHeaderLeavesPagesUnread("")).toBe(true);
-        expect(linkHeaderLeavesPagesUnread("   ")).toBe(true);
+        expect(leaves(null)).toBe(false);
+        expect(leaves("")).toBe(true);
+        expect(leaves("   ")).toBe(true);
       });
 
       // Everything else leaves the page unread.
@@ -2740,6 +2800,12 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         ["foo only", `${U}; foo=bar`],
         ["no rel in the second link-value", `${U}; rel="self", ${U}`],
         ["no rel in the first link-value", `${U}, ${U}; rel="self"`],
+        ["a self link to page 2", `<${REQ_URL}&page=2>; rel="self"`],
+        ["a self link with a relative target", `</repos/${OWNER}/${REPO}/pulls?state=open&per_page=100>; rel="self"`],
+        ["a self link with an empty target", "<>; rel=\"self\""],
+        ["a self link to another host", `<https://example.test/repos/${OWNER}/${REPO}/pulls?state=open&per_page=100>; rel="self"`],
+        ["a self link with a comma in a foreign target", '<https://a.test/x?q=a,b&page=1>; rel="self"'],
+        ["self links for page 1 and page 2", `${U}; rel="self", <${REQ_URL}&page=2>; rel="self"`],
         ["rel=last", `${U}; rel="last"`],
         ["rel=prev", `${U}; rel="prev"`],
         ["rel=first", `${U}; rel="first"`],
@@ -2768,7 +2834,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         ["blank header", "   "],
         ["comma only", ","],
       ])("linkHeaderLeavesPagesUnread leaves the page unread on %s", (_label, header) => {
-        expect(linkHeaderLeavesPagesUnread(header)).toBe(true);
+        expect(leaves(header)).toBe(true);
       });
 
       // Exhaustive property over a small grammar: up to two link-values, each with up
@@ -2791,15 +2857,55 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         const render = (params: string[]) => `${U}${params.map((param) => `; ${param}`).join("")}`;
         let checked = 0;
         for (const first of paramLists) {
-          expect(linkHeaderLeavesPagesUnread(render(first)), render(first)).toBe(!linkOk(first));
+          expect(leaves(render(first)), render(first)).toBe(!linkOk(first));
           checked += 1;
           for (const second of paramLists) {
             const header = `${render(first)}, ${render(second)}`;
-            expect(linkHeaderLeavesPagesUnread(header), header).toBe(!(linkOk(first) && linkOk(second)));
+            expect(leaves(header), header).toBe(!(linkOk(first) && linkOk(second)));
             checked += 1;
           }
         }
         expect(checked).toBeGreaterThan(8000);
+      });
+
+      // Property over (field x value) for every field a consumer reads. The oracle
+      // states the allow-list: an entry is well-formed exactly when it is an object
+      // with a safe positive integer number, a head object with a string ref, a string
+      // title and a boolean draft. Any other value in any of those fields is malformed.
+      it("readOpenPullRequestEntries: the field table, every field x every value", () => {
+        const ABSENT = Symbol("absent");
+        const universe: unknown[] = [null, ABSENT, 0, -1, 1, 7, 1.5, 2 ** 60, "", "x", "7", true, false, [], ["x"], {}, { ref: "r" }];
+        const validators: Record<string, (value: unknown) => boolean> = {
+          number: (v) => typeof v === "number" && Number.isSafeInteger(v) && v > 0,
+          title: (v) => typeof v === "string",
+          draft: (v) => typeof v === "boolean",
+          "head.ref": (v) => typeof v === "string",
+          head: (v) => typeof v === "object" && v !== null && !Array.isArray(v) && typeof (v as { ref?: unknown }).ref === "string",
+        };
+        const base = () => ({ number: 7, draft: false, head: { ref: "unrelated-7" } as Record<string, unknown>, title: "t", body: null }) as Record<string, unknown>;
+        expect(readOpenPullRequestEntries([base()]).malformed).toBe(false);
+        let cells = 0;
+        for (const [field, valid] of Object.entries(validators)) {
+          for (const value of universe) {
+            const entry = base();
+            const target = (field === "head.ref" ? entry.head : entry) as Record<string, unknown>;
+            const key = field === "head.ref" ? "ref" : field;
+            if (value === ABSENT) delete target[key];
+            else target[key] = value;
+            const { items, malformed } = readOpenPullRequestEntries([entry]);
+            const expectValid = value !== ABSENT && valid(value);
+            expect(malformed, `${field} = ${String(value === ABSENT ? "absent" : JSON.stringify(value))}`).toBe(!expectValid);
+            expect(items.length).toBe(typeof entry.number === "number" && Number.isSafeInteger(entry.number) && (entry.number as number) > 0 ? 1 : 0);
+            cells += 1;
+          }
+        }
+        expect(cells).toBeGreaterThan(60);
+        for (const entry of [null, "x", 1, true, [], [base()], undefined]) {
+          expect(readOpenPullRequestEntries([entry]).malformed, JSON.stringify(entry)).toBe(true);
+        }
+        expect(readOpenPullRequestEntries([]).malformed).toBe(false);
+        // body, user, state, merged_at are read by no consumer and are not validated.
+        expect(readOpenPullRequestEntries([{ ...base(), body: 3, user: null, state: [], merged_at: {} }]).malformed).toBe(false);
       });
 
       it("linkHeaderLeavesPagesUnread stays linear-time on hostile input", () => {
@@ -2811,7 +2917,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
           `${U}; rel="${"x ".repeat(300_000)}"`,
           `${U}, `.repeat(100_000),
         ]) {
-          linkHeaderLeavesPagesUnread(hostile);
+          leaves(hostile);
         }
         expect(Date.now() - started).toBeLessThan(10_000);
       });

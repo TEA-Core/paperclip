@@ -690,7 +690,9 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
   // door must keep the base head_draft refusal; a short page with no next page is
   // a complete scan and the verified merged carrier is accepted as before.
   describe("stale cached draft with a merged live carrier and a short open-PR page (SUP-24033)", () => {
-    const U = "<https://api.github.com/repositories/1/pulls?state=open&per_page=100&page=2>";
+    // The open-PR list request the scan issues, and its page-1 self link.
+    const REQ = "https://api.github.com/repos/TEA-Core/paperclip/pulls?state=open&per_page=100";
+    const U = `<${REQ}>`;
     type Door = "PATCH final verdict" | "board stage-decision" | "approval comment";
     const DOORS: Door[] = ["PATCH final verdict", "board stage-decision", "approval comment"];
     const expectHeadDraftRefusal = (response: request.Response) => {
@@ -750,13 +752,32 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       await expectRefusedAtEveryDoor({ openListLink });
     });
 
-    // Owner ruling (fail closed): an entry the code cannot read may have been an
-    // owned live draft, so the list is not a complete scan.
+    // A rel=self link must name page 1 of THIS request; any other self target
+    // describes some other list.
+    it.each([
+      ["page 2", `<${REQ}&page=2>`],
+      ["a relative target", "</repos/TEA-Core/paperclip/pulls?state=open&per_page=100>"],
+      ["an empty target", "<>"],
+      ["another host", "<https://example.test/repos/TEA-Core/paperclip/pulls?state=open&per_page=100>"],
+      ["another repository", "<https://api.github.com/repos/TEA-Core/other/pulls?state=open&per_page=100>"],
+    ])("every door refuses head_draft when the rel=self target is %s", async (_label, target) => {
+      await expectRefusedAtEveryDoor({ openListLink: `${target}; rel="self"` });
+    });
+
+    // Owner ruling (fail closed) and the allow-list rule: every field of a list entry
+    // that a consumer reads (number, head.ref, title, draft) is validated, so an entry
+    // the code cannot read may have been an owned live draft and the list is not complete.
     const OWNED = { number: 50, draft: true, head: { ref: "R-delivery" }, title: "Owned draft", body: null };
     it.each([
       ["a number as a string", [{ ...OWNED, number: "50" }]],
       ["a null number", [{ ...OWNED, number: null }]],
       ["an absent number", [{ draft: true, head: { ref: "R-delivery" }, title: "Owned draft" }]],
+      ["a null title", [{ number: 50, draft: true, head: { ref: "unrelated" }, title: null }]],
+      ["a numeric title", [{ number: 50, draft: true, head: { ref: "unrelated" }, title: 7 }]],
+      ["an array title", [{ number: 50, draft: true, head: { ref: "unrelated" }, title: ["x"] }]],
+      ["an object title", [{ number: 50, draft: true, head: { ref: "unrelated" }, title: { a: 1 } }]],
+      ["an absent title", [{ number: 50, draft: true, head: { ref: "unrelated" } }]],
+      ["a string draft flag", [{ number: 50, draft: "true", head: { ref: "unrelated" }, title: "t" }]],
       ["an entry that is a JSON string", ["50"]],
       ["a null entry", [null]],
       ["an entry that is an array", [[OWNED]]],
@@ -767,7 +788,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
 
     it.each([
       ["no Link header", undefined],
-      ["Link rel=self alone", `${U}; rel="self"`],
+      ["Link rel=self to page 1 of this request", `${U}; rel="self"`],
     ])("PATCH final verdict accepts the verified merged carrier on a short page with %s", async (_label, openListLink) => {
       const fixture = await pendingDelivery({ mentionState: "stale-draft-merged", openListLink });
       const response = await fixture.approve();
