@@ -103,6 +103,29 @@ const ACTIVITY_GATE_IGNORED_ACTIONS = [
 ];
 // SUP-24205: the audit rows a routine execution writes for the card it mints.
 const ROUTINE_ISSUE_CREATED_ACTIONS = ["issue.created", "issue.created_without_parent"];
+
+// SQLSTATEs an audit-row write may fail with while the dispatch transaction stays usable
+// after the savepoint rolls back: data (22) and integrity (23) errors, a serialization
+// failure or deadlock victim (40001, 40P01), a cancelled statement (57014) and a lock
+// timeout (55P03). Anything else (no SQLSTATE: a lost connection or a JS error; 25xxx: the
+// transaction is already aborted; 57P01 and friends) must fail the dispatch.
+const RECOVERABLE_AUDIT_SQLSTATES: ReadonlySet<string> = new Set(["40001", "40P01", "57014", "55P03"]);
+
+function readSqlState(err: unknown): string | null {
+  let current: unknown = err;
+  for (let depth = 0; depth < 5 && current && typeof current === "object"; depth += 1) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string" && /^[0-9A-Z]{5}$/.test(code)) return code;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return null;
+}
+
+function isRecoverableAuditError(err: unknown): boolean {
+  const state = readSqlState(err);
+  if (!state) return false;
+  return state.startsWith("22") || state.startsWith("23") || RECOVERABLE_AUDIT_SQLSTATES.has(state);
+}
 const WEEKDAY_INDEX: Record<string, number> = {
   Sun: 0,
   Mon: 1,
@@ -1994,7 +2017,7 @@ export function routineService(
    * routine-created card's audit trail starts at its creation and names the routine
    * execution that minted it. Runs inside the dispatch transaction; publications are
    * deferred to the caller so nothing is announced for a card that is rolled back. A
-   * failing audit write is logged and skipped (see `bestEffort`): the dispatch proceeds
+   * failing audit write is logged and skipped (see `isRecoverableAuditError`): the dispatch proceeds
    * exactly as it did before these rows existed.
    */
   async function recordRoutineIssueCreated(
@@ -2009,7 +2032,9 @@ export function routineService(
     },
     publications: ActivityPublication[],
   ) {
-    const manualActor = input.source === "manual" ? input.actor : undefined;
+    // An authenticated caller (route, built-in agent, plugin) is recorded as itself whatever
+    // source the request body names; the scheduler and webhook paths never carry an actor.
+    const manualActor = input.source === "schedule" || input.source === "webhook" ? undefined : input.actor;
     const actorUserId = manualActor?.userId?.trim() || null;
     const actorAgentId = actorUserId ? null : manualActor?.agentId ?? null;
     const systemActorId = input.source === "schedule"
@@ -2017,82 +2042,89 @@ export function routineService(
       : input.source === "webhook"
         ? "routine-webhook"
         : `routine-${input.source}`;
-    // The audit rows are a best-effort record: each write runs in its own savepoint so a
-    // failing insert (a constraint violation, a dangling key) rolls back only itself and
-    // can never abort the dispatch transaction or strand the card it describes.
-    const bestEffort = async (label: string, write: (sp: Db) => Promise<unknown>) => {
-      try {
-        await txDb.transaction(async (sp) => {
-          await write(sp as unknown as Db);
-        });
-      } catch (err) {
-        logger.warn(
-          { err, routineId: input.routine.id, issueId: input.issue.id, routineRunId: input.routineRunId },
-          `failed to record ${label} for routine-created issue`,
-        );
-      }
-    };
-
-    // Stamp a caller run id only when it names a real run in this company, the same rule
-    // the activity column enforces; an unknown, foreign or malformed id is dropped.
-    let actorRunId: string | null = null;
+    const warnFields = { routineId: input.routine.id, issueId: input.issue.id, routineRunId: input.routineRunId };
     const rawRunId = actorUserId ? null : manualActor?.runId?.trim() || null;
-    if (rawRunId && isUuidLike(rawRunId)) {
-      try {
-        const run = await txDb
-          .select({ id: heartbeatRuns.id })
-          .from(heartbeatRuns)
-          .where(and(eq(heartbeatRuns.companyId, input.routine.companyId), eq(heartbeatRuns.id, rawRunId)))
-          .then((rows) => rows[0] ?? null);
-        actorRunId = run?.id ?? null;
-      } catch (err) {
-        logger.warn({ err, routineId: input.routine.id }, "failed to resolve caller run for routine-created issue audit");
-      }
-    }
 
-    const base = {
-      companyId: input.routine.companyId,
-      actorType: actorUserId ? "user" : actorAgentId ? "agent" : "system",
-      actorId: actorUserId ?? actorAgentId ?? systemActorId,
-      agentId: actorAgentId,
-      runId: actorRunId,
-      boardApiKeyId: actorUserId ? manualActor?.boardApiKeyId ?? null : null,
-      entityType: "issue",
-      entityId: input.issue.id,
-      ...(input.issue.responsibleUserId ? { responsibleUserIdOverride: input.issue.responsibleUserId } : {}),
-    } as const;
-    const routineReference = {
-      originKind: input.issue.originKind,
-      routineId: input.routine.id,
-      routineExecutionId: input.routineRunId,
-      triggerId: input.trigger?.id ?? null,
-      source: input.source,
-      ...(actorRunId ? { runId: actorRunId } : {}),
-    };
-    await bestEffort("issue.created", (sp) => logActivityInTransaction(sp, {
-      ...base,
-      action: "issue.created",
-      details: {
-        title: input.issue.title,
-        identifier: input.issue.identifier,
-        status: input.issue.status,
-        ...routineReference,
-      },
-    }, publications));
-    if (actorAgentId && !input.issue.parentId) {
-      await bestEffort("issue.created_without_parent", (sp) => logActivityInTransaction(sp, {
-        ...base,
-        action: "issue.created_without_parent",
-        details: {
-          issueId: input.issue.id,
-          identifier: input.issue.identifier,
+    // The audit rows are a best-effort record. Everything that can fail on their account runs
+    // in a savepoint, so a failing statement rolls back only itself and never aborts the
+    // dispatch transaction or strands the card it describes. Only errors that leave the
+    // transaction usable are swallowed (see `isRecoverableAuditError`); a lost connection, an
+    // already-aborted transaction or a non-SQL error is rethrown so the dispatch fails
+    // instead of carrying on against a dead transaction.
+    try {
+      await txDb.transaction(async (sp) => {
+        const spDb = sp as unknown as Db;
+
+        // Stamp a caller run id only when it names a real run in this company, the same rule
+        // the activity column enforces (`isUuidLike`, shared with the column validation); an
+        // unknown, foreign or malformed id is dropped. A failing lookup drops the id too.
+        let actorRunId: string | null = null;
+        if (rawRunId && isUuidLike(rawRunId)) {
+          try {
+            actorRunId = await spDb.transaction(async (lookup) => {
+              const run = await (lookup as unknown as Db)
+                .select({ id: heartbeatRuns.id })
+                .from(heartbeatRuns)
+                .where(and(eq(heartbeatRuns.companyId, input.routine.companyId), eq(heartbeatRuns.id, rawRunId)))
+                .then((rows) => rows[0] ?? null);
+              return run?.id ?? null;
+            });
+          } catch (err) {
+            if (!isRecoverableAuditError(err)) throw err;
+            logger.warn({ err, ...warnFields }, "failed to resolve caller run for routine-created issue audit rows; recording without a run id");
+          }
+        }
+
+        const base = {
           companyId: input.routine.companyId,
-          projectId: input.issue.projectId ?? null,
-          actorAgentId,
-          hasBlockedByIssueIds: false,
-          ...routineReference,
-        },
-      }, publications));
+          actorType: actorUserId ? "user" : actorAgentId ? "agent" : "system",
+          actorId: actorUserId ?? actorAgentId ?? systemActorId,
+          agentId: actorAgentId,
+          runId: actorRunId,
+          boardApiKeyId: actorUserId ? manualActor?.boardApiKeyId ?? null : null,
+          entityType: "issue",
+          entityId: input.issue.id,
+          ...(input.issue.responsibleUserId ? { responsibleUserIdOverride: input.issue.responsibleUserId } : {}),
+        } as const;
+        const routineReference = {
+          originKind: input.issue.originKind,
+          routineId: input.routine.id,
+          routineExecutionId: input.routineRunId,
+          triggerId: input.trigger?.id ?? null,
+          source: input.source,
+          ...(actorRunId ? { runId: actorRunId } : {}),
+        };
+        // The pair is all-or-nothing: created_without_parent describes a creation that
+        // issue.created records, so it is never written alone.
+        await logActivityInTransaction(spDb, {
+          ...base,
+          action: "issue.created",
+          details: {
+            title: input.issue.title,
+            identifier: input.issue.identifier,
+            status: input.issue.status,
+            ...routineReference,
+          },
+        }, publications);
+        if (actorAgentId && !input.issue.parentId) {
+          await logActivityInTransaction(spDb, {
+            ...base,
+            action: "issue.created_without_parent",
+            details: {
+              issueId: input.issue.id,
+              identifier: input.issue.identifier,
+              companyId: input.routine.companyId,
+              projectId: input.issue.projectId ?? null,
+              actorAgentId,
+              hasBlockedByIssueIds: false,
+              ...routineReference,
+            },
+          }, publications);
+        }
+      });
+    } catch (err) {
+      if (!isRecoverableAuditError(err)) throw err;
+      logger.warn({ err, ...warnFields }, "failed to record issue.created audit rows for routine-created issue; the dispatch continues without them");
     }
   }
 

@@ -36,6 +36,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { activityService } from "../services/activity.ts";
+import { logger } from "../middleware/logger.js";
 import { issueService } from "../services/issues.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import * as providerRegistry from "../secrets/provider-registry.ts";
@@ -3244,7 +3245,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
         expect(await activityService(db).list({ companyId, entityId: run.linkedIssueId!, limit: 100 })).toEqual([]);
       });
 
-      it("keeps issue.created when only the created_without_parent insert fails", async () => {
+      it("writes neither row when the created_without_parent insert fails (all-or-nothing pair)", async () => {
         const { agentId, companyId, routine, svc } = await seedFixture();
         await db.execute(sql.raw(
           "alter table activity_log add constraint activity_log_force_failure check (action <> 'issue.created_without_parent') not valid",
@@ -3253,8 +3254,195 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
         const run = await svc.runRoutine(routine.id, { source: "manual" }, { agentId });
 
         await expectDispatchSurvived(routine.id, run);
-        const rows = await activityService(db).list({ companyId, entityId: run.linkedIssueId!, limit: 100 });
-        expect(rows.map((row) => row.action)).toEqual(["issue.created"]);
+        expect(await activityService(db).list({ companyId, entityId: run.linkedIssueId!, limit: 100 })).toEqual([]);
+      });
+
+      it("never leaves a lone created_without_parent row when only the issue.created insert fails", async () => {
+        const { agentId, companyId, routine, svc } = await seedFixture();
+        await db.execute(sql.raw(
+          "alter table activity_log add constraint activity_log_force_failure check (action <> 'issue.created') not valid",
+        ));
+
+        const run = await svc.runRoutine(routine.id, { source: "manual" }, { agentId });
+
+        await expectDispatchSurvived(routine.id, run);
+        expect(await activityService(db).list({ companyId, entityId: run.linkedIssueId!, limit: 100 })).toEqual([]);
+      });
+
+      it("logs a warning with the routine, issue and execution ids when the audit rows are dropped", async () => {
+        const { routine, svc } = await seedFixture();
+        await db.execute(sql.raw(
+          "alter table activity_log add constraint activity_log_force_failure check (action <> 'issue.created') not valid",
+        ));
+        const warn = vi.spyOn(logger, "warn");
+        try {
+          const run = await svc.runRoutine(routine.id, { source: "manual" }, { userId: "board-user" });
+
+          const call = warn.mock.calls.find(([, message]) => typeof message === "string" && message.includes("failed to record issue.created audit rows"));
+          expect(call).toBeDefined();
+          expect(call![0]).toMatchObject({ routineId: routine.id, issueId: run.linkedIssueId, routineRunId: run.id });
+        } finally {
+          warn.mockRestore();
+        }
+      });
+
+      describe("injected statement failures", () => {
+        type Fault = (target: any) => Promise<unknown>;
+        let restore: (() => void) | null = null;
+        afterEach(() => {
+          restore?.();
+          restore = null;
+        });
+
+        /** Make one statement kind fail at a transaction nesting depth: 1 = the audit savepoint,
+         *  2 = the caller-run lookup savepoint. `fault` receives the real transaction handle so it
+         *  can run a genuinely failing statement, or just throw a synthetic error. */
+        function injectFault(depth: 1 | 2, fault: Fault) {
+          const realTransaction = db.transaction.bind(db);
+          const wrap = (obj: any, level: number): any =>
+            new Proxy(obj, {
+              get(target, prop) {
+                const value = target[prop];
+                if (typeof value !== "function") return value;
+                if (prop === "transaction") {
+                  return (cb: any, cfg?: any) => target.transaction((inner: any) => cb(wrap(inner, level + 1)), cfg);
+                }
+                if (level === depth && depth === 2 && prop === "select") {
+                  return () => ({ from: () => ({ where: () => ({ then: (a: any, b: any) => fault(target).then(a, b) }) }) });
+                }
+                if (level === depth && depth === 1 && prop === "insert") {
+                  return (table: unknown) =>
+                    table === activityLog
+                      ? { values: () => ({ returning: () => fault(target) }) }
+                      : value.call(target, table);
+                }
+                return value.bind(target);
+              },
+            });
+          const spy = vi
+            .spyOn(db, "transaction")
+            .mockImplementation(((cb: any, cfg?: any) => realTransaction((tx: any) => cb(wrap(tx, 0)), cfg)) as any);
+          restore = () => spy.mockRestore();
+        }
+
+        const sqlError = (code: string) => async () => {
+          throw Object.assign(new Error(`synthetic ${code}`), { code });
+        };
+
+        async function dispatchWithAgentRun(routineId: string, svc: ReturnType<typeof routineService>, agentId: string, companyId: string) {
+          const callerRunId = randomUUID();
+          await db.insert(heartbeatRuns).values({ id: callerRunId, companyId, agentId, status: "running" });
+          return svc.runRoutine(routineId, { source: "manual" }, { agentId, runId: callerRunId });
+        }
+
+        it.each([
+          ["a real data exception", async (t: any) => t.execute(sql`select 1/0`)],
+          ["a real cancelled statement", async (t: any) => {
+            await t.execute(sql`set local statement_timeout = '1ms'`);
+            return t.execute(sql`select pg_sleep(1)`);
+          }],
+          ["a lock timeout", sqlError("55P03")],
+          ["a deadlock victim", sqlError("40P01")],
+        ] as Array<[string, Fault]>)("drops only the run id when the caller-run lookup fails with %s", async (_label, fault) => {
+          const { agentId, companyId, routine, svc } = await seedFixture();
+          injectFault(2, fault);
+          const warn = vi.spyOn(logger, "warn");
+          try {
+            const run = await dispatchWithAgentRun(routine.id, svc, agentId, companyId);
+
+            await expectDispatchSurvived(routine.id, run);
+            const rows = await activityService(db).list({ companyId, entityId: run.linkedIssueId!, limit: 100 });
+            const created = rows.filter((row) => row.action === "issue.created");
+            expect(created).toHaveLength(1);
+            expect(created[0]!.runId).toBeNull();
+            expect(created[0]!.details).not.toHaveProperty("runId");
+            expect(rows.filter((row) => row.action === "issue.created_without_parent")).toHaveLength(1);
+            expect(warn.mock.calls.some(([fields, message]) =>
+              typeof message === "string"
+              && message.includes("failed to resolve caller run")
+              && (fields as { routineId?: string }).routineId === routine.id)).toBe(true);
+          } finally {
+            warn.mockRestore();
+          }
+        });
+
+        it.each([
+          ["22001", "data exception"],
+          ["23505", "unique violation"],
+          ["23503", "foreign key violation"],
+          ["23514", "check violation"],
+          ["40001", "serialization failure"],
+          ["40P01", "deadlock victim"],
+          ["57014", "cancelled statement"],
+          ["55P03", "lock timeout"],
+        ])("swallows SQLSTATE %s (%s) from the audit insert and keeps the dispatch", async (code) => {
+          const { companyId, routine, svc } = await seedFixture();
+          injectFault(1, sqlError(code));
+
+          const run = await svc.runRoutine(routine.id, { source: "manual" }, { userId: "board-user" });
+
+          await expectDispatchSurvived(routine.id, run);
+          expect(await activityService(db).list({ companyId, entityId: run.linkedIssueId!, limit: 100 })).toEqual([]);
+        });
+
+        it.each([
+          ["25P02 aborted transaction", sqlError("25P02")],
+          ["08006 connection failure", sqlError("08006")],
+          ["57P01 administrator shutdown", sqlError("57P01")],
+          ["XX000 internal error", sqlError("XX000")],
+          ["a lost connection (no SQLSTATE)", async () => {
+            throw Object.assign(new Error("write CONNECTION_CLOSED"), { code: "CONNECTION_CLOSED" });
+          }],
+          ["a non-SQL error", async () => {
+            throw new TypeError("boom");
+          }],
+        ] as Array<[string, Fault]>)("rethrows %s from the audit insert so the dispatch fails without an orphan card", async (_label, fault) => {
+          const { routine, svc } = await seedFixture();
+          injectFault(1, fault);
+
+          const run = await svc.runRoutine(routine.id, { source: "manual" }, { userId: "board-user" });
+
+          expect(run.status).toBe("failed");
+          expect(run.linkedIssueId).toBeNull();
+          expect(await db.select({ id: issues.id }).from(issues).where(eq(issues.originId, routine.id))).toEqual([]);
+        });
+
+        it("rethrows a lost connection from the caller-run lookup instead of continuing on a dead transaction", async () => {
+          const { agentId, companyId, routine, svc } = await seedFixture();
+          injectFault(2, async () => {
+            throw Object.assign(new Error("write CONNECTION_CLOSED"), { code: "CONNECTION_CLOSED" });
+          });
+
+          const run = await dispatchWithAgentRun(routine.id, svc, agentId, companyId);
+
+          expect(run.status).toBe("failed");
+          expect(await db.select({ id: issues.id }).from(issues).where(eq(issues.originId, routine.id))).toEqual([]);
+        });
+      });
+
+      it("records an authenticated caller as itself even when the request body names source api", async () => {
+        const { agentId, companyId, routine, svc } = await seedFixture();
+
+        const userRun = await svc.runRoutine(routine.id, { source: "api" }, { userId: "board-user" });
+        await db.update(issues).set({ status: "done" }).where(eq(issues.id, userRun.linkedIssueId!));
+        const agentRun = await svc.runRoutine(routine.id, { source: "api" }, { agentId });
+
+        const [userRow] = (await activityService(db).list({ companyId, entityId: userRun.linkedIssueId!, limit: 100 })).filter((row) => row.action === "issue.created");
+        expect(userRow).toMatchObject({ actorType: "user", actorId: "board-user", details: { source: "api" } });
+        const [agentRow] = (await activityService(db).list({ companyId, entityId: agentRun.linkedIssueId!, limit: 100 })).filter((row) => row.action === "issue.created");
+        expect(agentRow).toMatchObject({ actorType: "agent", actorId: agentId, agentId });
+      });
+
+      it("treats a v7-shaped run id like the activity column does: dropped from the column and from details", async () => {
+        const { agentId, companyId, routine, svc } = await seedFixture();
+        const v7 = "0191d3a0-7c3e-7abc-8def-0123456789ab";
+        await db.insert(heartbeatRuns).values({ id: v7, companyId, agentId, status: "running" });
+
+        const run = await svc.runRoutine(routine.id, { source: "manual" }, { agentId, runId: v7 });
+
+        const [created] = (await activityService(db).list({ companyId, entityId: run.linkedIssueId!, limit: 100 })).filter((row) => row.action === "issue.created");
+        expect(created!.runId).toBeNull();
+        expect(created!.details).not.toHaveProperty("runId");
       });
 
       it("drops a caller run id that names no run in this company instead of storing it verbatim", async () => {
