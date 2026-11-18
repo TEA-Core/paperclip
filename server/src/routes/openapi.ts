@@ -8635,13 +8635,18 @@ registry.registerPath({
     "reconciles the execution state from it: it records the row's id as lastDecisionId, writes no second " +
     "decision row, logs issue.board_stage_reconciled and responds with `reconciled: true`. An unbound or " +
     "stale row is never reused: the approval is recorded as a fresh decision by the board user, bound to the " +
-    "current head and round. Any other policy with no undecided stage returns 409 reason no_undecided_stage.",
+    "current head and round. Any other policy with no undecided stage returns 409 reason no_undecided_stage. " +
+    "When the decided stage is still pending on its participant (agent or user), a non-empty " +
+    "`displacementReason` is required (409 reason displacement_reason_required otherwise, nothing " +
+    "written); the participant's pending state and the reason are recorded on the " +
+    "issue.board_stage_override activity row.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(
       z.object({
         decision: z.enum(["approved", "changes_requested"]),
         comment: z.string().trim().min(1),
+        displacementReason: z.string().trim().max(2_000).optional(),
       }),
     ),
   },

@@ -656,7 +656,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       const app = createApp(db, boardActor(fixture.company));
       const decision = request(app)
         .post(`/api/issues/${fixture.issue.id}/execution-stage/board-decision`)
-        .send({ decision: "approved", comment: "Independent final approval." })
+        .send({ decision: "approved", comment: "Independent final approval.", displacementReason: "Board decides the final stage for the pending reviewer." })
         .then((response) => response);
       await fixture.pullReached;
       const concurrent = await Promise.race([
@@ -1078,7 +1078,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       const before = await fixture.read();
       const decision = request(createApp(db, boardActor(fixture.company)))
         .post(`/api/issues/${fixture.issue.id}/execution-stage/board-decision`)
-        .send({ decision: "approved", comment: "Independent final approval." })
+        .send({ decision: "approved", comment: "Independent final approval.", displacementReason: "Board decides the final stage for the pending reviewer." })
         .then((response) => response);
       await fixture.pullReached;
       await db.update(executionWorkspaces)
@@ -1885,7 +1885,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       const fixture = await pendingDelivery({ unmentioned: true });
       const response = await request(createApp(db, boardActor(fixture.company)))
         .post(`/api/issues/${fixture.issue.id}/execution-stage/board-decision`)
-        .send({ decision: "approved", comment: "Independent final approval." });
+        .send({ decision: "approved", comment: "Independent final approval.", displacementReason: "Board decides the final stage for the pending reviewer." });
       expect(response.status).toBe(200);
       expect((await fixture.read()).executionState).toMatchObject({
         lastDecisionOutcome: "approved",
