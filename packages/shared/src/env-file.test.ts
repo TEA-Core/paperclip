@@ -1,5 +1,8 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { encodeEnvValue, updateEnvFileContents } from "./env-file.js";
+import { encodeEnvValue, updateEnvFileContents, writeEnvFileAtomicallyIfChanged } from "./env-file.js";
 
 describe("env file editor", () => {
   it("pins minimal and JSON value encoding", () => {
@@ -176,6 +179,64 @@ describe("env file editor", () => {
     expect(() => updateEnvFileContents(original, { PAPERCLIP_HOME: "CANARY\tescape" })).toThrow(
       /rewrite would change loader value/,
     );
+  });
+
+  it.each([
+    "__proto__",
+    "constructor",
+    "toString",
+    "valueOf",
+    "hasOwnProperty",
+    "__defineGetter__",
+  ])("preserves an unmanaged %s line byte-for-byte", (key) => {
+    const original = `${key}=x\nPAPERCLIP_HOME=/old\n`;
+
+    expect(updateEnvFileContents(original, { PAPERCLIP_HOME: "/new" })).toBe(
+      `${key}=x\nPAPERCLIP_HOME="/new"\n`,
+    );
+  });
+
+  it("post-condition add-key: refuses a managed key that would emit a new loader key", () => {
+    // A managed key carrying a newline would be emitted as two physical
+    // lines; only the post-condition sees the extra loader key in the output.
+    const entries = Object.fromEntries([["A\nDATABASE_URL", "x"]]);
+    expect(() => updateEnvFileContents("PLAIN=1\n", entries)).toThrow(
+      /would add loader key/,
+    );
+  });
+
+  it("post-condition drop-key: refuses a managed entry the loader cannot hold", () => {
+    const entries = Object.fromEntries([["__proto__", "x"]]);
+    expect(() => updateEnvFileContents("PLAIN=1\n", entries)).toThrow(
+      /would drop loader key/,
+    );
+  });
+
+  it("agreement value comparison: refuses when a colon duplicate changes the loader value", () => {
+    const original = 'PAPERCLIP_HOME=/old\nPAPERCLIP_HOME: "alpha\nbeta"\n';
+    expect(() => updateEnvFileContents(original, { PAPERCLIP_HOME: "alpha\nbeta" })).toThrow(
+      /writer and loader disagree/,
+    );
+  });
+
+  it("refuses a file with a bare carriage return", () => {
+    const original = "PAPERCLIP_HOME=/old\rPLAIN=1\r";
+    expect(() => updateEnvFileContents(original, { PAPERCLIP_HOME: "/new" })).toThrow(
+      /carriage return/,
+    );
+  });
+
+  it("writes the temp file with mode 600 and removes it on error", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-env-file-atomic-"));
+    const target = path.join(dir, "blocked");
+    fs.mkdirSync(target);
+
+    expect(() => writeEnvFileAtomicallyIfChanged(target, null, "KEY=1\n")).toThrow();
+    expect(fs.readdirSync(dir).filter((name) => name.includes(".tmp"))).toEqual([]);
+
+    const filePath = path.join(dir, ".env");
+    expect(writeEnvFileAtomicallyIfChanged(filePath, null, "KEY=1\n")).toBe(true);
+    expect(fs.statSync(filePath).mode & 0o777).toBe(0o600);
   });
 
   it("does not rewrite a managed-looking line inside an unmanaged multiline value", () => {

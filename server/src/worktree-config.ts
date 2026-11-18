@@ -435,6 +435,53 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
     return { repairedConfig: false, repairedEnv: false };
   }
 
+  // Compute the env repair before anything else is touched. The writer
+  // refuses files it cannot account for; that refusal must never fail the
+  // boot or leave a half-repaired instance, so on refusal the env file is
+  // left byte-identical, one warning names the file, and the boot continues
+  // with the values already in process.env.
+  const existingContents = fs.existsSync(context.envPath)
+    ? fs.readFileSync(context.envPath, "utf8")
+    : null;
+  const existingEnvEntries = parseEnvFile(existingContents ?? "");
+  // The worktree file wins. An inherited value is used for this boot only and
+  // never persisted, so a parent shell's secret cannot become the worktree's
+  // own (SUP-24365).
+  const inheritedToolActionSigningSecret = nonEmpty(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET);
+  const fileToolActionSigningSecret = nonEmpty(existingEnvEntries.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET);
+  const toolActionSigningSecret =
+    fileToolActionSigningSecret ??
+    inheritedToolActionSigningSecret ??
+    randomBytes(32).toString("hex");
+
+  const managedEnvEntries: Record<string, string> = {
+    PAPERCLIP_HOME: context.homeDir,
+    PAPERCLIP_INSTANCE_ID: context.instanceId,
+    PAPERCLIP_CONFIG: context.configPath,
+    PAPERCLIP_CONTEXT: context.contextPath,
+    PAPERCLIP_IN_WORKTREE: "true",
+    PAPERCLIP_DB_BACKUP_ENABLED: "false",
+    PAPERCLIP_WORKTREE_NAME: context.worktreeName,
+    ...(fileToolActionSigningSecret || toolActionSigningSecret === inheritedToolActionSigningSecret
+      ? {}
+      : { PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: toolActionSigningSecret }),
+  };
+
+  let repairedContents: string;
+  try {
+    repairedContents = updateEnvFileContents(
+      existingContents ?? emptyWorktreeEnvFileContents(),
+      managedEnvEntries,
+      { valueEncoding: "json" },
+    );
+  } catch (error) {
+    console.warn(
+      `Skipping worktree env repair for ${context.envPath}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return { repairedConfig: false, repairedEnv: false };
+  }
+  const repairedEnv = existingContents !== repairedContents;
+
   process.env.PAPERCLIP_HOME = context.homeDir;
   process.env.PAPERCLIP_INSTANCE_ID = context.instanceId;
   process.env.PAPERCLIP_CONFIG = context.configPath;
@@ -511,41 +558,8 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
     }
   }
 
-  const existingContents = fs.existsSync(context.envPath)
-    ? fs.readFileSync(context.envPath, "utf8")
-    : null;
-  const existingEnvEntries = parseEnvFile(existingContents ?? "");
-  // The worktree file wins. An inherited value is used for this boot only and
-  // never persisted, so a parent shell's secret cannot become the worktree's
-  // own (SUP-24365).
-  const inheritedToolActionSigningSecret = nonEmpty(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET);
-  const fileToolActionSigningSecret = nonEmpty(existingEnvEntries.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET);
-  const toolActionSigningSecret =
-    fileToolActionSigningSecret ??
-    inheritedToolActionSigningSecret ??
-    randomBytes(32).toString("hex");
-
-  const managedEnvEntries: Record<string, string> = {
-    PAPERCLIP_HOME: context.homeDir,
-    PAPERCLIP_INSTANCE_ID: context.instanceId,
-    PAPERCLIP_CONFIG: context.configPath,
-    PAPERCLIP_CONTEXT: context.contextPath,
-    PAPERCLIP_IN_WORKTREE: "true",
-    PAPERCLIP_DB_BACKUP_ENABLED: "false",
-    PAPERCLIP_WORKTREE_NAME: context.worktreeName,
-    ...(fileToolActionSigningSecret || toolActionSigningSecret === inheritedToolActionSigningSecret
-      ? {}
-      : { PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: toolActionSigningSecret }),
-  };
-
   process.env.PAPERCLIP_DB_BACKUP_ENABLED = "false";
   process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = toolActionSigningSecret;
-  const repairedContents = updateEnvFileContents(
-    existingContents ?? emptyWorktreeEnvFileContents(),
-    managedEnvEntries,
-    { valueEncoding: "json" },
-  );
-  const repairedEnv = existingContents !== repairedContents;
 
   if (repairedEnv) {
     writeEnvFileAtomicallyIfChanged(context.envPath, existingContents, repairedContents);

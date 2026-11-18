@@ -170,9 +170,17 @@ export function readPaperclipEnvEntries(filePath = resolveEnvFilePath()): Record
 
 export function writePaperclipEnvEntries(entries: Record<string, string>, filePath = resolveEnvFilePath()): void {
   const previousContents = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : null;
-  const nextContents = updateEnvFileContents(previousContents ?? emptyEnvFileContents(), paperclipOwnedEntries(entries), {
-    valueEncoding: "minimal",
-  });
+  let nextContents: string;
+  try {
+    nextContents = updateEnvFileContents(previousContents ?? emptyEnvFileContents(), paperclipOwnedEntries(entries), {
+      valueEncoding: "minimal",
+    });
+  } catch (error) {
+    throw new Error(
+      `Cannot update env file ${filePath}: ${error instanceof Error ? error.message : String(error)} ` +
+        `The file was left unchanged. Rewrite the conflicting assignment in that file in canonical KEY=value form, then retry.`,
+    );
+  }
   writeEnvFileAtomicallyIfChanged(filePath, previousContents, nextContents);
 }
 

@@ -178,14 +178,40 @@ function splitEnvLines(contents: string): EnvLine[] {
  * the continuation behind as a top-level assignment. Continuation lines of
  * unmanaged multiline values are preserved and never matched as keys.
  */
+function ownValue(record: Record<string, string>, key: string): string | undefined {
+  return Object.hasOwn(record, key) ? record[key] : undefined;
+}
+
+function unclosedQuoteInLine(text: string): boolean {
+  let quote: EnvQuote | null = null;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    if (quote !== null) {
+      if (character === "\\" && text[index + 1] === quote) {
+        index += 1;
+        continue;
+      }
+      if (character === quote) quote = null;
+      continue;
+    }
+    if (character === '"' || character === "'" || character === "`") quote = character;
+  }
+  return quote !== null;
+}
+
 // The loader (dotenv) is the oracle for what a file means. The writer's
 // own segmentation only understands canonical `KEY=` openers, so any key
 // or decoded value dotenv sees that the segmentation cannot account for
 // makes the file ambiguous for this writer: refuse instead of guessing.
+// A single-line assignment in an opener spelling the writer does not
+// manage (dotted, hyphenated or digit-led keys, colon assignments) is
+// unmanaged-but-understood when the loader's value for the whole file
+// equals the value that line alone decodes to: it is preserved as-is.
 function assertLoaderAgreement(
   parsedByLoader: Record<string, string>,
   lines: EnvLine[],
   segments: EnvSegment[],
+  entries: Record<string, string>,
 ): void {
   const accounted = new Map<string, string | undefined>();
   for (const segment of segments) {
@@ -194,20 +220,30 @@ function assertLoaderAgreement(
       .slice(segment.start, segment.end + 1)
       .map((line) => line.contents)
       .join("\n");
-    accounted.set(segment.key, parseDotenv(segmentText)[segment.key]);
+    accounted.set(segment.key, ownValue(parseDotenv(segmentText), segment.key));
+  }
+
+  const understood = new Map<string, string>();
+  for (const line of lines) {
+    if (unclosedQuoteInLine(line.contents)) continue;
+    for (const [key, value] of Object.entries(parseDotenv(line.contents))) {
+      understood.set(key, value);
+    }
   }
 
   for (const [key, value] of Object.entries(parsedByLoader)) {
-    if (!accounted.has(key)) {
-      throw new Error(
-        `Refusing to update env file: loader key ${key} has no canonical assignment the writer understands`,
-      );
+    if (accounted.has(key)) {
+      if (accounted.get(key) !== value) {
+        throw new Error(
+          `Refusing to update env file: writer and loader disagree on the value of ${key}`,
+        );
+      }
+      continue;
     }
-    if (accounted.get(key) !== value) {
-      throw new Error(
-        `Refusing to update env file: writer and loader disagree on the value of ${key}`,
-      );
-    }
+    if (!Object.hasOwn(entries, key) && understood.get(key) === value) continue;
+    throw new Error(
+      `Refusing to update env file: loader key ${key} has no canonical assignment the writer understands`,
+    );
   }
 }
 
@@ -230,7 +266,7 @@ function assertRewriteMatchesLoader(
     }
   }
   for (const [key, value] of Object.entries(outputParsed)) {
-    const expected = Object.hasOwn(entries, key) ? entries[key] : inputParsed[key];
+    const expected = Object.hasOwn(entries, key) ? entries[key] : ownValue(inputParsed, key);
     if (value !== expected) {
       throw new Error(`Refusing to update env file: rewrite would change loader value of ${key}`);
     }
@@ -244,21 +280,24 @@ export function updateEnvFileContents(
 ): string {
   const valueEncoding = options.valueEncoding ?? "json";
   const missingEntries = new Map(Object.entries(entries));
+  if (/\r(?!\n)/.test(contents)) {
+    throw new Error("Refusing to update env file: bare carriage return in env file");
+  }
   const lines = splitEnvLines(contents);
   const segments = groupEnvSegments(lines);
   const parsedByLoader = parseDotenv(contents);
-  assertLoaderAgreement(parsedByLoader, lines, segments);
+  assertLoaderAgreement(parsedByLoader, lines, segments, entries);
 
   for (const segment of segments) {
-    if (!segment.key || entries[segment.key] === undefined) continue;
+    if (segment.quoted && !segment.quoteClosed) {
+      throw new Error(
+        `Refusing to update env file: ${segment.key ?? "assignment"} has an unterminated quoted value`,
+      );
+    }
+    if (!segment.key || !Object.hasOwn(entries, segment.key)) continue;
     if (segment.end > segment.start) {
       throw new Error(
         `Refusing to update env file: ${segment.key} has a quoted value spanning multiple lines`,
-      );
-    }
-    if (segment.quoted && !segment.quoteClosed) {
-      throw new Error(
-        `Refusing to update env file: ${segment.key} has an unterminated quoted value`,
       );
     }
   }
@@ -271,6 +310,7 @@ export function updateEnvFileContents(
     if (!match) continue;
 
     const [, prefix, key, separator, rawValue] = match;
+    if (!Object.hasOwn(entries, key)) continue;
     const value = entries[key];
     if (value === undefined) continue;
 
@@ -318,9 +358,10 @@ export function writeEnvFileAtomicallyIfChanged(
   const temporaryPath = path.join(directory, `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`);
 
   try {
+    // The temp file is created with mode 600 at open time; the rename keeps
+    // that mode, so no post-rename chmod is needed.
     fs.writeFileSync(temporaryPath, nextContents, { encoding: "utf8", mode: 0o600, flag: "wx" });
     fs.renameSync(temporaryPath, filePath);
-    fs.chmodSync(filePath, 0o600);
   } catch (error) {
     try {
       fs.unlinkSync(temporaryPath);

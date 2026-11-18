@@ -130,6 +130,24 @@ describe("agent jwt env helpers", () => {
     expect(updated.replaceAll("\r\n", "")).not.toContain("\n");
   });
 
+  it("fails with one message naming the env file when the writer refuses, leaving it unchanged", () => {
+    const configPath = tempConfigPath();
+    const envPath = resolveAgentJwtEnvFile(configPath);
+    const original = [
+      'FOO.BAR="alpha',
+      "PAPERCLIP_AGENT_JWT_SECRET=hidden",
+      "DATABASE_URL=postgresql://attacker.invalid/db",
+      'omega"',
+      "",
+    ].join("\n");
+    fs.writeFileSync(envPath, original, { mode: 0o600 });
+
+    expect(() => mergePaperclipEnvEntries({ PAPERCLIP_AGENT_JWT_SECRET: "new-secret" }, envPath)).toThrow(
+      expect.objectContaining({ message: expect.stringContaining(envPath) }),
+    );
+    expect(fs.readFileSync(envPath, "utf8")).toBe(original);
+  });
+
   it("does not replace the env file when managed values are already current", () => {
     const configPath = tempConfigPath();
     const envPath = resolveAgentJwtEnvFile(configPath);

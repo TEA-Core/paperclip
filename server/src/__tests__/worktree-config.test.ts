@@ -1569,18 +1569,18 @@ describe("worktree config repair", () => {
     delete process.env.PAPERCLIP_INSTANCE_ID;
     delete process.env.PAPERCLIP_CONTEXT;
 
-    let thrown: unknown = null;
+    // A writer refusal is not a boot failure: the repair returns without
+    // touching the env file, and the loader gains no key. The gate-blocked
+    // marker key returns the same way without a warning.
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
-      maybeRepairLegacyWorktreeConfigAndEnvFiles();
-    } catch (error) {
-      thrown = error;
-    }
-
-    // Refusal is acceptable: the env file must be left byte-identical and
-    // the loader must gain no key. The gate-blocked marker key is the one
-    // case that returns without throwing.
-    if (managedKey !== "PAPERCLIP_IN_WORKTREE") {
-      expect(thrown).toBeInstanceOf(Error);
+      const result = maybeRepairLegacyWorktreeConfigAndEnvFiles();
+      expect(result).toEqual({ repairedConfig: false, repairedEnv: false });
+      if (managedKey !== "PAPERCLIP_IN_WORKTREE") {
+        expect(warning).toHaveBeenCalledWith(expect.stringContaining(envPath));
+      }
+    } finally {
+      warning.mockRestore();
     }
     expect(await fs.readFile(envPath, "utf8")).toBe(originalEnv);
     expect(parseEnvFile(originalEnv).DATABASE_URL).toBeUndefined();
@@ -1630,6 +1630,132 @@ describe("worktree config repair", () => {
   });
 
   it.each([
+    "__proto__",
+    "constructor",
+    "toString",
+    "valueOf",
+    "hasOwnProperty",
+    "__defineGetter__",
+  ])("preserves an unmanaged %s line during repair (SUP-24365)", async (protoKey) => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-proto-key-"));
+    const name = "SUP-24365-proto-key";
+    const worktreeRoot = path.join(tempRoot, name);
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const envPath = path.join(paperclipDir, ".env");
+    const isolatedHome = path.join(tempRoot, ".paperclip-worktrees");
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    await fs.writeFile(
+      envPath,
+      ["PAPERCLIP_IN_WORKTREE=true", `${protoKey}=x`, ""].join("\n"),
+      "utf8",
+    );
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
+    process.env.PAPERCLIP_WORKTREE_NAME = name;
+    process.env.PAPERCLIP_CONFIG = path.join(paperclipDir, "config.json");
+    delete process.env.PORT;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_CONTEXT;
+    delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+
+    const result = maybeRepairLegacyWorktreeConfigAndEnvFiles();
+
+    expect(result.repairedEnv).toBe(true);
+    const repairedEnv = await fs.readFile(envPath, "utf8");
+    expect(repairedEnv.split("\n")).toContain(`${protoKey}=x`);
+  });
+
+  it.each([
+    { name: "dotted key", line: "MY.DOTTED.KEY=1" },
+    { name: "hyphenated key", line: "MY-HYPHEN-KEY=1" },
+    { name: "digit-led key", line: "9LIVES=1" },
+    { name: "colon assignment", line: "FOO: bar" },
+    { name: "line separator in a value", line: "PLAIN_NOTE=before\u2028after" },
+  ])("still repairs a worktree env with a legitimate $name (SUP-24365)", async ({ line }) => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-legit-key-"));
+    const name = "SUP-24365-legit-key";
+    const worktreeRoot = path.join(tempRoot, name);
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const envPath = path.join(paperclipDir, ".env");
+    const isolatedHome = path.join(tempRoot, ".paperclip-worktrees");
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    await fs.writeFile(envPath, ["PAPERCLIP_IN_WORKTREE=true", line, ""].join("\n"), "utf8");
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
+    process.env.PAPERCLIP_WORKTREE_NAME = name;
+    process.env.PAPERCLIP_CONFIG = path.join(paperclipDir, "config.json");
+    delete process.env.PORT;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_CONTEXT;
+    delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+
+    const result = maybeRepairLegacyWorktreeConfigAndEnvFiles();
+
+    expect(result.repairedEnv).toBe(true);
+    const repairedEnv = await fs.readFile(envPath, "utf8");
+    expect(repairedEnv).toContain(line);
+    expect(repairedEnv).toContain("PAPERCLIP_DB_BACKUP_ENABLED=");
+  });
+
+  it("leaves config and the port registry untouched when the env repair refuses (SUP-24365)", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-half-repair-"));
+    const name = "SUP-24365-half-repair";
+    const worktreeRoot = path.join(tempRoot, name);
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const configPath = path.join(paperclipDir, "config.json");
+    const envPath = path.join(paperclipDir, ".env");
+    const isolatedHome = path.join(tempRoot, ".paperclip-worktrees");
+    const sharedRoot = path.join(tempRoot, "shared");
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    const originalConfig = JSON.stringify(buildLegacyConfig(sharedRoot), null, 2) + "\n";
+    await fs.writeFile(configPath, originalConfig, "utf8");
+    const originalEnv = [
+      "PAPERCLIP_IN_WORKTREE=true",
+      'FOO.BAR="alpha',
+      "PAPERCLIP_DB_BACKUP_ENABLED=true",
+      "DATABASE_URL=postgresql://attacker.invalid/db",
+      'omega"',
+      "",
+    ].join("\n");
+    await fs.writeFile(envPath, originalEnv, "utf8");
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
+    process.env.PAPERCLIP_WORKTREE_NAME = name;
+    process.env.PAPERCLIP_CONFIG = configPath;
+    delete process.env.PORT;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_CONTEXT;
+    delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let result: ReturnType<typeof maybeRepairLegacyWorktreeConfigAndEnvFiles>;
+    try {
+      result = maybeRepairLegacyWorktreeConfigAndEnvFiles();
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining(envPath));
+    } finally {
+      warning.mockRestore();
+    }
+
+    expect(result!).toEqual({ repairedConfig: false, repairedEnv: false });
+    expect(await fs.readFile(envPath, "utf8")).toBe(originalEnv);
+    expect(await fs.readFile(configPath, "utf8")).toBe(originalConfig);
+    expect(fsSync.existsSync(path.join(isolatedHome, "worktree-port-reservations.json"))).toBe(false);
+    expect(process.env.PAPERCLIP_HOME).toBeUndefined();
+  });
+
+  it.each([
     { name: "dotted double-quoted", opener: 'FOO.BAR="alpha', closer: 'omega"', newline: "\n", attacker: "DATABASE_URL=postgresql://attacker.invalid/db" },
     { name: "dotted single-quoted", opener: "FOO.BAR='alpha", closer: "omega'", newline: "\n", attacker: "PAPERCLIP_SECRETS_MASTER_KEY=attacker-key" },
     { name: "dotted backtick", opener: "FOO.BAR=`alpha", closer: "omega`", newline: "\n", attacker: "BETTER_AUTH_SECRET=attacker-secret" },
@@ -1675,14 +1801,14 @@ describe("worktree config repair", () => {
     delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
 
     expect(parseEnvFile(originalEnv).DATABASE_URL).toBeUndefined();
-    let thrown: unknown = null;
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
-      maybeRepairLegacyWorktreeConfigAndEnvFiles();
-    } catch (error) {
-      thrown = error;
+      const result = maybeRepairLegacyWorktreeConfigAndEnvFiles();
+      expect(result).toEqual({ repairedConfig: false, repairedEnv: false });
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining(envPath));
+    } finally {
+      warning.mockRestore();
     }
-
-    expect(thrown).toBeInstanceOf(Error);
     expect(await fs.readFile(envPath, "utf8")).toBe(originalEnv);
   });
 
@@ -1765,17 +1891,15 @@ describe("worktree config repair", () => {
       delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
 
       const before = parseEnvFile(originalEnv);
-      let thrown: unknown = null;
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
       try {
         maybeRepairLegacyWorktreeConfigAndEnvFiles();
-      } catch (error) {
-        thrown = error;
+      } finally {
+        warning.mockRestore();
       }
       const afterContents = await fs.readFile(envPath, "utf8");
-      if (thrown) {
-        expect(afterContents).toBe(originalEnv);
-        continue;
-      }
+      // A refusal leaves the file byte-identical and is a valid outcome.
+      if (afterContents === originalEnv) continue;
       const after = parseEnvFile(afterContents);
       for (const [key, value] of Object.entries(after)) {
         if (Object.hasOwn(deterministicManaged, key)) {
