@@ -831,7 +831,11 @@ has no return-to, so the route drops the no-op `assigneeAgentId: null` and
 `boardStageDecision` flag. The guard admits it only when the write carries no
 assignee key and the stored row has no agent and no user assignee. Any assignee
 write, including one naming the canonical Maintainer, and any owned row stay
-guarded as before.
+guarded as before. Only that route sets the flag. The plugin host forwards just
+the patch fields the plugin SDK declares for `issues.update`
+(`PluginIssueUpdatePatch`). It drops every other key, including the issue
+service's internal flags (`boardStageDecision`, `workflowControlledAssignment`,
+`companyGuard`, `expectedUpdatedAt`).
 
 The boundary is the write path. Per-card isolation is required for every
 startup sweep that writes issue rows through the guarded issue service
