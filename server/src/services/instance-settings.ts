@@ -15,6 +15,7 @@ import {
   DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
   DEFAULT_BACKUP_RETENTION,
   PAPERCLIP_CLOUD_MANAGED_BY,
+  LIVE_RUN_CAP_CEILING,
   instanceGeneralSettingsSchema,
   type InstanceGeneralSettings,
   instanceExperimentalSettingsSchema,
@@ -37,7 +38,11 @@ import { getManagedInstanceConfig, type ManagedInstanceConfig } from "./managed-
 import { getOperatorSettingDefaults } from "./setting-defaults.js";
 
 const DEFAULT_SINGLETON_KEY = "default";
-const instanceGeneralSettingsStorageSchema = instanceGeneralSettingsSchema.strip();
+// SUP-24563: `liveRunCap` is read apart from the other general fields, so a
+// corrupt stored cap cannot reset them and a corrupt other field cannot turn
+// the cap off.
+const instanceGeneralSettingsStorageSchema = instanceGeneralSettingsSchema.omit({ liveRunCap: true }).strip();
+const liveRunCapStorageSchema = instanceGeneralSettingsSchema.shape.liveRunCap;
 const instanceExperimentalSettingsStorageSchema = instanceExperimentalSettingsSchema.strip();
 const TRUTHY_RUNTIME_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
 
@@ -198,8 +203,22 @@ export async function resolveWorktreeRunExecutionActivationState(options: {
   }
 }
 
+/**
+ * Absent or null = off (the shipped default). A stored value that is present
+ * but not a valid cap (a hand edit, an older writer) fails closed to the hard
+ * ceiling, never open.
+ */
+function normalizeLiveRunCap(raw: unknown): number | null {
+  if (!raw || typeof raw !== "object" || !("liveRunCap" in raw)) return null;
+  const value = raw.liveRunCap;
+  if (value === undefined || value === null) return null;
+  const parsed = liveRunCapStorageSchema.safeParse(value);
+  return parsed.success ? parsed.data : LIVE_RUN_CAP_CEILING;
+}
+
 function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
   const parsed = instanceGeneralSettingsStorageSchema.safeParse(raw ?? {});
+  const liveRunCap = normalizeLiveRunCap(raw);
   if (parsed.success) {
     return {
       censorUsernameInLogs: parsed.data.censorUsernameInLogs ?? false,
@@ -209,7 +228,7 @@ function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
       // Absent => unrestricted; only carry through an explicit policy.
       ...(parsed.data.executionMode ? { executionMode: parsed.data.executionMode } : {}),
       enableBlockedWithoutBlockersAutoHeal: parsed.data.enableBlockedWithoutBlockersAutoHeal ?? false,
-      liveRunCap: parsed.data.liveRunCap ?? null,
+      liveRunCap,
     };
   }
   return {
@@ -217,7 +236,7 @@ function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
     feedbackDataSharingPreference: DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
     backupRetention: DEFAULT_BACKUP_RETENTION,
     enableBlockedWithoutBlockersAutoHeal: false,
-    liveRunCap: null,
+    liveRunCap,
   };
 }
 

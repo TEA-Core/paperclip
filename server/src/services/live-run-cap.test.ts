@@ -1,3 +1,5 @@
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   LIVE_RUN_CAP_CEILING,
@@ -13,6 +15,7 @@ import {
   invalidateLiveRunCapSettingCache,
   isLiveRunCapExemptAgent,
   listLiveRunCapSignals,
+  liveRunCapAdmission,
   readLiveRunCapSetting,
 } from "./live-run-cap.js";
 
@@ -145,39 +148,40 @@ describe("decideLiveRunCapAdmission", () => {
 });
 
 describe("classifyLiveRunCapRun", () => {
-  const base = { requestedByActorType: "system", requestReason: "issue_assigned", issueStatus: "todo", issueOriginKind: "manual" };
+  const agentId = "agent-under-test";
+  const base = { agentId, requestedByActorType: "system", issueOriginKind: "manual", issueExecutionState: null };
+  const pendingStage = (participantAgentId: string, currentStageType = "review") => ({
+    status: "pending",
+    currentStageType,
+    currentParticipant: { type: "agent", agentId: participantAgentId },
+  });
 
   it("puts human and board wakes first, even on review work", () => {
-    expect(classifyLiveRunCapRun({ ...base, requestedByActorType: "user", issueStatus: "in_review" })).toBe("human_board");
+    expect(classifyLiveRunCapRun({ ...base, requestedByActorType: "user", issueExecutionState: pendingStage(agentId) })).toBe("human_board");
   });
 
   it.each([
-    { issueStatus: "in_review" },
     { issueOriginKind: "stranded_issue_recovery" },
     { issueOriginKind: "harness_liveness_escalation" },
-    { requestReason: "execution_review_requested" },
-    { requestReason: "source_scoped_recovery_action" },
+    { issueExecutionState: pendingStage(agentId) },
+    { issueExecutionState: pendingStage(agentId, "approval") },
   ])("treats %j as review/recovery", (override) => {
     expect(classifyLiveRunCapRun({ ...base, ...override })).toBe("review_recovery");
   });
 
   it.each([
-    { requestedByActorType: "agent" },
-    { requestedByActorType: null },
-  ])("ignores a review reason on a wake not requested by the server or a board user: %j", (override) => {
-    for (const requestReason of ["execution_review_requested", "source_scoped_recovery_action", "issue_review_path_lost"]) {
-      expect(classifyLiveRunCapRun({ ...base, ...override, requestReason })).toBe("general");
-    }
+    { label: "a stage pending for another agent", issueExecutionState: pendingStage("someone-else") },
+    { label: "a stage that is not pending", issueExecutionState: { ...pendingStage(agentId), status: "changes_requested" } },
+    { label: "an unknown stage type", issueExecutionState: pendingStage(agentId, "custom") },
+    { label: "a user participant", issueExecutionState: { status: "pending", currentStageType: "review", currentParticipant: { type: "user", userId: "u" } } },
+    { label: "a malformed state", issueExecutionState: "pending" },
+    { label: "a plugin origin kind", issueOriginKind: "plugin:example:stranded_issue_recovery" },
+  ])("treats $label as general", ({ label: _label, ...override }) => {
+    expect(classifyLiveRunCapRun({ ...base, ...override })).toBe("general");
   });
 
-  it("keeps genuine review state for an agent-requested wake on an in_review or recovery-origin issue", () => {
-    expect(classifyLiveRunCapRun({ ...base, requestedByActorType: "agent", issueStatus: "in_review" })).toBe("review_recovery");
-    expect(classifyLiveRunCapRun({ ...base, requestedByActorType: "agent", issueOriginKind: "stranded_issue_recovery" })).toBe("review_recovery");
-  });
-
-  it("treats agent, system and timer work without review or recovery markers as general", () => {
-    expect(classifyLiveRunCapRun(base)).toBe("general");
-    expect(classifyLiveRunCapRun({ requestedByActorType: null, requestReason: null, issueStatus: null, issueOriginKind: null })).toBe("general");
+  it.each(["agent", "system", null])("ignores everything a %s-requested wake could choose", (requestedByActorType) => {
+    expect(classifyLiveRunCapRun({ ...base, requestedByActorType })).toBe("general");
   });
 });
 
@@ -255,6 +259,109 @@ describe("router poll", () => {
 
     await expect(poll()).resolves.toBe(false);
     expect(listLiveRunCapSignals()).toEqual([]);
+  });
+});
+
+describe("router poll hardening (real HTTP)", () => {
+  const servers: Server[] = [];
+  afterEach(async () => {
+    await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+  });
+
+  async function listen(handler: (req: IncomingMessage, res: ServerResponse) => void) {
+    const server = createServer(handler);
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server has no TCP address");
+    return `http://127.0.0.1:${(address satisfies AddressInfo).port}`;
+  }
+
+  it("refuses to follow a redirect", async () => {
+    const target = await listen((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ cap: 7 }));
+    });
+    const redirecting = await listen((_req, res) => {
+      res.writeHead(302, { location: `${target}/api/runcap` });
+      res.end();
+    });
+
+    await expect(createLiveRunCapRouterPoll({ url: `${redirecting}/api/runcap` })()).resolves.toBe(false);
+    expect(listLiveRunCapSignals()).toEqual([]);
+  });
+
+  it("refuses an answer larger than the body limit", async () => {
+    const url = await listen((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(`${" ".repeat(64 * 1024)}{"cap":7}`);
+    });
+
+    await expect(createLiveRunCapRouterPoll({ url })()).resolves.toBe(false);
+    expect(listLiveRunCapSignals()).toEqual([]);
+  });
+
+  it("still accepts a small, direct answer", async () => {
+    const url = await listen((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ cap: 9, reason: "clamped" }));
+    });
+
+    await expect(createLiveRunCapRouterPoll({ url })()).resolves.toBe(true);
+    expect(listLiveRunCapSignals().map((signal) => signal.cap)).toEqual([9]);
+  });
+
+  it("never has two polls in flight: a poll while one hangs reuses it", async () => {
+    let requests = 0;
+    // A listener that never answers; only the poll's own (real) abort timeout
+    // ends the request, so this case runs on the real clock by design.
+    const url = await listen(() => {
+      requests += 1;
+    });
+    const poll = createLiveRunCapRouterPoll({ url, timeoutMs: 200 });
+
+    const results = await Promise.all([poll(), poll(), poll()]);
+
+    expect(results).toEqual([false, false, false]);
+    expect(requests).toBe(1);
+  });
+});
+
+describe("admission lock", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("frees the lock and refuses the admission when a holder overruns its deadline", async () => {
+    vi.useFakeTimers();
+    const settled: Record<string, string> = {};
+    void liveRunCapAdmission.withLock(() => new Promise<string>(() => {}), "timed-out", 50)
+      .then((value) => { settled.hung = value; });
+    void liveRunCapAdmission.withLock(async () => "admitted", "timed-out", 50)
+      .then((value) => { settled.next = value; });
+
+    await vi.advanceTimersByTimeAsync(60);
+
+    expect(settled).toEqual({ hung: "timed-out", next: "admitted" });
+  });
+
+  it("tells an overrun holder its lease expired, so it can skip its reservation", async () => {
+    vi.useFakeTimers();
+    let expiredSeen: boolean | null = null;
+    let finishHolder!: () => void;
+    const holderDone = new Promise<void>((resolve) => {
+      finishHolder = resolve;
+    });
+    const result = liveRunCapAdmission.withLock(async (lease) => {
+      await holderDone;
+      expiredSeen = lease.expired();
+      return "late";
+    }, "timed-out", 20);
+
+    await vi.advanceTimersByTimeAsync(30);
+    await expect(result).resolves.toBe("timed-out");
+    finishHolder();
+    await vi.waitFor(() => expect(expiredSeen).toBe(true));
   });
 });
 

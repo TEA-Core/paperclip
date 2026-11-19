@@ -733,7 +733,7 @@ describe("instance settings routes", () => {
       expect(mockHeartbeatService.applyLiveRunCapSettingChange).not.toHaveBeenCalled();
     });
 
-    it("serves the read-only status to board users and refuses agents", async () => {
+    it("serves the instance-wide status to instance admins only: board members of one company and agents are refused", async () => {
       const status = {
         enabled: true,
         setting: 15,
@@ -745,12 +745,16 @@ describe("instance settings routes", () => {
       };
       mockHeartbeatService.getLiveRunCapStatus.mockResolvedValue(status);
 
-      const read = await request(createApp(boardMember)).get("/api/instance/live-run-cap");
+      const read = await request(createApp(instanceAdmin)).get("/api/instance/live-run-cap");
       expect(read.status).toBe(200);
       expect(read.body).toEqual(status);
 
-      const refused = await request(createApp(agentCaller)).get("/api/instance/live-run-cap");
-      expect(refused.status).toBe(403);
+      // The counts span every company, so a board member of one company must
+      // not read them (the same rule as GET /instance/lifecycle).
+      for (const actor of [boardMember, agentCaller]) {
+        const refused = await request(createApp(actor)).get("/api/instance/live-run-cap");
+        expect(refused.status).toBe(403);
+      }
       expect(mockHeartbeatService.getLiveRunCapStatus).toHaveBeenCalledTimes(1);
     });
   });

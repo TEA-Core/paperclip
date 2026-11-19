@@ -19208,10 +19208,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   /**
    * Queued runs matching `where`, with their admission class and exemption.
-   * The class reads the run's own wake request row (actor type and reason as
-   * the server recorded them) and the issue row, never the run's merged
-   * `contextSnapshot.wakeReason`: a coalesced or agent-supplied reason must
-   * not lift a run into the reserved slots.
+   * The class reads only server-recorded facts: the actor type on the run's
+   * own wake request row, and the issue row's origin kind and execution state
+   * (see `classifyLiveRunCapRun`). No wake reason (row or merged context) and
+   * no issue status is read, so no caller can lift a run into the reserved
+   * slots by choosing a reason or a status.
    */
   async function listLiveRunCapCandidates(where: SQL | undefined) {
     const rows = await db
@@ -19222,9 +19223,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterType: agents.adapterType,
         workDelivery: sql<string | null>`${agents.runtimeConfig} ->> 'workDelivery'`,
         requestedByActorType: agentWakeupRequests.requestedByActorType,
-        requestReason: agentWakeupRequests.reason,
-        issueStatus: issues.status,
         issueOriginKind: issues.originKind,
+        issueExecutionState: issues.executionState,
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
@@ -19247,13 +19247,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   /**
-   * Cap-waiters of other agents that are ahead of `entry` in line and still
-   * queued. Entries whose run left `queued` meanwhile are dropped.
+   * Cap-waiters of other agents that are ahead of `entry` in line, still
+   * queued, and able to take a slot that is free now: a general waiter can
+   * only use a general slot, so while the general slots are full it does not
+   * stand in front of review, recovery or human/board work. Entries whose run
+   * left `queued` meanwhile are dropped.
    */
-  async function countLiveRunCapWaitersAhead(entry: LiveRunCapQueueEntry) {
+  async function countLiveRunCapWaitersAhead(
+    entry: LiveRunCapQueueEntry,
+    cap: EffectiveLiveRunCap,
+    occupied: number,
+  ) {
+    const nowMs = Date.now();
     const ahead = liveRunCapAdmission
-      .listWaiters()
-      .filter((waiter) => waiter.agentId !== entry.agentId && compareLiveRunCapPrecedence(waiter, entry) < 0);
+      .listWaiters(nowMs)
+      .filter((waiter) => waiter.agentId !== entry.agentId && compareLiveRunCapPrecedence(waiter, entry, nowMs) < 0);
     if (ahead.length === 0) return 0;
     const stillQueued = new Set(
       (
@@ -19266,20 +19274,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ))
       ).map((row) => row.id),
     );
+    let count = 0;
     for (const waiter of ahead) {
-      if (!stillQueued.has(waiter.runId)) liveRunCapAdmission.removeWaiter(waiter.runId);
+      if (!stillQueued.has(waiter.runId)) {
+        liveRunCapAdmission.removeWaiter(waiter.runId);
+      } else if (waiter.runClass !== "general" || occupied < cap.generalCap) {
+        count += 1;
+      }
     }
-    return stillQueued.size;
+    return count;
   }
 
   /**
    * Count-and-reserve for one queued run, before it is claimed. Returns the
    * reservation release when the run may be claimed. Otherwise the run is
    * recorded as a cap-waiter and stays `queued`, untouched; nothing here reads
-   * or writes a running run.
+   * or writes a running run. An admission that overruns the lock deadline is
+   * refused (stays queued for the next pass) and records nothing.
    */
   async function admitUnderLiveRunCap(entry: LiveRunCapQueueEntry, cap: EffectiveLiveRunCap) {
-    return liveRunCapAdmission.withLock(async () => {
+    return liveRunCapAdmission.withLock(async (lease) => {
       const occupied = (await countLiveRunsTowardCap()) + liveRunCapAdmission.inFlight();
       let decision = decideLiveRunCapAdmission({ cap, occupied, runClass: entry.runClass, aheadCount: 0 });
       if (decision.admit) {
@@ -19287,15 +19301,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           cap,
           occupied,
           runClass: entry.runClass,
-          aheadCount: await countLiveRunCapWaitersAhead(entry),
+          aheadCount: await countLiveRunCapWaitersAhead(entry, cap, occupied),
         });
       }
+      if (lease.expired()) return null;
       if (!decision.admit) {
         liveRunCapAdmission.registerWaiter(entry);
         return null;
       }
       return liveRunCapAdmission.reserve(entry.runId);
-    });
+    }, null);
+  }
+
+  /**
+   * `executeRun` claims a run that is still queued (workspace preparation for
+   * a self-declared run). That claim passes the same gate as the claim loop:
+   * exempt agents and a cap that is off pass at once; a counted run that does
+   * not fit is not claimed. Returns the reservation release, or null when the
+   * run must stay queued.
+   */
+  async function admitDirectClaimUnderLiveRunCap(run: typeof heartbeatRuns.$inferSelect) {
+    const noReservation = () => {};
+    const agent = await getAgent(run.agentId);
+    if (!agent || isLiveRunCapExemptAgent(agent)) return noReservation;
+    const cap = await resolveLiveRunCap();
+    if (!cap) return noReservation;
+    const [entry] = await listLiveRunCapCandidates(eq(heartbeatRuns.id, run.id));
+    return admitUnderLiveRunCap(
+      entry ?? { runId: run.id, agentId: run.agentId, runClass: "general", createdAtMs: run.createdAt.getTime() },
+      cap,
+    );
   }
 
   /**
@@ -19332,7 +19367,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const exemptAgentIds = candidates.filter((candidate) => candidate.exempt).map((candidate) => candidate.agentId);
     const countedAgentIds = candidates
       .filter((candidate) => !candidate.exempt)
-      .sort(compareLiveRunCapPrecedence)
+      .sort((left, right) => compareLiveRunCapPrecedence(left, right, Date.now()))
       .map((candidate) => candidate.agentId);
     for (const agentId of new Set([...exemptAgentIds, ...countedAgentIds])) {
       await startNextQueuedRunForAgent(agentId, { fromAdmissionDrive: true });
@@ -24623,7 +24658,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (run.status !== "queued" && run.status !== "running") return;
 
     if (run.status === "queued") {
-      const claimed = await claimQueuedRun(run);
+      // SUP-24563: every claim of a queued run passes the live-run cap, this
+      // one included. A run that does not fit is not claimed; it stays queued.
+      const releaseLiveRunCapSlot = await admitDirectClaimUnderLiveRunCap(run);
+      if (!releaseLiveRunCapSlot) return;
+      let claimed: typeof heartbeatRuns.$inferSelect | null;
+      try {
+        claimed = await claimQueuedRun(run);
+      } finally {
+        releaseLiveRunCapSlot();
+      }
       if (!claimed) {
         // claimQueuedRun can also leave the run queued when dependencies are unresolved.
         return;

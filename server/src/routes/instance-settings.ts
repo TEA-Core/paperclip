@@ -258,9 +258,10 @@ export function instanceSettingsRoutes(db: Db) {
   );
 
   // SUP-24563: read-only live-run cap status. Counts only (no run ids, no
-  // router address), readable like the task-drain status.
+  // router address). The counts span every company, so only instance admins
+  // may read them (the same rule as GET /instance/lifecycle).
   router.get("/instance/live-run-cap", async (req, res) => {
-    assertBoardOrgAccess(req);
+    assertCanManageInstanceSettings(req);
     res.json(await heartbeat.getLiveRunCapStatus());
   });
 

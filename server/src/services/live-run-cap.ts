@@ -2,11 +2,12 @@
  * SUP-24563. Global live-run cap.
  *
  * An admission-only ceiling on how many counted heartbeat runs may be
- * `running` instance-wide. It is consulted in exactly one place:
- * `startNextQueuedRunForAgent`, before `claimQueuedRun`. A run that does not
- * fit stays `queued`; nothing here ever signals, cancels, pauses or releases a
- * run that is already running, so lowering the cap below the live count only
- * stops new starts until enough runs finish on their own.
+ * `running` instance-wide. Every claim of a queued run passes it: the claim
+ * loop of `startNextQueuedRunForAgent` and `executeRun`'s claim of a run that
+ * is still queued. A run that does not fit stays `queued`; nothing here ever
+ * signals, cancels, pauses or releases a run that is already running, so
+ * lowering the cap below the live count only stops new starts until enough
+ * runs finish on their own.
  *
  * Effective cap:
  *
@@ -27,12 +28,14 @@
  *
  * State is a module singleton, like `dispatchQuiesce`: `heartbeatService(db)`
  * is constructed by many routes and services, and a per-instance counter would
- * let them each admit up to the cap. The server is one process; a second
- * process would need `pg_advisory_xact_lock` around count-and-reserve instead
- * of the in-process lock below.
+ * let them each admit up to the cap. The cap therefore holds within ONE server
+ * process, which is a hard deployment limit while the cap is on: a second
+ * process sharing the database (for example both sides of a rolling deploy)
+ * keeps its own count of claims in flight and can over-admit until one exits.
+ * Making it multi-process needs `pg_advisory_xact_lock` around count and claim.
  */
 import type { agents } from "@paperclipai/db";
-import { LIVE_RUN_CAP_CEILING } from "@paperclipai/shared";
+import { ISSUE_EXECUTION_STAGE_TYPES, LIVE_RUN_CAP_CEILING } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 import { isExternalPullAgent } from "./agent-work-delivery.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
@@ -54,6 +57,23 @@ export const LIVE_RUN_CAP_SIGNAL_STALE_MS = 60_000;
 
 export const LIVE_RUN_CAP_ROUTER_POLL_INTERVAL_MS = 15_000;
 export const LIVE_RUN_CAP_ROUTER_TIMEOUT_MS = 2_000;
+/** The router answers a few dozen bytes; a larger body is refused unread. */
+export const LIVE_RUN_CAP_ROUTER_MAX_BODY_BYTES = 4_096;
+
+/**
+ * A general run waiting at least this long is ordered with review/recovery
+ * work, so a long review/recovery burst cannot hold it back for the whole
+ * burst. Ordering only: it still never uses the reserved slots, and human and
+ * board work still goes first (owner ruling).
+ */
+export const LIVE_RUN_CAP_AGING_MS = 30 * 60_000;
+
+/**
+ * The longest one count-and-reserve may hold the admission lock. A holder that
+ * overruns (a hung database read) is refused and the lock passes on, so one
+ * stuck admission cannot freeze every later one.
+ */
+export const LIVE_RUN_CAP_LOCK_TIMEOUT_MS = 10_000;
 
 /** How long admission reuses a setting read; the settings PATCH route invalidates it at once. */
 const LIVE_RUN_CAP_SETTING_TTL_MS = 2_000;
@@ -87,49 +107,55 @@ export function isLiveRunCapExemptAgent(agent: LiveRunCapAgentInput) {
 export const LIVE_RUN_CAP_CLASSES = ["human_board", "review_recovery", "general"] as const;
 export type LiveRunCapClass = (typeof LIVE_RUN_CAP_CLASSES)[number];
 
-/**
- * Review and recovery reasons, honoured only on a wake the server recorded as
- * `requested_by_actor_type = 'system'` (recovery sweeps, review dispatch and
- * other server paths). The wake routes accept any reason string from an agent
- * key, so an agent-requested (or unrecorded) wake never reaches this list.
- */
-const REVIEW_RECOVERY_WAKE_REASONS: ReadonlySet<string> = new Set([
-  "execution_review_requested",
-  "execution_approval_requested",
-  "execution_review_participant_recovery",
-  "native_completion_review",
-  "issue_review_path_lost",
-  "source_scoped_recovery_action",
-  "issue_recovery_action_restored",
-  "exhausted_recovery_issue",
-  "issue_monitor_recovery",
-  "issue_monitor_recovery_issue",
-]);
 const RECOVERY_ISSUE_ORIGIN_KINDS: ReadonlySet<string> = new Set(Object.values(RECOVERY_ORIGIN_KINDS));
+const REVIEW_STAGE_TYPES: ReadonlySet<string> = new Set(ISSUE_EXECUTION_STAGE_TYPES);
 
 /**
- * The admission class of a queued run, from facts the caller of a wake
- * cannot set:
- * - `requestedByActorType` and `requestReason` come from the run's own wake
- *   request row. The server records the actor type from the authenticated
- *   actor, and a coalesced wake never rewrites that row (unlike the run's
- *   merged `contextSnapshot.wakeReason`, which is never read here).
- * - `issueStatus` and `issueOriginKind` come from the issue row; the issue
- *   API does not accept an origin kind.
+ * True when the issue's execution state, as the execution policy wrote it, has
+ * a review or approval stage pending in front of this agent. Only the policy
+ * engine writes `execution_state`: no issue or wake API accepts it, and an
+ * issue created or set `in_review` by a caller has no pending stage.
+ */
+function isPendingReviewParticipant(executionState: unknown, agentId: string) {
+  if (!executionState || typeof executionState !== "object") return false;
+  if (!("status" in executionState) || executionState.status !== "pending") return false;
+  if (!("currentStageType" in executionState) || typeof executionState.currentStageType !== "string") return false;
+  if (!REVIEW_STAGE_TYPES.has(executionState.currentStageType)) return false;
+  if (!("currentParticipant" in executionState)) return false;
+  const participant = executionState.currentParticipant;
+  return Boolean(
+    participant &&
+      typeof participant === "object" &&
+      "type" in participant &&
+      participant.type === "agent" &&
+      "agentId" in participant &&
+      participant.agentId === agentId,
+  );
+}
+
+/**
+ * The admission class of a queued run, only from facts the server records and
+ * no caller-supplied field can set:
+ * - human/board: the run's own wake request row was recorded with a `user`
+ *   actor; the wake routes take the actor type from the authenticated caller.
+ * - review/recovery: the run's issue row has a recovery origin kind (the issue
+ *   API does not accept an origin kind; plugins are confined to `plugin:*`),
+ *   or a review/approval stage the execution policy put in front of this very
+ *   agent is pending on it.
+ * A wake reason is never read, whoever wrote the row (agent, board, plugin or
+ * server), and neither is the issue status: a caller can create or set an
+ * issue `in_review` without any review stage.
  */
 export function classifyLiveRunCapRun(input: {
+  agentId: string;
   requestedByActorType: string | null | undefined;
-  requestReason: string | null | undefined;
-  issueStatus: string | null | undefined;
   issueOriginKind: string | null | undefined;
+  issueExecutionState: unknown;
 }): LiveRunCapClass {
   if (input.requestedByActorType === "user") return "human_board";
   if (
-    input.issueStatus === "in_review" ||
     (input.issueOriginKind && RECOVERY_ISSUE_ORIGIN_KINDS.has(input.issueOriginKind)) ||
-    (input.requestedByActorType === "system" &&
-      input.requestReason &&
-      REVIEW_RECOVERY_WAKE_REASONS.has(input.requestReason))
+    isPendingReviewParticipant(input.issueExecutionState, input.agentId)
   ) {
     return "review_recovery";
   }
@@ -147,10 +173,25 @@ export interface LiveRunCapQueueEntry {
   createdAtMs: number;
 }
 
-/** Global admission order: class, then oldest first; run id breaks exact ties. */
-export function compareLiveRunCapPrecedence(left: LiveRunCapQueueEntry, right: LiveRunCapQueueEntry) {
+/**
+ * The rank a waiting run is ordered by: its class, except that a general run
+ * waiting at least `LIVE_RUN_CAP_AGING_MS` is ordered with review/recovery.
+ */
+export function liveRunCapOrderRank(entry: LiveRunCapQueueEntry, nowMs: number) {
+  if (entry.runClass === "general" && nowMs - entry.createdAtMs >= LIVE_RUN_CAP_AGING_MS) {
+    return liveRunCapClassRank("review_recovery");
+  }
+  return liveRunCapClassRank(entry.runClass);
+}
+
+/** Global admission order: rank (class with aging), then oldest first; run id breaks exact ties. */
+export function compareLiveRunCapPrecedence(
+  left: LiveRunCapQueueEntry,
+  right: LiveRunCapQueueEntry,
+  nowMs: number,
+) {
   return (
-    liveRunCapClassRank(left.runClass) - liveRunCapClassRank(right.runClass) ||
+    liveRunCapOrderRank(left, nowMs) - liveRunCapOrderRank(right, nowMs) ||
     left.createdAtMs - right.createdAtMs ||
     (left.runId < right.runId ? -1 : left.runId > right.runId ? 1 : 0)
   );
@@ -251,6 +292,37 @@ export function parseRouterRunCapResponse(body: unknown): number | null {
   return typeof cap === "number" && Number.isInteger(cap) && cap >= 0 ? cap : null;
 }
 
+/**
+ * Reads at most `maxBytes` of the body and parses it as JSON. A larger body
+ * (declared or streamed) or one that is not JSON reads as `undefined`.
+ */
+async function readBoundedJson(response: Response, maxBytes: number): Promise<unknown> {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await response.body?.cancel();
+    return undefined;
+  }
+  if (!response.body) return undefined;
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      return undefined;
+    }
+    chunks.push(value);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
 export interface LiveRunCapRouterPollerOptions {
   url: string;
   fetchImpl?: typeof fetch;
@@ -273,7 +345,12 @@ export function isLiveRunCapRouterConfigured() {
   return routerPollerConfigured;
 }
 
-/** One router poll, never throwing. Resolves true when a valid sample was stored. */
+/**
+ * One router poll, never throwing. Resolves true when a valid sample was
+ * stored. Calls while a poll is in flight share it, so a hung router never
+ * piles up requests. A redirect, a non-2xx answer, a body over
+ * `LIVE_RUN_CAP_ROUTER_MAX_BODY_BYTES` or a timeout is a failed poll.
+ */
 export function createLiveRunCapRouterPoll(options: LiveRunCapRouterPollerOptions): () => Promise<boolean> {
   const fetchImpl = options.fetchImpl ?? fetch;
   const now = options.now ?? Date.now;
@@ -289,14 +366,19 @@ export function createLiveRunCapRouterPoll(options: LiveRunCapRouterPollerOption
   };
   let lastContribution = contribution();
 
-  const pollNow = async () => {
+  const pollOnce = async () => {
     let cap: number | null = null;
     try {
       const response = await fetchImpl(options.url, {
         headers: { accept: "application/json" },
+        redirect: "error",
         signal: AbortSignal.timeout(timeoutMs),
       });
-      cap = response.ok ? parseRouterRunCapResponse(await response.json()) : null;
+      if (response.ok) {
+        cap = parseRouterRunCapResponse(await readBoundedJson(response, LIVE_RUN_CAP_ROUTER_MAX_BODY_BYTES));
+      } else {
+        await response.body?.cancel();
+      }
     } catch {
       cap = null;
     }
@@ -317,20 +399,21 @@ export function createLiveRunCapRouterPoll(options: LiveRunCapRouterPollerOption
     return cap !== null;
   };
 
-  return pollNow;
+  let inFlight: Promise<boolean> | null = null;
+  return () => {
+    inFlight ??= pollOnce().finally(() => {
+      inFlight = null;
+    });
+    return inFlight;
+  };
 }
 
 /** Starts the background router poll. Admission never awaits it; it reads the cached sample. */
 export function startLiveRunCapRouterPoller(options: LiveRunCapRouterPollerOptions): LiveRunCapRouterPoller {
   const pollNow = createLiveRunCapRouterPoll(options);
   routerPollerConfigured = true;
-  let inFlight = false;
   const tick = () => {
-    if (inFlight) return;
-    inFlight = true;
-    void pollNow().finally(() => {
-      inFlight = false;
-    });
+    void pollNow();
   };
   const interval = setInterval(tick, options.intervalMs ?? LIVE_RUN_CAP_ROUTER_POLL_INTERVAL_MS);
   interval.unref?.();
@@ -378,18 +461,49 @@ let admissionsInFlight = 0;
 let admissionLock: Promise<void> = Promise.resolve();
 const drainState: { running: Promise<void> | null; rerun: boolean } = { running: null, rerun: false };
 
+/** Handed to an admission-lock holder: `expired()` turns true once its deadline passed and the lock moved on. */
+export interface LiveRunCapLockLease {
+  expired(): boolean;
+}
+
 export const liveRunCapAdmission = {
   /**
    * Serializes count-and-reserve across agents. Holders must not call
    * `claimQueuedRun` or `startNextQueuedRunForAgent` inside it.
+   *
+   * Each holder gets `timeoutMs`. A holder that overruns resolves to
+   * `onTimeout` (callers pass a refusal), the lock passes to the next holder,
+   * and the overrun holder's lease reports `expired()` so it must not reserve
+   * or register anything when it finally returns.
    */
-  withLock<T>(fn: () => Promise<T>): Promise<T> {
-    const turn = admissionLock.then(fn);
-    admissionLock = turn.then(
-      () => undefined,
-      () => undefined,
-    );
-    return turn;
+  async withLock<T>(
+    fn: (lease: LiveRunCapLockLease) => Promise<T>,
+    onTimeout: T,
+    timeoutMs = LIVE_RUN_CAP_LOCK_TIMEOUT_MS,
+  ): Promise<T> {
+    const previous = admissionLock;
+    let releaseTurn!: () => void;
+    const turn = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    admissionLock = previous.then(() => turn);
+    await previous;
+    let expired = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<T>((resolve) => {
+      timer = setTimeout(() => {
+        expired = true;
+        logger.warn({ timeoutMs }, "live-run cap admission overran the lock deadline; refusing it and passing the lock on");
+        resolve(onTimeout);
+      }, timeoutMs);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([fn({ expired: () => expired }), deadline]);
+    } finally {
+      clearTimeout(timer);
+      releaseTurn();
+    }
   },
   inFlight() {
     return admissionsInFlight;
@@ -434,8 +548,8 @@ export const liveRunCapAdmission = {
   waiterCount() {
     return waiters.size;
   },
-  listWaiters(): LiveRunCapQueueEntry[] {
-    return [...waiters.values()].sort(compareLiveRunCapPrecedence);
+  listWaiters(nowMs = Date.now()): LiveRunCapQueueEntry[] {
+    return [...waiters.values()].sort((left, right) => compareLiveRunCapPrecedence(left, right, nowMs));
   },
   /**
    * Single-flight drain. A request while a drain runs makes it run one more

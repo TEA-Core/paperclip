@@ -10,6 +10,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  instanceSettings,
   issues,
 } from "@paperclipai/db";
 import {
@@ -93,7 +94,9 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
   let paperclipHome: string | null = null;
   let companyId = "";
   let loadAgentId = "";
-  let createdAtCursor = Date.parse("2026-11-17T10:00:00.000Z");
+  // Seeded runs are created a minute apart, starting 20 minutes back, so no
+  // seeded run is old enough to age into a higher admission rank by accident.
+  let createdAtCursor = 0;
 
   beforeAll(async () => {
     paperclipHome = await mkdtemp(join(tmpdir(), "heartbeat-live-run-cap-home-"));
@@ -137,6 +140,7 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
 
   async function seedCompany() {
     companyId = randomUUID();
+    createdAtCursor = Date.now() - 20 * 60_000;
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
@@ -201,13 +205,16 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
     runClass: RunClass = "general",
     wake: {
       requestedByActorType?: "user" | "agent" | "system";
+      requestedByActorId?: string;
       reason?: string;
       contextWakeReason?: string;
       issueStatus?: "todo" | "in_review";
       issueOriginKind?: string;
+      issueExecutionState?: Record<string, unknown>;
+      createdAt?: Date;
     } = {},
   ) {
-    const createdAt = new Date((createdAtCursor += 60_000));
+    const createdAt = wake.createdAt ?? new Date((createdAtCursor += 60_000));
     const issueId = randomUUID();
     await db.insert(issues).values({
       id: issueId,
@@ -216,6 +223,7 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
       status: wake.issueStatus ?? "todo",
       assigneeAgentId: agentId,
       originKind: wake.issueOriginKind ?? (runClass === "review_recovery" ? "stranded_issue_recovery" : "manual"),
+      ...(wake.issueExecutionState ? { executionState: wake.issueExecutionState } : {}),
     });
     const wakeupRequestId = randomUUID();
     const runId = randomUUID();
@@ -230,7 +238,8 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
       payload: { issueId },
       status: "queued",
       requestedByActorType,
-      requestedByActorId: requestedByActorType === "user" ? "board-user" : requestedByActorType === "agent" ? agentId : null,
+      requestedByActorId: wake.requestedByActorId ??
+        (requestedByActorType === "user" ? "board-user" : requestedByActorType === "agent" ? agentId : null),
       createdAt,
       requestedAt: createdAt,
     });
@@ -438,17 +447,83 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
     expect(await statusesOf({ olderGeneral, boardWake: boardWake!.id })).toEqual({ olderGeneral: "queued", boardWake: "running" });
   });
 
-  it.each([
-    { label: "an issue that is in_review", wake: { requestedByActorType: "agent", issueStatus: "in_review" } },
-    { label: "a recovery-origin issue", wake: { requestedByActorType: "agent", issueOriginKind: "stranded_issue_recovery" } },
-    { label: "a server recovery wake", wake: { requestedByActorType: "system", reason: "source_scoped_recovery_action" } },
-  ] as const)("(i) genuine review or recovery work on $label still starts in a reserved slot", async ({ wake }) => {
+  /** A review stage the execution policy put in front of `participantAgentId`. */
+  function pendingReviewStage(participantAgentId: string, executorAgentId: string) {
+    return {
+      status: "pending",
+      currentStageId: randomUUID(),
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: participantAgentId },
+      returnAssignee: { type: "agent", agentId: executorAgentId },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    };
+  }
+
+  it("(i) genuine review work on a pending review stage the run's agent is the participant of starts in a reserved slot", async () => {
     const olderGeneral = await seedReservedSlotsFree();
-    const genuine = await seedQueuedRun(await seedAgent("Reviewer"), "general", wake);
+    const executor = await seedAgent("Executor");
+    const reviewer = await seedAgent("Reviewer");
+    // The executor's submission wakes the reviewer: the wake row names the
+    // executor (an agent) and the reason is free text; the stage is the fact.
+    const genuine = await seedQueuedRun(reviewer, "general", {
+      requestedByActorType: "agent",
+      requestedByActorId: executor,
+      reason: "execution_review_requested",
+      issueStatus: "in_review",
+      issueExecutionState: pendingReviewStage(reviewer, executor),
+    });
 
     await heartbeat.resumeQueuedRuns();
 
     expect(await statusesOf({ olderGeneral, genuine })).toEqual({ olderGeneral: "queued", genuine: "running" });
+  });
+
+  it("(i) genuine recovery work on a recovery-origin issue starts in a reserved slot", async () => {
+    const olderGeneral = await seedReservedSlotsFree();
+    const genuine = await seedQueuedRun(await seedAgent("Recoverer"), "general", {
+      requestedByActorType: "agent",
+      issueOriginKind: "stranded_issue_recovery",
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    expect(await statusesOf({ olderGeneral, genuine })).toEqual({ olderGeneral: "queued", genuine: "running" });
+  });
+
+  /** The run did not take a reserved slot, and the older general run gets the next general slot first. */
+  async function expectGeneralBehindOlderRun(olderGeneral: string, candidate: string) {
+    await heartbeat.resumeQueuedRuns();
+    expect(await statusesOf({ olderGeneral, candidate })).toEqual({ olderGeneral: "queued", candidate: "queued" });
+    await finishLiveRuns(1);
+    await heartbeat.resumeQueuedRuns();
+    expect(await statusesOf({ olderGeneral, candidate })).toEqual({ olderGeneral: "running", candidate: "queued" });
+  }
+
+  it("(i) a pending review stage of another agent does not lift the run's class", async () => {
+    const olderGeneral = await seedReservedSlotsFree();
+    const executor = await seedAgent("Executor");
+    const bystander = await seedAgent("Bystander");
+    const candidate = await seedQueuedRun(bystander, "general", {
+      requestedByActorType: "agent",
+      issueStatus: "in_review",
+      issueExecutionState: pendingReviewStage(await seedAgent("RealReviewer"), executor),
+    });
+
+    await expectGeneralBehindOlderRun(olderGeneral, candidate);
+  });
+
+  it("(i) a server wake with a review or recovery reason on an ordinary issue is general: the reason is never read", async () => {
+    const olderGeneral = await seedReservedSlotsFree();
+    const candidate = await seedQueuedRun(await seedAgent("Owner"), "general", {
+      requestedByActorType: "system",
+      reason: "source_scoped_recovery_action",
+      contextWakeReason: "source_scoped_recovery_action",
+    });
+
+    await expectGeneralBehindOlderRun(olderGeneral, candidate);
   });
 
   it("(i) a review reason merged into the run context by a coalesced wake does not change the run's class", async () => {
@@ -470,7 +545,7 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
     expect(await statusesOf({ olderGeneral, merged })).toEqual({ olderGeneral: "running", merged: "queued" });
   });
 
-  it("(i) an agent's wake bound to another agent's in_review issue never runs in a reserved slot", async () => {
+  it("(i) an agent's wake bound to another agent's in_review issue never runs ahead of an older general run", async () => {
     const olderGeneral = await seedReservedSlotsFree();
     const owner = await seedAgent("Owner");
     const intruder = await seedAgent("Intruder");
@@ -483,18 +558,283 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
       assigneeAgentId: owner,
     });
 
-    // The payload binds the run to the in_review issue, so it is ordered as
-    // review work; the claim then refuses it because the issue is not its own.
     const forged = await heartbeat.wakeup(intruder, {
       ...routeWake({ type: "agent", agentId: intruder }, "execution_review_requested"),
       payload: { issueId },
     });
     expect(forged).not.toBeNull();
     await heartbeat.resumeQueuedRuns();
-
-    expect(mockAdapterExecute.mock.calls.some(([context]) => context?.runId === forged!.id)).toBe(false);
-    expect(await heartbeat.getRun(forged!.id)).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed" });
     expect(await statusOf(olderGeneral)).toBe("queued");
+
+    await finishLiveRuns(1);
+    await heartbeat.resumeQueuedRuns();
+    expect(await statusOf(olderGeneral)).toBe("running");
+    expect(mockAdapterExecute.mock.calls.some(([context]) => context?.runId === forged!.id)).toBe(false);
+  });
+
+  // ─── (j) round 2: in_review status a caller can set confers nothing ──────
+
+  /** A card as `POST /companies/:id/issues` creates it for an agent caller: `in_review`, manual origin, no review stage. */
+  async function createInReviewCardAsAgent(creatorAgentId: string, assigneeAgentId: string) {
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Self-made review card",
+      status: "in_review",
+      assigneeAgentId,
+      createdByAgentId: creatorAgentId,
+      originKind: "manual",
+    });
+    return issueId;
+  }
+
+  it("(j) an agent's own card created in_review does not move its self-wake into a reserved slot", async () => {
+    const olderGeneral = await seedReservedSlotsFree();
+    const agent = await seedAgent("SelfReviewer");
+    const issueId = await createInReviewCardAsAgent(agent, agent);
+
+    const forged = await heartbeat.wakeup(agent, {
+      ...routeWake({ type: "agent", agentId: agent }, "issue_assigned"),
+      payload: { issueId },
+    });
+    expect(forged).not.toBeNull();
+
+    await expectGeneralBehindOlderRun(olderGeneral, forged!.id);
+  });
+
+  it("(j) an in_review card another agent created for this agent, plus a comment wake, does not take a reserved slot", async () => {
+    const olderGeneral = await seedReservedSlotsFree();
+    const creator = await seedAgent("Creator");
+    const target = await seedAgent("Target");
+    const issueId = await createInReviewCardAsAgent(creator, target);
+
+    // The comment wake an agent's comment raises for the assignee.
+    const forged = await heartbeat.wakeup(target, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId },
+      requestedByActorType: "agent",
+      requestedByActorId: creator,
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_commented", source: "issue.comment" },
+    });
+    expect(forged).not.toBeNull();
+
+    await expectGeneralBehindOlderRun(olderGeneral, forged!.id);
+  });
+
+  // ─── (k) round 2: a plugin's chosen reason confers nothing ───────────────
+
+  const pluginId = "6f0f3c1e-4c1a-4d2b-9a55-2f4a3b1c9d10";
+  const pluginKey = "example.plugin";
+
+  it.each([
+    {
+      label: "issues.requestWakeup with execution_review_requested",
+      build: (issueId: string) => ({
+        source: "assignment" as const,
+        triggerDetail: "system" as const,
+        reason: "execution_review_requested",
+        payload: { issueId, mutation: "plugin_wakeup", pluginId, pluginKey, contextSource: "plugin.issue.requestWakeup" },
+        requestedByActorType: "system" as const,
+        requestedByActorId: pluginId,
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "execution_review_requested",
+          source: "plugin.issue.requestWakeup",
+          pluginId,
+          pluginKey,
+        },
+      }),
+    },
+    {
+      label: "agents.invoke with source_scoped_recovery_action",
+      build: () => ({
+        source: "automation" as const,
+        triggerDetail: "system" as const,
+        reason: "source_scoped_recovery_action",
+        payload: { prompt: "do the thing" },
+        contextSnapshot: {
+          wakeReason: "source_scoped_recovery_action",
+          paperclipAgentMessage: { text: "do the thing", source: "plugin_invoke", pluginKey },
+        },
+        requestedByActorType: "system" as const,
+        requestedByActorId: pluginId,
+      }),
+    },
+    {
+      label: "agentSessions.sendMessage with native_completion_review",
+      build: () => ({
+        source: "automation" as const,
+        triggerDetail: "system" as const,
+        reason: "native_completion_review",
+        payload: { prompt: "continue" },
+        contextSnapshot: {
+          taskKey: `plugin:${pluginKey}:session:session-1`,
+          wakeReason: "native_completion_review",
+          wakeSource: "automation",
+          wakeTriggerDetail: "system",
+          paperclipAgentMessage: { text: "continue", source: "plugin_session", pluginKey, sessionId: "session-1" },
+        },
+        requestedByActorType: "system" as const,
+        requestedByActorId: pluginId,
+      }),
+    },
+  ])("(k) a plugin wake ($label) does not take a reserved slot", async ({ build }) => {
+    const olderGeneral = await seedReservedSlotsFree();
+    const target = await seedAgent("PluginTarget");
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Plugin card", status: "todo", assigneeAgentId: target });
+
+    const forged = await heartbeat.wakeup(target, build(issueId));
+    expect(forged).not.toBeNull();
+
+    await expectGeneralBehindOlderRun(olderGeneral, forged!.id);
+  });
+
+  // ─── (l) round 2: every claim of a queued run passes the cap ─────────────
+
+  it("(l) a direct claim through executeRun (self-declared workspace preparation) does not start a queued run past a full cap", async () => {
+    await seedCompany();
+    await setCap(1);
+    await seedLiveRuns(1);
+    const queued = await seedQueuedRun(await seedAgent("Direct"), "human_board");
+
+    await heartbeat.prepareWorkspaceForSelfDeclaredRun(queued);
+
+    expect(await statusOf(queued)).toBe("queued");
+    expect(await heartbeat.getLiveRunCapStatus()).toMatchObject({ liveRuns: 1 });
+  });
+
+  // ─── (m) round 2: a corrupt stored setting fails closed ──────────────────
+
+  it("(m) a corrupt stored liveRunCap fails closed to the ceiling and keeps the other general settings", async () => {
+    await seedCompany();
+    await instanceSettingsService(db).updateGeneral({ censorUsernameInLogs: true });
+    const [row] = await db.select().from(instanceSettings).limit(1);
+    await db.update(instanceSettings)
+      .set({ general: { ...(row!.general ?? {}), liveRunCap: "not-a-number" } })
+      .where(eq(instanceSettings.id, row!.id));
+    invalidateLiveRunCapSettingCache();
+
+    expect(await instanceSettingsService(db).getGeneral()).toMatchObject({ liveRunCap: 15, censorUsernameInLogs: true });
+
+    await seedLiveRuns(15);
+    const queued = await seedQueuedRun(await seedAgent("Waiting"), "human_board");
+    await heartbeat.resumeQueuedRuns();
+    expect(await statusOf(queued)).toBe("queued");
+  });
+
+  // ─── (n) round 2: aging and within-agent order ───────────────────────────
+
+  it("(n) a general run waiting longer than the aging window starts ahead of a newer review flood", async () => {
+    await seedCompany();
+    await setCap(10);
+    await seedLiveRuns(7);
+    // 7 live: one general slot and the 2 reserved slots are free.
+    const aged = await seedQueuedRun(await seedAgent("Aged"), "general", { createdAt: new Date(Date.now() - 40 * 60_000) });
+    const flood = [
+      await seedQueuedRun(await seedAgent("R1"), "review_recovery"),
+      await seedQueuedRun(await seedAgent("R2"), "review_recovery"),
+      await seedQueuedRun(await seedAgent("R3"), "review_recovery"),
+    ];
+
+    await heartbeat.resumeQueuedRuns();
+
+    expect(await statusOf(aged)).toBe("running");
+    expect((await Promise.all(flood.map(statusOf))).filter((status) => status === "running")).toHaveLength(2);
+  });
+
+  it("(n) an aged general waiter does not hold review work out of a free reserved slot it cannot use itself", async () => {
+    await seedCompany();
+    await setCap(10);
+    await seedLiveRuns(9);
+    // 9 live: the general slots are full and one reserved slot is free.
+    const aged = await seedQueuedRun(await seedAgent("Aged"), "general", { createdAt: new Date(Date.now() - 40 * 60_000) });
+    const review = await seedQueuedRun(await seedAgent("Reviewer"), "review_recovery");
+
+    await heartbeat.resumeQueuedRuns();
+
+    expect(await statusesOf({ aged, review })).toEqual({ aged: "queued", review: "running" });
+  });
+
+  it.each(["human_board", "review_recovery"] as const)(
+    "(n) an agent at one slot starts its newer %s run before its own older general run when only reserved slots are free",
+    async (priorityClass) => {
+      await seedCompany();
+      await setCap(10);
+      await seedLiveRuns(8);
+      const agent = await seedAgent("OneSlot", { maxConcurrentRuns: 1 });
+      const olderGeneral = await seedQueuedRun(agent, "general");
+      const priority = await seedQueuedRun(agent, priorityClass);
+
+      await heartbeat.resumeQueuedRuns();
+
+      expect(await statusesOf({ olderGeneral, priority })).toEqual({ olderGeneral: "queued", priority: "running" });
+    },
+  );
+
+  // ─── (o) round 2: admissions still claiming count toward the cap ─────────
+
+  it("(o) two agents racing for the last general slot start exactly one run while the first claim is still committing", async () => {
+    await seedCompany();
+    await setCap(10);
+    await seedLiveRuns(7);
+    const first = await seedAgent("RaceA");
+    const second = await seedAgent("RaceB");
+    // Hold every queued -> running claim for 400 ms so the second admission
+    // is decided while the first claim is not yet visible as a running row.
+    await db.execute(sql`CREATE OR REPLACE FUNCTION test_slow_live_run_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        PERFORM pg_sleep(0.4);
+        RETURN NEW;
+      END;
+    $$`);
+    await db.execute(sql`CREATE TRIGGER test_slow_live_run_claim
+      BEFORE UPDATE OF status ON heartbeat_runs FOR EACH ROW
+      WHEN (NEW.status = 'running' AND OLD.status = 'queued')
+      EXECUTE FUNCTION test_slow_live_run_claim()`);
+    let runs: Array<{ id: string } | null>;
+    try {
+      // Each wake queues its run and admits it at once: two admissions race.
+      runs = await Promise.all([
+        heartbeat.wakeup(first, routeWake({ type: "agent", agentId: first }, "race")),
+        heartbeat.wakeup(second, routeWake({ type: "agent", agentId: second }, "race")),
+      ]);
+    } finally {
+      await db.execute(sql`DROP TRIGGER IF EXISTS test_slow_live_run_claim ON heartbeat_runs`);
+      await db.execute(sql`DROP FUNCTION IF EXISTS test_slow_live_run_claim()`);
+    }
+    expect(runs.every(Boolean)).toBe(true);
+    const [firstRun, secondRun] = runs.map((run) => run!.id);
+
+    const statuses = await Promise.all([firstRun, secondRun].map(statusOf));
+    expect(statuses.filter((status) => status === "running")).toHaveLength(1);
+    expect(await heartbeat.getLiveRunCapStatus()).toMatchObject({ liveRuns: 8 });
+  });
+
+  it("(o) a waiter whose run left the queue no longer holds a place in line", async () => {
+    await seedCompany();
+    await setCap(10);
+    await seedLiveRuns(8);
+    const staleAgent = await seedAgent("Stale");
+    const staleRun = await seedQueuedRun(staleAgent);
+    // The older run waits on the cap and is recorded as a cap-waiter.
+    await heartbeat.resumeQueuedRuns();
+    expect(liveRunCapAdmission.listWaiters().map((waiter) => waiter.runId)).toEqual([staleRun]);
+
+    // Its run leaves the queue outside admission (an operator cancel), and a
+    // general slot frees. A newer run of another agent takes it.
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, staleRun));
+    await finishLiveRuns(1);
+    const newerAgent = await seedAgent("Newer");
+    const newer = await heartbeat.wakeup(newerAgent, routeWake({ type: "agent", agentId: newerAgent }, "newer"));
+    expect(newer).not.toBeNull();
+
+    expect(await statusOf(newer!.id)).toBe("running");
   });
 
   // ─── (d) router input ─────────────────────────────────────────────────────

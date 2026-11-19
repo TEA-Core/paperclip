@@ -599,7 +599,7 @@ server/src/__tests__/helpers/paperclip-semantic-conformance.ts(54,24): TS2749
 server/src/__tests__/helpers/route-test-harness.ts(24,14): TS4023
 server/src/__tests__/http-log-redaction.test.ts(256,20): TS2339
 server/src/__tests__/inbox-archive-routes.test.ts(226,23): TS2502
-server/src/__tests__/instance-settings-routes.test.ts(1288,49): TS2345
+server/src/__tests__/instance-settings-routes.test.ts(1292,49): TS2345
 server/src/__tests__/instrumentation.test.ts(310,70): TS2307
 server/src/__tests__/invite-test-resolution-route.test.ts(69,7): TS2322
 server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts(4294,98): TS2322
