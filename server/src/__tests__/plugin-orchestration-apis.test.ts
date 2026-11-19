@@ -211,6 +211,46 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     await expect(services.executionWorkspaces.get({ workspaceId, companyId: otherCompanyId })).resolves.toBeNull();
   });
 
+  it("does not store a plugin-claimed run of another agent as the origin run", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const victimAgentId = randomUUID();
+    const victimRunId = randomUUID();
+    await db.insert(agents).values({
+      id: victimAgentId,
+      companyId,
+      name: "Victim",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: victimRunId,
+      companyId,
+      agentId: victimAgentId,
+      status: "running",
+      invocationSource: "timer",
+      contextSnapshot: { wakeReason: "heartbeat_timer" },
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    const issue = await services.issues.create({
+      companyId,
+      title: "Plugin forged origin",
+      status: "todo",
+      assigneeAgentId: victimAgentId,
+      actorAgentId: agentId,
+      actorRunId: victimRunId,
+    });
+
+    const [stored] = await db.select().from(issues).where(eq(issues.id, issue.id));
+    // A plugin can only claim a run; it does not authenticate it. A claimed
+    // run of another agent is never stored as the ownership proof.
+    expect(stored?.originRunId).toBeNull();
+  });
+
   it("creates plugin-origin issues with full orchestration fields and audit activity", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const blockerIssueId = randomUUID();

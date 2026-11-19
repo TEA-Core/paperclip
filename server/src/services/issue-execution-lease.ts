@@ -115,6 +115,30 @@ function runAuthoredIssueAssignment(runId: SQLWrapper | string): SQL {
 }
 
 /**
+ * SUP-20121: true when `runId` is the card's recorded author — it created the
+ * card (`originRunId`) or changed its assignee to the current assignee. This
+ * is the same server-recorded proof `findLiveIssueExecutionHolder` uses; a
+ * claimed run id alone is never proof.
+ */
+export async function runIsIssueAuthor(
+  db: Pick<Db, "select">,
+  companyId: string,
+  issueId: string,
+  runId: string,
+): Promise<boolean> {
+  const rows = await db
+    .select({ id: issues.id })
+    .from(issues)
+    .where(and(
+      eq(issues.companyId, companyId),
+      eq(issues.id, issueId),
+      runAuthoredIssueAssignment(runId),
+    ))
+    .limit(1);
+  return rows.length > 0;
+}
+
+/**
  * Finds the owner before acquiring an issue execution lock. The caller must
  * hold the issue row lock until its stamp commits. Include legacy
  * context-only owners and queued reservations, not just running direct leases.

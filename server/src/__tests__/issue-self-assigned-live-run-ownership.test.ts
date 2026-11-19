@@ -1053,6 +1053,147 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     expect(run!.status).toBe("running");
   });
 
+  it("a board cancel does not kill an issue-less author whose run context is null", async () => {
+    const { companyId, writerAgentId, writerRunId, issueId } = await seedHeldCard({ authorStatus: "running" });
+    await db.update(heartbeatRuns).set({ contextSnapshot: null }).where(eq(heartbeatRuns.id, writerRunId));
+
+    const cancel = await request(appFor(boardActor(companyId))).patch(`/api/issues/${issueId}`).send({ status: "cancelled" });
+    expect(cancel.status, JSON.stringify(cancel.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, writerRunId));
+    expect(run!.status).toBe("running");
+  });
+
+  it("a lock clear through the shared issue service promotes the held wake", async () => {
+    const { writerAgentId, writerRunId, issueId, wakeId } = await seedHeldCard({ authorStatus: "failed" });
+    runningProcesses.delete(writerRunId);
+    const { issueService } = await import("../services/issues.ts");
+    await issueService(db).update(issueId, { status: "todo" });
+    await expectWakePromoted(issueId, writerAgentId, writerRunId, wakeId);
+  });
+
+  it("the sweep promotes a held wake on an already-unlocked card", async () => {
+    const { writerAgentId, writerRunId, issueId, wakeId } = await seedHeldCard({ authorStatus: "failed" });
+    runningProcesses.delete(writerRunId);
+    await db.update(issues)
+      .set({ checkoutRunId: null, executionRunId: null, executionAgentNameKey: null, executionLockedAt: null })
+      .where(eq(issues.id, issueId));
+
+    await heartbeat.sweepStaleIssueLocks();
+    await expectWakePromoted(issueId, writerAgentId, writerRunId, wakeId);
+  });
+
+  it("the silence lapse never clears a live card-scoped run", async () => {
+    const { writerAgentId, writerRunId, issueId } = await seedHeldCard({ authorStatus: "running" });
+    await db.update(heartbeatRuns)
+      .set({
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+        startedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+        createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+        lastOutputAt: null,
+      })
+      .where(eq(heartbeatRuns.id, writerRunId));
+
+    const result = await heartbeat.sweepStaleIssueLocks();
+    expect(result.cleared).toBe(0);
+    expect((await cardRow(issueId)).executionRunId).toBe(writerRunId);
+  });
+
+  it("a board reassign does not hold the new assignee's wakes behind the previous author", async () => {
+    const { companyId, writerAgentId, peerAgentId, writerRunId } = await seed();
+    const writer = appFor(agentActor(companyId, writerAgentId, writerRunId));
+    const created = await request(writer)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Cross-agent hold", status: "in_progress", assigneeAgentId: writerAgentId });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    const issueId = created.body.id as string;
+    const comment = await request(appFor(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Board follow-up." });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+    await expectAuthorKeepsCard(issueId, writerAgentId, writerRunId);
+
+    const reassign = await request(appFor(boardActor(companyId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ assigneeAgentId: peerAgentId });
+    expect(reassign.status, JSON.stringify(reassign.body)).toBe(200);
+    const [author] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, writerRunId));
+    expect(author!.status).toBe("running");
+
+    await heartbeat.wakeup(peerAgentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "board_wake",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "board_wake" },
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+    });
+    await vi.waitFor(
+      async () => {
+        expect(await otherRunsForCard(issueId, peerAgentId, writerRunId)).toHaveLength(1);
+      },
+      { timeout: WAKE_SETTLE_MS * 2, interval: 50 },
+    );
+  });
+
+  it("the silence lapse reaches a queued successor behind a silent author", async () => {
+    const { companyId, writerAgentId, peerAgentId, writerRunId } = await seed();
+    const writer = appFor(agentActor(companyId, writerAgentId, writerRunId));
+    const created = await request(writer)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Queued successor lapse", status: "in_progress", assigneeAgentId: writerAgentId });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    const issueId = created.body.id as string;
+    const comment = await request(appFor(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Board follow-up." });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+    await expectAuthorKeepsCard(issueId, writerAgentId, writerRunId);
+    // The only waiting work is the queued successor run, not a deferred wake.
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: peerAgentId,
+      status: "queued",
+      invocationSource: "assignment",
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+    await db.update(heartbeatRuns)
+      .set({
+        startedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+        createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+        lastOutputAt: null,
+      })
+      .where(eq(heartbeatRuns.id, writerRunId));
+
+    const result = await heartbeat.sweepStaleIssueLocks();
+    expect(result.cleared).toBe(1);
+    expect((await cardRow(issueId)).executionRunId).toBeNull();
+  });
+
+  it("a board cancel still stops a checked-out run that did not author the card", async () => {
+    const { companyId, issuePrefix, writerAgentId, writerRunId } = await seed();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Checked-out card",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: writerAgentId,
+      checkoutRunId: writerRunId,
+      executionRunId: writerRunId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    const cancel = await request(appFor(boardActor(companyId))).patch(`/api/issues/${issueId}`).send({ status: "cancelled" });
+    expect(cancel.status, JSON.stringify(cancel.body)).toBe(200);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, writerRunId));
+    expect(run!.status).toBe("cancelled");
+  });
+
   it("a local_trusted request with only a run header does not forge the proof", async () => {
     const { companyId, writerAgentId, issueId, forgedRunId } = await seedForgedHeaderCard();
 

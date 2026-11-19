@@ -207,6 +207,7 @@ import {
 } from "../issue-continuation-path.js";
 import {
   ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS,
+  findLiveIssueExecutionHolder,
   listUnlockedIssuesWithDeferredWakesForRun,
   resolveLiveExecutionLeases,
   type LiveExecutionLease,
@@ -9572,6 +9573,10 @@ export function recoveryService(
     const silentRunIds = new Set<string>();
     for (const row of runRows) {
       if (row.status !== "running") continue;
+      // The lapse exists for issue-less authors: a run whose recorded
+      // context names a card is that card's live worker, and its lock is
+      // cleared by its own finish, never by this sweep.
+      if (issueIdFromRunContext(row.contextSnapshot)) continue;
       const lastActivityAt = row.lastOutputAt ?? row.startedAt ?? row.createdAt;
       if (lastActivityAt && sweepNow.getTime() - new Date(lastActivityAt).getTime() > ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS) {
         silentRunIds.add(row.id);
@@ -9592,12 +9597,30 @@ export function recoveryService(
         if (wakeIssueId && candidateIssueIds.has(wakeIssueId)) deferredWakeIssueIds.add(wakeIssueId);
       }
     }
+    // Waiting work behind a silent author is not only a deferred wake: a
+    // successor already promoted to a queued run for the card is held the
+    // same way, and the lapse must reach it too.
+    const waitingIssueIds = new Set(deferredWakeIssueIds);
+    if (candidates.length > 0) {
+      const candidateIssueIds = [...new Set(candidates.map((issue) => issue.id))];
+      const queuedRows = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(and(
+          inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' in (${sql.join(candidateIssueIds.map((id) => sql`${id}`), sql`, `)})`,
+        ));
+      for (const row of queuedRows) {
+        const queuedIssueId = issueIdFromRunContext(row.contextSnapshot);
+        if (queuedIssueId) waitingIssueIds.add(queuedIssueId);
+      }
+    }
     const isCleanable = (runId: string | null, issueId?: string) => {
       if (!runId) return true;
       const status = runStatusById.get(runId);
       if (!status) return true; // missing run row → no real claim
       if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(status)) return true;
-      return Boolean(issueId && silentRunIds.has(runId) && deferredWakeIssueIds.has(issueId));
+      return Boolean(issueId && silentRunIds.has(runId) && waitingIssueIds.has(issueId));
     };
 
     for (const issue of candidates) {
@@ -9677,6 +9700,64 @@ export function recoveryService(
         );
       }
       });
+    }
+
+    // Every lock clear does not pass through the route's promotion hook
+    // (hook-less service updates, checkout, release, plugin host writes):
+    // those cards are already unlocked, so the candidate pass above never
+    // sees them and a held wake strands forever. Visit unlocked cards that
+    // still hold a deferred wake and promote it when no live holder remains.
+    const unlockedHeldCards = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        assigneeAgentId: issues.assigneeAgentId,
+        originRunId: issues.originRunId,
+      })
+      .from(issues)
+      .where(and(
+        isNull(issues.executionRunId),
+        isNull(issues.checkoutRunId),
+        sql`exists (
+          select 1 from ${agentWakeupRequests}
+          where ${agentWakeupRequests.companyId} = ${issues.companyId}
+            and ${agentWakeupRequests.status} = 'deferred_issue_execution'
+            and ${agentWakeupRequests.payload} ->> 'issueId' = ${issues.id}::text
+        )`,
+      ));
+    for (const card of unlockedHeldCards) {
+      if (result.issueIds.includes(card.id)) continue;
+      const holder = await findLiveIssueExecutionHolder(db, card.companyId, card.id).catch((err) => {
+        logger.error({ err, issueId: card.id }, "failed to resolve the holder of an unlocked card with a held wake");
+        return null;
+      });
+      if (holder) continue;
+      let promotionRun = card.originRunId
+        ? await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, card.originRunId)).then((rows) => rows[0] ?? null)
+        : null;
+      if (!promotionRun) {
+        const [wake] = await db
+          .select({ agentId: agentWakeupRequests.agentId })
+          .from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.companyId, card.companyId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${card.id}::text`,
+          ))
+          .orderBy(asc(agentWakeupRequests.requestedAt))
+          .limit(1);
+        if (wake) {
+          promotionRun = await db
+            .select()
+            .from(heartbeatRuns)
+            .where(and(eq(heartbeatRuns.companyId, card.companyId), eq(heartbeatRuns.agentId, wake.agentId)))
+            .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+        }
+      }
+      if (!promotionRun) continue;
+      await promoteDeferredWakesAfterLockClear(promotionRun, [card.id]);
     }
 
     if (result.cleared > 0 || result.terminalizedRunIds.length > 0) {

@@ -1923,11 +1923,26 @@ export function buildHostServices(
             ? pluginOperationIssueOriginKind(pluginKey)
             : originKind,
         );
+        // originRunId is ownership proof. A plugin only claims a run id; it
+        // does not authenticate it, so the claim is stored only when the
+        // recorded run belongs to the acting agent in this company. A claim
+        // naming another agent's run is dropped, never stored.
+        const claimedRunId = params.originRunId ?? actorRunId ?? null;
+        let verifiedOriginRunId: string | null = null;
+        if (claimedRunId && actorAgentId) {
+          const [claimedRun] = await db
+            .select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, companyId: heartbeatRuns.companyId })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, claimedRunId));
+          if (claimedRun && claimedRun.companyId === companyId && claimedRun.agentId === actorAgentId) {
+            verifiedOriginRunId = claimedRunId;
+          }
+        }
         const issue = (await issues.create(companyId, {
           ...(issueInput as any),
           originKind: normalizedOriginKind,
           originId: params.originId ?? null,
-          originRunId: params.originRunId ?? actorRunId ?? null,
+          originRunId: verifiedOriginRunId,
           createdByAgentId: actorAgentId ?? null,
           createdByUserId: actorUserId ?? null,
           actorResponsibleUserId: actorUserId ?? null,

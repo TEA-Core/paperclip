@@ -1,3 +1,4 @@
+import { runIsIssueAuthor } from "../services/issue-execution-lease.js";
 import { setIssueTitle } from "../services/issue-title.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
 import { resolveConfirmationFromComment } from "../services/confirmation-comment-resolution.js";
@@ -10035,24 +10036,34 @@ export function issueRoutes(
 
   async function resolveActiveIssueRun(issue: {
     id: string;
+    companyId?: string | null;
     assigneeAgentId: string | null;
     executionRunId?: string | null;
     checkoutRunId?: string | null;
-  }, opts?: { allowIssueLessStampedRunId?: string | null }) {
+  }) {
     let runToInterrupt = issue.executionRunId
       ? await heartbeat.getRun(issue.executionRunId)
       : null;
 
     // An issue-less author run adopted through the SUP-20121 stamp is not the
-    // card's own run: its context names no issue (the adoption stamps both
-    // pointers), so it must never become the interruptible run for this card.
-    // Only a stamped run whose context names this card is the card's run.
-    if (runToInterrupt?.contextSnapshot && typeof runToInterrupt.contextSnapshot === "object") {
+    // card's own run: the adoption stamps both pointers, but the run is only
+    // interruptible here when it is not the card's recorded author, or when
+    // a server-recorded context names this card. Authorship is the recorded
+    // origin/activity proof, never the pointer alone: a null or empty
+    // context says nothing either way, and a checked-out run that did not
+    // author the card keeps the base interrupt behavior.
+    if (runToInterrupt) {
+      const contextSnapshot = runToInterrupt.contextSnapshot;
       const stampedIssueId =
-        typeof (runToInterrupt.contextSnapshot as Record<string, unknown>).issueId === "string"
-          ? ((runToInterrupt.contextSnapshot as Record<string, unknown>).issueId as string)
+        contextSnapshot && typeof contextSnapshot === "object" &&
+        typeof (contextSnapshot as Record<string, unknown>).issueId === "string"
+          ? ((contextSnapshot as Record<string, unknown>).issueId as string)
           : null;
-      if (stampedIssueId !== issue.id && runToInterrupt.id !== opts?.allowIssueLessStampedRunId) {
+      if (
+        stampedIssueId !== issue.id &&
+        issue.companyId &&
+        (await runIsIssueAuthor(db, issue.companyId, issue.id, runToInterrupt.id))
+      ) {
         runToInterrupt = null;
       }
     }
@@ -21072,13 +21083,11 @@ export function issueRoutes(
         issueId: existing.id,
         agentId: existing.assigneeAgentId,
       });
-      const runToStopForReassignment = await resolveActiveIssueRun(existing, {
-        // A workflow-controlled stage handoff issued by the stamped run
-        // itself still cancels that issuer after it hands off. An adopted
-        // issue-less author is never interrupted this way.
-        allowIssueLessStampedRunId:
-          transition.workflowControlledAssignment && actor.runId ? actor.runId : null,
-      });
+      // A workflow-controlled stage handoff issued by the card's own run
+      // still cancels that issuer after it hands off. An adopted issue-less
+      // author is never interrupted this way: resolveActiveIssueRun spares
+      // it through the recorded authorship proof, with no exception here.
+      const runToStopForReassignment = await resolveActiveIssueRun(existing);
       const isIssuingRunStageHandoff = transition.workflowControlledAssignment &&
         !terminalApprovalNeedsClassificationCheck &&
         actor.runId !== null &&

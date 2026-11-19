@@ -271,7 +271,7 @@ import { isTransactionHandle } from "./db-handle.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
-import { findLiveIssueExecutionHolder } from "./issue-execution-lease.js";
+import { findLiveIssueExecutionHolder, runIsIssueAuthor } from "./issue-execution-lease.js";
 
 const ALL_ISSUE_STATUSES = [
   "backlog",
@@ -12645,7 +12645,30 @@ export function issueService(
           (receiptExisting.executionRunId || receiptExisting.checkoutRunId)
         ) {
           const holder = await findLiveIssueExecutionHolder(tx as Db, receiptExisting.companyId, id);
+          // An adopted issue-less author does not keep the card across a
+          // reassignment: its stamp is authorship of the previous assignee,
+          // and keeping it holds the new assignee's wakes behind a run that
+          // is not working this card. A run whose recorded context names
+          // this card is its genuine worker and keeps the hold.
+          const adoptedAuthorHold = holder
+            ? await (async () => {
+                if (patch.assigneeAgentId === undefined || patch.assigneeAgentId === holder.agentId) return false;
+                const [holderRun] = await tx
+                  .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+                  .from(heartbeatRuns)
+                  .where(eq(heartbeatRuns.id, holder.runId));
+                const holderContext = holderRun?.contextSnapshot;
+                const holderIssueId =
+                  holderContext && typeof holderContext === "object" &&
+                  typeof (holderContext as Record<string, unknown>).issueId === "string"
+                    ? ((holderContext as Record<string, unknown>).issueId as string)
+                    : null;
+                if (holderIssueId === id) return false;
+                return runIsIssueAuthor(tx as Db, receiptExisting.companyId, id, holder.runId);
+              })()
+            : false;
           if (
+            !adoptedAuthorHold &&
             holder?.status === "running" &&
             (holder.runId === receiptExisting.executionRunId || holder.runId === receiptExisting.checkoutRunId)
           ) {
@@ -13075,6 +13098,18 @@ export function issueService(
       if (result && existing.executionRunId && !result.executionRunId) {
         if (!isTransactionHandle(dbOrTx)) {
           await notifyExecutionLockCleared(existing.companyId, id, existing.executionRunId);
+          // Callers that construct the service without the route's hook
+          // (heartbeat-internal, channel and plugin writes) still promote
+          // the wakes held behind the cleared lock, through the same
+          // post-commit action the transactional path queues. Without this
+          // the held wake stayed deferred with no lock left to release it.
+          if (!opts.onExecutionLockCleared) {
+            queuedPostCommitActions.push({
+              type: "promote_deferred_wakes",
+              runId: existing.executionRunId,
+              issueId: id,
+            });
+          }
         } else if (postCommitActions) {
           postCommitActions.push({
             type: "promote_deferred_wakes",
