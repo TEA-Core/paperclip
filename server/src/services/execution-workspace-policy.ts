@@ -262,6 +262,56 @@ export function inheritedExecutionWorkspaceBranchExempt(input: {
   });
 }
 
+/** Release and integration branch families no card may deliver on, whatever the project configures. */
+const PROTECTED_BRANCH_PREFIXES = ["release/", "releases/", "hotfix/", "fold/", "fold-sync/"];
+
+/** A branch or ref name in comparable form: trimmed, lowercased, without `refs/heads/` or trailing slashes. */
+function comparableBranchName(name: string): string {
+  const lowered = name.trim().toLowerCase();
+  const local = lowered.startsWith("refs/heads/") ? lowered.slice("refs/heads/".length) : lowered;
+  return local.replace(/\/+$/, "");
+}
+
+/**
+ * The branch names a stored default ref can denote. The control plane stores refs in several
+ * forms (`main`, `origin/main`, `upstream/main`, `refs/heads/main`, `refs/remotes/origin/main`).
+ * A `refs/heads/<x>` ref names exactly the local branch `x`; a `refs/remotes/<remote>/<x>` ref
+ * names `x`; a bare ref names itself or, when its first segment is a remote, the rest.
+ */
+function branchNamesOfRef(ref: string): string[] {
+  const lowered = ref.trim().toLowerCase().replace(/\/+$/, "");
+  if (lowered.startsWith("refs/heads/")) return [lowered.slice("refs/heads/".length)];
+  const remoteTracking = /^refs\/remotes\/[^/]+\/(.+)$/.exec(lowered);
+  if (remoteTracking) return [remoteTracking[1]!];
+  // Without the first path segment (a remote name); a ref with no slash yields itself again.
+  return [lowered, lowered.slice(lowered.indexOf("/") + 1)];
+}
+
+/**
+ * SUP-24409: a branch no card may claim as its own delivery branch, because it lands
+ * integration or release work. One predicate guards every place such a branch could reach a
+ * card's execution-workspace row: exact-branch and templated realization, and the board PATCH
+ * of a row's branch.
+ *
+ * True, independent of any configuration, for `main`, `master`, `release/*`, `releases/*`,
+ * `hotfix/*`, `fold/*` and `fold-sync/*`, and for any branch on a `project_primary` row (the
+ * project's own checkout is never a card's delivery row). Also true for any of `defaultRefs`, the
+ * repo default/base refs the caller knows (project workspace default and repo refs, a row's or
+ * strategy's base ref, the remote's default branch), in whatever form they are stored.
+ * Case-insensitive, and blind to a `refs/heads/` prefix, surrounding whitespace and trailing slashes.
+ */
+export function isProtectedDeliveryBranch(input: {
+  branch: string;
+  defaultRefs?: ReadonlyArray<string | null | undefined>;
+  workspaceMode?: string | null;
+}): boolean {
+  if (input.workspaceMode === "project_primary") return true;
+  const candidate = comparableBranchName(input.branch);
+  if (candidate === "main" || candidate === "master") return true;
+  if (PROTECTED_BRANCH_PREFIXES.some((prefix) => candidate.startsWith(prefix))) return true;
+  return (input.defaultRefs ?? []).some((ref) => !!ref && branchNamesOfRef(ref).includes(candidate));
+}
+
 /**
  * SUP-15205 (narrowed by SUP-15231): should a `reuse_existing` binding be
  * declined because it would restore this issue onto another issue's delivery

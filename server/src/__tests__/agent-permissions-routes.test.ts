@@ -224,7 +224,7 @@ function registerModuleMocks() {
 }
 
 function createDbStub(options: { requireBoardApprovalForNewAgents?: boolean } = {}) {
-  return {
+  const stub = {
     select: vi.fn().mockReturnValue({
       from: vi.fn().mockReturnValue({
         where: vi.fn().mockReturnValue({
@@ -235,10 +235,14 @@ function createDbStub(options: { requireBoardApprovalForNewAgents?: boolean } = 
               requireBoardApprovalForNewAgents: options.requireBoardApprovalForNewAgents ?? false,
             }])),
           ),
+          // Row lock taken by the agent permissions transaction.
+          for: vi.fn().mockResolvedValue([]),
         }),
       }),
     }),
+    transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(stub)),
   };
+  return stub;
 }
 
 async function requestApp(
@@ -2026,10 +2030,12 @@ describe("agent permission routes", () => {
       .send({ canCreateAgents: false, canAssignTasks: true }));
 
     expect(res.status).toBe(200);
+    // canAssignTasks matches the agent's simple_default effective value, so it
+    // is not merged into the stored permissions.
     expect(mockAgentService.updatePermissions).toHaveBeenCalledWith(agentId, {
       canCreateAgents: false,
-      canAssignTasks: true,
     });
+    expect(mockAccessService.setPrincipalPermission).not.toHaveBeenCalled();
     expect(res.body.permissions.canCreateSkills).toBe(false);
   });
 

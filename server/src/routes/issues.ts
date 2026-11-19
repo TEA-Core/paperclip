@@ -298,6 +298,7 @@ import {
   TIER1_FORM,
   verifyNoRepositoryLandingAtTransition,
   writeAuditLog,
+  writeGuardSkippedAuditLog,
   writeDoneTransitionRefusedAuditLog,
   type DoneTierClosingActor,
   type DoneTransitionOverride,
@@ -5556,7 +5557,7 @@ export function issueRoutes(
     // skipped result is allowed by construction, so that branch needs no extra row.
     const recordGuardSkipDisposition = () => {
       if (!guardResult.skipped) return;
-      void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+      void writeGuardSkippedAuditLog(db, issue, {
         reason: guardResult.reason,
         skipReason: guardResult.skipReason,
         branch: guardResult.branch,

@@ -732,4 +732,114 @@ describe("execution workspace routes", () => {
     // The reopen keeps its reusable leases because the fence skipped the destroy.
     expect(mockEnvironmentRuntimeService.destroyReusableSandboxLeases).not.toHaveBeenCalled();
   });
+
+  describe("SUP-24409: a workspace row cannot be pointed at a protected base branch", () => {
+    /** A fake db whose only read is the project-workspace ref lookup. */
+    function refsDb(refs: Array<{ defaultRef: string | null; repoRef: string | null }>) {
+      return { select: () => ({ from: () => ({ where: () => Promise.resolve(refs) }) }) };
+    }
+
+    function givenWorkspace(overrides: Record<string, unknown> = {}) {
+      mockExecutionWorkspaceService.getById.mockResolvedValue({
+        id: "workspace-1",
+        companyId: "company-1",
+        projectId: "project-1",
+        sourceIssueId: "issue-1",
+        status: "active",
+        mode: "isolated_workspace",
+        baseRef: "origin/develop",
+        branchName: "PAP-1-own-work",
+        ...overrides,
+      });
+      mockExecutionWorkspaceService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        id: "workspace-1",
+        companyId: "company-1",
+        ...patch,
+      }));
+    }
+
+    async function patchBranch(body: Record<string, unknown>, refs: Array<{ defaultRef: string | null; repoRef: string | null }> = []) {
+      return request(createApp(undefined, refsDb(refs))).patch("/api/execution-workspaces/workspace-1").send(body);
+    }
+
+    it.each([
+      ["the fold branch", { branchName: "fold/tea-patches-v2026.722.0" }, []],
+      ["the row's base ref", { branchName: "develop" }, []],
+      ["a base ref sent in the same patch", { branchName: "release", baseRef: "origin/release" }, []],
+      ["the project's default ref", { branchName: "main" }, [{ defaultRef: "main", repoRef: null }]],
+      ["the project's repo ref", { branchName: "trunk" }, [{ defaultRef: null, repoRef: "trunk" }]],
+    ] as const)("refuses %s with 422 and writes nothing", async (_label, body, refs) => {
+      givenWorkspace();
+
+      const res = await patchBranch(body, [...refs]);
+
+      expect(res.status).toBe(422);
+      expect(mockExecutionWorkspaceService.update).not.toHaveBeenCalled();
+    });
+
+    it("accepts the card's own branch", async () => {
+      givenWorkspace();
+
+      const res = await patchBranch({ branchName: "PAP-1-rebased-work" }, [{ defaultRef: "main", repoRef: "main" }]);
+
+      expect(res.status).toBe(200);
+      expect(mockExecutionWorkspaceService.update).toHaveBeenCalledWith("workspace-1", { branchName: "PAP-1-rebased-work" });
+    });
+
+    it("leaves an unchanged branch alone, so a project_primary row on the default branch stays editable", async () => {
+      givenWorkspace({ mode: "project_primary", baseRef: "origin/main", branchName: "main" });
+
+      const res = await patchBranch({ name: "Primary checkout", branchName: "main" }, [{ defaultRef: "main", repoRef: "main" }]);
+
+      expect(res.status).toBe(200);
+      expect(mockExecutionWorkspaceService.update).toHaveBeenCalledWith("workspace-1", { name: "Primary checkout", branchName: "main" });
+    });
+
+    it("accepts clearing the branch", async () => {
+      givenWorkspace();
+
+      const res = await patchBranch({ branchName: null });
+
+      expect(res.status).toBe(200);
+      expect(mockExecutionWorkspaceService.update).toHaveBeenCalledWith("workspace-1", { branchName: null });
+    });
+
+    // The standard protected classes hold with no configuration naming them.
+    it.each([
+      "main", "master", "release/1.2", "releases/v1", "hotfix/urgent", "fold/anything", "fold-sync/2026.11",
+    ])("refuses %s with 422 even when no ref configuration names it", async (branchName) => {
+      givenWorkspace({ baseRef: null });
+
+      const res = await patchBranch({ branchName });
+
+      expect(res.status).toBe(422);
+      expect(mockExecutionWorkspaceService.update).not.toHaveBeenCalled();
+    });
+
+    it("refuses a branch change on a project_primary row, which is never a delivery row", async () => {
+      givenWorkspace({ mode: "project_primary", baseRef: null, branchName: null });
+
+      const res = await patchBranch({ branchName: "PAP-1-own-work" });
+
+      expect(res.status).toBe(422);
+      expect(mockExecutionWorkspaceService.update).not.toHaveBeenCalled();
+    });
+
+    it("refuses the project default branch stored as refs/heads/<branch>", async () => {
+      givenWorkspace({ baseRef: null });
+
+      const res = await patchBranch({ branchName: "trunk" }, [{ defaultRef: "refs/heads/trunk", repoRef: null }]);
+
+      expect(res.status).toBe(422);
+      expect(mockExecutionWorkspaceService.update).not.toHaveBeenCalled();
+    });
+
+    it("does not protect a bare name that is only the last segment of a namespaced local ref", async () => {
+      givenWorkspace({ baseRef: null });
+
+      const res = await patchBranch({ branchName: "trunk" }, [{ defaultRef: "refs/heads/team/trunk", repoRef: null }]);
+
+      expect(res.status).toBe(200);
+    });
+  });
 });
