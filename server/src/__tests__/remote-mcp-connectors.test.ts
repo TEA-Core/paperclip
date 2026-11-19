@@ -286,7 +286,9 @@ describe("remote connector lifecycle", () => {
 
     const laterRun = await callIn(runs[1]!.id);
     expect(laterRun.reasonCode).toBe("provider_interaction_required");
-    expect(linkUrls(laterRun)).toEqual([]);
+    // The handoff itself still arrives, with its links removed.
+    expect(laterRun.details?.upstreamPending).toMatchObject({ kind: "authorization", elicitationId: "link-1" });
+    expect(laterRun.details?.upstreamPending?.links).toEqual([]);
     expect(toolCalls).toBe(1);
   });
 
