@@ -975,6 +975,21 @@ describeEmbeddedPostgres("summary slot service", () => {
         expect(description.match(HIDDEN_LINE)?.[1]).toBe("1");
       });
 
+      it("counts only hidden cards the includeHidden=true issue list returns (harness cards are excluded)", async () => {
+        const companyId = await seedCompany();
+        const projectId = await seedProject(companyId);
+        await seedSummarizer(companyId);
+        const hiddenAt = new Date(Date.now() - 3_600_000);
+
+        await seedCard(companyId, projectId, 361, { title: "Hidden plain card", status: "in_progress", hiddenAt });
+        await seedCard(companyId, projectId, 362, { title: "Hidden harness card", status: "in_progress", hiddenAt, harnessKind: "skill_test" });
+        await seedCard(companyId, projectId, 363, { title: "Hidden harness done card", status: "done", hiddenAt, harnessKind: "skill_test" });
+
+        const description = await generatedDescription(projectSelector(companyId, projectId));
+
+        expect(description.match(HIDDEN_LINE)?.[1]).toBe("1");
+      });
+
       it("tells the generator to use includeHidden=true for activity-window claims", async () => {
         const companyId = await seedCompany();
         const projectId = await seedProject(companyId);

@@ -33,6 +33,7 @@ import { builtInAgentService } from "./built-in-agents.js";
 import { agentService } from "./agents.js";
 import { issueService } from "./issues.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
+import { includeHiddenIssueCondition } from "./issue-visibility.js";
 import {
   generationWroteSlotSql,
   readGenerationToken,
@@ -659,11 +660,14 @@ export function summarySlotService(db: Db) {
         .groupBy(issues.id)
         .orderBy(desc(issues.updatedAt)).limit(SUMMARY_SNAPSHOT_GROUP_LIMIT),
       // Hidden cards the sections above leave out: same company/scope filters and the
-      // same status/window predicates, so the count describes exactly the excluded population.
+      // same status/window predicates, restricted to the cards the `includeHidden=true`
+      // issue list returns (the read the generation card points at), so the count and
+      // that list describe the same population.
       db.select({ count: sql<number>`count(*)::int` }).from(issues)
         .where(and(
           eq(issues.companyId, sel.companyId),
           isNotNull(issues.hiddenAt),
+          includeHiddenIssueCondition(),
           ...scopeIssueConditions(sel),
           or(
             inArray(issues.status, ["blocked", "in_review", "in_progress"]),
