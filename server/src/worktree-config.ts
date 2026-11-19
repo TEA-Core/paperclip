@@ -77,6 +77,45 @@ type WorktreeRuntimeContext = {
   secretsKeyFilePath: string;
 };
 
+// The boot context for a refused env file, derived only from facts the
+// server records itself: the physical `.paperclip` layout and the
+// operator environment. Nothing the refused file claims about identity
+// (home, instance, name) is honoured, so a refused worktree can never
+// boot sharing another instance's data dir, port or master-key file.
+function resolveWorktreeIsolatedFallbackContext(
+  context: WorktreeRuntimeContext,
+  env: NodeJS.ProcessEnv,
+): WorktreeRuntimeContext {
+  const worktreeStateDir = path.dirname(context.configPath);
+  const isUidScopedWorktreeState =
+    /^uid-\d+$/.test(path.basename(worktreeStateDir))
+    && path.basename(path.dirname(worktreeStateDir)) === ".paperclip";
+  const worktreeRoot = isUidScopedWorktreeState
+    ? path.resolve(worktreeStateDir, "..", "..")
+    : path.resolve(worktreeStateDir, "..");
+  const worktreeName = nonEmpty(env.PAPERCLIP_WORKTREE_NAME) ?? path.basename(worktreeRoot);
+  const instanceId = sanitizeWorktreeInstanceId(worktreeName);
+  const homeDir = resolveHomeAwarePath(
+    nonEmpty(env.PAPERCLIP_WORKTREES_DIR) ?? "~/.paperclip-worktrees",
+  );
+  const instanceRoot = path.resolve(homeDir, "instances", instanceId);
+
+  return {
+    configPath: context.configPath,
+    envPath: context.envPath,
+    worktreeName,
+    instanceId,
+    homeDir,
+    instanceRoot,
+    contextPath: path.resolve(homeDir, "context.json"),
+    embeddedPostgresDataDir: path.resolve(instanceRoot, "db"),
+    backupDir: path.resolve(instanceRoot, "data", "backups"),
+    logDir: path.resolve(instanceRoot, "logs"),
+    storageDir: path.resolve(instanceRoot, "data", "storage"),
+    secretsKeyFilePath: path.resolve("/etc/paperclip/worktrees", instanceId, "master.key"),
+  };
+}
+
 function resolveWorktreeRuntimeContext(
   env: NodeJS.ProcessEnv,
   overrideConfigPath?: string,
@@ -454,6 +493,7 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
   }
 
   // Compute the env repair before anything else is touched.
+  let effectiveContext: WorktreeRuntimeContext = context;
   let existingContents: string | null = null;
   let toolActionSigningSecret = "";
   let repairedContents: string | null = null;
@@ -495,6 +535,7 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
       `Skipping worktree env repair for ${context.envPath}: ${error instanceof Error ? error.message : String(error)}`,
     );
     repairedContents = null;
+    effectiveContext = resolveWorktreeIsolatedFallbackContext(context, process.env);
     if (!toolActionSigningSecret) {
       toolActionSigningSecret =
         nonEmpty(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET) ?? randomBytes(32).toString("hex");
@@ -502,26 +543,26 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
   }
   let repairedEnv = repairedContents !== null && existingContents !== repairedContents;
 
-  process.env.PAPERCLIP_HOME = context.homeDir;
-  process.env.PAPERCLIP_INSTANCE_ID = context.instanceId;
-  process.env.PAPERCLIP_CONFIG = context.configPath;
-  process.env.PAPERCLIP_CONTEXT = context.contextPath;
-  process.env.PAPERCLIP_WORKTREE_NAME = context.worktreeName;
+  process.env.PAPERCLIP_HOME = effectiveContext.homeDir;
+  process.env.PAPERCLIP_INSTANCE_ID = effectiveContext.instanceId;
+  process.env.PAPERCLIP_CONFIG = effectiveContext.configPath;
+  process.env.PAPERCLIP_CONTEXT = effectiveContext.contextPath;
+  process.env.PAPERCLIP_WORKTREE_NAME = effectiveContext.worktreeName;
 
   let repairedConfig = false;
-  if (fs.existsSync(context.configPath)) {
+  if (fs.existsSync(effectiveContext.configPath)) {
     try {
-      const runtimeConfig = withWorktreePortRegistryLockSync(context.homeDir, () => {
-        const parsed = JSON.parse(fs.readFileSync(context.configPath, "utf8")) as PaperclipConfig;
+      const runtimeConfig = withWorktreePortRegistryLockSync(effectiveContext.homeDir, () => {
+        const parsed = JSON.parse(fs.readFileSync(effectiveContext.configPath, "utf8")) as PaperclipConfig;
         let selectedConfig = parsed;
-        const registeredConfigPaths = readWorktreePortRegistry(context.homeDir);
-        const siblingPorts = collectSiblingWorktreePorts(context, registeredConfigPaths);
+        const registeredConfigPaths = readWorktreePortRegistry(effectiveContext.homeDir);
+        const siblingPorts = collectSiblingWorktreePorts(effectiveContext, registeredConfigPaths);
         const serverPortCollision = siblingPorts.serverPorts.has(parsed.server.port);
         const databasePortCollision =
           parsed.database.mode === "embedded-postgres" &&
           siblingPorts.databasePorts.has(parsed.database.embeddedPostgresPort);
 
-        if (needsWorktreeConfigRepair(parsed, context) || serverPortCollision || databasePortCollision) {
+        if (needsWorktreeConfigRepair(parsed, effectiveContext) || serverPortCollision || databasePortCollision) {
           const selectedServerPort = findNextUnclaimedPort(
             parsed.server.port === 3100 ? 3101 : parsed.server.port,
             siblingPorts.serverPorts,
@@ -536,17 +577,17 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
                 )
               : undefined;
 
-          selectedConfig = buildIsolatedWorktreeConfig(parsed, context, {
+          selectedConfig = buildIsolatedWorktreeConfig(parsed, effectiveContext, {
             serverPort: selectedServerPort,
             databasePort: selectedDatabasePort,
           });
-          writeConfigFile(context.configPath, selectedConfig);
+          writeConfigFile(effectiveContext.configPath, selectedConfig);
           repairedConfig = true;
 
           if (serverPortCollision || databasePortCollision) {
             console.warn(
               [
-                `Worktree port conflict detected for ${context.worktreeName}; updated and persisted workspace ports.`,
+                `Worktree port conflict detected for ${effectiveContext.worktreeName}; updated and persisted workspace ports.`,
                 ...(serverPortCollision
                   ? [`server: ${parsed.server.port} -> ${selectedServerPort}`]
                   : []),
@@ -558,10 +599,10 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
           }
         }
 
-        writeWorktreePortRegistry(context.homeDir, [
+        writeWorktreePortRegistry(effectiveContext.homeDir, [
           ...registeredConfigPaths,
           ...siblingPorts.configPaths,
-          context.configPath,
+          effectiveContext.configPath,
         ]);
         return selectedConfig;
       });
@@ -583,10 +624,10 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
 
   if (repairedEnv && repairedContents !== null) {
     try {
-      writeEnvFileAtomicallyIfChanged(context.envPath, existingContents, repairedContents);
+      writeEnvFileAtomicallyIfChanged(effectiveContext.envPath, existingContents, repairedContents);
     } catch (error) {
       console.warn(
-        `Skipping worktree env repair for ${context.envPath}: ${error instanceof Error ? error.message : String(error)}`,
+        `Skipping worktree env repair for ${effectiveContext.envPath}: ${error instanceof Error ? error.message : String(error)}`,
       );
       repairedEnv = false;
     }
