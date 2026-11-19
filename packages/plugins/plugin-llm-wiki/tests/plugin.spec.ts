@@ -2845,6 +2845,53 @@ Duplicate headings receive stable suffixes.
     ]));
   });
 
+  it("auto-applies a generated patch that shrinks a large existing page without tripping the agent-tool shrink guard", async () => {
+    const harness = createTestHarness({ manifest });
+    const project = existingProject();
+    const issue = paperclipIssue({
+      id: "77777777-7777-4777-8777-777777777793",
+      identifier: "PAP-4102",
+      title: "Implement project page writer",
+      description: "Implementation completed enough to publish the generated project page.",
+      status: "done",
+      projectId: project.id,
+      updatedAt: new Date("2026-05-04T10:00:00Z"),
+    });
+    const standupPath = "wiki/projects/existing-wiki-project/standup.md";
+    const bigExisting = `# Standup\n\n${"Stale generated standup content. ".repeat(400)}\n`;
+    expect(Buffer.byteLength(bigExisting)).toBeGreaterThanOrEqual(4096);
+    const files = new Map<string, string>([
+      ["wiki/index.md", DEFAULT_INDEX],
+      ["wiki/log.md", DEFAULT_LOG],
+      [standupPath, bigExisting],
+    ]);
+    harness.seed({ projects: [project], issues: [issue] });
+    harness.ctx.localFolders.readText = async (_companyId, _folderKey, relativePath) => {
+      const contents = files.get(relativePath);
+      if (contents == null) throw new Error(`missing ${relativePath}`);
+      return contents;
+    };
+    harness.ctx.localFolders.writeTextAtomic = async (_companyId, _folderKey, relativePath, contents) => {
+      files.set(relativePath, contents);
+      return harness.ctx.localFolders.status(COMPANY_ID, "wiki-root");
+    };
+
+    await plugin.definition.setup(harness.ctx);
+    const result = await harness.performAction<{ status: string; appliedPages: string[] }>("distill-paperclip-project-page", {
+      companyId: COMPANY_ID,
+      projectId: project.id,
+      autoApply: true,
+      maxCharacters: 20000,
+      includeSupportingPages: false,
+    });
+
+    expect(result.status).toBe("applied");
+    expect(result.appliedPages).toContain(standupPath);
+    expect(Buffer.byteLength(files.get(standupPath) ?? "")).toBeLessThan(Buffer.byteLength(bigExisting) / 2);
+    expect(files.get(standupPath)).toContain("## Executive Readout");
+    expect(files.get("wiki/log.md")).toContain("paperclip-distill | proposed");
+  });
+
   it("refuses auto-apply Paperclip project page patches in authenticated/public deployments", async () => {
     process.env.PAPERCLIP_DEPLOYMENT_MODE = "authenticated";
     process.env.PAPERCLIP_DEPLOYMENT_EXPOSURE = "public";
@@ -4400,6 +4447,37 @@ Duplicate headings receive stable suffixes.
     expect(harness.dbExecutes.some((execute) =>
       execute.sql.includes("wiki_query_sessions") && execute.params?.includes("completed"),
     )).toBe(true);
+  });
+
+  it("files an answer over a large existing page without tripping the agent-tool shrink guard", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.seed({ agents: [wikiMaintainerAgent()] });
+    const path = "wiki/concepts/plugin-boundaries.md";
+    const files = new Map<string, string>([[path, `# Old\n\n${"Old filed answer content. ".repeat(400)}\n`]]);
+    expect(Buffer.byteLength(files.get(path) ?? "")).toBeGreaterThanOrEqual(4096);
+    harness.ctx.localFolders.readText = async (_companyId, _folderKey, relativePath) => {
+      const contents = files.get(relativePath);
+      if (contents == null) throw new Error(`missing ${relativePath}`);
+      return contents;
+    };
+    harness.ctx.localFolders.writeTextAtomic = async (_companyId, _folderKey, relativePath, contents) => {
+      files.set(relativePath, contents);
+      return harness.ctx.localFolders.status(COMPANY_ID, "wiki-root");
+    };
+    await plugin.definition.setup(harness.ctx);
+
+    const result = await harness.performAction<{ path: string }>("file-as-page", {
+      companyId: COMPANY_ID,
+      querySessionId: "33333333-3333-4333-8333-333333333333",
+      question: "Where should wiki code live?",
+      answer: "Short.",
+      path,
+      title: "Plugin Boundaries",
+    });
+
+    expect(result.path).toBe(path);
+    expect(files.get(path)).toContain("Short.");
+    expect(files.get(path)).not.toContain("Old filed answer content.");
   });
 
   it("files a streamed query answer as a page through a hidden file-as-page operation", async () => {

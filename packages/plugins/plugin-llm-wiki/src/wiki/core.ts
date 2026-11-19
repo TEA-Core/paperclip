@@ -2030,9 +2030,9 @@ export async function writeWikiPage(ctx: PluginContext, input: WritePageInput) {
   const current = await readCurrentWithHash(ctx, input.companyId, path, space);
   assertNoNewRedactionPlaceholders(input.contents, current.contents, path);
   assertExpectedHash(input.expectedHash, current.hash, path);
-  // Only the agent-tool surface (the default writer) takes a caller-supplied full body that may be a stale or
-  // partial projection. Board UI saves are explicit human edits and plugin_internal bodies are generated.
-  const shrinkOverride = (input.writer ?? "agent_tool") === "agent_tool"
+  // Only callers that explicitly identify as the agent tool take a caller-supplied full body that may be a stale or
+  // partial projection. Board UI saves are explicit human edits; plugin_internal and unspecified writers are not guarded.
+  const shrinkOverride = input.writer === "agent_tool"
     ? assertNoDestructiveShrink(input.contents, current.contents, path, input.allowShrink === true)
     : null;
   await ctx.localFolders.writeTextAtomic(input.companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, path), input.contents);
@@ -3690,6 +3690,7 @@ export async function distillPaperclipProjectPage(ctx: PluginContext, input: Pap
       expectedHash: patch.currentHash,
       summary: `Paperclip distillation ${patch.operationType} from ${bundle.sourceHash}`,
       sourceRefs: patch.sourceRefs,
+      writer: "plugin_internal",
     });
     await upsertPageBinding(ctx, {
       companyId: input.companyId,
@@ -4205,6 +4206,7 @@ export async function fileQueryAnswerAsPage(ctx: PluginContext, input: FileQuery
     summary: `Filed query answer as ${path}`,
     sourceRefs: input.querySessionId ? [{ querySessionId: input.querySessionId }] : [],
     operationId: operation.operationId,
+    writer: "plugin_internal",
   });
   const affectedPage = {
     path,
@@ -4311,6 +4313,7 @@ export async function registerWikiTools(ctx: PluginContext) {
       contents: requireString(input.contents, "contents"),
       expectedHash: stringField(input.expectedHash),
       allowShrink: input.allowShrink === true,
+      writer: "agent_tool",
       summary: stringField(input.summary),
       sourceRefs: input.sourceRefs,
     });
@@ -4425,6 +4428,7 @@ export async function registerWikiTools(ctx: PluginContext) {
       contents: requireString(input.contents, "contents"),
       expectedHash: stringField(input.expectedHash),
       allowShrink: input.allowShrink === true,
+      writer: "agent_tool",
       summary: "Update index",
     });
     return { content: "Updated wiki/index.md", data: result };
