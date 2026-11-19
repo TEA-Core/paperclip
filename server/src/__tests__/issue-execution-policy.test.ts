@@ -6098,3 +6098,152 @@ describe("actor-versus-seat and stage membership compare principal ids exactly",
     ).toThrow("Only the active reviewer or approver can advance");
   });
 });
+
+// SUP-24563 round 3: the review stage a run is seated in is a server fact the
+// live-run cap reads, so the engine must never seat the delivery author on its
+// own delivery, and it records who seated each participant.
+describe("delivery seating never seats the delivery author and records the seat", () => {
+  const otherAgentId = "44444444-4444-4444-8444-444444444444";
+
+  it.each(["review", "approval"] as const)(
+    "refuses an agent's own %s stage on its own delivery when returnAssigneeAgentId names another agent",
+    (stageType) => {
+      const policy = normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: otherAgentId,
+        stages: [{ type: stageType, participants: [{ type: "agent", agentId: coderAgentId }] }],
+      })!;
+      for (const requestedStatus of ["in_review", "done"]) {
+        expect(() =>
+          applyIssueExecutionPolicyTransition({
+            issue: {
+              status: "in_progress",
+              assigneeAgentId: coderAgentId,
+              assigneeUserId: null,
+              executionPolicy: policy,
+              executionState: null,
+            },
+            policy,
+            requestedStatus,
+            requestedAssigneePatch: {},
+            actor: { agentId: coderAgentId },
+            commentBody: "Delivered.",
+          }),
+        ).toThrow(/delivery author/);
+      }
+    },
+  );
+
+  it("seats another participant of the same stage instead of the delivery author", () => {
+    const policy = normalizeIssueExecutionPolicy({
+      returnAssigneeAgentId: otherAgentId,
+      stages: [{
+        type: "review",
+        participants: [
+          { type: "agent", agentId: coderAgentId },
+          { type: "agent", agentId: qaAgentId },
+        ],
+      }],
+    })!;
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: null,
+      },
+      policy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: { assigneeAgentId: coderAgentId },
+      actor: { agentId: coderAgentId },
+      commentBody: "Delivered.",
+    });
+    expect(result.patch.executionState).toMatchObject({
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      deliveryAuthor: { type: "agent", agentId: coderAgentId },
+    });
+  });
+
+  it("records the participant and the actor that seated it on each seat", () => {
+    const policy = twoStagePolicy();
+    const delivered = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: null,
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: "Implemented.",
+    });
+    const reviewState = delivered.patch.executionState as IssueExecutionState;
+    expect(reviewState.participantSeat).toEqual({
+      participant: { type: "agent", agentId: qaAgentId, userId: null },
+      seatedBy: { type: "agent", agentId: coderAgentId, userId: null },
+    });
+    expect(parseIssueExecutionState(reviewState)!.participantSeat).toEqual(reviewState.participantSeat);
+
+    const approved = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: reviewState,
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Reviewed.",
+    });
+    expect((approved.patch.executionState as IssueExecutionState).participantSeat).toEqual({
+      participant: { type: "user", userId: ctoUserId, agentId: null },
+      seatedBy: { type: "agent", agentId: qaAgentId, userId: null },
+    });
+  });
+
+  it("keeps who seated a participant when that participant re-seats itself, and records a first self-seat as one", () => {
+    const policy = reviewOnlyPolicy();
+    const qa = { type: "agent" as const, agentId: qaAgentId, userId: null };
+    const coder = { type: "agent" as const, agentId: coderAgentId, userId: null };
+    const pendingState = (participantSeat: IssueExecutionState["participantSeat"]) => ({
+      status: "pending",
+      currentStageId: policy.stages[0].id,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      deliveryAuthor: { type: "agent", agentId: coderAgentId },
+      ...(participantSeat === undefined ? {} : { participantSeat }),
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    });
+    // The issue drifted out of in_review; the seated reviewer moves it back,
+    // which re-seats the same participant.
+    const reseatByParticipant = (executionState: Record<string, unknown>) =>
+      applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState,
+        },
+        policy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+      }).patch.executionState as IssueExecutionState;
+
+    expect(reseatByParticipant(pendingState({ participant: qa, seatedBy: coder })).participantSeat)
+      .toEqual({ participant: qa, seatedBy: coder });
+    expect(reseatByParticipant(pendingState(undefined)).participantSeat)
+      .toEqual({ participant: qa, seatedBy: qa });
+  });
+});

@@ -456,7 +456,6 @@ import {
   classifyLiveRunCapRun,
   compareLiveRunCapPrecedence,
   computeEffectiveLiveRunCap,
-  decideLiveRunCapAdmission,
   invalidateLiveRunCapSettingCache,
   isFreshLiveRunCapSignal,
   isLiveRunCapExemptAgent,
@@ -467,6 +466,7 @@ import {
   readLiveRunCapSetting,
   type EffectiveLiveRunCap,
   type LiveRunCapClass,
+  type LiveRunCapOccupancy,
   type LiveRunCapQueueEntry,
 } from "./live-run-cap.js";
 import { logActivity, logActivityInTransaction, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
@@ -19173,9 +19173,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // ─── SUP-24563 global live-run cap (see ./live-run-cap.ts) ────────────────
 
   async function resolveLiveRunCap(): Promise<EffectiveLiveRunCap | null> {
-    const setting = await readLiveRunCapSetting(
-      async () => (await instanceSettings.getGeneral()).liveRunCap ?? null,
-    );
+    const setting = await readLiveRunCapSetting(() => instanceSettings.getLiveRunCapSetting());
     return computeEffectiveLiveRunCap({
       setting,
       signals: listLiveRunCapSignals(),
@@ -19185,34 +19183,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   /**
    * Counted live runs: `running` rows instance-wide (every company) whose agent
-   * is not an external session. One query; the exemption is applied with the
-   * same predicate admission uses, so the two can never disagree.
+   * is not an external session, and how many of them are priority runs
+   * (human/board, review/recovery). One query; the class and the exemption use
+   * the same predicates admission uses, so the two can never disagree.
    */
-  async function countLiveRunsTowardCap() {
-    const rows = await db
-      .select({
-        adapterType: agents.adapterType,
-        workDelivery: sql<string | null>`${agents.runtimeConfig} ->> 'workDelivery'`,
-      })
-      .from(heartbeatRuns)
-      .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
-      .where(eq(heartbeatRuns.status, "running"));
-    return rows.filter(
-      (row) =>
-        !isLiveRunCapExemptAgent({
-          adapterType: row.adapterType,
-          runtimeConfig: { workDelivery: row.workDelivery },
-        }),
-    ).length;
+  async function countLiveRunCapOccupancy(): Promise<LiveRunCapOccupancy> {
+    const counted = (await listLiveRunCapCandidates(eq(heartbeatRuns.status, "running")))
+      .filter((run) => !run.exempt);
+    return {
+      total: counted.length,
+      reservedClass: counted.filter((run) => run.runClass !== "general").length,
+    };
   }
 
   /**
-   * Queued runs matching `where`, with their admission class and exemption.
-   * The class reads only server-recorded facts: the actor type on the run's
-   * own wake request row, and the issue row's origin kind and execution state
-   * (see `classifyLiveRunCapRun`). No wake reason (row or merged context) and
-   * no issue status is read, so no caller can lift a run into the reserved
-   * slots by choosing a reason or a status.
+   * Runs matching `where`, with their admission class and exemption. The
+   * class reads only server-recorded facts: the actor type and plugin stamp on
+   * the run's own wake request row, and the issue row's origin kind and
+   * execution state (see `classifyLiveRunCapRun`). No wake reason (row or
+   * merged context) and no issue status is read, so no caller can lift a run
+   * into the reserved slots by choosing a reason or a status.
    */
   async function listLiveRunCapCandidates(where: SQL | undefined) {
     const rows = await db
@@ -19223,6 +19213,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterType: agents.adapterType,
         workDelivery: sql<string | null>`${agents.runtimeConfig} ->> 'workDelivery'`,
         requestedByActorType: agentWakeupRequests.requestedByActorType,
+        wakePluginId: sql<string | null>`${agentWakeupRequests.payload} ->> 'pluginId'`,
         issueOriginKind: issues.originKind,
         issueExecutionState: issues.executionState,
       })
@@ -19249,14 +19240,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   /**
    * Cap-waiters of other agents that are ahead of `entry` in line, still
    * queued, and able to take a slot that is free now: a general waiter can
-   * only use a general slot, so while the general slots are full it does not
+   * only use a general slot, so while no general slot is free it does not
    * stand in front of review, recovery or human/board work. Entries whose run
    * left `queued` meanwhile are dropped.
    */
   async function countLiveRunCapWaitersAhead(
     entry: LiveRunCapQueueEntry,
-    cap: EffectiveLiveRunCap,
-    occupied: number,
+    free: { any: number; general: number },
   ) {
     const nowMs = Date.now();
     const ahead = liveRunCapAdmission
@@ -19278,7 +19268,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     for (const waiter of ahead) {
       if (!stillQueued.has(waiter.runId)) {
         liveRunCapAdmission.removeWaiter(waiter.runId);
-      } else if (waiter.runClass !== "general" || occupied < cap.generalCap) {
+      } else if (waiter.runClass !== "general" || free.general > 0) {
         count += 1;
       }
     }
@@ -19286,31 +19276,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   /**
-   * Count-and-reserve for one queued run, before it is claimed. Returns the
-   * reservation release when the run may be claimed. Otherwise the run is
+   * Count-and-reserve for one queued run, before it is claimed. Admitted: the
+   * result carries the reservation release. Not admitted: the run is
    * recorded as a cap-waiter and stays `queued`, untouched; nothing here reads
-   * or writes a running run. An admission that overruns the lock deadline is
-   * refused (stays queued for the next pass) and records nothing.
+   * or writes a running run. A decision that overruns the lock deadline is
+   * refused (`timedOut`), stays queued for the next pass and records nothing.
    */
-  async function admitUnderLiveRunCap(entry: LiveRunCapQueueEntry, cap: EffectiveLiveRunCap) {
-    return liveRunCapAdmission.withLock(async (lease) => {
-      const occupied = (await countLiveRunsTowardCap()) + liveRunCapAdmission.inFlight();
-      let decision = decideLiveRunCapAdmission({ cap, occupied, runClass: entry.runClass, aheadCount: 0 });
-      if (decision.admit) {
-        decision = decideLiveRunCapAdmission({
-          cap,
-          occupied,
-          runClass: entry.runClass,
-          aheadCount: await countLiveRunCapWaitersAhead(entry, cap, occupied),
-        });
-      }
-      if (lease.expired()) return null;
-      if (!decision.admit) {
-        liveRunCapAdmission.registerWaiter(entry);
-        return null;
-      }
-      return liveRunCapAdmission.reserve(entry.runId);
-    }, null);
+  function admitUnderLiveRunCap(entry: LiveRunCapQueueEntry, cap: EffectiveLiveRunCap) {
+    return liveRunCapAdmission.admit({
+      entry,
+      cap,
+      countLive: countLiveRunCapOccupancy,
+      countAhead: (free) => countLiveRunCapWaitersAhead(entry, free),
+    });
   }
 
   /**
@@ -19327,10 +19305,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const cap = await resolveLiveRunCap();
     if (!cap) return noReservation;
     const [entry] = await listLiveRunCapCandidates(eq(heartbeatRuns.id, run.id));
-    return admitUnderLiveRunCap(
+    const admission = await admitUnderLiveRunCap(
       entry ?? { runId: run.id, agentId: run.agentId, runClass: "general", createdAtMs: run.createdAt.getTime() },
       cap,
     );
+    return admission.admitted ? admission.release : null;
   }
 
   /**
@@ -19386,7 +19365,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if ((await getSchedulingSuppression()).suppressed) return;
       const cap = await resolveLiveRunCap();
       if (!cap || liveRunCapAdmission.waiterCount() === 0) return;
-      const occupied = (await countLiveRunsTowardCap()) + liveRunCapAdmission.inFlight();
+      const occupied = (await countLiveRunCapOccupancy()).total + liveRunCapAdmission.inFlight();
       if (occupied >= cap.effectiveCap) return;
       await startQueuedRunsInAdmissionOrder(await getWorktreeExecutionCutoff());
     });
@@ -19456,7 +19435,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
       effectiveCap: cap?.effectiveCap ?? null,
       generalCap: cap?.generalCap ?? null,
-      liveRuns: await countLiveRunsTowardCap(),
+      liveRuns: (await countLiveRunCapOccupancy()).total,
       admissionsInFlight: liveRunCapAdmission.inFlight(),
       queuedRuns: queued.length,
       queuedByClass,
@@ -24433,11 +24412,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // Gate BEFORE the claim: a run that does not fit is never claimed,
           // so it is never claimed-then-released; it simply stays queued.
           const entry = liveRunCapEntryFor(queuedRun);
-          releaseLiveRunCapSlot = await admitUnderLiveRunCap(entry, liveRunCap);
-          if (!releaseLiveRunCapSlot) {
+          const admission = await admitUnderLiveRunCap(entry, liveRunCap);
+          if (!admission.admitted) {
+            // A decision that overran the lock deadline (a stuck read) leaves
+            // the run queued and out of line; stop this pass for the agent so
+            // one stuck read costs one deadline, not one per queued run.
+            if (admission.timedOut) break;
             liveRunCapDeferred.push(entry);
             continue;
           }
+          releaseLiveRunCapSlot = admission.release;
         }
         let claimed: typeof heartbeatRuns.$inferSelect | null;
         try {

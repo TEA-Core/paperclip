@@ -14739,8 +14739,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       // The recovered run is itself a counted live run, so cap 1 is full.
       await instanceSettingsService(db).updateGeneral({ liveRunCap: 1 });
       invalidateLiveRunCapSettingCache();
-      const reserve = vi.spyOn(liveRunCapAdmission, "reserve");
-      const registerWaiter = vi.spyOn(liveRunCapAdmission, "registerWaiter");
+      // Reservations and waiter records only happen inside an admission.
+      const admit = vi.spyOn(liveRunCapAdmission, "admit");
       const factory = vi.fn(() => {
         throw new NativeRunnerOwnershipUnverifiedError();
       });
@@ -14756,11 +14756,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ]);
         await heartbeat.drainActiveRunExecutions();
         expect(factory).toHaveBeenCalledTimes(1);
-        expect(reserve.mock.calls.map(([runId]) => runId)).not.toContain(child.runId);
-        expect(registerWaiter.mock.calls.map(([entry]) => entry.runId)).not.toContain(child.runId);
+        expect(admit.mock.calls.map(([input]) => input.entry.runId)).not.toContain(child.runId);
       } finally {
-        reserve.mockRestore();
-        registerWaiter.mockRestore();
+        admit.mockRestore();
         await instanceSettingsService(db).updateGeneral({ liveRunCap: null });
         invalidateLiveRunCapSettingCache();
       }

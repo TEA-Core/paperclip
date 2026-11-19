@@ -892,6 +892,8 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       reason: "issue_commented",
       requestedByActorType: "user",
       requestedByActorId: humanUserId,
+      // SUP-24563: the relay is stamped, so the live-run cap keeps it out of the human/board slots.
+      payload: expect.objectContaining({ pluginId: "plugin-record-id", pluginKey: "paperclip.gateway" }),
     });
     expect(wakeupRequest?.status).toBe("queued");
     expect(wakeupRequest?.runId).toEqual(expect.any(String));
@@ -1057,6 +1059,49 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     expect(result.applied).toBe(true);
     const [row] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
     expect(row?.status).toBe("accepted");
+  });
+
+  it("stamps the plugin on the assignee wake a relayed interaction answer raises (SUP-24563)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const operatorUserId = randomUUID();
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: operatorUserId, status: "active", membershipRole: "operator",
+    });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Decision", status: "in_review", priority: "medium", assigneeAgentId: agentId,
+    });
+    // As in the comment-relay test: a full per-agent slot keeps the woken run queued.
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, agentId));
+    await db.insert(heartbeatRuns).values({
+      companyId, agentId, status: "running", invocationSource: "assignment", contextSnapshot: {},
+    });
+    const interactionId = await seedInteraction(companyId, issueId);
+    const services = buildHostServices(
+      db,
+      "plugin-record-id",
+      "paperclip.gateway",
+      createEventBusStub(),
+      undefined,
+      { heartbeatRuntimeEnv: {} },
+    );
+
+    const result = await services.issues.respondInteraction({
+      issueId, interactionId, companyId, action: "accept", actorUserId: operatorUserId,
+    });
+    expect(result.applied).toBe(true);
+
+    // The continuation wake is fire-and-forget.
+    await expect.poll(async () => (
+      await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId)))
+    )[0]).toMatchObject({
+      requestedByActorType: "user",
+      requestedByActorId: operatorUserId,
+      payload: expect.objectContaining({ pluginId: "plugin-record-id", pluginKey: "paperclip.gateway" }),
+    });
   });
 
   it.each(["accept", "reject"] as const)(

@@ -75,6 +75,7 @@ import type { IncomingMessage, RequestOptions as HttpRequestOptions } from "node
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
+import { unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
@@ -870,6 +871,18 @@ export function buildHostServices(
   };
 
   /**
+   * SUP-24563: the execution state (which review stage is pending, who is
+   * seated in it and who seated them) is written only by the execution-policy
+   * engine. A plugin issue write may not carry it, not even `null`: it could
+   * seat any agent in a review stage, or clear a pending one.
+   */
+  const refusePluginExecutionStateWrite = (fields: Record<string, unknown>) => {
+    if (Object.prototype.hasOwnProperty.call(fields, "executionState")) {
+      throw unprocessable("executionState is written only by the execution policy; a plugin issue write cannot set it");
+    }
+  };
+
+  /**
    * Verify `userId` is an active human member of `companyId` before letting a
    * plugin attribute a mutation to them. Mirrors the authorization bar the
    * web app's own board routes apply — a plugin can only ever attribute an
@@ -982,6 +995,10 @@ export function buildHostServices(
         sourceRunId: interaction.sourceRunId ?? null,
         ...(planReviewInteraction ? { planReviewInteraction } : {}),
         mutation: "interaction",
+        // SUP-24563: a human action a plugin relays is attributed to that
+        // human, but the live-run cap keeps it out of the human/board slots.
+        pluginId,
+        pluginKey,
       },
       requestedByActorType: "user",
       requestedByActorId: args.actorUserId,
@@ -1917,6 +1934,7 @@ export function buildHostServices(
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
+        refusePluginExecutionStateWrite(params as Record<string, unknown>);
         const { actorAgentId, actorUserId, actorRunId, originKind, surfaceVisibility, ...issueInput } = params;
         const normalizedOriginKind = normalizePluginOriginKind(
           surfaceVisibility === "plugin_operation" && !originKind
@@ -1955,6 +1973,7 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const existing = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const patch = { ...(params.patch as Record<string, unknown>) };
+        refusePluginExecutionStateWrite(patch);
         const actorAgentId = typeof patch.actorAgentId === "string" ? patch.actorAgentId : null;
         const actorUserId = typeof patch.actorUserId === "string" ? patch.actorUserId : null;
         const actorRunId = typeof patch.actorRunId === "string" ? patch.actorRunId : null;
@@ -2445,6 +2464,9 @@ export function buildHostServices(
                 issueId: issue.id,
                 commentId: comment.id,
                 mutation: "comment",
+                // SUP-24563: relayed, so not a human/board wake for the live-run cap.
+                pluginId,
+                pluginKey,
               },
               requestedByActorType: "user",
               requestedByActorId: params.actorUserId,

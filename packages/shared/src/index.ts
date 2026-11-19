@@ -1172,6 +1172,7 @@ export type {
   IssueExecutionStagePrincipal,
   IssueExecutionStallEscalationPolicy,
   IssueExecutionStallHandoff,
+  IssueExecutionParticipantSeat,
   IssueExecutionStallSignal,
   IssueExecutionDecision,
   IssueComment,

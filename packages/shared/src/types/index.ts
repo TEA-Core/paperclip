@@ -705,6 +705,7 @@ export type {
   IssueExecutionStagePrincipal,
   IssueExecutionStallEscalationPolicy,
   IssueExecutionStallHandoff,
+  IssueExecutionParticipantSeat,
   IssueExecutionStallSignal,
   IssueReviewRequest,
   IssueExecutionDecision,

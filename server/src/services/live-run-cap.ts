@@ -19,8 +19,13 @@
  * A signal can only lower the cap, never above S (itself at most
  * `LIVE_RUN_CAP_CEILING`), and never below the floor, so one slow router
  * sample cannot pin the fleet at 1. `LIVE_RUN_CAP_RESERVED_SLOTS` of the
- * effective cap are usable only by human/board and review/recovery work; an
- * operator cap below 3 shrinks the reserve so general work keeps one slot.
+ * effective cap are usable only by human/board and review/recovery work.
+ * Those priority runs fill the reserve first and hold general slots only
+ * beyond it (`liveRunCapFreeSlots`). A priority stream still goes first for a
+ * freed general slot, but a general run that has waited
+ * `LIVE_RUN_CAP_AGING_MS` is ordered with it and, being older, takes the next
+ * general slot that frees. An operator cap below 3 shrinks the reserve so
+ * general work keeps one slot.
  *
  * Phase-2 seam: a router-plugin advice value is a second lower-only signal
  * (`setLiveRunCapSignal({ source: "advice", ... })`); `computeEffectiveLiveRunCap`
@@ -110,38 +115,64 @@ export type LiveRunCapClass = (typeof LIVE_RUN_CAP_CLASSES)[number];
 const RECOVERY_ISSUE_ORIGIN_KINDS: ReadonlySet<string> = new Set(Object.values(RECOVERY_ORIGIN_KINDS));
 const REVIEW_STAGE_TYPES: ReadonlySet<string> = new Set(ISSUE_EXECUTION_STAGE_TYPES);
 
-/**
- * True when the issue's execution state, as the execution policy wrote it, has
- * a review or approval stage pending in front of this agent. Only the policy
- * engine writes `execution_state`: no issue or wake API accepts it, and an
- * issue created or set `in_review` by a caller has no pending stage.
- */
-function isPendingReviewParticipant(executionState: unknown, agentId: string) {
-  if (!executionState || typeof executionState !== "object") return false;
-  if (!("status" in executionState) || executionState.status !== "pending") return false;
-  if (!("currentStageType" in executionState) || typeof executionState.currentStageType !== "string") return false;
-  if (!REVIEW_STAGE_TYPES.has(executionState.currentStageType)) return false;
-  if (!("currentParticipant" in executionState)) return false;
-  const participant = executionState.currentParticipant;
-  return Boolean(
-    participant &&
-      typeof participant === "object" &&
-      "type" in participant &&
-      participant.type === "agent" &&
-      "agentId" in participant &&
-      participant.agentId === agentId,
-  );
+type LiveRunCapPrincipal = { type: "agent"; agentId: string } | { type: "user"; userId: string };
+
+function readPrincipal(value: unknown): LiveRunCapPrincipal | null {
+  if (!value || typeof value !== "object") return null;
+  const principal = value as { type?: unknown; agentId?: unknown; userId?: unknown };
+  if (principal.type === "agent" && typeof principal.agentId === "string" && principal.agentId) {
+    return { type: "agent", agentId: principal.agentId };
+  }
+  if (principal.type === "user" && typeof principal.userId === "string" && principal.userId) {
+    return { type: "user", userId: principal.userId };
+  }
+  return null;
+}
+
+function isAgentPrincipal(principal: LiveRunCapPrincipal | null, agentId: string) {
+  return principal?.type === "agent" && principal.agentId === agentId;
 }
 
 /**
- * The admission class of a queued run, only from facts the server records and
- * no caller-supplied field can set:
+ * True when the issue's execution state has a review or approval stage
+ * pending in front of this agent that someone else put there for someone
+ * else's work, as the execution-policy engine recorded it:
+ * - the agent is the current participant;
+ * - the delivery author (the assignee when the work was delivered) is known
+ *   and is not this agent;
+ * - the engine's seat record names this agent, seated by a board user or by a
+ *   different agent (a participant that seated itself does not count).
+ * The engine is the only writer of `execution_state`: no issue or wake API
+ * accepts it and the plugin host refuses it. A state without a seat record
+ * (written before the engine recorded seats) does not count.
+ */
+function isSeatedReviewParticipant(executionState: unknown, agentId: string) {
+  if (!executionState || typeof executionState !== "object") return false;
+  const state = executionState as Record<string, unknown>;
+  if (state.status !== "pending") return false;
+  if (typeof state.currentStageType !== "string" || !REVIEW_STAGE_TYPES.has(state.currentStageType)) return false;
+  if (!isAgentPrincipal(readPrincipal(state.currentParticipant), agentId)) return false;
+  const deliveryAuthor = readPrincipal(state.deliveryAuthor);
+  if (!deliveryAuthor || isAgentPrincipal(deliveryAuthor, agentId)) return false;
+  const seat = state.participantSeat;
+  if (!seat || typeof seat !== "object") return false;
+  const { participant, seatedBy } = seat as { participant?: unknown; seatedBy?: unknown };
+  if (!isAgentPrincipal(readPrincipal(participant), agentId)) return false;
+  const seater = readPrincipal(seatedBy);
+  return seater !== null && !isAgentPrincipal(seater, agentId);
+}
+
+/**
+ * The admission class of a run, only from facts the server records and no
+ * caller-supplied field can set:
  * - human/board: the run's own wake request row was recorded with a `user`
- *   actor; the wake routes take the actor type from the authenticated caller.
+ *   actor (the wake routes take the actor type from the authenticated caller)
+ *   and was not relayed by a plugin (the plugin host stamps its plugin id on
+ *   the wake request payload of every human action it relays).
  * - review/recovery: the run's issue row has a recovery origin kind (the issue
  *   API does not accept an origin kind; plugins are confined to `plugin:*`),
- *   or a review/approval stage the execution policy put in front of this very
- *   agent is pending on it.
+ *   or a review/approval stage is pending in front of this agent, seated by
+ *   someone else on someone else's delivery (`isSeatedReviewParticipant`).
  * A wake reason is never read, whoever wrote the row (agent, board, plugin or
  * server), and neither is the issue status: a caller can create or set an
  * issue `in_review` without any review stage.
@@ -149,13 +180,14 @@ function isPendingReviewParticipant(executionState: unknown, agentId: string) {
 export function classifyLiveRunCapRun(input: {
   agentId: string;
   requestedByActorType: string | null | undefined;
+  wakePluginId: string | null | undefined;
   issueOriginKind: string | null | undefined;
   issueExecutionState: unknown;
 }): LiveRunCapClass {
-  if (input.requestedByActorType === "user") return "human_board";
+  if (input.requestedByActorType === "user" && !input.wakePluginId) return "human_board";
   if (
     (input.issueOriginKind && RECOVERY_ISSUE_ORIGIN_KINDS.has(input.issueOriginKind)) ||
-    isPendingReviewParticipant(input.issueExecutionState, input.agentId)
+    isSeatedReviewParticipant(input.issueExecutionState, input.agentId)
   ) {
     return "review_recovery";
   }
@@ -246,24 +278,47 @@ export function computeEffectiveLiveRunCap(input: {
   };
 }
 
+/**
+ * Live runs counted toward the cap: `total` running (plus claiming), of which
+ * `reservedClass` are human/board or review/recovery runs.
+ */
+export interface LiveRunCapOccupancy {
+  total: number;
+  reservedClass: number;
+}
+
+/**
+ * Free slots now. Priority runs (human/board, review/recovery) fill the
+ * reserve first; only priority runs beyond the reserve hold general slots.
+ * So a priority stream holds general slots only while it runs beyond the
+ * reserve, and a general slot that frees is open to general work again.
+ */
+export function liveRunCapFreeSlots(cap: EffectiveLiveRunCap, occupancy: LiveRunCapOccupancy) {
+  const reserve = cap.effectiveCap - cap.generalCap;
+  const any = Math.max(0, cap.effectiveCap - occupancy.total);
+  const generalOccupied = occupancy.total - Math.min(occupancy.reservedClass, reserve);
+  return { any, general: Math.max(0, Math.min(any, cap.generalCap - generalOccupied)) };
+}
+
 export type LiveRunCapAdmissionDecision =
   | { admit: true }
   | { admit: false; reason: "cap_full" | "behind_earlier_waiters" };
 
 /**
- * `occupied` = counted running runs plus admissions still claiming.
- * `aheadCount` = cap-waiters of other agents with an earlier place in line.
+ * `occupancy` = counted running runs plus admissions still claiming.
+ * `aheadCount` = cap-waiters of other agents with an earlier place in line
+ * that could take one of the slots this run could take.
  */
 export function decideLiveRunCapAdmission(input: {
   cap: EffectiveLiveRunCap;
-  occupied: number;
+  occupancy: LiveRunCapOccupancy;
   runClass: LiveRunCapClass;
   aheadCount: number;
 }): LiveRunCapAdmissionDecision {
-  const limit = input.runClass === "general" ? input.cap.generalCap : input.cap.effectiveCap;
-  const free = limit - input.occupied;
-  if (free <= 0) return { admit: false, reason: "cap_full" };
-  if (input.aheadCount >= free) return { admit: false, reason: "behind_earlier_waiters" };
+  const free = liveRunCapFreeSlots(input.cap, input.occupancy);
+  const room = input.runClass === "general" ? free.general : free.any;
+  if (room <= 0) return { admit: false, reason: "cap_full" };
+  if (input.aheadCount >= room) return { admit: false, reason: "behind_earlier_waiters" };
   return { admit: true };
 }
 
@@ -428,42 +483,100 @@ export function startLiveRunCapRouterPoller(options: LiveRunCapRouterPollerOptio
   };
 }
 
-// ─── Setting cache ────────────────────────────────────────────────────────────
+// ─── Setting reader ───────────────────────────────────────────────────────────
 
-let settingCache: { value: number | null; atMs: number } | null = null;
+/** The stored setting as the cap reads it (see `readStoredLiveRunCap` in instance-settings). */
+export type LiveRunCapStoredSetting = { kind: "off" } | { kind: "cap"; value: number } | { kind: "invalid" };
 
 /**
- * Reads the `liveRunCap` setting through a short cache. A read failure keeps
- * the last good value; with none, the gate stays off (today's behaviour),
- * never a cap of 0.
+ * Reads the `liveRunCap` setting through a short cache, failing closed:
+ * - off (absent or null) turns the gate off;
+ * - an invalid stored value keeps the last valid cap this process read, so an
+ *   operator cap below 15 is not loosened, or the ceiling when it read none;
+ * - a failed read keeps the last value this process read (off included), or
+ *   the ceiling when it read none. Never a cap of 0, never off by accident.
  */
-export async function readLiveRunCapSetting(load: () => Promise<number | null>, nowMs = Date.now()) {
-  if (settingCache && nowMs - settingCache.atMs < LIVE_RUN_CAP_SETTING_TTL_MS) return settingCache.value;
-  try {
-    const value = await load();
-    settingCache = { value, atMs: nowMs };
-    if (value === null) liveRunCapAdmission.clearWaiters();
-    return value;
-  } catch (err) {
-    logger.warn({ err }, "failed to read the live-run cap setting; keeping the last value");
-    return settingCache?.value ?? null;
-  }
+export function createLiveRunCapSettingReader() {
+  let cache: { value: number | null; atMs: number } | null = null;
+  // undefined until this process has read the setting once.
+  let lastKnown: number | null | undefined;
+  return {
+    async read(load: () => Promise<LiveRunCapStoredSetting>, nowMs = Date.now()): Promise<number | null> {
+      if (cache && nowMs - cache.atMs < LIVE_RUN_CAP_SETTING_TTL_MS) return cache.value;
+      let value: number | null;
+      try {
+        const stored = await load();
+        if (stored.kind === "cap") {
+          value = stored.value;
+          lastKnown = value;
+        } else if (stored.kind === "off") {
+          value = null;
+          lastKnown = null;
+        } else {
+          value = typeof lastKnown === "number" ? lastKnown : LIVE_RUN_CAP_CEILING;
+          logger.warn({ cap: value }, "stored live-run cap setting is invalid; failing closed");
+        }
+      } catch (err) {
+        value = lastKnown === undefined ? LIVE_RUN_CAP_CEILING : lastKnown;
+        logger.warn({ err, cap: value }, "failed to read the live-run cap setting; keeping the last value, else the ceiling");
+        return value;
+      }
+      cache = { value, atMs: nowMs };
+      if (value === null) liveRunCapAdmission.clearWaiters();
+      return value;
+    },
+    invalidate() {
+      cache = null;
+    },
+  };
+}
+
+const liveRunCapSettingReader = createLiveRunCapSettingReader();
+
+export function readLiveRunCapSetting(load: () => Promise<LiveRunCapStoredSetting>, nowMs = Date.now()) {
+  return liveRunCapSettingReader.read(load, nowMs);
 }
 
 export function invalidateLiveRunCapSettingCache() {
-  settingCache = null;
+  liveRunCapSettingReader.invalidate();
 }
 
 // ─── Admission state ──────────────────────────────────────────────────────────
 
 const waiters = new Map<string, LiveRunCapQueueEntry>();
-let admissionsInFlight = 0;
+const admissionsInFlight: LiveRunCapOccupancy = { total: 0, reservedClass: 0 };
 let admissionLock: Promise<void> = Promise.resolve();
 const drainState: { running: Promise<void> | null; rerun: boolean } = { running: null, rerun: false };
 
-/** Handed to an admission-lock holder: `expired()` turns true once its deadline passed and the lock moved on. */
+/**
+ * Handed to an admission-lock holder. Reservations and waiter records go
+ * through it, so a holder that overran its deadline (the lock already moved
+ * on) can do neither: `reserve` returns null and `registerWaiter` is ignored.
+ */
 export interface LiveRunCapLockLease {
   expired(): boolean;
+  /** Takes one slot for a run about to be claimed; null once expired. The release is idempotent. */
+  reserve(runId: string, runClass: LiveRunCapClass): (() => void) | null;
+  /** Records a cap-waiter; ignored once expired. */
+  registerWaiter(entry: LiveRunCapQueueEntry): void;
+}
+
+export type LiveRunCapAdmissionResult =
+  | { admitted: true; release: () => void }
+  | { admitted: false; timedOut: boolean };
+
+function reserveSlot(runId: string, runClass: LiveRunCapClass) {
+  waiters.delete(runId);
+  const reservedClass = runClass === "general" ? 0 : 1;
+  admissionsInFlight.total += 1;
+  admissionsInFlight.reservedClass += reservedClass;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    admissionsInFlight.total -= 1;
+    admissionsInFlight.reservedClass -= reservedClass;
+  };
 }
 
 export const liveRunCapAdmission = {
@@ -473,8 +586,7 @@ export const liveRunCapAdmission = {
    *
    * Each holder gets `timeoutMs`. A holder that overruns resolves to
    * `onTimeout` (callers pass a refusal), the lock passes to the next holder,
-   * and the overrun holder's lease reports `expired()` so it must not reserve
-   * or register anything when it finally returns.
+   * and the overrun holder's lease refuses any later reservation or waiter.
    */
   async withLock<T>(
     fn: (lease: LiveRunCapLockLease) => Promise<T>,
@@ -498,29 +610,60 @@ export const liveRunCapAdmission = {
       }, timeoutMs);
       timer.unref?.();
     });
+    const lease: LiveRunCapLockLease = {
+      expired: () => expired,
+      reserve: (runId, runClass) => (expired ? null : reserveSlot(runId, runClass)),
+      registerWaiter: (entry) => {
+        if (!expired) waiters.set(entry.runId, entry);
+      },
+    };
     try {
-      return await Promise.race([fn({ expired: () => expired }), deadline]);
+      return await Promise.race([fn(lease), deadline]);
     } finally {
       clearTimeout(timer);
       releaseTurn();
     }
   },
+  /**
+   * Count-and-reserve for one queued run, before it is claimed. `countLive`
+   * reads the counted running runs; admissions still claiming are added here.
+   * `countAhead` counts other agents' waiters ahead in line that could take
+   * one of the free slots. A run that does not fit is recorded as a waiter; a
+   * decision that overruns the lock deadline is refused and records nothing.
+   */
+  async admit(input: {
+    entry: LiveRunCapQueueEntry;
+    cap: EffectiveLiveRunCap;
+    countLive: () => Promise<LiveRunCapOccupancy>;
+    countAhead: (free: { any: number; general: number }) => Promise<number>;
+    timeoutMs?: number;
+  }): Promise<LiveRunCapAdmissionResult> {
+    return liveRunCapAdmission.withLock<LiveRunCapAdmissionResult>(
+      async (lease) => {
+        const live = await input.countLive();
+        const occupancy: LiveRunCapOccupancy = {
+          total: live.total + admissionsInFlight.total,
+          reservedClass: live.reservedClass + admissionsInFlight.reservedClass,
+        };
+        const runClass = input.entry.runClass;
+        let decision = decideLiveRunCapAdmission({ cap: input.cap, occupancy, runClass, aheadCount: 0 });
+        if (decision.admit) {
+          const aheadCount = await input.countAhead(liveRunCapFreeSlots(input.cap, occupancy));
+          decision = decideLiveRunCapAdmission({ cap: input.cap, occupancy, runClass, aheadCount });
+        }
+        if (!decision.admit) {
+          lease.registerWaiter(input.entry);
+          return { admitted: false, timedOut: false };
+        }
+        const release = lease.reserve(input.entry.runId, runClass);
+        return release ? { admitted: true, release } : { admitted: false, timedOut: true };
+      },
+      { admitted: false, timedOut: true },
+      input.timeoutMs,
+    );
+  },
   inFlight() {
-    return admissionsInFlight;
-  },
-  /** Takes one slot for a run about to be claimed. The release is idempotent. */
-  reserve(runId: string) {
-    waiters.delete(runId);
-    admissionsInFlight += 1;
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      admissionsInFlight -= 1;
-    };
-  },
-  registerWaiter(entry: LiveRunCapQueueEntry) {
-    waiters.set(entry.runId, entry);
+    return admissionsInFlight.total;
   },
   removeWaiter(runId: string) {
     waiters.delete(runId);

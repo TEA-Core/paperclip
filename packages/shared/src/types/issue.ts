@@ -777,6 +777,12 @@ export interface IssueExecutionStallHandoff {
   handedOffAt: string;
 }
 
+/** The execution-policy engine's record of one participant seat (SUP-24563). */
+export interface IssueExecutionParticipantSeat {
+  participant: IssueExecutionStagePrincipal;
+  seatedBy: IssueExecutionStagePrincipal | null;
+}
+
 export interface IssueExecutionState {
   status: IssueExecutionStateStatus;
   currentStageId: string | null;
@@ -793,6 +799,13 @@ export interface IssueExecutionState {
    * deliveries (SUP-13899).
    */
   deliveryAuthor?: IssueExecutionStagePrincipal | null;
+  /**
+   * Who seated `currentParticipant`: the participant as seated and the actor
+   * of the transition that seated it (null when no actor, e.g. a server
+   * sweep). Written by the execution-policy engine at every seat; a state
+   * written before the field existed has none (SUP-24563).
+   */
+  participantSeat?: IssueExecutionParticipantSeat | null;
   reviewRequest: IssueReviewRequest | null;
   completedStageIds: string[];
   /**

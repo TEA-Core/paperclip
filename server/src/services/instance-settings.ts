@@ -36,6 +36,7 @@ import {
 import { eq } from "drizzle-orm";
 import { getManagedInstanceConfig, type ManagedInstanceConfig } from "./managed-config.js";
 import { getOperatorSettingDefaults } from "./setting-defaults.js";
+import type { LiveRunCapStoredSetting } from "./live-run-cap.js";
 
 const DEFAULT_SINGLETON_KEY = "default";
 // SUP-24563: `liveRunCap` is read apart from the other general fields, so a
@@ -204,16 +205,27 @@ export async function resolveWorktreeRunExecutionActivationState(options: {
 }
 
 /**
- * Absent or null = off (the shipped default). A stored value that is present
- * but not a valid cap (a hand edit, an older writer) fails closed to the hard
- * ceiling, never open.
+ * The stored `liveRunCap`, read apart from every other general field. Off only
+ * when the general blob or the key is absent or the value is null (the shipped
+ * default); anything else that is not a valid cap is `invalid`, including a
+ * general blob that is not an object. The live-run cap fails closed on
+ * `invalid` (see `createLiveRunCapSettingReader`).
  */
-function normalizeLiveRunCap(raw: unknown): number | null {
-  if (!raw || typeof raw !== "object" || !("liveRunCap" in raw)) return null;
-  const value = raw.liveRunCap;
-  if (value === undefined || value === null) return null;
+export function readStoredLiveRunCap(rawGeneral: unknown): LiveRunCapStoredSetting {
+  if (rawGeneral === undefined || rawGeneral === null) return { kind: "off" };
+  if (typeof rawGeneral !== "object" || Array.isArray(rawGeneral)) return { kind: "invalid" };
+  if (!("liveRunCap" in rawGeneral)) return { kind: "off" };
+  const value = rawGeneral.liveRunCap;
+  if (value === undefined || value === null) return { kind: "off" };
   const parsed = liveRunCapStorageSchema.safeParse(value);
-  return parsed.success ? parsed.data : LIVE_RUN_CAP_CEILING;
+  return parsed.success && typeof parsed.data === "number" ? { kind: "cap", value: parsed.data } : { kind: "invalid" };
+}
+
+/** The settings view of the stored cap: an invalid value shows as the ceiling it fails closed to. */
+function normalizeLiveRunCap(raw: unknown): number | null {
+  const stored = readStoredLiveRunCap(raw);
+  if (stored.kind === "cap") return stored.value;
+  return stored.kind === "off" ? null : LIVE_RUN_CAP_CEILING;
 }
 
 function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
@@ -549,6 +561,12 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
     ): Promise<InstanceGeneralSettings> => {
       const row = await getOrCreateRow(readOptions?.db);
       return toGeneralView(row.general);
+    },
+
+    /** The stored live-run cap as the cap reads it: off, a valid cap, or invalid (SUP-24563). */
+    getLiveRunCapSetting: async (): Promise<LiveRunCapStoredSetting> => {
+      const row = await getOrCreateRow();
+      return readStoredLiveRunCap(row.general);
     },
 
     getExperimental: async (): Promise<InstanceExperimentalSettingsWithManaged> => {

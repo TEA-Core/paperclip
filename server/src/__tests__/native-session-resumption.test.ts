@@ -1177,8 +1177,8 @@ describe.each(["unchanged", "newer_active", "stale_idle"] as const)(
       // run, so the global live-run cap must not gate it. With cap 1 the
       // resumed run alone fills the cap; only the variant without a newer
       // request carries the precondition (a newer request is a new admission).
-      const liveRunCapRegisterWaiter = vi.spyOn(liveRunCapAdmission, "registerWaiter");
-      const liveRunCapReserve = vi.spyOn(liveRunCapAdmission, "reserve");
+      // Reservations and waiter records only happen inside an admission.
+      const liveRunCapAdmit = vi.spyOn(liveRunCapAdmission, "admit");
       if (!newerRequest) {
         await instanceSettingsService(db).updateGeneral({ liveRunCap: 1 });
         invalidateLiveRunCapSettingCache();
@@ -1259,8 +1259,7 @@ describe.each(["unchanged", "newer_active", "stale_idle"] as const)(
       expect(startTurn).not.toHaveBeenCalled();
       expect(close).toHaveBeenCalledOnce();
       expect(legacyAdapterExecute).not.toHaveBeenCalled();
-      expect(liveRunCapReserve.mock.calls.map(([id]) => id)).not.toContain(runId);
-      expect(liveRunCapRegisterWaiter.mock.calls.map(([entry]) => entry.runId)).not.toContain(runId);
+      expect(liveRunCapAdmit.mock.calls.map(([input]) => input.entry.runId)).not.toContain(runId);
 
       await expect(
         db
