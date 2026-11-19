@@ -877,6 +877,10 @@ describeEmbeddedPostgres("tool access policy service", () => {
 
     const decision = await toolAccessPolicyService(db).decide(input);
     const first = await toolAccessPolicyService(db).recordInvocation(input, decision);
+    // Until the first call has an outcome, a retry is told it is in progress.
+    await expect(toolAccessPolicyService(db).recordInvocation(input, decision))
+      .rejects.toMatchObject({ status: 409, details: { reasonCode: "tool_invocation_in_progress" } });
+    await db.update(toolInvocations).set({ status: "succeeded", completedAt: new Date() }).where(eq(toolInvocations.id, first.invocation.id));
     const replay = await toolAccessPolicyService(db).recordInvocation(input, decision);
 
     expect(first.replayed).toBe(false);
@@ -908,6 +912,7 @@ describeEmbeddedPostgres("tool access policy service", () => {
 
     const decision = await toolAccessPolicyService(db).decide(input);
     const first = await toolAccessPolicyService(db).recordInvocation(input, decision);
+    await db.update(toolInvocations).set({ status: "succeeded", completedAt: new Date() }).where(eq(toolInvocations.id, first.invocation.id));
     const replay = await toolAccessPolicyService(db).recordInvocation(input, decision);
 
     expect(first.replayed).toBe(false);
@@ -941,6 +946,53 @@ describeEmbeddedPostgres("tool access policy service", () => {
 
     expect(recorded.map((entry) => entry.replayed)).toEqual([false, false]);
     expect(recorded[0]!.invocation.idempotencyKey).not.toBe(recorded[1]!.invocation.idempotencyKey);
+  });
+
+  it("ignores another principal's earlier-build row under the shared legacy key", async () => {
+    const company = await createCompany(db);
+    const { connection } = await createTool(db, company.id);
+    const [owner, other] = [await createAgent(db, company.id), await createAgent(db, company.id)];
+    const inputFor = (agentId: string) => ({
+      companyId: company.id,
+      actor: { actorType: "agent" as const, actorId: agentId, agentId },
+      request: { connectionId: connection.id, toolName: "send_email", arguments: { to: "ops@example.com", body: "same" }, sideEffecting: true },
+    });
+    for (const agent of [owner, other]) {
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id,
+        principalType: "agent",
+        principalId: agent.id,
+        permissionKey: "tools:use",
+        scope: { toolName: "send_email" },
+      });
+    }
+    const ownerInput = inputFor(owner.id);
+    const recorded = await toolAccessPolicyService(db).recordInvocation(ownerInput, await toolAccessPolicyService(db).decide(ownerInput));
+    const row = recorded.invocation;
+    // Rewrite the owner's row as an earlier build recorded it: the unversioned
+    // key, which names no principal (no run or issue here either).
+    const canonical = (value: Record<string, unknown>) =>
+      `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${JSON.stringify(value[key])}`).join(",")}}`;
+    const legacyKey = `side_effect:${createHash("sha256").update(canonical({
+      companyId: row.companyId,
+      runId: row.runId,
+      issueId: row.issueId,
+      applicationId: row.applicationId,
+      connectionId: row.connectionId,
+      catalogEntryId: row.catalogEntryId,
+      toolName: row.toolName,
+      argumentsHash: row.argumentsHash,
+    })).digest("hex")}`;
+    await db.update(toolInvocations).set({ idempotencyKey: legacyKey }).where(eq(toolInvocations.id, row.id));
+
+    const otherInput = inputFor(other.id);
+    const otherCall = await toolAccessPolicyService(db).recordInvocation(otherInput, await toolAccessPolicyService(db).decide(otherInput));
+
+    expect(otherCall.replayed).toBe(false);
+    expect(otherCall.invocation.id).not.toBe(row.id);
+    // The owner's own retry still meets its earlier-build row: refused, not run.
+    await expect(toolAccessPolicyService(db).recordInvocation(ownerInput, await toolAccessPolicyService(db).decide(ownerInput)))
+      .rejects.toMatchObject({ status: 409, details: { reasonCode: "tool_invocation_replay_ambiguous" } });
   });
 
   it("enforces rate-limit policies before explicit grants", async () => {

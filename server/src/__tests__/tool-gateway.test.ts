@@ -5810,4 +5810,38 @@ rl.on("line", (line) => {
       await db.select().from(toolActionRequests).where(eq(toolActionRequests.companyId, company.id)),
     ).toEqual([]);
   });
+
+  it("retries a remote call that failed before dispatch, once its credentials return and the replay window passes", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const remote = await startFakeRemoteMcpServer(({ body }) => ({
+      body: { jsonrpc: "2.0", id: body?.id, result: { content: [{ type: "text", text: "stored" }] } },
+    }));
+    try {
+      const { application, connection, catalogEntry } = await createRemoteMcpTool(db, company.id, { url: remote.url });
+      const toolName = expectedConnectedToolName({
+        applicationKey: application.applicationKey,
+        connectionId: connection.id,
+        toolName: catalogEntry.toolName,
+      });
+      await allowToolsForAgent(db, company.id, agent.id, [toolName]);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const call = () => gateway.executeTool({ sessionToken: session.token, tool: toolName, parameters: { key: "k", value: "v" } });
+      const toolCalls = () => remote.requests.filter((request) => request.body?.method === "tools/call").length;
+
+      // No organization grant: credential resolution fails before any request.
+      await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.connectionId, connection.id));
+      await expect(call()).rejects.toMatchObject({ reasonCode: "organization_authorization_required" });
+      expect(toolCalls()).toBe(0);
+
+      await db.update(connectionGrants).set({ status: "active" }).where(eq(connectionGrants.connectionId, connection.id));
+      await db.update(toolInvocations).set({ completedAt: new Date(Date.now() - 6 * 60_000) }).where(eq(toolInvocations.companyId, company.id));
+      await expect(call()).resolves.toMatchObject({ status: "completed" });
+      expect(toolCalls()).toBe(1);
+    } finally {
+      await remote.close();
+    }
+  });
 });

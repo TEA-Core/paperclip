@@ -1730,6 +1730,18 @@ export function toolAccessPolicyService(db: Db) {
     return existing;
   }
 
+  /**
+   * A stored row is replayed only once it has an outcome. A row still pending,
+   * authorized or executing has none yet, so the caller gets 409 in-progress
+   * rather than a replay with no result; its retry after the outcome replays.
+   */
+  function replayRecorded(invocation: typeof toolInvocations.$inferSelect) {
+    if (["pending", "authorized", "executing"].includes(invocation.status)) {
+      throw conflict("An identical call is still running; retry after it finishes.", { reasonCode: "tool_invocation_in_progress", invocationId: invocation.id });
+    }
+    return { invocation, replayed: true, actionRequest: null };
+  }
+
   async function recordInvocation(input: ToolAccessDecisionInput, accessDecision: ToolAccessDecision) {
     const loaded = await loadContext(input);
     if (!loaded.ok) throw new Error("Cannot record invocation for invalid tool access context");
@@ -1747,7 +1759,7 @@ export function toolAccessPolicyService(db: Db) {
     if (idempotencyKey) {
       const existing = await callerInvocationByIdempotencyKey(ctx, idempotencyKey);
       if (existing && !(derivedKey && failureReplayExpired(existing))) {
-        return { invocation: existing, replayed: true, actionRequest: null };
+        return replayRecorded(existing);
       }
       if (existing) {
         // Release the derived key from the expired failure so this retry
@@ -1758,7 +1770,7 @@ export function toolAccessPolicyService(db: Db) {
           .where(and(eq(toolInvocations.id, existing.id), eq(toolInvocations.idempotencyKey, idempotencyKey)))
           .returning({ id: toolInvocations.id });
         const winner = released ? null : await callerInvocationByIdempotencyKey(ctx, idempotencyKey);
-        if (winner) return { invocation: winner, replayed: true, actionRequest: null };
+        if (winner) return replayRecorded(winner);
       }
     }
     if (derivedKey) {
@@ -1767,9 +1779,18 @@ export function toolAccessPolicyService(db: Db) {
       // proves which arguments it recorded (a longer list, a longer string, a
       // different secret or an extra "__proto__" key all map onto these), so a
       // live row is neither replayed (another call's outcome) nor re-executed
-      // (a true retry would repeat the side effect). The key is run-scoped,
-      // so this ends with the runs an earlier build served.
-      const legacy = await callerInvocationByIdempotencyKey(ctx, sideEffectIdempotencyKey(ctx, redaction.legacyArgumentsHash, "legacy"));
+      // (a true retry would repeat the side effect). The unversioned key does
+      // not name a principal, so only this caller's own row in this run counts;
+      // another principal's row is not this call. The key is run-scoped, so
+      // this ends with the runs an earlier build served.
+      const [legacy] = await db.select().from(toolInvocations).where(and(
+        eq(toolInvocations.companyId, ctx.companyId),
+        eq(toolInvocations.idempotencyKey, sideEffectIdempotencyKey(ctx, redaction.legacyArgumentsHash, "legacy")),
+        eq(toolInvocations.actorType, ctx.actorType),
+        eq(toolInvocations.actorId, ctx.actorId),
+        ctx.agentId === null ? isNull(toolInvocations.agentId) : eq(toolInvocations.agentId, ctx.agentId),
+        ctx.heartbeatRunId === null ? isNull(toolInvocations.runId) : eq(toolInvocations.runId, ctx.heartbeatRunId),
+      ));
       if (legacy && !failureReplayExpired(legacy)) {
         throw conflict(
           "A call with these arguments was recorded before argument hashing changed and cannot be matched exactly; it was neither replayed nor executed again.",
@@ -1816,11 +1837,12 @@ export function toolAccessPolicyService(db: Db) {
       }).returning();
     } catch (error) {
       // Two first calls with one key both missed the lookup above; the loser
-      // replays the winner's row (owner-checked) instead of failing.
+      // gets the winner's row (owner-checked) on the same terms as any retry:
+      // replayed once it has an outcome, 409 in-progress until then.
       const winner = idempotencyKey && isIdempotencyKeyConflict(error)
         ? await callerInvocationByIdempotencyKey(ctx, idempotencyKey)
         : null;
-      if (winner) return { invocation: winner, replayed: true, actionRequest: null };
+      if (winner) return replayRecorded(winner);
       throw error;
     }
     const [invocation] = inserted;

@@ -957,7 +957,7 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
     expect(await db.select().from(toolInvocations)).toHaveLength(2);
   });
 
-  it("records two concurrent first calls with one key once, replaying the loser instead of failing it", async () => {
+  it("records two concurrent first calls with one key once; the loser gets an explicit in-progress answer, never a null result", async () => {
     const { company, agent, run } = await createAgentFixture(db, {});
     await allowBothPluginTools(db, company.id);
     let arrivals = 0;
@@ -989,7 +989,16 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    const { dispatcher, counter } = countingDispatcher();
+    // The winner's tool call stays in flight until the loser has answered.
+    let finishDispatch!: () => void;
+    const dispatchMayFinish = new Promise<void>((resolve) => {
+      finishDispatch = resolve;
+    });
+    const base = twoPluginDispatcher();
+    const { dispatcher, counter } = countingDispatcher(async (tool, parameters, runContext) => {
+      await dispatchMayFinish;
+      return base.executeTool(tool, parameters, runContext);
+    });
     const gateway = createToolGatewayService(racingDb, { pluginToolDispatcher: dispatcher });
     const call = () => gateway.executePluginTool({
       actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
@@ -998,11 +1007,57 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
       runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
     });
 
-    const outcomes = await Promise.allSettled([call(), call()]);
+    const calls = [call(), call()];
+    const firstAnswer = await Promise.race(calls.map((pending) => pending.then(() => "fulfilled", () => "rejected")));
+    finishDispatch();
+    const outcomes = await Promise.allSettled(calls);
 
-    expect(outcomes.map((outcome) => outcome.status)).toEqual(["fulfilled", "fulfilled"]);
+    expect(firstAnswer).toBe("rejected");
+    const winners = outcomes.filter((outcome) => outcome.status === "fulfilled");
+    const losers = outcomes.filter((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
+    expect(winners).toEqual([{ status: "fulfilled", value: expect.objectContaining({ pluginId: "plugin-a" }) }]);
+    expect(losers).toHaveLength(1);
+    expect(losers[0]!.reason).toMatchObject({ status: 409, details: { reasonCode: "tool_invocation_in_progress" } });
     expect(counter.attempts).toBe(1);
     expect(await db.select().from(toolInvocations)).toHaveLength(1);
+  });
+
+  it("answers an identical call while the first is still running with 409 in-progress, then replays the outcome", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    let reachedTool!: () => void;
+    const toolReached = new Promise<void>((resolve) => {
+      reachedTool = resolve;
+    });
+    let finishDispatch!: () => void;
+    const dispatchMayFinish = new Promise<void>((resolve) => {
+      finishDispatch = resolve;
+    });
+    const base = twoPluginDispatcher();
+    const { dispatcher, counter } = countingDispatcher(async (tool, parameters, runContext) => {
+      reachedTool();
+      await dispatchMayFinish;
+      return base.executeTool(tool, parameters, runContext);
+    });
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    const call = () => gateway.executePluginTool({
+      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: "a.b:wiki_append_log",
+      parameters: { path: "log/index.md", content: "slow entry" },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+    });
+
+    const first = call();
+    await toolReached;
+    const duringRun = await rejectionOf(call());
+    finishDispatch();
+    const firstResult = await first;
+
+    expect(duringRun.status).toBe(409);
+    expect(duringRun.details).toMatchObject({ reasonCode: "tool_invocation_in_progress" });
+    expect(firstResult).toMatchObject({ pluginId: "plugin-a" });
+    await expect(call()).resolves.toEqual(firstResult);
+    expect(counter.attempts).toBe(1);
   });
 
   it("reserves the derived side-effect key namespace: a caller cannot claim another agent's derived key", async () => {

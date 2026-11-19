@@ -1199,6 +1199,12 @@ export function createToolGatewayService(
     }).summary;
     await db.update(toolInvocations).set({ resultSummary: summary }).where(eq(toolInvocations.id, invocationId));
   }
+  /** Records the dispatch boundary once; an earlier stamp is kept. */
+  async function markInvocationDispatchStarted(invocationId: string) {
+    await db.update(toolInvocations)
+      .set({ startedAt: new Date(), updatedAt: new Date() })
+      .where(and(eq(toolInvocations.id, invocationId), isNull(toolInvocations.startedAt)));
+  }
   /**
    * The provider handoff of a `provider_interaction_required` invocation. Its
    * one-time links are returned only to the run that recorded the invocation
@@ -6078,6 +6084,7 @@ export function createToolGatewayService(
     }
     const grant = await resolveConnectionGrant(session, connection);
     if (isBrowserUseConnection(connection)) {
+      await markInvocationDispatchStarted(invocationId);
       const data = await browserUseService(db, options.remoteHttpRequest).execute(session, grant, invocationId!, entry.toolName, parameters);
       return { result: { content: JSON.stringify(data), data: { structuredContent: data, transport: "rest_api" } } };
     }
@@ -6097,6 +6104,8 @@ export function createToolGatewayService(
     });
     let headers = builtHeaders.headers;
     let headerSummary = builtHeaders.summary;
+    // Credentials resolved: from here a request can reach the provider.
+    await markInvocationDispatchStarted(invocationId);
     const requestId = `paperclip-tool-${randomUUID()}`;
     const execution: RemoteHttpExecutionAudit = {
       transport: "mcp_remote",
@@ -10898,11 +10907,15 @@ export function createToolGatewayService(
             },
           );
         }
+        // A remote call is stamped started only once its credentials resolve
+        // (see executeRemoteHttpTool): a failure before that never reached the
+        // provider, so its derived-key replay can expire and be retried.
+        const remoteDispatch = tool.providerType === "mcp_remote_http" || tool.providerType === "provider_rest";
         await db
           .update(toolInvocations)
           .set({
             status: "executing",
-            startedAt: new Date(),
+            ...(remoteDispatch ? {} : { startedAt: new Date() }),
             updatedAt: new Date(),
           })
           .where(eq(toolInvocations.id, invocationId));
