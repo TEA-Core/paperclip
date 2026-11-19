@@ -916,6 +916,33 @@ describeEmbeddedPostgres("tool access policy service", () => {
     expect(replay.invocation.id).toBe(first.invocation.id);
   });
 
+  it("derives a separate key per principal, so another agent's identical call is never blocked or replayed", async () => {
+    const company = await createCompany(db);
+    const { connection } = await createTool(db, company.id);
+    const callers = [await createAgent(db, company.id), await createAgent(db, company.id)];
+    const recorded = [];
+    for (const agent of callers) {
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id,
+        principalType: "agent",
+        principalId: agent.id,
+        permissionKey: "tools:use",
+        scope: { toolName: "send_email" },
+      });
+      // No run context: the derived key's run and issue scope are both empty.
+      const input = {
+        companyId: company.id,
+        actor: { actorType: "agent" as const, actorId: agent.id, agentId: agent.id },
+        request: { connectionId: connection.id, toolName: "send_email", arguments: { to: "ops@example.com", body: "same" }, sideEffecting: true },
+      };
+      const decision = await toolAccessPolicyService(db).decide(input);
+      recorded.push(await toolAccessPolicyService(db).recordInvocation(input, decision));
+    }
+
+    expect(recorded.map((entry) => entry.replayed)).toEqual([false, false]);
+    expect(recorded[0]!.invocation.idempotencyKey).not.toBe(recorded[1]!.invocation.idempotencyKey);
+  });
+
   it("enforces rate-limit policies before explicit grants", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);

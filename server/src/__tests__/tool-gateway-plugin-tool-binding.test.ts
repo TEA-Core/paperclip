@@ -903,29 +903,126 @@ describeEmbeddedPostgres("tool gateway plugin tool binding", () => {
     expect(await db.select().from(toolInvocations)).toHaveLength(1);
   });
 
-  it("replays, rather than re-executes, an exact same-run retry of a record an earlier build wrote", async () => {
+  it("refuses every live record an earlier build wrote, even when its truncated hash equals these arguments' hash", async () => {
     const { company, agent, run } = await createAgentFixture(db, {});
     await allowBothPluginTools(db, company.id);
     const { dispatcher, counter } = countingDispatcher();
     const gateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
-    const input = {
+    const call = (count: number) => gateway.executePluginTool({
       actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
       tool: "a.b:wiki_append_log",
-      parameters: { path: "log/index.md", content: "short entry" },
+      parameters: { path: "log/index.md", entries: Array.from({ length: count }, (_, index) => `entry ${index}`) },
       runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
-    };
+    });
 
-    await gateway.executePluginTool(input);
+    // An earlier build recorded a 51-item call under the hash of its first 50
+    // items: the same hash a 50-item call has today.
+    await call(51);
     const [row] = await db.select().from(toolInvocations);
-    // Nothing was truncated, so the earlier build's hash equals this one.
+    const truncatedHash = sha256Hex(stableStringify({
+      path: "log/index.md",
+      entries: Array.from({ length: 50 }, (_, index) => `entry ${index}`),
+    }));
     await db
       .update(toolInvocations)
-      .set({ idempotencyKey: legacySideEffectKeyFor(row!, row!.argumentsHash!) })
+      .set({ idempotencyKey: legacySideEffectKeyFor(row!, truncatedHash), argumentsHash: truncatedHash })
       .where(eq(toolInvocations.id, row!.id));
 
-    await expect(gateway.executePluginTool(input)).resolves.toMatchObject({ pluginId: "plugin-a" });
+    const refused = await rejectionOf(call(50));
+    expect(refused.status).toBe(409);
+    expect(refused.details).toMatchObject({ reasonCode: "tool_invocation_replay_ambiguous", invocationId: row!.id });
     expect(counter.attempts).toBe(1);
     expect(await db.select().from(toolInvocations)).toHaveLength(1);
+  });
+
+  it("never treats the text of a redacted value's hash input as that value", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const { dispatcher, counter } = countingDispatcher();
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    const call = (content: string) => gateway.executePluginTool({
+      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: "a.b:wiki_append_log",
+      parameters: { path: "p", content },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+    });
+    const secret = "sk-cccccccccccccccccccc";
+    // The string a digest-in-a-string scheme would hash in the secret's place.
+    const digestText = `[REDACTED:${sha256Hex(`tool-argument-redacted:${JSON.stringify(secret)}`)}]`;
+
+    await call(secret);
+    await call(digestText);
+
+    expect(counter.attempts).toBe(2);
+    expect(await db.select().from(toolInvocations)).toHaveLength(2);
+  });
+
+  it("records two concurrent first calls with one key once, replaying the loser instead of failing it", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    let arrivals = 0;
+    let release!: () => void;
+    const bothArrived = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // Hold each invocation insert until both calls have looked up the key and
+    // reached their insert, so the two inserts race on the unique key.
+    const racingDb = new Proxy(db, {
+      get(target, prop) {
+        if (prop === "insert") {
+          return (table: Parameters<typeof target.insert>[0]) => {
+            const builder = target.insert(table);
+            if (table !== toolInvocations) return builder;
+            return {
+              values: (values: Parameters<typeof builder.values>[0]) => ({
+                returning: async () => {
+                  arrivals += 1;
+                  if (arrivals === 2) release();
+                  await bothArrived;
+                  return builder.values(values).returning();
+                },
+              }),
+            };
+          };
+        }
+        const value: unknown = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const { dispatcher, counter } = countingDispatcher();
+    const gateway = createToolGatewayService(racingDb, { pluginToolDispatcher: dispatcher });
+    const call = () => gateway.executePluginTool({
+      actor: { type: "agent" as const, companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: "a.b:wiki_append_log",
+      parameters: { path: "log/index.md", content: "raced entry" },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: "" },
+    });
+
+    const outcomes = await Promise.allSettled([call(), call()]);
+
+    expect(outcomes.map((outcome) => outcome.status)).toEqual(["fulfilled", "fulfilled"]);
+    expect(counter.attempts).toBe(1);
+    expect(await db.select().from(toolInvocations)).toHaveLength(1);
+  });
+
+  it("reserves the derived side-effect key namespace: a caller cannot claim another agent's derived key", async () => {
+    const { company, agent, run } = await createAgentFixture(db, {});
+    await allowBothPluginTools(db, company.id);
+    const { dispatcher, counter } = countingDispatcher();
+    const gateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+
+    const squat = await rejectionOf(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "a.b:wiki_append_log",
+      parameters: { path: "log/index.md", content: "squat" },
+      idempotencyKey: `side_effect:v2:${"0".repeat(64)}`,
+    }));
+
+    expect(squat.status).toBe(400);
+    expect(squat.details).toMatchObject({ reasonCode: "idempotency_key_reserved" });
+    expect(counter.attempts).toBe(0);
+    expect(await db.select().from(toolInvocations)).toHaveLength(0);
   });
 
   it("executes a longer list after a 50-item list in the same run, even after a server restart", async () => {

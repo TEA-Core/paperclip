@@ -1199,11 +1199,20 @@ export function createToolGatewayService(
     }).summary;
     await db.update(toolInvocations).set({ resultSummary: summary }).where(eq(toolInvocations.id, invocationId));
   }
-  function recoverUpstreamHandoff(invocation: typeof toolInvocations.$inferSelect): ToolUpstreamPending | undefined {
+  /**
+   * The provider handoff of a `provider_interaction_required` invocation. Its
+   * one-time links are returned only to the run that recorded the invocation
+   * (`callerRunId` equal to its run): any other caller, including a later run
+   * of the same agent, gets the stored handoff with no links.
+   */
+  function recoverUpstreamHandoff(
+    invocation: typeof toolInvocations.$inferSelect,
+    callerRunId: string | null | undefined,
+  ): ToolUpstreamPending | undefined {
     if (invocation.errorCode !== "provider_interaction_required") return undefined;
     const cached = upstreamHandoffs.get(invocation.id);
-    if (cached && cached.expires > Date.now()) return cached.pending;
-    upstreamHandoffs.delete(invocation.id);
+    if (cached && cached.expires > Date.now() && (callerRunId ?? null) === invocation.runId) return cached.pending;
+    if (cached && cached.expires <= Date.now()) upstreamHandoffs.delete(invocation.id);
     const stored = asRecord(storedInvocationResult(invocation));
     const pending = asRecord(stored?.upstreamPending);
     if (!pending || !["approval", "authorization"].includes(String(pending.kind))) return undefined;
@@ -7744,6 +7753,7 @@ export function createToolGatewayService(
    */
   function replayedInvocationFailure(
     invocation: typeof toolInvocations.$inferSelect,
+    callerRunId: string | null | undefined,
   ): ToolGatewayHttpError {
     // The provider is still waiting on its authorization/approval: replay the
     // same 409 handoff the action-request replay returns, not a bare failure.
@@ -7756,7 +7766,7 @@ export function createToolGatewayService(
           invocationId: invocation.id,
           replayed: true,
           originalStatus: invocation.status,
-          upstreamPending: recoverUpstreamHandoff(invocation),
+          upstreamPending: recoverUpstreamHandoff(invocation, callerRunId),
         },
       );
     }
@@ -7794,8 +7804,9 @@ export function createToolGatewayService(
    */
   function replayStoredInvocation(
     invocation: typeof toolInvocations.$inferSelect,
+    callerRunId: string | null | undefined,
   ): unknown {
-    if (isReplayableFailure(invocation)) throw replayedInvocationFailure(invocation);
+    if (isReplayableFailure(invocation)) throw replayedInvocationFailure(invocation, callerRunId);
     return storedInvocationResult(invocation);
   }
 
@@ -8030,6 +8041,8 @@ export function createToolGatewayService(
   async function executeApprovedAgentInvocation(input: {
     actionRequest: typeof toolActionRequests.$inferSelect;
     invocation: typeof toolInvocations.$inferSelect;
+    /** The retrying agent's run; approval callers have none. */
+    callerRunId?: string | null;
   }) {
     const { actionRequest, invocation } = input;
     if (
@@ -8062,7 +8075,7 @@ export function createToolGatewayService(
         .where(eq(toolInvocations.id, invocation.id))
         .limit(1);
       if (settled?.status === "executed" && settledInvocation) {
-        return replayStoredInvocation(settledInvocation);
+        return replayStoredInvocation(settledInvocation, input.callerRunId);
       }
       if (settled?.status === "failed") {
         throw new ToolGatewayHttpError(
@@ -8500,7 +8513,7 @@ export function createToolGatewayService(
         "The provider is waiting for authorization or approval. Continue the existing execution; do not repeat the original call.",
         "provider_interaction_required", {
           invocationId: invocation.id, actionRequestId: actionRequest.id,
-          upstreamPending: recoverUpstreamHandoff(invocation),
+          upstreamPending: recoverUpstreamHandoff(invocation, input.session.runId),
         });
     }
     if (actionRequest.status === "pending") {
@@ -8529,7 +8542,7 @@ export function createToolGatewayService(
     if (actionRequest.status === "executed") {
       return {
         matched: true as const,
-        result: replayStoredInvocation(invocation),
+        result: replayStoredInvocation(invocation, input.session.runId),
         invocationId: invocation.id,
       };
     }
@@ -8543,7 +8556,7 @@ export function createToolGatewayService(
       if (settled?.status === "executed" && settledInvocation) {
         return {
           matched: true as const,
-          result: replayStoredInvocation(settledInvocation),
+          result: replayStoredInvocation(settledInvocation, input.session.runId),
           invocationId: invocation.id,
         };
       }
@@ -8557,6 +8570,7 @@ export function createToolGatewayService(
       const result = await executeApprovedAgentInvocation({
         actionRequest,
         invocation,
+        callerRunId: input.session.runId,
       });
       return { matched: true as const, result, invocationId: invocation.id };
     }
@@ -8662,7 +8676,8 @@ export function createToolGatewayService(
       parameters,
       ...(result !== undefined ? { result } : {}),
       ...(error ? { error } : {}),
-      ...(recoverUpstreamHandoff(invocation) ? { upstreamPending: recoverUpstreamHandoff(invocation) } : {}),
+      // The board's own test call: it has no run, and neither does the row.
+      ...(recoverUpstreamHandoff(invocation, invocation.runId) ? { upstreamPending: recoverUpstreamHandoff(invocation, invocation.runId) } : {}),
       durationMs,
       requestedAt: actionRequest.createdAt.toISOString(),
       resolvedAt: actionRequest.resolvedAt
@@ -10789,7 +10804,7 @@ export function createToolGatewayService(
           // result. A Slack rate-limit retry past its deadline was claimed
           // above and re-executes instead of replaying.
           if (isReplayableFailure(recorded.invocation)) {
-            const replayFailure = replayedInvocationFailure(recorded.invocation);
+            const replayFailure = replayedInvocationFailure(recorded.invocation, session.runId);
             await writeAudit({
               session,
               companyId: session.companyId,
@@ -11307,7 +11322,7 @@ export function createToolGatewayService(
 
       if (recorded.replayed) {
         if (isReplayableFailure(recorded.invocation)) {
-          const replayFailure = replayedInvocationFailure(recorded.invocation);
+          const replayFailure = replayedInvocationFailure(recorded.invocation, input.runContext.runId);
           await writeAudit({
             session: sessionLike,
             companyId: input.runContext.companyId,

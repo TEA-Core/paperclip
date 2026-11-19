@@ -296,12 +296,16 @@ function trustRuleIsActive(policy: typeof toolPolicies.$inferSelect, now = new D
 /**
  * Derived side-effect key. Builds before full-argument hashing wrote the
  * unversioned `side_effect:` form over a truncated-argument hash; this build
- * writes only the `side_effect:v2:` form. The key format itself therefore
- * records which build wrote a row: a durable marker that survives restarts
- * and rolling deploys, unlike any process-local clock.
+ * writes only the `side_effect:v2:` form, which also names the calling
+ * principal. The key format records which build wrote a row: a durable marker
+ * that survives restarts and rolling deploys, unlike any process-local clock.
+ * Callers cannot supply keys in this namespace (see `recordInvocation`), so
+ * only the server writes them.
  */
+const DERIVED_SIDE_EFFECT_KEY_PREFIX = "side_effect:";
+
 function sideEffectIdempotencyKey(ctx: ToolAccessContext, argumentsHash: string, format: "v2" | "legacy"): string {
-  return `${format === "v2" ? "side_effect:v2:" : "side_effect:"}${sha256({
+  const scope = {
     companyId: ctx.companyId,
     runId: ctx.heartbeatRunId,
     issueId: ctx.issueId,
@@ -310,7 +314,23 @@ function sideEffectIdempotencyKey(ctx: ToolAccessContext, argumentsHash: string,
     catalogEntryId: ctx.catalogEntryId,
     toolName: ctx.toolName,
     argumentsHash,
-  })}`;
+  };
+  if (format === "legacy") return `${DERIVED_SIDE_EFFECT_KEY_PREFIX}${sha256(scope)}`;
+  return `${DERIVED_SIDE_EFFECT_KEY_PREFIX}v2:${sha256({ ...scope, actorType: ctx.actorType, actorId: ctx.actorId, agentId: ctx.agentId })}`;
+}
+
+function isIdempotencyKeyConflict(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  while (typeof current === "object" && current !== null && !seen.has(current)) {
+    seen.add(current);
+    const maybe = current as { code?: string; constraint?: string; constraint_name?: string; cause?: unknown };
+    if (maybe.code === "23505" && (maybe.constraint ?? maybe.constraint_name) === "tool_invocations_company_idempotency_uq") {
+      return true;
+    }
+    current = maybe.cause;
+  }
+  return false;
 }
 
 /**
@@ -340,12 +360,26 @@ function auditOutcome(accessDecision: ToolAccessDecision): "pending" | "success"
 }
 
 /**
- * Hash-only stand-in for a redacted value: distinct values stay distinct (and
- * never equal the literal display marker) while the summary shows only
- * "[REDACTED]". The digest feeds the arguments hash and is never stored alone.
+ * Hash-only stand-in for a redacted value. `argumentsHashText` renders it as a
+ * bare token outside any JSON string, which no JSON argument can produce:
+ * every caller-supplied value renders as valid JSON, so a caller string that
+ * spells the token is still a quoted string and hashes differently. Distinct
+ * redacted values stay distinct; the summary shows only "[REDACTED]".
  */
-function redactedValueDigest(value: unknown): string {
-  return `[REDACTED:${createHash("sha256").update(`tool-argument-redacted:${stableStringify(value)}`).digest("hex")}]`;
+class RedactedValueDigest {
+  constructor(readonly hex: string) {}
+}
+
+function redactedValueDigest(value: unknown): RedactedValueDigest {
+  return new RedactedValueDigest(createHash("sha256").update(`tool-argument-redacted:${stableStringify(value)}`).digest("hex"));
+}
+
+/** `stableStringify`, plus the bare token for a redacted value. */
+function argumentsHashText(value: unknown): string {
+  if (value instanceof RedactedValueDigest) return `<redacted:${value.hex}>`;
+  if (Array.isArray(value)) return `[${value.map(argumentsHashText).join(",")}]`;
+  if (!isRecord(value)) return JSON.stringify(value);
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${argumentsHashText(value[key])}`).join(",")}}`;
 }
 
 function summarizeAndRedact(value: unknown): RedactionResult {
@@ -400,7 +434,7 @@ function summarizeAndRedact(value: unknown): RedactionResult {
     summary: {
       summary: displayText.length > 4000 ? `${displayText.slice(0, 4000)}...[truncated]` : displayText,
       sizeBytes: Buffer.byteLength(shownText),
-      sha256: createHash("sha256").update(stableStringify(hashed)).digest("hex"),
+      sha256: createHash("sha256").update(argumentsHashText(hashed)).digest("hex"),
       redactedFields,
     },
     redactionPlan: {
@@ -1702,6 +1736,12 @@ export function toolAccessPolicyService(db: Db) {
     const { ctx, redaction } = loaded;
     const argumentsHash = redaction.summary.sha256 ?? sha256(input.request.arguments ?? {});
     const derivedKey = input.request.idempotencyKey == null && Boolean(input.request.sideEffecting);
+    // Derived keys are server-generated and name their owner; a caller key in
+    // that namespace could claim (and permanently block) another principal's
+    // derived key, so it is refused before anything is recorded.
+    if (input.request.idempotencyKey?.startsWith(DERIVED_SIDE_EFFECT_KEY_PREFIX)) {
+      throw badRequest("Idempotency keys starting with \"side_effect:\" are reserved for the server.", { reasonCode: "idempotency_key_reserved" });
+    }
     const idempotencyKey = input.request.idempotencyKey
       ?? (derivedKey ? sideEffectIdempotencyKey(ctx, argumentsHash, "v2") : null);
     if (idempotencyKey) {
@@ -1723,17 +1763,14 @@ export function toolAccessPolicyService(db: Db) {
     }
     if (derivedKey) {
       // Only an earlier build writes the unversioned key, over the
-      // display-truncated hash. When that hash equals the full one, its row
-      // recorded exactly these arguments: replay it. Otherwise the row cannot
-      // prove it recorded these arguments, so neither replay it (a different
-      // tail would get another call's outcome) nor re-execute (a true retry
-      // would repeat the side effect). The key is run-scoped, so this ends
-      // with the runs an earlier build served.
+      // display-truncated, marker-redacted hash. No stored fact on such a row
+      // proves which arguments it recorded (a longer list, a longer string, a
+      // different secret or an extra "__proto__" key all map onto these), so a
+      // live row is neither replayed (another call's outcome) nor re-executed
+      // (a true retry would repeat the side effect). The key is run-scoped,
+      // so this ends with the runs an earlier build served.
       const legacy = await callerInvocationByIdempotencyKey(ctx, sideEffectIdempotencyKey(ctx, redaction.legacyArgumentsHash, "legacy"));
       if (legacy && !failureReplayExpired(legacy)) {
-        if (redaction.legacyArgumentsHash === argumentsHash) {
-          return { invocation: legacy, replayed: true, actionRequest: null };
-        }
         throw conflict(
           "A call with these arguments was recorded before argument hashing changed and cannot be matched exactly; it was neither replayed nor executed again.",
           { reasonCode: "tool_invocation_replay_ambiguous", invocationId: legacy.id },
@@ -1747,34 +1784,46 @@ export function toolAccessPolicyService(db: Db) {
         : accessDecision.decision === "rate_limited"
           ? "rate_limited"
           : "denied";
-    const [invocation] = await db.insert(toolInvocations).values({
-      companyId: ctx.companyId,
-      idempotencyKey,
-      actorType: ctx.actorType,
-      actorId: ctx.actorId,
-      agentId: ctx.agentId,
-      issueId: ctx.issueId,
-      runId: ctx.heartbeatRunId,
-      applicationId: ctx.applicationId,
-      connectionId: ctx.connectionId,
-      catalogEntryId: ctx.catalogEntryId,
-      catalogVersionHash: ctx.catalogVersionHash,
-      catalogSchemaHash: ctx.catalogSchemaHash,
-      providerType: ctx.providerType,
-      applicationKey: ctx.applicationKey,
-      upstreamToolName: ctx.upstreamToolName,
-      riskLevel: ctx.riskLevel,
-      toolName: ctx.toolName,
-      argumentsHash,
-      argumentsSummary: redaction.summary,
-      policyDecision: accessDecision.decision,
-      matchedPolicyIds: accessDecision.matchedPolicyIds,
-      approvalState: accessDecision.decision === "require_approval" ? "pending" : "not_required",
-      status,
-      errorCode: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : accessDecision.reasonCode,
-      errorMessage: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : accessDecision.explanation,
-      completedAt: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : new Date(),
-    }).returning();
+    let inserted: Array<typeof toolInvocations.$inferSelect>;
+    try {
+      inserted = await db.insert(toolInvocations).values({
+        companyId: ctx.companyId,
+        idempotencyKey,
+        actorType: ctx.actorType,
+        actorId: ctx.actorId,
+        agentId: ctx.agentId,
+        issueId: ctx.issueId,
+        runId: ctx.heartbeatRunId,
+        applicationId: ctx.applicationId,
+        connectionId: ctx.connectionId,
+        catalogEntryId: ctx.catalogEntryId,
+        catalogVersionHash: ctx.catalogVersionHash,
+        catalogSchemaHash: ctx.catalogSchemaHash,
+        providerType: ctx.providerType,
+        applicationKey: ctx.applicationKey,
+        upstreamToolName: ctx.upstreamToolName,
+        riskLevel: ctx.riskLevel,
+        toolName: ctx.toolName,
+        argumentsHash,
+        argumentsSummary: redaction.summary,
+        policyDecision: accessDecision.decision,
+        matchedPolicyIds: accessDecision.matchedPolicyIds,
+        approvalState: accessDecision.decision === "require_approval" ? "pending" : "not_required",
+        status,
+        errorCode: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : accessDecision.reasonCode,
+        errorMessage: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : accessDecision.explanation,
+        completedAt: accessDecision.allowed || accessDecision.decision === "require_approval" ? null : new Date(),
+      }).returning();
+    } catch (error) {
+      // Two first calls with one key both missed the lookup above; the loser
+      // replays the winner's row (owner-checked) instead of failing.
+      const winner = idempotencyKey && isIdempotencyKeyConflict(error)
+        ? await callerInvocationByIdempotencyKey(ctx, idempotencyKey)
+        : null;
+      if (winner) return { invocation: winner, replayed: true, actionRequest: null };
+      throw error;
+    }
+    const [invocation] = inserted;
     let actionRequest = null;
     if (accessDecision.decision === "require_approval") {
       [actionRequest] = await db.insert(toolActionRequests).values({
