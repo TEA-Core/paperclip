@@ -4308,9 +4308,18 @@ describe("issue execution policy routes", () => {
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
-      expect(patch.assigneeAgentId).toBeUndefined();
-      expect(patch.assigneeUserId).toBeUndefined();
-      expect(patch.title).toBeUndefined();
+      const attributionKeys = new Set([
+        "actorAgentId",
+        "actorRunId",
+        "actorRunStopId",
+        "actorUserId",
+        "boardApiKeyId",
+        "expectedUpdatedAt",
+      ]);
+      const fieldKeys = Object.entries(patch)
+        .filter(([key, value]) => value !== undefined && !attributionKeys.has(key))
+        .map(([key]) => key);
+      expect(fieldKeys).toEqual([]);
       expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
     });
 

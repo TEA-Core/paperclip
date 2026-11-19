@@ -9252,6 +9252,9 @@ describeEmbeddedPostgres("issueService.update Wiki handoff guard", () => {
     ["in_review", "an attributed status write", false, { status: "in_review", ...routeActorKeys }],
     ["in_review", "an attributed title write", false, { title: "Handoff to Wiki Maintainer (edited)", ...routeActorKeys }],
     ["blocked", "an attributed unblockDescriptor", false, { unblockDescriptor: blockedUnblockDescriptor, ...routeActorKeys }],
+    // An own executionPolicy key is a field even when undefined: the update
+    // normalizes it to null and clears the stored policy.
+    ["in_review", "an attributed undefined executionPolicy", false, { executionPolicy: undefined, ...routeActorKeys }],
   ] as const)("on a human-reviewed %s Wiki handoff, %s is admitted: %s (SUP-24762)", async (status, _name, admitted, data) => {
     const companyId = randomUUID();
     const pluginId = randomUUID();
@@ -9331,10 +9334,12 @@ describeEmbeddedPostgres("issueService.update Wiki handoff guard", () => {
         status: 422,
         details: expect.objectContaining({ subGuard: "wiki_handoff", reason: "wiki_handoff_unassigned" }),
       });
-      await expect(svc.getById(issueId)).resolves.toMatchObject({
+      const stored = await svc.getById(issueId);
+      expect(stored).toMatchObject({
         title: "Handoff to Wiki Maintainer",
         status,
       });
+      expect(stored?.executionPolicy).not.toBeNull();
     }
   });
 });

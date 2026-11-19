@@ -12463,6 +12463,8 @@ export function issueService(db: Db) {
         // SUP-24762: also skip it for a field-less write (only request
         // attribution, e.g. a comment-only PATCH): it writes no assignee. The
         // attribution keys still count as present keys for every other write.
+        // An own executionPolicy key is never field-less, even when undefined:
+        // this update's policy normalization writes null for it.
         const wikiHandoffUnguardedWriteKeys = new Set([
           "status",
           "blockedByIssueIds",
@@ -12473,8 +12475,11 @@ export function issueService(db: Db) {
         const presentWriteKeys = Object.entries(data)
           .filter(([, value]) => value !== undefined)
           .map(([key]) => key);
+        const fieldlessWrite =
+          isFieldlessIssueWrite(data) &&
+          !Object.prototype.hasOwnProperty.call(data, "executionPolicy");
         const wikiHandoffIdentityWrite =
-          !isFieldlessIssueWrite(data) &&
+          !fieldlessWrite &&
           presentWriteKeys.some((key) => !wikiHandoffUnguardedWriteKeys.has(key));
         if (wikiHandoffIdentityWrite) {
           await assertWikiHandoffWriteIntegrity({

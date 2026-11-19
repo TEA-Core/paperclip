@@ -833,7 +833,11 @@ write sets no assignee, so the guard does not judge the stored assignee. Thus
 a comment on a Wiki handoff whose review stage a human reviewer holds (stored
 `assigneeAgentId` null) is not refused. When the write carries any other key,
 the attribution keys still count as present keys. Thus an attributed `status`
-or `unblockDescriptor` write still runs the guard.
+or `unblockDescriptor` write still runs the guard. In `issueService.update`, an
+`executionPolicy` key is never field-less, even when its value is `undefined`,
+because the update normalizes that value to `null` and clears the stored
+policy. Thus an attributed `executionPolicy: undefined` write still runs the
+guard.
 
 The boundary is the write path. Per-card isolation is required for every
 startup sweep that writes issue rows through the guarded issue service
