@@ -21086,13 +21086,16 @@ export function issueRoutes(
         agentId: existing.assigneeAgentId,
       });
       // SUP-23801: every retained reassignment stop is deferred until the
-      // issue update commits. Target only a linked run that is still
-      // running, still owned by the outgoing assignee, and scoped to this
-      // issue, so a replacement run that takes ownership during the final
-      // delivery preflight is not cancelled.
-      const linkedRunIds = [existing.executionRunId, existing.checkoutRunId].filter(
-        (runId, index, runIds): runId is string =>
-          typeof runId === "string" && runId.length > 0 && runIds.indexOf(runId) === index,
+      // issue update commits. Only the execution run link carries
+      // cancellation authority: target a run that still holds the execution
+      // lock, is still running, and is still owned by the outgoing assignee.
+      // An issuer scoped to this issue finishes its own PATCH; an issuer
+      // scoped to no issue or another issue takes the post-commit cancel, so
+      // a replacement run that takes ownership during the final delivery
+      // preflight is not cancelled, and a checkout-only binding never
+      // borrows cancellation authority.
+      const linkedRunIds = [existing.executionRunId].filter(
+        (runId): runId is string => typeof runId === "string" && runId.length > 0,
       );
       for (const linkedRunId of linkedRunIds) {
         const linkedRun = await heartbeat.getRun(linkedRunId);
@@ -21102,8 +21105,7 @@ export function issueRoutes(
             : null;
         if (
           linkedRun?.status === "running" &&
-          linkedRun.agentId === existing.assigneeAgentId &&
-          linkedIssueId === existing.id
+          linkedRun.agentId === existing.assigneeAgentId
         ) {
           // A stage issuer must finish its own PATCH. Its running execution
           // still holds the issue lock, so the next stage waits for normal
@@ -21113,7 +21115,8 @@ export function issueRoutes(
           const isIssuingRunStageHandoff = transition.workflowControlledAssignment &&
             !terminalApprovalNeedsClassificationCheck &&
             actor.runId !== null &&
-            linkedRun.id === actor.runId;
+            linkedRun.id === actor.runId &&
+            linkedIssueId === existing.id;
           if (!isIssuingRunStageHandoff) {
             pendingReassignmentStopRunId = linkedRun.id;
           }
