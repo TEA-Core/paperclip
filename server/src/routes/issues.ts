@@ -223,6 +223,7 @@ import {
   publishApprovalStatus,
   recordApprovalAnchor,
   readCertifiedFinalDelivery,
+  readUncertifiedFinalDelivery,
   recordApprovalPublishOutcome,
   resolveApprovalDecisionHead,
   preflightFinalDelivery,
@@ -4839,6 +4840,22 @@ export function issueRoutes(
     };
   }
 
+  // SUP-24085: card completion, not stamp eligibility. `ladderIsTerminallyApproved`
+  // ignores post_merge stages so a pending post-merge stage cannot hold the merge
+  // stamp; an ADR-072 close ladder (pre_merge review, then post_merge stages) is
+  // therefore stamp-eligible after its first approve. A stage decision whose
+  // resulting state is pending on a stage that is neither completed nor skipped
+  // (post_merge included) redirects the requested close to that later stage: it
+  // does not complete the card and is not a delivery transition.
+  function leavesLadderPendingOnUndecidedStage(
+    policy: Parameters<typeof ladderIsTerminallyApproved>[0],
+    state: { status?: string | null; currentStageId?: string | null; completedStageIds?: string[]; skippedStageIds?: string[] } | undefined,
+  ): boolean {
+    if (state?.status !== "pending" || !state.currentStageId) return false;
+    const decided = new Set([...(state.completedStageIds ?? []), ...(state.skippedStageIds ?? [])]);
+    return (policy?.stages ?? []).some((stage) => stage.id === state.currentStageId && !decided.has(stage.id));
+  }
+
   async function preflightTerminalApproval(
     issue: FinalDeliveryIssue & { status?: string; updatedAt?: Date },
     patch: Record<string, unknown>,
@@ -4853,7 +4870,14 @@ export function issueRoutes(
       patch.executionState = { ...rawPatchState, approvalStatus: rest };
     }
     const state = patch.executionState as
-      | { completedStageIds?: string[]; lastDecisionOutcome?: string | null; lastDecisionId?: string | null }
+      | {
+          status?: string | null;
+          currentStageId?: string | null;
+          completedStageIds?: string[];
+          skippedStageIds?: string[];
+          lastDecisionOutcome?: string | null;
+          lastDecisionId?: string | null;
+        }
       | undefined;
     if (!shouldPublishApprovalStatus(decision) || !ladderIsTerminallyApproved(policy, state)) return;
     if (issue.deliveryRequirement === "record_only") {
@@ -4895,16 +4919,28 @@ export function issueRoutes(
     }
     if (issue.deliveryRequirement === "record_only" || !resolution.repoBacked) return;
     const { verdict, deliveryOwnerIssueId } = resolution;
+    const rawState = patch.executionState as Record<string, unknown>;
+    const prior = rawState.approvalStatus as Record<string, unknown> | undefined;
+    const decisionId = state?.lastDecisionId;
     if (verdict.kind !== "resolved") {
       if (options.overrideAccepted) return;
+      // SUP-24085: a stage approval that leaves the ladder pending on a later stage
+      // does not complete the card, so a card that owns no open PR is not refused.
+      // The decision certifies no head: the tag stops the post-commit hook from
+      // stamping a live head the preflight never saw. Every other unresolved
+      // verdict (draft, unreadable or moved head, ambiguous, ...) still refuses.
+      if (decisionId && verdict.reason.startsWith("no-pr:") && leavesLadderPendingOnUndecidedStage(policy, state)) {
+        patch.executionState = {
+          ...rawState,
+          approvalStatus: { ...prior, finalDeliveryUncertified: { decisionId, reason: verdict.reason } },
+        };
+        return;
+      }
       const remedy = `Delivery owner ${deliveryOwnerIssueId}: provide one OPEN, non-draft owned PR and a readable reviewed head, then submit the final verdict again. ${verdict.reason}`;
       throw conflict("Final repository delivery preflight refused; stage remains pending", {
         code: "approval_final_delivery_preflight", reason: verdict.reason, deliveryOwnerIssueId, remedy,
       });
     }
-    const rawState = patch.executionState as Record<string, unknown>;
-    const prior = rawState.approvalStatus as Record<string, unknown> | undefined;
-    const decisionId = state?.lastDecisionId;
     patch.executionState = {
       ...rawState,
       approvalStatus: {
@@ -4915,6 +4951,10 @@ export function issueRoutes(
       },
     };
   }
+
+  // SUP-24085: readUncertifiedFinalDelivery is shared from merge-arming.ts so
+  // every later stamp writer (this hook, merge-arming republish, and the
+  // approval-status reconciler) reads the tag the same way.
 
   // SUP-13904 / SUP-17163: shared post-transition merge-arming hook, run by every
   // door that records an approved review decision:
@@ -5084,6 +5124,23 @@ export function issueRoutes(
         );
       }
       // SUP-16081 fix #2: record the refusal before returning (total outcome).
+      await recordGuardOutcome("skipped", msg);
+      return;
+    }
+    // SUP-24085: the final-delivery preflight admitted this stage approval over a
+    // card with no open PR and certified no head. Re-resolving here would stamp
+    // (and claim or invalidate receipts for) a live head the preflight never saw.
+    const uncertifiedReason = readUncertifiedFinalDelivery(candidate.executionState);
+    if (uncertifiedReason !== undefined) {
+      const msg = `status:skipped:head_uncertified: the final-delivery preflight certified no head for this decision (${uncertifiedReason})`;
+      try {
+        await svc.addComment(issue.id, `[Merge-arming] ${msg}`, {}, { authorType: "system" });
+      } catch (commentErr) {
+        logger.warn(
+          { err: commentErr, issueId: issue.id },
+          "head_uncertified refusal comment write failed; still refusing to stamp/arm",
+        );
+      }
       await recordGuardOutcome("skipped", msg);
       return;
     }
@@ -12144,6 +12201,19 @@ export function issueRoutes(
         outcome: "rejected",
         reason: "no_approved_decision",
         message: "This card has no recorded 'approved' decision; there is nothing to re-stamp.",
+      });
+      return;
+    }
+
+    // SUP-24085 F1-later: the current decision was admitted over a card with
+    // no open PR and certified no head. Re-resolving a later-linked PR here
+    // would stamp a head the final-delivery preflight never certified.
+    const uncertifiedReason = readUncertifiedFinalDelivery(state);
+    if (uncertifiedReason !== undefined) {
+      res.status(409).json({
+        outcome: "rejected",
+        reason: "head_uncertified",
+        message: `status:skipped:head_uncertified: the final-delivery preflight certified no head for this decision (${uncertifiedReason}); refusing to stamp a head it never saw`,
       });
       return;
     }

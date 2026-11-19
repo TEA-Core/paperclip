@@ -1920,6 +1920,26 @@ export function readCertifiedFinalDelivery(executionState: Record<string, unknow
   };
 }
 
+/**
+ * SUP-24085: the reason the current decision's final-delivery preflight left
+ * no certified head, when it admitted a stage approval over a card with no
+ * open PR (`approvalStatus.finalDeliveryUncertified`, written by
+ * preflightTerminalApproval in routes/issues.ts). Returns undefined when the
+ * current decision carries no such tag: a tag whose decisionId differs from
+ * `lastDecisionId` belongs to an earlier decision and has no effect. Every
+ * later stamp writer (the post-commit hook, merge-arming republish, and the
+ * approval-status reconciler) must refuse or skip a tagged decision instead
+ * of stamping a live head the preflight never certified.
+ */
+export function readUncertifiedFinalDelivery(executionState: Record<string, unknown> | null | undefined): string | undefined {
+  const approvalStatus = executionState?.approvalStatus;
+  if (!approvalStatus || typeof approvalStatus !== "object" || !("finalDeliveryUncertified" in approvalStatus)) return undefined;
+  const uncertified = (approvalStatus as Record<string, unknown>).finalDeliveryUncertified;
+  if (!uncertified || typeof uncertified !== "object" || !("decisionId" in uncertified) || !("reason" in uncertified)) return undefined;
+  if (typeof executionState.lastDecisionId !== "string" || (uncertified as Record<string, unknown>).decisionId !== executionState.lastDecisionId) return undefined;
+  return typeof (uncertified as Record<string, unknown>).reason === "string" ? (uncertified as Record<string, string>).reason : "no certified head";
+}
+
 /** The board release the publisher CONFIRMED on a card: which status it was, and which PR and head it covered. */
 export interface ConfirmedRelease {
   owner: string;
