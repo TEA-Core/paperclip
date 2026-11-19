@@ -33,6 +33,7 @@ import {
   RELEASE_CONFIRMED_CONTEXT,
   releaseConfirmedDescription,
   readCertifiedFinalDelivery,
+  readUncertifiedFinalDelivery,
   resolveCardPullRequest,
   resolveLinkedPullRequestsWithState,
   type ApprovalCandidateAnchor,
@@ -2941,6 +2942,18 @@ async function reconcileCandidate(db: Db, row: CandidateRow): Promise<CandidateR
       kind: "skipped",
       reason: "non-terminal-ladder",
       detail: `non-terminal-ladder: incomplete review/approval stages: ${incompleteIds.join(", ")}`,
+    };
+  }
+
+  // SUP-24085 F1-later: the current decision was admitted over a card with
+  // no open PR and certified no head. A PR linked later must not be stamped
+  // for that decision; skip before any GitHub read or write.
+  const uncertifiedReason = readUncertifiedFinalDelivery(row.executionState);
+  if (uncertifiedReason !== undefined) {
+    return {
+      kind: "skipped",
+      reason: "head_uncertified",
+      detail: `head_uncertified: the final-delivery preflight certified no head for this decision (${uncertifiedReason}); refusing to stamp a head it never saw`,
     };
   }
 
