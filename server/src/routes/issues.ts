@@ -19682,11 +19682,23 @@ export function issueRoutes(
         executionRunId === (existing.executionRunId ?? null)
       ) return false;
       if (checkoutRunId === null && executionRunId === null) return false;
-      return !(
+      // SUP-23801: an authenticated actor may adopt its own live run onto the
+      // card while the outgoing links are cleared in the same write. The
+      // adoption takes either link; the link it does not take may only be
+      // cleared or stay unchanged. Any other live id still means a different
+      // run took ownership of the card.
+      if (
         actor.runId !== null &&
-        checkoutRunId === actor.runId &&
-        executionRunId === actor.runId
-      );
+        (checkoutRunId === actor.runId || executionRunId === actor.runId)
+      ) {
+        const otherCheckoutRunId = checkoutRunId === actor.runId ? null : checkoutRunId;
+        const otherExecutionRunId = executionRunId === actor.runId ? null : executionRunId;
+        return !(
+          (otherCheckoutRunId === null || otherCheckoutRunId === (existing.checkoutRunId ?? null)) &&
+          (otherExecutionRunId === null || otherExecutionRunId === (existing.executionRunId ?? null))
+        );
+      }
+      return true;
     };
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(existing);
     const isAgentWorkUpdate =
