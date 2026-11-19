@@ -8456,7 +8456,12 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(ghFetchMock).not.toHaveBeenCalled();
     });
 
-    it("does not link the same PR number from a foreign-headRef work product", async () => {
+    // SUP-23348 round 2: "SUP-99999" is deliberately NOT seeded here — the
+    // unresolvable anchor stays fail-closed (unknown), which still refuses the
+    // landing-delegated link exactly like a proven-foreign product would. The
+    // resolvable positive case is covered in the classification describe below
+    // and by the seeded route tests.
+    it("does not link the same PR number from a stamped work product with a foreign-looking head ref", async () => {
       vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce(ownDeliveryBranch("SUP-12345-work"));
       setupDbMock({
         executionWorkspaces: [mockExecutionWorkspaceRow()],
@@ -8482,10 +8487,13 @@ describe("evaluateDoneTierDeclaration", () => {
     });
 
     // SUP-23348: a pull-request work product is foreign from its head ref alone
-    // whenever the ref is anchored to another card, even when this card has no
-    // legitimate delivery branch to prove ownership with (a reused unrelated
-    // workspace, a workspace with no branch, no workspace at all). A ref
-    // anchored to this card, or carrying no card anchor, stays fail-closed.
+    // whenever the ref is anchored to another REAL card of this company — the
+    // anchor must resolve to an existing issue that is not this one — even when
+    // this card has no legitimate delivery branch to prove ownership with (a
+    // reused unrelated workspace, a workspace with no branch, no workspace at
+    // all). A ref anchored to this card, carrying no card anchor, or naming an
+    // identifier no issue owns (typo, stale branch, fabricated prefix) stays
+    // fail-closed.
     describe("pull-request work product classification (SUP-23348)", () => {
       type Ownership = Awaited<ReturnType<typeof resolveCardDeliveryBranchOwnership>>;
       const REUSED_UNRELATED_WORKSPACE: Ownership = {
@@ -8496,14 +8504,19 @@ describe("evaluateDoneTierDeclaration", () => {
         ownerIssueId: "other-issue",
         refusalReason: "owned by another issue that is not its ADR-083 carrier owner",
       };
+      // The issue the foreign anchor "sup-99999" resolves to (seeded by
+      // default; pass [] to prove the unresolvable case stays fail-closed).
+      const ANCHOR_OWNER_ISSUE = { id: "other-issue", identifier: "SUP-99999" };
 
       async function classifyProduct(
         ownership: Ownership,
         metadata: Record<string, unknown>,
         identifier: string | null = "SUP-12345",
+        anchorIssues: Record<string, unknown>[] = [ANCHOR_OWNER_ISSUE],
       ): Promise<"own" | "foreign" | "unknown"> {
         vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce(ownership);
         setupDbMock({
+          issues: anchorIssues,
           executionWorkspaces: [mockExecutionWorkspaceRow()],
           issueWorkProducts: [
             { id: "work-product-1", title: "Stamped PR", status: "open", metadata },
@@ -8536,6 +8549,26 @@ describe("evaluateDoneTierDeclaration", () => {
           { repository: "TEA-Core/paperclip", prNumber: 4161, headRef: "SUP-99999-their-work" },
         );
         expect(kind).toBe("foreign");
+      });
+
+      it("keeps a foreign-looking anchor fail-closed when no issue owns it (typo, stale, or fabricated prefix)", async () => {
+        const kind = await classifyProduct(
+          REUSED_UNRELATED_WORKSPACE,
+          { repository: "TEA-Core/paperclip", prNumber: 4161, headRef: "SUP-99999-their-work" },
+          "SUP-12345",
+          [],
+        );
+        expect(kind).toBe("unknown");
+      });
+
+      it("keeps a foreign-looking anchor fail-closed when the anchor resolves only to an unrelated identifier", async () => {
+        const kind = await classifyProduct(
+          REUSED_UNRELATED_WORKSPACE,
+          { repository: "TEA-Core/paperclip", prNumber: 4161, headRef: "SUP-99999-their-work" },
+          "SUP-12345",
+          [{ id: "unrelated-issue", identifier: "SUP-1234" }],
+        );
+        expect(kind).toBe("unknown");
       });
 
       it("never discounts a self-anchored head ref it cannot prove is own (reused unrelated workspace)", async () => {

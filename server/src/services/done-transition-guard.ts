@@ -1378,6 +1378,34 @@ export async function readPullRequestWorkProductLinks(
   const deliveryRepo = parsed?.hostname === "github.com" ? `${parsed.owner}/${parsed.repo}`.toLowerCase() : null;
   const ownership = await resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id);
   const ownIdentifier = issue.identifier !== null && issue.identifier.length > 0 ? issue.identifier.toLowerCase() : null;
+  // SUP-23348: an anchor only names another card when it resolves to a real
+  // company-scoped issue that is demonstrably not this one. A typo, stale
+  // branch, or fabricated prefix resolves to nothing and stays fail-closed
+  // (the anchor is then never counted foreign).
+  const foreignAnchors = new Set<string>();
+  for (const product of products) {
+    const metadata = product.metadata ?? {};
+    const headRef = typeof metadata.headRef === "string" && metadata.headRef.length > 0 ? metadata.headRef : null;
+    const headRefAnchor = cardIdentifierAnchoredToBranch(headRef);
+    if (headRefAnchor !== null && ownIdentifier !== null && headRefAnchor !== ownIdentifier) foreignAnchors.add(headRefAnchor);
+  }
+  const resolvedAnchorOwners = new Map<string, string>();
+  if (foreignAnchors.size > 0) {
+    try {
+      const anchorRows = await db
+        .select({ id: issues.id, identifier: issues.identifier })
+        .from(issues)
+        .where(and(eq(issues.companyId, issue.companyId), inArray(sql`lower(${issues.identifier})`, [...foreignAnchors])));
+      for (const row of anchorRows) {
+        if (typeof row.identifier === "string" && row.identifier.length > 0) {
+          resolvedAnchorOwners.set(row.identifier.toLowerCase(), row.id);
+        }
+      }
+    } catch {
+      // An unresolvable lookup is not proof of another card; every anchor it
+      // would have resolved stays fail-closed below.
+    }
+  }
   return products.map((product) => {
     const metadata = product.metadata ?? {};
     const headRef = typeof metadata.headRef === "string" && metadata.headRef.length > 0 ? metadata.headRef : null;
@@ -1386,10 +1414,17 @@ export async function readPullRequestWorkProductLinks(
     // SUP-23348: a head ref anchored to another card's identifier names another
     // card's work no matter whether this card can resolve a delivery branch of
     // its own (a reused unrelated workspace, a branchless workspace, no
-    // workspace at all). A ref anchored to this card, or carrying no card
-    // anchor, still needs the proven branch/repo identity above.
+    // workspace at all) — but only once that anchor is proven to belong to a
+    // real, different issue in this company. A ref anchored to this card, or
+    // carrying no card anchor, still needs the proven branch/repo identity above.
     const headRefAnchor = cardIdentifierAnchoredToBranch(headRef);
-    const anchoredToAnotherCard = headRefAnchor !== null && ownIdentifier !== null && headRefAnchor !== ownIdentifier;
+    const anchorOwner = headRefAnchor !== null ? resolvedAnchorOwners.get(headRefAnchor) : undefined;
+    const anchoredToAnotherCard =
+      headRefAnchor !== null &&
+      ownIdentifier !== null &&
+      headRefAnchor !== ownIdentifier &&
+      anchorOwner !== undefined &&
+      anchorOwner !== issue.id;
     const repository = typeof metadata.repository === "string"
       ? /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(metadata.repository)
       : null;

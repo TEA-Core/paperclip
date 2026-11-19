@@ -751,6 +751,31 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     });
   }
 
+  /**
+   * SUP-23348 round 2: seed the real issue a foreign head-ref anchor must
+   * resolve to before a stamped pull-request work product may be discounted.
+   * Identifiers are globally unique, so every test derives its anchor from the
+   * fixture's unique prefix (e.g. "NRL7-9"). Defaults to this fixture's
+   * company; pass another companyId to prove the resolution stays
+   * company-scoped (foreign-company owners do not discount).
+   */
+  async function seedAnchorIssue(fixture: SeededIssue, identifier: string, companyId: string = fixture.companyId) {
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      identifier,
+      title: "Anchor owner card",
+      status: "todo",
+      priority: "medium",
+      createdByUserId: "cloud-user-1",
+    });
+  }
+
+  /** A unique foreign anchor for this fixture (never collides across tests). */
+  function foreignAnchor(fixture: SeededIssue): string {
+    return `${fixture.identifier}9`;
+  }
+
   it("refuses an issue that records a pull request work product", async () => {
     const fixture = await seed();
     await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
@@ -765,10 +790,11 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
   it("discounts a foreign-headRef pull request work product", async () => {
     const fixture = await seed();
     await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    await seedAnchorIssue(fixture, foreignAnchor(fixture));
     await insertPullRequestProduct(fixture, {
       repository: "TEA-Core/records",
       prNumber: 9,
-      headRef: "SUP-99999-foreign",
+      headRef: `${foreignAnchor(fixture)}-foreign`,
     });
 
     const res = await close(fixture.identifier);
@@ -810,24 +836,61 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
   });
 
   // SUP-23348: a work product whose head ref names another card is foreign from
-  // the head ref alone; the card needs no legitimate delivery branch of its own
-  // to discount it (no branch, a reused unrelated workspace, no workspace at
-  // all classify the same way). The sibling test above keeps a self-anchored
-  // head ref on the same no-branch shape refused, and the one below keeps an
-  // unanchored head ref fail-closed.
+  // the head ref alone — but only once that anchor is proven to resolve to a
+  // real, different issue of the SAME company. The card needs no legitimate
+  // delivery branch of its own to discount it (no branch, a reused unrelated
+  // workspace, no workspace at all classify the same way). The sibling tests
+  // keep a self-anchored head ref on the same no-branch shape refused, an
+  // unanchored head ref fail-closed, an unresolvable anchor fail-closed, and
+  // an anchor owned by another company fail-closed.
   it("discounts a foreign-headRef pull request work product when the card has no delivery branch to prove ownership with", async () => {
     const fixture = await seed({ workspace: { branchName: null } });
     await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    await seedAnchorIssue(fixture, foreignAnchor(fixture));
     await insertPullRequestProduct(fixture, {
       repository: "TEA-Core/records",
       prNumber: 9,
-      headRef: "SUP-99999-foreign",
+      headRef: `${foreignAnchor(fixture)}-foreign`,
     });
 
     const res = await close(fixture.identifier);
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(await statusOf(fixture.issueId)).toBe("done");
+  });
+
+  it("still refuses a foreign-looking headRef when no issue owns the anchor (typo, stale, or fabricated prefix)", async () => {
+    const fixture = await seed({ workspace: { branchName: null } });
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    await insertPullRequestProduct(fixture, {
+      repository: "TEA-Core/records",
+      prNumber: 9,
+      headRef: `${foreignAnchor(fixture)}-typo-no-owner-seeded`,
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("records a pull request work product");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  it("still refuses a foreign-looking headRef whose anchor is owned by an issue of another company", async () => {
+    const fixture = await seed({ workspace: { branchName: null } });
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    const otherCompanyId = await insertCompany(`FX${seedSequence}`);
+    await seedAnchorIssue(fixture, foreignAnchor(fixture), otherCompanyId);
+    await insertPullRequestProduct(fixture, {
+      repository: "TEA-Core/records",
+      prNumber: 9,
+      headRef: `${foreignAnchor(fixture)}-their-work`,
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("records a pull request work product");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 
   it("still refuses an unanchored-headRef pull request work product when the card has no delivery branch", async () => {
