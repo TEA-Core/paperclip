@@ -7,12 +7,11 @@ import { describe, expect, it } from "vitest";
  * SUP-9856 / SUP-16540 guard.
  *
  * `logActivity` is best-effort by design: it swallows every failure so that an
- * audit outage can never decide a mutation. Inside a transaction that is wrong.
- * Postgres aborts the whole transaction the moment the audit insert fails, so a
- * caller that keeps going either commits the mutation without its audit row or
- * reports success on a silent rollback. Transaction-scoped audits must use
+ * audit outage can never decide a mutation. Inside a transaction it runs the
+ * insert in a savepoint (SUP-24746), so a failed audit only drops its own row
+ * and the mutation commits without it. Transaction-scoped audits use
  * `logActivityInTransaction`, which rethrows and therefore shares the mutation's
- * fate.
+ * fate; this guard keeps every site with a conventional transaction handle on it.
  *
  * This is a static scan, not a runtime test: it walks `server/src` (tests and
  * the `activity-log` definitions excluded) and fails on any `logActivity(...)`

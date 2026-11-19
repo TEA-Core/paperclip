@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
+import { PgTransaction } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agentApiKeys, companies, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, PLUGIN_EVENT_TYPES, type PluginEventType } from "@paperclipai/shared";
@@ -269,7 +270,10 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
  * into an HTTP 500 — and a client that correctly retries on 500 then double-posts. A failed
  * audit write is logged with the entity it belonged to instead (SUP-9856).
  *
- * Callers running inside a transaction must use {@link logActivityInTransaction}.
+ * When handed a transaction, the insert runs inside a savepoint (SUP-24746): a failed audit
+ * rolls back to the savepoint only, so the caller's transaction stays usable and its mutation
+ * still commits without the audit row. Callers that need the audit row and the mutation to
+ * share one fate must use {@link logActivityInTransaction}.
  *
  * `postCommitPublications` defers the realtime/plugin publication instead of firing it inline:
  * a caller that is still mid-write collects the publications and drains them once its write
@@ -281,7 +285,7 @@ export async function logActivity(
   postCommitPublications?: ActivityPublication[],
 ) {
   try {
-    const { activity, publication } = await persistActivity(db, input);
+    const { activity, publication } = await persistBestEffortActivity(db, input);
     if (postCommitPublications) {
       postCommitPublications.push(publication);
     } else {
@@ -305,6 +309,11 @@ export async function logActivity(
       "activity log write failed; the audited mutation is unaffected",
     );
   }
+}
+
+async function persistBestEffortActivity(db: Db, input: LogActivityInput) {
+  if (!(db instanceof PgTransaction)) return persistActivity(db, input);
+  return db.transaction((savepoint) => persistActivity(savepoint as unknown as Db, input));
 }
 
 /**
