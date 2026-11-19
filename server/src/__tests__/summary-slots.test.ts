@@ -27,6 +27,7 @@ import {
   GENERATION_ISSUE_ID_PLACEHOLDER,
   resolveSummaryGenerationReturnAssignee,
   summarySlotService,
+  type SummarySlotSelectorInput,
 } from "../services/summary-slots.ts";
 import {
   applyIssueExecutionPolicyTransition,
@@ -825,6 +826,168 @@ describeEmbeddedPostgres("summary slot service", () => {
       expect(issueRow.description).not.toContain("snapshot as the issue source of truth");
       expect(issueRow.description).toContain("Waiting on board approval");
       expect(issueRow.description).toContain("Implement summary cards");
+    });
+
+    describe("hidden-card annotation in the scope snapshot (SUP-24669)", () => {
+      const HIDDEN_LINE = /Hidden cards excluded from the sections below: (\d+)\./;
+
+      async function seedCard(
+        companyId: string,
+        projectId: string | null,
+        issueNumber: number,
+        overrides: Partial<typeof issues.$inferInsert> & { title: string; status: string },
+      ) {
+        await db.insert(issues).values({
+          companyId,
+          projectId,
+          identifier: `${issuePrefix(companyId)}-${issueNumber}`,
+          issueNumber,
+          priority: "medium",
+          ...overrides,
+        });
+      }
+
+      async function generatedDescription(selector: SummarySlotSelectorInput) {
+        const result = await summarySlotService(db).generate(selector, { userId: "board-user" });
+        const row = await db
+          .select()
+          .from(issues)
+          .where(eq(issues.id, result.generatingIssue.id))
+          .then((rows) => rows[0]!);
+        return row.description ?? "";
+      }
+
+      function sectionTitles(description: string, heading: string) {
+        const lines = description.split("\n");
+        const start = lines.indexOf(`### ${heading}`);
+        const titles: string[] = [];
+        for (const line of lines.slice(start + 1)) {
+          if (line.trim() === "") break;
+          titles.push(line.replace(/^- (?:\[[^\]]+\]\([^)]+\)|[^ ]+) — /, "").replace(/ \(.*\)$/, ""));
+        }
+        return titles;
+      }
+
+      it("counts exactly the hidden cards the sections exclude, and leaves section rows untouched", async () => {
+        const companyId = await seedCompany();
+        const projectId = await seedProject(companyId);
+        await seedSummarizer(companyId);
+
+        const now = Date.now();
+        const since = new Date(now - 2 * 3_600_000);
+        const inWindow = new Date(now - 1 * 3_600_000);
+        const beforeWindow = new Date(now - 3 * 3_600_000);
+        await db.insert(summarySlots).values({
+          companyId,
+          scopeKind: "project",
+          slotKey: "header",
+          scopeId: projectId,
+          status: "idle",
+          lastGeneratedAt: since,
+        });
+        const hiddenAt = new Date(now - 4 * 3_600_000);
+
+        await seedCard(companyId, projectId, 301, { title: "Visible blocked", status: "blocked" });
+        await seedCard(companyId, projectId, 302, { title: "Visible progress", status: "in_progress" });
+        await seedCard(companyId, projectId, 303, { title: "Visible done in window", status: "done", updatedAt: inWindow });
+        await seedCard(companyId, projectId, 304, { title: "Visible done before window", status: "done", updatedAt: beforeWindow });
+        // Hidden rows the sections would have listed: 2 blocked + 1 in_review + 3 in_progress + 2 done in window = 8.
+        await seedCard(companyId, projectId, 311, { title: "Hidden blocked A", status: "blocked", hiddenAt });
+        await seedCard(companyId, projectId, 312, { title: "Hidden blocked B", status: "blocked", hiddenAt });
+        await seedCard(companyId, projectId, 313, { title: "Hidden review", status: "in_review", hiddenAt });
+        await seedCard(companyId, projectId, 314, { title: "Hidden progress A", status: "in_progress", hiddenAt });
+        await seedCard(companyId, projectId, 315, { title: "Hidden progress B", status: "in_progress", hiddenAt });
+        await seedCard(companyId, projectId, 316, { title: "Hidden progress C", status: "in_progress", hiddenAt });
+        await seedCard(companyId, projectId, 317, { title: "Hidden done A", status: "done", hiddenAt, updatedAt: inWindow });
+        await seedCard(companyId, projectId, 318, { title: "Hidden done B", status: "done", hiddenAt, updatedAt: inWindow });
+        // Hidden rows that no section would list: not counted.
+        await seedCard(companyId, projectId, 321, { title: "Hidden done before window", status: "done", hiddenAt, updatedAt: beforeWindow });
+        await seedCard(companyId, projectId, 322, { title: "Hidden todo", status: "todo", hiddenAt });
+        await seedCard(companyId, projectId, 323, { title: "Hidden cancelled", status: "cancelled", hiddenAt });
+
+        const description = await generatedDescription(projectSelector(companyId, projectId));
+
+        expect(description.match(HIDDEN_LINE)?.[1]).toBe("8");
+        expect(sectionTitles(description, "Blocked")).toEqual(["Visible blocked"]);
+        expect(sectionTitles(description, "In review")).toEqual(["- None."]);
+        expect(sectionTitles(description, "In progress")).toEqual(["Visible progress"]);
+        expect(sectionTitles(description, "Recently done")).toEqual(["Visible done in window"]);
+        expect(description).not.toMatch(/Hidden (blocked|review|progress|done|todo|cancelled)/);
+      });
+
+      it("says 0 explicitly when the scope has no hidden cards", async () => {
+        const companyId = await seedCompany();
+        const projectId = await seedProject(companyId);
+        await seedSummarizer(companyId);
+
+        await seedCard(companyId, projectId, 331, { title: "Only visible", status: "in_progress" });
+
+        const description = await generatedDescription(projectSelector(companyId, projectId));
+
+        expect(description.match(HIDDEN_LINE)?.[1]).toBe("0");
+        expect(sectionTitles(description, "In progress")).toEqual(["Only visible"]);
+      });
+
+      it("follows the project selector and the company boundary", async () => {
+        const companyId = await seedCompany();
+        const projectId = await seedProject(companyId);
+        const otherProjectId = await seedProject(companyId);
+        const otherCompanyId = await seedCompany();
+        const foreignProjectId = await seedProject(otherCompanyId);
+        await seedSummarizer(companyId);
+
+        const hiddenAt = new Date(Date.now() - 3_600_000);
+
+        await seedCard(companyId, projectId, 341, { title: "Hidden in scope", status: "in_progress", hiddenAt });
+        await seedCard(companyId, otherProjectId, 342, { title: "Hidden other project", status: "in_progress", hiddenAt });
+        await seedCard(companyId, null, 343, { title: "Hidden no project", status: "blocked", hiddenAt });
+        await seedCard(otherCompanyId, foreignProjectId, 344, { title: "Hidden other company", status: "blocked", hiddenAt });
+        // Same project id, foreign company: the company filter alone must exclude it.
+        await seedCard(otherCompanyId, projectId, 345, { title: "Hidden foreign company same project", status: "blocked", hiddenAt });
+
+        const description = await generatedDescription(projectSelector(companyId, projectId));
+        expect(description.match(HIDDEN_LINE)?.[1]).toBe("1");
+
+        const overview = await generatedDescription({
+          companyId,
+          scopeKind: "workspaces_overview",
+          slotKey: "header",
+          scopeId: null,
+        });
+        // Whole company, but never the other company's rows.
+        expect(overview.match(HIDDEN_LINE)?.[1]).toBe("3");
+      });
+
+      it("follows the execution-workspace selector", async () => {
+        const companyId = await seedCompany();
+        const projectId = await seedProject(companyId);
+        const projectWorkspaceId = await seedProjectWorkspace(companyId, projectId);
+        const firstWorkspaceId = await seedExecutionWorkspace(companyId, projectId, projectWorkspaceId);
+        const secondWorkspaceId = await seedExecutionWorkspace(companyId, projectId, projectWorkspaceId);
+        await seedSummarizer(companyId);
+
+        const hiddenAt = new Date(Date.now() - 3_600_000);
+
+        await seedCard(companyId, projectId, 351, { title: "Hidden first", status: "in_progress", hiddenAt, projectWorkspaceId, executionWorkspaceId: firstWorkspaceId });
+        await seedCard(companyId, projectId, 352, { title: "Hidden second", status: "in_progress", hiddenAt, projectWorkspaceId, executionWorkspaceId: secondWorkspaceId });
+
+        const description = await generatedDescription(executionWorkspaceSelector(companyId, firstWorkspaceId));
+        expect(description.match(HIDDEN_LINE)?.[1]).toBe("1");
+      });
+
+      it("tells the generator to use includeHidden=true for activity-window claims", async () => {
+        const companyId = await seedCompany();
+        const projectId = await seedProject(companyId);
+        await seedSummarizer(companyId);
+
+
+        const description = await generatedDescription(projectSelector(companyId, projectId));
+
+        expect(description).toContain(
+          `GET /api/companies/${companyId}/issues?projectId=${projectId}&includeHidden=true`,
+        );
+        expect(description).toContain("state in the summary when hidden cards were excluded");
+      });
     });
   });
 

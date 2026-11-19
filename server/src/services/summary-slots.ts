@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, gte, inArray, isNull, max, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, isNull, max, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   documentRevisions,
@@ -605,7 +605,7 @@ export function summarySlotService(db: Db) {
       lastCommentAt: max(issueComments.createdAt),
     };
 
-    const [blocked, inReview, inProgress, recentlyDone] = await Promise.all([
+    const [blocked, inReview, inProgress, recentlyDone, hiddenExcluded] = await Promise.all([
       db.select(selectFields).from(issues)
         .leftJoin(
           issueComments,
@@ -658,6 +658,19 @@ export function summarySlotService(db: Db) {
         ))
         .groupBy(issues.id)
         .orderBy(desc(issues.updatedAt)).limit(SUMMARY_SNAPSHOT_GROUP_LIMIT),
+      // Hidden cards the sections above leave out: same company/scope filters and the
+      // same status/window predicates, so the count describes exactly the excluded population.
+      db.select({ count: sql<number>`count(*)::int` }).from(issues)
+        .where(and(
+          eq(issues.companyId, sel.companyId),
+          isNotNull(issues.hiddenAt),
+          ...scopeIssueConditions(sel),
+          or(
+            inArray(issues.status, ["blocked", "in_review", "in_progress"]),
+            and(inArray(issues.status, ["done"]), gte(issues.updatedAt, recentlyDoneSince)),
+          ),
+        ))
+        .then((rows) => rows[0]?.count ?? 0),
     ]);
 
     const formatGroup = (
@@ -682,6 +695,7 @@ export function summarySlotService(db: Db) {
       "## Prebuilt scope snapshot",
       "",
       `Snapshot generated at ${new Date().toISOString()}. Recently done means updated since ${recentlyDoneSince.toISOString()}.`,
+      `Hidden cards excluded from the sections below: ${hiddenExcluded}.`,
        "This bounded, company-scoped snapshot is an index, not proof of what a card still owes. Do not call issue-list endpoints for listing.",
        "Before writing an action claim about a specific issue — including that it still owes work, never ran, nothing has been sent, or an equivalent claim — read that issue's thread: `GET /api/issues/{identifier}/comments`, substituting the issue's identifier exactly as a snapshot row prints it (for example `SUP-19312`); the issue's UUID also resolves.",
        "The issue description, the card body, and the previous slot body returned with `latestRevisionId` are unsafe sources for an action claim: descriptions can carry dated amendments, and a false revision becomes the next run's input. `lastCommentAt` makes staleness visible; it does not make a stale body safe.",
@@ -704,6 +718,14 @@ export function summarySlotService(db: Db) {
     const target = sel.scopeId ? `\`${sel.scopeId}\`` : "the workspaces overview";
     const summarySlotPath = `/api/companies/${encodeURIComponent(sel.companyId)}/summary-slots/${encodeURIComponent(sel.scopeKind)}/${encodeURIComponent(sel.slotKey)}`;
     const scopeQuery = sel.scopeId ? `?scopeId=${encodeURIComponent(sel.scopeId)}` : "";
+    const issueListScopeParam =
+      sel.scopeKind === "project" ? "projectId"
+        : sel.scopeKind === "project_workspace" ? "workspaceId"
+          : sel.scopeKind === "execution_workspace" ? "executionWorkspaceId"
+            : null;
+    const issueListPath = `/api/companies/${encodeURIComponent(sel.companyId)}/issues?${
+      issueListScopeParam && sel.scopeId ? `${issueListScopeParam}=${encodeURIComponent(sel.scopeId)}&` : ""
+    }includeHidden=true`;
     return [
       `Generate the ${scopeLabel(sel.scopeKind)} summary for ${target}.`,
       "",
@@ -741,6 +763,7 @@ export function summarySlotService(db: Db) {
        "The current-slot response includes the latest document body and `latestRevisionId`; carry its body forward only after checking the issue thread for every action claim.",
       "Follow the skill's streaming protocol: emit the first plain-text `STATUS:` line immediately — named from the first task in the snapshot, before any analysis — keep emitting `STATUS:` lines as you think, and emit the sentinel-wrapped summary draft before the authoritative summary-slot write.",
       "Pass the `generationIssueId` from the token block above, the previous revision id when present, and the model actually used to the summary-slot write API.",
+      `For any claim about activity within a time window (what finished, started, or stalled), also read \`GET ${issueListPath}\` — the snapshot below and the default issue list omit hidden cards, including earlier summary-generation cards — and state in the summary when hidden cards were excluded.`,
       "",
       scopeSnapshot,
       "",
