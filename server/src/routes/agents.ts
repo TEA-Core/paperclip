@@ -257,6 +257,7 @@ import {
   changeConsentGateService,
   REFLECTION_COACH_ADOPTION_CARRIER_REQUIRED,
   touchesAgentProfileChangeConsentFields,
+  type ConsumedChangeConsent,
 } from "../services/change-consent-gate.js";
 import {
   PaperclipRunnerProviderProfileError,
@@ -2794,11 +2795,12 @@ export function agentRoutes(
     }
   }
 
+  /** Resolves to the consumed-consent receipt when an accepted confirmation was spent; hand it to the service door. */
   async function assertCanApplyProtectedAgentChange(
     req: Request,
     targetAgent: { id: string; companyId: string },
     targetKeys: string[],
-  ) {
+  ): Promise<ConsumedChangeConsent | undefined> {
     if (!hasCompanyAccess(req, targetAgent.companyId)) {
       throw notFound("Agent not found");
     }
@@ -2815,8 +2817,9 @@ export function agentRoutes(
     }
 
     if (decision.reason === "deny_missing_consent" && req.actor.type === "agent" && targetKeys.length > 0) {
+      let consent: ConsumedChangeConsent | null;
       try {
-        await changeConsentGateService(db).assertConsented({
+        consent = await changeConsentGateService(db).assertConsented({
           companyId: targetAgent.companyId,
           actorAgentId: req.actor.agentId,
           actorRunId: req.actor.runId ?? null,
@@ -2839,7 +2842,7 @@ export function agentRoutes(
         scope: { ...changeScope, consentedChange: true },
       });
       if (consentedDecision.allowed) {
-        return;
+        return consent ?? undefined;
       }
       throw forbidden(consentedDecision.explanation, authorizationDeniedDetails(consentedDecision));
     }
@@ -2848,7 +2851,7 @@ export function agentRoutes(
   }
 
   async function assertCanManageInstructionsPath(req: Request, targetAgent: { id: string; companyId: string }) {
-    await assertCanApplyProtectedAgentChange(
+    return assertCanApplyProtectedAgentChange(
       req,
       targetAgent,
       [agentInstructionsChangeTargetKey(targetAgent.id)],
@@ -5444,10 +5447,10 @@ export function agentRoutes(
       if (req.body.baseHash !== undefined) req.body.baseRevisionId = req.body.baseHash === null ? null : agentFileTokenFromHash(req.body.baseHash);
       if (req.body.baseRevisionId === undefined) throw unprocessable("Read the entry and supply baseRevisionId (null for a new entry)", { code: "INSTRUCTION_BASE_REQUIRED" });
       // Clearing legacy prompt configuration remains a protected config change.
-      if (req.body.clearLegacyPromptTemplate) await assertCanManageInstructionsPath(req, existing);
+      const consent = req.body.clearLegacyPromptTemplate ? await assertCanManageInstructionsPath(req, existing) : undefined;
       const receipt = await instructionRevisions.commit({ companyId: existing.companyId, agentId: existing.id,
         entryFile, content: req.body.content, baseRevisionId: req.body.baseRevisionId,
-        source: req.actor.type === "board" ? "board" : "api" }, req.actor);
+        source: req.actor.type === "board" ? "board" : "api" }, req.actor, consent);
       if (req.actor.type === "agent" && req.actor.runId) {
         await instructionWorkingCopies.acknowledgeExplicitSave({ companyId: existing.companyId, agentId: existing.id,
           runId: req.actor.runId, entryFile: receipt.revision.entryFile, revisionId: receipt.revision.id,
@@ -5465,13 +5468,13 @@ export function agentRoutes(
       res.json(instructionFileDetail(receipt, receipt));
       return;
     }
-    await assertCanManageInstructionsPath(req, existing);
+    const consent = await assertCanManageInstructionsPath(req, existing);
     assertExternalInstructionsAdmin(req, existing);
 
     if (agentInstructionsBundleMode(existing) === "managed" && req.body.path !== "promptTemplate.legacy.md") {
       if (req.body.baseHash === undefined) throw unprocessable("Read the file and supply baseHash (null for a new file)");
       await agentFiles.write({ companyId: existing.companyId, agentId: existing.id, path: req.body.path,
-        bytes: Buffer.from(req.body.content, "utf8"), baseHash: req.body.baseHash }, req.actor);
+        bytes: Buffer.from(req.body.content, "utf8"), baseHash: req.body.baseHash }, req.actor, consent);
       res.json(await instructions.readFile(existing, req.body.path)); return;
     }
     const actor = getActorInfo(req);
@@ -5581,7 +5584,7 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
-    await assertCanManageInstructionsPath(req, existing);
+    const consent = await assertCanManageInstructionsPath(req, existing);
     assertExternalInstructionsAdmin(req, existing);
 
     const relativePath = typeof req.query.path === "string" ? req.query.path : "";
@@ -5593,7 +5596,7 @@ export function agentRoutes(
     if (agentInstructionsBundleMode(existing) === "managed") {
       const baseHash = typeof req.query.baseHash === "string" && /^[a-f0-9]{64}$/.test(req.query.baseHash) ? req.query.baseHash : null;
       if (baseHash === null) throw unprocessable("Read the file and supply baseHash before deleting it");
-      await agentFiles.write({ companyId: existing.companyId, agentId: existing.id, path: relativePath, bytes: null, baseHash }, req.actor);
+      await agentFiles.write({ companyId: existing.companyId, agentId: existing.id, path: relativePath, bytes: null, baseHash }, req.actor, consent);
       res.json(await instructions.getBundle(existing)); return;
     }
     const actor = getActorInfo(req);

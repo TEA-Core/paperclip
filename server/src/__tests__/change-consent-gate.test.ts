@@ -166,7 +166,7 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
       actorAgentId: coachId,
       actorRunId,
       targetKeys: [targetKey],
-    })).resolves.toBe(true);
+    })).resolves.toEqual({ interactionId });
 
     const [stored] = await db
       .select({ result: issueThreadInteractions.result })
@@ -208,7 +208,7 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
       actorAgentId: coachId,
       actorRunId: randomUUID(),
       targetKeys: [targetKey],
-    })).resolves.toBe(true);
+    })).resolves.toMatchObject({ interactionId: expect.any(String) });
 
     await expect(changeConsentGateService(db).assertConsented({
       companyId,
@@ -248,7 +248,7 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
       actorAgentId: coachId,
       actorRunId: randomUUID(),
       targetKeys: [targetKey],
-    })).resolves.toBe(true);
+    })).resolves.toMatchObject({ interactionId: expect.any(String) });
   });
 
   it("rejects an instruction-bundle apply when the accepted confirmation names no adoption carrier", async () => {
@@ -393,7 +393,7 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
       actorAgentId: coachId,
       actorRunId,
       targetKeys: [targetKey],
-    })).resolves.toBe(true);
+    })).resolves.toMatchObject({ interactionId: expect.any(String) });
 
     const [stored] = await db
       .select({ result: issueThreadInteractions.result })
