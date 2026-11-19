@@ -2320,6 +2320,79 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       }
     });
 
+    // SUP-24825: a merged PR in another repository is a citation, not this
+    // card's delivery (ADR-091 D5), so the preflight keeps its no-pr verdict
+    // and makes no live verification of the foreign PR.
+    describe("SUP-24825 foreign-repository mention", () => {
+      const FOREIGN_REPO = "foreign-vault";
+      const FOREIGN_PR_URL = `https://api.github.com/repos/${OWNER}/${FOREIGN_REPO}/pulls/525`;
+      // Live workspace discovery lists open PRs in each mentioned PR's repository.
+      const FOREIGN_OPEN_PRS_URL = `https://api.github.com/repos/${OWNER}/${FOREIGN_REPO}/pulls?state=open&per_page=100`;
+      const foreignMergedBody = () => mergedMentionBody({
+        title: "Foreign deliverable",
+        head: { ref: "foreign-note", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${FOREIGN_REPO}` } },
+      });
+
+      it("keeps the original no-pr verdict when the single merged mentioned carrier is in another repository", async () => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { owner: OWNER, repo: FOREIGN_REPO, number: 525, state: "closed", headRefName: "foreign-note" });
+        installRoutes([
+          { url: OPEN_PRS_LIST_URL, body: [] },
+          { url: FOREIGN_OPEN_PRS_URL, body: [] },
+          { url: FOREIGN_PR_URL, body: foreignMergedBody() },
+          { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+        ]);
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe("unresolvable");
+        if (result.kind === "unresolvable") {
+          expect(result.reason).toBe("no-pr: no open linked PR resolvable at decision time");
+        }
+        const foreignProbes = mockGhFetch.mock.calls
+          .map((call) => String(call[0]))
+          .filter((url) => url.includes(`/repos/${OWNER}/${FOREIGN_REPO}/compare/`));
+        expect(foreignProbes).toEqual([]);
+      });
+
+      it("still refuses ambiguously when a foreign merged mention sits beside a same-repository merged mention", async () => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "closed" });
+        await insertMention(issueId, { owner: OWNER, repo: FOREIGN_REPO, number: 525, state: "closed", headRefName: "foreign-note" });
+        installRoutes([
+          ...mergedCarrierRoutes(),
+          { url: FOREIGN_OPEN_PRS_URL, body: [] },
+          { url: FOREIGN_PR_URL, body: foreignMergedBody() },
+        ]);
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe("unresolvable");
+        if (result.kind === "unresolvable") {
+          expect(result.reason).toContain("ambiguous: multiple merged mentioned PRs (2)");
+        }
+      });
+
+      it("still refuses unreadable_mention when a foreign mention is unreadable beside a verified same-repository carrier", async () => {
+        const issueId = await insertIssue();
+        await insertMention(issueId, { number: 42, state: "closed" });
+        await insertMention(issueId, { owner: OWNER, repo: FOREIGN_REPO, number: 525, state: "closed", headRefName: "foreign-note" });
+        installRoutes([
+          ...mergedCarrierRoutes(),
+          { url: FOREIGN_OPEN_PRS_URL, body: [] },
+          { url: FOREIGN_PR_URL, body: { message: "rate limited" }, ok: false, status: 429 },
+        ]);
+
+        const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+        expect(result.kind).toBe("unresolvable");
+        if (result.kind === "unresolvable") {
+          expect(result.reason).toContain("unreadable_mention");
+          expect(result.reason).toContain(`${OWNER}/${FOREIGN_REPO}#525`);
+        }
+      });
+    });
+
     it("never considers a merged PR that is not mentioned on the card (unrelated)", async () => {
       const issueId = await insertIssue();
       installRoutes(mergedCarrierRoutes());

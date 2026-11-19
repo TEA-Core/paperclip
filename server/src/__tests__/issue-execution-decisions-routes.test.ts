@@ -299,6 +299,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     atStage = 0,
     laterStages,
     projectionGap = false,
+    foreignMergedMention = false,
   }: {
     draft?: boolean;
     missing?: boolean;
@@ -319,6 +320,11 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     laterStages?: "completed" | "skipped" | "skipped-only";
     /** Drop the stage before `atStage` from `completedStageIds` while its approved decision row stays (a lost projection). */
     projectionGap?: boolean;
+    /**
+     * SUP-24825: mention a live-merged PR in another repository (the card cites a
+     * deliverable that landed elsewhere). It is the card's only merged mention.
+     */
+    foreignMergedMention?: boolean;
   } = {}) {
     const company = await seedCompany(db);
     if (mergeArmingEnabled) {
@@ -446,6 +452,28 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         pullRequestNumber: pr.number, headSha: pr.head.sha,
       });
     }
+    // SUP-24825: the cited foreign PR is merged and its merge commit is on its own
+    // base branch; nothing about it is this card's delivery.
+    const foreignPr = {
+      number: 525, state: "closed", draft: false, merged: true, node_id: "foreign-pr", title: "Foreign deliverable",
+      head: { ref: "foreign-note", sha: "f".repeat(40), repo: { full_name: "TEA-Core/foreign-vault" } },
+      merge_commit_sha: "e".repeat(40), base: { ref: "main" },
+    };
+    const foreignCompareReads: string[] = [];
+    if (foreignMergedMention) {
+      const [object] = await db.insert(externalObjects).values({
+        companyId: company.id, providerKey: "github", objectType: "pull_request",
+        externalId: "TEA-Core/foreign-vault#pull/525", displayKey: "525", displayTitle: foreignPr.title,
+        sanitizedCanonicalUrl: "https://github.com/TEA-Core/foreign-vault/pull/525",
+        canonicalIdentityHash: randomUUID(), data: foreignPr,
+      }).returning();
+      await db.insert(externalObjectMentions).values({
+        companyId: company.id, sourceIssueId: issue.id, sourceKind: "description",
+        objectId: object!.id, providerKey: "github", detectorKey: "github_pr", objectType: "pull_request",
+        matchedTextRedacted: "evidence", sanitizedDisplayUrl: object!.sanitizedCanonicalUrl,
+        canonicalIdentityHash: randomUUID(), canonicalIdentity: {},
+      });
+    }
     const writes: Array<{ url: string; body: unknown }> = [];
     const armCalls: string[] = [];
     let moveAfterPreflight = false;
@@ -471,6 +499,11 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         writes.push({ url, body: JSON.parse(String(init.body)) });
         return Response.json({ id: 1 });
       }
+      if (url.includes("/repos/TEA-Core/foreign-vault/pulls/525")) return Response.json(foreignPr);
+      if (url.includes("/repos/TEA-Core/foreign-vault/compare/")) {
+        foreignCompareReads.push(url);
+        return Response.json({ status: "behind", ahead_by: 0 });
+      }
       if (url.includes("/pulls/43")) {
         return Response.json({ ...pr, number: 43 });
       }
@@ -488,7 +521,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       throw new Error(`Unexpected sandbox request: ${url}`);
     });
     return {
-      company, issue, stageId, stageIds, writes, armCalls, pr,
+      company, issue, stageId, stageIds, writes, armCalls, pr, foreignCompareReads,
       pullReached, releasePull,
       moveHead: () => { moveAfterPreflight = true; },
       approve: (extra: Record<string, unknown> = {}) => request(createApp(db, boardActor(company))).patch(`/api/issues/${issue.id}`)
@@ -2068,6 +2101,74 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
         expect.objectContaining({ source: "no-pr-branch", headSha: fixture.pr.head.sha }),
       ]);
       expect(fixture.writes).toEqual([]);
+    });
+
+    // SUP-24825: a merged PR in another repository is a citation, not this card's
+    // delivery. It leaves the verdict `no-pr`, so a stage approval that does not
+    // complete the card is admitted uncertified, as if the citation were absent.
+    it.each(stageDoors)("%s: records a stage-1 approve over a card whose only merged mention is in another repository", async (door) => {
+      const fixture = await pendingDelivery({ adr072: true, missing: true, foreignMergedMention: true, mergeArmingEnabled: true });
+      const stored = await expectAdvanced(fixture, await approveAtDoor(fixture, door), door, 0);
+      const approvalStatus = approvalStatusOf(stored);
+      expect(approvalStatus.finalDelivery).toBeUndefined();
+      expect(approvalStatus.approvedHeadSha).toBeUndefined();
+      expect(approvalStatus.publishSkipped).toMatchObject({ reason: expect.stringContaining("head_uncertified"), headSha: null });
+      // The foreign PR gets no merge-containment probe and no status write.
+      expect(fixture.foreignCompareReads).toEqual([]);
+      expect(fixture.writes).toEqual([]);
+      expect(fixture.armCalls).toEqual([]);
+    });
+
+    it("records the same stage-1 PATCH approve without consulting a merged-elsewhere override", async () => {
+      const fixture = await pendingDelivery({ adr072: true, missing: true, foreignMergedMention: true });
+      const response = await fixture.approve({
+        doneTransitionOverride: { disposition: "merged-elsewhere", reason: "Deliverable merged in another repository." },
+      });
+      const stored = await expectAdvanced(fixture, response, "PATCH", 0);
+      expect(approvalStatusOf(stored).publishSkipped).toMatchObject({ reason: expect.stringContaining("head_uncertified") });
+      // A stage approval that leaves a later stage pending is not a close: the
+      // done-transition guard never runs, so no override is accepted or audited.
+      const actions = (await db.select({ action: activityLog.action }).from(activityLog)
+        .where(eq(activityLog.entityId, fixture.issue.id))).map((row) => row.action);
+      expect(actions).not.toContain("issue.done_transition_override");
+      expect(fixture.writes).toEqual([]);
+    });
+
+    it.each(stageDoors)("%s: still refuses the final-stage approve whose only merged mention is in another repository", async (door) => {
+      const fixture = await pendingDelivery({ adr072: true, missing: true, foreignMergedMention: true, atStage: 2 });
+      const before = await fixture.read();
+      await expectRefusedUnchanged(fixture, await approveAtDoor(fixture, door), before, "approval_final_delivery_preflight", "no-pr");
+    });
+
+    it("closes the final-stage approve over a foreign merged mention only with an accepted merged-elsewhere override", async () => {
+      const fixture = await pendingDelivery({ adr072: true, missing: true, foreignMergedMention: true, atStage: 2 });
+      const response = await fixture.approve({
+        doneTransitionOverride: { disposition: "merged-elsewhere", reason: "Deliverable merged in another repository." },
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      const stored = await fixture.read();
+      expect(stored.status).toBe("done");
+      expect(stored.executionState).toMatchObject({ completedStageIds: fixture.stageIds, lastDecisionOutcome: "approved" });
+      expect(approvalStatusOf(stored).finalDelivery).toBeUndefined();
+      const actions = (await db.select({ action: activityLog.action }).from(activityLog)
+        .where(eq(activityLog.entityId, fixture.issue.id))).map((row) => row.action);
+      expect(actions).toContain("issue.done_transition_override");
+      expect(fixture.writes).toEqual([]);
+    });
+
+    // The citation rule is repository-scoped: a merged carrier in the card's own
+    // repository on another branch still fails ownership and refuses mid-ladder.
+    it("still refuses a stage-1 approve whose merged mention is in the card's repository on another branch", async () => {
+      const fixture = await pendingDelivery({ adr072: true, mentionState: "merged" });
+      const served = github.getMockImplementation()!;
+      github.mockImplementation(async (input, init) => {
+        if (/\/pulls\/42$/.test(String(input))) {
+          return Response.json({ ...fixture.pr, head: { ...fixture.pr.head, ref: "SUP-99-other-branch" } });
+        }
+        return served(input, init);
+      });
+      const before = await fixture.read();
+      await expectRefusedUnchanged(fixture, await fixture.approve(), before, "approval_final_delivery_preflight", "not_delivered");
     });
 
     it.each(["completed", "skipped"] as const)("still refuses a stage-1 approve that completes the card because later stages are %s", async (laterStages) => {
