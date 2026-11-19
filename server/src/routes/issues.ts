@@ -19664,12 +19664,16 @@ export function issueRoutes(
         );
       }
     };
+    // SUP-23801: a run-link change is only unexpected when a DIFFERENT run
+    // takes ownership of the card between admission and persistence. The
+    // request's own effects are expected: releasing the outgoing run clears
+    // both links, and the actor's authenticated mutation may adopt its own
+    // live run onto the card before the write commits.
     const hasUnexpectedRunLink = (
       candidate: {
         checkoutRunId?: string | null;
         executionRunId?: string | null;
       },
-      allowActorRunAdoption = false,
     ) => {
       const checkoutRunId = candidate.checkoutRunId ?? null;
       const executionRunId = candidate.executionRunId ?? null;
@@ -19677,8 +19681,8 @@ export function issueRoutes(
         checkoutRunId === (existing.checkoutRunId ?? null) &&
         executionRunId === (existing.executionRunId ?? null)
       ) return false;
+      if (checkoutRunId === null && executionRunId === null) return false;
       return !(
-        allowActorRunAdoption &&
         actor.runId !== null &&
         checkoutRunId === actor.runId &&
         executionRunId === actor.runId
@@ -21171,7 +21175,7 @@ export function issueRoutes(
           !afterStop ||
           !isDeepStrictEqual(issueRowWithFoldedDecisionAgentIds(withoutRunRelease(afterStop)), issueRowWithFoldedDecisionAgentIds(withoutRunRelease(existing))) ||
           (!adoptedOwnCheckout && !isDeepStrictEqual(issueRowWithFoldedDecisionAgentIds(afterStop), issueRowWithFoldedDecisionAgentIds(existing))) ||
-          hasUnexpectedRunLink(afterStop, adoptedOwnCheckout) ||
+          hasUnexpectedRunLink(afterStop) ||
           (await readFinalDeliveryBinding(db, afterStop)) !== originalDeliveryBinding
         ) {
           throw conflict("Card or delivery binding changed before the final delivery preflight; retry the final verdict", {
