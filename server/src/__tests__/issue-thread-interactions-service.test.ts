@@ -34,7 +34,10 @@ import {
 import { ONBOARDING_FIRST_TASK_ORIGIN_KIND, connectionIntentPayloadSchema, type CreateIssueThreadInteractionInput, type IssueThreadInteractionPayload } from "@paperclipai/shared";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
-import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
+import {
+  issueThreadInteractionService,
+  readCloseOnAcceptGuardSnapshot,
+} from "../services/issue-thread-interactions.js";
 import { agentService } from "../services/agents.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -6027,6 +6030,16 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       );
     }
 
+    async function closeOptions(seeded: { companyId: string; issueId: string }) {
+      return {
+        closeIssueOnAccept: true as const,
+        closeOnAcceptGuardSnapshot: await readCloseOnAcceptGuardSnapshot(db, {
+          id: seeded.issueId,
+          companyId: seeded.companyId,
+        }),
+      };
+    }
+
     async function readIssueRow(issueId: string) {
       return db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
     }
@@ -6047,7 +6060,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         created.id,
         {},
         { userId: REVIEWER_ID },
-        { closeIssueOnAccept: true },
+        await closeOptions(seeded),
       );
 
       expect(accepted.interaction).toMatchObject({
@@ -6094,7 +6107,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         created.id,
         {},
         { userId: REVIEWER_ID },
-        { closeIssueOnAccept: true },
+        await closeOptions(seeded),
       );
 
       expect(accepted.closeOnAccept?.decision).toMatchObject({ stageId, outcome: "approved" });
@@ -6158,6 +6171,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       await afterCreate?.(seeded.issueId);
       const issueBefore = await readIssueRow(seeded.issueId);
       const interactionBefore = await readInteractionRow(created.id);
+      const options = await closeOptions(seeded);
 
       await expect(interactionsSvc.acceptInteraction(
         { id: seeded.issueId, companyId: seeded.companyId, projectId: null, goalId: null },
@@ -6166,13 +6180,86 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         actor === "agent"
           ? { agentId: seeded.creatorAgentId }
           : { userId: actor === "other_user" ? OTHER_USER_ID : REVIEWER_ID },
-        { closeIssueOnAccept: true },
+        options,
       )).rejects.toMatchObject(refusal);
 
       expect(await readIssueRow(seeded.issueId)).toEqual(issueBefore);
       expect(await readInteractionRow(created.id)).toEqual(interactionBefore);
       expect(interactionBefore.status).toBe("pending");
       expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    });
+
+    it.each<{ label: string; mutate: (seeded: { companyId: string; issueId: string }) => Promise<void> }>([
+      {
+        label: "a blocker is added",
+        mutate: async (seeded) => {
+          const blockerId = randomUUID();
+          await db.insert(issues).values({
+            id: blockerId,
+            companyId: seeded.companyId,
+            title: "Late blocker",
+            status: "todo",
+            priority: "medium",
+          });
+          await db.insert(issueRelations).values({
+            companyId: seeded.companyId,
+            issueId: blockerId,
+            relatedIssueId: seeded.issueId,
+            type: "blocks",
+          });
+        },
+      },
+      {
+        label: "a child issue is opened",
+        mutate: async (seeded) => {
+          await db.insert(issues).values({
+            id: randomUUID(),
+            companyId: seeded.companyId,
+            parentId: seeded.issueId,
+            title: "Late child",
+            status: "todo",
+            priority: "medium",
+          });
+        },
+      },
+      {
+        label: "the issue status changes",
+        mutate: async (seeded) => {
+          await db.update(issues).set({ status: "blocked", updatedAt: new Date() }).where(eq(issues.id, seeded.issueId));
+        },
+      },
+    ])("rolls back the issue and interaction when $label between preflight and the lock", async ({ mutate }) => {
+      const seeded = await seedPublicationIssue();
+      const created = await createPublicationConfirmation(seeded);
+      const options = await closeOptions(seeded);
+      await mutate(seeded);
+      const issueBefore = await readIssueRow(seeded.issueId);
+      const interactionBefore = await readInteractionRow(created.id);
+
+      await expect(interactionsSvc.acceptInteraction(
+        { id: seeded.issueId, companyId: seeded.companyId, projectId: null, goalId: null },
+        created.id,
+        {},
+        { userId: REVIEWER_ID },
+        options,
+      )).rejects.toMatchObject(refused("guard_inputs_changed"));
+
+      expect(await readIssueRow(seeded.issueId)).toEqual(issueBefore);
+      expect(await readInteractionRow(created.id)).toEqual(interactionBefore);
+      expect(interactionBefore.status).toBe("pending");
+    });
+
+    it("refuses a close without a guard snapshot", async () => {
+      const seeded = await seedPublicationIssue();
+      const created = await createPublicationConfirmation(seeded);
+      await expect(interactionsSvc.acceptInteraction(
+        { id: seeded.issueId, companyId: seeded.companyId, projectId: null, goalId: null },
+        created.id,
+        {},
+        { userId: REVIEWER_ID },
+        { closeIssueOnAccept: true },
+      )).rejects.toMatchObject(refused("guard_inputs_changed"));
+      expect((await readInteractionRow(created.id)).status).toBe("pending");
     });
 
     it("keeps the ordinary accept for a flagged confirmation without the close option", async () => {
@@ -6254,6 +6341,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         issue,
         ALLOWLISTED_INTERACTION_ID,
         { userId: REVIEWER_ID },
+        await readCloseOnAcceptGuardSnapshot(db, issue),
       );
 
       expect(first.outcome).toBe("applied");
@@ -6279,6 +6367,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         issue,
         ALLOWLISTED_INTERACTION_ID,
         { userId: REVIEWER_ID },
+        await readCloseOnAcceptGuardSnapshot(db, issue),
       );
 
       expect(second).toEqual({ outcome: "already_applied" });
@@ -6326,6 +6415,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         issue,
         ALLOWLISTED_INTERACTION_ID,
         { userId: userId ?? REVIEWER_ID },
+        await readCloseOnAcceptGuardSnapshot(db, issue),
       )).rejects.toMatchObject(refusal);
 
       expect(await readIssueRow(ALLOWLISTED_ISSUE_ID)).toEqual(issueBefore);

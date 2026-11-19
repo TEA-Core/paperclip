@@ -54,6 +54,7 @@ const mockInteractionService = vi.hoisted(() => ({
   recordSecretProposalExecutionResult: vi.fn(),
   hasAppliedCloseOnAcceptReconciliation: vi.fn(),
   reconcileAcceptedConfirmationClose: vi.fn(),
+  readCloseOnAcceptGuardSnapshot: vi.fn(async () => "guard-snapshot"),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -353,6 +354,7 @@ describe("issue thread interaction routes", () => {
     // queue. That gap once let a leftover queued value deny an unrelated
     // later test.
     vi.resetAllMocks();
+    mockInteractionService.readCloseOnAcceptGuardSnapshot.mockResolvedValue("guard-snapshot");
     // mockRunAttribution.value is a plain object, not a vi.fn().
     // resetAllMocks() does not reset it. createApp() overwrites it for an
     // agent actor. A board actor leaves whatever value a prior test set here.
@@ -3936,7 +3938,10 @@ describe("issue thread interaction routes", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(mockEvaluateDoneTransitionGuard).toHaveBeenCalledTimes(1);
       expect(mockInteractionService.acceptInteraction).toHaveBeenCalledTimes(1);
-      expect(mockInteractionService.acceptInteraction.mock.calls[0]?.[4]).toEqual({ closeIssueOnAccept: true });
+      expect(mockInteractionService.acceptInteraction.mock.calls[0]?.[4]).toEqual({
+        closeIssueOnAccept: true,
+        closeOnAcceptGuardSnapshot: "guard-snapshot",
+      });
       expect(mockLogActivity).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({
@@ -4059,6 +4064,7 @@ describe("issue thread interaction routes", () => {
           expect.objectContaining({ id: ALLOWLISTED_ISSUE_ID }),
           ALLOWLISTED_INTERACTION_ID,
           { userId: "local-board" },
+          "guard-snapshot",
         );
         expect(mockInteractionService.acceptInteraction).not.toHaveBeenCalled();
         expect(mockIssueService.update).not.toHaveBeenCalled();

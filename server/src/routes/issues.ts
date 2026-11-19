@@ -24990,7 +24990,9 @@ export function issueRoutes(
           interaction: current,
           acceptingUserId: req.actor.userId ?? null,
         }) === null;
+      let closeOnAcceptGuardSnapshot: string | undefined;
       if (closeIssueOnAccept) {
+        closeOnAcceptGuardSnapshot = await interactionSvc.readCloseOnAcceptGuardSnapshot(issue);
         const closeOutcome = await preflightCloseOnAcceptDoneTransition(
           issue,
           req.actor.userId as string,
@@ -25068,7 +25070,7 @@ export function issueRoutes(
             } : {}),
           })
         : closeIssueOnAccept
-          ? await interactionSvc.acceptInteraction(...acceptArgs, { closeIssueOnAccept: true })
+          ? await interactionSvc.acceptInteraction(...acceptArgs, { closeIssueOnAccept: true, closeOnAcceptGuardSnapshot })
           : await interactionSvc.acceptInteraction(...acceptArgs);
       for (const publication of deferredPostCommit.activityPublications) publishActivity(publication);
       await flushIssuePostCommitActions(deferredPostCommit.postCommitActions);
@@ -25413,6 +25415,7 @@ export function issueRoutes(
         res.json({ outcome: "already_applied", issueId: issue.id, interactionId });
         return;
       }
+      const guardSnapshot = await interactionSvc.readCloseOnAcceptGuardSnapshot(issue);
       const closeOutcome = await preflightCloseOnAcceptDoneTransition(issue, userId, true);
       if (!closeOutcome.ok) {
         res.status(closeOutcome.status).json(closeOutcome.body);
@@ -25422,6 +25425,7 @@ export function issueRoutes(
         issue,
         interactionId,
         { userId },
+        guardSnapshot,
       );
       if (reconciled.outcome === "applied") {
         await runCloseOnAcceptMergeArming(reconciled.closeOnAccept);

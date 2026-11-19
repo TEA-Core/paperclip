@@ -34,6 +34,7 @@ import {
   issueDocuments,
   issueQuestionResponseDeliveries,
   issueThreadInteractions,
+  issueRelations,
   issues,
   toolActionRequests,
   toolOauthStates,
@@ -222,6 +223,10 @@ type InteractionResolutionMutationOptions = {
    * eligibility under the row locks and closes the issue in the acceptance
    * transaction; any refusal leaves the issue and the interaction pending. */
   closeIssueOnAccept?: boolean;
+  /** SUP-24788: the guard-input snapshot the route captured before its
+   * done-transition preflight. Re-read under the issue lock; a change refuses
+   * the accept so the guard never approves a state that is no longer stored. */
+  closeOnAcceptGuardSnapshot?: string;
 };
 
 const GITHUB_PULL_REQUEST_URL_PATTERN =
@@ -882,6 +887,67 @@ export function closeIssueOnAcceptIneligibleReason(args: {
 
 function closeOnAcceptRefusedError(reason: string, message: string) {
   return conflict(message, { code: "close_on_accept_refused", reason });
+}
+
+/**
+ * SUP-24788: the stored inputs the done-transition guard reads (issue state,
+ * blockers, children, execution and workspace binding). The route captures this
+ * before the guard runs and the service re-reads it under the issue row lock.
+ * Live external reads (GitHub) are not covered; they are checked at preflight only.
+ */
+export async function readCloseOnAcceptGuardSnapshot(
+  dbOrTx: Pick<Db, "select">,
+  issue: { id: string; companyId: string },
+): Promise<string> {
+  const [row] = await dbOrTx
+    .select({
+      status: issues.status,
+      statusVersion: issues.statusVersion,
+      updatedAt: issues.updatedAt,
+      deliveryRequirement: issues.deliveryRequirement,
+      executionPolicy: issues.executionPolicy,
+      executionState: issues.executionState,
+      assigneeAgentId: issues.assigneeAgentId,
+      assigneeUserId: issues.assigneeUserId,
+      projectWorkspaceId: issues.projectWorkspaceId,
+      executionWorkspaceId: issues.executionWorkspaceId,
+    })
+    .from(issues)
+    .where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)));
+  const blockers = await dbOrTx
+    .select({ id: issueRelations.issueId, status: issues.status })
+    .from(issueRelations)
+    .innerJoin(issues, eq(issues.id, issueRelations.issueId))
+    .where(
+      and(
+        eq(issueRelations.companyId, issue.companyId),
+        eq(issueRelations.relatedIssueId, issue.id),
+        eq(issueRelations.type, "blocks"),
+      ),
+    );
+  const children = await dbOrTx
+    .select({ id: issues.id, status: issues.status })
+    .from(issues)
+    .where(and(eq(issues.companyId, issue.companyId), eq(issues.parentId, issue.id)));
+  const byId = (a: { id: string }, b: { id: string }) => a.id.localeCompare(b.id);
+  return JSON.stringify({
+    issue: row ?? null,
+    blockers: [...blockers].sort(byId),
+    children: [...children].sort(byId),
+  });
+}
+
+async function assertCloseOnAcceptGuardSnapshotCurrent(
+  tx: Pick<Db, "select">,
+  issue: { id: string; companyId: string },
+  expected: string | undefined,
+) {
+  if (!expected || (await readCloseOnAcceptGuardSnapshot(tx, issue)) !== expected) {
+    throw closeOnAcceptRefusedError(
+      "guard_inputs_changed",
+      "The issue changed after the done-transition preflight; retry the acceptance",
+    );
+  }
 }
 
 export type CloseOnAcceptDecision = {
@@ -2540,6 +2606,13 @@ export function issueThreadInteractionService(
             "The confirmation is no longer eligible to close the issue on accept",
           );
         }
+      }
+      if (closeIssueOnAccept) {
+        await assertCloseOnAcceptGuardSnapshotCurrent(
+          tx,
+          issueContext,
+          args.mutationOptions?.closeOnAcceptGuardSnapshot,
+        );
       }
       const selectedOptionIds =
         interaction.kind === "request_checkbox_confirmation"
@@ -4264,6 +4337,9 @@ export function issueThreadInteractionService(
       }
     },
 
+    readCloseOnAcceptGuardSnapshot: async (issue: { id: string; companyId: string }) =>
+      readCloseOnAcceptGuardSnapshot(db, issue),
+
     /** SUP-24788: true once the allowlisted reconciliation has applied. */
     hasAppliedCloseOnAcceptReconciliation: async (
       issue: { id: string; companyId: string },
@@ -4281,6 +4357,7 @@ export function issueThreadInteractionService(
       issue: { id: string; companyId: string },
       interactionId: string,
       actor: { userId: string },
+      guardSnapshot?: string,
     ): Promise<
       | { outcome: "already_applied" }
       | { outcome: "applied"; closeOnAccept: CloseOnAcceptResult }
@@ -4340,6 +4417,7 @@ export function issueThreadInteractionService(
         if (actor.userId !== row.resolvedByUserId) {
           throw forbidden("Only the human who accepted the confirmation can apply its close");
         }
+        await assertCloseOnAcceptGuardSnapshotCurrent(txDb, issue, guardSnapshot);
         const closeOnAccept = await closeIssueForAcceptedConfirmation({
           db,
           tx: txDb,
