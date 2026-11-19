@@ -30,6 +30,7 @@ import {
   evaluateDoneTierDeclaration,
   extractCitedCommitShas,
   resolveCitedCommits,
+  readPullRequestWorkProductLinks,
   DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS,
   DONE_TIER_STRUCTURED_FORMS,
   DONE_TIER_TIER1_DELEGATED_JSON,
@@ -8478,6 +8479,100 @@ describe("evaluateDoneTierDeclaration", () => {
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain("not a linked pull request");
       expect(ghFetchMock).not.toHaveBeenCalled();
+    });
+
+    // SUP-23348: a pull-request work product is foreign from its head ref alone
+    // whenever the ref is anchored to another card, even when this card has no
+    // legitimate delivery branch to prove ownership with (a reused unrelated
+    // workspace, a workspace with no branch, no workspace at all). A ref
+    // anchored to this card, or carrying no card anchor, stays fail-closed.
+    describe("pull-request work product classification (SUP-23348)", () => {
+      type Ownership = Awaited<ReturnType<typeof resolveCardDeliveryBranchOwnership>>;
+      const REUSED_UNRELATED_WORKSPACE: Ownership = {
+        branch: "SUP-99999-their-work",
+        branchIsOwn: false,
+        carrier: false,
+        legitimate: false,
+        ownerIssueId: "other-issue",
+        refusalReason: "owned by another issue that is not its ADR-083 carrier owner",
+      };
+
+      async function classifyProduct(
+        ownership: Ownership,
+        metadata: Record<string, unknown>,
+        identifier: string | null = "SUP-12345",
+      ): Promise<"own" | "foreign" | "unknown"> {
+        vi.mocked(resolveCardDeliveryBranchOwnership).mockResolvedValueOnce(ownership);
+        setupDbMock({
+          executionWorkspaces: [mockExecutionWorkspaceRow()],
+          issueWorkProducts: [
+            { id: "work-product-1", title: "Stamped PR", status: "open", metadata },
+          ],
+        });
+        const links = await readPullRequestWorkProductLinks(mockDb, {
+          id: "issue-1",
+          companyId: "company-1",
+          projectId: "project-1",
+          projectWorkspaceId: "pw-1",
+          executionWorkspaceId: "ew-1",
+          identifier,
+        });
+        expect(links).toHaveLength(1);
+        return links[0]!.kind;
+      }
+
+      it("calls a foreign-headRef PR foreign on a reused unrelated workspace (legitimate: false)", async () => {
+        const kind = await classifyProduct(REUSED_UNRELATED_WORKSPACE, {
+          repository: "TEA-Core/paperclip",
+          prNumber: 4161,
+          headRef: "SUP-99999-their-work",
+        });
+        expect(kind).toBe("foreign");
+      });
+
+      it("calls a foreign-headRef PR foreign when the card has no delivery branch at all", async () => {
+        const kind = await classifyProduct(
+          { branch: null, branchIsOwn: true, carrier: false, legitimate: true, ownerIssueId: null, refusalReason: null },
+          { repository: "TEA-Core/paperclip", prNumber: 4161, headRef: "SUP-99999-their-work" },
+        );
+        expect(kind).toBe("foreign");
+      });
+
+      it("never discounts a self-anchored head ref it cannot prove is own (reused unrelated workspace)", async () => {
+        const kind = await classifyProduct(REUSED_UNRELATED_WORKSPACE, {
+          repository: "TEA-Core/paperclip",
+          prNumber: 4161,
+          headRef: "SUP-12345-work",
+        });
+        expect(kind).toBe("unknown");
+      });
+
+      it("keeps a head ref with no card anchor fail-closed when the branch cannot be proven", async () => {
+        const kind = await classifyProduct(REUSED_UNRELATED_WORKSPACE, {
+          repository: "TEA-Core/paperclip",
+          prNumber: 4161,
+          headRef: "fm/fleet-fix",
+        });
+        expect(kind).toBe("unknown");
+      });
+
+      it("stays fail-closed when the card itself carries no identifier", async () => {
+        const kind = await classifyProduct(
+          REUSED_UNRELATED_WORKSPACE,
+          { repository: "TEA-Core/paperclip", prNumber: 4161, headRef: "SUP-99999-their-work" },
+          null,
+        );
+        expect(kind).toBe("unknown");
+      });
+
+      it("keeps proving a real own PR own", async () => {
+        const kind = await classifyProduct(ownDeliveryBranch("SUP-12345-work"), {
+          repository: "TEA-Core/paperclip",
+          prNumber: 4161,
+          headRef: "SUP-12345-work",
+        });
+        expect(kind).toBe("own");
+      });
     });
 
     async function declareDelegated(prNumber: number, cached: Record<string, unknown>) {

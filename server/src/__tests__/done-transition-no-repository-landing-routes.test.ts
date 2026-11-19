@@ -809,6 +809,43 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 
+  // SUP-23348: a work product whose head ref names another card is foreign from
+  // the head ref alone; the card needs no legitimate delivery branch of its own
+  // to discount it (no branch, a reused unrelated workspace, no workspace at
+  // all classify the same way). The sibling test above keeps a self-anchored
+  // head ref on the same no-branch shape refused, and the one below keeps an
+  // unanchored head ref fail-closed.
+  it("discounts a foreign-headRef pull request work product when the card has no delivery branch to prove ownership with", async () => {
+    const fixture = await seed({ workspace: { branchName: null } });
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    await insertPullRequestProduct(fixture, {
+      repository: "TEA-Core/records",
+      prNumber: 9,
+      headRef: "SUP-99999-foreign",
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(fixture.issueId)).toBe("done");
+  });
+
+  it("still refuses an unanchored-headRef pull request work product when the card has no delivery branch", async () => {
+    const fixture = await seed({ workspace: { branchName: null } });
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    await insertPullRequestProduct(fixture, {
+      repository: "TEA-Core/records",
+      prNumber: 9,
+      headRef: "fm/unanchored-work",
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("records a pull request work product");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
   function commitOnIssueBranch(fixture: SeededIssue) {
     writeFileSync(path.join(fixture.worktree, "deliverable.md"), "work\n");
     git(fixture.worktree, "add", "deliverable.md");
