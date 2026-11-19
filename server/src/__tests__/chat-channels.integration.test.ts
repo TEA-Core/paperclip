@@ -28208,6 +28208,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             { id: f.conversation.issueId, companyId: f.companyId },
             {
               kind,
+              ...(kind === "request_confirmation" ? { addresseeUserId: "owner-user" } : {}),
               continuationPolicy: "wake_assignee",
               sourceRunId: f.runId,
               payload:
@@ -28308,6 +28309,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           { id: f.conversation.issueId, companyId: f.companyId },
           {
             kind: "request_confirmation",
+            addresseeUserId: "owner-user",
             continuationPolicy: "wake_assignee",
             sourceRunId: otherRunId,
             payload: { version: 1, prompt: "Another run's confirmation" },
@@ -28396,6 +28398,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               { id: f.conversation.issueId, companyId: f.companyId },
               {
                 kind: "request_confirmation",
+                addresseeUserId: "owner-user",
                 continuationPolicy: "wake_assignee",
                 sourceRunId: f.runId,
                 payload: { version: 1, prompt: "Preserve this confirmation?" },
@@ -29684,6 +29687,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       { id: conversation.issueId, companyId: fixture.companyId },
       {
         kind: "request_confirmation",
+        addresseeUserId: "owner-user",
         continuationPolicy: "wake_assignee",
         sourceRunId: sourceRun.id,
         payload: {
@@ -39115,6 +39119,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       { id: conversation.issueId, companyId: fixture.companyId },
       {
         kind: "request_confirmation",
+        addresseeUserId: "owner-user",
         continuationPolicy: "wake_assignee",
         sourceRunId,
         title: "Release check",
@@ -40091,6 +40096,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       },
       {
         kind: "request_confirmation",
+        addresseeUserId: linkedUserId,
         continuationPolicy: "wake_assignee",
         title: "Release check",
         payload: {
@@ -40434,6 +40440,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       { id: conversation.issueId, companyId: fixture.companyId },
       {
         kind: "request_confirmation",
+        addresseeUserId: linkedUserId,
         continuationPolicy: "wake_assignee",
         payload: {
           version: 1,
@@ -40794,6 +40801,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       { id: conversation.issueId, companyId: fixture.companyId },
       {
         kind: "request_confirmation",
+        addresseeUserId: linkedUserId,
         continuationPolicy: "wake_assignee",
         payload: {
           version: 1,
@@ -41297,6 +41305,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       { id: conversation.issueId, companyId: fixture.companyId },
       {
         kind: "request_confirmation",
+        addresseeUserId: "owner-user",
         continuationPolicy: "wake_assignee",
         sourceCommentId,
         payload: { version: 1, prompt: "Ship this release?" },

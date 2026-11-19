@@ -149,6 +149,7 @@ describe("native external-chat response wait", () => {
       status: "in_progress",
       workMode: "standard",
       assigneeAgentId: agentId,
+      responsibleUserId: userId,
     });
     await db.insert(completionContracts).values({
       id: contractId,
