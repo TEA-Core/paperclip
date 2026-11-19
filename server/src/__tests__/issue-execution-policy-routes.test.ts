@@ -4239,6 +4239,96 @@ describe("issue execution policy routes", () => {
       });
       expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
     });
+
+    // SUP-24762: a human reviewer holds the review stage, so the stored agent
+    // assignee is null. A comment-only PATCH sets no issue field and must not
+    // be judged as a write of that null assignee.
+    function humanReviewHandoff() {
+      return {
+        ...issueWithParticipants([]),
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: "human-reviewer",
+        executionPolicy: normalizeIssueExecutionPolicy({
+          stages: [{
+            id: stageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ type: "user", userId: "human-reviewer" }],
+          }],
+        }),
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "user", agentId: null, userId: "human-reviewer" },
+          returnAssignee: { type: "agent", agentId: maintainerId, userId: null },
+          completedStageIds: [],
+          skippedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      };
+    }
+
+    async function patchHumanReviewed(actor: TestActor | undefined, body: Record<string, unknown>) {
+      const issue = humanReviewHandoff();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+      vi.doMock("../services/cross-issue-influence-limit.js", async (importOriginal) => ({
+        ...await importOriginal<typeof import("../services/cross-issue-influence-limit.js")>(),
+        observeCrossIssueInfluence: vi.fn(async () => null),
+      }));
+      return request(await createApp(actor)).patch(`/api/issues/${issueId}`).send(body);
+    }
+
+    const humanReviewActors: Array<[string, TestActor | undefined]> = [
+      ["the board", undefined],
+      ["the canonical Maintainer agent", {
+        type: "agent",
+        agentId: maintainerId,
+        companyId: "company-1",
+        runId: "55555555-5555-4555-8555-555555555555",
+      }],
+      ["the author agent", {
+        type: "agent",
+        agentId: authorId,
+        companyId: "company-1",
+        runId: "55555555-5555-4555-8555-555555555555",
+      }],
+    ];
+
+    it.each(humanReviewActors)("lets a comment-only PATCH through on a human-reviewed Wiki handoff as %s (SUP-24762)", async (_name, actor) => {
+      const res = await patchHumanReviewed(actor, { comment: "status note" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(patch.assigneeAgentId).toBeUndefined();
+      expect(patch.assigneeUserId).toBeUndefined();
+      expect(patch.title).toBeUndefined();
+      expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps refusing a comment that rides with a title write on a human-reviewed Wiki handoff (SUP-24762)", async () => {
+      const res = await patchHumanReviewed(undefined, {
+        comment: "rename",
+        title: "Weekly report — handoff to Wiki Maintainer (edited)",
+      });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details).toMatchObject({
+        guard: "assignee_review_gate",
+        subGuard: "wiki_handoff",
+        reason: "wiki_handoff_unassigned",
+      });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
   });
 
   it.each([

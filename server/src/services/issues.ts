@@ -168,6 +168,7 @@ import { instanceSettingsService } from "./instance-settings.js";
 import {
   assertAssigneeWriteDoesNotSelfSatisfyReviewStage,
   assertWikiHandoffWriteIntegrity,
+  isFieldlessIssueWrite,
 } from "./issue-assignee-review-gate.js";
 import {
   type CurrentUserRedactionOptions,
@@ -12459,6 +12460,9 @@ export function issueService(db: Db) {
         //   unblockDescriptor)
         // unblockDescriptor: repairNativeBlockedWait
         // companyGuard: blockIssueWithUnresolvedBlockers company scope
+        // SUP-24762: also skip it for a field-less write (only request
+        // attribution, e.g. a comment-only PATCH): it writes no assignee. The
+        // attribution keys still count as present keys for every other write.
         const wikiHandoffUnguardedWriteKeys = new Set([
           "status",
           "blockedByIssueIds",
@@ -12469,9 +12473,9 @@ export function issueService(db: Db) {
         const presentWriteKeys = Object.entries(data)
           .filter(([, value]) => value !== undefined)
           .map(([key]) => key);
-        const wikiHandoffIdentityWrite = presentWriteKeys.some(
-          (key) => !wikiHandoffUnguardedWriteKeys.has(key),
-        );
+        const wikiHandoffIdentityWrite =
+          !isFieldlessIssueWrite(data) &&
+          presentWriteKeys.some((key) => !wikiHandoffUnguardedWriteKeys.has(key));
         if (wikiHandoffIdentityWrite) {
           await assertWikiHandoffWriteIntegrity({
             db: tx as Db,

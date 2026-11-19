@@ -824,6 +824,17 @@ item. If every other present key is allowed bookkeeping, an explicit
 `executionPolicy: undefined` is dropped from the present-key check. The guard
 is skipped, while policy normalization writes `null`.
 
+The Wiki handoff guard is also skipped for a field-less write. In a field-less
+write, every present key is `undefined` or request attribution: `actorAgentId`,
+`actorRunId`, `actorRunStopId`, `actorUserId`, `boardApiKeyId`,
+`expectedUpdatedAt`. A comment-only `PATCH /api/issues/:id` is a field-less
+write, and the PATCH route skips its own guard call for it too. A field-less
+write sets no assignee, so the guard does not judge the stored assignee. Thus
+a comment on a Wiki handoff whose review stage a human reviewer holds (stored
+`assigneeAgentId` null) is not refused. When the write carries any other key,
+the attribution keys still count as present keys. Thus an attributed `status`
+or `unblockDescriptor` write still runs the guard.
+
 The boundary is the write path. Per-card isolation is required for every
 startup sweep that writes issue rows through the guarded issue service
 (`issueService.update`), because the Wiki handoff guard and the other assignee

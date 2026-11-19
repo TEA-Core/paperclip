@@ -9232,6 +9232,111 @@ describeEmbeddedPostgres("issueService.update Wiki handoff guard", () => {
       details: expect.objectContaining({ guard: "assignee_review_gate" }),
     });
   });
+
+  // SUP-24762: a human reviewer holds the review stage (stored assigneeAgentId
+  // null). routeActorKeys is the attribution the PATCH route always adds, so
+  // `{...routeActorKeys}` alone is a comment-only PATCH.
+  const routeActorKeys = {
+    actorAgentId: null,
+    actorRunId: null,
+    actorRunStopId: null,
+    actorUserId: "local-board",
+    boardApiKeyId: null,
+  };
+  const blockedUnblockDescriptor = { owner: "board", action: "Review the handoff" };
+  it.each([
+    ["in_review", "no keys", true, {}],
+    ["in_review", "attribution keys only (comment-only PATCH)", true, { ...routeActorKeys }],
+    ["in_review", "a bare blocked status", true, { status: "blocked" }],
+    ["blocked", "a bare unblockDescriptor", true, { unblockDescriptor: blockedUnblockDescriptor }],
+    ["in_review", "an attributed status write", false, { status: "in_review", ...routeActorKeys }],
+    ["in_review", "an attributed title write", false, { title: "Handoff to Wiki Maintainer (edited)", ...routeActorKeys }],
+    ["blocked", "an attributed unblockDescriptor", false, { unblockDescriptor: blockedUnblockDescriptor, ...routeActorKeys }],
+  ] as const)("on a human-reviewed %s Wiki handoff, %s is admitted: %s (SUP-24762)", async (status, _name, admitted, data) => {
+    const companyId = randomUUID();
+    const pluginId = randomUUID();
+    const canonicalAgentId = randomUUID();
+    const stageId = randomUUID();
+    const reviewerUserId = `reviewer-${randomUUID()}`;
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      packageName: "@paperclipai/plugin-llm-wiki",
+      version: "0.1.0",
+      apiVersion: 1,
+      categories: [],
+      manifestJson: {} as never,
+      status: "ready",
+      installOrder: 1,
+    });
+    await db.insert(agents).values({
+      id: canonicalAgentId,
+      companyId,
+      name: "Wiki Maintainer",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(pluginManagedResources).values({
+      companyId, pluginId, pluginKey: "paperclipai.plugin-llm-wiki", resourceKind: "agent", resourceKey: "wiki-maintainer", resourceId: canonicalAgentId, defaultsJson: {},
+    });
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: reviewerUserId, status: "active", membershipRole: "member",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Handoff to Wiki Maintainer",
+      status,
+      assigneeAgentId: null,
+      assigneeUserId: reviewerUserId,
+      executionPolicy: {
+        mode: "normal",
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ type: "user", agentId: null, userId: reviewerUserId }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "user", agentId: null, userId: reviewerUserId },
+        returnAssignee: { type: "agent", agentId: canonicalAgentId, userId: null },
+        completedStageIds: [],
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+
+    const write = svc.update(issueId, { ...data } as Parameters<typeof svc.update>[1]);
+    if (admitted) {
+      await expect(write).resolves.toMatchObject({ id: issueId, assigneeAgentId: null, assigneeUserId: reviewerUserId });
+    } else {
+      await expect(write).rejects.toMatchObject({
+        status: 422,
+        details: expect.objectContaining({ subGuard: "wiki_handoff", reason: "wiki_handoff_unassigned" }),
+      });
+      await expect(svc.getById(issueId)).resolves.toMatchObject({
+        title: "Handoff to Wiki Maintainer",
+        status,
+      });
+    }
+  });
 });
 
 describeEmbeddedPostgres("issueService.create defaultExecutionPolicy inheritance", () => {
