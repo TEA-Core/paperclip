@@ -6627,7 +6627,7 @@ describeEmbeddedPostgres("PATCH /issues/:id AS-05 bound-pr delivery identity (SU
   const PATCH_USER_ID = "as05-patch-user-1";
   const CARD_BRANCH = "SUP-23026-card-branch";
   const PR_HEAD = "SUP-23026-bound-pr-head";
-  const PR_SHA = "9f8e7d6c5b4a392817655443322110ffeeddccbba";
+  const PR_SHA = "9f8e7d6c5b4a392817655443322110ffeeddccbb";
   const PR_HTML_URL = `https://github.com/${OWNER}/${REPO}/pull/42`;
 
   beforeAll(async () => {
