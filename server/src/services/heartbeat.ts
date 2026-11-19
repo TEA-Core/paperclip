@@ -23718,6 +23718,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.sweepStaleIssueLocks(opts);
   }
 
+  // The queued-run age bound (MAX_QUEUED_ISSUE_RUN_AGE_MS). Every claim-skip
+  // exit in claimQueuedRun leaves a run `queued`, and enqueueWakeup re-adopts
+  // a queued run as the issue's execution holder, so without this bound a run
+  // that can never be claimed holds the issue lock indefinitely.
+  async function expireStaleQueuedRuns(opts?: { now?: Date }) {
+    if ((await getSchedulingSuppression()).suppressed) {
+      return { expired: 0, runIds: [] as string[], pageCapReached: false };
+    }
+    const result = await runDispatch.expireStaleQueuedRuns({ now: opts?.now });
+    applyRunDispatchPostCommitEffects(result.postCommitEffects);
+    for (const failure of result.failures) {
+      logger.warn(
+        { err: failure.error, runId: failure.runId },
+        "queued-run age bound skipped a candidate after an error; the sweep continued",
+      );
+    }
+    return { expired: result.expired, runIds: result.runIds, pageCapReached: result.pageCapReached };
+  }
+
   async function reconcileBlockedWithoutBlockers() {
     return recovery.reconcileBlockedWithoutBlockers();
   }
@@ -36376,6 +36395,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    expireStaleQueuedRuns,
 
     scheduleBoundedRetry: async (
       runId: string,

@@ -14,6 +14,17 @@ const {
   startAdapterExecutionTargetPaperclipBridge,
 } = vi.hoisted(() => ({
   runChildProcess: vi.fn(async (_runId: string, _command: string, args: string[]) => {
+    if (args.includes("--version")) {
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "1.17.9\n",
+        stderr: "",
+        pid: 121,
+        startedAt: new Date().toISOString(),
+      };
+    }
     if (args.includes("models")) {
       return {
         exitCode: 0,

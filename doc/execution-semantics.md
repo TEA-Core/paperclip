@@ -1060,10 +1060,19 @@ On startup and on the periodic recovery loop, Paperclip performs the following r
 
 1. reap orphaned `running` runs
 2. resume persisted `queued` runs
-3. reconcile stranded assigned work
-4. scan silent active runs only for source-aware terminal folding and legacy cleanup; API reads classify ordinary output silence for the board UI
+3. expire issue-bound `queued` runs past the queued-run age bound
+4. reconcile stranded assigned work
+5. scan silent active runs only for source-aware terminal folding and legacy cleanup; API reads classify ordinary output silence for the board UI
 
 The stranded-work pass closes the gap where issue state survives a crash but the wake/run path does not. The silent-run scan covers the separate case where a live process exists but has stopped producing observable output.
+
+The queued-run age bound (`MAX_QUEUED_ISSUE_RUN_AGE_MS`, 24 hours) covers a run that was queued but never started. A claim can skip a queued run without ending it, and a later wake on the issue re-adopts that run as the execution holder. Without a bound, such a run holds the issue execution lock until a board user cancels it. The expiry pass runs after queued runs are resumed. It cancels an issue-bound run that has stayed `queued` for 24 hours since creation, with error code `queued_run_expired`. It also cancels such a run when its issue no longer exists or is under a recovery hold. The pass skips a run whose issue is held by another live run, a run whose retry alarm is not yet due, and any run in a company that is not active. It checks the company again inside the cancel transaction, so a company paused after the candidate list was read keeps its runs. In the same transaction, the pass marks the run's wake request `skipped`, clears only the execution and checkout lock columns that name that run, and writes one `heartbeat.queued_run_expired` activity row. Running runs are never selected. The pass is a system sweep: it adds no API, and it does not change who may cancel a run or write to an issue.
+
+An expired legacy run records that provider work never started. Stranded-work recovery then treats its issue like any other lost wake: an ordinary assigned `todo` or `in_progress` issue gets a bounded dispatch or continuation retry, and an exhausted automatic continuation escalates as before. An expired automatic continuation whose chat-control source cannot be verified is not re-dispatched; its issue stays unlocked until the next wake.
+
+One pass expires at most 100 runs and reads at most 20 pages of 100 candidates, oldest first. The candidate query leaves out runs the bound does not expire: a run whose retry alarm is in the future, and a run whose issue another running run holds. So older runs that must wait cannot fill the pages and hide a newer stuck run. Paging uses the stored `created_at` value and the run id, so runs that share one timestamp are read once. The query also leaves out a run whose `issueId` is not a canonical issue id (for example a number or padded text). Such a run names no issue and holds no issue lock; this pass never expires it. A malformed recovery action id or comment id in a run's context is read as absent, so it cannot make the decision fail. If one candidate still fails, the pass logs it, skips it, and continues; cancellations already committed keep their effects. A pass that stops at either cap resumes after the last run it visited on the next pass, and a pass that reaches the end of the list starts the next one from the oldest run. So every listed run is visited within ceil(listed / 2,000) passes, and a run the bound expires is cancelled within ceil(expirable ahead of it / 100) passes. The resume position lives in server memory; a restart begins at the oldest run.
+
+Issues in `in_review` are not exempt. A queued approval, review, or wake run on an issue in review expires at the same 24-hour bound as any other queued run (owner decision 2026-11-17).
 
 The stale-lock sweep leaves native runs with their finalization coordinator while
 same-session recovery or accepted-result finalization is pending. A provider can
