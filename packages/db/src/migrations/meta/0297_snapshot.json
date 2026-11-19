@@ -25528,7 +25528,7 @@
         },
         "issue_delivery_receipt_links_head_sha_check": {
           "name": "issue_delivery_receipt_links_head_sha_check",
-          "value": "\"issue_delivery_receipt_links\".\"head_sha\" ~ '^[0-9a-f]{40,64}$'"
+          "value": "\"issue_delivery_receipt_links\".\"head_sha\" ~ '^[0-9a-f]{40}$'"
         }
       },
       "isRLSEnabled": false
@@ -25830,7 +25830,7 @@
         },
         "issue_delivery_receipts_head_sha_check": {
           "name": "issue_delivery_receipts_head_sha_check",
-          "value": "\"issue_delivery_receipts\".\"head_sha\" ~ '^[0-9a-f]{40,64}$'"
+          "value": "\"issue_delivery_receipts\".\"head_sha\" ~ '^[0-9a-f]{40}$'"
         }
       },
       "isRLSEnabled": false
