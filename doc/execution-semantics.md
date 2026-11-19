@@ -1451,6 +1451,20 @@ An upgrade may encounter an already-active agent-owned recovery action. Papercli
 
 Create an issue-backed recovery action only when a separate issue is the right execution object. In that fallback form, the source issue remains visible and is blocked on the recovery issue when blocking is necessary for correctness. The recovery owner must restore a live path, resolve the source issue manually, delegate real follow-up work, or record the reason the signal is a false positive.
 
+An exhausted-recovery card minted because the source cannot host a board monitor is `record_only`. It records the board decision and does not ship code, so it never inherits the source issue's `executionWorkspaceId` or settings, including a source workspace that failed validation and cannot be reused. The card keeps the source project for board context.
+
+Where it applies, the mint names the `agent_default` preference, which drops `projectWorkspaceId` instead of copying the source binding. A `projectWorkspaceId` is itself a workspace expectation: carrying it makes dispatch resolve a project checkout and fail the same validation. A card in the minted shape — `record_only`, no `executionWorkspaceId`, no `projectWorkspaceId`, `agent_default`, `stranded_issue_recovery` origin — is the ONLY shape exempt from the git-metadata check, because the resolved checkout is not a workspace the card is required to use. Dispatch never binds the realized checkout back onto such a card, so it keeps the no-binding shape after its owner wake, and that wake does not fail workspace validation. The exemption is decided by the shape alone: all five fields must match, and a card that differs in exactly one field keeps every workspace check. Every other `record_only` card, including one with a bound execution workspace or a checkout binding, keeps every workspace check.
+
+The exemption has stated limits. In these shapes a source checkout that is not a valid git checkout still fails the owner wake with `workspace_validation_failed`:
+
+- A project that isolates by default (policy `defaultMode: isolated_workspace`, or the instance-wide default-isolated setting). The card receives that default mode, and dispatch provisions the project checkout for it before the exempted adapter check runs.
+- A project whose policy sets `allowIssueOverride: false` while isolated workspaces are on. The write boundary refuses any explicit preference there, so the mint omits `agent_default`. The card is still minted and its owner is still woken, as before this change, but it carries the project default binding and is not exempt.
+- An instance with isolated workspaces off. The write boundary drops the explicit preference, so the card carries the project default binding and is not exempt.
+
+The exemption is decided by the card's fields, not by who created it. The public board, agent and plugin create paths cannot set `originKind`, but an internal `issueService.create` caller that builds the exact five-field shape gets the exemption.
+
+Ordinary parent-child workspace inheritance is unchanged. A lawful `reuse_existing` binding on a normal child still copies a live source workspace. At most one such card exists per recovery action.
+
 ### Human Escalation
 
 Human escalation is required when the next safe action depends on board judgment, budget/approval policy, or information unavailable to the control plane.
