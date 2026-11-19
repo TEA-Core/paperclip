@@ -223,7 +223,7 @@ describe("canonical instruction revisions", () => {
       return id;
     }
     async function consentResult(id: string) {
-      return (await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, id)))[0].result as Record<string, unknown>;
+      return (await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, id)))[0].result as unknown as Record<string, unknown>;
     }
     const routeDoor = (key = instructionsKey()) => changeConsentGateService(db).assertConsented({ companyId, actorAgentId: actorId, actorRunId: runId, targetKeys: [key] });
     const write = (content: string, consent?: ConsumedChangeConsent | null) =>
