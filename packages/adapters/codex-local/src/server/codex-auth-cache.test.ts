@@ -1,7 +1,7 @@
 import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   assertAccountHomeCacheDirStillValid,
@@ -432,7 +432,8 @@ describe("codex auth cache store", () => {
         await companyAGate;
         events.push("a-exit");
       });
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      // Wait until A actually holds its lock; a fixed sleep is racy under CI load.
+      await vi.waitFor(() => expect(events).toEqual(["a-enter"]));
       const companyBCall = withCodexAccountHomePromotionLock(env, "company-b", async () => {
         events.push("b-enter");
         events.push("b-exit");
@@ -502,7 +503,8 @@ describe("codex auth cache store", () => {
         await companyAGate;
         events.push("a-exit");
       });
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      // Wait until A actually holds its lock; a fixed sleep is racy under CI load.
+      await vi.waitFor(() => expect(events).toEqual(["a-enter"]));
       const companyBCall = withAccountHomeSecretMutationLock(env, "company-b", async () => {
         events.push("b-enter");
         events.push("b-exit");

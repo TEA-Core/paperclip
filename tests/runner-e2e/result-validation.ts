@@ -98,6 +98,7 @@ const runtime = shape({
   pricingAsOf: optional(string),
   pricingUrl: optional(url),
 });
+const assistant = shape({ provider: oneOf("openai", "anthropic"), model: string, observedModels: array(string), requests: integer, inputTokens: number, outputTokens: number, cachedInputTokens: number, estimatedCostUsd: number, pricingAsOf: string, pricingUrl: url });
 const llm = shape({
   runCount: integer,
   runsWithTokenUsage: integer,
@@ -111,6 +112,7 @@ const llm = shape({
 });
 const billing = shape({
   judge: optional(shape({ inputTokens: nullable(number), outputTokens: nullable(number), estimatedCostUsd: nullable(number), reservedCostUsd: number })),
+  assistant: optional(assistant),
   llm,
   runtime,
   reportedCostUsd: number,
@@ -144,6 +146,7 @@ const matcher: Rule = (value, at) => {
   rule(value, at);
 };
 const fields = {
+  publicMcp: optional(assistant),
   schema: oneOf(
     "paperclip.runner-e2e.result/v1",
     "paperclip.runner-e2e.result/v2",
@@ -240,6 +243,12 @@ const fields = {
       tasks: array(object), agents: array(object), comments: array(object), interactions: array(object), documents: array(object), attachments: optional(array(object)), runs: array(object) })),
     checks: array(shape({ id: string, passed: boolean, notReached: optional(string), evidence: array(string), detail: string })),
   })),
+  completionQuality: optional(array(shape({
+    name: string, purpose: optional(oneOf("product", "calibration")), expectedPass: boolean, passed: boolean, status: oneOf("completed", "failed", "pending"), config: object, configHash: string, evidenceHash: string,
+    criteria: array(shape({ id: string, passed: boolean, rationale: string, evidenceIds: array(string) })),
+    reports: optional(array(shape({ replyId: string, rationale: string, completedTaskIdsReferenced: array(string), resultAccessTaskIds: optional(array(string)), correctsReplyIds: array(string) }))),
+    inputTokens: nullable(integer), outputTokens: nullable(integer), estimatedCostUsd: nullable(number), reservedCostUsd: number, recordedAt: date, error: optional(string), rejectedVerdict: optional(string),
+  }))),
   firstTaskQuality: optional(shape({
     status: oneOf("completed", "failed", "pending"), informational: boolean, config: object, configHash: string, evidenceHash: string,
     scores: array(shape({ dimension: oneOf("questionRelevance", "useOfFacts", "proposalUsefulness", "clarity", "lowFriction"), score: integer, rationale: string, evidence: array(string) })),

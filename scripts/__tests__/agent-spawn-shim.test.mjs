@@ -233,11 +233,9 @@ function imageBuildSteps(workflowPath) {
 
 test("every published image build gives the agent principal ids that do not collide with node", () => {
   const defaults = dockerfileIdDefaults();
-  const steps = [".github/workflows/docker.yml", ".github/workflows/docker-cloud.yml"].flatMap(imageBuildSteps);
-  assert.ok(
-    steps.some(step => step.name.includes("docker-cloud.yml")),
-    "the cloud build step must still be found, or this test checks nothing",
-  );
+  // Upstream #13827 retired docker-cloud.yml; docker.yml is the only image workflow.
+  const steps = [".github/workflows/docker.yml"].flatMap(imageBuildSteps);
+  assert.ok(steps.length > 0, "an image build step must still be found, or this test checks nothing");
   for (const step of steps) {
     const ids = Object.fromEntries(principalIdArgs.map(name => [name, step.args[name] ?? defaults[name]]));
     const shown = JSON.stringify(ids);

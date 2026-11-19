@@ -14,7 +14,7 @@ import type {
 } from "@paperclipai/shared";
 import { gitCommitShaSchema, issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
 import { conflict, unprocessable } from "../errors.js";
-import { resolveSelfApprovalPrincipals } from "./approval-status-reconciler.js";
+import { latestDecisionPerStage, resolveSelfApprovalPrincipals } from "./approval-status-reconciler.js";
 import { resolveCallerSeat, seatAuthorityNextAction } from "./seat-authority-refusal.js";
 
 type AssigneeLike = {
@@ -99,6 +99,16 @@ type TransitionInput = {
    * through to the ordinary ceiling behaviour instead.
    */
   stallArbiterAvailable?: boolean;
+  /**
+   * SUP-24054: current-policy stage ids whose durable approval still holds
+   * (`listCurrentPolicyApprovedStageIds`). Read only when a `done` request
+   * starts the workflow (no active stage). A reopen nulls the executionState
+   * projection while the decision rows survive; when every stage is in this set
+   * nothing is re-armed and the requested `done` reaches the done-transition
+   * guard, which recovers the ladder from the same rows (SUP-14912). Absent
+   * counts as empty.
+   */
+  decidedStageIds?: readonly string[];
 };
 
 export type ReviewEscalationSignal = {
@@ -654,13 +664,16 @@ export function normalizeIssueExecutionPolicy(
  * - an explicitly empty `stages` array (`executionPolicy.stages: []`), unless
  *   the stored policy is *already* stage-less, in which case the array removes
  *   nothing (SUP-13925);
- * - an explicit `executionPolicy: null` on an issue whose stored policy is
- *   non-null;
+ * - an explicit `executionPolicy: null` on an issue whose stored policy holds
+ *   stages, a monitor, or other content that normalization keeps (SUP-24000);
  * - any other body over an issue that currently has stages, where the body
  *   normalizes back to null (e.g. `{}` or `{mode: "normal"}`) so it cannot
  *   silently clear the ladder.
  *
- * `null` over a `null` stored policy stays a no-op and is allowed. A
+ * `null` over a `null` stored policy stays a no-op and is allowed. SUP-24000:
+ * `null` over a stored `stages: []` policy with no other content is also
+ * allowed. That policy normalizes to null without the explicit-empty preserve,
+ * so the null removes nothing that this guard protects. A
  * monitor-only policy (or a policy with authorization/review-preset content
  * but no stages) can still be cleared or replaced with a body that is not
  * null-as-is and that omits the `stages` field.
@@ -731,7 +744,11 @@ export function assertPatchableExecutionPolicyWrite(input: {
     throw unprocessable("executionPolicy.stages must not be empty");
   }
 
-  if (raw === null && currentPolicy !== null) {
+  // SUP-24000: the stored explicit-empty policy (SUP-22135) is non-null, but
+  // when it holds nothing else, a normalization without the preserve option
+  // returns null. A null body removes no content from it, so allow the null,
+  // as for a null stored policy.
+  if (raw === null && currentPolicy !== null && normalizeIssueExecutionPolicy(currentPolicy) !== null) {
     throw unprocessable(
       "executionPolicy must not be set to null on an issue that currently has a policy; send the full replacement policy instead",
     );
@@ -798,9 +815,16 @@ export function assertPatchableExecutionPolicyWrite(input: {
  * the ladder.
  *
  * A caller that genuinely wants a stage-less policy must send `stages: []`
- * explicitly; `assertPatchableExecutionPolicyWrite` still refuses that over a
- * stored ladder. Over an already stage-less policy, omission is a no-op (there
- * is nothing to preserve), matching the SUP-13925 monitor-only round-trip.
+  * explicitly; `assertPatchableExecutionPolicyWrite` still refuses that over a
+  * stored ladder. Over an already stage-less policy, omission is a no-op (there
+  * is nothing to preserve), matching the SUP-13925 monitor-only round-trip.
+  *
+  * SUP-22135: over a stored policy that is ALREADY explicitly stage-less, every
+  * guard-admitted body (explicit `stages: []` round-trip or a partial write
+  * whose defaulted stages are empty) resolves to that same stage-less shape —
+  * it never collapses to null and wipes the stored policy. A null stored policy
+  * still normalizes bare-empty bodies to null; default inheritance is
+  * unaffected.
  *
  * A malformed non-object body is returned as `null` rather than thrown: the
  * route has already validated the body against the schema before calling this,
@@ -817,6 +841,7 @@ export function resolvePatchExecutionPolicy(input: {
   raw: unknown;
   currentPolicy: IssueExecutionPolicy | null;
   stagesKeyAbsent: boolean;
+  storedStagesExplicitlyEmpty?: boolean;
   /** SUP-16525: the issue's stored execution state. When present with a
    *  non-null currentStageId, INV-LADDER-1 rejects stage inserts behind the
    *  live pointer (including a shifted/mismatched duplicated pointer). */
@@ -826,7 +851,14 @@ export function resolvePatchExecutionPolicy(input: {
    *  rewrite, so the preservation invariant must not refuse it. */
   rearmPointer?: boolean;
 }): IssueExecutionPolicy | null {
-  const { raw, currentPolicy, stagesKeyAbsent, executionState, rearmPointer } = input;
+  const {
+    raw,
+    currentPolicy,
+    stagesKeyAbsent,
+    storedStagesExplicitlyEmpty = false,
+    executionState,
+    rearmPointer,
+  } = input;
   if (raw === null) return null;
   if (typeof raw !== "object" || Array.isArray(raw)) return null;
 
@@ -836,7 +868,15 @@ export function resolvePatchExecutionPolicy(input: {
     stagesKeyAbsent && storedStages !== null
       ? { ...(raw as Record<string, unknown>), stages: storedStages }
       : raw;
-  const resolved = normalizeIssueExecutionPolicy(effectiveRaw);
+  // SUP-22135: preserve only a policy whose raw stored representation explicitly
+  // carried `stages: []`; legacy monitor-only rows without that key normalize to
+  // null and retain their historical default-inheritance behavior.
+  const preserveStoredEmptyPolicy =
+    storedStagesExplicitlyEmpty && currentPolicy !== null && currentPolicy.stages.length === 0;
+  const resolved = normalizeIssueExecutionPolicy(
+    effectiveRaw,
+    preserveStoredEmptyPolicy ? { preserveEmptyPolicy: true } : undefined,
+  );
 
   // Preserve-on-omit carries the stored stages forward unchanged, so no insert
   // is possible on that path; only an explicit `stages` body can move the
@@ -1085,6 +1125,15 @@ function actorPrincipal(actor: ActorLike): IssueExecutionStagePrincipal | null {
   return null;
 }
 
+/**
+ * Exact principal identity: same type and byte-equal agent or user id. This is
+ * the authorization compare (actor versus seat, return-assignee exclusion,
+ * stage membership) and it deliberately does NOT fold agent-id case. The
+ * stale-snapshot compares (`executionDecisionParticipantSignature`,
+ * `stallHoldSignature`, `foldExecutionStateAgentIds`,
+ * `foldExecutionPolicyAgentIds`) fold agent-id case only to decide whether a
+ * row changed under the lock; folding here would widen who may act on a stage.
+ */
 function principalsEqual(a: IssueExecutionStagePrincipal | null, b: IssueExecutionStagePrincipal | null): boolean {
   if (!a || !b) return false;
   if (a.type !== b.type) return false;
@@ -1152,15 +1201,19 @@ function isStallArbiterHold(input: {
  * the decision snapshot compare and the route's raw-row compares. The seated
  * participant folds trim + lowercase; the policy's participant list and
  * `stallEscalation.toAgentId` fold lowercase only. User ids are never folded.
+ * These folds only decide whether a row is stale; they never decide who may
+ * act (see `principalsEqual`).
  */
 function foldSeatedAgentId(agentId: string | null | undefined): string {
   return (agentId ?? "").trim().toLowerCase();
 }
 
+/** Policy-side agent-id fold (stage participants and `stallEscalation.toAgentId`): lowercase only. */
 function foldPolicyAgentId(agentId: string | null | undefined): string {
   return (agentId ?? "").toLowerCase();
 }
 
+/** True for a non-null, non-array object (a jsonb record). */
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -1256,6 +1309,11 @@ export function deliveryBindingDiffers(
   );
 }
 
+/**
+ * Comparable form of the seated participant for the stale-snapshot compare.
+ * Agent ids fold trim + lowercase. User ids are trimmed but keep their case.
+ * Not an authorization compare: actor-versus-seat stays exact.
+ */
 function executionDecisionParticipantSignature(
   participant: IssueExecutionStagePrincipal | null | undefined,
 ): string | null {
@@ -1268,6 +1326,13 @@ function executionDecisionParticipantSignature(
   return userId.length > 0 ? `user:${userId}` : "user:";
 }
 
+/**
+ * Refuses (409 `review_stall_policy_changed`) a decision computed from a read
+ * whose execution state or stall-hold policy controls no longer match the row
+ * under the lock. Agent ids compare case-insensitively here, so a case-only
+ * rewrite of a stored agent id is not stale; whether the actor holds the seat
+ * is decided separately and exactly by the transition.
+ */
 export function assertExecutionDecisionSnapshotCurrent(
   readState: IssueExecutionState | null,
   readPolicy: IssueExecutionPolicy | null,
@@ -1288,7 +1353,7 @@ export function assertExecutionDecisionSnapshotCurrent(
     deliveryBindingDiffers(readState, lockedState)
   ) {
     throw conflict(
-      "The delivered head, the delivery binding (pull request number, URL or head), the execution policy (round ceiling, stall arbiter or stages), the review stage, the seated participant, the last decision, the review-round counter or the issue status changed while this decision was in flight; this decision was not recorded and the stage was not handed off. Re-read the issue before deciding.",
+      "The delivered head, the delivery binding (pull request number, URL or head), the execution policy (round ceiling, stall arbiter or stages), the review stage, the seated participant, the last decision, the review-round counter or the issue status changed while this decision was in flight; this decision was not recorded and the stage was not handed off. A concurrent decision on this stage, including another accept or reject of the same escalation, also causes this refusal. Re-read the issue before deciding; if the decision you intended is already recorded, do not repeat it.",
       {
         code: "review_stall_policy_changed",
         issueId,
@@ -1462,6 +1527,11 @@ function selectStageParticipant(
   return first ? { type: first.type, agentId: first.agentId ?? null, userId: first.userId ?? null } : null;
 }
 
+/**
+ * Exact stage membership through `principalsEqual`: a seat whose agent id
+ * matches a configured participant only by letter case is not a member, so the
+ * membership repair re-seats the configured participant instead.
+ */
 function stageHasParticipant(stage: IssueExecutionStage, participant: IssueExecutionStagePrincipal | null): boolean {
   if (!participant) return false;
   return stage.participants.some((candidate) => principalsEqual(candidate, participant));
@@ -1827,8 +1897,17 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
   // non-in_review status or an assignee/unassign change dissolves the stuck
   // executionState. A requested in_review cannot be honoured — it would strand
   // the issue in_review with no active participant — so it fails loud instead
-  // of the silent empty patch.
-  if (!activeStage && input.allowBoardOverride && existingState?.status === COMPLETED_STATUS) {
+  // of the silent empty patch. A board `done`/`cancelled` is a close, not an
+  // escape hatch: the done guard reads the pre-patch row either way, so the
+  // close skips this branch, reaches the #7893 terminal no-op and keeps the
+  // completed ladder record (completedStageIds, approvalStatus) (SUP-24054).
+  const boardTerminalClose = requestedStatus === "done" || requestedStatus === "cancelled";
+  if (
+    !activeStage &&
+    input.allowBoardOverride &&
+    existingState?.status === COMPLETED_STATUS &&
+    !boardTerminalClose
+  ) {
     const attemptedBoardAdvance =
       requestedAssigneePatchProvided ||
       (requestedStatus !== undefined && requestedStatus !== "in_review");
@@ -2293,6 +2372,17 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     return { patch };
   }
 
+  // SUP-24054: durable approvals survive a reopen. When every stage has a current
+  // approved decision row, nothing is re-armed and the requested `done` reaches
+  // the done-transition guard, which recovers the ladder from the same rows
+  // (SUP-14912). A partial ladder re-arms from the start as before.
+  if (
+    requestedStatus === "done" &&
+    input.policy.stages.length > 0 &&
+    input.policy.stages.every((stage) => (input.decidedStageIds ?? []).includes(stage.id))
+  ) {
+    return { patch };
+  }
   let pendingStage =
     existingState?.status === CHANGES_REQUESTED_STATUS && currentStage
       ? currentStage
@@ -2645,6 +2735,94 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
 
 export function applyIssueMonitorPolicyTransition(input: TransitionInput): TransitionResult {
   return { patch: applyMonitorTransition(input, {}) };
+}
+
+/**
+ * SUP-24054: one `issue_execution_decisions` row, as the durable-approval check
+ * for a `done` request reads it.
+ */
+export type DurableApprovalDecisionRow = {
+  id: string;
+  stageId: string;
+  stageType: string;
+  outcome: string;
+  actorAgentId: string | null;
+  actorUserId: string | null;
+  createdAt: Date;
+};
+
+/** SUP-24054: the issue fields the durable-approval check reads. */
+export type DurableApprovalIssue = AssigneeLike & {
+  createdByAgentId?: string | null;
+  executionState?: IssueExecutionState | Record<string, unknown> | null;
+};
+
+/**
+ * SUP-24054 (release-assurance B1/B2): the current-policy stages whose durable
+ * approval still holds, for the all-stages-approved skip of a `done` workflow
+ * start (`decidedStageIds`). A stage counts only when its LATEST decision row
+ * is `approved` and the current policy would still accept that row. Anything
+ * else leaves the stage undecided, so the start re-arms review exactly as it
+ * does without durable approvals:
+ * - a row for a stage the current policy no longer carries proves the policy
+ *   was edited after that decision, so no approval counts;
+ * - the row's stage type differs from the current stage type;
+ * - the row's actor is not a current participant of the stage. Membership is
+ *   exact (`stageHasParticipant`): an agent id that matches a participant only
+ *   by letter case is not a member. A board stage-decision row (SUP-15805) is
+ *   checked through the participant it was recorded for
+ *   (`boardDecisionParticipants`, keyed by decision id); a user row that is
+ *   neither a participant nor a board stage decision does not count;
+ * - the row's actor, or the participant a board stage decision was recorded
+ *   for, is a self-approval principal: `resolveSelfApprovalPrincipals`, the
+ *   current assignee (the delivery author of the `done`) and the `closer` (the
+ *   principal requesting the `done`). Agent ids match here case-insensitively,
+ *   which refuses more.
+ * A shrink that removed a stage with no decision row leaves the rows and the
+ * policy identical to a legit shorter ladder; this check cannot tell them apart.
+ */
+export function listCurrentPolicyApprovedStageIds(input: {
+  issue: DurableApprovalIssue;
+  policy: IssueExecutionPolicy;
+  decisions: readonly DurableApprovalDecisionRow[];
+  boardDecisionParticipants: ReadonlyMap<string, IssueExecutionStagePrincipal | null>;
+  closer: IssueExecutionStagePrincipal | null;
+}): string[] {
+  const stagesById = new Map(input.policy.stages.map((stage) => [stage.id, stage]));
+  if (input.decisions.some((decision) => !stagesById.has(decision.stageId))) return [];
+
+  const selfPrincipals = resolveSelfApprovalPrincipals(
+    input.policy as unknown as Record<string, unknown>,
+    (parseIssueExecutionState(input.issue.executionState) ?? {}) as Record<string, unknown>,
+    input.issue.createdByAgentId ?? null,
+  );
+  for (const principal of [assigneePrincipal(input.issue), input.closer]) {
+    if (principal?.type === "agent" && principal.agentId) selfPrincipals.agentIds.add(principal.agentId);
+    if (principal?.type === "user" && principal.userId) selfPrincipals.userIds.add(principal.userId);
+  }
+  const isSelf = (principal: IssueExecutionStagePrincipal | null) =>
+    principal !== null &&
+    (principal.type === "agent"
+      ? [...selfPrincipals.agentIds].some((agentId) => sameAgentId(agentId, principal.agentId))
+      : selfPrincipals.userIds.has(principal.userId ?? ""));
+
+  const approved: string[] = [];
+  for (const [stageId, latest] of latestDecisionPerStage(input.decisions)) {
+    const stage = stagesById.get(stageId)!;
+    if (latest.outcome !== "approved" || latest.stageType !== stage.type) continue;
+    const decider: IssueExecutionStagePrincipal | null = latest.actorAgentId
+      ? { type: "agent", agentId: latest.actorAgentId, userId: null }
+      : latest.actorUserId
+        ? { type: "user", userId: latest.actorUserId, agentId: null }
+        : null;
+    if (isSelf(decider)) continue;
+    const decidedFor = input.boardDecisionParticipants.has(latest.id)
+      ? input.boardDecisionParticipants.get(latest.id) ?? null
+      : decider;
+    if (isSelf(decidedFor) || !stageHasParticipant(stage, decidedFor)) continue;
+    approved.push(stageId);
+  }
+  return approved;
 }
 
 export type BoardStageDecision = "approved" | "changes_requested";

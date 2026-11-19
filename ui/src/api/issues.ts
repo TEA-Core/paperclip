@@ -1,3 +1,4 @@
+import type { SetIssueTitle } from "@paperclipai/shared";
 import type { ExecutionReconciliation } from "@paperclipai/shared";
 import type {
   AcceptedPlanDecompositionSummary,
@@ -76,6 +77,11 @@ export type IssueUpdateResponse = Issue & {
 export type ResolveRecoveryActionResponse = {
   issue: Issue;
   recoveryAction: IssueRecoveryAction;
+  /**
+   * The execution decision the resolution recorded, or null when it recorded
+   * none. Absent on an idempotent replay of an earlier resolution.
+   */
+  executionDecision?: { id: string; stageId: string; stageType: string; outcome: string } | null;
 };
 
 export type IssueListFilters = {
@@ -261,6 +267,8 @@ export const issuesApi = {
     api.delete<{ id: string; archivedAt: Date } | { ok: true }>(
       `/issues/${id}/inbox-archive`,
     ),
+  setTitle: (id: string, data: SetIssueTitle) =>
+    api.put<{ id: string; title: string; titleNeedsGeneration: boolean; changed: boolean }>(`/issues/${id}/title`, data),
   create: (companyId: string, data: Record<string, unknown>) =>
     api.post<Issue>(`/companies/${companyId}/issues`, data),
   update: (id: string, data: Record<string, unknown>) => {
@@ -276,6 +284,8 @@ export const issuesApi = {
       `/issues/${id}/stalled-review-decision`,
       data,
     ),
+  retryWorkspaceExport: (id: string, data: { actionId: string; runId: string; repairNote: string }) =>
+    api.post<{ runId: string; resultId: string; leaseId: string; status: "queued" }>(`/issues/${id}/recovery-actions/retry-workspace-export`, data),
   resolveRecoveryAction: (
     id: string,
     data: {

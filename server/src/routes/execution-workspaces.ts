@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { accessSync, constants as fsConstants, existsSync, readFileSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync } from "node:fs";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { Router, type Request, type Response } from "express";
@@ -35,7 +35,7 @@ import {
   type WorkspaceRuntimeLeaseClaim,
 } from "../services/index.js";
 import { mergeExecutionWorkspaceConfig, readExecutionWorkspaceConfig } from "../services/execution-workspaces.js";
-import { parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
+import { isProtectedDeliveryBranch, parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
 import { createGitRemoteAuthProvider } from "../services/git-credentials.js";
 import { readProjectWorkspaceRuntimeConfig } from "../services/project-workspace-runtime-config.js";
 import {
@@ -62,7 +62,8 @@ import { environmentRuntimeService } from "../services/environment-runtime.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { runExclusiveWorkspaceRuntimeControl } from "../services/workspace-operations.js";
 import { resolveManagedWorkspaceInstanceId } from "../services/managed-workspace-identity.js";
-import { isVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
+import { readLegacySeedManifestObject } from "../worktree-seed-manifest.js";
+import { isVerifiedWorktreeSeedManifest } from "@paperclipai/shared/worktree-initialization-manifest";
 import {
   issueWorkspaceLoginHandoff,
   workspaceLoginHandoffFailureStatus,
@@ -395,15 +396,15 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         source?: { configPath?: unknown; instanceId?: unknown };
         targetInstanceId?: unknown;
       };
-      try {
-        manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-      } catch {
+      const boundedManifest = readLegacySeedManifestObject(manifestPath);
+      if (!boundedManifest) {
         throw unprocessable("Workspace seed manifest is malformed; repair source identity cannot be trusted.", {
           code: "workspace_repair_precondition_failed",
           reason: "seed_manifest_malformed",
           repairPhase: "precondition_validation",
         });
       }
+      manifest = boundedManifest;
 
       try {
         if (!projectWorkspace?.cwd) {
@@ -736,12 +737,13 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
             const manifestPoll = setInterval(() => {
               if (reseedObserved || !existsSync(manifestPath)) return;
               try {
-                const current = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+                const current = readLegacySeedManifestObject(manifestPath) as {
                   attemptId?: unknown;
                   state?: unknown;
-                };
+                } | null;
                 if (
-                  typeof current.attemptId === "string"
+                  current
+                  && typeof current.attemptId === "string"
                   && current.attemptId !== repairPreviousAttemptId
                   && (current.state === "pending" || current.state === "running" || current.state === "failed")
                 ) {
@@ -768,11 +770,11 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
             if (exitCode !== 0) {
               let seedFailurePhase: string | null = null;
               try {
-                const failedManifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+                const failedManifest = readLegacySeedManifestObject(manifestPath) as {
                   phase?: unknown;
                   state?: unknown;
-                };
-                seedFailurePhase = failedManifest.state === "failed" && typeof failedManifest.phase === "string"
+                } | null;
+                seedFailurePhase = failedManifest && failedManifest.state === "failed" && typeof failedManifest.phase === "string"
                   ? failedManifest.phase
                   : null;
               } catch {
@@ -793,8 +795,8 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
               await reportRepairPhase("full_reseed", "started");
             }
 
-            const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
-            if (!isVerifiedWorktreeSeedManifest(manifest)) {
+            const manifest = readLegacySeedManifestObject(manifestPath);
+            if (!manifest || !isVerifiedWorktreeSeedManifest(manifest)) {
               throw new Error("Workspace reseed returned without a verified terminal manifest.");
             }
             const expectedInstanceId = resolveManagedWorkspaceInstanceId(workspaceCwd);
@@ -1162,6 +1164,25 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       }),
     );
     assertNoAgentExecutionWorkspaceIdentityMutation(req, collectExecutionWorkspaceIdentityPaths(req.body));
+    // SUP-24409: a row's branch is a card's delivery branch, so it cannot be pointed at a protected
+    // branch (main, master, a release, hotfix or fold branch, a base/default ref of the row or its
+    // project), and a project_primary row never takes a new branch. An unchanged branch is left alone
+    // (a project_primary row sits on its default).
+    if (typeof req.body.branchName === "string" && req.body.branchName !== existing.branchName) {
+      const projectRefs = await db
+        .select({ defaultRef: projectWorkspaces.defaultRef, repoRef: projectWorkspaces.repoRef })
+        .from(projectWorkspaces)
+        .where(and(eq(projectWorkspaces.companyId, existing.companyId), eq(projectWorkspaces.projectId, existing.projectId)));
+      if (isProtectedDeliveryBranch({
+        branch: req.body.branchName,
+        defaultRefs: [existing.baseRef, req.body.baseRef, ...projectRefs.flatMap((ref) => [ref.defaultRef, ref.repoRef])],
+        workspaceMode: existing.mode,
+      })) {
+        throw unprocessable(
+          `Branch "${req.body.branchName}" is a protected branch (main, master, a release, hotfix or fold branch, or a default branch of this workspace's project), or this is a project_primary workspace; it cannot be an execution workspace's delivery branch`,
+        );
+      }
+    }
     const patch: Record<string, unknown> = {
       ...(req.body.name === undefined ? {} : { name: req.body.name }),
       ...(req.body.cwd === undefined ? {} : { cwd: req.body.cwd }),
