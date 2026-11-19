@@ -24,6 +24,24 @@ export function encodeEnvValue(value: string, encoding: EnvValueEncoding = "json
   return JSON.stringify(value);
 }
 
+// Encodes a value the loader reads back exactly. The default encoding is
+// kept whenever it round-trips through dotenv; a value it mangles (a
+// double quote, a backslash, a tab) falls back to a literal single-quoted
+// form when that round-trips instead.
+function encodeValueForLoader(value: string, encoding: EnvValueEncoding): string {
+  const candidate = encodeEnvValue(value, encoding);
+  if (ownValue(parseDotenv(`__WRITER_KEY__=${candidate}`), "__WRITER_KEY__") === value) {
+    return candidate;
+  }
+  if (!value.includes("'") && !/[\r\n]/.test(value)) {
+    const singleQuoted = `'${value}'`;
+    if (ownValue(parseDotenv(`__WRITER_KEY__=${singleQuoted}`), "__WRITER_KEY__") === value) {
+      return singleQuoted;
+    }
+  }
+  return candidate;
+}
+
 function trailingEnvCommentStart(rawValue: string): number | null {
   let quote: "\"" | "'" | null = null;
   let escaped = false;
@@ -102,6 +120,14 @@ type EnvSegment = {
   quoteClosed: boolean;
 };
 
+function naiveClosingLine(lines: EnvLine[], start: number, quote: EnvQuote, startOffset: number): number {
+  for (let index = start; index < lines.length; index += 1) {
+    const text = index === start ? lines[index].contents.slice(startOffset) : lines[index].contents;
+    if (text.includes(quote)) return index;
+  }
+  return -1;
+}
+
 // Groups physical lines into logical assignments. A quoted value may span
 // physical lines; its continuation lines are part of the same assignment
 // and must never be treated as assignments of their own.
@@ -116,6 +142,39 @@ function groupEnvSegments(lines: EnvLine[]): EnvSegment[] {
     }
 
     const [, , key, , rawValue] = match;
+
+    // The loader allows whitespace (including newlines) between the
+    // separator and a quoted value, so the opening quote may sit on a
+    // following line. That whole span belongs to this assignment.
+    if (rawValue.trim() === "") {
+      let openingLine = index + 1;
+      while (openingLine < lines.length && lines[openingLine].contents.trim() === "") {
+        openingLine += 1;
+      }
+      const openingContents = openingLine < lines.length ? lines[openingLine].contents : "";
+      const openingStart = openingContents.length - openingContents.trimStart().length;
+      const openingQuote = openingContents[openingStart] as EnvQuote | undefined;
+      if (openingQuote === '"' || openingQuote === "'" || openingQuote === "`") {
+        if (closingQuoteIndex(openingContents, openingQuote, openingStart + 1) !== null) {
+          segments.push({ key, start: index, end: openingLine, quoted: true, quoteClosed: true });
+          index = openingLine;
+          continue;
+        }
+        let end = lines.length - 1;
+        let quoteClosed = false;
+        for (let next = openingLine + 1; next < lines.length; next += 1) {
+          if (closingQuoteIndex(lines[next].contents, openingQuote, 0) !== null) {
+            end = next;
+            quoteClosed = true;
+            break;
+          }
+        }
+        segments.push({ key, start: index, end, quoted: true, quoteClosed });
+        index = end;
+        continue;
+      }
+    }
+
     const valueStart = rawValue.length - rawValue.trimStart().length;
     const quote = rawValue[valueStart] as EnvQuote | undefined;
     if (quote !== '"' && quote !== "'" && quote !== "`") {
@@ -135,6 +194,21 @@ function groupEnvSegments(lines: EnvLine[]): EnvSegment[] {
         end = next;
         quoteClosed = true;
         break;
+      }
+    }
+    if (!quoteClosed) {
+      // The loader's regex backtracks when no later quote exists: a quote
+      // immediately after a backslash on the opening line itself then
+      // closes the value (for example `NOTE='cache\'`).
+      const openingInLine = lines[index].contents.length - rawValue.length + valueStart;
+      const naive = naiveClosingLine(lines, index, quote, openingInLine + 1);
+      if (naive === index) {
+        segments.push({ key, start: index, end: index, quoted: true, quoteClosed: true });
+        continue;
+      }
+      if (naive > index) {
+        end = naive;
+        quoteClosed = true;
       }
     }
     segments.push({ key, start: index, end, quoted: true, quoteClosed });
@@ -319,13 +393,13 @@ export function updateEnvFileContents(
 
     const commentStart = trailingEnvCommentStart(rawValue);
     const trailingComment = commentStart === null ? "" : rawValue.slice(commentStart);
-    line.contents = `${prefix}${key}${separator}${encodeEnvValue(value, valueEncoding)}${trailingComment}`;
+    line.contents = `${prefix}${key}${separator}${encodeValueForLoader(value, valueEncoding)}${trailingComment}`;
   }
 
   if (missingEntries.size > 0) {
     const newline = lines.find((line) => line.ending.length > 0)?.ending ?? "\n";
     const insertedLines = Array.from(missingEntries, ([key, value]) => ({
-      contents: `${key}=${encodeEnvValue(value, valueEncoding)}`,
+      contents: `${key}=${encodeValueForLoader(value, valueEncoding)}`,
       ending: newline,
     }));
     const trailingBlankIndex = lines.at(-1)?.contents === "" ? lines.length - 1 : lines.length;
@@ -355,6 +429,30 @@ export function writeEnvFileAtomicallyIfChanged(
 
   const directory = path.dirname(filePath);
   fs.mkdirSync(directory, { recursive: true });
+
+  // Remove temp orphans left by a writer process that is no longer alive
+  // (a SIGKILL between temp write and rename). A live writer's temp, and
+  // this process's own, are never touched.
+  const temporaryPrefix = `.${path.basename(filePath)}.`;
+  try {
+    for (const entry of fs.readdirSync(directory)) {
+      if (!entry.startsWith(temporaryPrefix) || !entry.endsWith(".tmp")) continue;
+      const ownerPid = Number(entry.slice(temporaryPrefix.length).split(".")[0]);
+      if (!Number.isInteger(ownerPid) || ownerPid === process.pid) continue;
+      try {
+        process.kill(ownerPid, 0);
+      } catch {
+        try {
+          fs.unlinkSync(path.join(directory, entry));
+        } catch {
+          // The orphan may already have been renamed or removed.
+        }
+      }
+    }
+  } catch {
+    // Cleanup is best-effort and never blocks the write itself.
+  }
+
   const temporaryPath = path.join(directory, `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`);
 
   try {

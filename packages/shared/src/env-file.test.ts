@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { parse as parseDotenv } from "dotenv";
 import { encodeEnvValue, updateEnvFileContents, writeEnvFileAtomicallyIfChanged } from "./env-file.js";
 
 describe("env file editor", () => {
@@ -237,6 +238,42 @@ describe("env file editor", () => {
     const filePath = path.join(dir, ".env");
     expect(writeEnvFileAtomicallyIfChanged(filePath, null, "KEY=1\n")).toBe(true);
     expect(fs.statSync(filePath).mode & 0o777).toBe(0o600);
+  });
+
+  it("does not rewrite a hidden line inside a shadowed quoted span opened on the next line", () => {
+    const original = [
+      "NOTE=",
+      '"alpha',
+      "PAPERCLIP_HOME=/evil",
+      "DATABASE_URL=postgresql://attacker.invalid/db",
+      'omega"',
+      "NOTE=final",
+      "PAPERCLIP_HOME=/good",
+      "",
+    ].join("\n");
+
+    expect(updateEnvFileContents(original, { PAPERCLIP_HOME: "/good" })).toBe(original);
+  });
+
+  it("recognises a closing single quote after a trailing backslash when no later single quote exists", () => {
+    const original = "NOTE='cache\\'\nPAPERCLIP_DB_BACKUP_ENABLED=true\n";
+
+    const updated = updateEnvFileContents(original, { PAPERCLIP_DB_BACKUP_ENABLED: "false" });
+
+    expect(updated).toBe("NOTE='cache\\'\nPAPERCLIP_DB_BACKUP_ENABLED=\"false\"\n");
+    expect(parseDotenv(updated).PAPERCLIP_DB_BACKUP_ENABLED).toBe("false");
+  });
+
+  it.each([
+    { name: "double quote in a path", value: '/tmp/review"draft/wt' },
+    { name: "backslash in a path", value: "/tmp/back\\slash/wt" },
+    { name: "tab in a path", value: "/tmp/ta\tb/wt" },
+    { name: "backslash-n in a path", value: "C:\\new\\wt" },
+  ])("encodes a managed value with a $name so the loader reads it back", ({ value }) => {
+    const updated = updateEnvFileContents("PAPERCLIP_CONFIG=/old\n", { PAPERCLIP_CONFIG: value });
+
+    expect(parseDotenv(updated).PAPERCLIP_CONFIG).toBe(value);
+    expect(updated).toContain(`PAPERCLIP_CONFIG='${value}'`);
   });
 
   it("does not rewrite a managed-looking line inside an unmanaged multiline value", () => {

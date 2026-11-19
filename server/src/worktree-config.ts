@@ -430,45 +430,61 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
   repairedConfig: boolean;
   repairedEnv: boolean;
 } {
-  const context = resolveWorktreeRuntimeContext(process.env);
+  // Every repair error (content refusal or filesystem) must never fail the
+  // boot: one warning names the env file, that file is left byte-identical,
+  // and the boot continues. A skipped env repair still runs the config
+  // isolation below, so the instance never runs on a legacy shared config.
+  let context: WorktreeRuntimeContext | null;
+  try {
+    context = resolveWorktreeRuntimeContext(process.env);
+  } catch (error) {
+    let envPath = "unknown env file";
+    try {
+      envPath = resolvePaperclipEnvPath(resolvePaperclipConfigPath());
+    } catch {
+      // Keep the fallback label; the warning still carries the error.
+    }
+    console.warn(
+      `Skipping worktree env repair for ${envPath}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return { repairedConfig: false, repairedEnv: false };
+  }
   if (!context) {
     return { repairedConfig: false, repairedEnv: false };
   }
 
-  // Compute the env repair before anything else is touched. The writer
-  // refuses files it cannot account for; that refusal must never fail the
-  // boot or leave a half-repaired instance, so on refusal the env file is
-  // left byte-identical, one warning names the file, and the boot continues
-  // with the values already in process.env.
-  const existingContents = fs.existsSync(context.envPath)
-    ? fs.readFileSync(context.envPath, "utf8")
-    : null;
-  const existingEnvEntries = parseEnvFile(existingContents ?? "");
-  // The worktree file wins. An inherited value is used for this boot only and
-  // never persisted, so a parent shell's secret cannot become the worktree's
-  // own (SUP-24365).
-  const inheritedToolActionSigningSecret = nonEmpty(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET);
-  const fileToolActionSigningSecret = nonEmpty(existingEnvEntries.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET);
-  const toolActionSigningSecret =
-    fileToolActionSigningSecret ??
-    inheritedToolActionSigningSecret ??
-    randomBytes(32).toString("hex");
-
-  const managedEnvEntries: Record<string, string> = {
-    PAPERCLIP_HOME: context.homeDir,
-    PAPERCLIP_INSTANCE_ID: context.instanceId,
-    PAPERCLIP_CONFIG: context.configPath,
-    PAPERCLIP_CONTEXT: context.contextPath,
-    PAPERCLIP_IN_WORKTREE: "true",
-    PAPERCLIP_DB_BACKUP_ENABLED: "false",
-    PAPERCLIP_WORKTREE_NAME: context.worktreeName,
-    ...(fileToolActionSigningSecret || toolActionSigningSecret === inheritedToolActionSigningSecret
-      ? {}
-      : { PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: toolActionSigningSecret }),
-  };
-
-  let repairedContents: string;
+  // Compute the env repair before anything else is touched.
+  let existingContents: string | null = null;
+  let toolActionSigningSecret = "";
+  let repairedContents: string | null = null;
   try {
+    existingContents = fs.existsSync(context.envPath)
+      ? fs.readFileSync(context.envPath, "utf8")
+      : null;
+    const existingEnvEntries = parseEnvFile(existingContents ?? "");
+    // The worktree file wins. An inherited value is used for this boot only
+    // and never persisted, so a parent shell's secret cannot become the
+    // worktree's own (SUP-24365).
+    const inheritedToolActionSigningSecret = nonEmpty(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET);
+    const fileToolActionSigningSecret = nonEmpty(existingEnvEntries.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET);
+    toolActionSigningSecret =
+      fileToolActionSigningSecret ??
+      inheritedToolActionSigningSecret ??
+      randomBytes(32).toString("hex");
+
+    const managedEnvEntries: Record<string, string> = {
+      PAPERCLIP_HOME: context.homeDir,
+      PAPERCLIP_INSTANCE_ID: context.instanceId,
+      PAPERCLIP_CONFIG: context.configPath,
+      PAPERCLIP_CONTEXT: context.contextPath,
+      PAPERCLIP_IN_WORKTREE: "true",
+      PAPERCLIP_DB_BACKUP_ENABLED: "false",
+      PAPERCLIP_WORKTREE_NAME: context.worktreeName,
+      ...(fileToolActionSigningSecret || toolActionSigningSecret === inheritedToolActionSigningSecret
+        ? {}
+        : { PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: toolActionSigningSecret }),
+    };
+
     repairedContents = updateEnvFileContents(
       existingContents ?? emptyWorktreeEnvFileContents(),
       managedEnvEntries,
@@ -478,9 +494,13 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
     console.warn(
       `Skipping worktree env repair for ${context.envPath}: ${error instanceof Error ? error.message : String(error)}`,
     );
-    return { repairedConfig: false, repairedEnv: false };
+    repairedContents = null;
+    if (!toolActionSigningSecret) {
+      toolActionSigningSecret =
+        nonEmpty(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET) ?? randomBytes(32).toString("hex");
+    }
   }
-  const repairedEnv = existingContents !== repairedContents;
+  let repairedEnv = repairedContents !== null && existingContents !== repairedContents;
 
   process.env.PAPERCLIP_HOME = context.homeDir;
   process.env.PAPERCLIP_INSTANCE_ID = context.instanceId;
@@ -561,8 +581,15 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
   process.env.PAPERCLIP_DB_BACKUP_ENABLED = "false";
   process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = toolActionSigningSecret;
 
-  if (repairedEnv) {
-    writeEnvFileAtomicallyIfChanged(context.envPath, existingContents, repairedContents);
+  if (repairedEnv && repairedContents !== null) {
+    try {
+      writeEnvFileAtomicallyIfChanged(context.envPath, existingContents, repairedContents);
+    } catch (error) {
+      console.warn(
+        `Skipping worktree env repair for ${context.envPath}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      repairedEnv = false;
+    }
   }
 
   return { repairedConfig, repairedEnv };

@@ -1575,7 +1575,9 @@ describe("worktree config repair", () => {
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       const result = maybeRepairLegacyWorktreeConfigAndEnvFiles();
-      expect(result).toEqual({ repairedConfig: false, repairedEnv: false });
+      // The env file is never touched; config isolation may still run
+      // for keys whose hostile value changes the derived context.
+      expect(result.repairedEnv).toBe(false);
       if (managedKey !== "PAPERCLIP_IN_WORKTREE") {
         expect(warning).toHaveBeenCalledWith(expect.stringContaining(envPath));
       }
@@ -1617,10 +1619,8 @@ describe("worktree config repair", () => {
         expect(Object.hasOwn(managed, key)).toBe(true);
       }
       for (const [key, value] of Object.entries(managed)) {
-        if (after[key] !== undefined && !shape.includes(`${key}=${value}`)) {
-          // A managed key that was present may only hold a managed value.
-          if (beforeKeys.has(key)) expect([value, after[key]]).toContain(after[key]);
-        }
+        // A managed key that was present may only hold the managed value.
+        if (beforeKeys.has(key)) expect(after[key]).toBe(value);
       }
       expect(after.DATABASE_URL).toBeUndefined();
       expect(after.BETTER_AUTH_SECRET).toBeUndefined();
@@ -1705,7 +1705,7 @@ describe("worktree config repair", () => {
     expect(repairedEnv).toContain("PAPERCLIP_DB_BACKUP_ENABLED=");
   });
 
-  it("leaves config and the port registry untouched when the env repair refuses (SUP-24365)", async () => {
+  it("still isolates the config when the env repair refuses, leaving only the env file untouched (SUP-24365)", async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-half-repair-"));
     const name = "SUP-24365-half-repair";
     const worktreeRoot = path.join(tempRoot, name);
@@ -1748,11 +1748,114 @@ describe("worktree config repair", () => {
       warning.mockRestore();
     }
 
-    expect(result!).toEqual({ repairedConfig: false, repairedEnv: false });
+    // The env file is untouched, but the instance must not run on the
+    // legacy shared config: the config isolation still happens.
+    expect(result!).toEqual({ repairedConfig: true, repairedEnv: false });
     expect(await fs.readFile(envPath, "utf8")).toBe(originalEnv);
-    expect(await fs.readFile(configPath, "utf8")).toBe(originalConfig);
-    expect(fsSync.existsSync(path.join(isolatedHome, "worktree-port-reservations.json"))).toBe(false);
-    expect(process.env.PAPERCLIP_HOME).toBeUndefined();
+    const repairedConfig = JSON.parse(await fs.readFile(configPath, "utf8"));
+    const instanceRoot = path.join(isolatedHome, "instances", "sup-24365-half-repair");
+    expect(repairedConfig.database.embeddedPostgresDataDir).toBe(path.join(instanceRoot, "db"));
+    expect(repairedConfig.database.backup.enabled).toBe(false);
+    expect(fsSync.existsSync(path.join(isolatedHome, "worktree-port-reservations.json"))).toBe(true);
+    expect(process.env.PAPERCLIP_HOME).toBe(isolatedHome);
+  });
+
+  it("does not fail the boot when the env path is a directory (SUP-24365)", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-env-isdir-"));
+    const name = "SUP-24365-env-isdir";
+    const worktreeRoot = path.join(tempRoot, name);
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const envPath = path.join(paperclipDir, ".env");
+    const isolatedHome = path.join(tempRoot, ".paperclip-worktrees");
+
+    await fs.mkdir(envPath, { recursive: true });
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
+    process.env.PAPERCLIP_WORKTREE_NAME = name;
+    process.env.PAPERCLIP_CONFIG = path.join(paperclipDir, "config.json");
+    delete process.env.PORT;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_CONTEXT;
+
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const result = maybeRepairLegacyWorktreeConfigAndEnvFiles();
+      expect(result).toEqual({ repairedConfig: false, repairedEnv: false });
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining(envPath));
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it("does not fail the boot when the env directory is read-only (SUP-24365)", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-env-readonly-"));
+    const name = "SUP-24365-env-readonly";
+    const worktreeRoot = path.join(tempRoot, name);
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const envPath = path.join(paperclipDir, ".env");
+    const isolatedHome = path.join(tempRoot, ".paperclip-worktrees");
+    const originalEnv = "PAPERCLIP_IN_WORKTREE=true\n";
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    await fs.writeFile(envPath, originalEnv, "utf8");
+    await fs.chmod(paperclipDir, 0o555);
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
+    process.env.PAPERCLIP_WORKTREE_NAME = name;
+    process.env.PAPERCLIP_CONFIG = path.join(paperclipDir, "config.json");
+    delete process.env.PORT;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_CONTEXT;
+    delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const result = maybeRepairLegacyWorktreeConfigAndEnvFiles();
+      expect(result.repairedEnv).toBe(false);
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining(envPath));
+      expect(await fs.readFile(envPath, "utf8")).toBe(originalEnv);
+    } finally {
+      warning.mockRestore();
+      await fs.chmod(paperclipDir, 0o755);
+    }
+  });
+
+  it("removes a dead writer temp orphan on the next repair and keeps a live one (SUP-24365)", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-orphan-"));
+    const name = "SUP-24365-orphan";
+    const worktreeRoot = path.join(tempRoot, name);
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const envPath = path.join(paperclipDir, ".env");
+    const isolatedHome = path.join(tempRoot, ".paperclip-worktrees");
+    const deadOrphan = path.join(paperclipDir, "..env.999999.123e4567-e89b-12d3-a456-426614174000.tmp");
+    const liveOrphan = path.join(paperclipDir, `..env.${process.pid}.123e4567-e89b-12d3-a456-426614174001.tmp`);
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    await fs.writeFile(envPath, "PAPERCLIP_IN_WORKTREE=true\n", "utf8");
+    await fs.writeFile(deadOrphan, "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET=orphaned\n", "utf8");
+    await fs.writeFile(liveOrphan, "partial\n", "utf8");
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREES_DIR = isolatedHome;
+    process.env.PAPERCLIP_WORKTREE_NAME = name;
+    process.env.PAPERCLIP_CONFIG = path.join(paperclipDir, "config.json");
+    delete process.env.PORT;
+    delete process.env.PAPERCLIP_HOME;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_CONTEXT;
+    delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+
+    maybeRepairLegacyWorktreeConfigAndEnvFiles();
+
+    expect(fsSync.existsSync(deadOrphan)).toBe(false);
+    expect(fsSync.existsSync(liveOrphan)).toBe(true);
   });
 
   it.each([
