@@ -17,7 +17,18 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { truncateWithLockRetry } from "./helpers/truncate-with-lock-retry.js";
 import { recoveryService } from "../services/recovery/service.ts";
 
-type RecoveryWakeup = (agentId: string, opts?: Record<string, unknown>) => Promise<{ id: string } | null>;
+// Mirrors the RecoveryWakeup contract in recovery/service.ts (not exported there):
+// the wake enqueue returns a heartbeat_runs row, and the rearm sweep asserts on
+// the reason it passes through.
+type RecoveryWakeupOptions = {
+  reason?: string | null;
+  payload?: Record<string, unknown> | null;
+  contextSnapshot?: Record<string, unknown>;
+};
+type RecoveryWakeup = (
+  agentId: string,
+  opts?: RecoveryWakeupOptions,
+) => Promise<typeof heartbeatRuns.$inferSelect | null>;
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
@@ -154,7 +165,7 @@ describeEmbeddedPostgres("recovery reconcilePendingReviewRearm", () => {
     expect(mockEnqueue).toHaveBeenCalledTimes(1);
     const call = mockEnqueue.mock.calls[0];
     expect(call?.[0]).toBe(agentId);
-    const opts = call?.[1] as { payload?: Record<string, unknown>; contextSnapshot?: Record<string, unknown> } | undefined;
+    const opts = call?.[1];
     expect(opts?.reason).toBe("execution_review_requested");
     expect(opts?.payload).toMatchObject({
       issueId,

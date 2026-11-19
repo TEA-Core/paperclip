@@ -1,7 +1,9 @@
+import { getExecutionBlocker } from "../execution-blocker.js";
 import { createRunDispatch, deriveCommentId } from "../../modules/run-dispatch/index.js";
 import { buildExecutionContinuation } from "../execution-continuation.js";
 import { issueService } from "../issues.js";
 import { activityService } from "../activity.js";
+import { instanceSettingsService } from "../instance-settings.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../heartbeat.js";
 import { legacyExecutionNeedsReconciliation, terminalizeLegacyExecution } from "../legacy-execution-recovery.js";
 import { deliverExecutionStatuses } from "../execution-status-delivery.js";
@@ -27,6 +29,10 @@ import {
   heartbeatRuns,
   issueRecoveryActions,
   issueComments,
+  issueThreadInteractions,
+  issueDocuments,
+  documents,
+  documentRevisions,
   issues,
   nativeRunFinalizations,
 } from "@paperclipai/db";
@@ -96,7 +102,21 @@ const support = externalDatabaseUrl
         nativeIssueId: issueId,
         runtimeMode: "native",
         status: "failed",
-        contextSnapshot: { issueId },
+        contextSnapshot: {
+          issueId,
+          preservedRecoveryContext: true,
+          paperclipWake: { comments: [{ id: "stale-comment" }] },
+          paperclipWakeComment: { id: "stale-comment" },
+          paperclipTaskMarkdown: "stale historical task",
+          paperclipTaskMarkdownCompact: "stale historical compact task",
+          paperclipTaskMarkdownAssignment: "stale assignment task",
+          paperclipTaskMarkdownAssignmentCompact: "stale assignment compact task",
+          paperclipTurnContext: {
+            version: 1,
+            assignment: { owner: "task_markdown" },
+            events: { owner: "wake_prompt", comments: [{ id: "stale-comment" }] },
+          },
+        },
         runnerProfileJson: {
           recoveryEventInventoryVersion: 1,
           nativeExecutionInput: {
@@ -164,6 +184,21 @@ const support = externalDatabaseUrl
           if (mode === "verified") {
             expect(retire).toHaveBeenCalledOnce();
             expect(task!.status).toBe("in_progress");
+            expect(successors[0]!.contextSnapshot).toMatchObject({
+              issueId: source.issueId,
+              preservedRecoveryContext: true,
+            });
+            for (const key of [
+              "paperclipWake",
+              "paperclipWakeComment",
+              "paperclipTaskMarkdown",
+              "paperclipTaskMarkdownCompact",
+              "paperclipTaskMarkdownAssignment",
+              "paperclipTaskMarkdownAssignmentCompact",
+              "paperclipTurnContext",
+            ]) {
+              expect(successors[0]!.contextSnapshot).not.toHaveProperty(key);
+            }
             const continuation = await buildExecutionContinuation({
               db, companyId: source.companyId, issueId: source.issueId, agentId: source.agentId,
               context: successors[0]!.contextSnapshot!, summary: null, exposeLowTrustRaw: false,
@@ -361,18 +396,184 @@ const support = externalDatabaseUrl
       expect(legacyExecutionNeedsReconciliation({ ...run, status: "failed", resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } })).toBe(false);
       expect(legacyExecutionNeedsReconciliation({ ...run, status: "failed", scheduledRetryAttempt: 2, resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } })).toBe(true);
     });
+
+    it.each(["pending", "accepted", "rejected", "expired"] as const)("preserves %s approval and saved work while unsafe restore recovery is repeated", async (status) => {
+      const source = await seed();
+      const documentId = randomUUID(), revisionId = randomUUID(), interactionId = randomUUID();
+      await db.insert(documents).values({ id: documentId, companyId: source.companyId, title: "Plan", latestBody: "Only the two approved changes.", latestRevisionId: revisionId });
+      await db.insert(documentRevisions).values({ id: revisionId, companyId: source.companyId, documentId, revisionNumber: 1, body: "Only the two approved changes.", createdByRunId: source.runId });
+      await db.insert(issueDocuments).values({ companyId: source.companyId, issueId: source.issueId, documentId, key: "plan" });
+      await db.insert(issueComments).values({ companyId: source.companyId, issueId: source.issueId, authorAgentId: source.agentId, createdByRunId: source.runId, body: "The plan is saved." });
+      await db.insert(issueThreadInteractions).values({
+        id: interactionId, companyId: source.companyId, issueId: source.issueId, kind: "request_confirmation", status,
+        sourceRunId: source.runId, createdByAgentId: source.agentId,
+        resolvedByUserId: status === "accepted" || status === "rejected" ? "board-user" : null,
+        resolvedAt: status === "pending" ? null : new Date(),
+        payload: { version: 1, prompt: "Review the scoped plan.", target: { type: "issue_document", key: "plan", revisionId } },
+        result: status === "pending" ? null : { version: 1, outcome: status === "expired" ? "superseded_by_comment" : status },
+      });
+      const [run] = await db.update(heartbeatRuns).set({
+        runtimeMode: "legacy", errorCode: "workspace_restore_failed", scheduledRetryAttempt: 1, scheduledRetryReason: "transient_failure",
+        runnerProfileJson: { adapterDispatch: { adapterType: "grok_local" } },
+        resultJson: { workspaceRestoreFailure: "restore_unsafe_archive", conversationContinuation: "continue_conversation_v1", summary: "The plan is saved.", workspaceRestorePath: "/tmp/private-clone/file", savedPlanRevisionId: randomUUID() },
+      }).where(eq(heartbeatRuns.id, source.runId)).returning();
+      const [resetComment] = await db.insert(issueComments).values({ companyId: source.companyId, issueId: source.issueId, authorUserId: "board-user", body: "/new" }).returning();
+      await db.update(issues).set({ conversationAgentId: source.agentId, conversationUserId: "board-user", conversationState: "active", conversationBoundaryCommentId: resetComment.id }).where(eq(issues.id, source.issueId));
+      const activityRuns = await activityService(db).runsForIssue(source.companyId, source.issueId);
+      expect(activityRuns.find((row) => row.runId === source.runId)?.resultJson).toMatchObject({ workspaceRestoreFailure: "restore_unsafe_archive", savedPlanRevisionId: revisionId, workspaceRestorePath: null });
+      const before = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
+      const savedComments = await db.select().from(issueComments).where(eq(issueComments.issueId, source.issueId));
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await terminalizeLegacyExecution({ db, run, status: "failed" });
+        await settleUnrecoverableExecutions(db);
+      }
+      const [task] = await db.select().from(issues).where(eq(issues.id, source.issueId));
+      expect(task.status).toBe("blocked");
+      const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
+      expect(actions).toHaveLength(1);
+      const [action] = actions;
+      expect(action).toMatchObject({ outcome: "blocked", evidence: { automaticRecovery: { replay: "blocked" }, workspaceRestoreFailure: "restore_unsafe_archive" } });
+      expect(action.nextAction).toContain("Workspace repair required");
+      expect(await getExecutionBlocker(db, source.companyId, source.issueId, { conversationResetCommentId: resetComment.id })).toMatchObject({ runId: source.runId });
+      const decision = { runId: source.runId, providerStopped: true as const, actionOutcome: "mixed" as const, outcomeEvidence: "Verified saved plan and comment. Workspace copy-back failed." };
+      const input = { db, companyId: source.companyId, issueId: source.issueId, agentId: source.agentId, sourceRunId: source.runId, decision };
+      await expect(validateExecutionReconciliation(input)).rejects.toThrow("workspaceRepairEvidence");
+      const verified = { ...decision, workspaceRepairEvidence: "Verified fresh confined staging after repairing the unsafe fixture link." };
+      await expect(validateExecutionReconciliation({ ...input, decision: verified })).resolves.toMatchObject({ id: source.runId });
+      await markExecutionReconciliation(db, action, verified, "operator");
+      // Occupy the only agent slot. Exercise real admission without a provider.
+      await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+      await db.update(agents).set({ status: "active", adapterType: "grok_local", runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } }).where(eq(agents.id, source.agentId));
+      await db.update(issues).set({ responsibleUserId: "board-user" }).where(eq(issues.id, source.issueId));
+      await db.insert(heartbeatRuns).values({ companyId: source.companyId, agentId: source.agentId, status: "running" });
+      const heartbeat = heartbeatService(db);
+      const wake = vi.fn(heartbeat.wakeup);
+      await deliverReconciledExecutions(db, wake as unknown as Parameters<typeof deliverReconciledExecutions>[1]);
+      await deliverReconciledExecutions(db, wake as unknown as Parameters<typeof deliverReconciledExecutions>[1]);
+      expect(wake).toHaveBeenCalledTimes(1);
+      const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, source.runId));
+      expect(successor).toMatchObject({ status: "queued", scheduledRetryAttempt: 1, scheduledRetryReason: "transient_failure" });
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, successor.id));
+      const [original] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.runId));
+      expect(original).toMatchObject({ status: "failed", errorCode: "workspace_restore_failed", resultJson: run.resultJson });
+      const continuation = await buildExecutionContinuation({ db, companyId: source.companyId, issueId: source.issueId, agentId: source.agentId, context: { previousRunId: source.runId }, summary: null, exposeLowTrustRaw: false });
+      if (status === "accepted" || status === "rejected") expect(continuation.humanResponses).toContainEqual(expect.objectContaining({ id: interactionId, status }));
+      else expect(continuation.humanResponses).not.toContainEqual(expect.objectContaining({ id: interactionId }));
+      expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, source.issueId))).toEqual(before);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, source.issueId))).toEqual(savedComments);
+      expect(await db.select().from(documentRevisions).where(eq(documentRevisions.documentId, documentId))).toHaveLength(1);
+      const [savedDocument] = await db.select().from(documents).where(eq(documents.id, documentId));
+      expect(savedDocument).toMatchObject({ latestBody: "Only the two approved changes.", latestRevisionId: revisionId });
+    });
+
     it("does not reopen a reconciled legacy run while continuation is pending", async () => {
       const source = await seed();
       const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled" }).where(eq(heartbeatRuns.id, source.runId)).returning();
       await terminalizeLegacyExecution({ db, run, status: "cancelled" });
       const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
       await markExecutionReconciliation(db, action!, { runId: source.runId, providerStopped: true, actionOutcome: "not_performed", outcomeEvidence: "The deterministic fixture has stopped and only printed output." }, "board");
-      await db.update(issueRecoveryActions).set({ status: "resolved" }).where(eq(issueRecoveryActions.id, action!.id));
+      await db.update(issueRecoveryActions).set({ status: "resolved", fingerprint: `reconciled:${source.runId}` }).where(eq(issueRecoveryActions.id, action!.id));
       await terminalizeLegacyExecution({ db, run, status: "cancelled" });
       const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
       expect(actions).toHaveLength(1);
       expect(actions[0]).toMatchObject({ status: "resolved", evidence: { continuationDelivery: "pending", executionReconciliation: { runId: source.runId } } });
       await db.update(issueRecoveryActions).set({ evidence: { ...actions[0]!.evidence, continuationDelivery: "invalidated" } }).where(eq(issueRecoveryActions.id, action!.id));
+    });
+    it("does not re-mint an interrupted conversation run after its hold is settled", async () => {
+      for (const status of ["resolved", "cancelled"] as const) {
+        const source = await seed();
+        const [run] = await db.update(heartbeatRuns).set({
+          runtimeMode: "legacy",
+          status: "interrupted",
+          resultJson: {},
+          runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+        }).where(eq(heartbeatRuns.id, source.runId)).returning();
+        expect(legacyExecutionNeedsReconciliation(run!)).toBe(true);
+        await terminalizeLegacyExecution({ db, run: run!, status: "interrupted" });
+        const [minted] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
+        await db.update(issueRecoveryActions).set({
+          status,
+          fingerprint: `settled:${source.runId}`,
+          outcome: "cancelled",
+          resolutionNote: "Conversation continuation does not replay prior tool calls.",
+          evidence: {
+            ...minted!.evidence,
+            automaticRecovery: { runId: source.runId, replay: "conversation_continuation" },
+          },
+        }).where(eq(issueRecoveryActions.id, minted!.id));
+        await terminalizeLegacyExecution({ db, run: run!, status: "interrupted" });
+        const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
+        expect(actions).toHaveLength(1);
+        expect(actions[0]).toMatchObject({
+          id: minted!.id,
+          status,
+          outcome: "cancelled",
+          resolutionNote: "Conversation continuation does not replay prior tool calls.",
+        });
+      }
+    });
+    it("keeps one legacy recovery action through two conversation settle cycles", async () => {
+      const source = await seed();
+      const [run] = await db.update(heartbeatRuns).set({
+        runtimeMode: "legacy",
+        status: "interrupted",
+        resultJson: {},
+        runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+      }).where(eq(heartbeatRuns.id, source.runId)).returning();
+      let mintedId: string | undefined;
+      for (let cycle = 0; cycle < 2; cycle += 1) {
+        await terminalizeLegacyExecution({ db, run: run!, status: "interrupted" });
+        if (cycle === 0) {
+          const [minted] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
+          mintedId = minted!.id;
+        }
+        await settleUnrecoverableExecutions(db);
+      }
+      const actions = await db.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.sourceIssueId, source.issueId),
+        eq(issueRecoveryActions.fingerprint, `legacy-execution:${source.runId}`),
+      ));
+      expect(actions).toHaveLength(1);
+      expect(actions[0]).toMatchObject({
+        id: mintedId,
+        status: "resolved",
+        outcome: "cancelled",
+        resolutionNote: "Conversation continuation does not replay prior tool calls.",
+      });
+    });
+    it("mints a separate hold for a new run after an earlier run is settled", async () => {
+      const source = await seed();
+      const [run] = await db.update(heartbeatRuns).set({
+        runtimeMode: "legacy",
+        status: "interrupted",
+        resultJson: {},
+        runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+      }).where(eq(heartbeatRuns.id, source.runId)).returning();
+      await terminalizeLegacyExecution({ db, run: run!, status: "interrupted" });
+      await settleUnrecoverableExecutions(db);
+      const nextRunId = randomUUID();
+      const [nextRun] = await db.insert(heartbeatRuns).values({
+        id: nextRunId,
+        companyId: source.companyId,
+        agentId: source.agentId,
+        nativeIssueId: source.issueId,
+        runtimeMode: "legacy",
+        status: "interrupted",
+        contextSnapshot: { issueId: source.issueId },
+        resultJson: {},
+        runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+      }).returning();
+      await terminalizeLegacyExecution({ db, run: nextRun!, status: "interrupted" });
+      const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
+      expect(actions).toHaveLength(2);
+      expect(actions.find(action => action.fingerprint === `legacy-execution:${source.runId}`)).toMatchObject({
+        status: "resolved",
+        outcome: "cancelled",
+      });
+      expect(actions.find(action => action.fingerprint === `legacy-execution:${nextRunId}`)).toMatchObject({
+        status: "active",
+        evidence: { runId: nextRunId },
+      });
     });
     it("surfaces a failed current reviewer without transferring the original assignment", async () => {
       const source = await seed();

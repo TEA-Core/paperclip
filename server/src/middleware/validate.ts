@@ -2,8 +2,45 @@ import type { Request, Response, NextFunction } from "express";
 import { ZodError, type ZodIssue, type ZodSchema } from "zod";
 import { unprocessable } from "../errors.js";
 
+/**
+ * True when `value` carries an own `__proto__` key at any depth. `JSON.parse`
+ * creates `__proto__` as an ordinary own key, and zod's `.strict()` strips it
+ * silently instead of rejecting it, so it has to be looked for in the raw body.
+ * Iterative, so an absurdly nested body cannot exhaust the stack.
+ */
+function hasOwnProtoKey(value: unknown): boolean {
+  const pending: unknown[] = [value];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === null || typeof current !== "object") continue;
+    for (const key of Reflect.ownKeys(current)) {
+      if (key === "__proto__") return true;
+      const descriptor = Reflect.getOwnPropertyDescriptor(current, key);
+      if (descriptor && "value" in descriptor) pending.push(descriptor.value);
+    }
+  }
+  return false;
+}
+
+/**
+ * Every door that accepts the structured `doneTier` close declaration goes
+ * through `validate` or `validateIssueMutationBody`, so the raw `doneTier` is
+ * checked here, before zod parses (and silently strips) it. The refusal is the
+ * generic 400 validation error. The schema itself stays a plain discriminated
+ * union so tool clients keep seeing the full declaration shape.
+ */
+function assertNoProtoKeyInDoneTier(body: unknown): void {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return;
+  const doneTier = Object.getOwnPropertyDescriptor(body, "doneTier")?.value;
+  if (!hasOwnProtoKey(doneTier)) return;
+  throw new ZodError([
+    { code: "custom", path: ["doneTier"], message: "doneTier must not carry a __proto__ key", input: doneTier },
+  ]);
+}
+
 export function validate(schema: ZodSchema) {
   return (req: Request, _res: Response, next: NextFunction) => {
+    assertNoProtoKeyInDoneTier(req.body);
     req.body = schema.parse(req.body);
     next();
   };
@@ -33,6 +70,7 @@ export function isExistingBranchSemanticsZodIssue(issue: Pick<ZodIssue, "path">)
 export function validateIssueMutationBody(schema: ZodSchema) {
   return (req: Request, _res: Response, next: NextFunction) => {
     try {
+      assertNoProtoKeyInDoneTier(req.body);
       req.body = schema.parse(req.body);
     } catch (err) {
       if (

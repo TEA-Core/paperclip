@@ -21,6 +21,7 @@ export type WeeklyRecoveryRate = {
   weekStart: string;
   runs: number;
   recoveryActions: number;
+  recoveryActionRows: number;
   /** recoveryActions / runs, as a percentage (0 when there are no runs). */
   ratePercent: number;
 };
@@ -182,6 +183,68 @@ function utcWeekStart(now: Date, weeksAgo: number): Date {
   return new Date(thisMonday - weeksAgo * 7 * 24 * 60 * 60 * 1000);
 }
 
+export async function loadWeeklyRecoveryRates(
+  db: Db,
+  companyId: string,
+  opts?: { now?: Date; weeks?: number },
+): Promise<WeeklyRecoveryRate[]> {
+  const now = opts?.now ?? new Date();
+  const weeks = Math.min(
+    MAX_WINDOW_WEEKS,
+    Math.max(1, Math.floor(opts?.weeks ?? DEFAULT_WINDOW_WEEKS)),
+  );
+  const sinceIso = utcWeekStart(now, weeks - 1).toISOString();
+
+  // Weekly run volume (denominator) — normalizes the recovery rate per run.
+  const runRows = (await db.execute(sql`
+    SELECT
+      to_char(date_trunc('week', ${heartbeatRuns.createdAt} AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS week_start,
+      count(*)::int AS runs
+    FROM ${heartbeatRuns}
+    WHERE ${heartbeatRuns.companyId} = ${companyId}
+      AND ${heartbeatRuns.createdAt} >= ${sinceIso}::timestamptz
+    GROUP BY week_start
+  `)) as unknown as Iterable<{ week_start: string; runs: number | string }>;
+
+  // Weekly recovery-incident volume (numerator) and raw action volume.
+  const actionRows = (await db.execute(sql`
+    SELECT
+      to_char(date_trunc('week', ${issueRecoveryActions.createdAt} AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS week_start,
+      count(DISTINCT (${issueRecoveryActions.sourceIssueId}, ${issueRecoveryActions.fingerprint}))::int AS incidents,
+      count(*)::int AS action_rows
+    FROM ${issueRecoveryActions}
+    WHERE ${issueRecoveryActions.companyId} = ${companyId}
+      AND ${issueRecoveryActions.createdAt} >= ${sinceIso}::timestamptz
+    GROUP BY week_start
+  `)) as unknown as Iterable<{
+    week_start: string;
+    incidents: number | string;
+    action_rows: number | string;
+  }>;
+
+  const runsByWeek = new Map<string, number>();
+  for (const row of runRows) runsByWeek.set(String(row.week_start), Number(row.runs));
+  const incidentsByWeek = new Map<string, number>();
+  const actionRowsByWeek = new Map<string, number>();
+  for (const row of actionRows) {
+    incidentsByWeek.set(String(row.week_start), Number(row.incidents));
+    actionRowsByWeek.set(String(row.week_start), Number(row.action_rows));
+  }
+
+  return Array.from({ length: weeks }, (_, index) => {
+    const weekStart = utcWeekStart(now, weeks - 1 - index).toISOString().slice(0, 10);
+    const runs = runsByWeek.get(weekStart) ?? 0;
+    const recoveryActions = incidentsByWeek.get(weekStart) ?? 0;
+    return {
+      weekStart,
+      runs,
+      recoveryActions,
+      recoveryActionRows: actionRowsByWeek.get(weekStart) ?? 0,
+      ratePercent: runs > 0 ? round2((recoveryActions / runs) * 100) : 0,
+    };
+  });
+}
+
 export function recoveryObservabilityService(db: Db) {
   async function report(
     companyId: string,
@@ -195,45 +258,7 @@ export function recoveryObservabilityService(db: Db) {
     const thresholdPercent = opts?.thresholdPercent ?? DEFAULT_RECOVERY_RATE_THRESHOLD_PERCENT;
     const since = utcWeekStart(now, weeks - 1);
     const sinceIso = since.toISOString();
-
-    // Weekly run volume (denominator) — normalizes the recovery rate per run.
-    const runRows = (await db.execute(sql`
-      SELECT
-        to_char(date_trunc('week', ${heartbeatRuns.createdAt} AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS week_start,
-        count(*)::int AS runs
-      FROM ${heartbeatRuns}
-      WHERE ${heartbeatRuns.companyId} = ${companyId}
-        AND ${heartbeatRuns.createdAt} >= ${sinceIso}::timestamptz
-      GROUP BY week_start
-    `)) as unknown as Iterable<{ week_start: string; runs: number | string }>;
-
-    // Weekly recovery-action volume (numerator).
-    const actionRows = (await db.execute(sql`
-      SELECT
-        to_char(date_trunc('week', ${issueRecoveryActions.createdAt} AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS week_start,
-        count(*)::int AS actions
-      FROM ${issueRecoveryActions}
-      WHERE ${issueRecoveryActions.companyId} = ${companyId}
-        AND ${issueRecoveryActions.createdAt} >= ${sinceIso}::timestamptz
-      GROUP BY week_start
-    `)) as unknown as Iterable<{ week_start: string; actions: number | string }>;
-
-    const runsByWeek = new Map<string, number>();
-    for (const row of runRows) runsByWeek.set(String(row.week_start), Number(row.runs));
-    const actionsByWeek = new Map<string, number>();
-    for (const row of actionRows) actionsByWeek.set(String(row.week_start), Number(row.actions));
-
-    const weekly: WeeklyRecoveryRate[] = Array.from({ length: weeks }, (_, index) => {
-      const weekStart = utcWeekStart(now, weeks - 1 - index).toISOString().slice(0, 10);
-      const runs = runsByWeek.get(weekStart) ?? 0;
-      const recoveryActions = actionsByWeek.get(weekStart) ?? 0;
-      return {
-        weekStart,
-        runs,
-        recoveryActions,
-        ratePercent: runs > 0 ? round2((recoveryActions / runs) * 100) : 0,
-      };
-    });
+    const weekly = await loadWeeklyRecoveryRates(db, companyId, { now, weeks });
 
     const alert = evaluateRecoveryRateAlert(weekly, thresholdPercent);
     // SUP-21344: the artifact key must name the same complete-week window the

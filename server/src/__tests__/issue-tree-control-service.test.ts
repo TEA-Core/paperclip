@@ -589,6 +589,12 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
       }),
     });
 
+    // The acting run is executing; a running run outranks the forged queued
+    // sibling that names the same card.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "running", startedAt: new Date() })
+      .where(eq(heartbeatRuns.id, deepDescendantRunId));
     const checkedOutChild = await issueSvc.checkout(deepDescendantIssueId, agentId, ["todo"], deepDescendantRunId);
     expect(checkedOutChild.status).toBe("in_progress");
     expect(checkedOutChild.checkoutRunId).toBe(deepDescendantRunId);

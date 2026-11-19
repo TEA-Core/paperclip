@@ -959,13 +959,12 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
       ...fixture,
     });
     await db.insert(issueThreadInteractions).values({
-      id: randomUUID(),
       companyId,
       issueId,
       kind: "request_confirmation",
       status: "pending",
       continuationPolicy: "wake_assignee",
-      payload: {},
+      payload: { version: 1, prompt: "Confirm the pending work." },
     });
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
@@ -1760,13 +1759,12 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
       executionState: null,
     });
     await db.insert(issueThreadInteractions).values({
-      id: randomUUID(),
       companyId,
       issueId,
       kind: "request_confirmation",
       status: "pending",
       continuationPolicy: "wake_assignee",
-      payload: {},
+      payload: { version: 1, prompt: "Confirm the pending work." },
     });
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
@@ -2107,5 +2105,93 @@ describeEmbeddedPostgres("recovery no-live-path strands", () => {
     expect(result.skipped).toBe(0);
     const [reloaded] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(reloaded?.status).toBe("blocked");
+  });
+
+  // A board-owned action of another kind that walked its attempt ceiling.
+  // upsertSourceScoped returns it untouched, so it keeps owning the card.
+  async function seedTerminalStrandedAction(companyId: string, issueId: string) {
+    const actionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: actionId,
+      companyId,
+      sourceIssueId: issueId,
+      kind: "stranded_assigned_issue",
+      status: "escalated",
+      ownerType: "board",
+      cause: "stranded_assigned_issue",
+      fingerprint: `stranded_assigned_issue:${companyId}:${issueId}`,
+      attemptCount: 5,
+      maxAttempts: 5,
+      nextAction: "Board decision required.",
+      outcome: "exhausted",
+      evidence: {},
+      lastAttemptAt: pastGraceDate(),
+    });
+    return actionId;
+  }
+
+  async function expectTerminalOwnerKeptAndNoEscalationRows(
+    issueId: string,
+    terminalActionId: string,
+    escalationAction: string,
+  ) {
+    const escalationRows = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, escalationAction)));
+    expect(escalationRows).toHaveLength(0);
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toEqual([
+      expect.objectContaining({
+        id: terminalActionId,
+        kind: "stranded_assigned_issue",
+        status: "escalated",
+        outcome: "exhausted",
+      }),
+    ]);
+  }
+
+  it("branch 1: a terminal action of another kind owning the card writes no escalation row on any tick", async () => {
+    const { companyId, prefix } = await seedCompany();
+    const issueId = await createIssue(companyId, prefix, "todo", null, {
+      updatedAt: pastGraceDate(),
+    });
+    const terminalActionId = await seedTerminalStrandedAction(companyId, issueId);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    for (let tick = 0; tick < 3; tick += 1) {
+      const result = await recovery.reconcileStrandedAssignedIssues();
+      expect(result.noLivePathUnowned).toBe(0);
+    }
+
+    await expectTerminalOwnerKeptAndNoEscalationRows(
+      issueId,
+      terminalActionId,
+      "issue.no_live_path_unowned_escalated",
+    );
+  });
+
+  it("branch 3: a terminal action of another kind owning the card writes no escalation row on any tick", async () => {
+    const { companyId, managerId, prefix } = await seedCompany();
+    const pausedAgentId = await seedPausedAgent(companyId, managerId);
+    const issueId = await createIssue(companyId, prefix, "in_progress", pausedAgentId, {
+      updatedAt: pastGraceDate(),
+    });
+    const terminalActionId = await seedTerminalStrandedAction(companyId, issueId);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    for (let tick = 0; tick < 3; tick += 1) {
+      const result = await recovery.reconcileStrandedAssignedIssues();
+      expect(result.noLivePathOwnerUnavailable).toBe(0);
+    }
+
+    await expectTerminalOwnerKeptAndNoEscalationRows(
+      issueId,
+      terminalActionId,
+      "issue.no_live_path_owner_unavailable_escalated",
+    );
   });
 });

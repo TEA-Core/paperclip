@@ -113,4 +113,12 @@ describe("agent permissions service", () => {
       canAssignTasks: false,
     }).canCreateSkills).toBe(false);
   });
+
+  it("accepts an omitted canAssignTasks but still requires a boolean when present", () => {
+    expect(updateAgentPermissionsSchema.parse({ canCreateAgents: false, canCreateSkills: false }))
+      .not.toHaveProperty("canAssignTasks");
+    expect(updateAgentPermissionsSchema.safeParse({ canCreateAgents: false, canAssignTasks: "true" }).success)
+      .toBe(false);
+    expect(updateAgentPermissionsSchema.safeParse({ canCreateSkills: false }).success).toBe(false);
+  });
 });

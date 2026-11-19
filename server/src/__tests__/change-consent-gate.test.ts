@@ -10,11 +10,13 @@ import {
   issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
+import { requestConfirmationPayloadSchema } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
+  agentInstructionsChangeTargetKey,
   changeConsentGateService,
   skillChangeTargetKey,
 } from "../services/change-consent-gate.js";
@@ -247,5 +249,180 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
       actorRunId: randomUUID(),
       targetKeys: [targetKey],
     })).resolves.toBe(true);
+  });
+
+  it("rejects an instruction-bundle apply when the accepted confirmation names no adoption carrier", async () => {
+    const { companyId, coachId, sourceRunId, proposalIssueId } = await seedGateFixture();
+    const targetKey = agentInstructionsChangeTargetKey(randomUUID());
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId: proposalIssueId,
+      kind: "request_confirmation",
+      status: "accepted",
+      continuationPolicy: "wake_assignee_on_accept",
+      sourceRunId,
+      createdByAgentId: coachId,
+      payload: {
+        version: 1,
+        prompt: "Apply this instruction diff?",
+        detailsMarkdown: "```diff\n+Name the carrier.\n```",
+        target: { type: "custom", key: targetKey, revisionId: "proposal-v1" },
+      },
+      result: { version: 1, outcome: "accepted" },
+      resolvedByUserId: "board-user",
+      resolvedAt: new Date(),
+    });
+
+    await expect(changeConsentGateService(db).assertConsented({
+      companyId,
+      actorAgentId: coachId,
+      actorRunId: randomUUID(),
+      targetKeys: [targetKey],
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "reflection_coach_adoption_carrier_required" },
+    });
+
+    const [stored] = await db
+      .select({ result: issueThreadInteractions.result })
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interactionId));
+    expect(stored?.result).toEqual({ version: 1, outcome: "accepted" });
+  });
+
+  it("rejects an instruction-bundle apply when the named carrier issue id is not a guid", async () => {
+    const { companyId, coachId, sourceRunId, proposalIssueId } = await seedGateFixture();
+    const targetKey = agentInstructionsChangeTargetKey(randomUUID());
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId: proposalIssueId,
+      kind: "request_confirmation",
+      status: "accepted",
+      continuationPolicy: "wake_assignee_on_accept",
+      sourceRunId,
+      createdByAgentId: coachId,
+      payload: {
+        version: 1,
+        prompt: "Apply this instruction diff?",
+        detailsMarkdown: "```diff\n+Name the carrier.\n```",
+        target: { type: "custom", key: targetKey, revisionId: "proposal-v1" },
+        adoptionCarrier: { issueId: "SUP-22752" },
+      },
+      result: { version: 1, outcome: "accepted" },
+      resolvedByUserId: "board-user",
+      resolvedAt: new Date(),
+    });
+
+    await expect(changeConsentGateService(db).assertConsented({
+      companyId,
+      actorAgentId: coachId,
+      actorRunId: randomUUID(),
+      targetKeys: [targetKey],
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "reflection_coach_adoption_carrier_required" },
+    });
+  });
+
+  it("rejects a legacy instruction confirmation that does not name an adoption carrier", async () => {
+    const { companyId, coachId, sourceRunId, proposalIssueId } = await seedGateFixture();
+    const agentId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId: proposalIssueId,
+      kind: "request_confirmation",
+      status: "accepted",
+      continuationPolicy: "wake_assignee_on_accept",
+      sourceRunId,
+      createdByAgentId: coachId,
+      payload: {
+        version: 1,
+        prompt: "Apply this instruction diff?",
+        detailsMarkdown: "```diff\n+Name the carrier.\n```",
+        target: { type: "custom", key: `reflection-coach:agent-instructions:${agentId}`, revisionId: "proposal-v1" },
+      },
+      result: { version: 1, outcome: "accepted" },
+      resolvedByUserId: "board-user",
+      resolvedAt: new Date(),
+    });
+
+    await expect(changeConsentGateService(db).assertConsented({
+      companyId,
+      actorAgentId: coachId,
+      actorRunId: randomUUID(),
+      targetKeys: [agentInstructionsChangeTargetKey(agentId)],
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "reflection_coach_adoption_carrier_required" },
+    });
+  });
+
+  it("allows an instruction-bundle apply when the accepted confirmation names a carrier issue id", async () => {
+    const { companyId, coachId, sourceRunId, proposalIssueId } = await seedGateFixture();
+    const targetKey = agentInstructionsChangeTargetKey(randomUUID());
+    const interactionId = randomUUID();
+    const carrierIssueId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId: proposalIssueId,
+      kind: "request_confirmation",
+      status: "accepted",
+      continuationPolicy: "wake_assignee_on_accept",
+      sourceRunId,
+      createdByAgentId: coachId,
+      payload: {
+        version: 1,
+        prompt: "Apply this instruction diff?",
+        detailsMarkdown: "```diff\n+Name the carrier.\n```",
+        target: { type: "custom", key: targetKey, revisionId: "proposal-v1" },
+        adoptionCarrier: { issueId: carrierIssueId },
+      },
+      result: { version: 1, outcome: "accepted" },
+      resolvedByUserId: "board-user",
+      resolvedAt: new Date(),
+    });
+    const actorRunId = randomUUID();
+
+    await expect(changeConsentGateService(db).assertConsented({
+      companyId,
+      actorAgentId: coachId,
+      actorRunId,
+      targetKeys: [targetKey],
+    })).resolves.toBe(true);
+
+    const [stored] = await db
+      .select({ result: issueThreadInteractions.result })
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interactionId));
+    expect(stored?.result).toMatchObject({
+      consumedByRunId: actorRunId,
+      outcome: "accepted",
+      version: 1,
+    });
+  });
+});
+
+describe("instruction confirmation payload", () => {
+  it("keeps a named adoption carrier through the confirmation schema", () => {
+    const issueId = "11111111-1111-4111-8111-111111111111";
+    const parsed = requestConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Apply this instruction diff?",
+      adoptionCarrier: { issueId },
+    });
+    expect(parsed.adoptionCarrier).toEqual({ issueId });
+  });
+
+  it("rejects an adoption carrier that does not name an issue id", () => {
+    expect(requestConfirmationPayloadSchema.safeParse({
+      version: 1,
+      prompt: "Apply this instruction diff?",
+      adoptionCarrier: { issueId: "SUP-22752" },
+    }).success).toBe(false);
   });
 });

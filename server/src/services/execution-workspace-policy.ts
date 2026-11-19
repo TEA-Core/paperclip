@@ -61,17 +61,17 @@ function parseExecutionWorkspaceStrategy(raw: unknown): ExecutionWorkspaceStrate
   }
   return {
     type,
-    ...(typeof parsed.baseRef === "string" ? { baseRef: parsed.baseRef } : {}),
-    ...(typeof parsed.branchTemplate === "string" ? { branchTemplate: parsed.branchTemplate } : {}),
+    ...(typeof parsed.baseRef === "string" || parsed.baseRef === null ? { baseRef: parsed.baseRef } : {}),
+    ...(typeof parsed.branchTemplate === "string" || parsed.branchTemplate === null ? { branchTemplate: parsed.branchTemplate } : {}),
     ...(typeof parsed.existingBranch === "string" && parsed.existingBranch.trim().length > 0
       ? { existingBranch: parsed.existingBranch.trim() }
       : {}),
-    ...(typeof parsed.worktreeParentDir === "string" ? { worktreeParentDir: parsed.worktreeParentDir } : {}),
-    ...(typeof parsed.provisionCommand === "string" ? { provisionCommand: parsed.provisionCommand } : {}),
-    ...(typeof parsed.runtimeProvisionCommand === "string"
+    ...(typeof parsed.worktreeParentDir === "string" || parsed.worktreeParentDir === null ? { worktreeParentDir: parsed.worktreeParentDir } : {}),
+    ...(typeof parsed.provisionCommand === "string" || parsed.provisionCommand === null ? { provisionCommand: parsed.provisionCommand } : {}),
+    ...(typeof parsed.runtimeProvisionCommand === "string" || parsed.runtimeProvisionCommand === null
       ? { runtimeProvisionCommand: parsed.runtimeProvisionCommand }
       : {}),
-    ...(typeof parsed.teardownCommand === "string" ? { teardownCommand: parsed.teardownCommand } : {}),
+    ...(typeof parsed.teardownCommand === "string" || parsed.teardownCommand === null ? { teardownCommand: parsed.teardownCommand } : {}),
   };
 }
 
@@ -260,6 +260,56 @@ export function inheritedExecutionWorkspaceBranchExempt(input: {
     workspaceBranchName: input.workspaceBranchName,
     issueIdentifier: input.workspaceSourceIssueIdentifier,
   });
+}
+
+/** Release and integration branch families no card may deliver on, whatever the project configures. */
+const PROTECTED_BRANCH_PREFIXES = ["release/", "releases/", "hotfix/", "fold/", "fold-sync/"];
+
+/** A branch or ref name in comparable form: trimmed, lowercased, without `refs/heads/` or trailing slashes. */
+function comparableBranchName(name: string): string {
+  const lowered = name.trim().toLowerCase();
+  const local = lowered.startsWith("refs/heads/") ? lowered.slice("refs/heads/".length) : lowered;
+  return local.replace(/\/+$/, "");
+}
+
+/**
+ * The branch names a stored default ref can denote. The control plane stores refs in several
+ * forms (`main`, `origin/main`, `upstream/main`, `refs/heads/main`, `refs/remotes/origin/main`).
+ * A `refs/heads/<x>` ref names exactly the local branch `x`; a `refs/remotes/<remote>/<x>` ref
+ * names `x`; a bare ref names itself or, when its first segment is a remote, the rest.
+ */
+function branchNamesOfRef(ref: string): string[] {
+  const lowered = ref.trim().toLowerCase().replace(/\/+$/, "");
+  if (lowered.startsWith("refs/heads/")) return [lowered.slice("refs/heads/".length)];
+  const remoteTracking = /^refs\/remotes\/[^/]+\/(.+)$/.exec(lowered);
+  if (remoteTracking) return [remoteTracking[1]!];
+  // Without the first path segment (a remote name); a ref with no slash yields itself again.
+  return [lowered, lowered.slice(lowered.indexOf("/") + 1)];
+}
+
+/**
+ * SUP-24409: a branch no card may claim as its own delivery branch, because it lands
+ * integration or release work. One predicate guards every place such a branch could reach a
+ * card's execution-workspace row: exact-branch and templated realization, and the board PATCH
+ * of a row's branch.
+ *
+ * True, independent of any configuration, for `main`, `master`, `release/*`, `releases/*`,
+ * `hotfix/*`, `fold/*` and `fold-sync/*`, and for any branch on a `project_primary` row (the
+ * project's own checkout is never a card's delivery row). Also true for any of `defaultRefs`, the
+ * repo default/base refs the caller knows (project workspace default and repo refs, a row's or
+ * strategy's base ref, the remote's default branch), in whatever form they are stored.
+ * Case-insensitive, and blind to a `refs/heads/` prefix, surrounding whitespace and trailing slashes.
+ */
+export function isProtectedDeliveryBranch(input: {
+  branch: string;
+  defaultRefs?: ReadonlyArray<string | null | undefined>;
+  workspaceMode?: string | null;
+}): boolean {
+  if (input.workspaceMode === "project_primary") return true;
+  const candidate = comparableBranchName(input.branch);
+  if (candidate === "main" || candidate === "master") return true;
+  if (PROTECTED_BRANCH_PREFIXES.some((prefix) => candidate.startsWith(prefix))) return true;
+  return (input.defaultRefs ?? []).some((ref) => !!ref && branchNamesOfRef(ref).includes(candidate));
 }
 
 /**
@@ -505,8 +555,8 @@ export function gateProjectExecutionWorkspacePolicy(
 }
 
 /**
- * Operator default: a project that stores no policy of its own runs its tasks
- * in an isolated per-task worktree instead of the shared project checkout.
+ * Operator default: a project with a configured workspace and no policy of its
+ * own runs its tasks in an isolated per-task worktree.
  *
  * This substitutes a policy rather than moving the terminal fallback in
  * `resolveExecutionWorkspaceMode`, and the distinction is load-bearing:
@@ -516,7 +566,10 @@ export function gateProjectExecutionWorkspacePolicy(
  *   an isolated + `git_worktree` task that has neither `projectId` nor
  *   `projectWorkspaceId`. Moving the terminal fallback would resolve isolated
  *   for project-less tasks (agent chat, for example) and strand them before
- *   dispatch. `hasProject` keeps them on the untouched path.
+ *   dispatch. A project without a configured workspace also uses a plain
+ *   managed directory, not a Git checkout. `hasProjectWorkspace` keeps both
+ *   cases on their existing path; configured checkouts are still validated
+ *   before a worktree is created.
  * - `buildExecutionWorkspaceAdapterConfig` only supplies the default
  *   `git_worktree` strategy when some layer actually asserts workspace
  *   control. A moved fallback would leave `hasWorkspaceControl` false and
@@ -532,10 +585,10 @@ export function gateProjectExecutionWorkspacePolicy(
 export function applyDefaultIsolatedExecutionWorkspacePolicy(input: {
   projectPolicy: ProjectExecutionWorkspacePolicy | null;
   defaultIsolatedWorkspacesEnabled: boolean;
-  hasProject: boolean;
+  hasProjectWorkspace: boolean;
 }): ProjectExecutionWorkspacePolicy | null {
   if (!input.defaultIsolatedWorkspacesEnabled) return input.projectPolicy;
-  if (!input.hasProject) return input.projectPolicy;
+  if (!input.hasProjectWorkspace) return input.projectPolicy;
   if (input.projectPolicy) return input.projectPolicy;
   return { enabled: true, defaultMode: "isolated_workspace" };
 }
@@ -758,11 +811,19 @@ export function buildExecutionWorkspaceAdapterConfig(input: {
 
   if (hasWorkspaceControl) {
     if (input.mode === "isolated_workspace") {
-      const strategy =
-        effectiveIssueSettings?.workspaceStrategy ??
-        input.projectPolicy?.workspaceStrategy ??
+      const projectStrategy = projectHasPolicy ? input.projectPolicy?.workspaceStrategy : undefined;
+      // Fork: allowIssueOverride=false drops the issue strategy (effectiveIssueSettings).
+      const issueStrategy = effectiveIssueSettings?.workspaceStrategy;
+      // An issue that changes its branch still needs the project's setup hooks.
+      // Do not carry those defaults into a different execution strategy.
+      const strategy = issueStrategy && projectStrategy?.type === issueStrategy.type
+        ? { ...projectStrategy, ...issueStrategy }
+        : issueStrategy ?? projectStrategy ??
         parseExecutionWorkspaceStrategy(nextConfig.workspaceStrategy) ??
         ({ type: "git_worktree" } satisfies ExecutionWorkspaceStrategy);
+      if (issueStrategy?.existingBranch && issueStrategy.branchTemplate === undefined && strategy !== issueStrategy) {
+        delete strategy.branchTemplate;
+      }
       nextConfig.workspaceStrategy = strategy as unknown as Record<string, unknown>;
     } else {
       delete nextConfig.workspaceStrategy;

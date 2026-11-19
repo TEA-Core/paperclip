@@ -38,7 +38,7 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import type { StorageService } from "../storage/types.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -70,8 +70,8 @@ describeEmbeddedPostgres("cases routes", () => {
         provider: "local_disk",
         objectKey: `${input.namespace}/${randomUUID()}`,
         contentType: input.contentType,
-        byteSize: input.body.length,
-        sha256: createHash("sha256").update(input.body).digest("hex"),
+        byteSize: (input.body as Buffer).length,
+        sha256: createHash("sha256").update(input.body as Buffer).digest("hex"),
         originalFilename: input.originalFilename,
       };
     },

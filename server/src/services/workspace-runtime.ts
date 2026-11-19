@@ -9,7 +9,15 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AdapterRuntimeServiceReport } from "@paperclipai/adapter-utils";
 import type { Db } from "@paperclipai/db";
-import { executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
+import {
+  executionWorkspaces,
+  heartbeatRuns,
+  issueComments,
+  issues,
+  MIGRATIONS_FOLDER,
+  projectWorkspaces,
+  workspaceRuntimeServices,
+} from "@paperclipai/db";
 import {
   ISSUE_COMMENT_METADATA_TEXT_MAX_LENGTH,
   DEFAULT_TAILSCALE_HTTPS_EXPOSURE,
@@ -34,7 +42,7 @@ import {
   type WorkspaceRuntimeDesiredState,
   type WorkspaceRuntimeServiceStateMap,
 } from "@paperclipai/shared";
-import { and, desc, eq, gte, inArray, isNull, lte, ne, or } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import { asNumber, asString, defaultPathForPlatform, parseObject, renderTemplate, resolveCommandForLogs } from "../adapters/utils.js";
 import { conflict } from "../errors.js";
 import { resolveHomeAwarePath, resolvePaperclipInstanceRoot } from "../home-paths.js";
@@ -44,7 +52,18 @@ import {
   type EnsureSharedGroupOwnershipOptions,
   type SharedGroupRepairOutcome,
 } from "./shared-group-ownership.js";
-import { hasVerifiedWorktreeSeedManifest, isVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
+import { resolveWorktreeSchemaLineage } from "@paperclipai/shared/worktree-initialization-identity";
+import {
+  isVerifiedWorktreeSeedManifest,
+  type WorktreeInitializationExpectation,
+} from "@paperclipai/shared/worktree-initialization-manifest";
+import { resolveWorktreeStateDir } from "../dev-runner-worktree.js";
+import {
+  readWorktreeInitializationKey,
+  readWorktreeSeedManifestStatus,
+  readWorktreeStateInstanceId,
+  readWorktreeStateManifest,
+} from "../worktree-seed-manifest.js";
 import {
   buildManagedWorkspaceGuestEnv,
   logManagedWorkspaceReadinessRejection,
@@ -72,6 +91,7 @@ import {
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { executionWorkspaceService, readExecutionWorkspaceConfig, type ExecutionWorkspaceBranchReconcileMode } from "./execution-workspaces.js";
 import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
+import { isProtectedDeliveryBranch } from "./execution-workspace-policy.js";
 import { logActivity } from "./activity-log.js";
 import {
   buildDivergenceAlertText,
@@ -4322,6 +4342,10 @@ export type BaseRepoHygieneDecision =
  * Restoring is hygiene, not a gate. It never blocks the dispatch: refusing to run
  * because the base repo is untidy would dead-block issues over a condition the
  * issue did not cause, which is the SUP-11207 mistake.
+ *
+ * SUP-24442 narrows the premise: while the primary clone is the cwd of a live
+ * project_primary execution workspace it is that card's workspace, and the
+ * caller's restore guard skips `restore` (see liveProjectPrimaryRestoreGuard).
  */
 export function resolveBaseRepoHygieneDecision(input: {
   /** Branch the base repo has checked out; null when detached. */
@@ -5427,11 +5451,112 @@ async function resolveGitRepoRootForWorkspaceCleanup(
   return path.dirname(resolvedGitDir);
 }
 
+/**
+ * SUP-24442: decides, only once hygiene has already chosen `restore`, whether
+ * the restore must be skipped. Returns the reason to skip, or null to restore.
+ */
+export type BaseRepoRestoreGuard = () => Promise<string | null>;
+
+const TERMINAL_ISSUE_STATUSES = ["done", "cancelled"];
+const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running"];
+
+/**
+ * SUP-24442: ids of the non-closed project_primary execution workspaces that a
+ * live card still uses and whose cwd is this checkout: the repo root, a
+ * directory inside it, or the sibling's base cwd. A card is live while its issue
+ * (the workspace's source issue, or any issue bound to the workspace) is not
+ * terminal, or while that issue has a queued or running heartbeat run.
+ */
+async function findLiveProjectPrimaryWorkspacesAtCheckout(
+  db: Db,
+  checkout: { repoRoot: string; baseCwd: string },
+): Promise<string[]> {
+  const spellings = async (dir: string) => [
+    path.resolve(dir),
+    await fs.realpath(dir).catch(() => path.resolve(dir)),
+  ];
+  const roots = [...new Set(await spellings(checkout.repoRoot))];
+  const exactPaths = [...new Set([...roots, ...(checkout.baseCwd ? await spellings(checkout.baseCwd) : [])])];
+  const workspaces = await db
+    .select({ id: executionWorkspaces.id, sourceIssueId: executionWorkspaces.sourceIssueId })
+    .from(executionWorkspaces)
+    .where(and(
+      eq(executionWorkspaces.strategyType, "project_primary"),
+      isNull(executionWorkspaces.closedAt),
+      notInArray(executionWorkspaces.status, ["archived", "cleanup_failed"]),
+      or(
+        inArray(executionWorkspaces.cwd, exactPaths),
+        ...roots.map((root) => sql`starts_with(${executionWorkspaces.cwd}, ${root + path.sep})`),
+      ),
+    ));
+  if (workspaces.length === 0) return [];
+
+  const workspaceIds = workspaces.map((workspace) => workspace.id);
+  const sourceIssueIds = workspaces
+    .map((workspace) => workspace.sourceIssueId)
+    .filter((id): id is string => Boolean(id));
+  const linkedIssues = await db
+    .select({
+      id: issues.id,
+      executionWorkspaceId: issues.executionWorkspaceId,
+      status: issues.status,
+      executionRunId: issues.executionRunId,
+      checkoutRunId: issues.checkoutRunId,
+    })
+    .from(issues)
+    .where(or(
+      inArray(issues.executionWorkspaceId, workspaceIds),
+      sourceIssueIds.length > 0 ? inArray(issues.id, sourceIssueIds) : undefined,
+    ));
+  const runIds = [...new Set(linkedIssues.flatMap((issue) => [issue.executionRunId, issue.checkoutRunId])
+    .filter((id): id is string => Boolean(id)))];
+  const liveRunIds = new Set(runIds.length === 0
+    ? []
+    : (await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(inArray(heartbeatRuns.id, runIds), inArray(heartbeatRuns.status, LIVE_HEARTBEAT_RUN_STATUSES))))
+      .map((run) => run.id));
+
+  return workspaces
+    .filter((workspace) => linkedIssues.some((issue) =>
+      (issue.executionWorkspaceId === workspace.id || issue.id === workspace.sourceIssueId) &&
+      (!TERMINAL_ISSUE_STATUSES.includes(issue.status) ||
+        [issue.executionRunId, issue.checkoutRunId].some((runId) => runId !== null && liveRunIds.has(runId)))))
+    .map((workspace) => workspace.id);
+}
+
+/**
+ * SUP-24442: the hygiene restore treats the primary checkout as nobody's
+ * workspace, but it is the cwd of every project_primary execution workspace.
+ * Restoring it under a live card detaches the card's branch (or force-checks
+ * out main over its edits). Without a database there is nothing to look up, so
+ * no guard applies and hygiene behaves as before.
+ */
+function liveProjectPrimaryRestoreGuard(
+  db: Db | null | undefined,
+  checkout: { repoRoot: string; baseCwd: string },
+): BaseRepoRestoreGuard | null {
+  if (!db) return null;
+  return async () => {
+    const liveWorkspaceIds = await findLiveProjectPrimaryWorkspacesAtCheckout(db, checkout);
+    return liveWorkspaceIds.length > 0
+      ? `it is the working directory of ${liveWorkspaceIds.length} live project_primary execution workspace(s)`
+      : null;
+  };
+}
+
 export async function prepareBaseRepoForWorkspace(input: {
   repoRoot: string;
   configuredBaseRef: string | null;
   resolveGitAuth?: GitRemoteAuthProvider | null;
   recorder?: WorkspaceOperationRecorder | null;
+  /**
+   * SUP-24442: consulted only when hygiene decides `restore`. A non-null
+   * reason (or a guard failure) skips the restore and leaves the checkout
+   * untouched with a warning; every other hygiene action is unaffected.
+   */
+  restoreGuard?: BaseRepoRestoreGuard | null;
 }): Promise<{
   baseRef: string;
   baseRefSha: string | null;
@@ -5534,7 +5659,17 @@ export async function prepareBaseRepoForWorkspace(input: {
         divergenceComputable: shallowState.divergenceComputable,
         graftCommits: shallowState.graftCommits,
       });
-      if (decision.action === "restore") {
+      const restoreSkipReason = decision.action === "restore" && input.restoreGuard
+        ? await input.restoreGuard().catch((err: unknown) =>
+            `the live project_primary workspace lookup failed (${err instanceof Error ? err.message : String(err)}), so the checkout is treated as live`)
+        : null;
+      if (decision.action === "restore" && restoreSkipReason) {
+        const message =
+          `Base repository at ${input.repoRoot} was not restored to ${baseRef} (${decision.reasons.join("; ")}): ` +
+          `${restoreSkipReason}. Hygiene restore skipped; the checkout was left untouched.`;
+        baseRepoHygieneWarnings.push(message);
+        logger.warn(message);
+      } else if (decision.action === "restore") {
         const result = await restoreBaseRepoToDefaultRef({
           repoRoot: input.repoRoot,
           baseRef,
@@ -5857,12 +5992,35 @@ export async function realizeExecutionWorkspace(input: {
   }
 
   const repoRoot = await resolveGitOwnerRepoRoot(input.base.baseCwd);
+  // SUP-24409: the refs a card's delivery branch may never equal: the remote's default branch, the
+  // project workspace's repo ref and the strategy's configured base ref.
+  const protectedBaseRefs = [
+    await detectRemoteDefaultBranch(repoRoot),
+    input.base.repoRef,
+    typeof rawStrategy.baseRef === "string" ? rawStrategy.baseRef : null,
+  ];
   let branchName: string;
   if (requestedExistingBranch) {
     // Exact-branch mode: attach the requested pre-existing branch verbatim.
     // The branch must already exist; realization never creates, renames, or
     // resets it, and any mismatch below fails closed instead of falling back
     // to a derived branch or the shared checkout.
+    // SUP-24409: the attached branch becomes the card's own delivery branch; an integration or
+    // release branch, or one of the repo's default/base refs, is never a card's delivery branch.
+    if (isProtectedDeliveryBranch({ branch: requestedExistingBranch, defaultRefs: protectedBaseRefs })) {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Workspace strategy pins existing branch "${requestedExistingBranch}", which is a protected branch `
+        + "(main, master, a release, hotfix or fold branch, or a default branch of the repository). A card cannot deliver on it; "
+        + "pin the card's own branch instead.",
+        {
+          workspaceValidation: {
+            reason: "existing_branch_is_protected",
+            requestedExistingBranch,
+            remoteDefaultBranch: protectedBaseRefs[0],
+          },
+        },
+      );
+    }
     const existingBranchSha = await runGit(
       ["rev-parse", "--verify", "--quiet", `refs/heads/${requestedExistingBranch}`],
       repoRoot,
@@ -5889,11 +6047,12 @@ export async function realizeExecutionWorkspace(input: {
       repoRef: input.base.repoRef,
     });
     branchName = sanitizeBranchName(renderedBranch);
-    const remoteDefaultBranch = await detectRemoteDefaultBranch(repoRoot);
-    if (remoteDefaultBranch && branchName === remoteDefaultBranch) {
+    // SUP-24409: the same protected set as exact-branch mode, not only the default.
+    if (isProtectedDeliveryBranch({ branch: branchName, defaultRefs: protectedBaseRefs })) {
       throw new WorkspaceRuntimeValidationFailure(
-        `Execution workspace branch name "${branchName}" matches the repo's default branch. `
-        + "Creating a worktree on the default branch would permanently strand the primary clone. "
+        `Execution workspace branch name "${branchName}" matches the repo's default branch or another protected branch `
+        + "(main, master, a release, hotfix or fold branch). Creating a worktree on it would strand the "
+        + "primary clone and make an integration branch a card's delivery branch. "
         + 'Use a branch template that produces a unique name (e.g., "{{issue.identifier}}-{{slug}}").',
         {
           workspaceValidation: {
@@ -5931,6 +6090,7 @@ export async function realizeExecutionWorkspace(input: {
     configuredBaseRef,
     resolveGitAuth: input.resolveGitAuth ?? null,
     recorder: input.recorder ?? null,
+    restoreGuard: liveProjectPrimaryRestoreGuard(input.db, { repoRoot, baseCwd: input.base.baseCwd }),
   });
   if (baseRepoHygiene.divergenceAlert) {
     await emitBaseRepoDivergenceSignal({
@@ -6445,6 +6605,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
           configuredBaseRef: reuseBaseRef,
           resolveGitAuth: input.resolveGitAuth ?? null,
           recorder: input.recorder ?? null,
+          restoreGuard: liveProjectPrimaryRestoreGuard(input.db, { repoRoot, baseCwd }),
         })
       : { baseRef: reuseBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: reuseBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false, divergenceAlert: null };
     if (baseRepoHygiene.divergenceAlert) {
@@ -6513,6 +6674,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         configuredBaseRef: restoreBaseRef,
         resolveGitAuth: input.resolveGitAuth ?? null,
         recorder: input.recorder ?? null,
+        restoreGuard: liveProjectPrimaryRestoreGuard(input.db, { repoRoot, baseCwd }),
       })
     : { baseRef: restoreBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: restoreBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false, divergenceAlert: null };
   if (baseRepoHygiene.divergenceAlert) {
@@ -8302,28 +8464,42 @@ export async function waitForRuntimeServiceReadiness(input: {
   // misleading `probe timed out after 1ms`. Give every probe after the first at
   // least one interval, and stop early rather than issue one that can only fail.
   const minProbeBudgetMs = Math.min(RUNTIME_SERVICE_READINESS_PROBE_TIMEOUT_MS, intervalMs);
-  const deadline = now() + timeoutSec * 1000;
+  const startedAt = now();
+  const deadline = startedAt + timeoutSec * 1000;
   let lastError = "service did not become ready";
   let probed = false;
+  let lastCause: unknown;
+  let probes = 0;
   while (now() < deadline) {
     const probeBudgetMs = Math.max(1, Math.min(RUNTIME_SERVICE_READINESS_PROBE_TIMEOUT_MS, deadline - now()));
     if (probed && probeBudgetMs < minProbeBudgetMs) break;
     probed = true;
+    probes += 1;
     try {
       const response = await fetchImpl(readinessUrl, { signal: AbortSignal.timeout(probeBudgetMs) });
       if (response.ok) return;
       lastError = `received HTTP ${response.status}`;
+      lastCause = undefined;
     } catch (err) {
+      lastCause = err;
       lastError = isReadinessProbeTimeout(err)
         ? `probe timed out after ${probeBudgetMs}ms`
         : err instanceof Error
           ? err.message
           : String(err);
+      // Node fetch hides connection errors behind "fetch failed". Retain the
+      // transport cause so a refused port is distinguishable from a timeout.
+      if (!isReadinessProbeTimeout(err) && err instanceof Error && err.cause instanceof Error) {
+        lastError += `: ${err.cause.message}`;
+      }
     }
     if (now() >= deadline) break;
     await delay(Math.min(intervalMs, Math.max(0, deadline - now())));
   }
-  throw new Error(`Readiness check failed for ${readinessUrl}: ${lastError}`);
+  throw new Error(
+    `Readiness check failed for ${readinessUrl}: ${lastError} (${probes} probes over ${now() - startedAt}ms)`,
+    { cause: lastCause },
+  );
 }
 
 async function waitForAllocatedPortBind(input: {
@@ -8897,22 +9073,29 @@ const BUILTIN_WORKSPACE_SEED_COMMAND = "bash ./scripts/provision-worktree-runtim
 // skip as a durable marker instead of a verified seed manifest, which can never
 // exist without a source. The marker is accepted seed evidence exactly where a
 // verified manifest would be, and nowhere else.
+//
+// SUP-14087: the built-in seed command runs as this server's uid, and
+// provision-worktree-runtime.sh works in the state directory that uid resolves
+// (`.paperclip/uid-<uid>/` when it holds an `.env`, else `.paperclip/`).
+// `resolveWorktreeStateDir` applies the same rule, so the provisioning decision,
+// the provisioner and the seed evidence read one manifest and one skip marker
+// in one directory. Another uid's scoped state belongs to that uid and is never
+// evidence here.
 const NO_SOURCE_SEED_SKIP_MARKER = "seed-skip-no-source";
 
-function hasNoSourceSeedSkip(worktreePath: string): boolean {
-  const stateDir = path.join(worktreePath, ".paperclip");
-  if (existsSync(path.join(stateDir, NO_SOURCE_SEED_SKIP_MARKER))) return true;
-  let scopedDirs: string[] = [];
-  try {
-    scopedDirs = readdirSync(stateDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && /^uid-\d+$/.test(entry.name))
-      .map((entry) => path.join(stateDir, entry.name));
-  } catch {
-    scopedDirs = [];
-  }
-  return scopedDirs.some((scopedDir) =>
-    existsSync(path.join(scopedDir, NO_SOURCE_SEED_SKIP_MARKER)),
-  );
+/**
+ * What a v3 initialization manifest in `stateDir` must be verified for: the
+ * instance the worktree runs as (its state `.env`), a revision of this server
+ * build's migration lineage, and the initialization key in the same state
+ * directory. This server never reads the worktree's own migration files,
+ * which that worktree controls.
+ */
+function expectWorktreeInitialization(stateDir: string): WorktreeInitializationExpectation {
+  return {
+    targetInstanceId: readWorktreeStateInstanceId(stateDir),
+    schema: resolveWorktreeSchemaLineage(MIGRATIONS_FOLDER),
+    bindingKey: readWorktreeInitializationKey(stateDir),
+  };
 }
 
 type RuntimeProvisionKind = "workspace_seed" | "runtime_dependencies";
@@ -8922,15 +9105,28 @@ export function readWorkspaceSeedOperationEvidence(worktreePath: string): {
   error: string | null;
   metadata: Record<string, unknown>;
 } {
-  const manifestPath = path.join(worktreePath, ".paperclip", "seed-manifest.json");
-  const noSourceSkip = hasNoSourceSeedSkip(worktreePath);
-  let manifest: Record<string, unknown> | null = null;
-  try {
-    manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
-  } catch {
-    manifest = null;
+  const stateDir = resolveWorktreeStateDir(worktreePath);
+  const manifestRead = readWorktreeStateManifest(
+    path.join(stateDir, "seed-manifest.json"),
+    expectWorktreeInitialization(stateDir),
+  );
+  if (manifestRead.kind === "initialization") {
+    // A verified fresh initialization has nothing to seed: it is complete
+    // evidence for this worktree, and it never selects a clone source.
+    return {
+      verified: true,
+      error: null,
+      metadata: {
+        provisionKind: "workspace_seed",
+        seedState: "verified",
+        seedPhase: "complete",
+        seedFailurePhase: null,
+        initializationProfile: manifestRead.manifest.profile,
+      },
+    };
   }
-  if (manifest) {
+  if (manifestRead.kind === "legacy-seed") {
+    const manifest = manifestRead.manifest;
     const state = typeof manifest.state === "string" ? manifest.state : "unknown";
     const phase = typeof manifest.phase === "string" ? manifest.phase : null;
     const verified = isVerifiedWorktreeSeedManifest(manifest);
@@ -8949,7 +9145,10 @@ export function readWorkspaceSeedOperationEvidence(worktreePath: string): {
       },
     };
   }
-  if (noSourceSkip) {
+  // A recorded no-source skip counts only when this directory holds no
+  // manifest at all. A refused manifest, or one behind a linked state
+  // directory, always wins over the marker.
+  if (manifestRead.kind === "absent" && existsSync(path.join(stateDir, NO_SOURCE_SEED_SKIP_MARKER))) {
     return {
       verified: true,
       error: null,
@@ -8964,10 +9163,12 @@ export function readWorkspaceSeedOperationEvidence(worktreePath: string): {
   }
   return {
     verified: false,
-    error: "Workspace seed command returned without a readable seed manifest.",
+    error: manifestRead.kind === "refused"
+      ? `Workspace seed command returned without a readable seed manifest. ${manifestRead.message}`
+      : "Workspace seed command returned without a readable seed manifest.",
     metadata: {
       provisionKind: "workspace_seed",
-      seedState: existsSync(manifestPath) ? "unreadable" : "absent",
+      seedState: manifestRead.kind === "refused" ? "unreadable" : "absent",
       seedPhase: null,
       seedFailurePhase: "seed_manifest_unreadable",
     },
@@ -8983,8 +9184,6 @@ export function resolveRuntimeProvisionCommand(input: {
 
   if (input.workspace.strategy !== "git_worktree") return "";
 
-  const stateDir = path.join(input.workspace.cwd, ".paperclip");
-  const manifestPath = path.join(stateDir, "seed-manifest.json");
   const provisionScript = path.join(
     input.workspace.baseCwd,
     "scripts",
@@ -8994,47 +9193,35 @@ export function resolveRuntimeProvisionCommand(input: {
     return "";
   }
 
-  // SUP-14087: cross-uid worktrees keep per-uid state under .paperclip/uid-<uid>/.
-  // When any scoped dir exists, IT describes what still needs seeding and the
-  // canonical manifest does not: that manifest belongs to whichever uid owns the
-  // canonical dir and says nothing about this run. Scoped state is marker-based
-  // (the seed manifest is written per state dir, but a scoped dir provisioned
-  // before the manifest landed has markers only), so fall back to markers there.
-  let scopedStateDirs: string[] = [];
-  try {
-    scopedStateDirs = readdirSync(stateDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && /^uid-\d+$/.test(entry.name))
-      .map((entry) => path.join(stateDir, entry.name));
-  } catch {
-    scopedStateDirs = [];
-  }
+  // SUP-14087: only the state directory this server's uid resolves decides,
+  // because that is where the built-in seed command works (see
+  // NO_SOURCE_SEED_SKIP_MARKER). Another uid's scoped manifest or markers never
+  // select or skip the command, so a refusal there cannot start a seed command
+  // that checks a different directory.
+  const stateDir = resolveWorktreeStateDir(input.workspace.cwd);
+  const scoped = stateDir !== path.resolve(input.workspace.cwd, ".paperclip");
+  const manifest = readWorktreeSeedManifestStatus(
+    path.join(stateDir, "seed-manifest.json"),
+    expectWorktreeInitialization(stateDir),
+  );
+  if (manifest.kind === "verified") return "";
+  // The provisioner reads this same manifest and fails fast on a refused one
+  // with the reason, without a reseed, so a skip marker never hides a refusal.
+  if (manifest.kind === "refused") return BUILTIN_WORKSPACE_SEED_COMMAND;
 
-  if (scopedStateDirs.length > 0) {
-    for (const scopedDir of scopedStateDirs) {
-      const scopedManifest = path.join(scopedDir, "seed-manifest.json");
-      if (existsSync(scopedManifest)) {
-        if (!hasVerifiedWorktreeSeedManifest(scopedManifest)) return BUILTIN_WORKSPACE_SEED_COMMAND;
-        continue;
-      }
-      // SUP-15609: a recorded no-source skip is the completion evidence for a
-      // scoped state dir that has no manifest to verify.
-      if (existsSync(path.join(scopedDir, NO_SOURCE_SEED_SKIP_MARKER))) {
-        continue;
-      }
-      const scopedPending = path.join(scopedDir, "seed-pending");
-      const scopedComplete = path.join(scopedDir, "seed-complete");
-      if (existsSync(scopedPending) && !existsSync(scopedComplete)) {
-        return BUILTIN_WORKSPACE_SEED_COMMAND;
-      }
-    }
-    return "";
-  }
+  // SUP-15609: a recorded no-source skip has no database to seed; the marker is
+  // the completion evidence of its state directory.
+  const skipRecorded = existsSync(path.join(stateDir, NO_SOURCE_SEED_SKIP_MARKER));
+  if (!scoped) return skipRecorded ? "" : BUILTIN_WORKSPACE_SEED_COMMAND;
 
-  // SUP-15609: an env-only worktree with a recorded no-source skip has no
-  // database to seed; the marker is its completion evidence.
-  const needsSeed = !hasNoSourceSeedSkip(input.workspace.cwd)
-    && (!existsSync(manifestPath) || !hasVerifiedWorktreeSeedManifest(manifestPath));
-  return needsSeed ? BUILTIN_WORKSPACE_SEED_COMMAND : "";
+  // Scoped state is marker-based (a scoped dir provisioned before the manifest
+  // landed has markers only): it needs seeding for an incomplete manifest, or
+  // while seed-pending has no sibling seed-complete.
+  if (manifest.kind === "incomplete") return BUILTIN_WORKSPACE_SEED_COMMAND;
+  if (skipRecorded) return "";
+  return existsSync(path.join(stateDir, "seed-pending")) && !existsSync(path.join(stateDir, "seed-complete"))
+    ? BUILTIN_WORKSPACE_SEED_COMMAND
+    : "";
 }
 
 function resolveRuntimeProvision(input: {

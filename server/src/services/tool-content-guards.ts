@@ -15,7 +15,7 @@ const PROMPT_INJECTION_PATTERNS: Array<{ code: string; re: RegExp }> = [
   { code: "ignore_previous_instructions", re: /\bignore\b.{0,40}\b(previous|above|earlier)\b.{0,40}\binstructions?\b/i },
   { code: "reveal_system_prompt", re: /\b(reveal|print|dump|show)\b.{0,40}\b(system|developer)\b.{0,20}\b(prompt|message|instructions?)\b/i },
   { code: "instruction_hijack", re: /\b(new|updated)\b.{0,20}\b(system|developer)\b.{0,20}\b(instructions?|message)\b/i },
-  { code: "secret_exfiltration", re: /\b(exfiltrate|leak|steal|send)\b.{0,40}\b(secret|token|api[-_ ]?key|credential)s?\b/i },
+  { code: "secret_exfiltration", re: /(?<!no )\b(exfiltrate|leak|steal|send)\b.{0,40}\b(secret|token|api[-_ ]?key|credential)s?\b/i },
 ];
 
 type ToolActionSigningSecretEnv = Partial<

@@ -111,6 +111,54 @@ describeEmbeddedPostgres("plugin-host updatePolicy issue guard", () => {
     services.dispose();
   });
 
+  it("rejects a plugin-host issues.update that selects release-assurance authority and leaves the policy unchanged", async () => {
+    const company = await createCompany(db, "PRA");
+    const [approver] = await db.insert(agents).values({
+      companyId: company.id,
+      name: "Approval participant",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+    }).returning();
+    const issue = await db
+      .insert(issues)
+      .values({
+        companyId: company.id,
+        title: "Release assurance authority",
+        status: "todo",
+        priority: "medium",
+        executionPolicy: null,
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
+
+    await expect(
+      services.issues.update({
+        issueId: issue.id,
+        companyId: company.id,
+        patch: {
+          executionPolicy: {
+            mode: "normal",
+            approvalAuthority: "release_assurance",
+            stages: [{
+              id: randomUUID(),
+              type: "approval",
+              approvalsNeeded: 1,
+              participants: [{ id: randomUUID(), type: "agent", agentId: approver!.id }],
+            }],
+            monitor: null,
+          },
+        } as never,
+      }),
+    ).rejects.toMatchObject({ status: 422 });
+
+    const row = await db.query.issues.findFirst({ where: (i, { eq }) => eq(i.id, issue.id) });
+    expect(row).toEqual(issue);
+    expect(await db.select().from(activityLog)).toEqual([]);
+    services.dispose();
+  });
+
   it("accepts a satisfiable low-trust policy carrying a trustBoundary and writes it", async () => {
     const company = await createCompany(db, "PIG");
     const targetIssue = await db
@@ -215,6 +263,7 @@ describeEmbeddedPostgres("plugin-host wiki handoff issue update guard (SUP-21752
     await db.delete(issues);
     await db.delete(pmr);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(companies);
     await db.delete(plg);
     await db.delete(projects);
@@ -307,6 +356,85 @@ describeEmbeddedPostgres("plugin-host wiki handoff issue update guard (SUP-21752
 
     const row = await db.query.issues.findFirst({ where: (i, { eq }) => eq(i.id, issue.id) });
     expect(row!.assigneeAgentId).toBe(CANONICAL);
+    services.dispose();
+  });
+
+  it("rejects a plugin-host user-only assignee write on an unassigned Wiki handoff", async () => {
+    const { company } = await seedWikiHandoff();
+    const userId = `board-${randomUUID()}`;
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: userId,
+      status: "active",
+      membershipRole: "member",
+    });
+    const issue = await db
+      .insert(issues)
+      .values({
+        companyId: company.id,
+        title: "[PPC ER] Weekly Report — handoff to Wiki Maintainer",
+        description: "Canonical wiki path wiki/projects/example/reports/2026-10-29.md",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: null,
+        assigneeUserId: null,
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
+
+    await expect(
+      services.issues.update({
+        issueId: issue.id,
+        companyId: company.id,
+        patch: { assigneeUserId: userId },
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        subGuard: "wiki_handoff",
+        reason: "wiki_handoff_unassigned",
+      },
+    });
+
+    const row = await db.query.issues.findFirst({ where: (i, { eq }) => eq(i.id, issue.id) });
+    expect(row).toMatchObject({ assigneeAgentId: null, assigneeUserId: null });
+    services.dispose();
+  });
+
+  it("rejects a plugin-host status-plus-user write on unassigned and user-owned Wiki handoffs", async () => {
+    const { company } = await seedWikiHandoff();
+    const userId = `board-${randomUUID()}`;
+    const otherUserId = `board-${randomUUID()}`;
+    await db.insert(companyMemberships).values([
+      { companyId: company.id, principalType: "user", principalId: userId, status: "active", membershipRole: "member" },
+      { companyId: company.id, principalType: "user", principalId: otherUserId, status: "active", membershipRole: "member" },
+    ]);
+    const unassigned = await db.insert(issues).values({
+      companyId: company.id,
+      title: "[PPC ER] Weekly Report — handoff to Wiki Maintainer",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    }).returning().then((rows) => rows[0]!);
+    const userOwned = await db.insert(issues).values({
+      companyId: company.id,
+      title: "[PPC ER] Weekly Report — handoff to Wiki Maintainer",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: null,
+      assigneeUserId: userId,
+    }).returning().then((rows) => rows[0]!);
+    const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
+    for (const issue of [unassigned, userOwned]) {
+      await expect(services.issues.update({
+        issueId: issue.id,
+        companyId: company.id,
+        patch: { status: "todo", assigneeUserId: otherUserId },
+      })).rejects.toMatchObject({ status: 422, details: { reason: "wiki_handoff_unassigned" } });
+    }
     services.dispose();
   });
 

@@ -37,6 +37,7 @@ import type {
   RequestConfirmationInteraction,
   RequestCheckboxConfirmationInteraction,
   CreateIssueThreadInteraction,
+  CreateIssueThreadInteractionInput,
   PluginIssueOriginKind,
   IssueSurfaceVisibility,
   PluginManagedAgentResolution,
@@ -143,6 +144,7 @@ export type {
   RequestConfirmationInteraction,
   RequestCheckboxConfirmationInteraction,
   CreateIssueThreadInteraction,
+  CreateIssueThreadInteractionInput,
   PluginIssueOriginKind,
   IssueSurfaceVisibility,
   Agent,
@@ -1466,6 +1468,7 @@ export interface PluginIssuesClient {
     description?: string;
     status?: Issue["status"];
     priority?: Issue["priority"];
+    deliveryRequirement?: Issue["deliveryRequirement"];
     assigneeAgentId?: string;
     assigneeUserId?: string | null;
     requestDepth?: number;
@@ -1567,7 +1570,7 @@ export interface PluginIssuesClient {
   ): Promise<IssueComment>;
   createInteraction(
     issueId: string,
-    interaction: CreateIssueThreadInteraction,
+    interaction: CreateIssueThreadInteractionInput,
     companyId: string,
     options?: { authorAgentId?: string },
   ): Promise<IssueThreadInteraction>;
@@ -1579,7 +1582,7 @@ export interface PluginIssuesClient {
   ): Promise<SuggestTasksInteraction>;
   askUserQuestions(
     issueId: string,
-    interaction: Omit<Extract<CreateIssueThreadInteraction, { kind: "ask_user_questions" }>, "kind">,
+    interaction: Omit<Extract<CreateIssueThreadInteractionInput, { kind: "ask_user_questions" }>, "kind">,
     companyId: string,
     options?: { authorAgentId?: string },
   ): Promise<AskUserQuestionsInteraction>;

@@ -14,15 +14,26 @@ const TIMED_OUT_STDOUT = [
 ].join("\n");
 
 const { runChildProcess, ensureCommandResolvable, resolveCommandForLogs } = vi.hoisted(() => ({
-  runChildProcess: vi.fn(async () => ({
-    exitCode: null,
-    signal: "SIGTERM",
-    timedOut: true,
-    stdout: TIMED_OUT_STDOUT,
-    stderr: "",
-    pid: 321,
-    startedAt: new Date().toISOString(),
-  })),
+  runChildProcess: vi.fn(async (_runId: string, _command: string, args: string[]) =>
+    args.includes("--version")
+      ? {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "1.17.9\n",
+          stderr: "",
+          pid: 320,
+          startedAt: new Date().toISOString(),
+        }
+      : {
+          exitCode: null,
+          signal: "SIGTERM",
+          timedOut: true,
+          stdout: TIMED_OUT_STDOUT,
+          stderr: "",
+          pid: 321,
+          startedAt: new Date().toISOString(),
+        }),
   ensureCommandResolvable: vi.fn(async () => undefined),
   resolveCommandForLogs: vi.fn(async () => "opencode"),
 }));

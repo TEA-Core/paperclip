@@ -387,6 +387,7 @@ export {
 } from "./agent.js";
 
 export {
+  projectDiscoverySchema,
   createProjectSchema,
   updateProjectSchema,
   createProjectWorkspaceSchema,
@@ -419,6 +420,8 @@ export {
 
 export {
   createIssueSchema,
+  setIssueTitleSchema,
+  type SetIssueTitle,
   createIssueInputSchema,
   createChildIssueSchema,
   createAcceptedPlanDecompositionSchema,
@@ -443,11 +446,16 @@ export {
   type OverrideReleaseIssueHead,
   stripCreateOnlyIssueAttribution,
   ISSUE_CREATE_ONLY_ATTRIBUTION_KEYS,
+  ISSUE_UPDATE_MONITOR_ALIAS_CONFLICT_MESSAGE,
+  refineIssueUpdateMonitorAliasConflict,
   stalledReviewDecisionSchema,
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
+  gitCommitShaSchema,
+  GIT_COMMIT_SHA_WIRE_PATTERN,
   issueRecoveryActionReadModelSchema,
   resolveIssueRecoveryActionSchema,
+  retryWorkspaceExportSchema,
   issueReviewRequestSchema,
   issueExecutionWorkspaceSettingsSchema,
   checkoutIssueSchema,
@@ -482,6 +490,7 @@ export {
   requestConfirmationCustomTargetSchema,
   requestConfirmationTargetSchema,
   requestConfirmationPayloadSchema,
+  requestConfirmationAdoptionCarrierSchema,
   requestConfirmationResumeFailureSchema,
   requestConfirmationResultSchema,
   requestConfirmationSecretProposalPayloadSchema,
@@ -498,6 +507,8 @@ export {
    requestBoardApprovalResultSchema,
    createIssueThreadInteractionSchema,
   acceptIssueThreadInteractionSchema,
+  resolveConfirmationFromCommentSchema,
+  type ResolveConfirmationFromComment,
   rejectIssueThreadInteractionSchema,
   cancelIssueThreadInteractionSchema,
   skipIssueThreadInteractionSchema,
@@ -524,6 +535,7 @@ export {
   type CheckoutIssue,
   type AddIssueComment,
   type CreateIssueThreadInteraction,
+  type CreateIssueThreadInteractionInput,
   type AcceptIssueThreadInteraction,
   type RejectIssueThreadInteraction,
   type CancelIssueThreadInteraction,
@@ -998,5 +1010,10 @@ export * from "./skill-policy.js";
 export * from "./provider-trace.js";
 export * from "./app-definition.js";
 export * from "./chat-channels.js";
+export * from "./chat-github.js";
 
 export * from "./email.js";
+
+export { restoreAgentInstructionSchema } from "./agent.js";
+
+export * from "./skill-source.js";

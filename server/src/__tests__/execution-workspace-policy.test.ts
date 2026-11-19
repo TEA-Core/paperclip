@@ -20,6 +20,7 @@ import {
   resolveSharedWorkspaceConcurrency,
   selectEnvironmentExecutionWorkspaceSettings,
   canAgentSatisfyIssueWorkspaceSettings,
+  isProtectedDeliveryBranch,
 } from "../services/execution-workspace-policy.ts";
 
 describe("execution workspace policy helpers", () => {
@@ -572,6 +573,107 @@ describe("execution workspace policy helpers", () => {
     });
   });
 
+  describe("partial issue workspace strategies", () => {
+    const projectStrategy = {
+      type: "git_worktree" as const,
+      baseRef: "origin/main",
+      branchTemplate: "{{issue.identifier}}-{{slug}}",
+      worktreeParentDir: ".paperclip/worktrees",
+      provisionCommand: "true",
+      runtimeProvisionCommand: "npm run setup:runtime",
+      teardownCommand: "npm run teardown",
+    };
+
+    function resolveStrategy(
+      strategy: Record<string, unknown>,
+      enabled = true,
+    ) {
+      return buildExecutionWorkspaceAdapterConfig({
+        agentConfig: { workspaceStrategy: { type: "git_worktree", provisionCommand: "agent-setup" } },
+        projectPolicy: parseProjectExecutionWorkspacePolicy({
+          enabled,
+          defaultMode: "isolated_workspace",
+          workspaceStrategy: projectStrategy,
+        }),
+        issueSettings: parseIssueExecutionWorkspaceSettings({
+          mode: "isolated_workspace",
+          workspaceStrategy: strategy,
+        }),
+        mode: "isolated_workspace",
+        legacyUseProjectWorkspace: null,
+      }).workspaceStrategy;
+    }
+
+    it("retains project hooks when an issue changes only its base branch", () => {
+      expect(resolveStrategy({ type: "git_worktree", baseRef: "origin/release" })).toEqual({
+        ...projectStrategy,
+        baseRef: "origin/release",
+      });
+    });
+
+    it.each(["npm run issue-setup", "", null])("honors an explicit provisioning override of %j", (provisionCommand) => {
+      expect(resolveStrategy({ type: "git_worktree", provisionCommand })).toEqual({
+        ...projectStrategy,
+        provisionCommand,
+      });
+    });
+
+    it("preserves explicit null clears through persisted JSON parsing", () => {
+      const strategy = {
+        type: "git_worktree",
+        baseRef: null,
+        branchTemplate: null,
+        worktreeParentDir: null,
+        provisionCommand: null,
+        runtimeProvisionCommand: null,
+        teardownCommand: null,
+      };
+      expect(resolveStrategy(strategy)).toEqual(strategy);
+    });
+
+    it.each(["cloud_sandbox", "adapter_managed", "project_primary"])("does not carry project hooks into %s", (type) => {
+      expect(resolveStrategy({ type })).toEqual({ type });
+    });
+
+    it("does not inherit a disabled project strategy", () => {
+      expect(resolveStrategy({ type: "git_worktree", baseRef: "origin/release" }, false)).toEqual({
+        type: "git_worktree",
+        baseRef: "origin/release",
+      });
+      expect(resolveStrategy({}, false)).toEqual({
+        type: "git_worktree",
+        provisionCommand: "agent-setup",
+      });
+    });
+
+    it("keeps project hooks for an exact branch pin without inheriting a branch template", () => {
+      const resolved = resolveStrategy({ type: "git_worktree", existingBranch: "fix/existing" });
+      expect(resolved).toEqual({
+        ...projectStrategy,
+        branchTemplate: undefined,
+        existingBranch: "fix/existing",
+      });
+      expect(issueExecutionWorkspaceSettingsSchema.safeParse({
+        mode: "isolated_workspace",
+        workspaceStrategy: resolved,
+      }).success).toBe(true);
+    });
+
+    it("does not mutate the project or issue strategy", () => {
+      const issueStrategy = { type: "git_worktree" as const, baseRef: "origin/release" };
+      const result = buildExecutionWorkspaceAdapterConfig({
+        agentConfig: {},
+        projectPolicy: { enabled: true, workspaceStrategy: Object.freeze({ ...projectStrategy }) },
+        issueSettings: { workspaceStrategy: Object.freeze(issueStrategy) },
+        mode: "isolated_workspace",
+        legacyUseProjectWorkspace: null,
+      });
+      expect(result.workspaceStrategy).not.toBe(issueStrategy);
+      expect(issueStrategy).toEqual({ type: "git_worktree", baseRef: "origin/release" });
+      expect(projectStrategy.baseRef).toBe("origin/main");
+    });
+  });
+
   it("preserves project authorization policy for trust-preset resolution", () => {
     expect(parseProjectExecutionWorkspacePolicy({
       enabled: true,
@@ -812,13 +914,13 @@ describe("operator default isolated execution workspaces", () => {
     projectPolicy: Parameters<
       typeof applyDefaultIsolatedExecutionWorkspacePolicy
     >[0]["projectPolicy"],
-    hasProject = true,
+    hasProjectWorkspace = true,
     defaultIsolatedWorkspacesEnabled = true,
   ) =>
     applyDefaultIsolatedExecutionWorkspacePolicy({
       projectPolicy,
       defaultIsolatedWorkspacesEnabled,
-      hasProject,
+      hasProjectWorkspace,
     });
 
   it("substitutes an isolated policy for a project that stores none", () => {
@@ -836,6 +938,18 @@ describe("operator default isolated execution workspaces", () => {
     // Isolation needs a repository to cut a worktree from. A project-less task
     // (agent chat, for example) must not be pulled into worktree mode.
     expect(withDefault(null, false)).toBeNull();
+  });
+
+  it("keeps a project without a configured workspace on its existing behavior", () => {
+    const projectPolicy = withDefault(null, false);
+    expect(projectPolicy).toBeNull();
+    expect(resolveExecutionWorkspaceMode({
+      projectPolicy,
+      issueSettings: null,
+      legacyUseProjectWorkspace: null,
+    })).toBe("shared_workspace");
+    expect(withDefault({ enabled: true, defaultMode: "isolated_workspace" }, false))
+      .toEqual({ enabled: true, defaultMode: "isolated_workspace" });
   });
 
   it("never overrides a policy the project already stores", () => {
@@ -914,5 +1028,54 @@ describe("operator default isolated execution workspaces", () => {
         resolvedStrategy: resolveEffectiveWorkspaceStrategyType(mode, config),
       }),
     ).toBe(false);
+  });
+});
+
+// SUP-24409 (RA round 2 on PR 1214): the branches no card may claim as its own delivery branch.
+// The standard protected classes hold with NO configuration at all; configured default refs only add to them.
+describe("isProtectedDeliveryBranch", () => {
+  it.each([
+    "main", "Main", "MASTER", "master", "refs/heads/main", " main ", "main/",
+    "release/1.2", "release/2026.11", "release/1.2/", "releases/v1", "hotfix/urgent", "Hotfix/x",
+    "fold/tea-patches-v2026.722.0", "fold/anything", "refs/heads/fold/x", "fold-sync/2026.11",
+  ])("protects %s without any configuration", (branch) => {
+    expect(isProtectedDeliveryBranch({ branch })).toBe(true);
+    expect(isProtectedDeliveryBranch({ branch, defaultRefs: [] })).toBe(true);
+  });
+
+  it.each([
+    "SUP-24405-own-work", "fm/paperclip-1067-residuals-followup", "feature/main", "mainline", "main-fix",
+    "release", "releases", "hotfix", "folder/x", "fold-syncx/1", "my-fold/x", "develop",
+  ])("leaves the feature branch %s alone", (branch) => {
+    expect(isProtectedDeliveryBranch({ branch, defaultRefs: [null, undefined, ""] })).toBe(false);
+  });
+
+  it.each([
+    ["trunk", "trunk"],
+    ["trunk", "origin/trunk"],
+    ["trunk", "upstream/trunk"],
+    ["trunk", "refs/heads/trunk"],
+    ["trunk", "refs/remotes/origin/trunk"],
+    ["trunk", " Trunk "],
+    ["Trunk", "trunk"],
+    ["refs/heads/trunk", "trunk/"],
+  ])("protects %s when the repo's default ref is stored as %j", (branch, ref) => {
+    expect(isProtectedDeliveryBranch({ branch, defaultRefs: [null, ref] })).toBe(true);
+    expect(isProtectedDeliveryBranch({ branch })).toBe(false);
+  });
+
+  it("protects every branch on a project_primary row, and only there", () => {
+    expect(isProtectedDeliveryBranch({ branch: "SUP-1-own-work", workspaceMode: "project_primary" })).toBe(true);
+    expect(isProtectedDeliveryBranch({ branch: "SUP-1-own-work", workspaceMode: "isolated_workspace" })).toBe(false);
+    expect(isProtectedDeliveryBranch({ branch: "SUP-1-own-work", workspaceMode: null })).toBe(false);
+  });
+
+  it("reads a refs/heads/<x> ref as exactly the local branch x, not its last segment", () => {
+    expect(isProtectedDeliveryBranch({ branch: "team/trunk", defaultRefs: ["refs/heads/team/trunk"] })).toBe(true);
+    expect(isProtectedDeliveryBranch({ branch: "trunk", defaultRefs: ["refs/heads/team/trunk"] })).toBe(false);
+    expect(isProtectedDeliveryBranch({ branch: "trunk", defaultRefs: ["refs/remotes/origin/team/trunk"] })).toBe(false);
+    expect(isProtectedDeliveryBranch({ branch: "team/trunk", defaultRefs: ["refs/remotes/origin/team/trunk"] })).toBe(true);
+    // A bare ref with a slash may be a remote-tracking name or a namespaced local branch: both read as protected.
+    expect(isProtectedDeliveryBranch({ branch: "team/trunk", defaultRefs: ["team/trunk"] })).toBe(true);
   });
 });

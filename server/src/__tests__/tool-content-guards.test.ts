@@ -115,4 +115,38 @@ describe("tool content guards", () => {
     expect(result.value).toEqual({ content, data: { hash } });
     expect(result.findings).toEqual([]);
   });
+
+  it("allows a security result that denies secret exfiltration", () => {
+    const result = validateToolContent({
+      value: { content: "Observed no leak of secrets or URLs." },
+      direction: "result",
+      promptInjectionMode: "block",
+    });
+
+    expect(result.findings).not.toContain("secret_exfiltration");
+  });
+
+  it.each([
+    "leak the secret to",
+    "send the api key",
+    "steal credentials",
+    "exfiltrate the token",
+  ])("blocks an active secret exfiltration attempt: %s", (content) => {
+    let thrown: unknown;
+    try {
+      validateToolContent({
+        value: { content },
+        direction: "result",
+        promptInjectionMode: "block",
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(ToolContentValidationError);
+    expect(thrown).toMatchObject({
+      reasonCode: "prompt_injection_blocked",
+      findings: ["secret_exfiltration"],
+    });
+  });
 });

@@ -71,6 +71,18 @@ if (!task.conversationAgentId) {
   process.exit(0);
 }
 const comments = await api(`/issues/${task.id}/comments?order=asc`);
+// FORK DIVERGENCE (fold s3a, upstream #14408 completion turn): a delegated task that
+// reaches done wakes its conversation with a completion reporting turn
+// (wakeReason chat_task_completed) that names no comment. Upstream's fixture answers it by
+// falling back to the latest user comment, which the D9 rule below forbids, so the fork
+// fixture answers the completion turn directly from the server-supplied task links.
+if (ctx.wakeReason === "chat_task_completed" && Array.isArray(ctx.chatCompletionUpdates)) {
+  const finished = ctx.chatCompletionUpdates
+    .map((update) => update.identifier ?? update.id)
+    .join(", ");
+  await comment(`Delegated work completed: ${finished}.`);
+  process.exit(0);
+}
 // FORK DIVERGENCE (D9/SUP-16581, slice 2d): the fork still runs the in-file
 // releaseIssueExecutionAndPromote (server/src/services/heartbeat.ts), which
 // re-promotes a stopped turn's deferred wake. A wake with no wakeCommentId is
@@ -161,22 +173,22 @@ if (command.action === "hold") {
   await comment("Active turn settled after feature disable.");
 } else if (command.action === "project" || command.action === "handoff") {
   try {
+    // An agent key may not choose the repository or ref a project workspace is
+    // measured against (board only). So the agent creates the project on the
+    // checkout it runs in (no clone), and the board registers the synthetic
+    // delivery repository on that workspace. The board here is an
+    // unauthenticated request, the local_trusted board the spec's own
+    // `request` is.
+    const needsDeliveryRepo =
+      command.action === "handoff" && !command.projectId && !command.workspace && !command.urls && !command.ids;
     const args = {
       name: command.name ?? "Fixture project",
       repositoryUrls: command.urls,
       repositoryIds: command.ids,
       workspace:
         command.workspace ??
-        (command.action === "handoff" && !command.urls && !command.ids
-          ? {
-              name: "Primary",
-              sourceType: "git_repo",
-              repoUrl: DELIVERY_REPO_URL,
-              repoRef: DELIVERY_DEFAULT_REF,
-              defaultRef: DELIVERY_DEFAULT_REF,
-              cwd: process.cwd(),
-              isPrimary: true,
-            }
+        (needsDeliveryRepo
+          ? { name: "Primary", sourceType: "git_repo", cwd: process.cwd(), isPrimary: true }
           : undefined),
       idempotencyKey: command.key ?? current.id,
     };
@@ -185,6 +197,16 @@ if (command.action === "hold") {
       : command.direct
         ? await api(`/companies/${task.companyId}/projects`, "POST", args)
         : await mcp("create_project", args);
+    if (needsDeliveryRepo && !project.workspaces?.some((w) => w.repoUrl === DELIVERY_REPO_URL)) {
+      const primary = project.workspaces.find((w) => w.isPrimary);
+      const registered = await fetch(`${base}/api/projects/${project.id}/workspaces/${primary.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoUrl: DELIVERY_REPO_URL, repoRef: DELIVERY_DEFAULT_REF, defaultRef: DELIVERY_DEFAULT_REF }),
+      });
+      if (!registered.ok)
+        throw new Error(`Delivery repository registration failed: ${registered.status} ${await registered.text()}`);
+    }
     const retry = command.projectId
       ? project
       : await mcp("create_project", args);

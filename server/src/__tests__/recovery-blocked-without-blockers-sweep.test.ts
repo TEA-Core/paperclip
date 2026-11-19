@@ -205,22 +205,27 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
   // (follow-ups included, since they are registered before the parent settles),
   // so it is the deterministic primitive; the poll below only confirms the
   // database agrees, and fails loudly rather than silently timing out.
+  //
+  // A scheduled_retry run is deferred work, not a live execution. Upstream
+  // #13888's legacy disposition repair schedules its second attempt 60 s out
+  // (a scheduled_retry run plus the queued wake bound to it) after an owner run
+  // ends without a recorded disposition, so that pair does not hold the drain.
   async function drainAgentRuns(agentId: string, timeoutMs = 30_000) {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       await heartbeatService(db).drainActiveRunExecutions();
-      const [activeRuns, pendingWakes] = await Promise.all([
+      const [activeRuns, pendingWakes, scheduledRetries] = await Promise.all([
         db
           .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
           .from(heartbeatRuns)
           .where(
             and(
               eq(heartbeatRuns.agentId, agentId),
-              inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"] as const),
+              inArray(heartbeatRuns.status, ["queued", "running"] as const),
             ),
           ),
         db
-          .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status })
+          .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
           .from(agentWakeupRequests)
           .where(
             and(
@@ -228,13 +233,19 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
               inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"] as const),
             ),
           ),
+        db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "scheduled_retry"))),
       ]);
-      if (activeRuns.length === 0 && pendingWakes.length === 0) return;
+      const scheduledRetryRunIds = new Set(scheduledRetries.map((run) => run.id));
+      const livePendingWakes = pendingWakes.filter((wake) => !wake.runId || !scheduledRetryRunIds.has(wake.runId));
+      if (activeRuns.length === 0 && livePendingWakes.length === 0) return;
       if (Date.now() >= deadline) {
         throw new Error(
           `drainAgentRuns timed out after ${timeoutMs}ms for agent ${agentId}: ` +
             `${activeRuns.length} active run(s) [${activeRuns.map((run) => run.status).join(", ")}], ` +
-            `${pendingWakes.length} pending wake(s) [${pendingWakes.map((wake) => wake.status).join(", ")}]`,
+            `${livePendingWakes.length} pending wake(s) [${livePendingWakes.map((wake) => wake.status).join(", ")}]`,
         );
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -2040,7 +2051,7 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(action.recoveryIssueId).not.toBeNull();
   });
 
-  it("board monitor re-arm rethrows a 422 without a clearReason from the drain", async () => {
+  it("board monitor re-arm skips only the card, not the drain, on a 422 without a clearReason", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
     const issueId = randomUUID();
     await db.insert(issues).values({
@@ -2061,15 +2072,22 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     );
     try {
       const heartbeat = heartbeatService(db);
-      await expect(heartbeat.reconcileExhaustedRecoveryDrain()).rejects.toThrow(
-        "Monitor can only be scheduled",
-      );
+      await expect(heartbeat.reconcileExhaustedRecoveryDrain()).resolves.toMatchObject({
+        checked: 1,
+        monitorArmed: 0,
+        recoveryIssueMinted: 0,
+      });
     } finally {
       mockMonitorTransitionFailure.error = null;
     }
+    const [action] = await db
+      .select({ recoveryIssueId: issueRecoveryActions.recoveryIssueId })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action.recoveryIssueId).toBeNull();
   });
 
-  it("board monitor re-arm rethrows non-422 transition errors from the drain", async () => {
+  it("board monitor re-arm skips only the card, not the drain, on non-422 transition errors", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
     const issueId = randomUUID();
     await db.insert(issues).values({
@@ -2087,12 +2105,19 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     mockMonitorTransitionFailure.error = new HttpError(500, "monitor transition exploded");
     try {
       const heartbeat = heartbeatService(db);
-      await expect(heartbeat.reconcileExhaustedRecoveryDrain()).rejects.toThrow(
-        "monitor transition exploded",
-      );
+      await expect(heartbeat.reconcileExhaustedRecoveryDrain()).resolves.toMatchObject({
+        checked: 1,
+        monitorArmed: 0,
+        recoveryIssueMinted: 0,
+      });
     } finally {
       mockMonitorTransitionFailure.error = null;
     }
+    const [action] = await db
+      .select({ recoveryIssueId: issueRecoveryActions.recoveryIssueId })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action.recoveryIssueId).toBeNull();
   });
 
   it("SUP-21344-review: a due self-armed board monitor is claimed by the monitor tick, not re-armed by the drain", async () => {
@@ -2263,6 +2288,9 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(recoveryIssue.assigneeAgentId).toBe(agentId);
     expect(recoveryIssue.originKind).toBe("stranded_issue_recovery");
     expect(recoveryIssue.originId).toBe(issueId);
+    // A recovery card records a board decision; it must be closable without
+    // a repository delivery.
+    expect(recoveryIssue.deliveryRequirement).toBe("record_only");
 
     const ownerWakes = await db
       .select({ id: agentWakeupRequests.id })
@@ -2287,13 +2315,13 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     expect(recoveryIssues).toHaveLength(1);
   });
 
-  it("SUP-21344-review: reused exhausted recovery issue re-enqueues the owner wake when no live wake remains", async () => {
+  it("SUP-21344: an open exhausted recovery issue is not re-woken on later drain ticks", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
     const issueId = randomUUID();
     await db.insert(issues).values({
       id: issueId,
       companyId,
-      title: "Todo behind an exhausted recovery action, reused recovery issue",
+      title: "Todo behind an exhausted recovery action, open recovery issue",
       status: "todo",
       priority: "high",
       updatedAt: oldDate(),
@@ -2309,32 +2337,100 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
       .where(eq(issueRecoveryActions.sourceIssueId, issueId));
     expect(action.recoveryIssueId).not.toBeNull();
 
-    // Simulate the first owner wake having been consumed without producing a
-    // disposition: a reused recovery issue must not stay a silent terminal sink.
+    // The owner was woken once, at mint. Its run ended without closing the
+    // card (the board decision is still open), so no live wake remains.
     await db
       .update(agentWakeupRequests)
       .set({ status: "cancelled" })
       .where(eq(agentWakeupRequests.agentId, agentId));
     await drainAgentRuns(agentId);
-    const wakesBeforeReuse = await db
-      .select({ id: agentWakeupRequests.id })
+    const wakesAfterMint = await db
+      .select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId));
-
-    const second = await heartbeat.reconcileExhaustedRecoveryDrain();
-    expect(second.recoveryIssueMinted).toBe(0);
-    expect(second.alreadyLive).toBe(1);
-
-    const wakesAfterReuse = await db
-      .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status, payload: agentWakeupRequests.payload })
-      .from(agentWakeupRequests)
-      .where(eq(agentWakeupRequests.agentId, agentId));
-    expect(wakesAfterReuse.length).toBeGreaterThan(wakesBeforeReuse.length);
-    expect(wakesAfterReuse.some((wake) => {
+    expect(wakesAfterMint.some((wake) => {
       const payload = wake.payload as { issueId?: unknown } | null;
       return payload?.issueId === action.recoveryIssueId;
     })).toBe(true);
+
+    for (let tick = 0; tick < 3; tick += 1) {
+      const result = await heartbeat.reconcileExhaustedRecoveryDrain();
+      expect(result.recoveryIssueMinted).toBe(0);
+      expect(result.alreadyLive).toBe(1);
+    }
+
+    const wakesAfterTicks = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakesAfterTicks).toHaveLength(wakesAfterMint.length);
   });
+
+  it.each(["cancelled", "done"] as const)(
+    "SUP-21344: a %s exhausted recovery issue is never re-minted for the same recovery action",
+    async (closedStatus) => {
+      const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: `Todo behind an exhausted recovery action, ${closedStatus} recovery issue`,
+        status: "todo",
+        priority: "high",
+        updatedAt: oldDate(),
+      });
+      await seedExhaustedWorkspaceValidationAction(companyId, agentId, issueId);
+
+      const heartbeat = heartbeatService(db);
+      const first = await heartbeat.reconcileExhaustedRecoveryDrain();
+      expect(first.recoveryIssueMinted).toBe(1);
+      const [action] = await db
+        .select({ id: issueRecoveryActions.id, recoveryIssueId: issueRecoveryActions.recoveryIssueId })
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      const mintedRecoveryIssueId = action.recoveryIssueId!;
+      await drainAgentRuns(agentId);
+
+      // The owner closes the card while the action stays exhausted. Clearing
+      // the action's link proves the lookup keys on the card's origin
+      // fingerprint, not on the link.
+      await db.update(issues).set({ status: closedStatus }).where(eq(issues.id, mintedRecoveryIssueId));
+      await db
+        .update(issueRecoveryActions)
+        .set({ recoveryIssueId: null })
+        .where(eq(issueRecoveryActions.id, action.id));
+      const wakesBeforeTicks = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+
+      await heartbeat.reconcileExhaustedRecoveryDrain();
+      const second = await heartbeat.reconcileExhaustedRecoveryDrain();
+      expect(second.recoveryIssueMinted).toBe(0);
+
+      const recoveryIssues = await db
+        .select({ id: issues.id, status: issues.status })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, companyId),
+            eq(issues.originKind, "stranded_issue_recovery"),
+            eq(issues.originId, issueId),
+          ),
+        );
+      expect(recoveryIssues).toEqual([{ id: mintedRecoveryIssueId, status: closedStatus }]);
+      const [relinked] = await db
+        .select({ recoveryIssueId: issueRecoveryActions.recoveryIssueId })
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(relinked.recoveryIssueId).toBe(mintedRecoveryIssueId);
+      const wakesAfterTicks = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakesAfterTicks).toHaveLength(wakesBeforeTicks.length);
+    },
+  );
 
   it("SUP-21344-review: concurrent exhausted drains mint at most one recovery issue per source", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentRole: "cto" });
@@ -2471,6 +2567,66 @@ describeEmbeddedPostgres("recovery reconcileBlockedWithoutBlockers", () => {
     // is armed; the replacement action is recorded on a later pass once the
     // monitor has been consumed (board acted or check elapsed).
     expect(suppressorIds).toEqual([firstActionId]);
+  });
+
+  it("budget-exhausted action of another kind owning the card writes no escalation row on any pass", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked behind a budget-exhausted disposition repair",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      updatedAt: oldDate(),
+    });
+    // The row upsertSourceScoped's in-place budget escalation leaves behind:
+    // `escalated` with outcome `escalated`, not the terminal `exhausted`, so
+    // the terminal-action suppression does not match it, and the upsert
+    // refuses to overwrite it.
+    const actionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: actionId,
+      companyId,
+      sourceIssueId: issueId,
+      kind: "deliberate_wait_without_target",
+      status: "escalated",
+      ownerType: "board",
+      previousOwnerAgentId: agentId,
+      cause: "deliberate_wait_without_target",
+      fingerprint: `disposition_repair:${issueId}`,
+      attemptCount: 5,
+      maxAttempts: 5,
+      nextAction: "Automatic recovery exhausted after 5/5 attempts.",
+      outcome: "escalated",
+      evidence: { recoveryBudget: { state: "exhausted", attemptsUsed: 5, maxAttempts: 5 } },
+      lastAttemptAt: oldDate(),
+    });
+
+    const heartbeat = heartbeatService(db);
+    for (let pass = 0; pass < 3; pass += 1) {
+      const result = await heartbeat.reconcileBlockedWithoutBlockers();
+      expect(result.escalated).toBe(0);
+    }
+
+    const escalationRows = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.blocked_without_blockers_escalated"),
+        ),
+      );
+    expect(escalationRows).toHaveLength(0);
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toEqual([
+      expect.objectContaining({ id: actionId, kind: "deliberate_wait_without_target", status: "escalated" }),
+    ]);
   });
 });
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertPatchableExecutionPolicyWrite, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, isReviewChangesRequestedTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { BASE_MAX_REVIEW_ROUNDS, DEFAULT_MAX_REVIEW_ROUNDS, applyIssueExecutionPolicyTransition, assertExecutionDecisionSnapshotCurrent, assertPatchableExecutionPolicyWrite, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, foldExecutionPolicyAgentIds, foldExecutionStateAgentIds, isReviewChangesRequestedTransition, listCurrentPolicyApprovedStageIds, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolvePatchExecutionPolicy, stallHoldControlsDiffer, stripMonitorFromExecutionPolicy, type DurableApprovalDecisionRow } from "../services/issue-execution-policy.ts";
 import { HttpError } from "../errors.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
@@ -348,10 +348,70 @@ describe("assertPatchableExecutionPolicyWrite (SUP-13634)", () => {
     );
   });
 
-  it("allows a body that normalizes to null over an issue with no close ladder", () => {
+  // SUP-22890: the null-clear allowance is scoped to stored policies with
+  // nothing to destroy. A monitor-only watcher previously fell through the
+  // stages-only gate: `{mode, commentRequired, stages: []}` — the SUP-13925
+  // round-trip with `monitor` dropped — normalized to null and silently wiped
+  // the card's only wake path. The backstop now protects a stored monitor.
+  it("rejects a body that normalizes to null over a stored monitor-only policy, naming the monitor", () => {
     const monitorOnly = normalizeIssueExecutionPolicy({ monitor, stages: [] });
     expect(monitorOnly).not.toBeNull();
-    expect(() => assertWrite({ raw: { mode: "normal" }, currentPolicy: monitorOnly })).not.toThrow();
+    expect(() => assertWrite({ raw: { mode: "normal" }, currentPolicy: monitorOnly })).toThrowError(
+      "executionPolicy must not clear the issue's monitor",
+    );
+    // The field repro: explicit `stages: []` with the `monitor` key omitted.
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw: { mode: "normal", commentRequired: true, stages: [] },
+        currentPolicy: monitorOnly,
+        stagesKeyAbsent: false,
+        stagesExplicitlyEmpty: true,
+      }),
+    ).toThrowError("executionPolicy must not clear the issue's monitor");
+  });
+
+  it("still allows a body that normalizes to null over a stored policy with nothing to destroy", () => {
+    const noLadder = normalizeIssueExecutionPolicy({ stages: [] }, { preserveEmptyPolicy: true });
+    expect(noLadder).not.toBeNull();
+    expect(noLadder!.stages).toEqual([]);
+    expect(noLadder!.monitor).toBeUndefined();
+    expect(() => assertWrite({ raw: { mode: "normal" }, currentPolicy: noLadder })).not.toThrow();
+  });
+
+  it("rejects an explicit empty stages write that drops a monitor even when another field preserves normalization", () => {
+    const monitorOnly = normalizeIssueExecutionPolicy({ monitor, stages: [] });
+    expect(monitorOnly).not.toBeNull();
+    expect(() =>
+      assertPatchableExecutionPolicyWrite({
+        raw: { stages: [], baseRef: "main" },
+        currentPolicy: monitorOnly,
+        stagesKeyAbsent: false,
+        stagesExplicitlyEmpty: true,
+      }),
+    ).toThrowError("executionPolicy must not clear the issue's monitor");
+  });
+
+  // SUP-22890 AC2: a stage-less body that carries a monitor must never
+  // normalize to null — neither with `stages` omitted (SUP-15377 preserve
+  // shape) nor with an explicit `stages: []` (SUP-13925 round-trip shape).
+  it("never collapses a stage-less monitor-bearing body to null, with or without explicit stages", () => {
+    const stored = normalizeIssueExecutionPolicy({ stages: [], monitor })!;
+    expect(normalizeIssueExecutionPolicy({ mode: "normal", commentRequired: true, monitor })).not.toBeNull();
+    expect(normalizeIssueExecutionPolicy({ mode: "normal", commentRequired: true, stages: [], monitor })).not.toBeNull();
+    const partial = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, monitor },
+      currentPolicy: stored,
+      stagesKeyAbsent: true,
+    });
+    expect(partial).not.toBeNull();
+    expect(partial!.monitor?.nextCheckAt).toBe(monitor.nextCheckAt);
+    const roundTrip = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [], monitor },
+      currentPolicy: stored,
+      stagesKeyAbsent: false,
+    });
+    expect(roundTrip).not.toBeNull();
+    expect(roundTrip!.monitor?.nextCheckAt).toBe(monitor.nextCheckAt);
   });
 
   it("allows a full replacement policy over a non-null stored policy", () => {
@@ -396,6 +456,7 @@ describe("resolvePatchExecutionPolicy (SUP-15377)", () => {
       raw: { mode: "normal", commentRequired: true, monitor },
       currentPolicy: stored,
       stagesKeyAbsent: true,
+      storedStagesExplicitlyEmpty: false,
     });
     expect(resolved).not.toBeNull();
     expect(resolved!.stages.length).toBe(1);
@@ -412,6 +473,7 @@ describe("resolvePatchExecutionPolicy (SUP-15377)", () => {
       raw: { mode: "normal", commentRequired: true, monitor },
       currentPolicy: stored,
       stagesKeyAbsent: true,
+      storedStagesExplicitlyEmpty: false,
     });
     expect(resolved!.stages).toEqual([]);
     expect(resolved!.monitor?.nextCheckAt).toBe(monitor.nextCheckAt);
@@ -449,6 +511,87 @@ describe("resolvePatchExecutionPolicy (SUP-15377)", () => {
     expect(resolvePatchExecutionPolicy({ raw: "nope", currentPolicy: reviewOnlyPolicy(), stagesKeyAbsent: true })).toBeNull();
     expect(resolvePatchExecutionPolicy({ raw: null, currentPolicy: reviewOnlyPolicy(), stagesKeyAbsent: true })).toBeNull();
     expect(resolvePatchExecutionPolicy({ raw: [1, 2], currentPolicy: reviewOnlyPolicy(), stagesKeyAbsent: true })).toBeNull();
+  });
+});
+
+describe("resolvePatchExecutionPolicy explicit-empty preservation (SUP-22135)", () => {
+  const stageLessPolicy = () =>
+    normalizeIssueExecutionPolicy({ mode: "normal", commentRequired: true, stages: [] }, { preserveEmptyPolicy: true })!;
+
+  it("keeps an explicit `stages: []` round-trip over a stored stage-less policy non-null", () => {
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [] },
+      currentPolicy: stageLessPolicy(),
+      stagesKeyAbsent: false,
+      storedStagesExplicitlyEmpty: true,
+    });
+    // Before SUP-22135 the normalizer collapsed the bare-empty body to null,
+    // silently wiping the stored SUP-22098 shape.
+    expect(resolved).not.toBeNull();
+    expect(resolved!.stages).toEqual([]);
+    expect(resolved!.mode).toBe("normal");
+  });
+
+  it("keeps a stage-less partial write (stages key absent) non-null", () => {
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "auto", commentRequired: true },
+      currentPolicy: stageLessPolicy(),
+      stagesKeyAbsent: true,
+      storedStagesExplicitlyEmpty: true,
+    });
+    expect(resolved).not.toBeNull();
+    expect(resolved!.stages).toEqual([]);
+    expect(resolved!.mode).toBe("auto");
+  });
+
+  it("still collapses a bare-empty body over a null stored policy (default inheritance unchanged)", () => {
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [] },
+      currentPolicy: null,
+      stagesKeyAbsent: false,
+      storedStagesExplicitlyEmpty: false,
+    });
+    expect(resolved).toBeNull();
+  });
+
+  it("still carries the stored ladder forward on stages omission (SUP-15377 unchanged)", () => {
+    const stored = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+    })!;
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true },
+      currentPolicy: stored,
+      stagesKeyAbsent: true,
+      storedStagesExplicitlyEmpty: false,
+    });
+    expect(resolved!.stages.length).toBe(1);
+    expect(resolved!.stages[0]!.id).toBe(stored.stages[0]!.id);
+  });
+
+  it("does not preserve a legacy monitor-only policy without a raw stages key", () => {
+    const stored = normalizeIssueExecutionPolicy({ monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" } })!;
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "auto", commentRequired: true, stages: [] },
+      currentPolicy: stored,
+      stagesKeyAbsent: false,
+      storedStagesExplicitlyEmpty: false,
+    });
+    expect(resolved).toBeNull();
+  });
+
+  it("preserves a stored policy only when the raw stages key was explicitly empty", () => {
+    const stored = normalizeIssueExecutionPolicy(
+      { mode: "normal", monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" }, stages: [] },
+      { preserveEmptyPolicy: true },
+    )!;
+    const resolved = resolvePatchExecutionPolicy({
+      raw: { mode: "normal", commentRequired: true, stages: [] },
+      currentPolicy: stored,
+      stagesKeyAbsent: false,
+      storedStagesExplicitlyEmpty: true,
+    });
+    expect(resolved).not.toBeNull();
+    expect(resolved!.stages).toEqual([]);
   });
 });
 
@@ -1107,7 +1250,7 @@ describe("issue execution policy transitions", () => {
           assigneeAgentId: qaAgentId,
           assigneeUserId: null,
           executionPolicy: policy,
-          executionState: rearm.patch.executionState,
+          executionState: rearm.patch.executionState as IssueExecutionState,
         },
         policy,
         requestedStatus: "done",
@@ -1518,8 +1661,8 @@ describe("issue execution policy transitions", () => {
         lastDecisionOutcome: "approved",
       };
 
-      it("clears executionState for a non-in_review status (done/cancelled/blocked/in_progress)", () => {
-        for (const status of ["done", "cancelled", "blocked", "in_progress"] as const) {
+      it("clears executionState for a non-terminal status (blocked/in_progress/todo)", () => {
+        for (const status of ["blocked", "in_progress", "todo"] as const) {
           const result = applyIssueExecutionPolicyTransition({
             issue: {
               status: "blocked",
@@ -1536,6 +1679,34 @@ describe("issue execution policy transitions", () => {
             commentBody: "Overriding the stuck review",
           });
           expect(result.patch.executionState).toBeNull();
+          expect(result.decision).toBeUndefined();
+        }
+      });
+
+      it("keeps the completed state on a board done/cancelled close (SUP-24054)", () => {
+        // A successful close leaves nothing stuck to dissolve. The done guard
+        // already read the pre-patch row, so a null here only destroyed the
+        // completed ladder record (completedStageIds, approvalStatus).
+        const approvalStatus = {
+          finalDelivery: { owner: "TEA-Core", repo: "paperclip", number: 404, headSha: "a".repeat(40) },
+        };
+        for (const status of ["done", "cancelled"] as const) {
+          const result = applyIssueExecutionPolicyTransition({
+            issue: {
+              status: "in_progress",
+              assigneeAgentId: coderAgentId,
+              assigneeUserId: null,
+              executionPolicy: policy,
+              executionState: { ...completedState, approvalStatus },
+            },
+            policy,
+            requestedStatus: status,
+            requestedAssigneePatch: {},
+            actor: { userId: boardUserId },
+            allowBoardOverride: true,
+            commentBody: "Closing the approved card",
+          });
+          expect(result.patch).not.toHaveProperty("executionState");
           expect(result.decision).toBeUndefined();
         }
       });
@@ -1815,6 +1986,372 @@ describe("issue execution policy transitions", () => {
       });
 
       expect(result.patch.executionState).toBeNull();
+    });
+  });
+
+  describe("durable approvals survive a reopen (SUP-24054)", () => {
+    // The SUP-24036 shape: the policy returns to the delivering agent, the
+    // review stage has another participant, a reopen nulled the projection,
+    // and the stage's latest decision row is `approved`. The route resolves
+    // `decidedStageIds` from those rows with listCurrentPolicyApprovedStageIds.
+    function reviewPolicyReturningToCoder() {
+      return normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: coderAgentId,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      })!;
+    }
+
+    function coderDoneOnNullState(policy: IssueExecutionPolicy, decidedStageIds?: string[]) {
+      return applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: "Closing after the approved delivery",
+        ...(decidedStageIds ? { decidedStageIds } : {}),
+      });
+    }
+
+    it("leaves the requested done in place when every stage holds a current approval", () => {
+      const policy = reviewPolicyReturningToCoder();
+      const result = coderDoneOnNullState(policy, [policy.stages[0].id]);
+
+      expect(result.patch.status).toBeUndefined();
+      expect(result.patch.assigneeAgentId).toBeUndefined();
+      expect(result.patch.executionState).toBeUndefined();
+      expect(result.workflowControlledAssignment).toBeUndefined();
+      expect(result.decision).toBeUndefined();
+    });
+
+    it("still arms the stage when no durable approval exists", () => {
+      const policy = reviewPolicyReturningToCoder();
+      const result = coderDoneOnNullState(policy);
+
+      expect(result.patch.status).toBe("in_review");
+      expect(result.patch.assigneeAgentId).toBe(qaAgentId);
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageId: policy.stages[0].id,
+        completedStageIds: [],
+      });
+      expect(result.workflowControlledAssignment).toBe(true);
+    });
+
+    it("re-arms from the first stage when only some stages are approved", () => {
+      const policy = twoStagePolicy();
+      const [reviewStage] = policy.stages;
+      const result = coderDoneOnNullState(policy, [policy.stages[1].id]);
+
+      expect(result.patch.status).toBe("in_review");
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageId: reviewStage.id,
+        completedStageIds: [],
+      });
+    });
+
+    it("arms a stage whose latest decision is changes_requested (fail closed)", () => {
+      const policy = reviewPolicyReturningToCoder();
+      const stageId = policy.stages[0].id;
+      const decidedStageIds = listCurrentPolicyApprovedStageIds({
+        issue: { assigneeAgentId: coderAgentId, assigneeUserId: null, executionState: null },
+        policy,
+        decisions: [
+          { id: "d-1", stageId, stageType: "review", outcome: "approved", actorAgentId: qaAgentId, actorUserId: null, createdAt: new Date("2026-11-12T19:09:34Z") },
+          { id: "d-2", stageId, stageType: "review", outcome: "changes_requested", actorAgentId: qaAgentId, actorUserId: null, createdAt: new Date("2026-11-12T19:30:00Z") },
+        ],
+        boardDecisionParticipants: new Map(),
+        closer: { type: "agent", agentId: coderAgentId, userId: null },
+      });
+      expect(decidedStageIds).toEqual([]);
+
+      const result = coderDoneOnNullState(policy, decidedStageIds);
+      expect(result.patch.status).toBe("in_review");
+      expect(result.patch.assigneeAgentId).toBe(qaAgentId);
+      expect(result.patch.executionState).toMatchObject({ status: "pending", currentStageId: stageId });
+    });
+  });
+
+  describe("durable approvals must hold under the current policy (SUP-24054 release-assurance B1/B2)", () => {
+    const otherAgentId = "44444444-4444-4444-8444-444444444444";
+    const boardDeciderUserId = "board-decider";
+    const approvedAt = new Date("2026-11-12T19:09:34Z");
+
+    function ladder(reviewParticipants: Array<{ type: "agent"; agentId: string }> = [{ type: "agent", agentId: qaAgentId }]) {
+      return normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: coderAgentId,
+        stages: [
+          { type: "review", participants: reviewParticipants },
+          { type: "approval", participants: [{ type: "user", userId: ctoUserId }] },
+        ],
+      })!;
+    }
+
+    function row(overrides: Partial<DurableApprovalDecisionRow> & { stageId: string }): DurableApprovalDecisionRow {
+      return {
+        id: `d-${overrides.stageId}-${overrides.actorAgentId ?? overrides.actorUserId ?? "none"}`,
+        stageType: "review",
+        outcome: "approved",
+        actorAgentId: null,
+        actorUserId: null,
+        createdAt: approvedAt,
+        ...overrides,
+      };
+    }
+
+    function approvedIds(input: {
+      policy: IssueExecutionPolicy;
+      decisions: DurableApprovalDecisionRow[];
+      board?: Array<[string, { type: "agent"; agentId: string } | { type: "user"; userId: string } | null]>;
+      issue?: { assigneeAgentId?: string | null; assigneeUserId?: string | null; createdByAgentId?: string | null };
+      closer?: { type: "agent"; agentId: string } | { type: "user"; userId: string };
+    }) {
+      return listCurrentPolicyApprovedStageIds({
+        issue: { assigneeAgentId: coderAgentId, assigneeUserId: null, executionState: null, ...input.issue },
+        policy: input.policy,
+        decisions: input.decisions,
+        boardDecisionParticipants: new Map(
+          (input.board ?? []).map(([id, principal]) => [
+            id,
+            principal === null ? null : { agentId: null, userId: null, ...principal },
+          ]),
+        ),
+        closer: input.closer ? { agentId: null, userId: null, ...input.closer } : null,
+      });
+    }
+
+    it("counts approvals by current agent and user participants", () => {
+      const policy = ladder();
+      const [review, approval] = policy.stages;
+      expect(
+        approvedIds({
+          policy,
+          decisions: [
+            row({ stageId: review.id, actorAgentId: qaAgentId }),
+            row({ stageId: approval.id, stageType: "approval", actorUserId: ctoUserId }),
+          ],
+        }),
+      ).toEqual([review.id, approval.id]);
+    });
+
+    it("counts a board stage decision recorded for a current participant", () => {
+      const policy = ladder();
+      const [review, approval] = policy.stages;
+      const boardReview = row({ id: "board-review", stageId: review.id, actorUserId: boardDeciderUserId });
+      const boardApproval = row({ id: "board-approval", stageId: approval.id, stageType: "approval", actorUserId: boardDeciderUserId });
+      expect(
+        approvedIds({
+          policy,
+          decisions: [boardReview, boardApproval],
+          board: [
+            ["board-review", { type: "agent", agentId: qaAgentId }],
+            ["board-approval", { type: "user", userId: ctoUserId }],
+          ],
+        }),
+      ).toEqual([review.id, approval.id]);
+    });
+
+    it("drops an approval whose agent is no longer a participant of the stage", () => {
+      const policy = ladder([{ type: "agent", agentId: otherAgentId }]);
+      const [review] = policy.stages;
+      expect(approvedIds({ policy, decisions: [row({ stageId: review.id, actorAgentId: qaAgentId })] })).toEqual([]);
+    });
+
+    it("drops a board stage decision whose participant was replaced, or that names none", () => {
+      const policy = ladder([{ type: "agent", agentId: otherAgentId }]);
+      const [review] = policy.stages;
+      const boardReview = row({ id: "board-review", stageId: review.id, actorUserId: boardDeciderUserId });
+      expect(approvedIds({ policy, decisions: [boardReview], board: [["board-review", { type: "agent", agentId: qaAgentId }]] })).toEqual([]);
+      expect(approvedIds({ policy, decisions: [boardReview], board: [["board-review", null]] })).toEqual([]);
+    });
+
+    it("drops a user approval that is neither a participant's nor a board stage decision", () => {
+      const policy = ladder();
+      const [, approval] = policy.stages;
+      expect(
+        approvedIds({ policy, decisions: [row({ stageId: approval.id, stageType: "approval", actorUserId: boardDeciderUserId })] }),
+      ).toEqual([]);
+    });
+
+    it("drops an approval after the stage type was flipped", () => {
+      const policy = ladder();
+      const [review] = policy.stages;
+      expect(
+        approvedIds({ policy, decisions: [row({ stageId: review.id, stageType: "approval", actorAgentId: qaAgentId })] }),
+      ).toEqual([]);
+    });
+
+    it("drops every approval once any decision row names a stage the policy no longer carries", () => {
+      const policy = ladder();
+      const [review, approval] = policy.stages;
+      const removedStageId = "99999999-9999-4999-8999-999999999999";
+      expect(
+        approvedIds({
+          policy,
+          decisions: [
+            row({ stageId: review.id, actorAgentId: qaAgentId }),
+            row({ stageId: approval.id, stageType: "approval", actorUserId: ctoUserId }),
+            row({ stageId: removedStageId, outcome: "changes_requested", actorAgentId: otherAgentId }),
+          ],
+        }),
+      ).toEqual([]);
+    });
+
+    it("drops a self-approval by the return assignee, matched case-insensitively", () => {
+      // The decider is listed on the stage with exactly its recorded letter
+      // case, so stage membership holds; only the case-folded self-approval
+      // exclusion (the stricter direction) can drop it.
+      const returnAgentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const policy = normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: returnAgentId,
+        stages: [
+          {
+            type: "review",
+            participants: [
+              { type: "agent", agentId: qaAgentId },
+              { type: "agent", agentId: returnAgentId.toUpperCase() },
+            ],
+          },
+        ],
+      })!;
+      const [review] = policy.stages;
+      expect(
+        approvedIds({
+          policy,
+          decisions: [row({ stageId: review.id, actorAgentId: returnAgentId.toUpperCase() })],
+          issue: { assigneeAgentId: otherAgentId },
+        }),
+      ).toEqual([]);
+    });
+
+    it("compares stage membership exactly: a decider that matches a participant only by letter case does not count", () => {
+      const participantId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      const policy = ladder([{ type: "agent", agentId: participantId }]);
+      const [review] = policy.stages;
+      expect(approvedIds({ policy, decisions: [row({ stageId: review.id, actorAgentId: participantId })] })).toEqual([review.id]);
+      expect(
+        approvedIds({ policy, decisions: [row({ stageId: review.id, actorAgentId: participantId.toUpperCase() })] }),
+      ).toEqual([]);
+    });
+
+    it("compares a board stage decision's participant exactly", () => {
+      const participantId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      const policy = ladder([{ type: "agent", agentId: participantId }]);
+      const [review] = policy.stages;
+      const boardReview = row({ id: "board-review", stageId: review.id, actorUserId: boardDeciderUserId });
+      expect(
+        approvedIds({ policy, decisions: [boardReview], board: [["board-review", { type: "agent", agentId: participantId }]] }),
+      ).toEqual([review.id]);
+      expect(
+        approvedIds({
+          policy,
+          decisions: [boardReview],
+          board: [["board-review", { type: "agent", agentId: participantId.toUpperCase() }]],
+        }),
+      ).toEqual([]);
+    });
+
+    it("drops a self-approval by the current assignee, the delivery author of the done", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [
+          { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+          { type: "approval", participants: [{ type: "user", userId: ctoUserId }] },
+        ],
+      })!;
+      const [review, approval] = policy.stages;
+      expect(
+        approvedIds({ policy, decisions: [row({ stageId: review.id, actorAgentId: qaAgentId })], issue: { assigneeAgentId: qaAgentId } }),
+      ).toEqual([]);
+      expect(
+        approvedIds({
+          policy,
+          decisions: [row({ stageId: approval.id, stageType: "approval", actorUserId: ctoUserId })],
+          issue: { assigneeAgentId: null, assigneeUserId: ctoUserId },
+        }),
+      ).toEqual([]);
+    });
+
+    it("drops a row with no recorded actor", () => {
+      const policy = ladder();
+      const [review] = policy.stages;
+      expect(approvedIds({ policy, decisions: [row({ stageId: review.id })] })).toEqual([]);
+    });
+
+    it("drops an approval by the closer of the done", () => {
+      const policy = ladder();
+      const [review, approval] = policy.stages;
+      expect(
+        approvedIds({
+          policy,
+          decisions: [row({ stageId: review.id, actorAgentId: qaAgentId.toUpperCase() })],
+          closer: { type: "agent", agentId: qaAgentId },
+        }),
+      ).toEqual([]);
+      expect(
+        approvedIds({
+          policy,
+          decisions: [row({ stageId: approval.id, stageType: "approval", actorUserId: ctoUserId })],
+          closer: { type: "user", userId: ctoUserId },
+        }),
+      ).toEqual([]);
+    });
+
+    it("drops a board user's own board stage decision when that user closes", () => {
+      const policy = ladder();
+      const [review] = policy.stages;
+      const boardReview = row({ id: "board-review", stageId: review.id, actorUserId: boardDeciderUserId });
+      const board: Array<[string, { type: "agent"; agentId: string }]> = [["board-review", { type: "agent", agentId: qaAgentId }]];
+      expect(approvedIds({ policy, decisions: [boardReview], board })).toEqual([review.id]);
+      expect(
+        approvedIds({ policy, decisions: [boardReview], board, closer: { type: "user", userId: boardDeciderUserId } }),
+      ).toEqual([]);
+    });
+
+    it("drops a board stage decision recorded for a self-approval principal's seat", () => {
+      const policy = ladder([
+        { type: "agent", agentId: qaAgentId },
+        { type: "agent", agentId: coderAgentId },
+      ]);
+      const [review] = policy.stages;
+      const boardReview = row({ id: "board-review", stageId: review.id, actorUserId: boardDeciderUserId });
+      expect(
+        approvedIds({
+          policy,
+          decisions: [boardReview],
+          board: [["board-review", { type: "agent", agentId: coderAgentId }]],
+          issue: { assigneeAgentId: otherAgentId },
+        }),
+      ).toEqual([]);
+    });
+
+    it("keeps re-arm-review behaviour when an approval no longer holds", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        returnAssigneeAgentId: coderAgentId,
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      })!;
+      const [review] = policy.stages;
+      const decidedStageIds = approvedIds({
+        policy,
+        decisions: [row({ stageId: review.id, stageType: "approval", actorAgentId: qaAgentId })],
+      });
+      const result = applyIssueExecutionPolicyTransition({
+        issue: { status: "in_progress", assigneeAgentId: coderAgentId, assigneeUserId: null, executionPolicy: policy, executionState: null },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: "Closing after the approved delivery",
+        decidedStageIds,
+      });
+      expect(result.patch.status).toBe("in_review");
+      expect(result.patch.executionState).toMatchObject({ status: "pending", currentStageId: review.id });
     });
   });
 
@@ -3379,6 +3916,7 @@ describe("issue execution policy transitions", () => {
         completedStageIds: [],
         lastDecisionId: null,
         lastDecisionOutcome: null,
+        reviewRequest: null,
       };
     }
 
@@ -3577,7 +4115,7 @@ describe("return-assignee exclusion is absolute (reverses SUP-10602 allowSelfAsF
             assigneeAgentId: qaAgentId,
             assigneeUserId: null,
             executionPolicy: policy,
-            executionState: result.patch.executionState,
+            executionState: result.patch.executionState as IssueExecutionState,
           },
           policy,
           requestedStatus: "done",
@@ -3874,7 +4412,7 @@ describe("review round circuit breaker", () => {
       escalatedToUserId: boardUserId,
       stageId: reviewStageId,
       stageType: "review",
-      maxRounds: DEFAULT_MAX_REVIEW_ROUNDS,
+      maxRounds: BASE_MAX_REVIEW_ROUNDS,
       changesRequestedCount: 3,
       returnAssignee: { type: "agent", agentId: coderAgentId },
     });
@@ -4089,6 +4627,823 @@ describe("review round circuit breaker", () => {
       status: "pending",
       currentParticipant: { type: "user", userId: boardUserId },
       changesRequestedCount: 1,
+    });
+  });
+
+  describe("effective round ceiling (R20)", () => {
+    const arbiterId = "44444444-4444-4444-8444-444444444444";
+    const stallEscalation = { afterRounds: 2, toAgentId: arbiterId };
+
+    function agentRound(withPolicy: typeof policy, changesRequestedCount: number) {
+      return applyIssueExecutionPolicyTransition({
+        issue: reviewPendingIssue({ executionPolicy: withPolicy }, { changesRequestedCount }),
+        policy: withPolicy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: `Round ${changesRequestedCount + 1} feedback`,
+      });
+    }
+
+    it("keeps the ceiling of 3 without stallEscalation", () => {
+      const second = agentRound(policy, 1);
+      expect(second.patch.status).toBe("in_progress");
+      expect(second.reviewEscalation).toBeUndefined();
+
+      const third = agentRound(policy, 2);
+      expect(third.patch.status).toBe("in_review");
+      expect(third.patch.assigneeUserId).toBe(boardUserId);
+      expect(third.reviewEscalation).toMatchObject({ maxRounds: 3, changesRequestedCount: 3 });
+    });
+
+    it("lets a policy with stallEscalation run to 10 rounds before escalating", () => {
+      const stalled = { ...policy, stallEscalation } as typeof policy;
+      const third = agentRound(stalled, 2);
+      expect(third.patch.status).toBe("in_progress");
+      expect(third.patch.assigneeAgentId).toBe(coderAgentId);
+      expect(third.reviewEscalation).toBeUndefined();
+
+      const ninth = agentRound(stalled, 8);
+      expect(ninth.patch.status).toBe("in_progress");
+      expect(ninth.reviewEscalation).toBeUndefined();
+
+      const tenth = agentRound(stalled, 9);
+      expect(tenth.patch.status).toBe("in_review");
+      expect(tenth.patch.assigneeUserId).toBe(boardUserId);
+      expect(tenth.reviewEscalation).toMatchObject({ maxRounds: DEFAULT_MAX_REVIEW_ROUNDS, changesRequestedCount: 10 });
+    });
+
+    it("honours an explicit maxReviewRounds with and without stallEscalation", () => {
+      const plain = { ...policy, maxReviewRounds: 5 } as typeof policy;
+      expect(agentRound(plain, 3).reviewEscalation).toBeUndefined();
+      expect(agentRound(plain, 4).reviewEscalation).toMatchObject({ maxRounds: 5, changesRequestedCount: 5 });
+
+      const stalled = { ...policy, maxReviewRounds: 4, stallEscalation } as typeof policy;
+      expect(agentRound(stalled, 2).reviewEscalation).toBeUndefined();
+      expect(agentRound(stalled, 3).reviewEscalation).toMatchObject({ maxRounds: 4, changesRequestedCount: 4 });
+    });
+
+    it("keeps a hold escalated at round 3 sticky under a stall-arbiter policy whose ceiling is 10", () => {
+      const stalled = { ...policy, stallEscalation } as typeof policy;
+      const held = reviewPendingIssue(
+        { executionPolicy: stalled, assigneeAgentId: null, assigneeUserId: boardUserId },
+        { currentParticipant: { type: "user", userId: boardUserId }, changesRequestedCount: 3 },
+      );
+      const unrelated = applyIssueExecutionPolicyTransition({
+        issue: held,
+        policy: stalled,
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+      expect(unrelated.patch.executionState).toBeUndefined();
+      expect(unrelated.patch.assigneeAgentId).toBeUndefined();
+
+      const humanApproves = applyIssueExecutionPolicyTransition({
+        issue: held,
+        policy: stalled,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { userId: boardUserId },
+        commentBody: "Approved from the escalation",
+      });
+      expect(humanApproves.decision).toMatchObject({ outcome: "approved" });
+    });
+  });
+});
+
+describe("review stall escalation (R20)", () => {
+  const arbiterAgentId = "44444444-4444-4444-8444-444444444444";
+  const headA = "a".repeat(40);
+  const headB = "b".repeat(40);
+
+  type ReviewIssueFixture = {
+    status: string;
+    assigneeAgentId: string | null;
+    assigneeUserId: string | null;
+    responsibleUserId: string | null;
+    executionPolicy: IssueExecutionPolicy;
+    executionState: Record<string, unknown>;
+  };
+
+  function stallPolicy(): IssueExecutionPolicy {
+    return normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      stallEscalation: { afterRounds: 2, toAgentId: arbiterAgentId },
+    })!;
+  }
+
+  function pendingReview(
+    policy: IssueExecutionPolicy,
+    stateOverrides: Record<string, unknown> = {},
+    issueOverrides: Record<string, unknown> = {},
+  ): ReviewIssueFixture {
+    return {
+      status: "in_review",
+      assigneeAgentId: qaAgentId,
+      assigneeUserId: null,
+      responsibleUserId: boardUserId,
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: policy.stages[0].id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId },
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+        deliveryAuthor: { type: "agent", agentId: coderAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        ...stateOverrides,
+      },
+      ...issueOverrides,
+    } as ReviewIssueFixture;
+  }
+
+  function decide(
+    policy: IssueExecutionPolicy,
+    issue: ReviewIssueFixture,
+    actor: { agentId?: string; userId?: string },
+    requestedStatus: string | undefined,
+    commentBody?: string,
+  ) {
+    return applyIssueExecutionPolicyTransition({
+      issue,
+      policy,
+      requestedStatus,
+      requestedAssigneePatch: {},
+      actor,
+      commentBody,
+      stallArbiterAvailable: true,
+    });
+  }
+
+  function arbiterHold(policy: IssueExecutionPolicy, stateOverrides: Record<string, unknown> = {}): ReviewIssueFixture {
+    return pendingReview(
+      policy,
+      {
+        currentParticipant: { type: "agent", agentId: arbiterAgentId },
+        changesRequestedCount: 2,
+        deliveredHeadSha: headA,
+        bouncedHeadSha: headA,
+        stallHandoff: {
+          stageId: policy.stages[0].id,
+          arbiterAgentId,
+          fromParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+          changesRequestedCount: 2,
+          signals: ["same_head_rebounced"],
+          handedOffAt: "2026-11-05T00:00:00.000Z",
+        },
+        ...stateOverrides,
+      },
+      { assigneeAgentId: arbiterAgentId },
+    );
+  }
+
+  it("keeps today's bounce when the policy has no stallEscalation, even on a re-bounced head", () => {
+    const policy = reviewOnlyPolicy();
+    const result = decide(
+      policy,
+      pendingReview(policy, { changesRequestedCount: 1, deliveredHeadSha: headA, bouncedHeadSha: headA }),
+      { agentId: qaAgentId },
+      "in_progress",
+      "Same finding again\nCode acceptable: yes",
+    );
+
+    expect(result.stallEscalation).toBeUndefined();
+    expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+    expect(result.patch.executionState).toMatchObject({ status: "changes_requested", changesRequestedCount: 2 });
+  });
+
+  it("hands the stalled stage to the arbiter when the same delivered head is bounced again", () => {
+    const policy = stallPolicy();
+    const result = decide(
+      policy,
+      pendingReview(policy, { changesRequestedCount: 1, deliveredHeadSha: headA, bouncedHeadSha: headA }),
+      { agentId: qaAgentId },
+      "in_progress",
+      "Same finding as last round",
+    );
+
+    // The reviewer's decision is still recorded; the stage stays pending on the
+    // same stage with the arbiter as its participant, never the implementer.
+    expect(result.decision).toMatchObject({ outcome: "changes_requested", stageId: policy.stages[0].id });
+    expect(result.patch.status).toBe("in_review");
+    expect(result.patch.assigneeAgentId).toBe(arbiterAgentId);
+    expect(result.patch.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: policy.stages[0].id,
+      currentParticipant: { type: "agent", agentId: arbiterAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      changesRequestedCount: 2,
+      deliveredHeadSha: headA,
+      bouncedHeadSha: headA,
+      stallHandoff: {
+        stageId: policy.stages[0].id,
+        arbiterAgentId,
+        fromParticipant: { type: "agent", agentId: qaAgentId },
+        changesRequestedCount: 2,
+        signals: ["same_head_rebounced"],
+      },
+    });
+    expect(result.stallEscalation).toMatchObject({
+      arbiterAgentId,
+      afterRounds: 2,
+      maxRounds: DEFAULT_MAX_REVIEW_ROUNDS,
+      changesRequestedCount: 2,
+      signals: ["same_head_rebounced"],
+      deliveredHeadSha: headA,
+    });
+    expect(result.reviewEscalation).toBeUndefined();
+    expect(parseIssueExecutionState(result.patch.executionState)?.stallHandoff?.arbiterAgentId).toBe(arbiterAgentId);
+  });
+
+  it("hands the stage to the arbiter when the reviewer reports the code acceptable", () => {
+    const policy = stallPolicy();
+    const result = decide(
+      policy,
+      pendingReview(policy, { changesRequestedCount: 1 }),
+      { agentId: qaAgentId },
+      "in_progress",
+      "Remaining finding is the preflight refusal, not the diff.\n- **Code acceptable:** yes",
+    );
+
+    expect(result.patch.assigneeAgentId).toBe(arbiterAgentId);
+    expect(result.stallEscalation?.signals).toEqual(["code_acceptable"]);
+  });
+
+  it("does not escalate a progressing loop: a new head with findings about the code goes back to the implementer", () => {
+    const policy = stallPolicy();
+    const result = decide(
+      policy,
+      pendingReview(policy, { changesRequestedCount: 3, deliveredHeadSha: headB, bouncedHeadSha: headA }),
+      { agentId: qaAgentId },
+      "in_progress",
+      "New head fixes the retry path; the timeout branch is still wrong. Code acceptable: no",
+    );
+
+    expect(result.stallEscalation).toBeUndefined();
+    expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+    // The bounced head becomes the comparison point; the next round starts with
+    // no head until its delivery records one.
+    expect(result.patch.executionState).toMatchObject({
+      status: "changes_requested",
+      changesRequestedCount: 4,
+      deliveredHeadSha: null,
+      bouncedHeadSha: headB,
+    });
+  });
+
+  it("does not read a re-delivery that recorded no head as the same head", () => {
+    const policy = stallPolicy();
+    const result = decide(
+      policy,
+      pendingReview(policy, { changesRequestedCount: 1, deliveredHeadSha: null, bouncedHeadSha: headA }),
+      { agentId: qaAgentId },
+      "in_progress",
+      "Still failing",
+    );
+
+    expect(result.stallEscalation).toBeUndefined();
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+  });
+
+  it("waits for afterRounds before a stall signal hands the stage off", () => {
+    const policy = stallPolicy();
+    const result = decide(
+      policy,
+      pendingReview(policy, { changesRequestedCount: 0, deliveredHeadSha: headA, bouncedHeadSha: headA }),
+      { agentId: qaAgentId },
+      "in_progress",
+      "Code acceptable: yes",
+    );
+
+    expect(result.stallEscalation).toBeUndefined();
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+  });
+
+  it("never hands the same stage-run to the arbiter twice", () => {
+    const policy = stallPolicy();
+    const result = decide(
+      policy,
+      pendingReview(policy, {
+        changesRequestedCount: 4,
+        deliveredHeadSha: headA,
+        bouncedHeadSha: headA,
+        stallHandoff: {
+          stageId: policy.stages[0].id,
+          arbiterAgentId,
+          fromParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+          changesRequestedCount: 2,
+          signals: ["same_head_rebounced"],
+          handedOffAt: "2026-11-05T00:00:00.000Z",
+        },
+      }),
+      { agentId: qaAgentId },
+      "in_progress",
+      "Same head again. Code acceptable: yes",
+    );
+
+    expect(result.stallEscalation).toBeUndefined();
+    expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+    expect(result.patch.executionState).toMatchObject({ stallHandoff: { changesRequestedCount: 2 } });
+  });
+
+  it("lets the round ceiling escalate to the human after the arbiter", () => {
+    const policy = stallPolicy();
+    const result = decide(
+      policy,
+      arbiterHold(policy, {
+        currentParticipant: { type: "agent", agentId: qaAgentId },
+        changesRequestedCount: DEFAULT_MAX_REVIEW_ROUNDS - 1,
+      }),
+      { agentId: qaAgentId },
+      "in_progress",
+      "Still the same head",
+    );
+
+    expect(result.stallEscalation).toBeUndefined();
+    expect(result.reviewEscalation).toMatchObject({ escalatedToUserId: boardUserId });
+    expect(result.patch.assigneeUserId).toBe(boardUserId);
+  });
+
+  it("never hands the stage to the arbiter when it is the return assignee", () => {
+    const policy = stallPolicy();
+    const result = decide(
+      policy,
+      pendingReview(policy, {
+        changesRequestedCount: 1,
+        deliveredHeadSha: headA,
+        bouncedHeadSha: headA,
+        returnAssignee: { type: "agent", agentId: arbiterAgentId },
+      }),
+      { agentId: qaAgentId },
+      "in_progress",
+      "Same finding as last round",
+    );
+
+    expect(result.stallEscalation).toBeUndefined();
+    expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(arbiterAgentId);
+    expect(result.patch.executionState).toMatchObject({ status: "changes_requested" });
+  });
+
+  it("never hands the stage to the arbiter when it authored the delivery", () => {
+    const policy = stallPolicy();
+    const result = decide(
+      policy,
+      pendingReview(policy, {
+        changesRequestedCount: 1,
+        deliveredHeadSha: headA,
+        bouncedHeadSha: headA,
+        deliveryAuthor: { type: "agent", agentId: arbiterAgentId },
+      }),
+      { agentId: qaAgentId },
+      "in_progress",
+      "Same finding as last round",
+    );
+
+    expect(result.stallEscalation).toBeUndefined();
+    expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+  });
+
+  it.each([
+    ["the caller found the arbiter unavailable (paused or terminated)", false],
+    ["the caller never confirmed the arbiter", undefined],
+  ])("falls through to the ordinary bounce when %s", (_label, arbiterAvailable) => {
+    const policy = stallPolicy();
+    const result = applyIssueExecutionPolicyTransition({
+      issue: pendingReview(policy, { changesRequestedCount: 1, deliveredHeadSha: headA, bouncedHeadSha: headA }),
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Same finding as last round\nCode acceptable: yes",
+      ...(arbiterAvailable === undefined ? {} : { stallArbiterAvailable: arbiterAvailable }),
+    });
+
+    expect(result.stallEscalation).toBeUndefined();
+    expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+    expect(result.patch.executionState).toMatchObject({ status: "changes_requested", changesRequestedCount: 2 });
+  });
+
+  it.each([
+    ["a non-sha string", "not-a-sha"],
+    ["a short sha", "abc1234"],
+    ["39 hex digits", "a".repeat(39)],
+    ["41 hex digits", "a".repeat(41)],
+    ["non-hex characters", "g".repeat(40)],
+    ["an empty string", ""],
+  ])("never reads %s as the same delivered head", (_label, head) => {
+    const policy = stallPolicy();
+    const result = decide(
+      policy,
+      pendingReview(policy, { changesRequestedCount: 1, deliveredHeadSha: head, bouncedHeadSha: head }),
+      { agentId: qaAgentId },
+      "in_progress",
+      "Same finding as last round",
+    );
+
+    expect(result.stallEscalation).toBeUndefined();
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+  });
+
+  it("reads a 64-digit sha and differently cased hex as the same head", () => {
+    const policy = stallPolicy();
+    const sha256Head = "c".repeat(64);
+    const result = decide(
+      policy,
+      pendingReview(policy, { changesRequestedCount: 1, deliveredHeadSha: sha256Head.toUpperCase(), bouncedHeadSha: sha256Head }),
+      { agentId: qaAgentId },
+      "in_progress",
+      "Same finding as last round",
+    );
+
+    expect(result.stallEscalation?.signals).toEqual(["same_head_rebounced"]);
+  });
+
+  it.each([
+    "Code acceptable: yes",
+    "code acceptable: YES",
+    "- **Code acceptable:** yes",
+    "**Code acceptable**: yes",
+    "> Code acceptable: **yes**",
+    "  * Code acceptable:   yes  ",
+  ])("reads the exact marker line %j as code acceptable", (line) => {
+    const policy = stallPolicy();
+    const result = decide(
+      policy,
+      pendingReview(policy, { changesRequestedCount: 1 }),
+      { agentId: qaAgentId },
+      "in_progress",
+      `The only open item is the preflight wall.\n${line}\nNothing else.`,
+    );
+
+    expect(result.stallEscalation?.signals).toEqual(["code_acceptable"]);
+  });
+
+  it.each([
+    "Code acceptable: no",
+    "Code acceptable: yesterday",
+    "Code acceptable: yes, but the timeout branch is wrong",
+    "Code acceptable: maybe yes",
+    "The Code acceptable: yes line does not apply here",
+    "Code acceptable yes",
+    "Code is acceptable: yes",
+    "Code acceptable: yes.",
+  ])("does not read %j as the code-acceptable marker", (line) => {
+    const policy = stallPolicy();
+    const result = decide(
+      policy,
+      pendingReview(policy, { changesRequestedCount: 1 }),
+      { agentId: qaAgentId },
+      "in_progress",
+      `Findings below.\n${line}`,
+    );
+
+    expect(result.stallEscalation).toBeUndefined();
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+  });
+
+  it.each([
+    ["a backtick fence", "Template for the arbiter:\n```\nCode acceptable: yes\n```"],
+    ["a tilde fence with an info string", "~~~md\nCode acceptable: yes\n~~~"],
+    ["an unclosed fence", "Example:\n```text\nCode acceptable: yes"],
+    ["a longer outer fence holding a shorter one", "````\n```\n```\nCode acceptable: yes\n````"],
+  ])("does not read a marker line inside %s as code acceptable", (_fence, body) => {
+    const policy = stallPolicy();
+    const result = decide(policy, pendingReview(policy, { changesRequestedCount: 1 }), { agentId: qaAgentId }, "in_progress", body);
+
+    expect(result.stallEscalation).toBeUndefined();
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+  });
+
+  it.each([
+    ["backticks plus js", ["```", "```js", "Code acceptable: yes", "```"].join("\n")],
+    ["trailing text after the backticks", ["```", "``` trailing text", "Code acceptable: yes", "```"].join("\n")],
+    [
+      "a nested markdown example",
+      ["```", "Nested markdown example:", "```markdown", "# Review template", "Code acceptable: yes", "```"].join("\n"),
+    ],
+    ["the tilde variant", ["~~~", "~~~ trailing text", "Code acceptable: yes", "~~~"].join("\n")],
+    ["a mixed backtick and tilde line", ["```", "```~~~", "Code acceptable: yes", "```"].join("\n")],
+    ["a shorter closer", ["````", "```", "Code acceptable: yes", "````"].join("\n")],
+    ["a backtick line inside a tilde fence", ["~~~", "```", "Code acceptable: yes", "~~~"].join("\n")],
+    ["a tilde line inside a backtick fence", ["```", "~~~", "Code acceptable: yes", "```"].join("\n")],
+  ])("does not close a fence on %s", (_shape, body) => {
+    const policy = stallPolicy();
+    const result = decide(policy, pendingReview(policy, { changesRequestedCount: 1 }), { agentId: qaAgentId }, "in_progress", body);
+
+    expect(result.stallEscalation).toBeUndefined();
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+  });
+
+  it("closes a CRLF fence on the opener and not on a pseudo-closer", () => {
+    const policy = stallPolicy();
+    const pseudo = ["```", "```js", "Code acceptable: yes", "```"].join("\r\n");
+    const premature = decide(policy, pendingReview(policy, { changesRequestedCount: 1 }), { agentId: qaAgentId }, "in_progress", pseudo);
+    expect(premature.stallEscalation).toBeUndefined();
+    expect(premature.patch.assigneeAgentId).toBe(coderAgentId);
+
+    const closed = ["```", "exit 2: preflight", "```", "Code acceptable: yes"].join("\r\n");
+    const visible = decide(policy, pendingReview(policy, { changesRequestedCount: 1 }), { agentId: qaAgentId }, "in_progress", closed);
+    expect(visible.stallEscalation?.signals).toEqual(["code_acceptable"]);
+  });
+
+  it.each([
+    ["a longer backtick closer", ["```", "exit 2: preflight", "````", "Code acceptable: yes"].join("\n")],
+    ["a longer tilde closer", ["~~~", "exit 2: preflight", "~~~~", "Code acceptable: yes"].join("\n")],
+    ["a closer with trailing spaces and tabs", ["```", "exit 2: preflight", "``` \t ", "Code acceptable: yes"].join("\n")],
+    ["an indented CRLF closer", ["~~~", "exit 2: preflight", "  ~~~~\t", "Code acceptable: yes"].join("\r\n")],
+  ])("closes a fence on %s", (_shape, body) => {
+    const policy = stallPolicy();
+    const result = decide(policy, pendingReview(policy, { changesRequestedCount: 1 }), { agentId: qaAgentId }, "in_progress", body);
+
+    expect(result.stallEscalation?.signals).toEqual(["code_acceptable"]);
+  });
+
+  it("reads a marker line after a closed code fence as code acceptable", () => {
+    const policy = stallPolicy();
+    const result = decide(
+      policy,
+      pendingReview(policy, { changesRequestedCount: 1 }),
+      { agentId: qaAgentId },
+      "in_progress",
+      "The wall is upstream:\n```\nexit 2: preflight\n```\nCode acceptable: yes",
+    );
+
+    expect(result.stallEscalation?.signals).toEqual(["code_acceptable"]);
+  });
+
+  it("compares arbiter ids case-insensitively", () => {
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      stallEscalation: { afterRounds: 2, toAgentId: "ABCDEF00-0000-4000-8000-0000000000AA" },
+    })!;
+    expect(policy.stallEscalation?.toAgentId).toBe("abcdef00-0000-4000-8000-0000000000aa");
+
+    // The arbiter differs only in case from the return assignee: no hand-off.
+    const authored = decide(
+      policy,
+      pendingReview(policy, {
+        changesRequestedCount: 1,
+        deliveredHeadSha: headA,
+        bouncedHeadSha: headA,
+        returnAssignee: { type: "agent", agentId: "ABCDEF00-0000-4000-8000-0000000000AA" },
+      }),
+      { agentId: qaAgentId },
+      "in_progress",
+      "Same finding",
+    );
+    expect(authored.stallEscalation).toBeUndefined();
+
+    // A hold recorded with an upper-case arbiter id stays sticky.
+    const held = decide(
+      policy,
+      pendingReview(
+        policy,
+        {
+          currentParticipant: { type: "agent", agentId: "ABCDEF00-0000-4000-8000-0000000000AA" },
+          changesRequestedCount: 2,
+          stallHandoff: {
+            stageId: policy.stages[0].id,
+            arbiterAgentId: "ABCDEF00-0000-4000-8000-0000000000AA",
+            fromParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+            changesRequestedCount: 2,
+            signals: ["same_head_rebounced"],
+            handedOffAt: "2026-11-05T00:00:00.000Z",
+          },
+        },
+        { assigneeAgentId: "ABCDEF00-0000-4000-8000-0000000000AA" },
+      ),
+      { agentId: coderAgentId },
+      undefined,
+    );
+    expect(held.patch.executionState).toBeUndefined();
+    expect(held.patch.assigneeAgentId).toBeUndefined();
+  });
+
+  it("keeps a policy without stallEscalation free of head bookkeeping through 12 rounds", () => {
+    const policy = reviewOnlyPolicy();
+    const bookkeepingKeys = ["deliveredHeadSha", "bouncedHeadSha", "stallHandoff"];
+    let state: Record<string, unknown> = pendingReview(policy).executionState;
+    for (let round = 1; round <= 12; round += 1) {
+      const bounce = applyIssueExecutionPolicyTransition({
+        issue: { status: "in_review", assigneeAgentId: qaAgentId, assigneeUserId: null, responsibleUserId: null, executionPolicy: policy, executionState: state },
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: `Round ${round}: same finding.\nCode acceptable: yes`,
+        stallArbiterAvailable: true,
+      });
+      state = bounce.patch.executionState as Record<string, unknown>;
+      expect(state).toMatchObject({ status: "changes_requested", changesRequestedCount: round });
+      if (round === 1 || round === 12) {
+        for (const key of bookkeepingKeys) expect(state).not.toHaveProperty(key);
+      }
+      const redelivery = applyIssueExecutionPolicyTransition({
+        issue: { status: "in_progress", assigneeAgentId: coderAgentId, assigneeUserId: null, responsibleUserId: null, executionPolicy: policy, executionState: state },
+        policy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+      state = redelivery.patch.executionState as Record<string, unknown>;
+      if (round === 1 || round === 12) {
+        for (const key of bookkeepingKeys) expect(state).not.toHaveProperty(key);
+      }
+    }
+  });
+
+  it("keeps the arbiter hold sticky across unrelated transitions", () => {
+    const policy = stallPolicy();
+    const result = decide(policy, arbiterHold(policy), { agentId: coderAgentId }, undefined);
+
+    expect(result.patch.executionState).toBeUndefined();
+    expect(result.patch.assigneeAgentId).toBeUndefined();
+  });
+
+  it("dissolves the hold back to the configured reviewer once the policy drops stallEscalation", () => {
+    const policy = stallPolicy();
+    const withoutStall = { ...policy, stallEscalation: undefined };
+    const result = applyIssueExecutionPolicyTransition({
+      issue: { ...arbiterHold(policy), executionPolicy: withoutStall },
+      policy: withoutStall,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+    });
+
+    expect(result.patch.assigneeAgentId).toBe(qaAgentId);
+    expect(result.patch.executionState).toMatchObject({
+      status: "pending",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+    });
+  });
+
+  it("refuses an approval by the arbiter: it advises only and cannot skip the reviewer", () => {
+    const policy = stallPolicy();
+    expect(() =>
+      decide(policy, arbiterHold(policy), { agentId: arbiterAgentId }, "done", "Looks fine to me"),
+    ).toThrow("The stall arbiter advises only and cannot approve this review stage");
+  });
+
+  const otherAgentId = "55555555-5555-4555-8555-555555555555";
+  it.each([
+    ["listed beside the reviewer, stallEscalation repointed", [qaAgentId, arbiterAgentId], { afterRounds: 2, toAgentId: otherAgentId }],
+    ["listed beside the reviewer, stallEscalation dropped", [qaAgentId, arbiterAgentId], undefined],
+    ["replacing the reviewer, stallEscalation dropped", [arbiterAgentId], undefined],
+  ] as const)(
+    "refuses an approval by the handed-off arbiter %s after the hand-off",
+    (_shape, participants, stallEscalation) => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [
+          { type: "review", participants: participants.map((agentId) => ({ type: "agent", agentId })) },
+          { type: "approval", participants: [{ type: "user", userId: boardUserId }] },
+        ],
+        ...(stallEscalation ? { stallEscalation } : {}),
+      })!;
+      expect(() =>
+        decide(policy, arbiterHold(policy), { agentId: arbiterAgentId }, "done", "Approved on the arbiter's reading"),
+      ).toThrow("The stall arbiter advises only and cannot approve this review stage");
+    },
+  );
+
+  it("routes the arbiter's directive to the implementer and the next delivery back to the reviewer", () => {
+    const policy = stallPolicy();
+    const directive = decide(
+      policy,
+      arbiterHold(policy),
+      { agentId: arbiterAgentId },
+      "in_progress",
+      "Root cause is the stale fixture; regenerate it and redeliver.",
+    );
+
+    expect(directive.decision).toMatchObject({ outcome: "changes_requested" });
+    expect(directive.stallEscalation).toBeUndefined();
+    expect(directive.patch.status).toBe("in_progress");
+    expect(directive.patch.assigneeAgentId).toBe(coderAgentId);
+    expect(directive.patch.executionState).toMatchObject({
+      status: "changes_requested",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      changesRequestedCount: 3,
+      stallHandoff: { arbiterAgentId },
+    });
+
+    const redelivery = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        responsibleUserId: boardUserId,
+        executionPolicy: policy,
+        executionState: directive.patch.executionState as Record<string, unknown>,
+      },
+      policy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+    });
+
+    expect(redelivery.patch.assigneeAgentId).toBe(qaAgentId);
+    expect(redelivery.patch.executionState).toMatchObject({
+      status: "pending",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      stallHandoff: { arbiterAgentId },
+    });
+  });
+
+  it("lets the arbiter park the card blocked without moving the stage", () => {
+    const policy = stallPolicy();
+    const result = decide(
+      policy,
+      arbiterHold(policy),
+      { agentId: arbiterAgentId },
+      "blocked",
+      "Blocked on the preflight owner; unblock by fixing the repo grant.",
+    );
+
+    expect(result.decision).toBeUndefined();
+    expect(result.patch.executionState).toBeUndefined();
+  });
+
+  it("does not trigger on approval stages", () => {
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "approval", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      stallEscalation: { afterRounds: 2, toAgentId: arbiterAgentId },
+    })!;
+    const issue = pendingReview(policy, {
+      currentStageType: "approval",
+      changesRequestedCount: 1,
+      deliveredHeadSha: headA,
+      bouncedHeadSha: headA,
+    });
+    const result = decide(policy, issue, { agentId: qaAgentId }, "in_progress", "Code acceptable: yes");
+
+    expect(result.stallEscalation).toBeUndefined();
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+  });
+
+  describe("policy validation", () => {
+    const reviewStage = { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] };
+
+    it("carries a valid stallEscalation and leaves it absent when unset", () => {
+      expect(stallPolicy().stallEscalation).toEqual({ afterRounds: 2, toAgentId: arbiterAgentId });
+      expect(reviewOnlyPolicy()).not.toHaveProperty("stallEscalation");
+    });
+
+    it("refuses afterRounds above the resolved round ceiling", () => {
+      expect(() =>
+        normalizeIssueExecutionPolicy({
+          stages: [reviewStage],
+          maxReviewRounds: 3,
+          stallEscalation: { afterRounds: 4, toAgentId: arbiterAgentId },
+        }),
+      ).toThrow("must not exceed the review-round ceiling (3)");
+      expect(() =>
+        normalizeIssueExecutionPolicy({
+          stages: [reviewStage],
+          stallEscalation: { afterRounds: DEFAULT_MAX_REVIEW_ROUNDS + 1, toAgentId: arbiterAgentId },
+        }),
+      ).toThrow(`must not exceed the review-round ceiling (${DEFAULT_MAX_REVIEW_ROUNDS})`);
+      expect(
+        normalizeIssueExecutionPolicy({
+          stages: [reviewStage],
+          stallEscalation: { afterRounds: DEFAULT_MAX_REVIEW_ROUNDS, toAgentId: arbiterAgentId },
+        })?.stallEscalation?.afterRounds,
+      ).toBe(DEFAULT_MAX_REVIEW_ROUNDS);
+    });
+
+    it.each([
+      ["zero afterRounds", { afterRounds: 0, toAgentId: arbiterAgentId }],
+      ["fractional afterRounds", { afterRounds: 1.5, toAgentId: arbiterAgentId }],
+      ["a non-uuid arbiter", { afterRounds: 2, toAgentId: "coder-le" }],
+      ["an unknown key", { afterRounds: 2, toAgentId: arbiterAgentId, overrideReviewer: true }],
+    ])("refuses %s", (_label, stallEscalation) => {
+      expect(() => normalizeIssueExecutionPolicy({ stages: [reviewStage], stallEscalation })).toThrow(
+        "Invalid execution policy",
+      );
+    });
+
+    it("refuses an arbiter that is the return assignee or a review participant", () => {
+      expect(() =>
+        normalizeIssueExecutionPolicy({
+          stages: [reviewStage],
+          returnAssigneeAgentId: arbiterAgentId,
+          stallEscalation: { afterRounds: 2, toAgentId: arbiterAgentId },
+        }),
+      ).toThrow("must not be the policy's returnAssigneeAgentId");
+      expect(() =>
+        normalizeIssueExecutionPolicy({
+          stages: [reviewStage],
+          stallEscalation: { afterRounds: 2, toAgentId: qaAgentId },
+        }),
+      ).toThrow("must not be a review-stage participant");
     });
   });
 });
@@ -4542,5 +5897,204 @@ describe("approvalStatus preservation across monitor transitions (SUP-16977)", (
     });
     // No approvalStatus key is invented on a blank card.
     expect(state.approvalStatus).toBeUndefined();
+  });
+});
+
+describe("raw execution-row agent-id fold agrees with the decision snapshot compare", () => {
+  const stageId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  // Agent ids with hex letters: `toUpperCase()` changes them. The suite-wide
+  // agent ids are digit-only, so a case row built from them compares a value
+  // with itself and passes whether or not the fold runs.
+  const seatAgentId = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+  const arbiterAgentId = "f0e1d2c3-b4a5-4968-8776-655443322aab";
+  const otherAgentId = "44444444-4444-4444-8444-444444444444";
+  type Principal = { type: "agent" | "user"; agentId?: string; userId?: string };
+
+  const stateWithSeat = (currentParticipant: Principal) => ({
+    status: "pending",
+    currentStageId: stageId,
+    currentStageIndex: 0,
+    currentStageType: "review",
+    currentParticipant,
+    returnAssignee: null,
+    completedStageIds: [],
+    lastDecisionId: null,
+    lastDecisionOutcome: null,
+  });
+  const policyWith = (participants: Principal[], toAgentId: string) => ({
+    mode: "normal",
+    commentRequired: true,
+    stages: [{ id: stageId, type: "review", phase: "pre_merge", approvalsNeeded: 1, participants }],
+    stallEscalation: { afterRounds: 2, toAgentId },
+  });
+  const seatedAgent = (agentId: string): Principal => ({ type: "agent", agentId });
+  const seatedUser = (userId: string): Principal => ({ type: "user", userId });
+
+  function decisionCompareAccepts(read: { state: unknown; policy: unknown }, locked: { state: unknown; policy: unknown }) {
+    try {
+      assertExecutionDecisionSnapshotCurrent(
+        parseIssueExecutionState(read.state),
+        normalizeIssueExecutionPolicy(read.policy),
+        { executionState: locked.state, executionPolicy: locked.policy },
+        "issue-1",
+      );
+      return true;
+    } catch (error) {
+      expect(error).toBeInstanceOf(HttpError);
+      return false;
+    }
+  }
+
+  const cases: Array<{ name: string; read: Principal | string; locked: Principal | string; part: "seat" | "participant" | "arbiter"; same: boolean }> = [
+    { name: "seated agent id differs only in case", part: "seat", read: seatedAgent(seatAgentId), locked: seatedAgent(seatAgentId.toUpperCase()), same: true },
+    { name: "seated agent id differs only in mixed case", part: "seat", read: seatedAgent(seatAgentId), locked: seatedAgent("A1b2C3d4-E5f6-4A7b-8C9d-0E1f2A3b4C5d"), same: true },
+    { name: "seated agent is a different agent", part: "seat", read: seatedAgent(seatAgentId), locked: seatedAgent(otherAgentId), same: false },
+    { name: "seated user id differs only in case", part: "seat", read: seatedUser(boardUserId), locked: seatedUser(boardUserId.toUpperCase()), same: false },
+    { name: "policy participant agent id differs only in case", part: "participant", read: seatedAgent(seatAgentId), locked: seatedAgent(seatAgentId.toUpperCase()), same: true },
+    { name: "policy participant agent id differs only in mixed case", part: "participant", read: seatedAgent(seatAgentId), locked: seatedAgent("a1B2c3D4-e5F6-4a7B-8c9D-0e1F2a3B4c5D"), same: true },
+    { name: "policy participant is a different agent", part: "participant", read: seatedAgent(seatAgentId), locked: seatedAgent(otherAgentId), same: false },
+    { name: "policy participant user id differs only in case", part: "participant", read: seatedUser(boardUserId), locked: seatedUser(boardUserId.toUpperCase()), same: false },
+    { name: "stall arbiter id differs only in case", part: "arbiter", read: arbiterAgentId, locked: arbiterAgentId.toUpperCase(), same: true },
+    { name: "stall arbiter id differs only in mixed case", part: "arbiter", read: arbiterAgentId, locked: "F0e1D2c3-B4a5-4968-8776-655443322AaB", same: true },
+    { name: "stall arbiter is a different agent", part: "arbiter", read: arbiterAgentId, locked: otherAgentId, same: false },
+  ];
+
+  it.each(cases)("$name", ({ part, read, locked, same }) => {
+    const build = (value: Principal | string) => {
+      if (part === "seat") return { state: stateWithSeat(value as Principal), policy: policyWith([seatedAgent(seatAgentId)], arbiterAgentId) };
+      if (part === "participant") return { state: stateWithSeat(seatedAgent(seatAgentId)), policy: policyWith([value as Principal], arbiterAgentId) };
+      return { state: stateWithSeat(seatedAgent(seatAgentId)), policy: policyWith([seatedAgent(seatAgentId)], value as string) };
+    };
+    const readRow = build(read);
+    const lockedRow = build(locked);
+
+    // Plain jsonb shapes built by one builder: JSON text equality is deep equality here.
+    const sameJson = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+    // Every row compares two different raw rows, so no row can pass without the fold.
+    expect(sameJson(readRow, lockedRow)).toBe(false);
+    const foldEqual =
+      sameJson(foldExecutionStateAgentIds(readRow.state), foldExecutionStateAgentIds(lockedRow.state)) &&
+      sameJson(foldExecutionPolicyAgentIds(readRow.policy), foldExecutionPolicyAgentIds(lockedRow.policy));
+
+    expect(foldEqual).toBe(same);
+    expect(decisionCompareAccepts(readRow, lockedRow)).toBe(foldEqual);
+  });
+
+  it("folds the seat with trim + lowercase and a policy id with lowercase only", () => {
+    expect(foldExecutionStateAgentIds(stateWithSeat(seatedAgent(` ${seatAgentId.toUpperCase()} `)))).toMatchObject({
+      currentParticipant: { type: "agent", agentId: seatAgentId },
+    });
+    const policy = foldExecutionPolicyAgentIds(policyWith([seatedAgent(` ${seatAgentId.toUpperCase()} `)], arbiterAgentId.toUpperCase())) as ReturnType<typeof policyWith>;
+    expect(policy.stages[0].participants[0]).toMatchObject({ agentId: ` ${seatAgentId} ` });
+    expect(policy.stallEscalation.toAgentId).toBe(arbiterAgentId);
+  });
+
+  it("folds stallEscalation.toAgentId case in the raw policy row and in the stall-hold controls", () => {
+    const upper = arbiterAgentId.toUpperCase();
+    expect(upper).not.toBe(arbiterAgentId);
+    expect((foldExecutionPolicyAgentIds(policyWith([seatedAgent(seatAgentId)], upper)) as ReturnType<typeof policyWith>).stallEscalation.toAgentId).toBe(arbiterAgentId);
+    // Built without normalization, as a raw stored policy reaches the compare.
+    const raw = (toAgentId: string) => policyWith([seatedAgent(seatAgentId)], toAgentId) as unknown as IssueExecutionPolicy;
+    expect(stallHoldControlsDiffer(raw(arbiterAgentId), raw(upper))).toBe(false);
+    expect(stallHoldControlsDiffer(raw(arbiterAgentId), raw(otherAgentId))).toBe(true);
+  });
+
+  it("stores a normalized stallEscalation.toAgentId in lowercase", () => {
+    const normalized = normalizeIssueExecutionPolicy(policyWith([seatedAgent(seatAgentId)], arbiterAgentId.toUpperCase()));
+    expect(normalized?.stallEscalation?.toAgentId).toBe(arbiterAgentId);
+  });
+
+  it("leaves user ids and non-execution shapes untouched", () => {
+    const userState = stateWithSeat(seatedUser("Board-User"));
+    expect(foldExecutionStateAgentIds(userState)).toBe(userState);
+    expect(foldExecutionStateAgentIds(null)).toBeNull();
+    expect(foldExecutionPolicyAgentIds(undefined)).toBeNull();
+    expect(foldExecutionPolicyAgentIds(policyWith([seatedUser("Board-User")], arbiterAgentId))).toMatchObject({
+      stages: [{ participants: [{ type: "user", userId: "Board-User" }] }],
+    });
+  });
+});
+
+// The stale-snapshot compares above fold agent-id case. Authorization compares
+// do not: the actor must be the seat exactly, and the seat must be a configured
+// stage participant exactly. Each test fails if that compare starts to fold.
+describe("actor-versus-seat and stage membership compare principal ids exactly", () => {
+  const memberAgentId = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+  const caseVariant = memberAgentId.toUpperCase();
+  const policy = makePolicy([{ type: "review", participants: [{ type: "agent", agentId: memberAgentId }] }]);
+  const stageId = policy.stages[0].id;
+  const approve = (seatAgentId: string, actorAgentId: string) =>
+    applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: seatAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: seatAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: actorAgentId },
+      commentBody: "Approved.",
+    });
+
+  it("approves when the actor is the seated agent exactly", () => {
+    expect(approve(memberAgentId, memberAgentId).decision).toMatchObject({ outcome: "approved", stageId });
+  });
+
+  it("refuses an actor whose agent id matches the seat only by letter case", () => {
+    expect(caseVariant).not.toBe(memberAgentId);
+    expect(() => approve(memberAgentId, caseVariant)).toThrow("Only the active reviewer or approver can advance");
+  });
+
+  it("does not treat a seat that matches a stage participant only by letter case as a member", () => {
+    // The case-variant agent is seated and is the actor, so only exact stage
+    // membership stands between it and an approval: the stage re-seats the
+    // configured participant and records no decision.
+    const result = approve(caseVariant, caseVariant);
+    expect(result.decision).toBeUndefined();
+    expect(result.workflowControlledAssignment).toBe(true);
+    expect(result.patch.executionState).toMatchObject({ currentParticipant: { type: "agent", agentId: memberAgentId } });
+  });
+
+  it("refuses an actor whose user id matches the seated user only by letter case", () => {
+    const userPolicy = approvalOnlyPolicy();
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: null,
+          assigneeUserId: ctoUserId,
+          executionPolicy: userPolicy,
+          executionState: {
+            status: "pending",
+            currentStageId: userPolicy.stages[0].id,
+            currentStageIndex: 0,
+            currentStageType: "approval",
+            currentParticipant: { type: "user", userId: ctoUserId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy: userPolicy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { userId: ctoUserId.toUpperCase() },
+        commentBody: "Approved.",
+      }),
+    ).toThrow("Only the active reviewer or approver can advance");
   });
 });

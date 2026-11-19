@@ -172,6 +172,74 @@ export async function resolveCanonicalWikiMaintainerAgentId(
   return rows[0]?.resourceId ?? null;
 }
 
+function isWorkflowControlledPendingReviewParticipant(input: {
+  executionPolicy: unknown;
+  executionState: unknown;
+  incomingAssigneeAgentId: string | null;
+  workflowControlledAssignment?: boolean;
+}): boolean {
+  if (input.workflowControlledAssignment !== true) return false;
+  const state = parseIssueExecutionState(input.executionState);
+  if (
+    state?.status !== "pending" ||
+    typeof state.currentStageIndex !== "number" ||
+    state.currentStageType !== "review"
+  ) return false;
+  const currentParticipant = state.currentParticipant;
+  if (currentParticipant?.type === "agent") {
+    if (currentParticipant.agentId !== input.incomingAssigneeAgentId) return false;
+  } else if (currentParticipant?.type === "user") {
+    if (input.incomingAssigneeAgentId !== null) return false;
+  } else {
+    return false;
+  }
+  const policy = input.executionPolicy as { stages?: unknown } | null | undefined;
+  if (!policy || typeof policy !== "object" || !Array.isArray(policy.stages)) return false;
+  const rawStage = policy.stages[state.currentStageIndex];
+  if (!rawStage || typeof rawStage !== "object") return false;
+  const stage = rawStage as Pick<IssueExecutionStage, "id" | "type"> & { participants?: unknown };
+  if (
+    stage.type !== "review" ||
+    stage.id !== state.currentStageId ||
+    state.completedStageIds.includes(stage.id) ||
+    state.skippedStageIds?.includes(stage.id)
+  ) return false;
+  return Array.isArray(stage.participants) && stage.participants.some((participant) => {
+    if (!participant || typeof participant !== "object") return false;
+    if (currentParticipant.type === "agent") {
+      return participant.type === "agent" && participant.agentId === currentParticipant.agentId;
+    }
+    return participant.type === "user" && participant.userId === currentParticipant.userId;
+  });
+}
+
+/**
+ * SUP-24280: the one write the Wiki handoff guard admits without the canonical
+ * Maintainer as the resulting assignee. The emitter must be able to cancel a
+ * half-emitted handoff stub that nobody owns, and the cancellation must leave
+ * the row unowned. All conditions hold together:
+ * - the write persists status `cancelled`;
+ * - the write carries no assignee field (`assigneeAgentId`/`assigneeUserId`),
+ *   including one a workflow transition adds;
+ * - the stored row has no agent and no user assignee (both exactly null).
+ * With no assignee field written, the resulting row keeps the stored null
+ * assignees. Any assignee write, any other status, any owned row, and any
+ * unknown (undefined) stored assignee stay guarded.
+ */
+export function isUnassignedWikiHandoffCancellation(input: {
+  requestedStatus: unknown;
+  assigneeFieldWritten: boolean;
+  currentAssigneeAgentId: string | null | undefined;
+  currentAssigneeUserId: string | null | undefined;
+}): boolean {
+  return (
+    input.requestedStatus === "cancelled" &&
+    input.assigneeFieldWritten === false &&
+    input.currentAssigneeAgentId === null &&
+    input.currentAssigneeUserId === null
+  );
+}
+
 export async function assertWikiHandoffWriteIntegrity(input: {
   db: Db | { select: unknown };
   companyId: string;
@@ -182,7 +250,20 @@ export async function assertWikiHandoffWriteIntegrity(input: {
     executionState?: unknown;
   };
   incomingAssigneeAgentId: string | null | undefined;
+  actorAgentId?: string | null;
+  currentAssigneeAgentId?: string | null;
   checkReviewStage?: boolean;
+  workflowControlledAssignment?: boolean;
+  /**
+   * SUP-24280: the persisted status and assignee shape of this write, so the
+   * guard can admit an unassigned-stub cancellation. Omit it at doors that
+   * cannot cancel; without it the exemption never applies.
+   */
+  cancellation?: {
+    requestedStatus: unknown;
+    assigneeFieldWritten: boolean;
+    currentAssigneeUserId: string | null | undefined;
+  };
   refusalContext?: { caller: RefusalCaller; issue: RefusalIssue | null };
 }): Promise<void> {
   const canonicalMaintainerAgentId = await resolveCanonicalWikiMaintainerAgentId(
@@ -194,35 +275,64 @@ export async function assertWikiHandoffWriteIntegrity(input: {
   const incoming = typeof input.incomingAssigneeAgentId === "string" && input.incomingAssigneeAgentId.length > 0
     ? input.incomingAssigneeAgentId
     : null;
-  if (incoming !== canonicalMaintainerAgentId) {
-    throw unprocessable(
-      "Refusing assigneeAgentId write on a Wiki handoff: the resulting assignee is not the canonical Wiki Maintainer managed by plugin paperclipai.plugin-llm-wiki (resourceKey wiki-maintainer)",
-      {
-        guard: "assignee_review_gate",
-        subGuard: "wiki_handoff",
-        reason: incoming === null ? "wiki_handoff_unassigned" : "wiki_handoff_non_canonical_assignee",
-        pluginKey: WIKI_LLM_WIKI_PLUGIN_KEY,
-        resourceKey: WIKI_MAINTAINER_AGENT_KEY,
-        canonicalMaintainerAgentId,
-        assigneeAgentId: incoming,
-      },
-    );
-  }
-  if (input.checkReviewStage !== false) {
+  const violation = wikiHandoffWriteWouldViolate({
+    canonicalMaintainerAgentId,
+    incomingAssigneeAgentId: incoming,
+    actorAgentId: input.actorAgentId,
+    currentAssigneeAgentId: input.currentAssigneeAgentId,
+    executionPolicy: input.issue.executionPolicy,
+    executionState: input.issue.executionState,
+    checkReviewStage: input.checkReviewStage,
+    workflowControlledAssignment: input.workflowControlledAssignment,
+  });
+  if (!violation) return;
+  if (
+    input.cancellation &&
+    isUnassignedWikiHandoffCancellation({
+      requestedStatus: input.cancellation.requestedStatus,
+      assigneeFieldWritten: input.cancellation.assigneeFieldWritten,
+      currentAssigneeAgentId: input.currentAssigneeAgentId,
+      currentAssigneeUserId: input.cancellation.currentAssigneeUserId,
+    })
+  ) return;
+  if (
+    violation.reason === "wiki_handoff_self_satisfy" &&
+    input.workflowControlledAssignment !== true &&
+    input.checkReviewStage !== false
+  ) {
     assertAssigneeWriteDoesNotSelfSatisfyReviewStage({
       executionPolicy: input.issue.executionPolicy,
       executionState: input.issue.executionState,
-      incomingAssigneeAgentId: input.incomingAssigneeAgentId,
+      incomingAssigneeAgentId: incoming,
       refusalContext: input.refusalContext,
     });
+    return;
   }
+  throw unprocessable(
+    violation.reason === "wiki_handoff_self_satisfy"
+      ? "Refusing assigneeAgentId write on a Wiki handoff: the canonical Wiki Maintainer cannot be the only participant able to clear the pending review stage"
+      : "Refusing assigneeAgentId write on a Wiki handoff: the resulting assignee is not the canonical Wiki Maintainer managed by plugin paperclipai.plugin-llm-wiki (resourceKey wiki-maintainer)",
+    {
+      guard: "assignee_review_gate",
+      subGuard: "wiki_handoff",
+      reason: incoming === null ? "wiki_handoff_unassigned" : violation.reason,
+      pluginKey: WIKI_LLM_WIKI_PLUGIN_KEY,
+      resourceKey: WIKI_MAINTAINER_AGENT_KEY,
+      canonicalMaintainerAgentId,
+      assigneeAgentId: incoming,
+    },
+  );
 }
 
 export function wikiHandoffWriteWouldViolate(input: {
   canonicalMaintainerAgentId: string | null | undefined;
   incomingAssigneeAgentId: string | null | undefined;
+  actorAgentId?: string | null;
+  currentAssigneeAgentId?: string | null;
   executionPolicy: unknown;
   executionState: unknown;
+  checkReviewStage?: boolean;
+  workflowControlledAssignment?: boolean;
 }): { reason: "wiki_handoff_non_canonical_assignee" | "wiki_handoff_self_satisfy" } | null {
   const canonical = typeof input.canonicalMaintainerAgentId === "string" && input.canonicalMaintainerAgentId.length > 0
     ? input.canonicalMaintainerAgentId
@@ -231,7 +341,22 @@ export function wikiHandoffWriteWouldViolate(input: {
   const incoming = typeof input.incomingAssigneeAgentId === "string" && input.incomingAssigneeAgentId.length > 0
     ? input.incomingAssigneeAgentId
     : null;
-  if (incoming !== canonical) return { reason: "wiki_handoff_non_canonical_assignee" };
+  if (incoming !== canonical) {
+    if (
+      (incoming !== null || (
+        input.actorAgentId === canonical &&
+        input.currentAssigneeAgentId === canonical
+      )) &&
+      isWorkflowControlledPendingReviewParticipant({
+        executionPolicy: input.executionPolicy,
+        executionState: input.executionState,
+        incomingAssigneeAgentId: incoming,
+        workflowControlledAssignment: input.workflowControlledAssignment,
+      })
+    ) return null;
+    return { reason: "wiki_handoff_non_canonical_assignee" };
+  }
+  if (input.checkReviewStage === false && input.workflowControlledAssignment !== true) return null;
   if (
     findSelfSatisfyingReviewStage({
       executionPolicy: input.executionPolicy,

@@ -15,11 +15,18 @@
  * that state on from the live workspace-operation row.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import path from "node:path";
+import { readBoundedStateFile, resolveWorktreeStateRoot } from "@paperclipai/shared/bounded-state-file";
+import {
+  classifyWorktreeStateManifest,
+  isVerifiedWorktreeSeedManifest,
+} from "@paperclipai/shared/worktree-initialization-manifest";
+import { resolveWorktreeSchemaLineage } from "@paperclipai/shared/worktree-initialization-identity";
+import { readWorktreeInitializationKey } from "../worktree-seed-manifest.js";
 import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { authUsers, companies, companyMemberships, issues } from "@paperclipai/db";
+import { authUsers, companies, companyMemberships, issues, MIGRATIONS_FOLDER } from "@paperclipai/db";
 import type {
   WorkspaceReadiness,
   WorkspaceReadinessState,
@@ -58,15 +65,41 @@ export function resolveWorkspaceSeedMarkerDir(env: NodeJS.ProcessEnv = process.e
 
 function readSeedManifestSummary(markerDir: string): SeedManifestSummary {
   const manifestPath = path.join(markerDir, WORKSPACE_SEED_MANIFEST_BASENAME);
-  if (existsSync(manifestPath)) {
-    let manifest: Record<string, unknown>;
-    try {
-      manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
-    } catch {
+  let bytes: Buffer | null;
+  try {
+    bytes = readBoundedStateFile(manifestPath, { trustedRoot: resolveWorktreeStateRoot(manifestPath) });
+  } catch {
+    // A non-regular, oversized, or torn manifest, or one behind a linked state
+    // directory, is never a silent "assume seeded"; the bounded reader refuses
+    // it without blocking.
+    return { state: "failed", phase: null, mode: null, failurePhase: "seed_manifest_unreadable" };
+  }
+  if (bytes !== null) {
+    // A v3 manifest is confirmed for this running instance, a revision of this
+    // build's migration lineage, and the initialization key next to it.
+    const classification = classifyWorktreeStateManifest(bytes, {
+      targetInstanceId: resolvePaperclipInstanceId(),
+      schema: resolveWorktreeSchemaLineage(MIGRATIONS_FOLDER),
+      bindingKey: readWorktreeInitializationKey(markerDir),
+    });
+    if (classification.kind === "refused") {
       // A manifest we cannot parse is evidence of an interrupted write, which is
       // a failure — never a silent "assume seeded".
-      return { state: "failed", phase: null, mode: null, failurePhase: "seed_manifest_unreadable" };
+      const failurePhase = classification.reason === "malformed"
+        ? "seed_manifest_unreadable"
+        : classification.reason === "legacy_unsafe"
+          ? "seed_manifest_legacy_unsafe"
+          : "seed_manifest_unsupported";
+      return { state: "failed", phase: null, mode: null, failurePhase };
     }
+    if (classification.kind === "initialization") {
+      // A fresh or synthetic-fixture preview holds no cloned company, issue or
+      // membership, so the managed "open this clone" contract can never be met
+      // here. It reports its own phase and is never `ready`, and never a
+      // degraded clone that a repair (a reseed from the parent) would "fix".
+      return { state: "failed", phase: "complete", mode: null, failurePhase: "seed_manifest_fresh_preview" };
+    }
+    const manifest = classification.manifest;
     const rawState = typeof manifest.state === "string" ? manifest.state : null;
     const state: WorkspaceSeedReadinessState =
       rawState === "pending" || rawState === "running" || rawState === "verified" || rawState === "failed"
@@ -74,6 +107,13 @@ function readSeedManifestSummary(markerDir: string): SeedManifestSummary {
         : "unknown";
     const phase = typeof manifest.phase === "string" ? manifest.phase : null;
     const mode = manifest.seedMode === "minimal" || manifest.seedMode === "full" ? manifest.seedMode : null;
+    if (state === "verified" && !isVerifiedWorktreeSeedManifest(manifest)) {
+      // Only a complete v2 `minimal` or `full` manifest (source, snapshot,
+      // migration revision, target, attempt, times and a succeeded `complete`
+      // diagnostic) is seed evidence. A bare `verified` claims a finished seed
+      // it cannot show, so it is a failure, never `ready`.
+      return { state: "failed", phase, mode, failurePhase: "seed_manifest_incomplete" };
+    }
     return {
       state,
       phase,
