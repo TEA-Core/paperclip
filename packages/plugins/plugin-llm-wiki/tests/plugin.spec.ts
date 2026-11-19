@@ -3823,6 +3823,206 @@ Duplicate headings receive stable suffixes.
     expect(files.get(path)).toBe(original);
   });
 
+  describe("wiki_write_page destructive-shrink guard", () => {
+    const sha256 = (value: string) => createHash("sha256").update(value, "utf8").digest("hex");
+    const logEntry = (index: number) =>
+      `## [2026-01-01] ingest | entry ${index}\n${"- detail line that pads the entry out to a realistic size.\n".repeat(60)}`;
+    const buildLog = (entryCount: number) =>
+      `# Log\n\nAppend-only chronological record of wiki operations.\n\n${Array.from({ length: entryCount }, (_, i) => logEntry(i)).join("\n")}`;
+
+    async function setupFiles(initial: Record<string, string>) {
+      const harness = createTestHarness({ manifest });
+      const files = new Map<string, string>(Object.entries(initial));
+      const writes: Array<{ path: string; contents: string }> = [];
+      harness.ctx.localFolders.readText = async (_companyId, _folderKey, relativePath) => {
+        const value = files.get(relativePath);
+        if (value == null) throw new Error("missing");
+        return value;
+      };
+      harness.ctx.localFolders.writeTextAtomic = async (_companyId, _folderKey, relativePath, contents) => {
+        writes.push({ path: relativePath, contents });
+        files.set(relativePath, contents);
+        return harness.ctx.localFolders.status(COMPANY_ID, "wiki-root");
+      };
+      await plugin.definition.setup(harness.ctx);
+      return { harness, files, writes };
+    }
+
+    it("refuses the incident shape: a ~1.3 MB log with 382 entries replaced by one entry", async () => {
+      const original = buildLog(382);
+      expect(Buffer.byteLength(original)).toBeGreaterThan(1_000_000);
+      const { harness, files, writes } = await setupFiles({ "wiki/log.md": original });
+
+      // The CAS hash is correct, exactly as in the incident.
+      const rejection = harness.executeTool("wiki_write_page", {
+        companyId: COMPANY_ID,
+        wikiId: "default",
+        path: "wiki/log.md",
+        contents: logEntry(999),
+        expectedHash: sha256(original),
+      });
+      await expect(rejection).rejects.toThrow("Refusing to shrink wiki/log.md");
+      await expect(rejection).rejects.toThrow(/-\d+ bytes/);
+      await expect(rejection).rejects.toThrow("382 to 1");
+      await expect(rejection).rejects.toThrow("allowShrink");
+      expect(writes).toHaveLength(0);
+      expect(files.get("wiki/log.md")).toBe(original);
+      expect(harness.dbExecutes.some((execute) => execute.sql.includes("wiki_page_revisions"))).toBe(false);
+    });
+
+    it("refuses a log write that drops entries even when the byte size barely changes", async () => {
+      const original = buildLog(10);
+      const { harness, files } = await setupFiles({ "wiki/log.md": original });
+      // Drop one entry, replace it with a same-sized filler block.
+      const dropped = original.replace(logEntry(3), `${"x".repeat(logEntry(3).length - 1)}\n`);
+      await expect(
+        harness.executeTool("wiki_write_page", {
+          companyId: COMPANY_ID,
+          wikiId: "default",
+          path: "wiki/log.md",
+          contents: dropped,
+        }),
+      ).rejects.toThrow("10 to 9");
+      expect(files.get("wiki/log.md")).toBe(original);
+    });
+
+    it("refuses a non-log page shrunk below half its size", async () => {
+      const path = "wiki/concepts/big-page.md";
+      const original = `# Big page\n\n${"A paragraph of real content. ".repeat(400)}\n`;
+      const { harness, files } = await setupFiles({ [path]: original });
+      await expect(
+        harness.executeTool("wiki_write_page", {
+          companyId: COMPANY_ID,
+          wikiId: "default",
+          path,
+          contents: "# Big page\n\nstub\n",
+        }),
+      ).rejects.toThrow(`Refusing to shrink ${path}`);
+      expect(files.get(path)).toBe(original);
+    });
+
+    it("allows the same shrink with allowShrink: true and records the override on the revision", async () => {
+      const original = buildLog(382);
+      const { harness, files } = await setupFiles({ "wiki/log.md": original });
+      const replacement = logEntry(999);
+      await expect(
+        harness.executeTool("wiki_write_page", {
+          companyId: COMPANY_ID,
+          wikiId: "default",
+          path: "wiki/log.md",
+          contents: replacement,
+          expectedHash: sha256(original),
+          allowShrink: true,
+        }),
+      ).resolves.toBeTruthy();
+      expect(files.get("wiki/log.md")).toBe(replacement.trimEnd());
+
+      const revisionInsert = harness.dbExecutes.find((execute) => execute.sql.includes("wiki_page_revisions"));
+      const metadataParam = revisionInsert?.params?.find(
+        (param): param is string => typeof param === "string" && param.includes("shrinkOverride"),
+      );
+      expect(metadataParam).toBeTruthy();
+      expect(JSON.parse(metadataParam as string)).toEqual({
+        shrinkOverride: {
+          allowShrink: true,
+          previousBytes: Buffer.byteLength(original),
+          newBytes: Buffer.byteLength(replacement.trimEnd()),
+          previousEntries: 382,
+          newEntries: 1,
+        },
+      });
+    });
+
+    it("does not treat a non-boolean allowShrink as an opt-in", async () => {
+      const original = buildLog(20);
+      const { harness, files } = await setupFiles({ "wiki/log.md": original });
+      await expect(
+        harness.executeTool("wiki_write_page", {
+          companyId: COMPANY_ID,
+          wikiId: "default",
+          path: "wiki/log.md",
+          contents: logEntry(1),
+          allowShrink: "true",
+        }),
+      ).rejects.toThrow("Refusing to shrink wiki/log.md");
+      expect(files.get("wiki/log.md")).toBe(original);
+    });
+
+    it("passes a normal log append, a small edit, and a first write unchanged, with empty revision metadata", async () => {
+      const log = buildLog(50);
+      const pagePath = "wiki/concepts/edited.md";
+      const page = `# Edited\n\n${"Stable body text. ".repeat(300)}\n`;
+      const { harness, files } = await setupFiles({ "wiki/log.md": log, [pagePath]: page });
+
+      const appended = `${log}\n${logEntry(50)}`;
+      await harness.executeTool("wiki_write_page", {
+        companyId: COMPANY_ID,
+        wikiId: "default",
+        path: "wiki/log.md",
+        contents: appended,
+        expectedHash: sha256(log),
+      });
+      expect(files.get("wiki/log.md")).toBe(appended.trimEnd());
+
+      // A ~10% trim is a small edit.
+      const edited = page.slice(0, Math.floor(page.length * 0.9));
+      await harness.executeTool("wiki_write_page", {
+        companyId: COMPANY_ID,
+        wikiId: "default",
+        path: pagePath,
+        contents: edited,
+        expectedHash: sha256(page),
+      });
+      expect(files.get(pagePath)).toBe(edited.trimEnd());
+
+      // A first write to a new page has nothing to shrink.
+      await harness.executeTool("wiki_write_page", {
+        companyId: COMPANY_ID,
+        wikiId: "default",
+        path: "wiki/concepts/brand-new.md",
+        contents: "# Brand new\n",
+      });
+      expect(files.get("wiki/concepts/brand-new.md")).toBe("# Brand new");
+
+      const revisionInserts = harness.dbExecutes.filter((execute) => execute.sql.includes("wiki_page_revisions"));
+      expect(revisionInserts).toHaveLength(3);
+      for (const insert of revisionInserts) {
+        expect(insert.params?.some((param) => typeof param === "string" && param.includes("shrinkOverride"))).toBe(false);
+      }
+    });
+
+    it("lets a small page be rewritten freely (below the guard's minimum size)", async () => {
+      const path = "wiki/concepts/tiny.md";
+      const { harness, files } = await setupFiles({ [path]: "# Tiny\n\nA short page of text.\n" });
+      await harness.executeTool("wiki_write_page", { companyId: COMPANY_ID, wikiId: "default", path, contents: "# T\n" });
+      expect(files.get(path)).toBe("# T");
+    });
+
+    it("still runs the redaction-placeholder and expectedHash guards before the shrink guard", async () => {
+      const original = buildLog(20);
+      const { harness, files } = await setupFiles({ "wiki/log.md": original });
+      await expect(
+        harness.executeTool("wiki_write_page", {
+          companyId: COMPANY_ID,
+          wikiId: "default",
+          path: "wiki/log.md",
+          contents: "***REDACTED***",
+          expectedHash: sha256(original),
+        }),
+      ).rejects.toThrow("contents carries redaction placeholder(s) absent from the current page");
+      await expect(
+        harness.executeTool("wiki_write_page", {
+          companyId: COMPANY_ID,
+          wikiId: "default",
+          path: "wiki/log.md",
+          contents: logEntry(1),
+          expectedHash: "stale",
+        }),
+      ).rejects.toThrow("expected hash stale");
+      expect(files.get("wiki/log.md")).toBe(original);
+    });
+  });
+
   it("accepts keeping placeholder lines verbatim while editing unrelated lines", async () => {
     const harness = createTestHarness({ manifest });
     const original = "# Access notes\n\napi_key: ***REDACTED***\n\nThe service is reached via the internal mesh gateway.\n";

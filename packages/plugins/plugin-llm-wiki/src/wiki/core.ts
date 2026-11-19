@@ -374,6 +374,8 @@ type WritePageInput = {
   path: string;
   contents: string;
   expectedHash?: string | null;
+  /** Explicit opt-in for a full-page write that the destructive-shrink guard would refuse. */
+  allowShrink?: boolean;
   summary?: string | null;
   sourceRefs?: unknown;
   operationId?: string | null;
@@ -1886,6 +1888,62 @@ function assertNoNewRedactionPlaceholders(incomingContents: string, currentConte
   }
 }
 
+/** Pages smaller than this are rewritten freely; the byte-ratio guard only protects pages worth recovering. */
+const WIKI_SHRINK_GUARD_MIN_CURRENT_BYTES = 4096;
+/** A full-page write must keep at least this fraction of the current page's bytes unless the caller opts in. */
+const WIKI_SHRINK_GUARD_MIN_RETAINED_RATIO = 0.5;
+const WIKI_LOG_ENTRY_PATTERN = /^## \[/gm;
+
+type WikiShrinkOverride = {
+  allowShrink: true;
+  previousBytes: number;
+  newBytes: number;
+  previousEntries: number;
+  newEntries: number;
+};
+
+function countLogEntries(contents: string): number {
+  return contents.match(WIKI_LOG_ENTRY_PATTERN)?.length ?? 0;
+}
+
+/**
+ * Refuses a full-page write that would destroy most of an existing page, or drop `## [` entries from the
+ * append-only log (`wiki/log.md`, the page type inferPageType() reports as "log"). Returns the override
+ * record when the caller opted in to a write that the guard would otherwise have refused.
+ */
+function assertNoDestructiveShrink(
+  incomingContents: string,
+  currentContents: string | null,
+  path: string,
+  allowShrink: boolean,
+): WikiShrinkOverride | null {
+  if (currentContents == null) return null;
+  const previousBytes = Buffer.byteLength(currentContents, "utf8");
+  const newBytes = Buffer.byteLength(incomingContents, "utf8");
+  const isAppendOnlyLog = path === "wiki/log.md" || path === "log.md";
+  const previousEntries = isAppendOnlyLog ? countLogEntries(currentContents) : 0;
+  const newEntries = isAppendOnlyLog ? countLogEntries(incomingContents) : 0;
+  const droppedEntries = newEntries < previousEntries;
+  const droppedBytes =
+    previousBytes >= WIKI_SHRINK_GUARD_MIN_CURRENT_BYTES &&
+    newBytes < previousBytes * WIKI_SHRINK_GUARD_MIN_RETAINED_RATIO;
+  if (!droppedEntries && !droppedBytes) return null;
+  if (allowShrink) return { allowShrink: true, previousBytes, newBytes, previousEntries, newEntries };
+
+  const signed = (value: number) => (value >= 0 ? `+${value}` : `${value}`);
+  const byteDelta = newBytes - previousBytes;
+  const percent = previousBytes > 0 ? Math.round((byteDelta / previousBytes) * 100) : 0;
+  const entryDelta = isAppendOnlyLog
+    ? `; \`## [\` entries ${previousEntries} to ${newEntries} (${signed(newEntries - previousEntries)})`
+    : "";
+  throw new Error(
+    `Refusing to shrink ${path}: write would change it from ${previousBytes} to ${newBytes} bytes ` +
+    `(${signed(byteDelta)} bytes, ${signed(percent)}%)${entryDelta}. ` +
+    `wiki_write_page replaces the whole page; to append, send the full existing contents plus the new entry. ` +
+    `If this shrink is deliberate, repeat the write with allowShrink: true`,
+  );
+}
+
 async function upsertWikiInstance(ctx: PluginContext, input: { companyId: string; wikiId: string; rootPath?: string | null }) {
   await ctx.db.execute(
     `INSERT INTO ${tableName(ctx.db.namespace, "wiki_instances")} AS wiki_instances
@@ -1917,6 +1975,7 @@ async function upsertPageMetadata(ctx: PluginContext, input: {
   summary?: string | null;
   sourceRefs?: unknown;
   operationId?: string | null;
+  revisionMetadata?: Record<string, unknown>;
 }) {
   const pageId = randomUUID();
   const revisionId = randomUUID();
@@ -1956,8 +2015,8 @@ async function upsertPageMetadata(ctx: PluginContext, input: {
   await ctx.db.execute(
     `INSERT INTO ${tableName(ctx.db.namespace, "wiki_page_revisions")}
        (id, company_id, wiki_id, space_id, page_id, operation_id, path, content_hash, summary, metadata)
-     VALUES ($1, $2, $3, $8, (SELECT id FROM ${tableName(ctx.db.namespace, "wiki_pages")} WHERE company_id = $2 AND wiki_id = $3 AND space_id = $8 AND path = $4), $7, $4, $5, $6, '{}'::jsonb)`,
-    [revisionId, input.companyId, input.wikiId, input.path, hash, input.summary ?? null, input.operationId ?? null, input.spaceId],
+     VALUES ($1, $2, $3, $8, (SELECT id FROM ${tableName(ctx.db.namespace, "wiki_pages")} WHERE company_id = $2 AND wiki_id = $3 AND space_id = $8 AND path = $4), $7, $4, $5, $6, $9::jsonb)`,
+    [revisionId, input.companyId, input.wikiId, input.path, hash, input.summary ?? null, input.operationId ?? null, input.spaceId, jsonParam(input.revisionMetadata ?? {})],
   );
 
   return { title, pageType, backlinks, hash, revisionId };
@@ -1971,6 +2030,11 @@ export async function writeWikiPage(ctx: PluginContext, input: WritePageInput) {
   const current = await readCurrentWithHash(ctx, input.companyId, path, space);
   assertNoNewRedactionPlaceholders(input.contents, current.contents, path);
   assertExpectedHash(input.expectedHash, current.hash, path);
+  // Only the agent-tool surface (the default writer) takes a caller-supplied full body that may be a stale or
+  // partial projection. Board UI saves are explicit human edits and plugin_internal bodies are generated.
+  const shrinkOverride = (input.writer ?? "agent_tool") === "agent_tool"
+    ? assertNoDestructiveShrink(input.contents, current.contents, path, input.allowShrink === true)
+    : null;
   await ctx.localFolders.writeTextAtomic(input.companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, path), input.contents);
   const metadata = await upsertPageMetadata(ctx, {
     companyId: input.companyId,
@@ -1981,6 +2045,7 @@ export async function writeWikiPage(ctx: PluginContext, input: WritePageInput) {
     summary: input.summary,
     sourceRefs: input.sourceRefs,
     operationId: input.operationId,
+    revisionMetadata: shrinkOverride ? { shrinkOverride } : undefined,
   });
   await upsertWikiInstance(ctx, { companyId: input.companyId, wikiId });
   return { status: "ok", wikiId, spaceSlug: space.slug, path, previousHash: current.hash, ...metadata };
@@ -4234,7 +4299,7 @@ export async function registerWikiTools(ctx: PluginContext) {
 
   ctx.tools.register("wiki_write_page", {
     displayName: "Write Wiki Page",
-    description: "Atomically write a markdown wiki page after plugin path validation.",
+    description: "Atomically write a markdown wiki page after plugin path validation. Replaces the whole page; a write that destroys most of an existing page or drops wiki/log.md entries is refused unless allowShrink: true.",
     parametersSchema: ctx.manifest.tools?.find((tool) => tool.name === "wiki_write_page")?.parametersSchema ?? { type: "object" },
   }, async (params: unknown): Promise<ToolResult> => {
     const input = params as ToolParams;
@@ -4245,6 +4310,7 @@ export async function registerWikiTools(ctx: PluginContext) {
       path: requireString(input.path, "path"),
       contents: requireString(input.contents, "contents"),
       expectedHash: stringField(input.expectedHash),
+      allowShrink: input.allowShrink === true,
       summary: stringField(input.summary),
       sourceRefs: input.sourceRefs,
     });
@@ -4358,6 +4424,7 @@ export async function registerWikiTools(ctx: PluginContext) {
       path: "wiki/index.md",
       contents: requireString(input.contents, "contents"),
       expectedHash: stringField(input.expectedHash),
+      allowShrink: input.allowShrink === true,
       summary: "Update index",
     });
     return { content: "Updated wiki/index.md", data: result };

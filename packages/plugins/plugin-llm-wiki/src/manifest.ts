@@ -351,7 +351,7 @@ const manifest: PaperclipPluginManifestV1 = {
     {
       name: "wiki_write_page",
       displayName: "Write Wiki Page",
-      description: "Atomically write a markdown wiki page in one wiki space after plugin path validation and optional hash conflict checks. Operation agents should pass the issue's spaceSlug; omitting it uses the default space. Protected control files such as AGENTS.md and IDEA.md are excluded from agent-tool writes.",
+      description: "Atomically write a markdown wiki page in one wiki space after plugin path validation and optional hash conflict checks. This replaces the WHOLE page: to add to an existing page, send its full current contents plus your change. A write that would shrink an existing page below half its size (pages of 4096 bytes or more) or drop `## [` entries from wiki/log.md is refused with the size and entry-count deltas; pass allowShrink: true only for a deliberate shrink (recorded on the page revision). Operation agents should pass the issue's spaceSlug; omitting it uses the default space. Protected control files such as AGENTS.md and IDEA.md are excluded from agent-tool writes.",
       parametersSchema: {
         type: "object",
         properties: {
@@ -361,6 +361,7 @@ const manifest: PaperclipPluginManifestV1 = {
           path: { type: "string" },
           contents: { type: "string" },
           expectedHash: { type: "string" },
+          allowShrink: { type: "boolean", description: "Default false. Set true to allow a write that the destructive-shrink guard would refuse; the override is recorded on the page revision." },
           summary: { type: "string" }
         },
         required: ["companyId", "wikiId", "path", "contents"]
@@ -439,7 +440,8 @@ const manifest: PaperclipPluginManifestV1 = {
           wikiId: { type: "string" },
           spaceSlug: { type: "string" },
           contents: { type: "string" },
-          expectedHash: { type: "string" }
+          expectedHash: { type: "string" },
+          allowShrink: { type: "boolean", description: "Default false. Set true to allow a write that the destructive-shrink guard would refuse; the override is recorded on the page revision." }
         },
         required: ["companyId", "wikiId", "contents"]
       }
