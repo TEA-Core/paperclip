@@ -1,10 +1,12 @@
 import path from "node:path";
-import { and, eq, inArray, isNotNull, ne } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, ne, sql } from "drizzle-orm";
 import {
+  activityLog,
   agents,
   documentRevisions,
   documents,
   executionWorkspaces,
+  heartbeatRuns,
   issueDocuments,
   issueExecutionDecisions,
   issueLabels,
@@ -15,6 +17,7 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
+import { readBuildCommit } from "../build-commit.js";
 import {
   LEGACY_WORKTREE_GIT_OPTIONS,
   normalizeBaseBranch,
@@ -51,6 +54,7 @@ import {
   LADDERED_CHILD_CARVE_OUT_LABEL_NAMES,
 } from "./laddered-child-eligibility.js";
 import { resolveGatedPrincipal } from "./approval-status-reconciler.js";
+import { isStrandedIssueRecoveryOriginKind } from "./recovery/origins.js";
 
 export class GitHubAuthError extends Error {
   readonly status: number;
@@ -72,6 +76,7 @@ const NO_DELIVERABLE_HEAD_DISPOSITIONS = new Set([
   "upstream-equivalent-fix-no-deliverable-head",
   "child-delivery-parent-close",
   "merged-elsewhere",
+  "control-plane-operation-no-deliverable",
 ]);
 
 // SUP-14579 (ADR-072 close-ladder shape): the three stages a top-level
@@ -105,6 +110,8 @@ const ADR072_CLOSE_LADDER: {
 const TIER_2_PREFIX = "Closed at Tier 2 (live):";
 const TIER_1_PREFIX = "Closed at Tier 1 (landed, not liveness-probed):";
 const TIER_1_SUFFIX = "Liveness unverified.";
+// SUP-24299: refusal code for a Tier 2 declaration that also carries TIER_1_SUFFIX.
+export const DONE_TRANSITION_TIER_CONFLICT_CODE = "done_transition_tier_conflict";
 // Machine-checkable accepted forms, embedded verbatim in every rejection message so the
 // 422 remedy and the parser always agree on the exact literal (SUP-15787).
 // SUP-21902: the Tier 2 form is self-verifying — the evidence must name the probe
@@ -120,7 +127,8 @@ export const TIER2_FORM =
 // message (SUP-15787 invariant). Accepted ONLY on record_only cards; a
 // repository_delivery card keeps the merge-head form above unchanged.
 export const TIER2_RECORD_ONLY_FORM =
-  '"Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>"';
+  '"Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>"' +
+  ' or, for a single instant, "Closed at Tier 2 (live): record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>"';
 export const TIER1_FORM =
   '"Closed at Tier 1 (landed, not liveness-probed): landed-at-tip <sha> — <why Tier 2 was not probed>. Liveness unverified."' +
   ' or "Closed at Tier 1 (landed, not liveness-probed): landing-delegated PR #<N>; ' +
@@ -147,9 +155,13 @@ export const DONE_TIER_STRUCTURED_FORMS =
 // set by noRepositoryStructuredFormSuffix, never listed in it, so a
 // repository_delivery remedy stays byte-identical.
 export const DONE_TIER_TIER2_RECORD_ONLY_JSON =
-  '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>" }';
+  '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }';
+// Structured probeEvidence carries the grammar WITHOUT the Tier 2 prefix: the guard
+// composes the prefix itself (SUP-24079).
+export const DONE_TIER_RECORD_ONLY_PROBE_EVIDENCE_NOTE =
+  'probeEvidence excludes the "Closed at Tier 2 (live): " prefix because the guard composes that prefix; for a single instant, write "observed <UTC ISO-8601 timestamp>" in place of the range';
 export const DONE_TIER_RECORD_ONLY_STRUCTURED_FORMS =
-  `${DONE_TIER_TIER2_RECORD_ONLY_JSON}; ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
+  `${DONE_TIER_TIER2_RECORD_ONLY_JSON} (${DONE_TIER_RECORD_ONLY_PROBE_EVIDENCE_NOTE}); ${DONE_TIER_TIER1_LANDED_JSON}; ${DONE_TIER_TIER1_DELEGATED_JSON}`;
 // SUP-22570: the record_only close form. Advertised only on record_only issues,
 // so the repository_delivery remedies stay byte-identical.
 export const TIER1_NO_REPOSITORY_FORM =
@@ -279,12 +291,34 @@ export interface DoneTransitionOverride {
   reason?: string;
 }
 
+interface DoneTier2CloseAuditDetails {
+  probeEvidence: string;
+  probeCommand: string;
+  probeTarget: string | null;
+  observed: string | null;
+  observedRangeEnd: string | null;
+  tierForm: "live" | "record-only";
+  probeHead: string | null;
+  mergeCommit: string | null;
+  /**
+   * SUP-23490: the run that performed the close, as the closing door carried it
+   * (null on doors without a run — human closes and the system backstop). With
+   * `closingRunStartedAt` and `observed` in the same record, a restated
+   * observation (an `observed` instant predating the closing run) is detectable
+   * after the fact from the audit row alone.
+   */
+  closingRunId?: string | null;
+  /** SUP-23490: the closing run's resolved start (`startedAt ?? createdAt`), when resolvable. */
+  closingRunStartedAt?: string | null;
+}
+
 export interface DoneTierDeclarationResult {
   allowed: boolean;
   reason: string;
   tier: "tier1" | "tier2" | null;
   skipped: boolean;
   skipReason: string | null;
+  tier2Audit?: DoneTier2CloseAuditDetails;
   // SUP-22570: set when the accepted declaration is the record_only
   // no-repository form, with what it measured. The accepting door measures
   // again just before its status write (measureNoRepositoryLandingForClose)
@@ -294,6 +328,10 @@ export interface DoneTierDeclarationResult {
   // A remedy specific to this refusal. A door that builds its own generic remedy
   // for a refused declaration uses this one instead when it is set.
   remedy?: string;
+  // Set when the refusal carries its own route error code. A door that maps every
+  // refused declaration to done_transition_missing_tier_declaration uses this one
+  // instead when it is set.
+  code?: typeof DONE_TRANSITION_TIER_CONFLICT_CODE;
 }
 
 function appendSkipReason(current: string | null, piece: string): string {
@@ -625,6 +663,206 @@ async function writeAuditLog(
 }
 
 /**
+ * SUP-24136: a mechanism C refusal is deterministic — the same unsatisfied
+ * stage refuses the same way until a decision lands — yet the 15 s
+ * stranded-summary sweep (execution-control-reconciliation.ts) re-evaluates
+ * the guard on every tick for a Summarizer-assigned card. SUP-24118 got 54
+ * identical rows in 13 minutes, SUP-24121 47, SUP-23420 several hundred.
+ * Bound the audit trail per (company, issue, reason): while fewer than
+ * LADDER_REFUSAL_REPEAT_LIMIT identical refusal rows exist inside the window,
+ * the refusal is recorded unchanged; the next one records a single
+ * `issue.done_transition_ladder_refusal_repeated` escalation row; further
+ * identical refusals inside the window record nothing.
+ *
+ * One clock only: the window test compares `activity_log.created_at` (stamped
+ * by the database default `now()`) with the database `now()` in the same SQL
+ * statement. The application clock is never read, so app/database skew cannot
+ * widen or shrink the window.
+ *
+ * Only the audit row is bounded. The caller computes the refusal verdict
+ * before this runs and returns it unchanged; nothing on the close path reads
+ * these rows. A failed count read records the refusal row, as before the cap.
+ * Two concurrent refusals can both read the same count, so the bound is
+ * approximate under concurrency, never below the pre-cap behaviour.
+ */
+export const LADDER_REFUSAL_REPEAT_LIMIT = 3;
+export const LADDER_REFUSAL_REPEAT_WINDOW_SECONDS = 60 * 60;
+const LADDER_REFUSED_ACTION = "issue.done_transition_ladder_refused";
+const LADDER_REFUSAL_REPEATED_ACTION = "issue.done_transition_ladder_refusal_repeated";
+
+/**
+ * SUP-24298: a done write refused with 422 `done_transition_missing_tier_declaration`
+ * leaves its own refusal-class row, countable like `LADDER_REFUSED_ACTION`. The row
+ * is written per refused write: the thread remedy comment is deduped per guard code
+ * (`postTerminalStatusRefusalComment`), so a repeated refusal posts no second
+ * comment and this row is the only per-write machine trace. Never throws, so the
+ * HTTP result of the refusal is unchanged by a failed audit write.
+ *
+ * SUP-24429: a 409 `done_transition_record_only_flip_refused` (a close request that
+ * also relabels a stored repository_delivery card record_only) writes the same
+ * refusal-class row, naming the stored and requested requirements and recording
+ * that the landing check was not skipped.
+ */
+export const DONE_TRANSITION_REFUSED_ACTION = "issue.done_transition_refused";
+
+export async function writeDoneTransitionRefusedAuditLog(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  details:
+    | {
+        code: "done_transition_missing_tier_declaration";
+        httpStatus: 422;
+        reason: string;
+        decisionCarried: boolean;
+        runId: string | null;
+        stage?: string;
+      }
+    | {
+        code: "done_transition_record_only_flip_refused";
+        httpStatus: 409;
+        reason: string;
+        decisionCarried: boolean;
+        runId: string | null;
+        storedDeliveryRequirement: IssueDeliveryRequirement;
+        requestedDeliveryRequirement: "record_only";
+        landingCheckSkipped: false;
+        // `request`: refused against the unlocked read; `locked_recheck`:
+        // refused under the issue row lock in the write transaction.
+        stage: "request" | "locked_recheck";
+      },
+): Promise<void> {
+  await writeAuditLog(db, issue, DONE_TRANSITION_REFUSED_ACTION, {
+    ...details,
+    source: "done_transition_guard",
+  });
+}
+
+/**
+ * The shared repeat cap behind `writeLadderRefusalAuditLog` and
+ * `writeGuardSkippedAuditLog`. `signatureKey` names the `activity_log.details`
+ * field whose value identifies a repeat; the cap counts `action` rows and
+ * `repeatedAction` escalation rows with that signature inside the window.
+ */
+async function writeRepeatCappedAuditLog(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  cap: {
+    action: string;
+    repeatedAction: string;
+    signatureKey: string;
+    signature: string;
+    details: Record<string, unknown>;
+  },
+): Promise<void> {
+  const { action, repeatedAction, signatureKey, signature, details } = cap;
+  let priorRefusals = 0;
+  let priorEscalations = 0;
+  try {
+    const [counts] = await db
+      .select({
+        refused: sql<number>`count(*) filter (where ${activityLog.action} = ${action})`,
+        escalated: sql<number>`count(*) filter (where ${activityLog.action} = ${repeatedAction})`,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, issue.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issue.id),
+          inArray(activityLog.action, [action, repeatedAction]),
+          sql`${activityLog.details} ->> ${signatureKey}::text = ${signature}`,
+          sql`${activityLog.createdAt} > now() - make_interval(secs => ${LADDER_REFUSAL_REPEAT_WINDOW_SECONDS})`,
+        ),
+      );
+    const refused = Number(counts?.refused);
+    const escalated = Number(counts?.escalated);
+    if (Number.isFinite(refused)) priorRefusals = refused;
+    if (Number.isFinite(escalated)) priorEscalations = escalated;
+  } catch (err) {
+    logger.warn({ err, issueId: issue.id, action }, "failed to count prior repeats; recording the row");
+  }
+  if (priorRefusals < LADDER_REFUSAL_REPEAT_LIMIT) {
+    await writeAuditLog(db, issue, action, details);
+    return;
+  }
+  if (priorEscalations === 0) {
+    await writeAuditLog(db, issue, repeatedAction, {
+      ...details,
+      refusalCount: priorRefusals + 1,
+      repeatLimit: LADDER_REFUSAL_REPEAT_LIMIT,
+      windowSeconds: LADDER_REFUSAL_REPEAT_WINDOW_SECONDS,
+    });
+  }
+}
+
+async function writeLadderRefusalAuditLog(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  details: Record<string, unknown> & { reason: string },
+): Promise<void> {
+  await writeRepeatCappedAuditLog(db, issue, {
+    action: LADDER_REFUSED_ACTION,
+    repeatedAction: LADDER_REFUSAL_REPEATED_ACTION,
+    signatureKey: "reason",
+    signature: details.reason,
+    details,
+  });
+}
+
+/**
+ * SUP-24557 (SUP-24216): the same cap for `issue.done_transition_guard_skipped`
+ * rows whose class is `branch_absent_on_remote`. The sweeps that re-run the
+ * guard every tick (stranded-summary reaper, merged-operator-merge-cards) wrote
+ * one such row per tick for a card whose branch stays absent from the remote.
+ * The signature is (issue, skip action, class, BRANCH): the branch is parsed
+ * out of the skipReason (`branch_absent_on_remote:<branch>[; <pr skip reason>]`,
+ * where the optional `; ` tail varies per tick and is excluded) or taken from
+ * the refusal row's `branch`, and is stored in `details.repeatSignature`. A
+ * second absent branch is its own signature and starts its own count. The
+ * refusal row (`reason: branch_absent_on_remote`, `allowed: false`) and the
+ * fail-open row (`skipReason: branch_absent_on_remote:<branch>`) keep separate
+ * signatures. The escalation row needs its own action name because
+ * `issue.done_transition_ladder_refusal_repeated` is ladder-specific.
+ *
+ * Every other skip row is written unchanged, in the same synchronous step.
+ */
+export const GUARD_SKIP_REPEATED_ACTION = "issue.done_transition_guard_skip_repeated";
+const GUARD_SKIPPED_ACTION = "issue.done_transition_guard_skipped";
+const BRANCH_ABSENT_SKIP_CLASS = "branch_absent_on_remote";
+
+function branchAbsentSkipSignature(details: Record<string, unknown>): string | null {
+  const skipReason = details.skipReason;
+  const prefix = `${BRANCH_ABSENT_SKIP_CLASS}:`;
+  if (typeof skipReason === "string" && skipReason.startsWith(prefix)) {
+    const branch = skipReason.slice(prefix.length).split("; ")[0];
+    return branch ? `${prefix}${branch}` : null;
+  }
+  if (details.reason === BRANCH_ABSENT_SKIP_CLASS && typeof details.branch === "string" && details.branch) {
+    return `refused:${prefix}${details.branch}`;
+  }
+  return null;
+}
+
+export async function writeGuardSkippedAuditLog(
+  db: Db,
+  issue: { id: string; companyId: string; identifier: string | null },
+  details: Record<string, unknown>,
+): Promise<void> {
+  const signature = branchAbsentSkipSignature(details);
+  if (signature === null) {
+    await writeAuditLog(db, issue, GUARD_SKIPPED_ACTION, details);
+    return;
+  }
+  await writeRepeatCappedAuditLog(db, issue, {
+    action: GUARD_SKIPPED_ACTION,
+    repeatedAction: GUARD_SKIP_REPEATED_ACTION,
+    signatureKey: "repeatSignature",
+    signature,
+    details: { ...details, repeatSignature: signature },
+  });
+}
+
+/**
  * SUP-14429 (mechanism B): resolve the live GraphQL `reviewDecision` of an open
  * linked PR. This is the only signal that an external reviewer is currently
  * holding the PR open — an undismissed CHANGES_REQUESTED is a pre-existing,
@@ -670,6 +908,156 @@ async function fetchPullRequestReviewDecision(
   } catch {
     return null;
   }
+}
+
+/**
+ * SUP-24135: live landability of a `landing-delegated` carrier PR, read once at
+ * close time. A declaration names the carrier; this is the only read of the
+ * carrier itself before the obligation transfers to the backstop.
+ */
+interface LandingCarrierHealth {
+  headSha: string | null;
+  mergeStateStatus: string | null;
+  /**
+   * Required checks whose every same-type, same-name context on the head is
+   * terminal-failed. Empty when the context list was cut at a page boundary:
+   * a rerun on a later page could still pass, so a partial read never refuses.
+   */
+  failedRequired: Array<{ name: string; conclusion: string }>;
+}
+
+// Terminal check-run conclusions and commit-status states that cannot satisfy a
+// required check. NEUTRAL/SKIPPED/SUCCESS satisfy it; STALE is not terminal-failed.
+// ACTION_REQUIRED awaits manual approval and is not terminal-failed.
+const FAILED_CHECK_RUN_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE"]);
+const FAILED_STATUS_STATES = new Set(["FAILURE", "ERROR"]);
+// A hung carrier read must not hold the close; an aborted read fails open.
+const LANDING_CARRIER_PROBE_TIMEOUT_MS = 10_000;
+// The refusal names at most this many failed checks, each cut to a bounded length.
+const LANDING_CARRIER_REFUSAL_MAX_CHECKS = 3;
+const LANDING_CARRIER_REFUSAL_MAX_NAME_CHARS = 80;
+
+/**
+ * Read-only GraphQL probe of the carrier's head required checks and merge state.
+ * Every unresolvable outcome returns null; callers fail open, as for
+ * fetchPullRequestReviewDecision (never fail closed on a GitHub outage).
+ */
+async function fetchLandingCarrierHealth(
+  pr: LinkedPullRequest,
+  token: string,
+): Promise<LandingCarrierHealth | null> {
+  const query =
+    "query landingCarrier($owner: String!, $name: String!, $number: Int!) { " +
+    "repository(owner: $owner, name: $name) { pullRequest(number: $number) { state mergeStateStatus " +
+    "commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 100) { pageInfo { hasNextPage } nodes { __typename " +
+    "... on CheckRun { name status conclusion isRequired(pullRequestNumber: $number) } " +
+    "... on StatusContext { context state isRequired(pullRequestNumber: $number) } } } } } } } } } }";
+  try {
+    const response = await ghFetch(GITHUB_GRAPHQL_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "user-agent": "paperclip-done-transition-guard",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        query,
+        variables: { owner: pr.owner, name: pr.repo, number: pr.number },
+      }),
+      signal: AbortSignal.timeout(LANDING_CARRIER_PROBE_TIMEOUT_MS),
+    });
+    if (!response.ok) return null;
+    const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!body || (Array.isArray(body.errors) && body.errors.length > 0)) return null;
+    const repository = (body.data as Record<string, unknown> | null | undefined)?.repository as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    const pullRequest = repository?.pullRequest as Record<string, unknown> | null | undefined;
+    if (!pullRequest || pullRequest.state !== "OPEN") return null;
+    const commitNodes = (pullRequest.commits as { nodes?: unknown } | null | undefined)?.nodes;
+    const commit = Array.isArray(commitNodes)
+      ? (commitNodes[0] as { commit?: Record<string, unknown> } | undefined)?.commit
+      : undefined;
+    const rollup = commit?.statusCheckRollup as
+      | { contexts?: { nodes?: unknown; pageInfo?: { hasNextPage?: unknown } | null } }
+      | null
+      | undefined;
+    const contexts = Array.isArray(rollup?.contexts?.nodes) ? rollup.contexts.nodes : [];
+    // A re-run leaves the failed run beside a newer one with the same name, so a
+    // required check counts as failed only when none of its contexts can still pass.
+    // Check runs and commit statuses are separate requirements on GitHub, so one
+    // type never satisfies (or hides) the other: group by type plus name.
+    const byCheck = new Map<string, { name: string; failed: string | null; open: boolean }>();
+    for (const node of contexts) {
+      const ctx = node as Record<string, unknown> | null;
+      if (!ctx || ctx.isRequired !== true) continue;
+      let name: string | null = null;
+      let failed: string | null = null;
+      if (ctx.__typename === "CheckRun" && typeof ctx.name === "string") {
+        name = ctx.name;
+        const conclusion = typeof ctx.conclusion === "string" ? ctx.conclusion : null;
+        if (ctx.status === "COMPLETED" && conclusion && FAILED_CHECK_RUN_CONCLUSIONS.has(conclusion)) failed = conclusion;
+      } else if (ctx.__typename === "StatusContext" && typeof ctx.context === "string") {
+        name = ctx.context;
+        if (typeof ctx.state === "string" && FAILED_STATUS_STATES.has(ctx.state)) failed = ctx.state;
+      }
+      if (name === null) continue;
+      const key = `${ctx.__typename}\u0000${name}`;
+      const entry = byCheck.get(key) ?? { name, failed: null, open: false };
+      if (failed) entry.failed = failed;
+      else entry.open = true;
+      byCheck.set(key, entry);
+    }
+    const partial = rollup?.contexts?.pageInfo?.hasNextPage !== false;
+    const failedRequired = partial
+      ? []
+      : [...byCheck.values()]
+        .filter((entry) => entry.failed !== null && !entry.open)
+        .map((entry) => ({ name: entry.name, conclusion: entry.failed!.toLowerCase() }));
+    return {
+      headSha: typeof commit?.oid === "string" ? commit.oid : null,
+      mergeStateStatus: typeof pullRequest.mergeStateStatus === "string" ? pullRequest.mergeStateStatus : null,
+      failedRequired,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * SUP-24135: refuse a `landing-delegated` close whose carrier cannot land as it
+ * stands. `BLOCKED` alone is the normal delegated state (required checks still
+ * running, review pending) and `UNKNOWN` is GitHub still computing, so neither
+ * refuses; a terminal-failed required check or a merge conflict does.
+ */
+function landingCarrierRefusal(
+  prNumber: number,
+  health: LandingCarrierHealth | null,
+): DoneTierDeclarationResult | null {
+  if (!health) return null;
+  const head = health.headSha ? ` on head ${health.headSha.slice(0, 12)}` : "";
+  if (health.failedRequired.length > 0) {
+    const named = health.failedRequired.slice(0, LANDING_CARRIER_REFUSAL_MAX_CHECKS).map((check) => {
+      const name = check.name.length > LANDING_CARRIER_REFUSAL_MAX_NAME_CHARS
+        ? `${check.name.slice(0, LANDING_CARRIER_REFUSAL_MAX_NAME_CHARS)}…`
+        : check.name;
+      return `${name} (${check.conclusion})`;
+    });
+    const more = health.failedRequired.length - named.length;
+    const checks = more > 0 ? `${named.join(", ")} and ${more} more` : named.join(", ");
+    return refuseTier1(
+      `carrier_required_check_failed: Tier 1 declaration using "landing-delegated" names PR #${prNumber}, but its required check ${checks} is terminal-failed${head}; the carrier cannot land, so the landing obligation cannot transfer to done-close-landing-backstop.`,
+      `Fix the failing required check on PR #${prNumber} (push a fix or re-run it) and close again once it is passing or running, or keep the card open until the carrier can land.`,
+    );
+  }
+  if (health.mergeStateStatus === "DIRTY") {
+    return refuseTier1(
+      `carrier_merge_conflict: Tier 1 declaration using "landing-delegated" names PR #${prNumber}, but it has merge conflicts with its base branch${head}; the carrier cannot land, so the landing obligation cannot transfer to done-close-landing-backstop.`,
+      `Resolve the merge conflicts on PR #${prNumber} and close again, or keep the card open until the carrier can land.`,
+    );
+  }
+  return null;
 }
 
 /**
@@ -827,7 +1215,8 @@ function parseTier1Declaration(body: string): Tier1Parse {
 //    AND belongs to this issue (a linked merged PR merge commit, or this issue's recorded
 //    delivery head / work-product commit — SUP-23031; ancestry alone is not possession).
 //  - `landing-delegated`: names a linked `PR #<N>` and `done-close-landing-backstop` as the
-//    post-merge carrier (the async worker itself is unchanged here).
+//    post-merge carrier, and a live open carrier has no terminal-failed required check and
+//    no merge conflict (SUP-24135; the async worker itself is unchanged here).
 // TIER1_FORM is token-bearing so every emitted accepted form reaches the landing-token pre-check.
 // Tier 2 is a separate live-probe concern and is not checked here; see proveTier2Live.
 const LANDED_AT_TIP_TOKEN = "landed-at-tip";
@@ -939,6 +1328,86 @@ export async function loadOwnDraftPredicate(
     );
 }
 
+type PullRequestWorkProductLink = {
+  kind: "own" | "foreign" | "unknown";
+  pr: LinkedPullRequest | null;
+};
+
+async function readPullRequestWorkProductLinks(
+  db: Db,
+  issue: {
+    id: string;
+    companyId: string;
+    projectId?: string | null;
+    projectWorkspaceId?: string | null;
+    executionWorkspaceId?: string | null;
+  },
+): Promise<PullRequestWorkProductLink[]> {
+  const products = await db
+    .select({
+      id: issueWorkProducts.id,
+      title: issueWorkProducts.title,
+      status: issueWorkProducts.status,
+      metadata: issueWorkProducts.metadata,
+    })
+    .from(issueWorkProducts)
+    .where(
+      and(
+        eq(issueWorkProducts.companyId, issue.companyId),
+        eq(issueWorkProducts.issueId, issue.id),
+        eq(issueWorkProducts.type, "pull_request"),
+      ),
+    );
+  if (products.length === 0) return [];
+  const fields = await loadTier1RepoFields(db, issue);
+  const context = await resolveIssueRepoContext(db, { companyId: issue.companyId, ...fields });
+  const parsed = parseRepoUrl(context?.repoUrl ?? null);
+  const deliveryRepo = parsed?.hostname === "github.com" ? `${parsed.owner}/${parsed.repo}`.toLowerCase() : null;
+  const ownership = await resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id);
+  return products.map((product) => {
+    const metadata = product.metadata ?? {};
+    const headRef = typeof metadata.headRef === "string" && metadata.headRef.length > 0 ? metadata.headRef : null;
+    const branchIsKnown = headRef !== null && ownership.legitimate && ownership.branch !== null;
+    const branchMatches = branchIsKnown && ownership.branch === headRef;
+    const repository = typeof metadata.repository === "string"
+      ? /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(metadata.repository)
+      : null;
+    const repositoryName = repository ? `${repository[1]}/${repository[2]}`.toLowerCase() : null;
+    const own = branchMatches && deliveryRepo !== null && repositoryName === deliveryRepo;
+    const prNumber = typeof metadata.prNumber === "number" && Number.isInteger(metadata.prNumber) && metadata.prNumber > 0
+      ? metadata.prNumber
+      : null;
+    let pr: LinkedPullRequest | null = null;
+    if (repository && prNumber !== null) {
+      const owner = repository[1]!;
+      const repo = repository[2]!;
+      pr = {
+        id: product.id,
+        owner,
+        repo,
+        number: prNumber,
+        nodeId: null,
+        headRefName: headRef,
+        displayName: `${owner}/${repo}#${prNumber}`,
+        title: product.title,
+        cachedState: product.status,
+        lastErrorCode: null,
+        reviewDecision: null,
+        draft: false,
+        headRepoFullName: `${owner}/${repo}`,
+      };
+    }
+    const kind = !branchIsKnown
+      ? "unknown"
+      : own
+        ? "own"
+        : !branchMatches || (deliveryRepo !== null && repositoryName !== null)
+          ? "foreign"
+          : "unknown";
+    return { kind, pr };
+  });
+}
+
 async function proveLandingDelegated(
   db: Db,
   issue: { id: string; companyId: string; identifier: string | null },
@@ -960,6 +1429,15 @@ async function proveLandingDelegated(
   let linked: LinkedPullRequest[];
   try {
     linked = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id, { includeDrafts: true });
+    const workProductLinks = await readPullRequestWorkProductLinks(db, issue);
+    const seen = new Set(linked.map((candidate) => `${candidate.owner}/${candidate.repo}#${candidate.number}`.toLowerCase()));
+    for (const link of workProductLinks) {
+      if (link.kind !== "own" || link.pr === null) continue;
+      const key = `${link.pr.owner}/${link.pr.repo}#${link.pr.number}`.toLowerCase();
+      if (seen.has(key)) continue;
+      linked.push(link.pr);
+      seen.add(key);
+    }
   } catch (err) {
     return refuseTier1(unverifiedTier1(err));
   }
@@ -1058,6 +1536,15 @@ async function proveLandingDelegated(
               `Tier 1 declaration using "landing-delegated" names PR #${number}, but repository auto-merge is disabled and no merge queue covers the PR's base branch; enable auto-merge, enable a merge queue for the base branch, or use landed-at-tip evidence. The backstop arms merges via GitHub's enablePullRequestAutoMerge, which on a repository with auto-merge disabled and no merge queue has no landing carrier.`,
             );
           }
+        }
+        // SUP-24135: the carrier itself must still be able to land. Only a live
+        // open PR is probed; any unreadable probe fails open (null).
+        if (hydration.hydrated && live.cachedState === "open") {
+          const carrierRefusal = landingCarrierRefusal(
+            number,
+            await fetchLandingCarrierHealth(pr, candidate.token),
+          );
+          if (carrierRefusal) return carrierRefusal;
         }
         break;
       }
@@ -1482,7 +1969,11 @@ function refuseTier2(reason: string): DoneTierDeclarationResult {
   };
 }
 
-function acceptTier2(evidence: string, sameRun: boolean): DoneTierDeclarationResult {
+function acceptTier2(
+  evidence: string,
+  sameRun: boolean,
+  audit: Omit<DoneTier2CloseAuditDetails, "probeEvidence">,
+): DoneTierDeclarationResult {
   const prefix = sameRun
     ? "Tier 2 declaration found in same-run comment: "
     : "Tier 2 declaration found: ";
@@ -1492,6 +1983,7 @@ function acceptTier2(evidence: string, sameRun: boolean): DoneTierDeclarationRes
     tier: "tier2",
     skipped: false,
     skipReason: null,
+    tier2Audit: { probeEvidence: evidence, ...audit },
   };
 }
 
@@ -1646,7 +2138,146 @@ function proveTier2RecordOnlyLive(evidence: string, sameRun: boolean): DoneTierD
         `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
     );
   }
-  return acceptTier2(evidence.trim(), sameRun);
+  return acceptTier2(evidence.trim(), sameRun, {
+    probeCommand: probeCommand!.trim(),
+    probeTarget: observedTarget!.trim(),
+    observed: observedAt!,
+    observedRangeEnd: observedRangeEnd ?? null,
+    tierForm: "record-only",
+    probeHead: null,
+    mergeCommit: null,
+  });
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// SUP-23490: a record-only Tier 2 observation must belong to the CLOSING run.
+// The record-only grammar's `observed` instant is the whole liveness claim, and
+// nothing used to compare it against the closing run's lifetime, so a run could
+// restate another run's close line byte-for-byte (SUP-22444 → SUP-22817, a
+// 290-character verbatim copy whose cited state was already false) and be
+// accepted as fresh proof. The guard now loads the closing run's
+// `heartbeat_runs` row and refuses an observation that predates the run's
+// start (`startedAt ?? createdAt` — both precede any probe the run itself can
+// make) or that postdates the evaluation (SUP-24266: no clock-skew allowance —
+// the evaluation precedes the close write that carries the declaration, so an
+// observed instant later than it is later than the close), with the reason
+// naming the run and its start. Fail-closed: a closing run
+// whose row cannot be resolved has no verifiable lifetime, so the observation
+// cannot be attributed to it. The merge-head grammar has no `observed`
+// component and its origin predicate (probe head == delivery merge head) is
+// unchanged: it is stamped with the closing run id but never lifetime-gated.
+// Doors without a run id (human closes, the system backstop) have no lifetime
+// to compare against; they keep the pre-existing grammar checks plus the
+// future-observed refusal (SUP-24266, applied to every closer), and the
+// audit row's null `closingRunId` says so. Every accepted result — both forms —
+// is stamped with `closingRunId`/`closingRunStartedAt` so the
+// `issue.done_transition_tier2_close` activity row carries the closing run
+// identity beside the cited observation (SUP-23366's machine record).
+// ───────────────────────────────────────────────────────────────────────
+async function loadClosingRunStart(
+  db: Db,
+  companyId: string,
+  runId: string,
+): Promise<Date | null> {
+  const rows = await db
+    .select({ startedAt: heartbeatRuns.startedAt, createdAt: heartbeatRuns.createdAt })
+    .from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
+  const row = rows[0];
+  if (!row) {
+    return null;
+  }
+  return row.startedAt ?? row.createdAt;
+}
+
+async function attributeTier2EvidenceToClosingRun(
+  db: Db,
+  issue: { companyId: string },
+  result: DoneTierDeclarationResult,
+  runId: string | null,
+  closingAgentId: string | null = null,
+): Promise<DoneTierDeclarationResult> {
+  if (!result.allowed || !result.tier2Audit) {
+    return result;
+  }
+  const audit: DoneTier2CloseAuditDetails = {
+    ...result.tier2Audit,
+    closingRunId: runId,
+    closingRunStartedAt: null,
+  };
+  // The merge-head form's origin predicate (probe head resolves to the recorded
+  // delivery merge head) already binds the evidence to the delivery; there is
+  // no observation instant to place inside the run's lifetime.
+  if (audit.tierForm !== "record-only") {
+    return { ...result, tier2Audit: audit };
+  }
+  const latestObserved = audit.observedRangeEnd ?? audit.observed;
+  // Compare at the full accepted precision (1-6 fractional digits): `Date.parse`
+  // truncates to milliseconds, so `.7261Z` would tie a `.726Z` close write. The
+  // evaluation clock has millisecond precision, so any observed sub-millisecond
+  // tail past it is strictly later.
+  if (
+    latestObserved &&
+    utcInstantSortKey(latestObserved) > utcInstantSortKey(new Date(Date.now()).toISOString())
+  ) {
+    return refuseTier2(
+      `record-only close Tier 2 probe evidence names observed instant ${latestObserved}, which postdates this ` +
+        "close; an observation cannot be made after the close that cites it, and it must fall inside the " +
+        "closing run, at or before the close write. Re-probe from this run and close with the fresh observed " +
+        "timestamp. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
+  }
+  if (!runId) {
+    // An agent closer has no excuse: every agent request can carry the run id
+    // header (or close from the issue's own checkout run), so an agent
+    // record-only close with no resolvable closing run is exactly the
+    // header-omission bypass — the cited observation cannot be proven to be
+    // this run's, and omitting the identity must not skip the lifetime gate.
+    // Human and system closers have no run to name; they keep the grammar-only
+    // behavior and the audit row's null closingRunId says so.
+    if (closingAgentId) {
+      return refuseTier2(
+        `record-only close Tier 2 probe evidence cannot be attributed to a closing run: agent ${closingAgentId} closed ` +
+          "without a resolvable closing run, so the cited observation cannot be proven to be this run's. Close from a " +
+          "live run (run id header set, or from the issue's own checkout run) and cite a fresh observed timestamp. " +
+          `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+      );
+    }
+    return { ...result, tier2Audit: audit };
+  }
+  let runStart: Date | null = null;
+  try {
+    runStart = await loadClosingRunStart(db, issue.companyId, runId);
+  } catch (err) {
+    return refuseTier2(
+      `record-only close Tier 2 probe evidence could not be checked against the closing run's lifetime ` +
+        `(heartbeat run lookup for ${runId} failed: ${err instanceof Error ? err.message : "unknown"}); a closing ` +
+        "run whose lifetime cannot be resolved cannot prove the cited observation is its own. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
+  }
+  if (runStart === null) {
+    return refuseTier2(
+      `record-only close Tier 2 probe evidence cannot be attributed to the closing run: run ${runId} has no ` +
+        "heartbeat run row, so the closing run's lifetime is unresolvable and the cited observation cannot be " +
+        "proven to be this run's. Re-probe from this run and close with the fresh observed timestamp. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
+  }
+  const runStartMs = runStart.getTime();
+  const observedStartMs = Date.parse(audit.observed ?? "");
+  if (!Number.isNaN(observedStartMs) && observedStartMs < runStartMs) {
+    return refuseTier2(
+      `record-only close Tier 2 probe evidence names observed instant ${audit.observed}, which predates the ` +
+        `closing run (run ${runId}, started ${runStart.toISOString()}); an observation made before this run began ` +
+        "is another run's observation restated, not this run's live proof. Re-probe from this run and close " +
+        "with the fresh observed timestamp. " +
+        `Accepted form: ${TIER2_RECORD_ONLY_FORM}`,
+    );
+  }
+  audit.closingRunStartedAt = runStart.toISOString();
+  return { ...result, tier2Audit: audit };
 }
 
 async function proveTier2Live(
@@ -1774,7 +2405,17 @@ async function proveTier2Live(
         `Accepted form: ${tier2Forms}`,
     );
   }
-  return acceptTier2(evidence.trim(), sameRun);
+  const probeCommand = shape[1]!.trim();
+  const probeTarget = /https?:\/\/[^\s<>"']+/.exec(probeCommand)?.[0] ?? null;
+  return acceptTier2(evidence.trim(), sameRun, {
+    probeCommand,
+    probeTarget,
+    observed: null,
+    observedRangeEnd: null,
+    tierForm: "live",
+    probeHead,
+    mergeCommit: recordedMergeCommit,
+  });
 }
 
 // SUP-22570: the record_only no-repository close form. A record_only issue
@@ -1818,6 +2459,8 @@ export interface NoRepositoryLandingSubject {
   projectWorkspaceId?: string | null;
   executionWorkspaceId?: string | null;
   deliveryRequirement?: IssueDeliveryRequirement | null;
+  originKind?: string | null;
+  originId?: string | null;
 }
 
 /**
@@ -1834,6 +2477,8 @@ export interface NoRepositoryLandingMeasurement {
   baseBranch: string;
   /** The project workspace's reference branch, reduced to a branch name; board-only like the base. */
   repoRef: string | null;
+  recoverySourceIssueId: string | null;
+  permittedSourceCard: { id: string; identifier: string } | null;
   ruling: { documentId: string; revisionNumber: number; revisionCount: number; updatedAt: string };
   probe: {
     branch: string;
@@ -1912,7 +2557,10 @@ function noRepositoryRefusal(reason: string, remedy?: string): NoRepositoryLandi
 }
 
 /** Everything the close rests on that the database holds; `probe` aside, the measurement. */
-type NoRepositoryLandingRecord = Omit<NoRepositoryLandingMeasurement, "probe"> & {
+type NoRepositoryLandingRecord = Omit<
+  NoRepositoryLandingMeasurement,
+  "probe" | "recoverySourceIssueId" | "permittedSourceCard"
+> & {
   identifier: string;
   projectId: string;
   repositoryLocation: NonNullable<ReturnType<typeof parseRepoUrl>>;
@@ -2075,17 +2723,8 @@ async function readNoRepositoryLandingRecord(
       `cannot be declared on an issue that links pull requests (${linkedPrs.map((pr) => pr.displayName).join(", ")}).`,
     );
   }
-  const pullRequestProducts = await db
-    .select({ id: issueWorkProducts.id })
-    .from(issueWorkProducts)
-    .where(
-      and(
-        eq(issueWorkProducts.companyId, issue.companyId),
-        eq(issueWorkProducts.issueId, issue.id),
-        eq(issueWorkProducts.type, "pull_request"),
-      ),
-    );
-  if (pullRequestProducts.length > 0) {
+  const pullRequestProducts = await readPullRequestWorkProductLinks(db, issue);
+  if (pullRequestProducts.some((product) => product.kind !== "foreign")) {
     return noRepositoryRefusal("cannot be declared on an issue that records a pull request work product.");
   }
 
@@ -2196,12 +2835,25 @@ async function verifyNoRepositoryLanding(
   }
   const projectBranches = new Set([record.baseBranch, githubDefaultBranch]);
   if (record.repoRef) projectBranches.add(record.repoRef);
+  const recoverySourceIssueId = isStrandedIssueRecoveryOriginKind(issue.originKind) ? issue.originId ?? null : null;
+  let permittedSourceCard: NoRepositoryLandingMeasurement["permittedSourceCard"] = null;
+  if (recoverySourceIssueId) {
+    permittedSourceCard = await db
+      .select({ id: issues.id, identifier: issues.identifier })
+      .from(issues)
+      .where(and(eq(issues.id, recoverySourceIssueId), eq(issues.companyId, issue.companyId)))
+      .then((rows) => {
+        const source = rows[0];
+        return source?.identifier ? { id: source.id, identifier: source.identifier } : null;
+      });
+  }
   const probe = await probeNoRepositoryWorktree({
     recordedWorktreePath: record.recordedWorktreePath,
     managedProjectRoot: path.dirname(
       resolveManagedProjectWorkspaceDir({ companyId: issue.companyId, projectId: record.projectId }),
     ),
     issueIdentifier: record.identifier,
+    permittedOtherCardIdentifiers: permittedSourceCard ? new Set([permittedSourceCard.identifier]) : undefined,
     projectBranches,
     attributedBranches: new Set(record.attributedBranches),
     existingOtherCardIdentifiers: async (candidates) =>
@@ -2245,6 +2897,8 @@ async function verifyNoRepositoryLanding(
       repository: record.repository,
       baseBranch: record.baseBranch,
       repoRef: record.repoRef,
+      recoverySourceIssueId,
+      permittedSourceCard,
       ruling: record.ruling,
       probe: {
         branch: probe.branch,
@@ -2372,6 +3026,26 @@ export async function verifyNoRepositoryLandingAtTransition(
     (lockedIssue.projectWorkspaceId ?? null) !== measurement.issueProjectWorkspaceId
   ) {
     return noRepositoryRefusal("refused: the issue's workspace binding changed after the close was measured.");
+  }
+  const recoverySourceIssueId = isStrandedIssueRecoveryOriginKind(lockedIssue.originKind)
+    ? lockedIssue.originId ?? null
+    : null;
+  if (recoverySourceIssueId !== measurement.recoverySourceIssueId) {
+    return noRepositoryRefusal("refused: the recovery source changed after the close was measured.");
+  }
+  if (measurement.permittedSourceCard) {
+    const sourceIdentifier = await tx
+      .select({ identifier: issues.identifier })
+      .from(issues)
+      .where(and(
+        eq(issues.id, measurement.permittedSourceCard.id),
+        eq(issues.companyId, lockedIssue.companyId),
+      ))
+      .for("update")
+      .then((rows) => rows[0]?.identifier ?? null);
+    if (sourceIdentifier !== measurement.permittedSourceCard.identifier) {
+      return noRepositoryRefusal("refused: the recovery source identifier changed after the close was measured.");
+    }
   }
   let read: Awaited<ReturnType<typeof readNoRepositoryLandingRecord>>;
   try {
@@ -2516,6 +3190,40 @@ function describeTierRejection(tier2: Tier2Parse, tier1: Tier1Parse, tier2Forms:
   return null;
 }
 
+/**
+ * SUP-24299: the Tier 1 marker "Liveness unverified." disclaims the probe that
+ * a Tier 2 (live) declaration claims, so one declaration cannot carry both. The
+ * Tier 2 matchers end in a catch-all (`(.+)$`), which accepted the marker as
+ * part of the predicate text. Returns the refusal, or null when the Tier 2
+ * evidence does not carry the marker. The check reads only the matched evidence
+ * line, so a separate Tier 1 line elsewhere in the same comment is unaffected.
+ */
+function refuseTier2LivenessConflict(
+  evidence: string,
+  tier2Forms: string,
+  tier1Forms: string,
+): DoneTierDeclarationResult | null {
+  if (!evidence.toLowerCase().includes(TIER_1_SUFFIX.toLowerCase())) {
+    return null;
+  }
+  return {
+    allowed: false,
+    reason:
+      `A Tier 2 declaration also carries the Tier 1 marker "${TIER_1_SUFFIX}". The two are mutually ` +
+      'exclusive: "Closed at Tier 2 (live)" claims the running surface was probed, and ' +
+      `"${TIER_1_SUFFIX}" says it was not. ` +
+      `Accepted Tier 2 form: ${tier2Forms} — per SUP-12693.`,
+    tier: null,
+    skipped: false,
+    skipReason: null,
+    code: DONE_TRANSITION_TIER_CONFLICT_CODE,
+    remedy:
+      `If you probed the running surface, remove "${TIER_1_SUFFIX}" from the Tier 2 line and keep the ` +
+      `probe evidence: ${tier2Forms}. If you did not probe it, do not claim Tier 2: close at Tier 1 ` +
+      `with the marker as the suffix of the Tier 1 line: ${tier1Forms} — per SUP-12693.`,
+  };
+}
+
 export async function evaluateDoneTierDeclaration(
   db: Db,
   issue: {
@@ -2538,6 +3246,11 @@ export async function evaluateDoneTierDeclaration(
   // inside its status write passes the closer; without one the record_only
   // no-repository form refuses.
   noRepositoryLandingCloser: DoneTierClosingActor | null = null,
+  // The closing agent's id, when the closer is an agent (null for human and
+  // system closers). A record-only Tier 2 close by an agent must resolve to a
+  // closing run or it refuses — an agent can otherwise drop the run id header
+  // and skip the closing-run lifetime gate entirely.
+  closingAgentId: string | null = null,
   recordOnlyReviewDecision = false,
 ): Promise<DoneTierDeclarationResult> {
   // SUP-22801: a record_only card's primary accepted Tier 2 form is the
@@ -2576,11 +3289,22 @@ export async function evaluateDoneTierDeclaration(
   if (accompanyingComment && accompanyingComment.trim().length > 0) {
     const tier2 = parseTier2Declaration(accompanyingComment);
     if (tier2.kind === "matched") {
+      const conflict = refuseTier2LivenessConflict(tier2.evidence, tier2Forms, tier1Forms);
+      if (conflict) return conflict;
       // SUP-21902: a matched Tier 2 sentence is no longer accepted on its face —
       // the origin predicate resolves the named probe head and compares it with
       // the delivery merge head before the close is allowed. SUP-22801: on a
       // record_only card the record-only grammar is proven locally instead.
-      return proveTier2Live(db, issue, tier2.evidence, false, issue.deliveryRequirement);
+      // SUP-23490: the accepted evidence is then attributed to the closing run —
+      // a record-only `observed` instant outside the closing run's lifetime is
+      // refused as a restated observation.
+      return attributeTier2EvidenceToClosingRun(
+        db,
+        issue,
+        await proveTier2Live(db, issue, tier2.evidence, false, issue.deliveryRequirement),
+        runId,
+        closingAgentId,
+      );
     }
     const tier1 = parseTier1Declaration(accompanyingComment);
     if (tier1.kind === "matched") {
@@ -2657,10 +3381,19 @@ export async function evaluateDoneTierDeclaration(
 
   const tier2 = parseTier2Declaration(sameRunComment.body);
   if (tier2.kind === "matched") {
+    const conflict = refuseTier2LivenessConflict(tier2.evidence, tier2Forms, tier1Forms);
+    if (conflict) return conflict;
     // SUP-21902: same-run Tier 2 declarations face the same origin predicate as
     // accompanying-comment ones — a pre-merge or unresolvable head is refused
-    // identically on both doors.
-    return proveTier2Live(db, issue, tier2.evidence, true, issue.deliveryRequirement);
+    // identically on both doors. SUP-23490: the same closing-run lifetime gate
+    // applies — a same-run comment can still restate another run's observation.
+    return attributeTier2EvidenceToClosingRun(
+      db,
+      issue,
+      await proveTier2Live(db, issue, tier2.evidence, true, issue.deliveryRequirement),
+      runId,
+      closingAgentId,
+    );
   }
 
   const tier1 = parseTier1Declaration(sameRunComment.body);
@@ -2709,20 +3442,54 @@ export async function evaluateDoneTierDeclaration(
 
 export type CitedCommitStatus = "resolved" | "nonexistent" | "unverifiable";
 
+export interface CitedCommitRepository {
+  hostname: string;
+  owner: string;
+  repo: string;
+}
+
 export interface CitedCommitResolution {
   sha: string;
   status: CitedCommitStatus;
+  probedRepos?: CitedCommitRepository[];
+  reason?: string;
 }
 
 export interface CitedShaResolution {
   results: CitedCommitResolution[];
 }
 
-const CITED_SHA_PATTERNS: RegExp[] = [
-  /`([0-9a-f]{40})`/gi,
-  /\b[A-Za-z0-9_.-]+@([0-9a-f]{40})(?![0-9a-f])/gi,
-  /github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/commit\/([0-9a-f]{40})(?![0-9a-f])/gi,
-  /\b(?:commits?|shas?)\s*[:#]?\s*([0-9a-f]{40})(?![0-9a-f])/gi,
+interface CitedCommitReference {
+  sha: string;
+  explicitRepos: CitedCommitRepository[];
+  ambiguous: boolean;
+}
+
+interface CitedRepoCandidate extends CitedCommitRepository {
+  controlRef: string | null;
+}
+
+interface CitedShaPattern {
+  regex: RegExp;
+  shaIndex: number;
+  repo?: (match: RegExpMatchArray) => CitedCommitRepository | null;
+}
+
+const CITED_SHA_PATTERNS: CitedShaPattern[] = [
+  { regex: /`([0-9a-f]{40})`/gi, shaIndex: 1 },
+  {
+    regex: /\b(?:([A-Za-z0-9_.-]+)\/)?([A-Za-z0-9_.-]+)@([0-9a-f]{40})(?![0-9a-f])/gi,
+    shaIndex: 3,
+    repo: (match) => match[1]
+      ? { hostname: "github.com", owner: match[1], repo: match[2]! }
+      : null,
+  },
+  {
+    regex: /github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/commit\/([0-9a-f]{40})(?![0-9a-f])/gi,
+    shaIndex: 3,
+    repo: (match) => ({ hostname: "github.com", owner: match[1]!, repo: match[2]! }),
+  },
+  { regex: /\b(?:commits?|shas?)\s*[:#]?\s*([0-9a-f]{40})(?![0-9a-f])/gi, shaIndex: 1 },
 ];
 
 const CITED_SHA_MAX = 10;
@@ -2731,20 +3498,48 @@ function looksLikeShaCandidate(token: string): boolean {
   return /[0-9]/.test(token) && /[a-f]/.test(token);
 }
 
-export function extractCitedCommitShas(text: string | null | undefined): string[] {
+function citedRepoKey(repo: CitedCommitRepository): string {
+  return `${repo.hostname.toLowerCase()}/${repo.owner.toLowerCase()}/${repo.repo.toLowerCase()}`;
+}
+
+function mergeCitedRepoCandidates(...groups: CitedRepoCandidate[][]): CitedRepoCandidate[] {
+  const merged = new Map<string, CitedRepoCandidate>();
+  for (const candidate of groups.flat()) {
+    const key = citedRepoKey(candidate);
+    const existing = merged.get(key);
+    if (existing) existing.controlRef ??= candidate.controlRef;
+    else merged.set(key, { ...candidate });
+  }
+  return [...merged.values()];
+}
+
+function extractCitedCommitReferences(text: string | null | undefined): CitedCommitReference[] {
   if (!text) return [];
-  const seen = new Set<string>();
+  const references = new Map<string, CitedCommitReference>();
   for (const pattern of CITED_SHA_PATTERNS) {
-    for (const match of text.matchAll(pattern)) {
-      const raw = match[1];
+    for (const match of text.matchAll(pattern.regex)) {
+      const raw = match[pattern.shaIndex];
       if (!raw) continue;
       const sha = raw.toLowerCase();
       if (!looksLikeShaCandidate(sha)) continue;
-      seen.add(sha);
-      if (seen.size >= CITED_SHA_MAX) return [...seen];
+      const reference = references.get(sha) ?? { sha, explicitRepos: [], ambiguous: false };
+      const repo = pattern.repo?.(match) ?? null;
+      if (repo) {
+        if (!reference.explicitRepos.some((candidate) => citedRepoKey(candidate) === citedRepoKey(repo))) {
+          reference.explicitRepos.push(repo);
+        }
+      } else {
+        reference.ambiguous = true;
+      }
+      references.set(sha, reference);
+      if (references.size >= CITED_SHA_MAX) return [...references.values()];
     }
   }
-  return [...seen];
+  return [...references.values()];
+}
+
+export function extractCitedCommitShas(text: string | null | undefined): string[] {
+  return extractCitedCommitReferences(text).map((reference) => reference.sha);
 }
 
 type CommitRefProbeOutcome = "present" | "absent" | "error";
@@ -2781,6 +3576,22 @@ async function githubCommitRefProbe(
   return "error";
 }
 
+async function resolveServedBuildRepo(): Promise<CitedCommitRepository | null> {
+  const configured = parseRepoUrl(process.env.PAPERCLIP_BUILD_REPO_URL ?? null);
+  if (configured) return configured;
+  try {
+    const origin = await runHardenedGit(["config", "--get", "remote.origin.url"], {
+      cwd: process.cwd(),
+      timeoutMs: 1500,
+      inheritEnvironment: true,
+    });
+    const parsed = parseRepoUrl(origin.trim());
+    if (parsed) return parsed;
+  } catch {
+  }
+  return null;
+}
+
 export async function resolveCitedCommits(
   db: Db,
   issue: {
@@ -2793,98 +3604,175 @@ export async function resolveCitedCommits(
   },
   text: string | null | undefined,
 ): Promise<CitedShaResolution> {
-  const shas = extractCitedCommitShas(text);
-  if (shas.length === 0) return { results: [] };
+  const references = extractCitedCommitReferences(text);
+  if (references.length === 0) return { results: [] };
 
-  const unverifiableAll = (): CitedShaResolution => ({
-    results: shas.map((sha) => ({ sha, status: "unverifiable" as const })),
-  });
-
-  let ctx: IssueRepoContext | null;
+  let globalCandidates: CitedRepoCandidate[] = [];
+  let repositoryContextFailed = false;
   try {
     const fields = await loadTier1RepoFields(db, issue);
-    ctx = await resolveIssueRepoContext(db, {
+    const ctx = await resolveIssueRepoContext(db, {
       companyId: issue.companyId,
       projectId: fields.projectId,
       projectWorkspaceId: fields.projectWorkspaceId,
       executionWorkspaceId: fields.executionWorkspaceId,
     });
+    const parsed = parseRepoUrl(ctx?.repoUrl ?? null);
+    if (parsed) {
+      globalCandidates = mergeCitedRepoCandidates(globalCandidates, [
+        { ...parsed, controlRef: ctx?.defaultRef ?? null },
+      ]);
+    } else if (ctx?.repoUrl) {
+      repositoryContextFailed = true;
+    }
   } catch {
-    return unverifiableAll();
+    repositoryContextFailed = true;
   }
-  if (!ctx?.repoUrl || !ctx.defaultRef) return unverifiableAll();
-  const parsed = parseRepoUrl(ctx.repoUrl);
-  if (!parsed) return unverifiableAll();
 
-  let token: string | null;
+  let linkedPrs: LinkedPullRequest[] = [];
+  let linkedPrLookupFailed = false;
   try {
-    const tokenResult = await resolveGitHubToken(db, issue.companyId);
-    token = tokenResult.token;
+    linkedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id);
   } catch {
-    return unverifiableAll();
+    linkedPrLookupFailed = true;
   }
-  if (!token) return unverifiableAll();
+  for (const pr of linkedPrs) {
+    const candidates: CitedRepoCandidate[] = [{
+      hostname: "github.com",
+      owner: pr.owner,
+      repo: pr.repo,
+      controlRef: pr.baseRefName ?? null,
+    }];
+    const headRepo = pr.headRepoFullName
+      ? parseRepoUrl(`https://github.com/${pr.headRepoFullName}`)
+      : null;
+    if (headRepo) candidates.push({ ...headRepo, controlRef: null });
+    globalCandidates = mergeCitedRepoCandidates(globalCandidates, candidates);
+  }
 
-  const apiHostname = parsed.hostname;
-  const repoOwner = parsed.owner;
-  const repoName = parsed.repo;
-  const defaultRef = ctx.defaultRef;
+  const buildCommit = readBuildCommit();
+  if (buildCommit) {
+    const servedRepo = await resolveServedBuildRepo();
+    if (servedRepo) {
+      globalCandidates = mergeCitedRepoCandidates(globalCandidates, [
+        { ...servedRepo, controlRef: buildCommit },
+      ]);
+    }
+  }
+
+  const candidatesFor = (reference: CitedCommitReference) => mergeCitedRepoCandidates(
+    reference.explicitRepos.map((repo) => ({ ...repo, controlRef: null })),
+    globalCandidates,
+  );
+  const publicRepos = (candidates: CitedRepoCandidate[]): CitedCommitRepository[] =>
+    candidates.map(({ hostname, owner, repo }) => ({ hostname, owner, repo }));
+  const unverifiable = (
+    reference: CitedCommitReference,
+    candidates: CitedRepoCandidate[],
+    reason: string,
+  ): CitedCommitResolution => ({
+    sha: reference.sha,
+    status: "unverifiable",
+    reason,
+    probedRepos: publicRepos(candidates),
+  });
+
+  let token: string | null = null;
+  try {
+    token = (await resolveGitHubToken(db, issue.companyId)).token;
+  } catch {
+  }
+  if (!token) {
+    return {
+      results: references.map((reference) => unverifiable(
+        reference,
+        [],
+        "github_credential_unavailable",
+      )),
+    };
+  }
   const authToken = token;
-
-  // Positive control (probed lazily, once, only when a SHA probe first reports
-  // absence): the default branch ref must resolve in the same repo with the
-  // same credential before any "nonexistent" verdict is trusted. The remote-
-  // tracking prefix is stripped exactly as the compare probe does (SUP-13691).
-  let control: CommitRefProbeOutcome | null = null;
-  const controlPresent = async (): Promise<boolean> => {
-    if (control === null) {
-      const controlRef =
-        defaultRef.startsWith("origin/") && defaultRef.length > "origin/".length
-          ? defaultRef.slice("origin/".length)
-          : defaultRef;
-      control = await githubCommitRefProbe(apiHostname, repoOwner, repoName, controlRef, authToken);
+  const controlOutcomes = new Map<string, CommitRefProbeOutcome>();
+  const controlPresent = async (candidate: CitedRepoCandidate): Promise<boolean> => {
+    if (!candidate.controlRef) return false;
+    const controlRef = candidate.controlRef.startsWith("origin/") && candidate.controlRef.length > "origin/".length
+      ? candidate.controlRef.slice("origin/".length)
+      : candidate.controlRef;
+    const key = `${citedRepoKey(candidate)}:${controlRef}`;
+    let outcome = controlOutcomes.get(key);
+    if (outcome === undefined) {
+      outcome = await githubCommitRefProbe(
+        candidate.hostname,
+        candidate.owner,
+        candidate.repo,
+        controlRef,
+        authToken,
+      );
+      controlOutcomes.set(key, outcome);
     }
-    return control === "present";
-  };
-
-  let linkedPrs: LinkedPullRequest[] | null | undefined;
-  const matchesLinkedPr = async (sha: string): Promise<boolean | null> => {
-    if (linkedPrs === undefined) {
-      try {
-        linkedPrs = await resolveLinkedPullRequestsWithState(db, issue.companyId, issue.id);
-      } catch {
-        linkedPrs = null;
-      }
-    }
-    if (linkedPrs === null) return null;
-    return linkedPrs.some((pr) =>
-      [pr.mergeCommitSha, pr.headSha].some((candidate) => candidate?.trim().toLowerCase() === sha),
-    );
+    return outcome === "present";
   };
 
   const results: CitedCommitResolution[] = [];
-  for (const sha of shas) {
-    const outcome = await githubCommitRefProbe(apiHostname, repoOwner, repoName, sha, authToken);
-    if (outcome === "present") {
-      results.push({ sha, status: "resolved" });
+  for (const reference of references) {
+    const candidates = candidatesFor(reference);
+    const outcomes: { candidate: CitedRepoCandidate; outcome: CommitRefProbeOutcome }[] = [];
+    for (const candidate of candidates) {
+      const outcome = await githubCommitRefProbe(
+        candidate.hostname,
+        candidate.owner,
+        candidate.repo,
+        reference.sha,
+        authToken,
+      );
+      outcomes.push({ candidate, outcome });
+      if (outcome === "present") break;
+    }
+    if (outcomes.some(({ outcome }) => outcome === "present")) {
+      results.push({ sha: reference.sha, status: "resolved" });
       continue;
     }
-    if (outcome === "absent") {
-      const linkedMatch = await matchesLinkedPr(sha);
-      if (linkedMatch === true) {
-        results.push({ sha, status: "resolved" });
-        continue;
-      }
-      if (linkedMatch === null) {
-        results.push({ sha, status: "unverifiable" });
-        continue;
-      }
-      if (await controlPresent()) {
-        results.push({ sha, status: "nonexistent" });
-        continue;
-      }
+    if (
+      outcomes.length > 0
+      && outcomes.every(({ outcome }) => outcome === "absent")
+      && linkedPrs.some((pr) => [pr.mergeCommitSha, pr.headSha]
+        .some((candidate) => candidate?.trim().toLowerCase() === reference.sha))
+    ) {
+      results.push({ sha: reference.sha, status: "resolved" });
+      continue;
     }
-    results.push({ sha, status: "unverifiable" });
+
+    const probedCandidates = outcomes.map(({ candidate }) => candidate);
+    let reason: string;
+    if (outcomes.some(({ outcome }) => outcome === "error")) {
+      reason = "commit_probe_error";
+    } else if (linkedPrLookupFailed) {
+      reason = "linked_pull_request_lookup_failed";
+    } else if (repositoryContextFailed) {
+      reason = "repository_context_unavailable";
+    } else if (outcomes.length === 0) {
+      reason = "repository_scope_unavailable";
+    } else if (reference.ambiguous) {
+      reason = "ambiguous_repository_scope";
+    } else {
+      let controlsPresent = true;
+      for (const { candidate } of outcomes) {
+        if (!(await controlPresent(candidate))) {
+          controlsPresent = false;
+          break;
+        }
+      }
+      if (controlsPresent) {
+        results.push({
+          sha: reference.sha,
+          status: "nonexistent",
+          probedRepos: publicRepos(probedCandidates),
+        });
+        continue;
+      }
+      reason = "positive_control_unavailable";
+    }
+    results.push(unverifiable(reference, probedCandidates, reason));
   }
   return { results };
 }
@@ -2939,7 +3827,10 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
     }
   | {
       allowed: false;
-      code: "done_transition_missing_delivery" | "done_transition_missing_tier_declaration";
+      code:
+        | "done_transition_missing_delivery"
+        | "done_transition_missing_tier_declaration"
+        | typeof DONE_TRANSITION_TIER_CONFLICT_CODE;
       reason: string;
     }
 > {
@@ -2964,7 +3855,7 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
     if (!tierResult.allowed) {
       return {
         allowed: false,
-        code: "done_transition_missing_tier_declaration",
+        code: tierResult.code ?? "done_transition_missing_tier_declaration",
         reason: tierResult.reason,
       };
     }
@@ -2972,6 +3863,13 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
       void writeAuditLog(db, issue, "issue.done_transition_tier1_close", {
         reason: tierResult.reason,
         systemBackstopActor: actorId,
+      });
+    }
+    if (tierResult.tier === "tier2" && tierResult.tier2Audit) {
+      void writeAuditLog(db, issue, "issue.done_transition_tier2_close", {
+        reason: tierResult.reason,
+        systemBackstopActor: actorId,
+        ...tierResult.tier2Audit,
       });
     }
     return { allowed: true, closeComment: renderedComment, doneTierSkipAudit: null };
@@ -3911,6 +4809,9 @@ async function evaluateDoneTransitionGuardCore(
     executionPolicy?: unknown;
     executionState?: unknown;
     deliveryRequirement?: IssueDeliveryRequirement | null;
+    // The status version before this close; it binds a requirement-change
+    // marker to the close (SUP-24429).
+    statusVersion?: number;
   },
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
@@ -3918,6 +4819,9 @@ async function evaluateDoneTransitionGuardCore(
   // exported wrapper can audit a below-threshold carve-out on a successful close
   // without issuing a second countLadderedChildren query.
   observer?: { census?: DoneTransitionCensus },
+  // SUP-24429: the requirement stored before the close request; undefined when
+  // the caller's request does not change it.
+  storedDeliveryRequirement?: IssueDeliveryRequirement | null,
 ): Promise<DoneTransitionGuardResult> {
   const fallback = (reason: string, skipped = false, skipReason: string | null = null): DoneTransitionGuardResult => ({
     allowed: true,
@@ -4031,7 +4935,7 @@ async function evaluateDoneTransitionGuardCore(
   // waved through by a credential-less or network-fail-open configuration.
   if (reviewLadder !== null && !reviewLadder.satisfied) {
     const first = reviewLadder.firstUnsatisfiedStage;
-    void writeAuditLog(db, issue, "issue.done_transition_ladder_refused", {
+    await writeLadderRefusalAuditLog(db, issue, {
       reason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
       skipReason: `review_ladder_unsatisfied:${first?.id ?? "unknown"}`,
       stageIndex: reviewLadder.firstUnsatisfiedIndex,
@@ -4174,12 +5078,14 @@ async function evaluateDoneTransitionGuardCore(
     };
   }
 
-  if (issue.deliveryRequirement === "record_only") {
-    void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
-      reason: "record_only_delivery_skipped",
-      skipReason: "record_only_delivery_skipped",
-      source: "done_transition_guard",
-    });
+  // SUP-24429: the skip follows the requirement stored before this request.
+  // A close request that just relabelled a repository_delivery card record_only
+  // falls through to the repository landing check below. A caller that passes
+  // no stored requirement changes nothing in that request.
+  if (
+    issue.deliveryRequirement === "record_only" &&
+    (storedDeliveryRequirement === undefined || storedDeliveryRequirement === "record_only")
+  ) {
     return {
       allowed: true,
       reason: "Record-only delivery requirement: repository/PR delivery is not required; transition allowed",
@@ -4200,6 +5106,30 @@ async function evaluateDoneTransitionGuardCore(
   // the mechanism C / A / D refusals, is the fix: the disposition is a waiver of
   // the head check, and it can no longer reach (or waive) a ladder this parent
   // owes (SUP-13724 §1). A card that owes a ladder was already refused above.
+  let overrideRefusal: string | null = null;
+  if (override?.disposition === "control-plane-operation-no-deliverable") {
+    try {
+      const ownership = await resolveCardDeliveryBranchOwnership(db, issue.companyId, issue.id);
+      if (ownership.legitimate && ownership.branch !== null) {
+        overrideRefusal = "Override refused: control-plane-operation-no-deliverable requires no legitimate delivery branch, but this issue has one.";
+      }
+    } catch (err) {
+      overrideRefusal = `Override refused: control-plane-operation-no-deliverable could not verify delivery-branch ownership (${err instanceof Error ? err.message : "unknown"}).`;
+    }
+  }
+  if (overrideRefusal !== null) {
+    return {
+      allowed: false,
+      reason: overrideRefusal,
+      aheadBy: null,
+      branch: null,
+      defaultRef: null,
+      owner: null,
+      repo: null,
+      skipped: false,
+      skipReason: null,
+    };
+  }
   if (override && NO_DELIVERABLE_HEAD_DISPOSITIONS.has(override.disposition)) {
     void writeAuditLog(db, issue, "issue.done_transition_override", {
       disposition: override.disposition,
@@ -4380,6 +5310,17 @@ async function evaluateDoneTransitionGuardCore(
         reason: `open_linked_prs_decision_carried:${openPrs.length}`,
         skipReason: `open_linked_prs_decision_carried:${openPrs.length}`,
         prs: prNames,
+        // SUP-24429: this row is a landing-backstop candidate. When the close
+        // request relabelled the stored requirement, name both sides and the
+        // status version this close produces, so the backstop keeps sweeping
+        // the card under a live record_only label until a later close.
+        ...(storedDeliveryRequirement !== undefined && storedDeliveryRequirement !== issue.deliveryRequirement
+          ? {
+              storedDeliveryRequirement,
+              requestedDeliveryRequirement: issue.deliveryRequirement ?? null,
+              ...(issue.statusVersion !== undefined ? { closeStatusVersion: issue.statusVersion + 1 } : {}),
+            }
+          : {}),
       });
       return {
         allowed: true,
@@ -4614,7 +5555,7 @@ async function evaluateDoneTransitionGuardCore(
             skipReason: prSkipReason,
           };
         }
-        void writeAuditLog(db, issue, "issue.done_transition_guard_skipped", {
+        await writeGuardSkippedAuditLog(db, issue, {
           reason: "branch_absent_on_remote",
           branch,
           defaultRef: ctx.defaultRef,
@@ -4936,9 +5877,20 @@ export async function evaluateDoneTransitionGuard(
   issue: Parameters<typeof evaluateDoneTransitionGuardCore>[1],
   override: DoneTransitionOverride | null,
   decisionCarried: boolean = false,
+  // SUP-24429: the requirement stored before this request, passed by a door that
+  // lets the close request change it. The record-only skip applies only when this
+  // is record_only too; omitted means the request did not change the requirement.
+  storedDeliveryRequirement?: IssueDeliveryRequirement | null,
 ): Promise<DoneTransitionGuardResult> {
   const observer: { census?: DoneTransitionCensus } = {};
-  const result = await evaluateDoneTransitionGuardCore(db, issue, override, decisionCarried, observer);
+  const result = await evaluateDoneTransitionGuardCore(
+    db,
+    issue,
+    override,
+    decisionCarried,
+    observer,
+    storedDeliveryRequirement,
+  );
   const census = observer.census;
   if (
     result.allowed

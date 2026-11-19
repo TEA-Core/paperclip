@@ -315,7 +315,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       deliveryRequirement?: "record_only" | "repository_delivery";
       workspace?: Partial<typeof executionWorkspaces.$inferInsert>;
       /** The issue-title slug after the identifier in the worktree's branch (the default template). */
-      branchSlug?: string;
+      branchSlug?: string | ((identifier: string) => string);
       projectWorkspace?: Partial<typeof projectWorkspaces.$inferInsert>;
     } = {},
   ): Promise<SeededIssue> {
@@ -329,7 +329,8 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     const executionWorkspaceId = randomUUID();
     const issueId = randomUUID();
     const identifier = `${prefix}-1`;
-    const branch = `${identifier}-${options.branchSlug ?? "entry-ruling"}`;
+    const branchSlug = typeof options.branchSlug === "function" ? options.branchSlug(identifier) : options.branchSlug;
+    const branch = `${identifier}-${branchSlug ?? "entry-ruling"}`;
 
     const repoRoot = resolveManagedProjectWorkspaceDir({ companyId, projectId, repoName: "paperclip" });
     const origin = path.join(home, "origins", `${prefix}.git`);
@@ -431,6 +432,15 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       .then((rows) => rows.length);
   }
 
+  async function activityRows(issueId: string, action: string) {
+    return db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, action)));
+  }
+
+  const refusalRows = (issueId: string) => activityRows(issueId, "issue.done_transition_refused");
+
   async function statusOf(issueId: string) {
     return db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]?.status);
   }
@@ -451,6 +461,90 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       .where(eq(issueComments.issueId, fixture.issueId))
       .then((rows) => rows.map((row) => row.body));
     expect(bodies.some((body) => body.includes("Closed at Tier 1 (landed, not liveness-probed): no-repository-landing"))).toBe(true);
+  });
+
+  // SUP-24298: the activity log follows the actual decision. A refused terminal
+  // write leaves a refusal row and never the guard's "transition allowed" row.
+  it("records a refused missing-declaration close as a refusal row and not as an allowed transition", async () => {
+    const fixture = await seed();
+
+    const res = await request(app).patch(`/api/issues/${fixture.identifier}`).send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(await activityCount(fixture.issueId, "issue.done_transition_guard_skipped")).toBe(0);
+    const refusals = await refusalRows(fixture.issueId);
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]!.details).toMatchObject({
+      code: "done_transition_missing_tier_declaration",
+      httpStatus: 422,
+      decisionCarried: false,
+      runId: fixture.actor.runId,
+      reason: res.body.error,
+      identifier: fixture.identifier,
+      source: "done_transition_guard",
+    });
+  });
+
+  it("gives every refused write its own row when the remedy comment is deduplicated", async () => {
+    const fixture = await seed();
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const res = await request(app).patch(`/api/issues/${fixture.identifier}`).send({ status: "done" });
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+    }
+
+    const remedies = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, fixture.issueId))
+      .then((rows) => rows.filter((row) => row.body.includes("[Terminal status refused] done_transition_missing_tier_declaration")));
+    expect(remedies).toHaveLength(1);
+    expect(await refusalRows(fixture.issueId)).toHaveLength(2);
+    expect(await activityCount(fixture.issueId, "issue.done_transition_guard_skipped")).toBe(0);
+  });
+
+  it("still records the guard disposition for a close that is allowed", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const skipped = await activityRows(fixture.issueId, "issue.done_transition_guard_skipped");
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]!.details).toMatchObject({
+      skipReason: "record_only_delivery_skipped",
+      decisionCarried: false,
+      source: "done_transition_guard",
+    });
+    expect(String((skipped[0]!.details as Record<string, unknown>).reason)).toContain("transition allowed");
+    expect(await refusalRows(fixture.issueId)).toHaveLength(0);
+  });
+
+  it("still records the guard disposition for a board close, which bypasses the tier declaration", async () => {
+    const fixture = await seed();
+    currentActor = { type: "board", userId: "local-board", source: "local_implicit" } as Express.Request["actor"];
+
+    const res = await request(app).patch(`/api/issues/${fixture.identifier}`).send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await activityCount(fixture.issueId, "issue.done_transition_guard_skipped")).toBe(1);
+    expect(await activityCount(fixture.issueId, "issue.done_tier_declaration_skipped")).toBe(1);
+    expect(await refusalRows(fixture.issueId)).toHaveLength(0);
+  });
+
+  it("reads a refused, refused, allowed sequence as two refusals and one allowed disposition", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+
+    expect((await request(app).patch(`/api/issues/${fixture.identifier}`).send({ status: "done" })).status).toBe(422);
+    expect((await request(app).patch(`/api/issues/${fixture.identifier}`).send({ status: "done" })).status).toBe(422);
+    expect((await close(fixture.identifier)).status).toBe(200);
+
+    expect(await activityCount(fixture.issueId, "issue.done_transition_refused")).toBe(2);
+    expect(await activityCount(fixture.issueId, "issue.done_transition_guard_skipped")).toBe(1);
+    expect(await statusOf(fixture.issueId)).toBe("done");
   });
 
   it("names the no-repository form in the missing-declaration remedy only on a record_only issue", async () => {
@@ -640,9 +734,7 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(res.body.error).toContain("a no-repository close carries no repository evidence");
   });
 
-  it("refuses an issue that records a pull request work product", async () => {
-    const fixture = await seed();
-    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+  async function insertPullRequestProduct(fixture: SeededIssue, metadata?: Record<string, unknown>) {
     await db.insert(issueWorkProducts).values({
       companyId: fixture.companyId,
       issueId: fixture.issueId,
@@ -655,12 +747,66 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
       reviewState: "none",
       isPrimary: false,
       healthStatus: "unknown",
+      ...(metadata === undefined ? {} : { metadata }),
+    });
+  }
+
+  it("refuses an issue that records a pull request work product", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    await insertPullRequestProduct(fixture);
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("records a pull request work product");
+  });
+
+  it("discounts a foreign-headRef pull request work product", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    await insertPullRequestProduct(fixture, {
+      repository: "TEA-Core/records",
+      prNumber: 9,
+      headRef: "SUP-99999-foreign",
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(fixture.issueId)).toBe("done");
+  });
+
+  it("still refuses a pull request work product on this issue's own delivery branch", async () => {
+    const fixture = await seed();
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    await insertPullRequestProduct(fixture, {
+      repository: "TEA-Core/records",
+      prNumber: 9,
+      headRef: fixture.branch,
     });
 
     const res = await close(fixture.identifier);
 
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.error).toContain("records a pull request work product");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
+
+  it("refuses a pull request work product for an issue-owned workspace with no delivery branch", async () => {
+    const fixture = await seed({ workspace: { branchName: null } });
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    await insertPullRequestProduct(fixture, {
+      repository: "TEA-Core/records",
+      prNumber: 9,
+      headRef: fixture.branch,
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("records a pull request work product");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 
   function commitOnIssueBranch(fixture: SeededIssue) {
@@ -922,6 +1068,26 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     });
   });
 
+  it("does not let another company's project-workspace refs block a board branch change (SUP-24409)", async () => {
+    const fixture = await seed();
+    currentActor = { type: "board", userId: "local-board", source: "local_implicit" } as Express.Request["actor"];
+    const otherCompanyId = await insertCompany(`OTH${seedSequence}`);
+    await db.insert(projectWorkspaces).values({
+      id: randomUUID(),
+      companyId: otherCompanyId,
+      projectId: fixture.projectId,
+      name: "Foreign",
+      repoUrl: "https://github.com/TEA-Core/records",
+      defaultRef: "board-chosen",
+    });
+
+    const res = await request(app)
+      .patch(`/api/execution-workspaces/${fixture.executionWorkspaceId}`)
+      .send({ branchName: "board-chosen" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+  });
+
   it("does not let the closing agent redirect the probe to a clean decoy worktree while its deliverable sits in the real one", async () => {
     const fixture = await seed();
     await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
@@ -1062,6 +1228,15 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.error).toContain(expected);
     expect(await statusOf(fixture.issueId)).toBe("in_progress");
+    // SUP-24298: the refusal at the compare-and-set leaves its own row.
+    const [refusal] = await refusalRows(fixture.issueId);
+    expect(refusal?.details).toMatchObject({
+      code: "done_transition_missing_tier_declaration",
+      stage: "no_repository_landing_transition_recheck",
+      httpStatus: 422,
+      runId: fixture.actor.runId,
+    });
+    expect(await activityCount(fixture.issueId, "issue.done_transition_guard_skipped")).toBe(0);
   });
 
   // A terminal status is the one mismatch that leaves the row changed by someone
@@ -1371,6 +1546,57 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(await statusOf(fixture.issueId)).toBe("done");
+  });
+
+  async function seedStrandedRecovery() {
+    const fixture = await seed({
+      branchSlug: (identifier) => `recover-exhausted-recovery-for-${identifier.replace(/-1$/, "-2")}`,
+    });
+    const sourceIssueId = randomUUID();
+    const sourceIdentifier = fixture.identifier.replace(/-1$/, "-2");
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId: fixture.companyId,
+      projectId: fixture.projectId,
+      identifier: sourceIdentifier,
+      title: "Source card",
+      status: "done",
+      priority: "medium",
+      createdByUserId: "cloud-user-1",
+    });
+    await db.update(issues).set({
+      originKind: "stranded_issue_recovery",
+      originId: sourceIssueId,
+      title: `Recover exhausted recovery for ${sourceIdentifier}`,
+    }).where(eq(issues.id, fixture.issueId));
+    expect(fixture.branch).toBe(`${fixture.identifier}-recover-exhausted-recovery-for-${sourceIdentifier}`);
+    await insertRuling({ companyId: fixture.companyId, issueId: fixture.issueId, authorAgentId: fixture.rulerAgentId });
+    return { fixture, sourceIssueId, sourceIdentifier };
+  }
+
+  it("closes a stranded recovery card whose platform-minted title slug names its source card", async () => {
+    const { fixture } = await seedStrandedRecovery();
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(fixture.issueId)).toBe("done");
+  });
+
+  it("refuses when a stranded recovery source identifier changes after measurement", async () => {
+    const { fixture, sourceIssueId, sourceIdentifier } = await seedStrandedRecovery();
+    mockMeasureNoRepositoryLanding.mockImplementation(async (...args: Parameters<typeof measureNoRepositoryLandingForClose>) => {
+      const verdict = await realMeasureNoRepositoryLandingRef.current!(...args);
+      expect(verdict.ok, JSON.stringify(verdict)).toBe(true);
+      await db.update(issues).set({ identifier: `${sourceIdentifier}0` }).where(eq(issues.id, sourceIssueId));
+      return verdict;
+    });
+
+    const res = await close(fixture.identifier);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("the recovery source identifier changed after the close was measured");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
 
   it("still refuses a declaration that carries a word-number token, whatever its case", async () => {

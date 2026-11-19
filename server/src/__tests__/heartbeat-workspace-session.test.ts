@@ -48,6 +48,7 @@ import {
   stripWorkspaceRuntimeFromExecutionRunConfig,
   stripPaperclipSessionMetadataFromSessionParams,
   normalizeSessionParams,
+  isTaskSessionCredentialCompatible,
   shouldResetTaskSessionForWake,
   WorkspaceValidationFailure,
   scrubGitCredentialText,
@@ -447,6 +448,155 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
       "missing_git_metadata",
       "has no .git metadata",
     );
+  });
+
+  it("does not require git metadata for the exhausted record-only recovery card minted off a failed source workspace", async () => {
+    const input = buildWorkspaceValidationInput();
+    const cwd = "/tmp/paperclip-record-only-without-git-metadata";
+
+    await expect(
+      assertGitSensitiveAdapterWorkspaceValid(
+        buildWorkspaceValidationInput({
+          issue: {
+            ...input.issue!,
+            deliveryRequirement: "record_only",
+            executionWorkspaceId: null,
+            projectWorkspaceId: null,
+            executionWorkspacePreference: "agent_default",
+            originKind: "stranded_issue_recovery",
+          },
+          resolvedWorkspace: buildResolvedWorkspace({ cwd }),
+          executionWorkspace: {
+            ...input.executionWorkspace,
+            baseCwd: cwd,
+            cwd,
+          },
+          persistedExecutionWorkspace: {
+            ...input.persistedExecutionWorkspace!,
+            cwd,
+          },
+        }),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("still requires git metadata for a record_only card with a bound execution workspace", async () => {
+    const input = buildWorkspaceValidationInput();
+    const cwd = "/tmp/paperclip-record-only-bound-workspace-without-git-metadata";
+
+    await expectWorkspaceValidationFailure(
+      buildWorkspaceValidationInput({
+        issue: {
+          ...input.issue!,
+          deliveryRequirement: "record_only",
+          executionWorkspaceId: "bound-execution-workspace-1",
+          executionWorkspacePreference: "reuse_existing",
+          originKind: "manual",
+        },
+        resolvedWorkspace: buildResolvedWorkspace({ cwd }),
+        executionWorkspace: {
+          ...input.executionWorkspace,
+          baseCwd: cwd,
+          cwd,
+        },
+        persistedExecutionWorkspace: {
+          ...input.persistedExecutionWorkspace!,
+          cwd,
+        },
+      }),
+      "missing_git_metadata",
+      "has no .git metadata",
+    );
+  });
+
+  it("still requires git metadata for an ordinary record_only card outside the exhausted-recovery mint", async () => {
+    const input = buildWorkspaceValidationInput();
+    const cwd = "/tmp/paperclip-record-only-non-recovery-without-git-metadata";
+
+    await expectWorkspaceValidationFailure(
+      buildWorkspaceValidationInput({
+        issue: {
+          ...input.issue!,
+          deliveryRequirement: "record_only",
+          executionWorkspaceId: null,
+          executionWorkspacePreference: "agent_default",
+          originKind: "manual",
+        },
+        resolvedWorkspace: buildResolvedWorkspace({ cwd }),
+        executionWorkspace: {
+          ...input.executionWorkspace,
+          baseCwd: cwd,
+          cwd,
+        },
+        persistedExecutionWorkspace: {
+          ...input.persistedExecutionWorkspace!,
+          cwd,
+        },
+      }),
+      "missing_git_metadata",
+      "has no .git metadata",
+    );
+  });
+
+  // The exemption is shape-only, so each of the five fields must be load-bearing
+  // on its own: a card that matches the exhausted-recovery shape in four fields
+  // and differs in exactly one must keep every workspace check.
+  describe("exhausted-recovery exemption shape: one field off", () => {
+    const exemptShape: NonNullable<WorkspaceValidationInput["issue"]> = {
+      id: "issue-1",
+      identifier: "PAP-1",
+      projectId: "project-1",
+      deliveryRequirement: "record_only",
+      executionWorkspaceId: null,
+      projectWorkspaceId: null,
+      executionWorkspacePreference: "agent_default",
+      originKind: "stranded_issue_recovery",
+    };
+    const cwd = "/tmp/paperclip-exemption-shape-without-git-metadata";
+    type IssueFields = Partial<NonNullable<WorkspaceValidationInput["issue"]>>;
+    function inputWithIssueFields(fields: IssueFields) {
+      const base = buildWorkspaceValidationInput();
+      return buildWorkspaceValidationInput({
+        issue: { ...base.issue!, ...exemptShape, ...fields },
+        resolvedWorkspace: buildResolvedWorkspace({ cwd }),
+        executionWorkspace: { ...base.executionWorkspace, baseCwd: cwd, cwd },
+        persistedExecutionWorkspace: { ...base.persistedExecutionWorkspace!, cwd },
+      });
+    }
+
+    it("control: the exact five-field shape is exempt", async () => {
+      await expect(
+        assertGitSensitiveAdapterWorkspaceValid(inputWithIssueFields({})),
+      ).resolves.toBeUndefined();
+    });
+
+    const oneFieldOff: Array<[string, IssueFields]> = [
+      ["deliveryRequirement", { deliveryRequirement: "repository_delivery" }],
+      ["executionWorkspaceId", { executionWorkspaceId: "bound-execution-workspace-1" }],
+      ["projectWorkspaceId", { projectWorkspaceId: "workspace-1" }],
+      ["executionWorkspacePreference", { executionWorkspacePreference: "reuse_existing" }],
+      ["originKind", { originKind: "manual" }],
+    ];
+    it.each(oneFieldOff)("keeps every workspace check when only %s differs", async (_field, fields) => {
+      await expectWorkspaceValidationFailure(
+        inputWithIssueFields(fields),
+        "missing_git_metadata",
+        "has no .git metadata",
+      );
+    });
+
+    const absentFields: Array<[string, IssueFields]> = [
+      ["deliveryRequirement", { deliveryRequirement: null }],
+      ["executionWorkspacePreference", { executionWorkspacePreference: null }],
+      ["originKind", { originKind: null }],
+    ];
+    it.each(absentFields)("keeps every workspace check when %s is absent", async (_field, fields) => {
+      await expectWorkspaceValidationFailure(
+        inputWithIssueFields(fields),
+        "missing_git_metadata",
+        "has no .git metadata",
+      );
+    });
   });
 
   it("does not apply the git-sensitive workspace guard to non-local execution targets", async () => {
@@ -2559,6 +2709,56 @@ function sessionParamsWithConfigMetadata(
 }
 
 describe("effective run session config freshness", () => {
+  it("resets legacy sessions after connection instructions change or disappear", async () => {
+    const first = await buildSessionConfigMetadata({ effectiveAdapterConfig: { paperclipConnectionInstructions: { text: "Use the handbook.", digest: "before" } } });
+    for (const instructions of [null, { text: "Use the updated handbook.", digest: "after" }]) {
+      const next = await buildSessionConfigMetadata({ effectiveAdapterConfig: { paperclipConnectionInstructions: instructions } });
+      expect(resolveTaskSessionConfigFreshness({ hasTaskSession: true, taskSessionParams: sessionParamsWithConfigMetadata(first), configMetadata: next }).reset).toBe(true);
+    }
+  });
+
+  it("reuses managed AI sessions across temporary credential homes while preserving configuration boundaries", async () => {
+    const config = (home: string) => ({
+      model: "gpt-5.4-mini",
+      approvalPolicy: "never",
+      managedAiConnection: { identity: "account-1:credential-generation-1" },
+      env: {
+        HOME: home,
+        XDG_CONFIG_HOME: path.join(home, "config"),
+        XDG_DATA_HOME: path.join(home, "data"),
+        CODEX_HOME: path.join(home, "provider"),
+        GROK_HOME: path.join(home, "provider"),
+        CLAUDE_CONFIG_DIR: path.join(home, "provider"),
+        CUSTOM_SETTING: "original",
+      },
+    });
+    const first = await buildSessionConfigMetadata({ effectiveAdapterConfig: config("/tmp/ai-first"), managedAiHome: "/tmp/ai-first" });
+    const nextConfig = config("/tmp/ai-next");
+    const next = await buildSessionConfigMetadata({ effectiveAdapterConfig: nextConfig, managedAiHome: "/tmp/ai-next" });
+    expect(next.fingerprint).toBe(first.fingerprint);
+    expect(nextConfig.env.HOME).toBe("/tmp/ai-next");
+    expect(resolveTaskSessionConfigFreshness({
+      hasTaskSession: true, configuredModel: "gpt-5.4-mini",
+      taskSessionParams: sessionParamsWithConfigMetadata(first), configMetadata: next,
+    }).reset).toBe(false);
+    // Fork divergence (SUP-13734): model selection is excluded from the session
+    // fingerprint so a pure model swap keeps the session (see the test below), so
+    // upstream's `model: "different-model"` boundary case does not apply here.
+    for (const changed of [
+      { ...nextConfig, approvalPolicy: "on-request" },
+      { ...nextConfig, managedAiConnection: { identity: "account-2:credential-generation-1" } },
+      { ...nextConfig, managedAiConnection: { identity: "account-1:credential-generation-2" } },
+      { ...nextConfig, env: { ...nextConfig.env, CUSTOM_SETTING: "changed" } },
+      { ...nextConfig, env: { ...nextConfig.env, CODEX_HOME: "/custom/provider" } },
+    ]) {
+      const metadata = await buildSessionConfigMetadata({ effectiveAdapterConfig: changed, managedAiHome: "/tmp/ai-next" });
+      expect(metadata.fingerprint).not.toBe(first.fingerprint);
+    }
+    const unmanagedFirst = await buildSessionConfigMetadata({ effectiveAdapterConfig: config("/custom/first") });
+    const unmanagedNext = await buildSessionConfigMetadata({ effectiveAdapterConfig: config("/custom/next") });
+    expect(unmanagedFirst.fingerprint).not.toBe(unmanagedNext.fingerprint);
+  });
+
   it("resets when effective adapter config changes after model/profile/env resolution", async () => {
     const base = await buildSessionConfigMetadata();
     const next = await buildSessionConfigMetadata({
@@ -3032,6 +3232,7 @@ describe("stripPaperclipSessionMetadataFromSessionParams", () => {
       stripPaperclipSessionMetadataFromSessionParams({
         sessionId: "thread-1",
         cwd: "/tmp/project",
+        paperclipAiCredentialIdentity: "grant:user:generation",
         __paperclipConfiguredModel: "gpt-5.4-mini",
         __paperclipConfigFingerprint: "v1:sha256:abc",
         __paperclipConfigFingerprintVersion: 1,
@@ -3042,6 +3243,30 @@ describe("stripPaperclipSessionMetadataFromSessionParams", () => {
       sessionId: "thread-1",
       cwd: "/tmp/project",
     });
+  });
+});
+
+describe("isTaskSessionCredentialCompatible", () => {
+  it("retains the server-owned identity even when the Codex codec drops it", () => {
+    const saved = { sessionId: "thread-1", paperclipAiCredentialIdentity: "grant:user:generation" };
+    const decoded = codexSessionCodec.deserialize(saved);
+    expect(decoded).toEqual({ sessionId: "thread-1" });
+    expect(isTaskSessionCredentialCompatible(saved, "grant:user:generation")).toBe(true);
+  });
+
+  it.each([
+    undefined,
+    null,
+    {},
+    { paperclipAiCredentialIdentity: "other-grant:user:generation" },
+    { paperclipAiCredentialIdentity: "grant:other-user:generation" },
+    { paperclipAiCredentialIdentity: "grant:user:new-generation" },
+  ])("requires the same saved grant, responsible user, and credential generation: %j", (saved) => {
+    expect(isTaskSessionCredentialCompatible(saved, "grant:user:generation")).toBe(false);
+  });
+
+  it("preserves unmanaged session behavior", () => {
+    expect(isTaskSessionCredentialCompatible({ sessionId: "thread-1" }, undefined)).toBe(true);
   });
 });
 
@@ -3127,6 +3352,15 @@ describe("comment wake batching", () => {
     );
 
     expect(merged.forceFreshSession).toBe(true);
+  });
+
+  it("keeps connection tool refresh intent while allowing harness session recovery", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      { issueId: "issue-1", wakeReason: "issue_commented", refreshTools: true },
+      { issueId: "issue-1", wakeReason: "issue_commented", refreshTools: false },
+    );
+    expect(merged.refreshTools).toBe(true);
+    expect(shouldResetTaskSessionForWake(merged)).toBe(false);
   });
 });
 

@@ -27,9 +27,10 @@ describe("waitForOpenCodeMcpReady", () => {
   let server: Server;
   let baseUrl: string;
   let requests: RecordedRequest[];
-  let sseClients: Set<{ write: (chunk: string) => void }>;
+  let sseClients: Set<{ write: (chunk: string) => void; end: () => void }>;
   let mcpEntries: Array<{ name: string; status: { status: string; error?: string } }>;
   let eventStreamStatus: number;
+  let hangMcpRead: boolean;
 
   const emit = (type: string, data: Record<string, unknown> = {}) => {
     for (const client of sseClients) client.write(sseFrame({ type, data }));
@@ -51,6 +52,7 @@ describe("waitForOpenCodeMcpReady", () => {
     sseClients = new Set();
     mcpEntries = [];
     eventStreamStatus = 200;
+    hangMcpRead = false;
     server = createServer((req, res) => {
       const recorded: RecordedRequest = { method: req.method ?? "", url: req.url ?? "" };
       requests.push(recorded);
@@ -59,6 +61,7 @@ describe("waitForOpenCodeMcpReady", () => {
         res.writeHead(eventStreamStatus, { "content-type": "text/event-stream", "cache-control": "no-cache" });
         if (eventStreamStatus === 200) {
           sseClients.add(res);
+          res.on("close", () => sseClients.delete(res));
           res.write(sseFrame({ type: "server.connected" }));
         } else {
           res.end();
@@ -66,6 +69,7 @@ describe("waitForOpenCodeMcpReady", () => {
         return;
       }
       if (req.url === "/api/mcp" && req.method === "GET") {
+        if (hangMcpRead) return;
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ data: mcpEntries }));
         return;
@@ -196,6 +200,58 @@ describe("waitForOpenCodeMcpReady", () => {
     } finally {
       eventStreamStatus = 200;
     }
+  });
+
+  it("hard-fails when the event stream closes before readiness", async () => {
+    mcpEntries = [{ name: "paperclip", status: { status: "connected" } }];
+    const closeStream = setTimeout(() => {
+      for (const client of sseClients) client.end();
+    }, 20);
+    const startedAt = Date.now();
+    const error = await waitForOpenCodeMcpReady({
+      baseUrl,
+      authorization: "Basic b3BlbmNvZGU6cHc=",
+      servers: ["paperclip"],
+      deadlineMs: 2_000,
+      quiescenceMs: 100,
+      pollMs: 20,
+    }).then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+    clearTimeout(closeStream);
+
+    expect(error).toBeInstanceOf(OpenCodeMcpReadinessError);
+    expect((error as OpenCodeMcpReadinessError).reason).toBe("stream");
+    expect((error as OpenCodeMcpReadinessError).message).toContain("event stream closed before MCP readiness");
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    noNudgeWasIssued();
+  });
+
+  it("hard-fails at the deadline when the MCP status request hangs", async () => {
+    hangMcpRead = true;
+    const startedAt = Date.now();
+    let error: unknown;
+    try {
+      error = await waitForOpenCodeMcpReady({
+        baseUrl,
+        authorization: "Basic b3BlbmNvZGU6cHc=",
+        servers: ["paperclip"],
+        deadlineMs: 150,
+        quiescenceMs: 50,
+        pollMs: 20,
+      }).then(
+        () => null,
+        (caught: unknown) => caught,
+      );
+    } finally {
+      hangMcpRead = false;
+    }
+
+    expect(error).toBeInstanceOf(OpenCodeMcpReadinessError);
+    expect((error as OpenCodeMcpReadinessError).reason).toBe("deadline");
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    noNudgeWasIssued();
   });
 
   it("ships the validated defaults", () => {

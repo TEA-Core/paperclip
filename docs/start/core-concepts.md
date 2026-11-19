@@ -69,7 +69,7 @@ A heartbeat can be triggered by:
 
 - **Schedule** — periodic timer (e.g. every hour)
 - **Assignment** — a new task is assigned to the agent
-- **Comment** — someone @-mentions the agent
+- **Comment** — a comment on a task assigned to the agent (an @-mention is context only and wakes no one)
 - **Manual** — a human clicks "Invoke" in the UI
 - **Approval resolution** — a pending approval is approved or rejected
 

@@ -175,7 +175,7 @@ export async function resolveCanonicalWikiMaintainerAgentId(
 function isWorkflowControlledPendingReviewParticipant(input: {
   executionPolicy: unknown;
   executionState: unknown;
-  incomingAssigneeAgentId: string;
+  incomingAssigneeAgentId: string | null;
   workflowControlledAssignment?: boolean;
 }): boolean {
   if (input.workflowControlledAssignment !== true) return false;
@@ -183,10 +183,16 @@ function isWorkflowControlledPendingReviewParticipant(input: {
   if (
     state?.status !== "pending" ||
     typeof state.currentStageIndex !== "number" ||
-    state.currentStageType !== "review" ||
-    state.currentParticipant?.type !== "agent" ||
-    state.currentParticipant.agentId !== input.incomingAssigneeAgentId
+    state.currentStageType !== "review"
   ) return false;
+  const currentParticipant = state.currentParticipant;
+  if (currentParticipant?.type === "agent") {
+    if (currentParticipant.agentId !== input.incomingAssigneeAgentId) return false;
+  } else if (currentParticipant?.type === "user") {
+    if (input.incomingAssigneeAgentId !== null) return false;
+  } else {
+    return false;
+  }
   const policy = input.executionPolicy as { stages?: unknown } | null | undefined;
   if (!policy || typeof policy !== "object" || !Array.isArray(policy.stages)) return false;
   const rawStage = policy.stages[state.currentStageIndex];
@@ -198,12 +204,39 @@ function isWorkflowControlledPendingReviewParticipant(input: {
     state.completedStageIds.includes(stage.id) ||
     state.skippedStageIds?.includes(stage.id)
   ) return false;
-  return Array.isArray(stage.participants) && stage.participants.some(
-    (participant) =>
-      participant &&
-      typeof participant === "object" &&
-      participant.type === "agent" &&
-      participant.agentId === input.incomingAssigneeAgentId,
+  return Array.isArray(stage.participants) && stage.participants.some((participant) => {
+    if (!participant || typeof participant !== "object") return false;
+    if (currentParticipant.type === "agent") {
+      return participant.type === "agent" && participant.agentId === currentParticipant.agentId;
+    }
+    return participant.type === "user" && participant.userId === currentParticipant.userId;
+  });
+}
+
+/**
+ * SUP-24280: the one write the Wiki handoff guard admits without the canonical
+ * Maintainer as the resulting assignee. The emitter must be able to cancel a
+ * half-emitted handoff stub that nobody owns, and the cancellation must leave
+ * the row unowned. All conditions hold together:
+ * - the write persists status `cancelled`;
+ * - the write carries no assignee field (`assigneeAgentId`/`assigneeUserId`),
+ *   including one a workflow transition adds;
+ * - the stored row has no agent and no user assignee (both exactly null).
+ * With no assignee field written, the resulting row keeps the stored null
+ * assignees. Any assignee write, any other status, any owned row, and any
+ * unknown (undefined) stored assignee stay guarded.
+ */
+export function isUnassignedWikiHandoffCancellation(input: {
+  requestedStatus: unknown;
+  assigneeFieldWritten: boolean;
+  currentAssigneeAgentId: string | null | undefined;
+  currentAssigneeUserId: string | null | undefined;
+}): boolean {
+  return (
+    input.requestedStatus === "cancelled" &&
+    input.assigneeFieldWritten === false &&
+    input.currentAssigneeAgentId === null &&
+    input.currentAssigneeUserId === null
   );
 }
 
@@ -217,8 +250,20 @@ export async function assertWikiHandoffWriteIntegrity(input: {
     executionState?: unknown;
   };
   incomingAssigneeAgentId: string | null | undefined;
+  actorAgentId?: string | null;
+  currentAssigneeAgentId?: string | null;
   checkReviewStage?: boolean;
   workflowControlledAssignment?: boolean;
+  /**
+   * SUP-24280: the persisted status and assignee shape of this write, so the
+   * guard can admit an unassigned-stub cancellation. Omit it at doors that
+   * cannot cancel; without it the exemption never applies.
+   */
+  cancellation?: {
+    requestedStatus: unknown;
+    assigneeFieldWritten: boolean;
+    currentAssigneeUserId: string | null | undefined;
+  };
   refusalContext?: { caller: RefusalCaller; issue: RefusalIssue | null };
 }): Promise<void> {
   const canonicalMaintainerAgentId = await resolveCanonicalWikiMaintainerAgentId(
@@ -233,12 +278,23 @@ export async function assertWikiHandoffWriteIntegrity(input: {
   const violation = wikiHandoffWriteWouldViolate({
     canonicalMaintainerAgentId,
     incomingAssigneeAgentId: incoming,
+    actorAgentId: input.actorAgentId,
+    currentAssigneeAgentId: input.currentAssigneeAgentId,
     executionPolicy: input.issue.executionPolicy,
     executionState: input.issue.executionState,
     checkReviewStage: input.checkReviewStage,
     workflowControlledAssignment: input.workflowControlledAssignment,
   });
   if (!violation) return;
+  if (
+    input.cancellation &&
+    isUnassignedWikiHandoffCancellation({
+      requestedStatus: input.cancellation.requestedStatus,
+      assigneeFieldWritten: input.cancellation.assigneeFieldWritten,
+      currentAssigneeAgentId: input.currentAssigneeAgentId,
+      currentAssigneeUserId: input.cancellation.currentAssigneeUserId,
+    })
+  ) return;
   if (
     violation.reason === "wiki_handoff_self_satisfy" &&
     input.workflowControlledAssignment !== true &&
@@ -271,6 +327,8 @@ export async function assertWikiHandoffWriteIntegrity(input: {
 export function wikiHandoffWriteWouldViolate(input: {
   canonicalMaintainerAgentId: string | null | undefined;
   incomingAssigneeAgentId: string | null | undefined;
+  actorAgentId?: string | null;
+  currentAssigneeAgentId?: string | null;
   executionPolicy: unknown;
   executionState: unknown;
   checkReviewStage?: boolean;
@@ -285,7 +343,10 @@ export function wikiHandoffWriteWouldViolate(input: {
     : null;
   if (incoming !== canonical) {
     if (
-      incoming !== null &&
+      (incoming !== null || (
+        input.actorAgentId === canonical &&
+        input.currentAssigneeAgentId === canonical
+      )) &&
       isWorkflowControlledPendingReviewParticipant({
         executionPolicy: input.executionPolicy,
         executionState: input.executionState,

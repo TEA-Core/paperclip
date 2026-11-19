@@ -393,7 +393,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       metadata: { prNumber: 404, repository: "TEA-Core/paperclip", mergedAt: "2026-08-29T00:11:06Z", mergeCommitSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
     });
 
-    return { companyId, reviewerAgentId, implementerAgentId, issueId, identifier };
+    return { companyId, reviewerAgentId, implementerAgentId, secondReviewerAgentId, issueId, identifier, firstStageId, secondStageId };
   }
 
   /**
@@ -699,6 +699,11 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       companyId,
       agentId,
       status: "running",
+      // SUP-23490: the done-tier gate places a record-only observation inside
+      // the closing run's lifetime (startedAt ?? createdAt); a run that closes
+      // its own card has always started, so seed the start before the suites'
+      // fixed probe instants (2026-11-04T09:15:00Z).
+      startedAt: new Date("2026-11-04T09:00:00Z"),
       contextSnapshot: { issueId },
     });
     return runId;
@@ -1117,7 +1122,8 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
   it("PATCH: record_only close with structured record-only Tier 2 evidence needs no merge head (SUP-22801)", async () => {
     const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D22801A", { deliveryRequirement: "record_only" });
     await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
-    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    const runId = await seedRun(companyId, reviewerAgentId, issueId);
+    currentActor = agentActor(companyId, reviewerAgentId, runId);
     mockNoOpenPulls();
 
     const res = await request(app)
@@ -1137,6 +1143,162 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       expect(String((init as RequestInit | undefined)?.method ?? "GET")).toBe("GET");
       expect(String(url)).not.toContain("/commits/");
     }
+    // SUP-23490: the accepted close emits the machine record (SUP-23366) with
+    // the cited observation AND the closing run identity beside it, so a
+    // restated observation is detectable after the fact from the row alone.
+    const tier2Rows = await vi.waitFor(
+      async () => {
+        const found = await auditRows(companyId, issueId, "issue.done_transition_tier2_close");
+        if (found.length === 0) throw new Error("waiting for tier2 close audit row");
+        return found;
+      },
+      { timeout: 5000 },
+    );
+    expect(tier2Rows).toHaveLength(1);
+    expect(tier2Rows[0]?.details).toMatchObject({
+      observed: "2026-11-04T09:15:00Z",
+      tierForm: "record-only",
+      closingRunId: runId,
+      closingRunStartedAt: "2026-11-04T09:00:00.000Z",
+    });
+  });
+
+  it("PATCH: record_only close citing an observation predating the closing run is refused as a restatement (SUP-23490)", async () => {
+    // The SUP-22817 shape: the closing run started AFTER the cited observation
+    // (here 5 minutes after, matching the real restatement), so the cited
+    // liveness cannot belong to the run that is closing. Negative control for
+    // the lifetime gate: the guard refuses with the restatement reason.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23490A", { deliveryRequirement: "record_only" });
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: reviewerAgentId,
+      status: "running",
+      startedAt: new Date("2026-11-04T09:20:00Z"),
+      contextSnapshot: { issueId },
+    });
+    currentActor = agentActor(companyId, reviewerAgentId, runId);
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: "Closing.",
+        doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(String(res.body.error)).toContain("predates the closing run");
+    expect(String(res.body.error)).toContain(runId);
+    expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("PATCH: without a run id header the issue's own checkout run attributes the close and its lifetime gate fires (SUP-23490)", async () => {
+    // The run id header is optional on agent requests. The cross-issue run
+    // context gate resolves the same fallback (header, else the issue's
+    // checkout run) and would let the write through, while the tier guard used
+    // to receive only the header value — so a header-less close escaped the
+    // lifetime gate entirely. The door now passes the resolved closing run, and
+    // here that checkout run started AFTER the cited observation: refused as a
+    // restatement.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23490C", { deliveryRequirement: "record_only" });
+    const checkoutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId: reviewerAgentId,
+      status: "running",
+      invocationSource: "self_declared",
+      startedAt: new Date("2026-11-04T09:20:00Z"),
+      contextSnapshot: { issueId },
+    });
+    await db.update(issues).set({ executionPolicy: null, executionState: null, checkoutRunId }).where(eq(issues.id, issueId));
+    currentActor = { type: "agent", agentId: reviewerAgentId, companyId, source: "agent_key", runId: undefined };
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .patch(`/api/issues/${identifier}`)
+      .send({
+        status: "done",
+        comment: "Closing.",
+        doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(String(res.body.error)).toContain("predates the closing run");
+    expect(String(res.body.error)).toContain(checkoutRunId);
+    expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("POST comment: without a run id header the issue's checkout run attributes the approval close and its lifetime gate fires (SUP-23490)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23490E", { deliveryRequirement: "record_only" });
+    const checkoutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId: reviewerAgentId,
+      status: "running",
+      invocationSource: "self_declared",
+      startedAt: new Date("2026-11-04T09:20:00Z"),
+      contextSnapshot: { issueId },
+    });
+    await db.update(issues).set({ checkoutRunId }).where(eq(issues.id, issueId));
+    currentActor = { type: "agent", agentId: reviewerAgentId, companyId, source: "agent_key", runId: undefined };
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({ body: `## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): ${RECORD_ONLY_EVIDENCE}` });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+    expect(String(res.body.error)).toContain("predates the closing run");
+    expect(String(res.body.error)).toContain(checkoutRunId);
+    expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("POST comment: an accepted header-less approval stamps the checkout run into the tier2 audit record (SUP-23490)", async () => {
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D23490F", { deliveryRequirement: "record_only" });
+    const checkoutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId: reviewerAgentId,
+      status: "running",
+      invocationSource: "self_declared",
+      startedAt: new Date("2026-11-04T09:00:00Z"),
+      contextSnapshot: { issueId },
+    });
+    await db.update(issues).set({ checkoutRunId }).where(eq(issues.id, issueId));
+    currentActor = { type: "agent", agentId: reviewerAgentId, companyId, source: "agent_key", runId: undefined };
+    mockNoOpenPulls();
+
+    const res = await request(app)
+      .post(`/api/issues/${identifier}/comments`)
+      .send({ body: `## Review: APPROVED\n\nShip it.\n\nClosed at Tier 2 (live): ${RECORD_ONLY_EVIDENCE}` });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await statusOf(issueId)).toBe("done");
+    const tier2Rows = await vi.waitFor(
+      async () => {
+        const found = await auditRows(companyId, issueId, "issue.done_transition_tier2_close");
+        if (found.length === 0) throw new Error("waiting for tier2 close audit row");
+        return found;
+      },
+      { timeout: 5000 },
+    );
+    expect(tier2Rows).toHaveLength(1);
+    expect(tier2Rows[0]?.details).toMatchObject({
+      observed: "2026-11-04T09:15:00Z",
+      tierForm: "record-only",
+      closingRunId: checkoutRunId,
+      closingRunStartedAt: "2026-11-04T09:00:00.000Z",
+    });
   });
 
   it("PATCH: record_only close with prose-only Tier 2 evidence is refused naming the record-only form (SUP-22801)", async () => {
@@ -1151,8 +1313,32 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.code).toBe("done_transition_missing_tier_declaration");
-    expect(String(res.body.error)).toContain("record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>");
+    expect(String(res.body.error)).toContain("record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>");
     expect(await statusOf(issueId)).toBe("in_review");
+  });
+
+  it("PATCH: record_only close whose Tier 2 evidence ends in the Tier 1 marker is refused with done_transition_tier_conflict, structured and comment forms (SUP-24299)", async () => {
+    // Same card and evidence as the accepted close in the SUP-22801 test above;
+    // only the trailing Tier 1 marker differs, so only the conflict refusal can stop it.
+    const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D24299A", { deliveryRequirement: "record_only" });
+    await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
+    currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+    mockNoOpenPulls();
+    const conflicted = `${RECORD_ONLY_EVIDENCE}. Liveness unverified.`;
+
+    for (const body of [
+      { status: "done", comment: "Closing.", doneTier: { tier: "tier2", probeEvidence: conflicted } },
+      { status: "done", comment: `Closing.\n\nClosed at Tier 2 (live): ${conflicted}` },
+    ]) {
+      const res = await request(app).patch(`/api/issues/${identifier}`).send(body);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_tier_conflict");
+      expect(String(res.body.error)).toContain("mutually exclusive");
+      expect(String(res.body.details?.remedy)).toContain('remove "Liveness unverified." from the Tier 2 line');
+      expect(await statusOf(issueId)).toBe("in_review");
+    }
+    expect(await auditRows(companyId, issueId, "issue.done_transition_tier2_close")).toHaveLength(0);
   });
 
   it("PATCH: the record_only missing-tier 422 remedy names both record-only forms and no merge head (SUP-22801)", async () => {
@@ -1174,11 +1360,11 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
     const remedy = String(res.body.details.remedy);
     // The structured record-only form, verbatim.
     expect(remedy).toContain(
-      '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>" }',
+      '"doneTier": { "tier": "tier2", "probeEvidence": "record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>" }',
     );
     // The comment form for a record_only card is the record-only grammar...
     expect(remedy).toContain(
-      'record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>[-<UTC ISO-8601 timestamp>] result: pass <pass predicate and observed result>',
+      'record-only probe `<probe command>` target <observed target> observed <UTC ISO-8601 timestamp>-<UTC ISO-8601 timestamp> result: pass <pass predicate and observed result>',
     );
     // ...and the remedy demands no merge head anywhere.
     expect(remedy).not.toContain("post-merge");
@@ -1580,14 +1766,18 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       const rows = await vi.waitFor(
         async () => {
           const found = await auditRows(companyId, issueId, "issue.done_transition_guard_skipped");
-          if (found.length === 0) throw new Error("waiting for waiver audit row");
-          return found;
+          const hits = found.filter(
+            (r) => (r.details as Record<string, unknown>).reason === "open_linked_prs_decision_carried:1",
+          );
+          if (hits.length === 0) throw new Error("waiting for waiver audit row");
+          return hits;
         },
         { timeout: 5000 },
       );
-      expect(
-        rows.some((r) => (r.details as Record<string, unknown>).reason === "open_linked_prs_decision_carried:1"),
-      ).toBe(true);
+      expect(rows).toHaveLength(1);
+      expect((rows[0]?.details as Record<string, unknown>).skipReason).toBe(
+        "open_linked_prs_decision_carried:1",
+      );
     });
 
   it("POST comment: auto-approval publishes paperclip/approved and persists the Guard A head (SUP-13904)", async () => {
@@ -1998,6 +2188,80 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(await statusOf(issueId)).toBe("done");
     });
+
+    it("recovery-action close: the resolved closing run binds the observation lifetime on this door too (SUP-23490)", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("D23490R", { deliveryRequirement: "record_only" });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId: reviewerAgentId,
+        status: "running",
+        invocationSource: "self_declared",
+        startedAt: new Date("2026-11-04T09:20:00Z"),
+        contextSnapshot: { issueId },
+      });
+      await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, issueId));
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      currentActor = { type: "agent", agentId: reviewerAgentId, companyId, source: "agent_key", runId: undefined };
+      mockNoOpenPulls();
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          ...closeBody,
+          doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_missing_tier_declaration");
+      expect(String(res.body.error)).toContain("predates the closing run");
+      expect(String(res.body.error)).toContain(runId);
+      expect(await statusOf(issueId)).toBe("in_review");
+    });
+
+    it("recovery-action close: an accepted close stamps the closing run into the tier2 audit record (SUP-23490)", async () => {
+      const { companyId, reviewerAgentId, issueId } = await seedIssueAwaitingReview("D23490S", { deliveryRequirement: "record_only" });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId: reviewerAgentId,
+        status: "running",
+        invocationSource: "self_declared",
+        startedAt: new Date("2026-11-04T09:00:00Z"),
+        contextSnapshot: { issueId },
+      });
+      await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, issueId));
+      await seedRecoveryActionFor(companyId, issueId, reviewerAgentId, runId);
+      currentActor = agentActor(companyId, reviewerAgentId, runId);
+      mockNoOpenPulls();
+
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          ...closeBody,
+          doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+      const tier2Rows = await vi.waitFor(
+        async () => {
+          const found = await auditRows(companyId, issueId, "issue.done_transition_tier2_close");
+          if (found.length === 0) throw new Error("waiting for tier2 close audit row");
+          return found;
+        },
+        { timeout: 5000 },
+      );
+      expect(tier2Rows).toHaveLength(1);
+      expect(tier2Rows[0]?.details).toMatchObject({
+        observed: "2026-11-04T09:15:00Z",
+        tierForm: "record-only",
+        closingRunId: runId,
+        closingRunStartedAt: "2026-11-04T09:00:00.000Z",
+      });
+    });
   });
 
   it("PATCH: a decision-carrying close refused by mechanism D carries the mechanism's own remedy, not merge-first (ADR-103 M3)", async () => {
@@ -2223,7 +2487,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         .send({
           status: "done",
           comment:
-            "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe re-hit the endpoint; cited commit afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60.",
+            "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe re-hit the endpoint; cited commit TEA-Core/paperclip@afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60.",
         });
 
       // The tier line passed; the provably nonexistent cited SHA is the refusal.
@@ -2255,8 +2519,44 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       );
       expect(rows[0]?.details).toMatchObject({
         decisionCarried: false,
-        results: [{ sha: "afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60", status: "nonexistent" }],
+        results: [{
+          sha: "afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60",
+          status: "nonexistent",
+          probedRepos: [{ hostname: "github.com", owner: "TEA-Core", repo: "paperclip" }],
+        }],
       });
+    });
+
+    it("PATCH: a record_only close refused for a nonexistent cited SHA leaves no allowed guard disposition (SUP-24298)", async () => {
+      const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D24298A");
+      await db
+        .update(issues)
+        .set({ executionPolicy: null, executionState: null, deliveryRequirement: "record_only" })
+        .where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
+      mockMergedBranchWithCommitProbes({ afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60: "absent" });
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment:
+            "Closed at Tier 2 (live): probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: probe re-hit the endpoint; cited commit TEA-Core/paperclip@afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("done_transition_cited_sha_unresolvable");
+      // The refused write is not an allowed transition. Wait for the resolver's own
+      // fire-and-forget row so a late guard row would have landed before this check.
+      await vi.waitFor(
+        async () => {
+          if ((await auditRows(companyId, issueId, "issue.done_transition_cited_sha_resolved")).length === 0) {
+            throw new Error("waiting for cited-sha audit row");
+          }
+        },
+        { timeout: 5000 },
+      );
+      expect(await auditRows(companyId, issueId, "issue.done_transition_guard_skipped")).toHaveLength(0);
     });
 
     it("PATCH: a close citing only resolvable SHAs still closes (no regression)", async () => {
@@ -2274,6 +2574,16 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(await statusOf(issueId)).toBe("done");
+      // An allowed close the guard did not skip writes no skipped disposition (SUP-24298).
+      await vi.waitFor(
+        async () => {
+          if ((await auditRows(companyId, issueId, "issue.done_transition_cited_sha_resolved")).length === 0) {
+            throw new Error("waiting for cited-sha audit row");
+          }
+        },
+        { timeout: 5000 },
+      );
+      expect(await auditRows(companyId, issueId, "issue.done_transition_guard_skipped")).toHaveLength(0);
       // Exact probe list, restored: two calls, both for the same ref — the
       // Tier 2 origin predicate resolves the named probe head, and the
       // cited-SHA resolver probes the cited commit. A single call cannot
@@ -2293,7 +2603,7 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       const { companyId, reviewerAgentId, issueId, identifier } = await seedIssueAwaitingReview("D20525C");
       await db.update(issues).set({ executionPolicy: null, executionState: null }).where(eq(issues.id, issueId));
       currentActor = agentActor(companyId, reviewerAgentId, await seedRun(companyId, reviewerAgentId, issueId));
-      // The SHA probe says absent, but the control ref does not resolve either,
+      // The bare SHA probe says absent, but its repository scope is ambiguous,
       // so absence is unproven: the citation is unverifiable and the close holds.
       mockMergedBranchWithCommitProbes({ afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60: "absent" }, 404);
 
@@ -2315,7 +2625,12 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
         { timeout: 5000 },
       );
       expect(rows[0]?.details).toMatchObject({
-        results: [{ sha: "afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60", status: "unverifiable" }],
+        results: [{
+          sha: "afc6278bea3c9d2f41e6b7805ca94d17f2e8ab60",
+          status: "unverifiable",
+          reason: "ambiguous_repository_scope",
+          probedRepos: [{ hostname: "github.com", owner: "TEA-Core", repo: "paperclip" }],
+        }],
       });
     });
 
@@ -2362,6 +2677,627 @@ describeEmbeddedPostgres("done-transition guards on decision-carrying transition
       // the live default-branch tip, and the cited-SHA resolver probes nothing.
       expect(commitProbeCalls()).toHaveLength(1);
       expect(await auditRows(companyId, issueId, "issue.done_transition_cited_sha_resolved")).toHaveLength(0);
+    });
+  });
+
+  describe("durable approvals survive a reopen (SUP-24054)", () => {
+    // Replays SUP-24036. The board approved the only stage: a decision row plus
+    // the completed projection, back to the return assignee in_progress (the
+    // shape the board stage-decision route writes). The board closed the card.
+    // A deferred comment wake reopened it with a null executionState, and the
+    // return assignee took it back in_progress and closed it with a Tier 2 done.
+    const TIER2_DONE = {
+      tier: "tier2",
+      probeEvidence:
+        "probe `curl -sf https://tea-core.example/healthz` head 7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19 post-merge: the changed page reads back live.",
+    } as const;
+    const APPROVAL_STATUS = {
+      finalDelivery: { owner: "TEA-Core", repo: "paperclip", number: 404, headSha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" },
+    };
+
+    function boardOwner(companyId: string): Express.Request["actor"] {
+      return {
+        type: "board",
+        userId: "cloud-user-1",
+        companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+        source: "cloud_tenant",
+        isInstanceAdmin: false,
+        runId: randomUUID(),
+      };
+    }
+
+    // The board stage-decision route writes the decision row and its
+    // `issue.board_stage_override` activity row in one transaction, so both carry
+    // the same `created_at`; the activity row names the participant decided for.
+    // Decision rows are written first, then the activity rows in the given order.
+    async function recordBoardDecisions(
+      seeded: { companyId: string; issueId: string },
+      outcome: "approved" | "changes_requested",
+      createdAt: Date,
+      entries: Array<{ stageId: string; decidedForAgentId: string }>,
+    ) {
+      await db.transaction(async (tx) => {
+        for (const entry of entries) {
+          await tx.insert(issueExecutionDecisions).values({
+            companyId: seeded.companyId,
+            issueId: seeded.issueId,
+            stageId: entry.stageId,
+            stageType: "review",
+            actorUserId: "cloud-user-1",
+            outcome,
+            body: `board: ${outcome}`,
+            createdAt,
+          });
+        }
+        for (const entry of entries) {
+          await tx.insert(activityLog).values({
+            companyId: seeded.companyId,
+            actorType: "user",
+            actorId: "cloud-user-1",
+            action: "issue.board_stage_override",
+            entityType: "issue",
+            entityId: seeded.issueId,
+            details: {
+              stageId: entry.stageId,
+              stageType: "review",
+              decision: outcome,
+              displacedParticipant: { type: "agent", agentId: entry.decidedForAgentId, userId: null },
+              commentId: null,
+            },
+            createdAt,
+          });
+        }
+      });
+    }
+
+    async function recordBoardDecision(
+      seeded: { companyId: string; issueId: string; firstStageId: string; reviewerAgentId: string },
+      outcome: "approved" | "changes_requested",
+      createdAt: Date,
+    ) {
+      await recordBoardDecisions(seeded, outcome, createdAt, [
+        { stageId: seeded.firstStageId, decidedForAgentId: seeded.reviewerAgentId },
+      ]);
+    }
+
+    async function seedBoardApprovedCard(issuePrefix: string) {
+      const seeded = await seedIssueAwaitingReview(issuePrefix);
+      await recordBoardDecision(seeded, "approved", new Date("2026-11-12T19:09:34Z"));
+      await db
+        .update(issues)
+        .set({
+          status: "in_progress",
+          assigneeAgentId: seeded.implementerAgentId,
+          executionState: {
+            status: "completed",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: { type: "agent", agentId: seeded.implementerAgentId, userId: null },
+            reviewRequest: null,
+            completedStageIds: [seeded.firstStageId],
+            lastDecisionId: null,
+            lastDecisionOutcome: "approved",
+            monitor: null,
+            changesRequestedCount: 0,
+            approvalStatus: APPROVAL_STATUS,
+          },
+        })
+        .where(eq(issues.id, seeded.issueId));
+      return seeded;
+    }
+
+    async function issueRow(issueId: string) {
+      const rows = await db
+        .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId, executionState: issues.executionState })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      return rows[0];
+    }
+
+    it("PATCH: the board still closes a stuck completed card, and the close keeps the completed ladder record", async () => {
+      const { companyId, issueId, identifier, firstStageId } = await seedBoardApprovedCard("S24054A");
+      // The SUP-15305 stuck shape: a blocked card whose workflow already completed.
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+      currentActor = boardOwner(companyId);
+      mockMergedBranch();
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Board close of the approved card." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const row = await issueRow(issueId);
+      expect(row?.status).toBe("done");
+      expect(row?.executionState).toMatchObject({
+        status: "completed",
+        completedStageIds: [firstStageId],
+        approvalStatus: APPROVAL_STATUS,
+      });
+    });
+
+    it("PATCH: the return assignee's Tier 2 done after a reopen closes on the durable approval, never in_review", async () => {
+      const { companyId, implementerAgentId, issueId, identifier } = await seedBoardApprovedCard("S24054B");
+      mockMergedBranch();
+
+      currentActor = boardOwner(companyId);
+      const boardClose = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Approved and merged; closing." });
+      expect(boardClose.status, JSON.stringify(boardClose.body)).toBe(200);
+      expect(await statusOf(issueId)).toBe("done");
+
+      // The deferred comment wake reopens the card with a null projection
+      // (the heartbeat reopen writer), then the assignee checks it out.
+      await db.update(issues).set({ status: "in_progress", executionState: null }).where(eq(issues.id, issueId));
+
+      currentActor = agentActor(companyId, implementerAgentId, await seedRun(companyId, implementerAgentId, issueId));
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Closing after the approved delivery.", doneTier: TIER2_DONE });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const row = await issueRow(issueId);
+      expect(row?.status).toBe("done");
+      expect(row?.assigneeAgentId).toBe(implementerAgentId);
+      const recovered = await vi.waitFor(
+        async () => {
+          const found = await auditRows(companyId, issueId, "issue.done_transition_ladder_recovered_from_decisions");
+          if (found.length === 0) throw new Error("waiting for audit row");
+          return found;
+        },
+        { timeout: 5000 },
+      );
+      expect(recovered).toHaveLength(1);
+    });
+
+    it("PATCH: an approval superseded by a later changes_requested still re-arms the stage (fail closed)", async () => {
+      const seeded = await seedBoardApprovedCard("S24054C");
+      const { companyId, reviewerAgentId, implementerAgentId, issueId, identifier, firstStageId } = seeded;
+      await recordBoardDecision(seeded, "changes_requested", new Date("2026-11-12T19:30:00Z"));
+      await db.update(issues).set({ executionState: null }).where(eq(issues.id, issueId));
+      currentActor = agentActor(companyId, implementerAgentId, await seedRun(companyId, implementerAgentId, issueId));
+      mockMergedBranch();
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({ status: "done", comment: "Addressed the requested changes." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const row = await issueRow(issueId);
+      expect(row?.status).toBe("in_review");
+      expect(row?.assigneeAgentId).toBe(reviewerAgentId);
+      expect(row?.executionState).toMatchObject({ status: "pending", currentStageId: firstStageId });
+      expect(await auditRows(companyId, issueId, "issue.done_transition_ladder_recovered_from_decisions")).toHaveLength(0);
+    });
+
+    // Release-assurance B1/B2: an approval recorded under a policy that was edited
+    // afterwards, or a self-approval, is not a durable approval. The `done` then
+    // re-arms review exactly as it does without durable approvals.
+    type SeededCard = {
+      companyId: string;
+      reviewerAgentId: string;
+      implementerAgentId: string;
+      secondReviewerAgentId: string;
+      issueId: string;
+      identifier: string;
+      firstStageId: string;
+      secondStageId: string;
+    };
+    type PolicyStage = { id: string; type: "review" | "approval"; participants: Array<string | { userId: string }> };
+
+    async function writePolicy(seeded: SeededCard, stages: PolicyStage[]) {
+      await db
+        .update(issues)
+        .set({
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            returnAssigneeAgentId: seeded.implementerAgentId,
+            stages: stages.map((stage) => ({
+              id: stage.id,
+              type: stage.type,
+              approvalsNeeded: 1,
+              participants: stage.participants.map((participant) =>
+                typeof participant === "string"
+                  ? { type: "agent", agentId: participant, userId: null }
+                  : { type: "user", agentId: null, userId: participant.userId },
+              ),
+            })),
+          },
+        })
+        .where(eq(issues.id, seeded.issueId));
+    }
+
+    async function recordAgentDecision(
+      seeded: SeededCard,
+      decision: { stageId: string; stageType: "review" | "approval"; actorAgentId: string; outcome: "approved" | "changes_requested"; createdAt: Date },
+    ) {
+      await db.insert(issueExecutionDecisions).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        stageId: decision.stageId,
+        stageType: decision.stageType,
+        actorAgentId: decision.actorAgentId,
+        outcome: decision.outcome,
+        body: `${decision.outcome}`,
+        createdAt: decision.createdAt,
+      });
+    }
+
+    /** Reopen with a null projection, back in_progress to `assigneeAgentId` (null: unassigned). */
+    async function reopenWithNullState(seeded: SeededCard, assigneeAgentId: string | null) {
+      await db
+        .update(issues)
+        .set({ status: "in_progress", assigneeAgentId, executionState: null })
+        .where(eq(issues.id, seeded.issueId));
+    }
+
+    /** Reopen with a null projection, back to the return assignee in_progress, then its Tier 2 `done`. */
+    async function reopenAndClose(seeded: SeededCard, mockGitHub: () => void = mockMergedBranch) {
+      await reopenWithNullState(seeded, seeded.implementerAgentId);
+      currentActor = agentActor(
+        seeded.companyId,
+        seeded.implementerAgentId,
+        await seedRun(seeded.companyId, seeded.implementerAgentId, seeded.issueId),
+      );
+      mockGitHub();
+      return request(app)
+        .patch(`/api/issues/${seeded.identifier}`)
+        .send({ status: "done", comment: "Closing after the approved delivery.", doneTier: TIER2_DONE });
+    }
+
+    /**
+     * `mockMergedBranch`, plus one write that lands on the first GitHub call. The
+     * done guard makes that call after the transition was computed from the
+     * unlocked read and before the write transaction takes the row lock, so the
+     * write models a concurrent change that commits in that window.
+     */
+    function mockMergedBranchWithConcurrentWrite(write: () => Promise<void>) {
+      mockGetByName.mockResolvedValue({ id: "secret-1", name: "GITHUB_TOKEN" });
+      mockResolveSecretValue.mockResolvedValue("test-token");
+      let written = false;
+      mockGhFetch.mockImplementation(async (url: string) => {
+        if (!written) {
+          written = true;
+          await write();
+        }
+        if (url.includes("/compare/")) return new Response(JSON.stringify({ ahead_by: 0 }), { status: 200 });
+        if (url.includes("/commits/")) return new Response(JSON.stringify({ sha: "7d3f9c1e0a25b864d7f2c9e6a18b40c3d5e72f19" }), { status: 200 });
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+    }
+
+    async function seedRecoveryAction(seeded: SeededCard, ownerAgentId: string, runId: string) {
+      const now = new Date();
+      await db.insert(issueRecoveryActions).values({
+        companyId: seeded.companyId,
+        sourceIssueId: seeded.issueId,
+        recoveryIssueId: null,
+        kind: "missing_disposition",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId,
+        ownerUserId: null,
+        previousOwnerAgentId: null,
+        returnOwnerAgentId: null,
+        cause: "successful_run_missing_issue_disposition",
+        fingerprint: `missing-disposition:${seeded.issueId}`,
+        evidence: { runId },
+        nextAction: "Choose a valid issue disposition.",
+        attemptCount: 1,
+        lastAttemptAt: now,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+
+    function resolveRecoveryAsDone(seeded: SeededCard) {
+      return request(app)
+        .post(`/api/issues/${seeded.issueId}/recovery-actions/resolve`)
+        .send({
+          outcome: "restored",
+          sourceIssueStatus: "done",
+          resolutionNote: "Closing after the approved delivery.",
+          doneTier: TIER2_DONE,
+        });
+    }
+
+    async function expectReviewReArmed(
+      seeded: SeededCard,
+      res: request.Response,
+      expected: { stageId: string; assigneeAgentId: string },
+    ) {
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const row = await issueRow(seeded.issueId);
+      expect(row?.status).toBe("in_review");
+      expect(row?.assigneeAgentId).toBe(expected.assigneeAgentId);
+      expect(row?.executionState).toMatchObject({ status: "pending", currentStageId: expected.stageId });
+      expect(
+        await auditRows(seeded.companyId, seeded.issueId, "issue.done_transition_ladder_recovered_from_decisions"),
+      ).toHaveLength(0);
+    }
+
+    const APPROVED_AT = new Date("2026-11-12T19:09:34Z");
+
+    it("PATCH: a current participant's approval under the unchanged policy still closes on the durable approval", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054D");
+      await recordAgentDecision(seeded, {
+        stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.reviewerAgentId, outcome: "approved", createdAt: APPROVED_AT,
+      });
+
+      const res = await reopenAndClose(seeded);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(seeded.issueId)).toBe("done");
+      await vi.waitFor(
+        async () => {
+          const found = await auditRows(seeded.companyId, seeded.issueId, "issue.done_transition_ladder_recovered_from_decisions");
+          if (found.length === 0) throw new Error("waiting for audit row");
+        },
+        { timeout: 5000 },
+      );
+    });
+
+    it("PATCH: a participant approval does not count after that participant was replaced on the stage", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054E");
+      await recordAgentDecision(seeded, {
+        stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.reviewerAgentId, outcome: "approved", createdAt: APPROVED_AT,
+      });
+      await writePolicy(seeded, [{ id: seeded.firstStageId, type: "review", participants: [seeded.secondReviewerAgentId] }]);
+
+      const res = await reopenAndClose(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.secondReviewerAgentId });
+    });
+
+    it("PATCH: a board stage approval does not count after the participant it decided for was replaced", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054F");
+      await recordBoardDecision(seeded, "approved", APPROVED_AT);
+      await writePolicy(seeded, [{ id: seeded.firstStageId, type: "review", participants: [seeded.secondReviewerAgentId] }]);
+
+      const res = await reopenAndClose(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.secondReviewerAgentId });
+    });
+
+    it("PATCH: an approval does not count after the stage type was flipped", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054G");
+      await recordAgentDecision(seeded, {
+        stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.reviewerAgentId, outcome: "approved", createdAt: APPROVED_AT,
+      });
+      await writePolicy(seeded, [{ id: seeded.firstStageId, type: "approval", participants: [seeded.reviewerAgentId] }]);
+
+      const res = await reopenAndClose(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.reviewerAgentId });
+    });
+
+    it("PATCH: an approval does not count after the policy dropped a stage that holds a decision", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054H", { stageCount: 2 });
+      await recordAgentDecision(seeded, {
+        stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.reviewerAgentId, outcome: "approved", createdAt: APPROVED_AT,
+      });
+      await recordAgentDecision(seeded, {
+        stageId: seeded.secondStageId, stageType: "review", actorAgentId: seeded.secondReviewerAgentId, outcome: "changes_requested",
+        createdAt: new Date("2026-11-12T19:20:00Z"),
+      });
+      await writePolicy(seeded, [{ id: seeded.firstStageId, type: "review", participants: [seeded.reviewerAgentId] }]);
+
+      const res = await reopenAndClose(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.reviewerAgentId });
+    });
+
+    it("PATCH: a self-approval by the return assignee does not count, even when it is a stage participant", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054I");
+      await writePolicy(seeded, [
+        { id: seeded.firstStageId, type: "review", participants: [seeded.reviewerAgentId, seeded.implementerAgentId] },
+      ]);
+      await recordAgentDecision(seeded, {
+        stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.implementerAgentId, outcome: "approved", createdAt: APPROVED_AT,
+      });
+
+      const res = await reopenAndClose(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.reviewerAgentId });
+    });
+
+    it("PATCH: a later board approval is checked against its own override row, not an earlier one", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054J");
+      await recordBoardDecisions(seeded, "approved", APPROVED_AT, [
+        { stageId: seeded.firstStageId, decidedForAgentId: seeded.secondReviewerAgentId },
+      ]);
+      await recordBoardDecisions(seeded, "approved", new Date("2026-11-12T19:40:00Z"), [
+        { stageId: seeded.firstStageId, decidedForAgentId: seeded.reviewerAgentId },
+      ]);
+      await writePolicy(seeded, [{ id: seeded.firstStageId, type: "review", participants: [seeded.secondReviewerAgentId] }]);
+
+      const res = await reopenAndClose(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.secondReviewerAgentId });
+    });
+
+    it("PATCH: board approvals on two stages in one instant are each checked against their own stage's override row", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054K", { stageCount: 2 });
+      await recordBoardDecisions(seeded, "approved", APPROVED_AT, [
+        { stageId: seeded.secondStageId, decidedForAgentId: seeded.secondReviewerAgentId },
+        { stageId: seeded.firstStageId, decidedForAgentId: seeded.reviewerAgentId },
+      ]);
+
+      const res = await reopenAndClose(seeded);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await statusOf(seeded.issueId)).toBe("done");
+    });
+
+    // Release-assurance B3: a durable-approval close re-reads the decision rows
+    // and the execution state under the issue row lock, so a change that commits
+    // between the unlocked read and the write is never overwritten by the close.
+    async function seedParticipantApprovedCard(issuePrefix: string) {
+      const seeded = await seedIssueAwaitingReview(issuePrefix);
+      await recordAgentDecision(seeded, {
+        stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.reviewerAgentId, outcome: "approved", createdAt: APPROVED_AT,
+      });
+      return seeded;
+    }
+
+    async function expectCloseRefusedAsStale(seeded: SeededCard, res: request.Response, expectedStatus: string) {
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.details?.code ?? res.body.code).toBe("durable_approval_close_conflict");
+      expect(await statusOf(seeded.issueId)).toBe(expectedStatus);
+    }
+
+    it("PATCH: a durable-approval close does not overwrite a board re-arm that commits first", async () => {
+      const seeded = await seedParticipantApprovedCard("S24054L");
+
+      const res = await reopenAndClose(seeded, () =>
+        mockMergedBranchWithConcurrentWrite(async () => {
+          await db
+            .update(issues)
+            .set({
+              status: "in_review",
+              assigneeAgentId: seeded.reviewerAgentId,
+              executionState: {
+                status: "pending",
+                currentStageId: seeded.firstStageId,
+                currentStageIndex: 0,
+                currentStageType: "review",
+                currentParticipant: { type: "agent", agentId: seeded.reviewerAgentId, userId: null },
+                returnAssignee: { type: "agent", agentId: seeded.implementerAgentId, userId: null },
+                reviewRequest: null,
+                completedStageIds: [],
+                lastDecisionId: null,
+                lastDecisionOutcome: null,
+                monitor: null,
+                changesRequestedCount: 0,
+              },
+            })
+            .where(eq(issues.id, seeded.issueId));
+        }),
+      );
+
+      await expectCloseRefusedAsStale(seeded, res, "in_review");
+    });
+
+    it("PATCH: a durable-approval close does not overwrite a reviewer changes_requested that commits first", async () => {
+      const seeded = await seedParticipantApprovedCard("S24054M");
+
+      const res = await reopenAndClose(seeded, () =>
+        mockMergedBranchWithConcurrentWrite(() =>
+          recordAgentDecision(seeded, {
+            stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.reviewerAgentId, outcome: "changes_requested",
+            createdAt: new Date(),
+          }),
+        ),
+      );
+
+      await expectCloseRefusedAsStale(seeded, res, "in_progress");
+    });
+
+    it("PATCH: a durable-approval close does not overwrite a policy edit that commits first", async () => {
+      const seeded = await seedParticipantApprovedCard("S24054N");
+
+      const res = await reopenAndClose(seeded, () =>
+        mockMergedBranchWithConcurrentWrite(() =>
+          writePolicy(seeded, [{ id: seeded.firstStageId, type: "review", participants: [seeded.reviewerAgentId, seeded.secondReviewerAgentId] }]),
+        ),
+      );
+
+      await expectCloseRefusedAsStale(seeded, res, "in_progress");
+    });
+
+    // Release-assurance B2: the closer of the `done` is a self-approval
+    // principal too, and a board stage decision recorded for the return
+    // assignee's seat is the return assignee's own approval.
+    async function closeAsBoard(seeded: SeededCard) {
+      await reopenWithNullState(seeded, seeded.implementerAgentId);
+      currentActor = boardOwner(seeded.companyId);
+      mockMergedBranch();
+      return request(app).patch(`/api/issues/${seeded.identifier}`).send({ status: "done", comment: "Board close." });
+    }
+
+    it("PATCH: a board user's done does not count its own board stage decision", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054O");
+      await recordBoardDecision(seeded, "approved", APPROVED_AT);
+
+      const res = await closeAsBoard(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.reviewerAgentId });
+    });
+
+    it("PATCH: a board user's done does not count its own approval as a user participant", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054P");
+      await writePolicy(seeded, [{ id: seeded.firstStageId, type: "review", participants: [{ userId: "cloud-user-1" }] }]);
+      await db.insert(issueExecutionDecisions).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        stageId: seeded.firstStageId,
+        stageType: "review",
+        actorUserId: "cloud-user-1",
+        outcome: "approved",
+        body: "approved",
+        createdAt: APPROVED_AT,
+      });
+
+      const res = await closeAsBoard(seeded);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const row = await issueRow(seeded.issueId);
+      expect(row?.status).toBe("in_review");
+      expect(row?.executionState).toMatchObject({ status: "pending", currentStageId: seeded.firstStageId });
+    });
+
+    it("recovery resolve: a board user's done does not count its own board stage decision", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054Q");
+      await recordBoardDecision(seeded, "approved", APPROVED_AT);
+      await reopenWithNullState(seeded, seeded.implementerAgentId);
+      await seedRecoveryAction(
+        seeded,
+        seeded.implementerAgentId,
+        await seedRun(seeded.companyId, seeded.implementerAgentId, seeded.issueId),
+      );
+      currentActor = boardOwner(seeded.companyId);
+      mockMergedBranch();
+
+      const res = await resolveRecoveryAsDone(seeded);
+
+      expect(await statusOf(seeded.issueId), JSON.stringify(res.body)).not.toBe("done");
+    });
+
+    it("recovery resolve: the owner of an unassigned card's recovery action does not close on its own approval", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054R");
+      await writePolicy(seeded, [
+        { id: seeded.firstStageId, type: "review", participants: [seeded.reviewerAgentId, seeded.secondReviewerAgentId] },
+      ]);
+      await recordAgentDecision(seeded, {
+        stageId: seeded.firstStageId, stageType: "review", actorAgentId: seeded.secondReviewerAgentId, outcome: "approved", createdAt: APPROVED_AT,
+      });
+      await reopenWithNullState(seeded, null);
+      const runId = await seedRun(seeded.companyId, seeded.secondReviewerAgentId, seeded.issueId);
+      await seedRecoveryAction(seeded, seeded.secondReviewerAgentId, runId);
+      currentActor = agentActor(seeded.companyId, seeded.secondReviewerAgentId, runId);
+      mockMergedBranch();
+
+      const res = await resolveRecoveryAsDone(seeded);
+
+      expect(await statusOf(seeded.issueId), JSON.stringify(res.body)).not.toBe("done");
+    });
+
+    it("PATCH: a board stage decision recorded for the return assignee's seat does not count", async () => {
+      const seeded = await seedIssueAwaitingReview("S24054S");
+      await writePolicy(seeded, [
+        { id: seeded.firstStageId, type: "review", participants: [seeded.reviewerAgentId, seeded.implementerAgentId] },
+      ]);
+      await recordBoardDecisions(seeded, "approved", APPROVED_AT, [
+        { stageId: seeded.firstStageId, decidedForAgentId: seeded.implementerAgentId },
+      ]);
+
+      const res = await reopenAndClose(seeded);
+
+      await expectReviewReArmed(seeded, res, { stageId: seeded.firstStageId, assigneeAgentId: seeded.reviewerAgentId });
     });
   });
 });

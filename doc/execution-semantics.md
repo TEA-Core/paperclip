@@ -91,8 +91,47 @@ An external review service can also be a valid review path when the issue keeps 
 Each `executionPolicy.stages` entry may set `phase` to `pre_merge` (the default)
 or `post_merge`. The `paperclip/approved` stamp requires all pre-merge stages to
 be completed and the last recorded decision to be approved; a pending post-merge
-stage does not delay that stamp. Stage order and issue completion are unchanged:
-the review workflow still waits for post-merge stages before closing `done`.
+stage does not delay that stamp. The review workflow follows stage order and
+waits for post-merge stages before closing `done`.
+
+For a native completion review addressed to an agent, the server saves the review
+card and a durable reviewer wake in the same transaction. The reviewer can act
+on the child task even when its own parent task waits for that child. The child
+keeps its worker assignee and the parent keeps its dependency. The review run
+can read the submitted work and accept or reject its assigned card. It cannot
+use that role to change ordinary task assignments or dependencies.
+
+Accepting the last required native completion review marks the child Done and
+makes its dependents eligible to continue. Rejection returns the requested
+changes to the worker. A review run that ends without a decision cannot mark
+the child Done. It retains the review and records a bounded recovery action.
+See [native status arbitration](architecture/native-status-arbitration.md#agent-review-handoff)
+for the authorization checks and completion-report rules.
+
+The parent receives recent child review decisions in its continuation evidence
+and through `get_task_context`. Each record names the child, decision, reviewer,
+and review run. The server reads these records from saved review state; it does
+not depend on the parent session remembering a separate review session. These
+records are evidence and do not grant permission to resolve another review.
+
+### Answered Slack conversations
+
+A successful Slack turn with a published final reply and no remaining execution
+or decision path settles to `chat_conversations.state = waiting` and issue
+`in_review`. This is a server-owned passive conversation state, displayed as
+**Idle**, not a request for review. It is excluded from execution counts, work
+queues, and generic review attention, while remaining accessible through
+Conversations, search, recent history, and unread activity.
+
+An admitted Slack or board message clears waiting and returns the issue to
+`todo` in the message transaction; normal wake admission and checkout resume
+execution. Settlement rechecks the
+latest run, message cursor, publication receipt, and outstanding work under the
+task lock. Failed delivery, a newer message, queued work, monitors, dependencies,
+and pending decisions prevent settlement. Reconciliation applies the same rule
+to existing answered threads without another model invocation. Slack identity,
+permissions, and the ability to execute work in the same thread are unchanged.
+Other providers keep their existing lifecycle.
 
 ### `done`
 
@@ -137,7 +176,7 @@ These are related but not identical:
 - `checkoutRunId` answers who currently owns execution rights for the issue
 - `executionRunId` answers which run is actually live right now
 
-Paperclip already clears stale execution locks and can adopt some stale checkout locks when the original run is gone.
+Paperclip clears stale execution locks and can adopt some stale checkout locks when the original run is gone.
 
 The active-lock lifecycle is part of the checkout contract:
 
@@ -146,9 +185,69 @@ The active-lock lifecycle is part of the checkout contract:
 - finalization must not clear a lock already reacquired by a successor run
 - process-loss retry handoff must not leave `checkoutRunId` pinned to the failed run when `executionRunId` moves to the retry run
 - checkout and checkout-owner checks may self-heal lock columns that point at terminal or missing runs before evaluating conflicts
+- checkout and checkout-owner adoption check the same-company execution, checkout and legacy `contextSnapshot.issueId` bindings; another queued, running or scheduled-retry run returns `409`, even when the caller has no run ID or issue context
+- the own-run exemption uses the exact run ID, not the agent ID; status and assignment checks still apply, a running owner takes precedence over an older queued reservation, and an acting run must belong to the issue company
+- the holder check, ownership change and execution stamp use one transaction and keep the issue row locked until commit
+- queued issue-ownership claims fence a different running holder under that same row lock and commit their execution stamp with the transition to `running`; a queued reservation is not already executing, and non-assignee visitor or mention runs do not acquire issue ownership
+- external self-declared run creation also checks and stamps under one issue lock; a live checkout or legacy-context holder refuses creation even when `executionRunId` is clear
 - the recovery sweeper may clear rows whose checkout and execution locks all point at terminal or missing runs
 
 Stale-lock recovery is crash recovery, not a retry loop. Paperclip must not clear or adopt locks held by non-terminal runs. After stale cleanup, a checkout `409` should mean a real live owner, status/assignee mismatch, unresolved blocker, or active gate still prevents checkout. Agents must treat that `409` as an ownership conflict and stop rather than retrying the same checkout.
+
+An agent run can claim an issue for its own agent with one PATCH that sets
+`status: "in_progress"` and sets `assigneeAgentId` to that agent. When the
+writing run is `running` and its run context names no issue or this issue, that
+PATCH does not enqueue an `issue_assigned` wake for the agent. The claiming run
+executes the claim and takes the checkout itself. A wake would dispatch a second
+live run of the same agent on the issue, and that run would take the checkout
+from the claiming run. A board or user claim, a claim for a different agent, an
+assignment that does not set `in_progress`, and a claim from a run scoped to a
+different issue still wake the assignee.
+
+A non-final workflow handoff may change the assignee while its issuing run is
+still running. Only an issuer whose run context names this issue is exempt from
+its own handoff PATCH's cancellation. For any other issuer, the handoff is saved
+first and cancellation is then attempted only for a run the route's existing
+lookup finds: the execution-lock holder or the assignee's issue-scoped active
+run. The route does not cancel an issuer that this lookup cannot find.
+A cancellation attempt can throw or leave the run running. The handoff stays
+saved; the route logs a warning and a `heartbeat.cancel_failed` activity. A
+terminal approval keeps the confirmed stop before the write: an unconfirmed stop
+returns `409 runner_goal_reassignment_stop_unconfirmed` and saves nothing.
+
+Under the issue row lock, a non-terminal assignee change retains a running
+holder identified by the issue's existing execution or checkout binding. It
+clears checkout permission but preserves execution admission across the saved
+update, a delayed cancellation and a failed cancellation. A request header alone
+grants neither cancellation nor a hold. If only a legacy issue-context binding
+remains, admission recovers it by company and issue, not by the new assignee.
+
+While that issuer runs, the successor stays `deferred_issue_execution`. After
+the issuer stops, `releaseIssueExecutionAndPromote` compare-and-clears only this
+run's actual bindings and promotes their existing deferred intents, including
+bindings outside the run's context issue. It does not clear a different run's
+lock or create automatic recovery for a sibling issue. Existing task, chat,
+comment-disposal and no-replay gates still apply. Recovery and missing-comment
+retry producers retain valid queued intent behind a different running holder;
+a former assignee cannot use a comment retry or a sibling binding to reclaim
+the next stage.
+
+A successor that is already a queued run, not a deferred intent, is not
+promoted. When the previous run's executor finishes its cleanup, Paperclip
+starts the queue of every other agent with a queued run on the same issue,
+using the same queue-start call as the scheduler. Admission still applies the
+agent, budget and scheduling checks, the live-holder deferral and the claim
+fence. A run that they refuse stays queued for the next scheduler pass. A
+failure to start that queue is logged and does not change the settled run.
+
+The existing `reapOrphanedRuns` sweep can also finalize a lost run after its
+process-liveness and controller-ownership checks allow recovery. It marks that
+orphan failed and uses the same release/promotion path unless a process-loss
+retry takes over. It skips tracked live executions, live child processes and
+native runs whose ownership is unverified. It is not a forced-stop timeout for
+an issuer that stays active forever. A cancellation attempt alone never
+authorizes release: execution must have stopped. Without a saved binding or
+matching issue context, Paperclip does not infer an issuer hold from a request header.
 
 ### Known execution waits at admission
 
@@ -224,6 +323,13 @@ comment, and no new blocker edge. Failed, timed-out, cancelled,
 platform-refused, and run-less wakes always count. At the cap, the recovery
 action asks the board to distinguish platform refusal, all blockers terminal
 without a valid continuation, and an unlinked real blocker.
+
+The zero-blocker heal does not wake a deliberate review-stage or approval-stage
+park. That park is `blocked` with no blocker edge, a usable `unblockDescriptor`
+that names the blocker, and an execution state that is still `pending` with a
+`currentStageId`. The stage holder parks this way on purpose, and a wake would
+only make it exit as a no-op. A descriptor with no pending stage, or a pending
+stage with no descriptor, is not this park and still heals.
 
 If a parent is truly waiting on a child, model that with blockers. Do not rely on the parent/child relationship alone.
 
@@ -334,6 +440,12 @@ The valid action-path primitives are:
 - a first-class blocker chain whose unresolved leaf issues are themselves healthy
 - an open explicit recovery action that names the owner and action needed to restore liveness
 
+A bounded review-path recovery for a task from a supported external-chat
+provider retains the source run's admitted message IDs. It does not inherit checkout or authorization
+markers. Before dispatch, Paperclip verifies the recovery run's task ownership
+and current conversation, endpoint, and principal access for every message.
+Missing message references or revoked access still prevent execution.
+
 ### Durable external waits and heartbeat finalization
 
 An external wait counts as a live or waiting path only when the next move survives the current heartbeat and is represented in Paperclip's durable control-plane state. Valid external-wait shapes are:
@@ -369,12 +481,15 @@ Issue document comments, document annotation comments, and document review comme
 
 Document-scoped activity may still route work when it is converted into an explicit action-path primitive. Valid routing exceptions include:
 
-- an issue mention or structured agent mention that intentionally wakes or assigns a named participant
 - a document-review assignment that names a reviewer or assignee for the review state
 - a response to an issue-thread interaction, such as `request_confirmation`, `ask_user_questions`, or `suggest_tasks`
 - intentional board routing that assigns or reassigns the issue, opens a first-class blocker, creates delegated follow-up work, or queues a typed wake
 
 Freeform document approval text is not auto-acceptance. Plan approval, implementation approval, or review acceptance must flow through the explicit interaction, approval, execution-policy, assignment, or blocker primitives that define who owns the next move.
+
+An interaction can be created by a run on another task in the same company, or by a run with no task. That run records the interaction's origin; its comments and results do not become context for the target task. Explicit resume and retry history takes precedence and must belong to the target task.
+
+New interactions exclude known comments from other tasks when recording their origins. At dispatch, older interactions may discard a copied origin only when both the producer's saved context and a comment on that producer's other task prove where it came from. Missing records, cross-company references, explicit wake comments, and unrelated origins still fail closed.
 
 ### Comment interrupts and ownership handoffs
 
@@ -390,20 +505,13 @@ An ownership change selects who owns the issue after the comment is committed:
 - setting `assigneeUserId`, or clearing `assigneeAgentId`, makes the issue human-owned or unassigned
 - leaving assignee fields unchanged preserves the current owner
 
-A wake is the delivery path for a selected agent owner. If an interrupting update also assigns a non-terminal, non-backlog issue to an agent, Paperclip should enqueue one wake for the new assignee and include the interrupting comment and interrupted run id in the wake payload/context when available. Stale scheduled retries for the previous owner must not run after ownership changes away from that owner.
+A wake is the delivery path for a selected agent owner. If an interrupting update also assigns a non-terminal, non-backlog issue to an agent, Paperclip should enqueue one wake for the new assignee and include the interrupting comment and interrupted run id in the wake payload/context when available. Stale scheduled retries for the previous owner must not run after ownership changes away from that owner. The one exception is a queued native-review run for the reviewer participant: while its native-review assignment is still valid (and no other run has already claimed it), the queued-run staleness gate does not cancel it as `issue_assignee_changed`, so it reaches the native-review claim. An invalid assignment is still cancelled as `issue_assignee_changed`; a duplicate is cancelled as `native_review_assignment_already_claimed`.
 
 If the committed update assigns the issue to a user, clears the agent assignee, or leaves the issue without an agent owner, Paperclip must not imply that an agent handoff happened. The issue is then waiting on the human owner or on a future explicit assignment, blocker, approval, interaction, monitor, or recovery action.
 
-Plain text is not assignment. Writing an agent's name, role, or team label in a comment does not change ownership and does not create an agent wake. Agent routing from comment text requires a structured agent mention that resolves inside the company, an explicit `assigneeAgentId` mutation, or an existing current agent assignee receiving normal issue-thread feedback.
+Agent names and structured @-mentions are context, not assignment or wake requests. Mentions remain on the original comment and do not start an agent, authorize checkout, or copy feedback onto a referenced child task. This applies equally to board and agent comments, standalone comments and issue updates, and open and terminal tasks. New work for another agent requires explicit assignment, a bounded delegated task, or an explicit review request.
 
-A delegation comment from the current assignee's run on this parent must not start competing parent work when the named worker already owns the referenced child. This applies to issue updates with a comment and standalone comments. Verify the source run's company, agent, and parent-task context. Then verify that the comment references the child's identifier, the child's `parentId` names this parent, and the child belongs to the same company and is assigned to the mentioned worker. Apply child-aware routing only in either of these states:
-
-- The parent is `blocked` and the child is `in_progress`. The child must have a blocker edge to the parent. The child's execution or checkout run must still be `running`, belong to that worker and company, and name that child in its run context. Verify comment and mutation access to the child, then retain the parent comment and append a linked copy on the child. Preserve the full comment, author, source run, responsible-user attribution, and source trust. Target the normal mention wake at the child and its new comment ID, with explicit resume and follow-up intent. This keeps new feedback available to the worker and lets the existing queue serialize a child continuation behind its current execution.
-- The parent and child are both `done`. The assignee's closing comment must not start another worker run for the completed delegation. A blocker edge is not required after completion: a fast child can finish before the lead needs to record a wait. New agent work must use explicit `resume: true`, a status change, or a new assigned task. Explicit resume moves the parent out of `done` before this rule runs; the comment's prose alone does not restart completed work.
-
-The completed-delegation comment remains on the parent without a worker wake. Neither path changes ownership. Board-user comments and unrelated mentions retain their normal wake behavior. If multiple referenced children qualify for the same worker, the child or run no longer meets these conditions, child comment or mutation access is denied, or a lookup or copy fails, use the normal parent mention path. Do not parse mentions again while copying a comment, which would create another routing loop. Completion of the child still uses the existing blocker-resolution wake for the parent's assignee.
-
-The parent may receive a closing comment before its assignee changes the status to `done`. Recheck the completed-delegation rule when releasing that parent execution, before promoting a deferred mention. On the same transaction, verify the final parent state, finishing run, and every original queued or deferred comment ID. Each comment must belong to this parent and company, come from its assignee's finishing run, and reference exactly one completed direct child assigned to the mentioned worker. A link to the parent itself is allowed; any other extra issue reference keeps the normal mention path, including an unknown or foreign reference. Mixed human, other-run, unrelated, or ambiguous input retains its normal wake path. Explicit continuation and interaction requests also retain their normal path.
+Normal issue-thread feedback can still wake the current assignee according to the comment policy; self-comments and closed-task comments retain their existing suppression rules. Explicit assignment, review, interaction, and blocker-resolution wakes retain their own routing. New mention wake requests are ignored at admission, including calls from legacy producers. Already accepted queue entries retain their existing execution rules: an old entry can combine an assignment or other feedback with a later mention, so its last wake reason does not prove that the entry is mention-only.
 
 Accepted agent feedback must survive a child changing to `done` before its active run exits. Deferred wake promotion may reopen that completed child only for its current assignee, with explicit agent resume intent and live tracked comments from another author. Claim promotion before reopening. Cancelled tasks, deleted comments, self-authored comments, empty continuations, and agent continuations without explicit intent keep their existing suppression rules. Normal pause, ownership, authorization, and budget gates still apply.
 
@@ -430,6 +538,45 @@ The state `projectWorkspaceId` plus `executionWorkspaceId` without `projectId` i
 Workspace incoherence feeds into the same non-terminal liveness and stranded assigned-work model as a disappeared run. The recovery path should first fail or reject the incoherent wake, then either repair and requeue one bounded continuation for the same assignee or surface an explicit recovery action. It must not leave an agent-owned `in_progress` issue healthy solely because a wake record exists that would invoke the adapter in the wrong cwd, a non-git directory where git is required, an unrelated project workspace, or an unrecoverable missing worktree.
 
 For runtime-created `git_worktree` execution workspaces, branch coherence is part of workspace coherence. The persisted execution workspace branch is the recorded branch for future dispatch. Reusing that workspace must verify that the worktree is still registered and that `HEAD` is on the recorded branch. Successful run finalization must perform the same check before recording `workspace_finalize=succeeded`. If the run switched to a publishing/PR branch without updating the execution workspace record, finalization may auto-restore the recorded branch only when the worktree is clean, still registered, and the recorded branch points at the current `HEAD`; the repair is recorded as a workspace operation before the successful finalize row. If that safe repair cannot be proven, finalization records a failed workspace finalize and the run fails with bounded evidence for the expected and actual branch. A branch change is sanctioned when a control-plane path updates the execution workspace record before finalization, when publishing work happens in a separate worktree and the managed issue worktree remains on its recorded branch, or when the finalizer performs this clean same-commit restoration.
+
+Sandbox Git restore uses the host branch and commit captured before staging.
+If that identity is unchanged, a rebased or amended sandbox history with shared
+ancestry replaces the starting tip instead of being merged with it. The ref
+update checks the expected old commit; a concurrent change retries through the
+normal history integration path. Git holds the HEAD and applicable branch locks
+while restore verifies the attached/detached branch identity and commits the ref
+transaction. A checkout during integration cannot redirect that write.
+The directory merge still preserves host-only
+file changes under its existing rules. A changed host branch requires recovery.
+An intentional reset to an ancestor exports a full Git bundle so restore keeps
+the actual sandbox tip; an empty delta is reserved for an unchanged tip.
+Unrelated sandbox history keeps the existing history-preserving graft only when
+the recorded host has not advanced; it must not replace concurrent host work.
+Warm sandbox reuse must match the current host Git tip and branch as well as the
+file snapshot and saved stamp, including managed nested repositories. A history
+or branch mismatch restages the host before the next run begins.
+
+### Native provider model capacity
+
+A committed Codex `turn.failed` event with `codexErrorInfo: serverOverloaded`,
+bound to the failed terminal turn and pinned execution identity, surfaces
+“Selected model is at capacity. Please try a different model.” directly.
+Paperclip preserves the accepted result and task history, then atomically records
+a durable automatic retry with its status decision. The first retry waits one
+minute; the second waits two minutes. Both spend the existing failure-retry
+budget. Exhaustion requires an explicit retry or a model change.
+
+Retries use a fresh provider session and the normal task context, without an
+automatic model switch. Consumed wake input and continuation receipts stay on
+the failed run; `retryOfRunId` supplies task history without lending the new run
+its predecessor's resume authority. Finalization replay and restart reuse the
+same successor.
+Scheduling preserves pending review authority and respects task holds; promotion,
+claim, and dispatch recheck ownership, dependencies, governance, pause, budget,
+and execution locks. Claim also waits for the predecessor's provider execution,
+workspace finalization, and environment cleanup to settle. Model incompatibility,
+usage-limit exhaustion, unknown failures, and unbound diagnostic text do not
+qualify as capacity failures.
 
 ### Workspace scan failures before provider startup
 
@@ -461,9 +608,17 @@ The handshake failure code is distinct from a session-identity mismatch. A timeo
 
 An explicit recovery action is a typed liveness repair path for a source issue. It is the recovery primitive; the action can be rendered directly on the source issue or backed by a separate recovery issue when the repair needs its own work item.
 
+A terminal native failure can retain a result accepted before checkpoint or cleanup failed. That result is historical evidence, not a live controller. New user input may start a fresh turn after the controller and execution environment have stopped and ordinary admission checks pass. Preserve the failed run, its result, and its recovery budget. Do not commit the old result, infer action outcomes, or replay the failed turn. A message saved while cleanup is pending must be reconsidered after verified cleanup and delivered once. Admission must consume its deferred receipt in the same transaction that creates the new run, including in agent chat, where later messages keep their separate turns. Completing that run must not promote the consumed receipt again. Workspace-export repair retains its separate saved-result recovery path.
+
+When a legacy turn admitted by an explicit user message fails or times out, a bounded transient retry needs its own durable continuation authorization. Initial admission binds the message's exact body digest and revision. Scheduling requires that original binding and revalidates the human author, source task, assignee, and execution ownership, then records the successor's receipt in the same transaction as its run. Historical receipts without a message binding cannot authorize automatic retries and are not backfilled. The parent receipt remains intact. Dispatch checks the exact successor, retry parent, and unchanged message binding again. Deleted or edited input, changed actors or ownership, superseded work, and duplicate successors cannot renew authority. One-run Retry and Interrupt intents retain their separate admission contracts; they are not renewable user-message authority. Other retry policies cannot borrow this receipt: their scheduling fails closed. Successful explicit turns do not create a prose-only missing-comment follow-up with spent authority.
+
+Explicit retry admission checks the local parent adapter controller and verified environment cleanup. The existing queue-first release policy may retain only its own terminal execution claim while that cleanup is pending; finalization and the periodic stale-lock sweep reconsider the same policy after cleanup. Generic terminal-lock cleanup and stale checkout adoption leave these claims for that settlement. New user input, reassignment, and a successor's claim take precedence. Exhausted retries and revoked or missing authorization release the terminal claim without requesting another retry. Pending or failed environment cleanup cannot mint a successor receipt.
+
 A new user message can continue a terminal native run whose process fields were cleared before local stop receipts existed. Admission must verify the exact run, runner, workspace, and provider session in the retained suspended state, with no active provider turn, pending tool call, or undelivered output. Missing or mismatched state keeps the hold. A later recorded process launch also keeps the hold until its stop is verified. Normal assignment, decision, controller, environment cleanup, and active-run gates still apply. The message starts one fresh conversation turn; it does not replay the failed run, reset its recovery budget, or certify unknown action outcomes.
 
-The task thread exposes the existing guarded Retry action for failed or timed-out legacy conversation runs. Where the server supports an explicit new attempt after a stopped legacy conversation, the thread must not hide that action solely because the old run still has a recovery-needed projection. Native and process recovery holds, pending decisions, active execution, and other retry gates remain in force. When a gate hides Retry, the thread says the message is preserved instead of promising an unavailable action. This presentation change does not rewrite historical outcomes or certify prior actions.
+The task thread exposes the guarded Retry action for failed or timed-out conversation runs and native preparation cancelled before provider startup when the never-started proof is verified. The server projects this eligibility on the recovery notice and rechecks it on Retry. Cleanup quarantine retains its inspection path, and non-conversation reconciliation gates remain enforced. Pending decisions, active execution, pause, budget, dependency, and ownership gates remain in force. A refused Retry reports its reason inline and remains available for another attempt.
+
+A continuation cancelled by the queued-run gate while waiting for review did not start a provider. Its matching dispatch-gate receipt and unclaimed execution fields keep this deliberate wait out of unknown-action reconciliation. Pending review and decision gates still apply. If an older server already created a recovery hold for this exact state, Retry or a new user message can request one fresh turn after the server verifies there is no provider, coordinator, or unfinished cleanup. Saved user input is reconsidered through the same admission path; the cancelled turn is not replayed.
 
 A valid recovery action must name:
 
@@ -586,6 +741,14 @@ Monitor policy lives under `executionPolicy.monitor` and includes:
 - `externalRef`: optional external-service reference input; Paperclip treats it as secret-adjacent, redacts it before persistence/visibility, and omits it from activity and wake payloads
 - `timeoutAt`, `maxAttempts`, and `recoveryPolicy`: optional recovery hints for bounded waits
 
+`PATCH /api/issues/{id}` also accepts a top-level `monitor` alias for `executionPolicy.monitor`. The route normalizes it into a partial `executionPolicy` write that preserves the other stored policy fields, and it passes the same authorization gates as the nested spelling. A body that sends both `monitor` and `executionPolicy` (even `null`) is rejected with a validation error. The alias is update-only; issue creation uses `executionPolicy.monitor`.
+
+The alias does not grant access to release-assurance policies: those cards reject
+monitor PATCHes with `422`, including nested `{ executionPolicy: { monitor: null } }`.
+Monitor changes compare the stored policy and agent assignee again under the issue
+row lock. A concurrent policy change or reassignment returns `409` instead of
+letting the former assignee change the monitor.
+
 Monitors are not recurring intervals. When a monitor fires, Paperclip clears the scheduled monitor and queues an `issue_monitor_due` wake for the assignee. If the external service is still pending, the assignee must explicitly re-arm the monitor with a new `nextCheckAt`. If the issue moves to `done`, `cancelled`, an invalid status, or a human/unassigned owner, the monitor is cleared.
 
 The task's waiting banner and composer countdown also display automatic retries
@@ -597,6 +760,8 @@ tasks hide both waiting surfaces even if a stale schedule remains in the respons
 Because `serviceName` and `notes` remain visible in issue activity and wake context, operators should keep them short and non-secret. Put enough context for the assignee to know what to inspect, but do not include signed URLs, bearer tokens, customer secrets, tenant-private identifiers, or provider links with embedded credentials.
 
 Monitor bounds are enforced. Paperclip rejects attempts to re-arm a monitor whose `timeoutAt` or `maxAttempts` is already exhausted. When a scheduled monitor reaches an exhausted bound at trigger time, Paperclip clears it and follows `recoveryPolicy`: `wake_owner` queues a bounded recovery wake for the assignee, `create_recovery_issue` opens visible issue-backed recovery work, and `escalate_to_board` records a board-visible escalation comment/activity.
+
+A due monitor on an issue with no assignee has no agent to wake. When its `recoveryPolicy` is `wake_owner` (the default), Paperclip clears the monitor with `clearReason: invalid_assignee` and raises one board-owned `no_live_path_unowned` recovery action for the issue, unless the issue already has an active recovery action. The monitor does not count as an attempt and does not set `lastTriggeredAt`. The clear is guarded by the claimed `monitorNextCheckAt`; if the monitor was re-armed concurrently, the new schedule is left untouched and the clear is skipped. Monitors with `create_recovery_issue` or `escalate_to_board` on an unassigned issue are not selected and stay armed.
 
 Use `blocked` instead of a monitor when no Paperclip assignee owns a responsible polling path. In that case, name the external owner/action or create first-class recovery/blocker work.
 
@@ -616,18 +781,179 @@ A `blocked` issue is stalled when the unresolved blocker leaf has no active run,
 
 ## 9. Crash and Restart Recovery
 
-Paperclip now treats crash/restart recovery as a stranded-assigned-work problem, not just a stranded-run problem.
+Paperclip treats crash/restart recovery as a stranded-assigned-work problem, not just a stranded-run problem.
 
 The HTTP listener binds before startup recovery so surviving runners can
-reconnect. Recovery-action reconciliation logs and skips an individual failed
-action, allowing the other actions and startup to continue. A fatal startup
-failure after binding instead closes the HTTP listener before ending database
+reconnect. Inside the wrapped startup sweeps below, a per-card failure of any
+error class except a lost database connection is logged and that card is
+skipped. That includes assignee-review refusals and non-connection database
+failures (constraint, check, deadlock). The helper rethrows a lost database
+connection (`CONNECTION_CLOSED`, `CONNECTION_ENDED`, `CONNECTION_DESTROYED`,
+anywhere on the error `cause` chain). For the wrapped sweeps other than the
+host-restart strand sweep, that rethrow fails startup.
+`server/src/index.ts` catches every error from `sweepHostRestartStrandedIssues`,
+including a lost connection. It logs `startup host-restart strand sweep failed`
+and does not rethrow. Later startup steps still run. If those later steps
+succeed, startup can finish after that sweep fails. The log carries
+the issue identifier, the sweep name, and the error class and message. Writes
+made earlier in the same iteration (recovery action, comment, wake) may
+already have persisted. The sweep continues with the remaining cards so
+startup can finish and the listener stays open.
+
+The Wiki handoff guard runs on any issue write that is not purely status and
+blocker bookkeeping. `assigneeUserId` is guarded, the same as
+`assigneeAgentId`. The guard is skipped only when every present key is in this
+allow-list: `status`, `blockedByIssueIds`, `lastStatusDecisionId`,
+`unblockDescriptor`, `companyGuard`. A status-only or blocker-only park still
+passes, and so does the native policy-review cleanup, which writes `status`,
+`lastStatusDecisionId` and `unblockDescriptor` together. Any other key,
+including `priority`, `labelIds`, `hiddenAt`, `parentId`, `billingCode`,
+`requestDepth`, `statusVersion`, and the monitor columns, runs the guard. The
+monitor re-arm paths always send `executionPolicy` with the monitor columns, and
+the native status-decision commits send `statusVersion` with
+`actorAgentId` and `actorUserId` (null values still count as present keys), so
+those keys never form a write on their own and are not allow-listed. Known
+consequence: an exhausted non-canonical Wiki handoff card gets no monitor, and
+the sweep logs one error per tick. The recovery-issue fallback runs when the
+monitor arm returns null. It does not run after a successful arm. A thrown
+guard error stops the card before that fallback, so the card also gets no
+recovery issue. The same monitor refusal holds for a non-canonical Wiki handoff
+card that is `in_progress`, or `in_review` with an invokable participant, whose
+latest run failed on provider quota. That card gets no monitor and no board
+item. If every other present key is allowed bookkeeping, an explicit
+`executionPolicy: undefined` is dropped from the present-key check. The guard
+is skipped, while policy normalization writes `null`.
+
+The boundary is the write path. Per-card isolation is required for every
+startup sweep that writes issue rows through the guarded issue service
+(`issueService.update`), because the Wiki handoff guard and the other assignee
+and review gates can refuse that write. Steps that only write run, wake or
+session rows, or that clear raw lock columns (`executionRunId`,
+`executionAgentNameKey`, `executionLockedAt`, `checkoutRunId`) with direct
+drizzle updates inside a per-run loop, stay fail-fast on purpose: those loops
+are not the guarded issue-service path. A failure there, including a database
+failure, still stops startup.
+
+Each card's repair is processed inside the shared `runRecoverySweepIssue` helper
+in these startup sweeps. For `sweepHostRestartStrandedIssues`, the sweep gathers
+facts for each candidate before it enters the helper. A non-connection error in
+that phase aborts the sweep, and later cards are not processed. Per-card
+isolation applies only to the wrapped repair phase.
+The helper accepts only the names in `RECOVERY_SWEEP_NAMES`
+(`server/src/lib/recovery-sweep-isolation.ts`), so a call site with an
+unregistered name fails typecheck, and the sweep isolation table test runs an
+injected-failure case per registered name, with the failing card in both
+iteration positions, and checks that the sweep's effect landed on the other
+card and not on the refused one. Each line says how the card body
+reaches `issueService.update`, the guarded path:
+
+- `reconcileStrandedAssignedIssues`: `blockIssueWithUnresolvedBlockers`,
+  `escalateStrandedAssignedIssue`, `repairNativeBlockedWait`,
+  `resolveContinuationWaitingOnReview` and
+  `scheduleProviderQuotaRecoveryMonitor` all call it.
+- Unassigned blocking issues (`reconcileUnassignedBlockingIssues`): the
+  reassignment calls `issueService(txDb).update` with `assigneeAgentId`.
+- `reconcileStillbornAssignedBacklog`: `escalateStrandedAssignedIssue` calls it.
+- `reconcileBlockedWithoutBlockers` (also run through
+  `reconcileIssueGraphLiveness`): the heal and `armExhaustedBoardMonitor` call it.
+- `reconcileDispatchSuppressionParks`, park write only: it calls
+  `issuesSvc.update(id, { status: "blocked" })`.
+- `reconcileTodoStrandedCards`: it calls `issuesSvc.update(id, { status: "blocked" })`.
+- `reconcileExhaustedRecoveryDrain`: `armExhaustedBoardMonitor` calls it with the
+  monitor columns and `executionPolicy`.
+- `reconcileStaleRecoveryActionWakes`: its wake path writes only recovery-action
+  and wake rows, but an action at its attempt ceiling goes through
+  `escalateExhaustedRecoveryAction`, which reaches it through
+  `armExhaustedBoardMonitor`.
+- `sweepHostRestartStrandedIssues`: the escalation calls it through
+  `blockIssueWithUnresolvedBlockers`. The re-arm repair is a direct drizzle
+  update. Fact gathering runs before the helper. A non-connection error there
+  aborts the sweep. Isolation covers only the wrapped repair.
+- `reconcileTaskWatchdogs`: `evaluateWatchdog` reaches
+  `ensureReusableWatchdogIssue`, which reopens the watchdog issue with
+  `issuesSvc.update`.
+- `sweepStaleIssueLocks`, the per-card lock clear only: it does not call it. It
+  clears raw lock columns with a direct drizzle update. It stays wrapped as a
+  recorded decision, not because of the boundary above.
+
+Active recovery-action reconciliation (`reconcileActiveRecoveryActions`)
+isolates each action with its own `try`/`catch`; it logs and skips the action
+and does not rethrow a lost database connection.
+
+These startup steps are knowingly left fail-fast. A failure in one of them
+fails startup:
+
+- `scanTerminableSilentActiveRuns` (`terminateSilentActiveRun`), per run: in one
+  transaction marks the run `failed`, fails its wake request, clears the
+  execution lock columns on `issues` with a direct drizzle update, and inserts a
+  watchdog decision row; then appends a run event and an activity row. It does
+  not call `issueService.update`.
+- `scanSilentActiveRuns` (`foldSourceResolvedRun`), per run: in one transaction
+  finalizes the run and its wake request, clears the source issue's execution
+  lock columns with a direct drizzle update, resolves the watchdog recovery
+  action, and inserts a watchdog decision row. For an open evaluation issue it
+  also calls `issuesSvc.update(id, { status: "done" })` and adds a comment. That
+  patch carries only `status`, an allow-listed key, so the Wiki handoff guard
+  does not run, and the assignee review-stage gate (it runs only when the patch
+  has `assigneeAgentId`) is not reached. It is not wrapped, and it runs inside
+  the fold's open transaction.
+- `promoteDueScheduledRetries`, per due retry run: promotes the run to `queued`
+  or cancels a suppressed retry, updates the wake request, and clears the
+  execution lock columns on `issues` with a direct drizzle update. No
+  `issueService.update`.
+- `resumeQueuedRuns`: touches `agent_wakeup_requests`, delivers saved queued
+  comments and releases execution through `releaseIssueExecutionAndPromote` (each
+  call carries its own `.catch` that logs), cancels stale queued runs
+  (`cancelStaleQueuedRun` also clears `executionRunId` and `checkoutRunId` on
+  `issues` with direct drizzle updates), and starts the next queued run per
+  agent. The step's own writes make no `issueService.update` call.
+- `recoverPendingSessionGoalActions`, per pending goal action:
+  `failRunnerGoalAction` on the session-goal action row (its error is swallowed)
+  and `enqueueWakeup` for wake and run rows.
+- `recoverActiveSessionGoals`, per active goal session: `enqueueWakeup` for wake
+  and run rows.
+- The run terminalization pre-pass of `sweepStaleIssueLocks`
+  (`terminalizeOrphanedRunningRun`), per referenced run: updates the
+  `heartbeat_runs` row and appends a run event.
+- `clearStaleRecoveryReplayHolds`, per resolved recovery action, at the tail of
+  `reconcileStrandedAssignedIssues`: rewrites `evidence` on the
+  `issue_recovery_actions` row with a direct drizzle update. It writes no issue
+  row.
+- `reconcileDeferredWakeupReplay`, per deferred wake: a compare-and-swap on the
+  `agent_wakeup_requests` row, then `enqueueWakeup`, whose throw is already caught
+  per wake and counted as `reDriveFailed`. No `issueService.update`.
+- `reconcileUnfinalizableWorkspaceBarriers`, per blocker: report-only; writes
+  one activity-log row. No `issueService.update`.
+- `detectStaleIssueMonitors`, per stale monitor: one select and one activity-log
+  insert. No `issueService.update`.
+- `reconcileResolvedDependencyWakeBackstop`, per candidate: `enqueueWakeup` and
+  an activity-log row. Its enqueue throw is already caught per card and counted
+  as `enqueueFailed`. No `issueService.update`.
+- `reconcilePendingReviewRearm`, per candidate: a recovery-action upsert,
+  `enqueueWakeup` and an activity-log row. Its enqueue throw is already caught
+  per card. No `issueService.update`.
+- `reconcileDispatchSuppressionParks`, park resolution: resolves the recovery
+  action and writes an activity-log row. No `issueService.update`.
+- `ingestStaleInReviewChildIssues`, per stale child: a system comment, a direct
+  drizzle update of `hiddenAt` and an archive row. No `issueService.update`.
+- `reconcileCancelledOnlyBlockerDependents` (action resolution and detection):
+  recovery-action rows and detection activity rows. No `issueService.update`.
+- `reconcileUndispatchableAssignedIssues` (action resolution and escalation):
+  recovery-action rows and activity rows. No `issueService.update`.
+- `sweepCompletedRunStrandedIssues`, per escalation: a system comment through
+  `addComment`, which does not call `issueService.update`.
+- Native-runner restart recovery fails closed by design and rethrows.
+  Hot-restart adoption, the orphaned-run reap and the abandoned run scratch sweep
+  are each caught as a whole by the caller, so startup continues after them.
+
+A failure that escapes a sweep, or any other fatal startup
+failure after binding, closes the HTTP listener before ending database
 clients: a rejected `startServer()` must not leave a port accepting requests
-against a closed pool. The failure is logged and rethrown. When the server runs
+against a closed pool. That failure is logged and rethrown. When the server runs
 as the main module, the entrypoint reports eligible failures to Sentry and exits
-nonzero so the supervisor restarts it. Embedding callers such as the CLI receive
-the rejection with no leaked listener and decide how to recover; the server does
-not hard-kill them.
+nonzero so the supervisor restarts it. Embedding callers such as the CLI
+receive the rejection with no leaked listener and decide how to recover; the
+server does not hard-kill them.
 
 There are two distinct failure modes.
 
@@ -676,6 +1002,8 @@ The same bounded rule applies when the previous heartbeat reported waiting on a 
 
 A continuation that the staleness gate cancelled with `issue_continuation_waiting_on_review` is a *deliberate park*, not a disappeared execution path. The latest run reported that the issue is waiting for review/approval (for example, an umbrella issue whose work was just decomposed into sub-tasks). Treating that park as a stranded run would retry it, then escalate it to `blocked` with a recovery action and an operator-facing failure notice — even though nothing failed and there is nothing for a human to do.
 
+Execution admission reads a narrow server-owned cancellation-evidence projection. Ordinary run presentation can redact `resultJson` for database encoding or output size; that presentation projection must not decide Retry eligibility or saved-input recovery. The admission projection excludes provider diagnostics and preserves whether the stored result is absent.
+
 Recovery rule for a parked-for-review continuation:
 
 - if the issue has a real waiting target — open (non-terminal) sub-tasks or existing unresolved blockers — Paperclip converts the deliberate wait into a first-class dependency wait: it sets the issue `blocked` by those issues, keeps the original assignee, and posts a plain-language comment explaining that the task will resume automatically when its dependencies finish. The issue then self-resumes through the normal `issue_blockers_resolved` path; no recovery action or escalation owner is involved
@@ -705,10 +1033,27 @@ On startup and on the periodic recovery loop, Paperclip performs the following r
 
 1. reap orphaned `running` runs
 2. resume persisted `queued` runs
-3. reconcile stranded assigned work
-4. scan silent active runs only for source-aware terminal folding and legacy cleanup; API reads classify ordinary output silence for the board UI
+3. expire issue-bound `queued` runs past the queued-run age bound
+4. reconcile stranded assigned work
+5. scan silent active runs only for source-aware terminal folding and legacy cleanup; API reads classify ordinary output silence for the board UI
 
 The stranded-work pass closes the gap where issue state survives a crash but the wake/run path does not. The silent-run scan covers the separate case where a live process exists but has stopped producing observable output.
+
+The queued-run age bound (`MAX_QUEUED_ISSUE_RUN_AGE_MS`, 24 hours) covers a run that was queued but never started. A claim can skip a queued run without ending it, and a later wake on the issue re-adopts that run as the execution holder. Without a bound, such a run holds the issue execution lock until a board user cancels it. The expiry pass runs after queued runs are resumed. It cancels an issue-bound run that has stayed `queued` for 24 hours since creation, with error code `queued_run_expired`. It also cancels such a run when its issue no longer exists or is under a recovery hold. The pass skips a run whose issue is held by another live run, a run whose retry alarm is not yet due, and any run in a company that is not active. It checks the company again inside the cancel transaction, so a company paused after the candidate list was read keeps its runs. In the same transaction, the pass marks the run's wake request `skipped`, clears only the execution and checkout lock columns that name that run, and writes one `heartbeat.queued_run_expired` activity row. Running runs are never selected. The pass is a system sweep: it adds no API, and it does not change who may cancel a run or write to an issue.
+
+An expired legacy run records that provider work never started. Stranded-work recovery then treats its issue like any other lost wake: an ordinary assigned `todo` or `in_progress` issue gets a bounded dispatch or continuation retry, and an exhausted automatic continuation escalates as before. An expired automatic continuation whose chat-control source cannot be verified is not re-dispatched; its issue stays unlocked until the next wake.
+
+One pass expires at most 100 runs and reads at most 20 pages of 100 candidates, oldest first. The candidate query leaves out runs the bound does not expire: a run whose retry alarm is in the future, and a run whose issue another running run holds. So older runs that must wait cannot fill the pages and hide a newer stuck run. Paging uses the stored `created_at` value and the run id, so runs that share one timestamp are read once. The query also leaves out a run whose `issueId` is not a canonical issue id (for example a number or padded text). Such a run names no issue and holds no issue lock; this pass never expires it. A malformed recovery action id or comment id in a run's context is read as absent, so it cannot make the decision fail. If one candidate still fails, the pass logs it, skips it, and continues; cancellations already committed keep their effects. A pass that stops at either cap resumes after the last run it visited on the next pass, and a pass that reaches the end of the list starts the next one from the oldest run. So every listed run is visited within ceil(listed / 2,000) passes, and a run the bound expires is cancelled within ceil(expirable ahead of it / 100) passes. The resume position lives in server memory; a restart begins at the oldest run.
+
+Issues in `in_review` are not exempt. A queued approval, review, or wake run on an issue in review expires at the same 24-hour bound as any other queued run (owner decision 2026-11-17).
+
+The stale-lock sweep leaves native runs with their finalization coordinator while
+same-session recovery or accepted-result finalization is pending. A provider can
+exit before workspace copy-back, assessment, or arbitration completes. An expired
+coordinator lease or a delayed retry does not make that run orphaned. The sweep
+checks coordinator ownership in its terminal update, so a result recorded after
+the process check is also protected. Terminal task status remains authoritative;
+exhausted finalization retries do not keep an otherwise orphaned run alive.
 
 Automatic productivity reviews are retired. Run counts, missing comments, and elapsed task time do not create review tasks or impose continuation holds. Bounded continuation, provider recovery, budget limits, explicit blockers, and normal review/approval stages remain in force. Existing productivity-review tasks, comments, assignments, and dependencies remain unchanged and readable; their historical origins still identify them as recovery work for recursion suppression.
 
@@ -833,7 +1178,7 @@ Verification and escalation semantics:
 - attempt lineage is durable watchdog state: attempt number, the fingerprint each attempt claimed to fix, and the restoration actions taken
 - after N attempts (N = 2–3) on the same fingerprint lineage, the platform stops re-firing and escalates to a human — the watchdog owner or a board notification — carrying the attempt history
 
-This bounds both failure modes: a failed restoration retries instead of going silent (liveness), and the attempt bound plus human escalation prevents an infinite fire loop (no runaway watchdog). Legitimate stops still suppress exactly as before.
+This bounds both failure modes: a failed restoration retries instead of going silent (liveness), and the attempt bound plus human escalation prevents an infinite fire loop (no runaway watchdog). A reviewed legitimate stop suppresses re-firing for its recorded fingerprint.
 
 Task watchdogs must not silently mark source work done from prose comments, must not duplicate child trees for the same accepted plan revision, and must not create another task-watchdog issue for the same source issue.
 
@@ -843,7 +1188,7 @@ An active run can still be unhealthy even when its process is `running`. Papercl
 
 The recovery service owns this contract:
 
-- classify active-run output silence as `ok`, `suspicious`, `critical`, `snoozed`, or `not_applicable`
+- classify active-run output silence as `ok`, `suspicious` after five minutes, `critical` after fifteen minutes, `snoozed`, or `not_applicable`; measure silence from the latest output, falling back to the run start when no output exists
 - honor active snooze and continue decisions on the run
 - permanently suppress the signal for a run after a `dismissed_false_positive` decision
 - build the `outputSilence` summary shown by live-run and active-run API responses
@@ -932,6 +1277,20 @@ Questions must be created as durable interactions before the agent claims to be
 waiting. A direct Board comment reopening completed work has the same passive
 response-wait semantics as a comment on an open task, subject to the same source,
 identity, and governance checks. An automatic continuation is not a user reply.
+For ordinary tasks, a response wait cannot park reported blocking remaining
+work without a recorded wait condition. The finish tool rejects this combination;
+finalization routes already-accepted reports through one bounded corrective
+continuation and then a visible recovery error. Real questions, approvals,
+dependencies, pauses, and conversation lifecycles keep their existing behavior.
+A superseded Board comment never grants permission to replay the old response.
+
+A run must receive queued human direction before it creates a new task question.
+When the saved run context contains an explicit delivered-comment list, the
+server rejects `ask_user_questions` if a newer human comment is absent from that
+list. It returns `409` with `reason: "newer_comment_not_delivered"` and creates no
+pending question. The next run receives the queued comments and can ask a question
+if it still needs an answer. Older contexts without a delivered-comment list keep
+their existing behavior. This rule does not answer, accept, or dismiss an approval.
 
 Provider-turn identity separates recovery responses from earlier assistant
 output. A recovery turn cannot overwrite a delivered answer. File attachments
@@ -963,6 +1322,19 @@ recording the proof and successor lineage. Retained provider files are not edite
 
 Bootstrap retries, exact-checkpoint resumes, and fresh replacement sessions share three total provider attempts, including the original attempt. Linked run IDs, controller restarts, and duplicate wakes do not reset this budget. Automatic attempts retain the 30-second delay. Replacement scheduling and predecessor lineage commit together, with one successor per predecessor and admission through the normal task locks, authorization, pause, approval, and budget gates.
 
+An exact local Codex restart can restore the conversation after losing its active
+turn. Runnerd records this as `provider_turn_lost_on_restore`, with no invented
+task result. The admitted restart attempt may send one continuation in that same
+conversation. It preserves the workspace and asks the agent to reconcile unfinished
+commands and external actions before proceeding. It does not resend the task or
+tool calls. An outcome that cannot be reconciled remains a blocker. The continuation
+uses the existing durable one-shot recovery marker; recovery adopts an accepted
+turn if the controller dies before checkpointing its ID. The interrupted terminal
+is checkpointed before submission. Real provider failures, accepted semantic
+results, intentional stops, and historical unmarked failures keep their existing
+terminal behavior. This continuation uses the already charged restart attempt and
+does not reset the provider-attempt budget.
+
 Provider execution and control-plane finalization have different clocks. A healthy provider can think or execute a long tool without output. Once execution settles, recovery and finalization control steps have a 60-second deadline, checked on startup and every 15 seconds. With a healthy database and scheduler, an abandoned transition must be repaired or surfaced within 90 seconds. Terminal persistence must not wait on provider cleanup or publication; a late finalizer cannot change a reassigned or closed task or release another run's locks. Historical ambiguous runs are never automatically replayed after an upgrade.
 
 Every continuation carries the triggering request, ordered user direction, interaction outcomes, completed work, and explicit history coverage. A delivered message remains part of the task's request after its connection or approval resolves. The original title is background; a completed Notion read does not satisfy a later Gmail request. Author and source-trust boundaries survive rendering into both native and legacy prompts. Missing required history must be fetched before dispatch rather than described as complete.
@@ -985,11 +1357,13 @@ Real gates still apply: company and task ownership, active provider ownership, b
 
 An operator Stop waits for provider termination. Remote sandbox providers may return a stopped/deleted receipt after their control-plane operation completes. Paperclip binds that receipt to the company, run, and exact lease; successful file cleanup, a terminal run row, or an in-sandbox shutdown event is not sufficient. Legacy conversational runs receive their cancellation acknowledgement after all remote leases have confirmed termination. Stop alone never creates a continuation. A user message queued during remote cleanup is reconsidered when the provider confirms termination; it still passes normal admission and adopts pending comment IDs in order. Once stopped, the next explicit wake uses the same queue. A compatible saved ACP session can resume, and an unavailable or incompatible session can start fresh with the full task context. Run credentials and scratch paths remain scoped to the new run. A subtree pause requires Resume; a message does not bypass it.
 
+Cancelled runs and runs with a recorded pending stop lose run-scoped API write authority, while reads remain available for diagnostics. This applies to ordinary tasks as well as conversations. Task and interaction mutations recheck that authority in the write transaction, so a cancelled run cannot overwrite a recovery disposition with a late Done or resolve an interaction after revocation. A task handoff that intentionally stops its own run can commit only with a server receipt tied to that exact request. Direct sandbox CLI adapters such as Grok register cancellation before preparation and keep ownership until host-owned termination is verified, including a sandbox acquired before adapter registration. A failed stop does not acknowledge cancellation or abandon an outstanding remote command. Interrupted workspace restore failures remain recorded for recovery; a stop receipt proves termination, not successful file restoration.
+
 For native conversations, an authenticated user message sent after the previous run finishes can retire its execution recovery holds and start a fresh turn. Hold retirement and the new run are atomic. The previous transcript, tool outcomes, and recovery history remain intact. This starts a new conversation; it does not replay tool calls with unknown outcomes.
 
 Local recovery records a server-authored stop receipt before it clears a verified absent process identity. A new execution request invalidates that receipt before any process can spawn; recording a new process identity also invalidates it. Missing process IDs without a receipt still block admission. Remote execution continues to require termination receipts for every lease.
 
-If cleanup or another execution gate is still pending, the message stays in its existing queue receipt. Startup and periodic scheduling reconsider up to 50 due receipts per pass, at most once per 30 seconds per receipt, without calling a model or resetting recovery attempts. Cleanup callbacks use the same admission path. The issue lock prevents concurrent workers from delivering an adopted or discarded receipt again. The queued-message area shows the current wait reason. Pauses, approvals, budgets, ownership, and external chat authorization remain enforced. A message sent before the run finished does not grant new post-stop authority.
+If cleanup or another execution gate is still pending, the message stays in its existing queue receipt. Startup and periodic scheduling reconsider up to 50 due receipts per pass, at most once per 30 seconds per receipt, without calling a model or resetting recovery attempts. Cleanup callbacks use the same admission path. The issue lock prevents concurrent workers from delivering an adopted or discarded receipt again. The queued-message area shows the current wait reason. Pauses, approvals, budgets, ownership, and external chat authorization remain enforced. For a failed native conversation, saved authenticated messages that have never been delivered can request a fresh turn after verified stop even when submitted before the failure finished. Admission validates and adopts their exact queue receipt, order, and original authors. This does not replay the failed request or undo an operator cancellation.
 
 Historical legacy interruption holds for conversational adapters no longer block new messages or Resume. Automatic classification uses the server-owned adapter identity saved atomically at run claim, the saved adapter invocation, or the continuation policy, never the agent’s current adapter settings. Missing historical adapter evidence retains the automatic hold; an explicit user continuation can retire it after proving the predecessor stopped. A terminal row with a live predecessor process, an unreleased environment lease, or failed/pending cleanup still blocks actual admission and Resume; a release timestamp alone does not prove cleanup succeeded. Retry scheduling can happen before cleanup, but grants no execution authority. Recovery folds their obsolete no-replay bookkeeping without changing task ownership, status, or automatically waking old work. The audit trail remains readable. Native integrity and ownership holds, and non-conversational adapter holds, remain enforced.
 
@@ -1031,7 +1405,7 @@ unknown, and they do not gain automatic replay eligibility.
 Admission validates the persisted comment's author, task, and time against every
 held predecessor. Retry validates the selected failed run's company, task, and
 agent and preserves that run's identity through admission and history loading.
-Duplicate Retry requests adopt the same successor. An agent-authored comment, an old queued request, or a generic
+Duplicate Retry requests adopt the same successor. Only a validated, unconsumed human queue receipt can authorize saved-message continuation after a native failure; arbitrary historical input, an agent-authored comment, or a generic
 system wake cannot release a hold. The source task keeps its assignee. Process
 ownership, active controllers, cleanup leases, pause, approval, budget, and normal
 execution gates still apply. Dependency-blocked interaction mode remains limited
@@ -1050,7 +1424,6 @@ runners. A stop receipt retires only the settled cleanup owner for that exact co
 Missing receipts and failed cleanup retain the hold. Older providers that return
 no receipt remain supported but cannot authorize remote continuation. A terminal
 database status or a PID check on the wrong host is insufficient.
-No historical task is automatically awakened by this change.
 
 Startup waits for provider plugin initialization before remote recovery and
 lease cleanup. The task's blocked notice offers Retry, and a refused retry
@@ -1077,6 +1450,20 @@ The board owns the recovery decision, not the source deliverable. Automatic reco
 An upgrade may encounter an already-active agent-owned recovery action. Paperclip keeps that record readable and resolvable for compatibility, but periodic reconciliation does not enqueue another takeover wake from it.
 
 Create an issue-backed recovery action only when a separate issue is the right execution object. In that fallback form, the source issue remains visible and is blocked on the recovery issue when blocking is necessary for correctness. The recovery owner must restore a live path, resolve the source issue manually, delegate real follow-up work, or record the reason the signal is a false positive.
+
+An exhausted-recovery card minted because the source cannot host a board monitor is `record_only`. It records the board decision and does not ship code, so it never inherits the source issue's `executionWorkspaceId` or settings, including a source workspace that failed validation and cannot be reused. The card keeps the source project for board context.
+
+Where it applies, the mint names the `agent_default` preference, which drops `projectWorkspaceId` instead of copying the source binding. A `projectWorkspaceId` is itself a workspace expectation: carrying it makes dispatch resolve a project checkout and fail the same validation. A card in the minted shape — `record_only`, no `executionWorkspaceId`, no `projectWorkspaceId`, `agent_default`, `stranded_issue_recovery` origin — is the ONLY shape exempt from the git-metadata check, because the resolved checkout is not a workspace the card is required to use. Dispatch never binds the realized checkout back onto such a card, so it keeps the no-binding shape after its owner wake, and that wake does not fail workspace validation. The exemption is decided by the shape alone: all five fields must match, and a card that differs in exactly one field keeps every workspace check. Every other `record_only` card, including one with a bound execution workspace or a checkout binding, keeps every workspace check.
+
+The exemption has stated limits. In these shapes a source checkout that is not a valid git checkout still fails the owner wake with `workspace_validation_failed`:
+
+- A project that isolates by default (policy `defaultMode: isolated_workspace`, or the instance-wide default-isolated setting). The card receives that default mode, and dispatch provisions the project checkout for it before the exempted adapter check runs.
+- A project whose policy sets `allowIssueOverride: false` while isolated workspaces are on. The write boundary refuses any explicit preference there, so the mint omits `agent_default`. The card is still minted and its owner is still woken, as before this change, but it carries the project default binding and is not exempt.
+- An instance with isolated workspaces off. The write boundary drops the explicit preference, so the card carries the project default binding and is not exempt.
+
+The exemption is decided by the card's fields, not by who created it. The public board, agent and plugin create paths cannot set `originKind`, but an internal `issueService.create` caller that builds the exact five-field shape gets the exemption.
+
+Ordinary parent-child workspace inheritance is unchanged. A lawful `reuse_existing` binding on a normal child still copies a live source workspace. At most one such card exists per recovery action.
 
 ### Human Escalation
 
@@ -1126,6 +1513,15 @@ controller lease in the same transaction that creates the native coordinator.
 The native executor rechecks cancellation and terminal status when claiming the
 coordinator, before starting or attaching a provider.
 
+Run-only Stop also covers the interval after the coordinator claim and before
+the provider session publishes its handle. Stop retains its pending audited
+intent and waits up to 30 seconds for that startup to settle. A published
+session receives cancellation before prompt submission; only real dispatch
+sets `dispatched: true`. A deadline leaves the intent pending and the late
+session remains fenced and is closed. Stop acknowledgement alone does not
+certify cleanup: the existing process and environment receipts still govern
+admission of the next message.
+
 A cancelled startup can continue from a newer authenticated user message after
 cleanup. The server requires either its explicit before-selection fence or an
 unclaimed native coordinator (zero attempts and controller generations, no
@@ -1133,6 +1529,15 @@ controller, lease, or result). It also checks for contradictory launch/process
 evidence and verifies local cleanup or exact remote termination receipts. The
 preparer must have finished or its startup lease must have expired. A missing
 PID alone does not establish this proof.
+For older interrupted preparation rows without a cancellation receipt, or with
+a retained startup fence but no preparation-settled marker, the
+immutable Paperclip Runner adapter claim, unresolved runtime, and preparing stage
+must agree. The old controller must belong to another server boot and its lease
+must have expired. Only absent results or the retained before-selection
+cancellation fence qualify. No native identity, coordinator, adapter invocation,
+provider event, or process-launch evidence may exist. Environment cleanup still
+requires the same receipts. This historical proof permits explicit Retry or a
+newer saved user message; it does not replay the cancelled input.
 
 The existing bounded saved-message worker rechecks this proof after restart.
 Admission atomically settles an unclaimed coordinator and admits one fresh turn,
@@ -1235,7 +1640,25 @@ turn finishes during shutdown, its release checkpoints the session before
 returning instead of leaving a new idle owner behind. If checkpointing fails,
 the retained state continues to block unverified reuse.
 
+Local durable control-plane state is bounded at 256 MiB in the server,
+runnerd recovery, and durable control-plane readers. These paths synchronously
+read and parse the full JSON file, so memory use and parse time grow with file
+size. Remote checkpoint archive and expanded-size limits remain 64 MiB.
+
 ### Warm sandbox continuity
+
+For the native runner, warm mode requests a reusable sandbox lease **before**
+lease acquisition. The environment's explicit runner lifecycle overrides the
+agent default; an inherited lifecycle uses the current agent setting on each
+new turn. This run-scoped configuration does not modify the shared environment
+or replace the task's workspace. Switching an existing task from per-turn to
+warm therefore acquires a reusable lease through the normal provider path,
+instead of starting warm execution on an ephemeral lease. Provider capability,
+ownership, cleanup, and verified restore checks still apply; an unsupported
+provider must not be treated as reusable. Existing active runs retain their
+admitted lifecycle, including when recovery acquires a lease after the agent or
+environment lifecycle setting changes. Recovery uses the persisted execution
+input for both lease acquisition and lifecycle validation.
 
 A warm sandbox's shared workspace binding persists independently of the
 experimental isolated-workspaces UI. Ordinary workspace updates remain gated;
@@ -1244,6 +1667,21 @@ and project. Follow-ups can therefore reuse the same sandbox and provider
 session. A staged provider package is reused only after the complete expected
 manifest and artifact hashes verify. A missing, changed, or incompatible package
 must be replaced and verified before launch.
+
+Warm attachment requires two consecutive authenticated readiness snapshots.
+Blocked readiness probes back off within the reconnect deadline so they do not
+fill the durable command journal while waiting. The fast ready path keeps its
+short second barrier. If readiness never arrives, attachment fails closed with
+the last observed blocker; a full journal is not a substitute for that diagnosis.
+Both native providers publish this readiness contract. ACPX reports its durable
+session identity, active turn, pending audit events, closed state, and unproven
+provider exit as blockers. Explicit readiness probes let the durable runner
+commit and acknowledge retained events under the old run authority; snapshotting
+alone never discards them. ACPX checkpoints its process during the subsequent
+attachment before resuming the same provider session under the new run.
+During an in-place handoff, the ACPX descriptor binds to the validated next run
+while event correlation stays on the old run until durable authority activation.
+A changed session identity or a descriptor that names any other run is rejected.
 
 Safe native replacement may clear a Blocked status only with a durable receipt
 that the same failed run projected that exact status version. Explicitly
@@ -1266,8 +1704,22 @@ execution recovery holds still apply. Unconfirmed cleanup does not start work.
 
 The active session advertises steering only when its driver supports it. A
 transport method that rejects steering does not grant that capability. The
-queued-message control remains mounted until the server accepts a steer request,
-so a rejected last-row action keeps its message and visible error.
+queued-message controller remains mounted across an empty queue, preserving
+pending delivery and inline errors. Steer immediately moves the selected message
+into the conversation; Interrupt immediately moves all submitted queued messages.
+Stale queue polls do not restore those rows while delivery is pending or accepted.
+Rejected delivery restores the latest queue and shows an inline error without a
+toast. The provider acknowledgement remains the authoritative delivery receipt;
+optimistic display never grants permission or records successful delivery. A preparing
+Paperclip Runner retains the Steer label while steering is unavailable; the
+initial legacy database default and an empty queue snapshot cannot select
+Interrupt. Model and effort changes apply to the next turn and do not change
+the active turn's steering target. While awaiting steering acknowledgement, the
+queue route holds the task and queue locks but leaves the run row available for
+PRP event persistence. It locks and rereads the run after acknowledgement before
+merging the receipt, preserving concurrent provider updates.
+If the run stops during that wait, the request fails with a stale-target error
+and retains the queued input for continuation.
 
 ### Preserve work across handoff and deliver requested files
 
@@ -1281,6 +1733,11 @@ transaction that queues it. Their original authors remain intact. A former
 assignee's ordinary comment wake must not start another execution or reopen a
 completed task after the replacement finishes. Mentions, chat deliveries, and
 dedicated interaction continuations retain their separate delivery contracts.
+Comment insertion takes the issue-row lock before writing. When no valid
+historical timestamp is supplied, the comment's `createdAt` and `updatedAt`
+use one statement timestamp so a transaction that started earlier cannot make
+the later comment appear older; imported historical timestamps retain their
+existing behavior.
 
 A requested file is complete when the user can retrieve it. Native runners must
 register requested output files before reporting Done and link the resulting
@@ -1344,3 +1801,116 @@ permission again or copy Connect / Not now into a generic question. A generic
 question does not start setup. The real connection card keeps user identity,
 access grants, the decision, and continuation together. This guidance does not
 approve a connection or bypass its normal user decision.
+
+## Responses submitted during an active run
+
+A confirmation, checkbox confirmation, or question answer is new conversation
+input. Resolving the card records the decision immediately; it does not implicitly
+interrupt or steer an agent that is doing work. Its typed continuation wake waits
+behind the issue's active execution and appears in the message queue.
+
+The queue projects the original resolved interaction as an immutable response.
+It keeps the selected answers and accepted document revision; it does not create
+an editable comment that could silently change what was approved. Ordinary
+messages retain their existing edit, discard, and reorder behavior.
+
+- Normal run completion promotes the saved response once. The restart scan also
+  finds stranded interaction receipts after the issue execution lock is released.
+- **Steer** explicitly delivers the saved response to a compatible native turn.
+  The acknowledgement consumes the receipt, so a retry cannot create a second
+  delivery. It retains the existing run's execution identity.
+- **Interrupt** stops a legacy turn and starts a continuation with the typed
+  response. Native plan approvals that require a fresh session use Interrupt too;
+  steering cannot turn a planning session into an execution session. Existing
+  process-stop, environment-cleanup, ownership, and recovery gates still apply.
+- If the provider is blocked on the original native question request, answering
+  resolves that tool request directly. It must not wait behind the blocked turn.
+
+An agent may finish its review handoff after the user has already answered its
+card. A resolved card from that same source run, or its queued continuation, is a
+valid live path. A stale agent handback to a human cannot cancel the run and orphan
+a queued response. This does not make an old resolved card a review path for a
+later run, or prevent an explicit board reassignment.
+
+### Persistent sandbox cleanup
+
+A lost bridge cannot indefinitely prevent Daytona termination. Ordinary lease release
+and destruction wait briefly for bridge activity, then call the provider for the exact
+recorded sandbox. Drain timeout is not a stop receipt. Reusable sandboxes prefer
+stop; failed stop falls back to deletion. Stop/delete transport hangs are bounded
+and leave cleanup pending unless the provider confirms termination.
+
+The pending-cleanup sweep retains a durable attempt identity and a 15-minute
+in-flight deadline. It retries after restart, waits at least 30 seconds between
+failed attempts, and slows to 30 minutes after five failures. It reports that
+operator attention is needed at that threshold, while automatic cleanup continues.
+Provider outages never convert a live sandbox into an abandoned manual task.
+Explicit Retry can skip the cooldown after a failed cleanup, but cannot take over
+a live cleanup attempt. Active startup cancellation still stops the sandbox first.
+
+A live cleanup attempt renews its durable claim every 30 seconds. Another sweep in the same controller cannot overlap it, even if the deadline passes. Completion writes require the current attempt identity. After controller loss, cleanup can repeat destruction of the exact quarantined provider resource; providers must make that operation idempotent. A timeout or claim expiry does not prove termination.
+
+Renewal updates only the ownership deadline, never the retry cooldown. Cleanup
+does not await an outstanding renewal; a stalled database response cannot retain
+process-local cleanup ownership. Late responses still require the same active
+attempt, and completed attempts use only the persisted retry cooldown.
+
+
+### Follow-up completion instructions
+
+Generated native completion contracts interpret pending comments within the current
+task brief, assigned-skill instructions, and approval gates. Later human direction
+replaces conflicting scope; clarification alone does not approve execution. A
+wake from a server-verified human card response references that entry in
+`humanResponses`, whose answer is already present in the current request context.
+Agent/tool outcomes and generated summaries are not promoted to human direction.
+
+These are model instructions, not additional execution or permission gates.
+Contracts reference the existing brief and answers instead of copying them again.
+Resumed sessions keep the existing message-delta path; fresh sessions receive the
+full covered history. Stable wording and bounded references avoid adding another
+full brief on each comment, but provider cache hits must be measured separately.
+
+### Legacy cancellation recovery
+
+Legacy recovery notices expose the original stopped run, its failure reason,
+saved-message count, and the recorded next action. All run-bound holds offer
+Inspect run. A positively identified unexpected provider cancellation can request
+a fresh continuation only with a complete empty tool inventory. Admission still
+proves provider termination and applies pause, budget, approval, dependency,
+and ownership gates. Saved input uses the existing ordered, single-delivery queue;
+prior completed actions and uncertain outcomes remain history. An operator Stop
+or ambiguous historical cancellation does not automatically release that queue.
+Externally bound chat conversations use a new chat message to continue. Their
+recovery notices show that guidance and do not offer the board Continue action.
+Removed chat connections direct the operator to inspect the run and create a new
+task. Unavailable connections direct the operator to restore access or create a
+new task. A retained conversation record does not prove the chat is available.
+
+### Native finalization recovery display
+
+A native finalization retry uses the existing recovery record but does not imply
+that an agent turn is running. Task and inbox surfaces show recovery in progress
+only while its recorded retry is still due or its matching retry run is verified
+live. An expired or missing retry, exhausted budget, or board-owned failure shows
+recovery needed rather than “Observing active run.”
+
+Native recovery reads include a read-only `nativeRunActivity` projection, bound
+to the company, source issue, and exact `resume_native_run.runId`. It reports a
+queued/running native heartbeat, or a running `workspace_finalize` operation
+owned by `native_workspace_finalizer` whose actual callback is still executing
+in this server process. A persisted running row alone is not activity evidence: a
+crash may leave it behind. The in-process claim ends when the callback joins and
+is empty after restart, with no expiry that can misclassify a slow export. This
+read-only presentation check never grants takeover authority. It remains authoritative while
+the original heartbeat still records its previous failure. Completed operations,
+unrelated runs, and other companies do not establish activity. These retries do
+not require or synthesize a legacy `scheduledRetryReason`.
+
+The card describes recovery of the existing run. It does not describe a fresh
+owner disposition turn. This also covers native bootstrap/session recovery,
+which shares the same resume policy. Inbox rows, source cards, and blocker chips
+use the same activity projection. Board-owned repairs stay actionable until a
+verified native retry actually starts. Once an explicit board retry is running,
+its live activity takes precedence over the prior owner and exhausted budget.
+Resolved and cancelled actions remain resolved.

@@ -39,7 +39,21 @@ function createSeededWorkspace() {
   writeFileSync(path.join(dir, "config.json"), "{}\n", "utf8");
   writeFileSync(
     path.join(dir, "seed-manifest.json"),
-    JSON.stringify({ version: 2, state: "verified", phase: "complete", seedMode: "minimal" }),
+    // Readiness reports `verified` only for a complete v2 manifest.
+    JSON.stringify({
+      version: 2,
+      source: { instanceId: "source", configPath: "/source/config.json" },
+      snapshotAt: "2026-08-18T00:00:00.000Z",
+      seedMode: "minimal",
+      migrationRevision: "0001",
+      targetInstanceId: "target",
+      phase: "complete",
+      state: "verified",
+      attemptId: "attempt",
+      startedAt: "2026-08-18T00:00:00.000Z",
+      finishedAt: "2026-08-18T00:01:00.000Z",
+      diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-08-18T00:01:00.000Z" }],
+    }),
     "utf8",
   );
   return path.join(dir, "config.json");
@@ -56,7 +70,7 @@ function stubDb() {
     select: vi.fn((projection?: Record<string, unknown>) => {
       const rows = projection && "count" in projection ? [{ count: 1 }] : [{ companyId: "company-1" }];
       const chain: Record<string, unknown> = {};
-      for (const method of ["from", "where", "innerJoin", "limit", "orderBy"]) {
+      for (const method of ["from", "where", "innerJoin", "limit", "orderBy", "groupBy"]) {
         chain[method] = vi.fn(() => chain);
       }
       chain.then = (resolve: (value: unknown) => unknown) => Promise.resolve(rows).then(resolve);
