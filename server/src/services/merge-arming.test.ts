@@ -6696,6 +6696,16 @@ describeEmbeddedPostgres("PATCH /issues/:id AS-05 bound-pr delivery identity (SU
     } as unknown as Express.Request["actor"];
   }
 
+  function boardActor(companyId: string): Express.Request["actor"] {
+    return {
+      type: "board",
+      userId: PATCH_USER_ID,
+      companyIds: [companyId],
+      memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+      source: "cloud_tenant",
+    } as unknown as Express.Request["actor"];
+  }
+
   interface SeedOpts {
     executionRunId?: string | null;
     strategyType?: "project_primary" | "git_worktree";
@@ -6704,6 +6714,8 @@ describeEmbeddedPostgres("PATCH /issues/:id AS-05 bound-pr delivery identity (SU
     unrelatedOwner?: boolean;
     /** Unique per seeded company: issue_prefix has a UNIQUE index. */
     issuePrefix?: string;
+    /** Card status; the board-refresh shape needs in_review. */
+    status?: string;
   }
 
   async function seedIssue(opts: SeedOpts = {}) {
@@ -6806,7 +6818,7 @@ describeEmbeddedPostgres("PATCH /issues/:id AS-05 bound-pr delivery identity (SU
       identifier: `${opts.issuePrefix ?? "SUP"}-23026-1`,
       issueNumber: 1,
       title: "AS-05 bound-pr delivery test card",
-      status: "in_progress",
+      status: opts.status ?? "in_progress",
       priority: "medium",
       assigneeUserId: PATCH_USER_ID,
       createdByUserId: PATCH_USER_ID,
@@ -7046,6 +7058,65 @@ describeEmbeddedPostgres("PATCH /issues/:id AS-05 bound-pr delivery identity (SU
     expect(res.status).toBe(422);
     expect(res.body.code).toBe("delivery_identity_write_rejected");
     expect(String((res.body.details as Record<string, unknown>)?.reason)).toContain("token");
+    expect(await readDelivery(issueId)).toBeUndefined();
+  });
+
+  // Round-1 review regression (`as05-write-path-board-refresh-regression`): a
+  // board refresh of a complete PR binding on a card already in_review keeps its
+  // pre-AS-05 write contract — exact branch equality against the control-plane
+  // branch, no live write-time PR verification, no AS-05 kind stamp. The AS-05
+  // live write-time proof belongs to the executor's entry-into-review write only.
+  it("keeps the board refresh of a bound-PR record on exact branch equality with no live write-time verification", async () => {
+    const { companyId, issueId } = await seedIssue({ status: "in_review", issuePrefix: "SUQ" });
+    currentActor = boardActor(companyId);
+    mockGhFetch.mockClear();
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ deliveryIdentity: patchDelivery({ branch: CARD_BRANCH }) });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const delivery = await readDelivery(issueId);
+    expect(delivery).toBeDefined();
+    expect(delivery!.branch).toBe(CARD_BRANCH);
+    expect(delivery!.headSha).toBe(PR_SHA);
+    expect(delivery!.prNumber).toBe(42);
+    expect(delivery!.kind).toBeUndefined();
+    expect(delivery!.cardBranch).toBeUndefined();
+    // No live GitHub call may back a board-refresh write: the record rests on
+    // control-plane equality, and approval time re-verifies as before.
+    expect(mockGhFetch).not.toHaveBeenCalled();
+  });
+
+  it("still rejects a board-refresh bound-PR record whose branch is not the control-plane branch", async () => {
+    const { companyId, issueId } = await seedIssue({ status: "in_review", issuePrefix: "SUR" });
+    currentActor = boardActor(companyId);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ deliveryIdentity: patchDelivery() });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_branch_write_rejected");
+    expect(await readDelivery(issueId)).toBeUndefined();
+  });
+
+  // Round-1 review regression: fail-closed is a designed 4xx, never an unhandled
+  // exception — a verifier throw (secret store outage, transport error) must
+  // surface as 422 delivery_identity_write_rejected, not 500.
+  it("converts a live-verifier throw into a 422 refusal, never a 500", async () => {
+    const runId = randomUUID();
+    const { companyId, issueId, agentId } = await seedIssue({ executionRunId: runId, issuePrefix: "SUS" });
+    currentActor = agentActor(companyId, agentId, runId);
+    mockGetByName.mockRejectedValue(new Error("secret store exploded"));
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_review", deliveryIdentity: patchDelivery() });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("delivery_identity_write_rejected");
+    expect(String((res.body.details as Record<string, unknown>)?.reason)).toContain("threw");
     expect(await readDelivery(issueId)).toBeUndefined();
   });
 

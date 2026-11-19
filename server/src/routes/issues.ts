@@ -20585,7 +20585,13 @@ export function issueRoutes(
       // The board merged-only refresh shapes (no execution workspace at all, or a
       // terminal ADR-083 carrier) keep their pre-AS-05 both-fields record shape:
       // they are stamped WITHOUT the AS-05 kind and stay subject to the
-      // approval-time requireMerged merged-on-base proof.
+      // approval-time requireMerged merged-on-base proof. Every OTHER board
+      // refresh of a complete PR binding (SUP-14824) also keeps its pre-AS-05
+      // write contract: the recorded branch is accepted by exact equality with
+      // the control-plane branch, with NO mandatory live GitHub verification at
+      // write time — approval time re-verifies the binding as before. The
+      // write-time live proof is the AS-05 producer contract for the executor's
+      // own entry-into-review write, the only other shape that can reach here.
       const boundPrRequested =
         requestedDeliveryIdentity.prNumber !== undefined || requestedDeliveryIdentity.prUrl !== undefined;
       if (boundPrRequested) {
@@ -20619,7 +20625,7 @@ export function issueRoutes(
         }
       }
       const boardMergedOnlyRecord = boardOrphanDeliveryRecord || boardTerminalCarrierRecord;
-      if (boundPrRequested && !boardMergedOnlyRecord) {
+      if (boundPrRequested && !boardMergedOnlyRecord && !boardDeliveryRefresh) {
         // The card boundary first (no network): a bound-PR record still needs a
         // control-plane branch this card may lawfully deliver on. The
         // project_primary null-branch carve-out does NOT apply here — an AS-05
@@ -20670,7 +20676,26 @@ export function issueRoutes(
           });
           return;
         }
-        const exact = await resolveExactBoundPullRequest(db, existing.companyId, existing.id, binding, recordedRepo);
+        // Fail-closed is a designed 4xx, never an unhandled exception: the live
+        // verifier may throw on transport or credential failures, and a 500 is
+        // not a refusal a producer can act on.
+        let exact: Awaited<ReturnType<typeof resolveExactBoundPullRequest>>;
+        try {
+          exact = await resolveExactBoundPullRequest(db, existing.companyId, existing.id, binding, recordedRepo);
+        } catch (err) {
+          res.status(422).json({
+            error: "deliveryIdentity bound PR failed live verification",
+            code: "delivery_identity_write_rejected",
+            details: {
+              issueId: existing.id,
+              identifier: existing.identifier ?? null,
+              holdsLease,
+              enteringReview,
+              reason: `recorded delivery identity PR live verification threw: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          });
+          return;
+        }
         if (!exact.pr) {
           const reason = exact.reason ?? "recorded delivery identity PR cannot be verified";
           res.status(422).json({
