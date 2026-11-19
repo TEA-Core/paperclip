@@ -133,8 +133,7 @@ export async function runIsIssueAuthor(
       eq(issues.companyId, companyId),
       eq(issues.id, issueId),
       runAuthoredIssueAssignment(runId),
-    ))
-    .limit(1);
+    ));
   return rows.length > 0;
 }
 
