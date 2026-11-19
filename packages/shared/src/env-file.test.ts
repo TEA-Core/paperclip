@@ -255,6 +255,35 @@ describe("env file editor", () => {
     expect(updateEnvFileContents(original, { PAPERCLIP_HOME: "/good" })).toBe(original);
   });
 
+  it.each([
+    { name: "double-quoted", open: 'NOTE="alpha', close: 'omega"' },
+    { name: "single-quoted", open: "NOTE='alpha", close: "omega'" },
+    { name: "backtick", open: "NOTE=`alpha", close: "omega`" },
+  ])("keeps a canary inside a $name span after the shadowing duplicate is deleted", ({ open, close }) => {
+    const canary = "PAPERCLIP_SECRETS_MASTER_KEY=canary-key";
+    const original = [open, "PAPERCLIP_HOME=/evil", canary, close, "NOTE=final", "PAPERCLIP_HOME=/good", ""].join("\n");
+
+    const updated = updateEnvFileContents(original, { PAPERCLIP_HOME: "/good" });
+    const edited = updated.split("\n").filter((line) => line !== "NOTE=final").join("\n");
+    const parsed = parseDotenv(edited);
+
+    expect(parsed.PAPERCLIP_SECRETS_MASTER_KEY).toBeUndefined();
+    expect(parsed.NOTE).toContain(canary);
+    expect(parsed.PAPERCLIP_HOME).toBe("/good");
+  });
+
+  it("refuses an unterminated quoted value even for an unmanaged key", () => {
+    expect(() => updateEnvFileContents('UNRELATED="alpha\n', { PAPERCLIP_HOME: "/good" })).toThrow(
+      /unterminated/,
+    );
+  });
+
+  it("does not let the understood fallback rewrite a key the caller manages", () => {
+    expect(() => updateEnvFileContents("FOO.BAR=1\n", { "FOO.BAR": "2" })).toThrow(
+      /no canonical assignment/,
+    );
+  });
+
   it("recognises a closing single quote after a trailing backslash when no later single quote exists", () => {
     const original = "NOTE='cache\\'\nPAPERCLIP_DB_BACKUP_ENABLED=true\n";
 
