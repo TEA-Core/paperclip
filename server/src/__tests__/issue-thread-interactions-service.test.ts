@@ -18,6 +18,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueDocuments,
+  issueExecutionDecisions,
   instanceSettings,
   issueRelations,
   issueThreadInteractions,
@@ -5969,6 +5970,367 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       status: "todo",
       assigneeAgentId: creatorAgentId,
       assigneeUserId: null,
+    });
+  });
+
+  describe("close-on-accept publication confirmations (SUP-24788)", () => {
+    const REVIEWER_ID = "paperclip-id:publication-reviewer";
+    const OTHER_USER_ID = "paperclip-id:other-reviewer";
+    const PUBLICATION_TARGET = { type: "custom" as const, key: "wiki-report-2026-11-16-publication" };
+    const ALLOWLISTED_ISSUE_ID = "4cddd194-cc27-4869-9402-7c44cc200518";
+    const ALLOWLISTED_INTERACTION_ID = "7be1fdaf-beb6-4d8f-8acf-fd03dbc781a0";
+
+    afterEach(async () => {
+      await db.delete(issueExecutionDecisions);
+    });
+
+    async function seedPublicationIssue(overrides: Partial<typeof issues.$inferInsert> = {}) {
+      const { companyId, issueId } = await seedConfirmationIssue("Weekly report publication");
+      const creatorAgentId = await seedAgent(companyId);
+      await seedQuestionUser(companyId, REVIEWER_ID);
+      await seedQuestionUser(companyId, OTHER_USER_ID);
+      await db.update(issues).set({
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: REVIEWER_ID,
+        deliveryRequirement: "record_only",
+        ...overrides,
+      }).where(eq(issues.id, issueId));
+      return { companyId, issueId, creatorAgentId };
+    }
+
+    async function createPublicationConfirmation(
+      seeded: { companyId: string; issueId: string; creatorAgentId: string },
+      overrides: {
+        resolverPolicy?: "human_only" | "anyone";
+        addresseeUserId?: string | null;
+        payload?: Record<string, unknown>;
+      } = {},
+    ) {
+      const addresseeUserId = overrides.addresseeUserId === undefined ? REVIEWER_ID : overrides.addresseeUserId;
+      return interactionsSvc.create(
+        { id: seeded.issueId, companyId: seeded.companyId },
+        {
+          kind: "request_confirmation",
+          resolverPolicy: overrides.resolverPolicy ?? "human_only",
+          ...(addresseeUserId ? { addresseeUserId } : {}),
+          continuationPolicy: "wake_assignee_on_accept",
+          payload: {
+            version: 1,
+            prompt: "Publish the weekly report?",
+            target: PUBLICATION_TARGET,
+            closeIssueOnAccept: true,
+            ...overrides.payload,
+          },
+        } as CreateIssueThreadInteractionInput,
+        { agentId: seeded.creatorAgentId },
+      );
+    }
+
+    async function readIssueRow(issueId: string) {
+      return db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    }
+
+    async function readInteractionRow(interactionId: string) {
+      return db.select().from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, interactionId))
+        .then((rows) => rows[0]!);
+    }
+
+    it("persists the flag and closes an eligible record_only issue in the acceptance transaction", async () => {
+      const seeded = await seedPublicationIssue();
+      const created = await createPublicationConfirmation(seeded);
+      expect(created.payload).toMatchObject({ closeIssueOnAccept: true, target: PUBLICATION_TARGET });
+
+      const accepted = await interactionsSvc.acceptInteraction(
+        { id: seeded.issueId, companyId: seeded.companyId, projectId: null, goalId: null },
+        created.id,
+        {},
+        { userId: REVIEWER_ID },
+        { closeIssueOnAccept: true },
+      );
+
+      expect(accepted.interaction).toMatchObject({
+        status: "accepted",
+        resolvedByUserId: REVIEWER_ID,
+        payload: expect.objectContaining({ closeIssueOnAccept: true }),
+      });
+      expect(accepted.continuationIssue).toMatchObject({ id: seeded.issueId, status: "done" });
+      expect(accepted.closeOnAccept?.decision).toBeNull();
+      const issueRow = await readIssueRow(seeded.issueId);
+      expect(issueRow.status).toBe("done");
+      expect(issueRow.completedAt).not.toBeNull();
+    });
+
+    it("records the human approval-stage decision and closes in the same transaction", async () => {
+      const stageId = randomUUID();
+      const seeded = await seedPublicationIssue({
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [{
+            id: stageId,
+            type: "approval",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "user", userId: REVIEWER_ID }],
+          }],
+        },
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "approval",
+          currentParticipant: { type: "user", userId: REVIEWER_ID },
+          returnAssignee: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      });
+      const created = await createPublicationConfirmation(seeded);
+
+      const accepted = await interactionsSvc.acceptInteraction(
+        { id: seeded.issueId, companyId: seeded.companyId, projectId: null, goalId: null },
+        created.id,
+        {},
+        { userId: REVIEWER_ID },
+        { closeIssueOnAccept: true },
+      );
+
+      expect(accepted.closeOnAccept?.decision).toMatchObject({ stageId, outcome: "approved" });
+      const decisions = await db.select().from(issueExecutionDecisions)
+        .where(eq(issueExecutionDecisions.issueId, seeded.issueId));
+      expect(decisions).toEqual([
+        expect.objectContaining({ stageId, actorUserId: REVIEWER_ID, outcome: "approved" }),
+      ]);
+      expect((await readIssueRow(seeded.issueId)).status).toBe("done");
+      expect((await readInteractionRow(created.id)).status).toBe("accepted");
+    });
+
+    type RollbackCase = {
+      label: string;
+      issue?: Partial<typeof issues.$inferInsert>;
+      confirmation?: Parameters<typeof createPublicationConfirmation>[1];
+      actor?: "other_user" | "agent";
+      afterCreate?: (issueId: string) => Promise<void>;
+      refusal: Record<string, unknown>;
+    };
+    const refused = (reason: string) => ({ status: 409, details: { code: "close_on_accept_refused", reason } });
+    it.each<RollbackCase>([
+      { label: "the flag is false", confirmation: { payload: { closeIssueOnAccept: false } }, refusal: refused("close_flag_absent") },
+      { label: "the flag is missing", confirmation: { payload: { closeIssueOnAccept: undefined } }, refusal: refused("close_flag_absent") },
+      { label: "the resolver policy is anyone", confirmation: { resolverPolicy: "anyone" }, refusal: refused("resolver_policy_not_human_only") },
+      { label: "the confirmation has no addressee", confirmation: { addresseeUserId: null }, refusal: refused("addressee_missing") },
+      // The existing resolver governance refuses these actors before the close
+      // re-check; the route never requests a close for them either.
+      { label: "another human accepts", actor: "other_user", refusal: { status: 403, details: { code: "interaction_addressee_mismatch" } } },
+      { label: "an agent accepts", actor: "agent", refusal: { status: 422 } },
+      { label: "the target key is not a publication", confirmation: { payload: { target: { type: "custom", key: "wiki-report-latest-publication" } } }, refusal: refused("target_not_publication") },
+      { label: "the target is missing", confirmation: { payload: { target: null } }, refusal: refused("target_not_publication") },
+      { label: "the issue is repository_delivery", issue: { deliveryRequirement: "repository_delivery" }, refusal: refused("issue_not_record_only") },
+      {
+        label: "the issue is already terminal",
+        afterCreate: async (issueId) => {
+          await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+        },
+        refusal: { status: 409 },
+      },
+      {
+        label: "the execution policy refuses the direct done transition",
+        issue: {
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            stages: [{
+              id: "11111111-1111-4111-8111-1111111111aa",
+              type: "review",
+              approvalsNeeded: 1,
+              participants: [{ id: "11111111-1111-4111-8111-1111111111ab", type: "user", userId: OTHER_USER_ID }],
+            }],
+          },
+          executionState: null,
+        },
+        refusal: refused("execution_policy_redirects_close"),
+      },
+    ])("leaves the issue and interaction unchanged when $label", async ({ issue, confirmation, actor, afterCreate, refusal }) => {
+      const seeded = await seedPublicationIssue(issue);
+      const created = await createPublicationConfirmation(seeded, confirmation);
+      await afterCreate?.(seeded.issueId);
+      const issueBefore = await readIssueRow(seeded.issueId);
+      const interactionBefore = await readInteractionRow(created.id);
+
+      await expect(interactionsSvc.acceptInteraction(
+        { id: seeded.issueId, companyId: seeded.companyId, projectId: null, goalId: null },
+        created.id,
+        {},
+        actor === "agent"
+          ? { agentId: seeded.creatorAgentId }
+          : { userId: actor === "other_user" ? OTHER_USER_ID : REVIEWER_ID },
+        { closeIssueOnAccept: true },
+      )).rejects.toMatchObject(refusal);
+
+      expect(await readIssueRow(seeded.issueId)).toEqual(issueBefore);
+      expect(await readInteractionRow(created.id)).toEqual(interactionBefore);
+      expect(interactionBefore.status).toBe("pending");
+      expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
+    });
+
+    it("keeps the ordinary accept for a flagged confirmation without the close option", async () => {
+      const seeded = await seedPublicationIssue();
+      const created = await createPublicationConfirmation(seeded);
+
+      const accepted = await interactionsSvc.acceptInteraction(
+        { id: seeded.issueId, companyId: seeded.companyId, projectId: null, goalId: null },
+        created.id,
+        {},
+        { userId: REVIEWER_ID },
+      );
+
+      expect(accepted.interaction.status).toBe("accepted");
+      expect(accepted.closeOnAccept).toBeUndefined();
+      expect((await readIssueRow(seeded.issueId)).status).not.toBe("done");
+    });
+
+    async function seedAllowlistedAcceptance(overrides: {
+      issue?: Partial<typeof issues.$inferInsert>;
+      interaction?: Partial<typeof issueThreadInteractions.$inferInsert>;
+    } = {}) {
+      const companyId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      const creatorAgentId = await seedAgent(companyId);
+      await seedQuestionUser(companyId, REVIEWER_ID);
+      await seedQuestionUser(companyId, OTHER_USER_ID);
+      await db.insert(issues).values({
+        id: ALLOWLISTED_ISSUE_ID,
+        companyId,
+        title: "Weekly report publication",
+        status: "in_review",
+        priority: "medium",
+        assigneeUserId: REVIEWER_ID,
+        deliveryRequirement: "record_only",
+        ...overrides.issue,
+      });
+      const resolvedAt = new Date("2026-11-16T12:00:00.000Z");
+      await db.insert(issueThreadInteractions).values({
+        id: ALLOWLISTED_INTERACTION_ID,
+        companyId,
+        issueId: ALLOWLISTED_ISSUE_ID,
+        kind: "request_confirmation",
+        status: "accepted",
+        createdByAgentId: creatorAgentId,
+        addresseeUserId: REVIEWER_ID,
+        continuationPolicy: "wake_assignee_on_accept",
+        requestedResolverPolicy: "human_only",
+        effectiveResolverPolicy: "human_only",
+        // The historical payload predates the flag; the allowlist stands in for it.
+        payload: { version: 1, prompt: "Publish the weekly report?", target: PUBLICATION_TARGET },
+        result: { version: 1, outcome: "accepted" },
+        resolvedByUserId: REVIEWER_ID,
+        resolvedAt,
+        updatedAt: resolvedAt,
+        ...overrides.interaction,
+      });
+      return { companyId, issue: { id: ALLOWLISTED_ISSUE_ID, companyId } };
+    }
+
+    async function reconciliationRecords() {
+      return db.select().from(activityLog).where(and(
+        eq(activityLog.entityId, ALLOWLISTED_ISSUE_ID),
+        eq(activityLog.action, "issue.updated"),
+      ));
+    }
+
+    it("applies the allowlisted reconciliation once and is a verified no-op on repeat", async () => {
+      const { issue } = await seedAllowlistedAcceptance();
+      const interactionBefore = await readInteractionRow(ALLOWLISTED_INTERACTION_ID);
+      expect(await interactionsSvc.hasAppliedCloseOnAcceptReconciliation(issue, ALLOWLISTED_INTERACTION_ID)).toBe(false);
+
+      const first = await interactionsSvc.reconcileAcceptedConfirmationClose(
+        issue,
+        ALLOWLISTED_INTERACTION_ID,
+        { userId: REVIEWER_ID },
+      );
+
+      expect(first.outcome).toBe("applied");
+      const closedIssue = await readIssueRow(ALLOWLISTED_ISSUE_ID);
+      expect(closedIssue.status).toBe("done");
+      expect(await readInteractionRow(ALLOWLISTED_INTERACTION_ID)).toEqual(interactionBefore);
+      const records = await reconciliationRecords();
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({
+        actorType: "user",
+        actorId: REVIEWER_ID,
+        details: expect.objectContaining({
+          source: "request_confirmation_accept",
+          interactionId: ALLOWLISTED_INTERACTION_ID,
+          status: "done",
+          reconciliation: "close_on_accept",
+          _previous: expect.objectContaining({ status: "in_review" }),
+        }),
+      });
+      expect(await interactionsSvc.hasAppliedCloseOnAcceptReconciliation(issue, ALLOWLISTED_INTERACTION_ID)).toBe(true);
+
+      const second = await interactionsSvc.reconcileAcceptedConfirmationClose(
+        issue,
+        ALLOWLISTED_INTERACTION_ID,
+        { userId: REVIEWER_ID },
+      );
+
+      expect(second).toEqual({ outcome: "already_applied" });
+      expect(await readIssueRow(ALLOWLISTED_ISSUE_ID)).toEqual(closedIssue);
+      expect(await readInteractionRow(ALLOWLISTED_INTERACTION_ID)).toEqual(interactionBefore);
+      expect(await reconciliationRecords()).toHaveLength(1);
+    });
+
+    it("refuses a reconciliation for any pair outside the allowlist", async () => {
+      const { issue } = await seedAllowlistedAcceptance();
+      await expect(interactionsSvc.reconcileAcceptedConfirmationClose(
+        issue,
+        randomUUID(),
+        { userId: REVIEWER_ID },
+      )).rejects.toMatchObject({ status: 404 });
+      expect((await readIssueRow(ALLOWLISTED_ISSUE_ID)).status).toBe("in_review");
+    });
+
+    const reconciliationRefused = (reason: string) => ({
+      status: 409,
+      details: { code: "close_on_accept_reconciliation_refused", reason },
+    });
+    it.each<{
+      label: string;
+      issue?: Partial<typeof issues.$inferInsert>;
+      interaction?: Partial<typeof issueThreadInteractions.$inferInsert>;
+      userId?: string;
+      refusal: Record<string, unknown>;
+    }>([
+      { label: "the caller is not the accepting human", userId: OTHER_USER_ID, refusal: { status: 403 } },
+      { label: "the interaction is still pending", interaction: { status: "pending", result: null, resolvedByUserId: null, resolvedAt: null }, refusal: reconciliationRefused("interaction_not_accepted") },
+      { label: "the result is not accepted", interaction: { status: "rejected", result: { version: 1, outcome: "rejected" } }, refusal: reconciliationRefused("interaction_not_accepted") },
+      { label: "an agent resolved it", interaction: { resolvedByUserId: null }, refusal: reconciliationRefused("resolver_not_human") },
+      { label: "the resolver is not the addressee", interaction: { addresseeUserId: OTHER_USER_ID }, refusal: reconciliationRefused("resolver_not_addressee") },
+      { label: "the policy is not human_only", interaction: { requestedResolverPolicy: "anyone", effectiveResolverPolicy: "anyone" }, refusal: reconciliationRefused("resolver_policy_not_human_only") },
+      { label: "the target is not a publication", interaction: { payload: { version: 1, prompt: "Publish?", target: { type: "custom", key: "wiki-report-draft" } } }, refusal: reconciliationRefused("target_not_publication") },
+      { label: "the issue is repository_delivery", issue: { deliveryRequirement: "repository_delivery" }, refusal: reconciliationRefused("issue_not_record_only") },
+      { label: "the issue is already terminal", issue: { status: "done" }, refusal: reconciliationRefused("issue_terminal") },
+    ])("refuses the reconciliation without any write when $label", async ({ issue: issueOverrides, interaction, userId, refusal }) => {
+      const { issue } = await seedAllowlistedAcceptance({ issue: issueOverrides, interaction });
+      const issueBefore = await readIssueRow(ALLOWLISTED_ISSUE_ID);
+      const interactionBefore = await readInteractionRow(ALLOWLISTED_INTERACTION_ID);
+
+      await expect(interactionsSvc.reconcileAcceptedConfirmationClose(
+        issue,
+        ALLOWLISTED_INTERACTION_ID,
+        { userId: userId ?? REVIEWER_ID },
+      )).rejects.toMatchObject(refusal);
+
+      expect(await readIssueRow(ALLOWLISTED_ISSUE_ID)).toEqual(issueBefore);
+      expect(await readInteractionRow(ALLOWLISTED_INTERACTION_ID)).toEqual(interactionBefore);
+      expect(await reconciliationRecords()).toHaveLength(0);
     });
   });
 });

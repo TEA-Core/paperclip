@@ -22,6 +22,7 @@ import {
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  activityLog,
   agents,
   authUsers,
   companySecretProposals,
@@ -43,6 +44,7 @@ import {
 } from "@paperclipai/shared/telemetry";
 import type {
   AcceptIssueThreadInteraction,
+  IssueExecutionDecisionOutcome,
   AskUserQuestionsAnswer,
   AskUserQuestionsInteraction,
   CancelIssueThreadInteraction,
@@ -116,10 +118,19 @@ import {
   isIssueReviewVerdictInteraction,
 } from "./issue-review-policy.js";
 import {
+  executeIssuePostCommitActions,
   issueService,
   readAcceptedPlanConfirmationTarget,
   runWorkspaceIsFinalized,
+  type IssuePostCommitAction,
 } from "./issues.js";
+import {
+  applyIssueExecutionPolicyTransition,
+  approvingCurrentStageCompletesLadder,
+  normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
+} from "./issue-execution-policy.js";
+import { applyReviewEscalationDecision } from "./issue-stage-decision.js";
 import { questionResponseDeliveryValues } from "./question-response-delivery.js";
 import {
   cancelPendingIssueInteractionChatPublications,
@@ -206,6 +217,11 @@ type InteractionResolutionMutationOptions = {
     tx: DbTransaction,
     interaction: IssueThreadInteraction,
   ) => Promise<void>;
+  /** SUP-24788: set only by the accept route after its done-transition
+   * preflight passed for a stored-eligible confirmation. The service re-checks
+   * eligibility under the row locks and closes the issue in the acceptance
+   * transaction; any refusal leaves the issue and the interaction pending. */
+  closeIssueOnAccept?: boolean;
 };
 
 const GITHUB_PULL_REQUEST_URL_PATTERN =
@@ -360,6 +376,8 @@ type ResolvedInteractionResult = {
   interaction: IssueThreadInteraction;
   createdIssues: IssueWakeTarget[];
   continuationIssue?: IssueWakeTarget | null;
+  /** SUP-24788: present when the acceptance also closed the issue. */
+  closeOnAccept?: CloseOnAcceptResult;
 };
 
 type IssueThreadInteractionRow = typeof issueThreadInteractions.$inferSelect;
@@ -765,6 +783,259 @@ async function touchIssue(db: IssueTouchDb, issueId: string) {
 
 function isTerminalIssueStatus(status: string) {
   return status === "done" || status === "cancelled";
+}
+
+/**
+ * SUP-24788: close-on-accept for weekly-report publication confirmations.
+ * Close authority comes only from the stored `payload.closeIssueOnAccept`
+ * flag plus the stored issue and interaction state below. It is never
+ * inferred from prompt, label, or title text.
+ */
+export const WIKI_REPORT_PUBLICATION_TARGET_KEY_PATTERN =
+  /^wiki-report-\d{4}-\d{2}-\d{2}-publication$/;
+
+export const CLOSE_ON_ACCEPT_DECISION_BODY =
+  "Publication approved by the addressed human on the close-on-accept confirmation.";
+
+/**
+ * The single historical acceptance that the close-on-accept reconciliation may
+ * apply. It was accepted before the server honored `closeIssueOnAccept` (the
+ * create schema stripped the field), so this exact pair stands in for the flag.
+ */
+export const CLOSE_ON_ACCEPT_RECONCILIATION_ALLOWLIST: ReadonlyArray<{
+  readonly issueId: string;
+  readonly interactionId: string;
+}> = [
+  {
+    issueId: "4cddd194-cc27-4869-9402-7c44cc200518",
+    interactionId: "7be1fdaf-beb6-4d8f-8acf-fd03dbc781a0",
+  },
+];
+
+export function isCloseOnAcceptReconciliationAllowlisted(
+  issueId: string,
+  interactionId: string,
+) {
+  return CLOSE_ON_ACCEPT_RECONCILIATION_ALLOWLIST.some(
+    (entry) => entry.issueId === issueId && entry.interactionId === interactionId,
+  );
+}
+
+export type CloseIssueOnAcceptIneligibleReason =
+  | "not_request_confirmation"
+  | "close_flag_absent"
+  | "issue_terminal"
+  | "issue_not_record_only"
+  | "resolver_policy_not_human_only"
+  | "addressee_missing"
+  | "resolver_not_human"
+  | "resolver_not_addressee"
+  | "target_not_publication";
+
+/**
+ * Pure eligibility check over stored state. `acceptingUserId` is the human
+ * principal that accepts (or accepted) the confirmation; pass null for any
+ * agent or system resolver. The reconciliation path passes
+ * `requireCloseFlag: false` because its allowlist stands in for the flag.
+ */
+export function closeIssueOnAcceptIneligibleReason(args: {
+  issue: { status: string; deliveryRequirement?: string | null };
+  interaction: {
+    kind: string;
+    payload: unknown;
+    effectiveResolverPolicy: string;
+    addresseeUserId?: string | null;
+  };
+  acceptingUserId: string | null;
+  requireCloseFlag?: boolean;
+}): CloseIssueOnAcceptIneligibleReason | null {
+  const { issue, interaction, acceptingUserId } = args;
+  if (interaction.kind !== "request_confirmation") return "not_request_confirmation";
+  const payload =
+    interaction.payload && typeof interaction.payload === "object"
+      ? (interaction.payload as { closeIssueOnAccept?: unknown; target?: unknown })
+      : {};
+  if ((args.requireCloseFlag ?? true) && payload.closeIssueOnAccept !== true) {
+    return "close_flag_absent";
+  }
+  if (isTerminalIssueStatus(issue.status)) return "issue_terminal";
+  if (issue.deliveryRequirement !== "record_only") return "issue_not_record_only";
+  if (interaction.effectiveResolverPolicy !== "human_only") {
+    return "resolver_policy_not_human_only";
+  }
+  if (!interaction.addresseeUserId) return "addressee_missing";
+  if (!acceptingUserId) return "resolver_not_human";
+  if (interaction.addresseeUserId !== acceptingUserId) return "resolver_not_addressee";
+  const target =
+    payload.target && typeof payload.target === "object"
+      ? (payload.target as { type?: unknown; key?: unknown })
+      : null;
+  if (
+    target?.type !== "custom" ||
+    typeof target.key !== "string" ||
+    !WIKI_REPORT_PUBLICATION_TARGET_KEY_PATTERN.test(target.key)
+  ) {
+    return "target_not_publication";
+  }
+  return null;
+}
+
+function closeOnAcceptRefusedError(reason: string, message: string) {
+  return conflict(message, { code: "close_on_accept_refused", reason });
+}
+
+export type CloseOnAcceptDecision = {
+  decisionId: string;
+  stageId: string;
+  stageType: string;
+  outcome: IssueExecutionDecisionOutcome;
+};
+
+export type CloseOnAcceptResult = {
+  issue: typeof issues.$inferSelect;
+  previous: typeof issues.$inferSelect;
+  decision: CloseOnAcceptDecision | null;
+};
+
+/**
+ * The one done transition shared by close-on-accept and its reconciliation.
+ * It runs inside the caller's transaction under the issue row lock. A pending
+ * execution stage is decided as the accepting human through the shared
+ * stage-decision engine and must complete the ladder; with no pending stage
+ * the execution policy must not redirect the close. Any refusal throws, so the
+ * caller's transaction rolls back every write.
+ */
+async function closeIssueForAcceptedConfirmation(args: {
+  db: Db;
+  tx: Db;
+  issueId: string;
+  companyId: string;
+  userId: string;
+  deferredPostCommit: {
+    activityPublications: ActivityPublication[];
+    postCommitActions: IssuePostCommitAction[];
+  };
+}): Promise<CloseOnAcceptResult> {
+  const issueSvc = issueService(args.db);
+  const locked = await issueSvc.getByIdForUpdate(args.issueId, args.tx);
+  if (!locked || locked.companyId !== args.companyId) throw notFound("Issue not found");
+  if (isTerminalIssueStatus(locked.status)) {
+    throw closeOnAcceptRefusedError("issue_terminal", "The issue is already closed");
+  }
+  if (locked.deliveryRequirement !== "record_only") {
+    throw closeOnAcceptRefusedError("issue_not_record_only", "Only a record_only issue can close on accept");
+  }
+  const actor = { agentId: null, userId: args.userId, runId: null };
+  const policy = normalizeIssueExecutionPolicy(locked.executionPolicy ?? null);
+  const executionState = parseIssueExecutionState(locked.executionState);
+  const transition = applyIssueExecutionPolicyTransition({
+    issue: locked,
+    policy,
+    requestedStatus: "done",
+    requestedAssigneePatch: {},
+    actor,
+    commentBody: CLOSE_ON_ACCEPT_DECISION_BODY,
+  });
+  if (transition.decision) {
+    if (!policy || !executionState || !approvingCurrentStageCompletesLadder({ policy, executionState })) {
+      throw closeOnAcceptRefusedError(
+        "execution_ladder_incomplete",
+        "Approving the current execution stage does not complete the issue's ladder",
+      );
+    }
+    const decided = await applyReviewEscalationDecision({
+      db: args.tx,
+      issue: locked,
+      requestedStatus: "done",
+      decisionBody: CLOSE_ON_ACCEPT_DECISION_BODY,
+      actor,
+      finalStageDisposition: "done",
+      deferredPostCommit: args.deferredPostCommit,
+    });
+    if (!decided || decided.issue.status !== "done") {
+      throw closeOnAcceptRefusedError("done_transition_refused", "The execution stage decision did not close the issue");
+    }
+    return {
+      issue: decided.issue,
+      previous: locked,
+      decision: {
+        decisionId: decided.decisionId,
+        stageId: decided.stageId,
+        stageType: decided.stageType,
+        outcome: decided.outcome,
+      },
+    };
+  }
+  if (
+    executionState?.status === "pending" ||
+    (transition.patch.status !== undefined && transition.patch.status !== "done")
+  ) {
+    throw closeOnAcceptRefusedError(
+      "execution_policy_redirects_close",
+      "The issue's execution policy routes this close to a review stage",
+    );
+  }
+  const closed = await issueSvc.update(
+    locked.id,
+    {
+      ...transition.patch,
+      status: "done",
+      actorAgentId: null,
+      actorUserId: args.userId,
+    },
+    args.tx,
+    args.deferredPostCommit.activityPublications,
+    args.deferredPostCommit.postCommitActions,
+  );
+  if (!closed || closed.status !== "done") {
+    throw closeOnAcceptRefusedError("done_transition_refused", "The done transition did not close the issue");
+  }
+  return { issue: closed, previous: locked, decision: null };
+}
+
+function readCloseOnAcceptIssueUpdatedDetails(
+  closed: typeof issues.$inferSelect,
+  previous: typeof issues.$inferSelect,
+  interactionId: string,
+) {
+  return {
+    identifier: closed.identifier,
+    status: closed.status,
+    assigneeAgentId: closed.assigneeAgentId ?? null,
+    assigneeUserId: closed.assigneeUserId ?? null,
+    source: "request_confirmation_accept",
+    interactionId,
+    _previous: {
+      status: previous.status,
+      workMode: previous.workMode,
+      assigneeAgentId: previous.assigneeAgentId ?? null,
+      assigneeUserId: previous.assigneeUserId ?? null,
+    },
+  };
+}
+
+/** The durable record a reconciliation writes in its own transaction. */
+async function hasCloseOnAcceptReconciliationRecord(
+  dbOrTx: Pick<Db, "select">,
+  issue: { id: string; companyId: string },
+  interactionId: string,
+) {
+  const rows = await dbOrTx
+    .select({ id: activityLog.id })
+    .from(activityLog)
+    .where(
+      and(
+        eq(activityLog.companyId, issue.companyId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, issue.id),
+        eq(activityLog.action, "issue.updated"),
+        sql`${activityLog.details}->>'source' = 'request_confirmation_accept'`,
+        sql`${activityLog.details}->>'interactionId' = ${interactionId}`,
+        sql`${activityLog.details}->>'reconciliation' = 'close_on_accept'`,
+      ),
+    )
+    .limit(1);
+  return rows.length > 0;
 }
 
 function interactionNotFoundError() {
@@ -2170,6 +2441,7 @@ export function issueThreadInteractionService(
   }): Promise<{
     interaction: IssueThreadInteraction;
     continuationIssue: IssueWakeTarget | null;
+    closeOnAccept?: CloseOnAcceptResult;
   }> {
     const expired = await expireStaleRequestConfirmationTarget(db, {
       row: args.current,
@@ -2183,6 +2455,8 @@ export function issueThreadInteractionService(
 
     const now = new Date();
     const postCommitActivityPublications: ActivityPublication[] = [];
+    const postCommitActions: IssuePostCommitAction[] = [];
+    const closeIssueOnAccept = args.mutationOptions?.closeIssueOnAccept === true;
     const result = await db.transaction(async (tx) => {
       await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor);
       await args.mutationOptions?.beforeResolveInTransaction?.(tx);
@@ -2244,6 +2518,29 @@ export function issueThreadInteractionService(
       );
 
       const interaction = hydrateInteraction(lockedCurrent);
+      if (closeIssueOnAccept) {
+        // SUP-24788: re-derive eligibility from the locked rows, never from the
+        // route's earlier read or the request. A failure refuses the accept.
+        const [lockedDelivery] = await tx
+          .select({ deliveryRequirement: issues.deliveryRequirement })
+          .from(issues)
+          .where(eq(issues.id, issueContext.id));
+        const ineligible = closeIssueOnAcceptIneligibleReason({
+          issue: {
+            status: issueContext.status,
+            deliveryRequirement: lockedDelivery?.deliveryRequirement ?? null,
+          },
+          interaction,
+          acceptingUserId:
+            args.actor.agentId || args.actor.systemId ? null : (args.actor.userId ?? null),
+        });
+        if (ineligible) {
+          throw closeOnAcceptRefusedError(
+            ineligible,
+            "The confirmation is no longer eligible to close the issue on accept",
+          );
+        }
+      }
       const selectedOptionIds =
         interaction.kind === "request_checkbox_confirmation"
           ? resolveSelectedCheckboxConfirmationOptions({
@@ -2290,6 +2587,7 @@ export function issueThreadInteractionService(
       );
 
       let continuationIssue: IssueWakeTarget | null = null;
+      let closeOnAccept: CloseOnAcceptResult | undefined;
       const acceptedPlanTarget = readAcceptedPlanConfirmationTarget(
         lockedCurrent.payload,
         issueContext.id,
@@ -2299,7 +2597,25 @@ export function issueThreadInteractionService(
         acceptedPlanTarget?.issueId === issueContext.id &&
         acceptedPlanTarget.key === "plan" &&
         issueContext.workMode === "planning";
-      if (isNativeCompletionReview(lockedCurrent)) {
+      if (closeIssueOnAccept) {
+        closeOnAccept = await closeIssueForAcceptedConfirmation({
+          db,
+          tx: tx as unknown as Db,
+          issueId: issueContext.id,
+          companyId: issueContext.companyId,
+          userId: args.actor.userId as string,
+          deferredPostCommit: {
+            activityPublications: postCommitActivityPublications,
+            postCommitActions,
+          },
+        });
+        continuationIssue = {
+          id: closeOnAccept.issue.id,
+          assigneeAgentId: closeOnAccept.issue.assigneeAgentId ?? null,
+          assigneeUserId: closeOnAccept.issue.assigneeUserId ?? null,
+          status: closeOnAccept.issue.status,
+        };
+      } else if (isNativeCompletionReview(lockedCurrent)) {
         const otherPending = await tx.select({ id: issueThreadInteractions.id })
           .from(issueThreadInteractions).where(and(
             eq(issueThreadInteractions.companyId, issueContext.companyId),
@@ -2426,10 +2742,12 @@ export function issueThreadInteractionService(
       return {
         interaction: acceptedInteraction,
         continuationIssue,
+        ...(closeOnAccept ? { closeOnAccept } : {}),
       };
     });
     const publish = async (committedDb: Db) => {
       for (const publication of postCommitActivityPublications) publishActivity(publication);
+      await executeIssuePostCommitActions(committedDb, postCommitActions);
       await emitInteractionResolvedTelemetry(committedDb, result.interaction);
     };
     if (args.mutationOptions?.deferConfirmationCommitEffects) args.mutationOptions.deferConfirmationCommitEffects(publish);
@@ -3903,6 +4221,7 @@ export function issueThreadInteractionService(
             interaction: accepted.interaction,
             continuationIssue: accepted.continuationIssue,
             createdIssues: [],
+            ...(accepted.closeOnAccept ? { closeOnAccept: accepted.closeOnAccept } : {}),
           };
         }
         case "request_checkbox_confirmation": {
@@ -3943,6 +4262,119 @@ export function issueThreadInteractionService(
             `Interactions of kind ${current.kind} cannot be accepted`,
           );
       }
+    },
+
+    /** SUP-24788: true once the allowlisted reconciliation has applied. */
+    hasAppliedCloseOnAcceptReconciliation: async (
+      issue: { id: string; companyId: string },
+      interactionId: string,
+    ) => hasCloseOnAcceptReconciliationRecord(db, issue, interactionId),
+
+    /**
+     * SUP-24788: apply the close-on-accept done transition for the single
+     * allowlisted acceptance that predates the flag. It never touches the
+     * interaction row, never re-runs the acceptance, and writes the issue only
+     * through the shared close transition. A repeat run returns
+     * `already_applied` without any write.
+     */
+    reconcileAcceptedConfirmationClose: async (
+      issue: { id: string; companyId: string },
+      interactionId: string,
+      actor: { userId: string },
+    ): Promise<
+      | { outcome: "already_applied" }
+      | { outcome: "applied"; closeOnAccept: CloseOnAcceptResult }
+    > => {
+      if (!isCloseOnAcceptReconciliationAllowlisted(issue.id, interactionId)) {
+        throw interactionNotFoundError();
+      }
+      const activityPublications: ActivityPublication[] = [];
+      const postCommitActions: IssuePostCommitAction[] = [];
+      const result = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const lockedIssue = await issueService(db).getByIdForUpdate(issue.id, txDb);
+        if (!lockedIssue || lockedIssue.companyId !== issue.companyId) {
+          throw notFound("Issue not found");
+        }
+        const row = await tx
+          .select()
+          .from(issueThreadInteractions)
+          .where(
+            and(
+              eq(issueThreadInteractions.id, interactionId),
+              eq(issueThreadInteractions.companyId, issue.companyId),
+              eq(issueThreadInteractions.issueId, issue.id),
+            ),
+          )
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!row) throw interactionNotFoundError();
+        if (await hasCloseOnAcceptReconciliationRecord(tx, issue, interactionId)) {
+          return { outcome: "already_applied" as const };
+        }
+        const refuse = (reason: string, message: string) =>
+          conflict(message, { code: "close_on_accept_reconciliation_refused", reason });
+        if (row.kind !== "request_confirmation") {
+          throw refuse("not_request_confirmation", "The allowlisted interaction is not a confirmation");
+        }
+        const storedResult =
+          row.result && typeof row.result === "object"
+            ? (row.result as { outcome?: unknown })
+            : null;
+        if (row.status !== "accepted" || storedResult?.outcome !== "accepted") {
+          throw refuse("interaction_not_accepted", "The allowlisted interaction is not accepted");
+        }
+        if (row.resolvedByAgentId || !row.resolvedByUserId) {
+          throw refuse("resolver_not_human", "The allowlisted interaction was not accepted by a human");
+        }
+        const interaction = hydrateInteraction(row);
+        const ineligible = closeIssueOnAcceptIneligibleReason({
+          issue: lockedIssue,
+          interaction,
+          acceptingUserId: row.resolvedByUserId,
+          requireCloseFlag: false,
+        });
+        if (ineligible) {
+          throw refuse(ineligible, "The allowlisted acceptance is not eligible to close the issue");
+        }
+        if (actor.userId !== row.resolvedByUserId) {
+          throw forbidden("Only the human who accepted the confirmation can apply its close");
+        }
+        const closeOnAccept = await closeIssueForAcceptedConfirmation({
+          db,
+          tx: txDb,
+          issueId: issue.id,
+          companyId: issue.companyId,
+          userId: row.resolvedByUserId,
+          deferredPostCommit: { activityPublications, postCommitActions },
+        });
+        await logActivityInTransaction(
+          txDb,
+          {
+            companyId: issue.companyId,
+            actorType: "user",
+            actorId: row.resolvedByUserId,
+            agentId: null,
+            runId: null,
+            action: "issue.updated",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              ...readCloseOnAcceptIssueUpdatedDetails(
+                closeOnAccept.issue,
+                closeOnAccept.previous,
+                interactionId,
+              ),
+              reconciliation: "close_on_accept",
+            },
+          },
+          activityPublications,
+        );
+        return { outcome: "applied" as const, closeOnAccept };
+      });
+      for (const publication of activityPublications) publishActivity(publication);
+      await executeIssuePostCommitActions(db, postCommitActions);
+      return result;
     },
 
     acceptSuggestedTasks: async (

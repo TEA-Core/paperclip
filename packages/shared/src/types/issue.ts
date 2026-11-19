@@ -1540,6 +1540,7 @@ export interface RequestConfirmationPayload {
   secretProposal?: RequestConfirmationSecretProposalPayload;
   connectionAuthorization?: RequestConfirmationConnectionAuthorizationPayload;
   adoptionCarrier?: RequestConfirmationAdoptionCarrier | null;
+  closeIssueOnAccept?: boolean;
 }
 
 export interface RequestCheckboxConfirmationOption {
