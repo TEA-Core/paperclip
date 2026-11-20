@@ -538,6 +538,35 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
     await expect(git(["symbolic-ref", "--short", "HEAD"], control.source)).resolves.toBe("branch-a");
   }, 30_000);
 
+  it.each([
+    ["a tag ref", "v1-tag", async (f: Awaited<ReturnType<typeof makeLinkedSource>>) => {
+      await git(["tag", "v1-tag", "branch-b"], f.owner);
+    }],
+    ["a refs/heads/ form", "refs/heads/branch-a", async () => {}],
+    ["a deliberately detached checkout", "branch-a", async (f: Awaited<ReturnType<typeof makeLinkedSource>>) => {
+      await git(["checkout", "-q", "--detach", "branch-a"], f.source);
+    }],
+  ])("starts when the recorded ref is %s", async (_label, recordedRef, prepare) => {
+    const fixture = await makeLinkedSource();
+    await prepare(fixture);
+    const scope = await seedCompany();
+    const started = path.join(fixture.root, "started");
+    const seeded = await seedWorkspace({
+      scope,
+      cwd: fixture.source,
+      branchName: recordedRef,
+      baseRef: "branch-a",
+      projectCwd: null,
+      provisionCommand: "true",
+      serviceCommand: httpCommand(started),
+    });
+    const res = await request(app())
+      .post(`/api/execution-workspaces/${seeded.workspaceId}/runtime-services/start`)
+      .send({});
+    expect(res.status).toBeLessThan(300);
+    await expect(fs.stat(started)).resolves.toBeTruthy();
+  }, 30_000);
+
   it("surfaces drift on readiness and keeps the original early-exit error", async () => {
     async function openBarrier() {
       const server = net.createServer();

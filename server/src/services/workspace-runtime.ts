@@ -3790,11 +3790,13 @@ function formatCheckoutBranchDriftMessage(evidence: CheckoutBranchDriftEvidence)
   );
 }
 
+function normalizeRecordedBranchRef(raw: string) {
+  return raw.replace(/^refs\/heads\//, "").replace(/^origin\//, "");
+}
+
 function recordedBranchMatchesCheckout(expectedRaw: string, actualBranch: string | null) {
   if (!actualBranch) return false;
-  const expected = expectedRaw.replace(/^origin\//, "");
-  const actual = actualBranch.replace(/^origin\//, "");
-  return actualBranch === expectedRaw || actual === expected;
+  return normalizeRecordedBranchRef(actualBranch) === normalizeRecordedBranchRef(expectedRaw);
 }
 
 async function readBoundCheckoutGitIdentity(cwd: string): Promise<{
@@ -3830,13 +3832,20 @@ async function assertRecordedCheckoutBranchIdentity(input: {
   if (!isConcreteRecordedBranch(expectedRaw)) return;
   const identity = await readBoundCheckoutGitIdentity(input.cwd);
   if (!identity || !identity.isGit) return;
+  if (!identity.branch) return;
   if (recordedBranchMatchesCheckout(expectedRaw, identity.branch)) return;
+  const expectedLocalBranch = normalizeRecordedBranchRef(expectedRaw);
+  const isLocalBranch = await runGit(
+    ["show-ref", "--verify", "--quiet", `refs/heads/${expectedLocalBranch}`],
+    identity.canonicalCwd,
+  ).then(() => true, () => false);
+  if (!isLocalBranch) return;
 
   let actualBranch = identity.branch;
   if (input.strategy === "git_worktree") {
     const inspection = await inspectManagedGitWorktreeBranch({
       worktreePath: identity.canonicalCwd,
-      expectedBranchName: expectedRaw.replace(/^origin\//, ""),
+      expectedBranchName: expectedLocalBranch,
       repoRoot: input.repoRoot ?? null,
     }).catch(() => null);
     if (inspection?.valid) return;
@@ -3849,7 +3858,7 @@ async function assertRecordedCheckoutBranchIdentity(input: {
   const evidence: CheckoutBranchDriftEvidence = {
     reason: "checkout_branch_drift",
     reasonCode: "branch_mismatch",
-    expectedBranch: expectedRaw.replace(/^origin\//, ""),
+    expectedBranch: expectedLocalBranch,
     actualBranch,
     headSha: identity.headSha,
     canonicalCwd: identity.canonicalCwd,
