@@ -5,7 +5,7 @@ import { claimedAdapterType, conversationRecoveryActionPredicate, getConversatio
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, not, or, sql } from "drizzle-orm";
 import {
   chatActions,
   environmentLeases,
@@ -276,6 +276,8 @@ export async function deliverReconciledExecutions(
               and(
                 eq(heartbeatRuns.companyId, action.companyId),
                 eq(heartbeatRuns.id, run.id),
+                // A coalesced wake can return the source run itself (SUP-24883).
+                ne(heartbeatRuns.id, decision.runId),
                 eq(heartbeatRuns.agentId, action.returnOwnerAgentId!),
                 sql`${heartbeatRuns.contextSnapshot}->>'recoveryActionId' = ${action.id}`,
                 sql`${heartbeatRuns.contextSnapshot}->>'previousRunId' = ${decision.runId}`,
