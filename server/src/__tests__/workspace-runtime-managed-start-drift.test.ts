@@ -299,6 +299,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
     provisionCommand?: string | null;
     serviceCommand?: string | null;
     runtimeOwned?: boolean;
+    strategyType?: string;
   }) {
     const issueId = randomUUID();
     const workspaceId = randomUUID();
@@ -330,7 +331,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
       projectWorkspaceId: input.projectCwd ? input.scope.projectWorkspaceId : null,
       sourceIssueId: issueId,
       mode: "isolated_workspace",
-      strategyType: "git_worktree",
+      strategyType: input.strategyType ?? "git_worktree",
       name: "Bound source",
       status: "active",
       cwd: input.cwd,
@@ -557,6 +558,7 @@ describeEmbeddedPostgres("managed runtime start detects checkout drift", () => {
       branchName: recordedRef,
       baseRef: "branch-a",
       projectCwd: null,
+      strategyType: "project_primary",
       provisionCommand: "true",
       serviceCommand: httpCommand(started),
     });
