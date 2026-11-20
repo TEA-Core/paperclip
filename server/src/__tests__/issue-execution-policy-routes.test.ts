@@ -4338,6 +4338,74 @@ describe("issue execution policy routes", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(mockIssueService.addComment).not.toHaveBeenCalled();
     });
+
+    // CodeRabbit r2 on SUP-24762: reviewRequest and deliveryIdentity are removed
+    // from updateFields and add executionState only after the route guard. The
+    // route must still refuse such a write on a human-held handoff before a
+    // closed workspace reopens, as it did before the field-less skip.
+    it.each([
+      ["a deliveryIdentity", {
+        deliveryIdentity: {
+          repo: { owner: "TEA-Core", repo: "paperclip" },
+          branch: "PAP-1550-wiki",
+          headSha: "a".repeat(40),
+        },
+      }],
+      ["a reviewRequest", { reviewRequest: { instructions: "Please check the summary." } }],
+    ])("refuses a board comment with %s on a human-held Wiki handoff before reopening its closed workspace (SUP-24762)", async (_name, extra) => {
+      const workspaceId = "78787878-7878-4787-8787-787878787878";
+      const issue = { ...humanReviewHandoff(), executionWorkspaceId: workspaceId };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+      mockExecutionWorkspaceService.getById.mockResolvedValue({
+        id: workspaceId,
+        mode: "isolated_workspace",
+        status: "archived",
+        closedAt: new Date("2026-01-01T00:00:00.000Z"),
+      });
+      mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue.mockResolvedValue({
+        ok: false,
+        code: "rebuild_failed",
+        message: "Failed to rebuild the execution workspace",
+      });
+      vi.doMock("../services/merge-arming.js", async (importOriginal) => ({
+        ...await importOriginal<typeof import("../services/merge-arming.js")>(),
+        resolveIssueRepoContext: vi.fn(async () => ({ repoUrl: "https://github.com/TEA-Core/paperclip" })),
+        resolveCardDeliveryBranchOwnership: vi.fn(async () => ({
+          legitimate: true,
+          branch: "PAP-1550-wiki",
+          branchIsOwn: true,
+          ownerIssueId: issueId,
+          carrierOwnerTerminal: false,
+          refusalReason: null,
+        })),
+      }));
+
+      let res;
+      try {
+        res = await request(await createApp()).patch(`/api/issues/${issueId}`).send({
+          comment: "refreshing the review record",
+          ...extra,
+        });
+      } finally {
+        // The module mock must not leak into later tests that use merge-arming.
+        vi.doUnmock("../services/merge-arming.js");
+      }
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details).toMatchObject({
+        guard: "assignee_review_gate",
+        subGuard: "wiki_handoff",
+        reason: "wiki_handoff_unassigned",
+      });
+      expect(mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
   });
 
   it.each([

@@ -20309,7 +20309,14 @@ export function issueRoutes(
     // SUP-24762: a field-less write (comment-only PATCH) cannot change who
     // holds the handoff or what it is; judging the stored assignee would
     // refuse a comment while a human reviewer holds the review seat.
-    if (!isFieldlessIssueWrite(updateFields)) {
+    // reviewRequest and deliveryIdentity add executionState after this check,
+    // so a request that carries either still runs the guard here: a refused
+    // write must not reach the closed-workspace reopen below.
+    if (
+      !isFieldlessIssueWrite(updateFields)
+      || reviewRequest !== undefined
+      || requestedDeliveryIdentity !== undefined
+    ) {
       await assertWikiHandoffWriteIntegrity({
         db,
         companyId: existing.companyId,
