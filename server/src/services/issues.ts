@@ -12214,10 +12214,13 @@ export function issueService(
           ? issueData.assigneeAgentId
           : existing.assigneeAgentId;
       // A reassignment drops the creation proof: a later self-assign by a run
-      // proves itself through its assignee-change activity row instead.
+      // proves itself through its assignee-change activity row instead. An
+      // originRunId explicitly supplied in this same patch wins over the
+      // drop: it is a declared field, not the stale stored proof.
       if (
         issueData.assigneeAgentId !== undefined &&
-        issueData.assigneeAgentId !== existing.assigneeAgentId
+        issueData.assigneeAgentId !== existing.assigneeAgentId &&
+        issueData.originRunId === undefined
       ) {
         patch.originRunId = null;
       }
