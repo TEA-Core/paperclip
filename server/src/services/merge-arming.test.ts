@@ -2264,6 +2264,32 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       }
     });
 
+    it("still accepts a merged mentioned PR beside a closed unmerged draft sibling (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "closed" });
+      await insertMention(issueId, { number: 43, state: "closed", draft: true });
+      installRoutes([
+        ...mergedCarrierRoutes(),
+        {
+          url: PR_43_URL,
+          body: {
+            state: "closed",
+            draft: true,
+            merged: false,
+            title: "Abandoned (SUP-42)",
+            head: { ref: "SUP-42-abandoned", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+          },
+        },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("resolved");
+      if (result.kind === "resolved") {
+        expect(result.pr).toEqual({ owner: OWNER, repo: REPO, number: 42 });
+      }
+    });
+
     it("resolveApprovalDecisionHead stays open-PR-only for the same card (no carrier fallback)", async () => {
       const issueId = await insertMentionOnlyCard();
       installRoutes(mergedCarrierRoutes());

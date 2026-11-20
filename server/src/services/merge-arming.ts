@@ -3874,7 +3874,7 @@ async function resolveSingleMergedMentionCarrier(
       const live = await fetchPullRequestHeadSha(candidates[i]!.token, pr.owner, pr.repo, pr.number);
       if (live.ok) {
         unreadable = null;
-        if (live.merged !== true && live.draft === true) liveDraft = true;
+        if (live.open === true && live.draft === true) liveDraft = true;
         if (live.merged === true && live.headSha) {
           mergedCarriers.push({
             kind: "resolved",
