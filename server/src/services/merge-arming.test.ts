@@ -2205,6 +2205,7 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
         displayName: `${OWNER}/${REPO}#42`,
         pr: { owner: OWNER, repo: REPO, number: 42 },
       });
+      expect(mockGhFetch.mock.calls.map((call) => String(call[0]))).toContain(COMPARE_URL);
       expect(postStatusShas()).toEqual([]);
     });
 

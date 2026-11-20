@@ -3735,6 +3735,14 @@ const finalDeliveryLiveSchema = z.object({
  * and branch/repo ownership checks as the ordinary path. Every other
  * resolution path (approval publication, merge arming, reconciliation) stays
  * open-PR-only.
+ *
+ * SUP-24033: a cached `state: "open", draft: true` mention makes
+ * resolveApprovalDecisionHead return `head_draft` before that fallback, so a
+ * PR that has since merged never reaches it. The cached draft bit is trusted
+ * only after the same live merged-carrier read. The merged path is used only
+ * when live state proves the sole mention merged; a live draft keeps
+ * `head_draft`. Unreadable, ambiguous, ownership-mismatched, and
+ * containment-unproven candidates stay rejected by that same read.
  */
 export async function preflightFinalDelivery(
   db: Db, companyId: string, issueId: string, identifier: string,
@@ -3743,7 +3751,12 @@ export async function preflightFinalDelivery(
   if (resolved.kind === "resolved") {
     return verifyLiveFinalDeliveryHead(db, companyId, issueId, resolved);
   }
-  if (resolved.reason.startsWith("no-pr:")) {
+  // SUP-24033: head_draft from cached mention metadata is not live proof the
+  // carrier is still a draft. Run the existing merged-carrier read before
+  // returning it. none leaves the original refusal (a genuine live draft stays
+  // head_draft); resolved is accepted only after verifyLiveFinalDeliveryHead
+  // proves the merge commit.
+  if (resolved.reason.startsWith("no-pr:") || resolved.reason.startsWith("head_draft:")) {
     const carrier = await resolveSingleMergedMentionCarrier(db, companyId, issueId);
     if (carrier.kind === "resolved") {
       return verifyLiveFinalDeliveryHead(db, companyId, issueId, carrier);
