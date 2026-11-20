@@ -168,6 +168,7 @@ import { instanceSettingsService } from "./instance-settings.js";
 import {
   assertAssigneeWriteDoesNotSelfSatisfyReviewStage,
   assertWikiHandoffWriteIntegrity,
+  isFieldlessIssueWrite,
 } from "./issue-assignee-review-gate.js";
 import {
   type CurrentUserRedactionOptions,
@@ -258,7 +259,7 @@ import {
   type IssueLivenessFinding,
 } from "./recovery/issue-graph-liveness.js";
 import { USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS } from "./issue-interaction-kinds.js";
-import { visibleIssueCondition } from "./issue-visibility.js";
+import { includeHiddenIssueCondition, visibleIssueCondition } from "./issue-visibility.js";
 import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 import { finalizeSummarySlotsForTerminalIssue, hasSummaryGenerationToken } from "./summary-slot-finalization.js";
 import {
@@ -8856,7 +8857,7 @@ export function issueService(
 
       const conditions = [
         eq(issues.companyId, companyId),
-        filters?.includeHidden === true ? isNull(issues.harnessKind) : visibleIssueCondition(),
+        filters?.includeHidden === true ? includeHiddenIssueCondition() : visibleIssueCondition(),
       ];
       if (filters?.ids) conditions.push(inArray(issues.id, [...filters.ids]));
       if (filters?.identifiers) conditions.push(inArray(issues.identifier, [...filters.identifiers]));
@@ -9211,7 +9212,7 @@ export function issueService(
 
       const conditions = [
         eq(issues.companyId, companyId),
-        filters?.includeHidden === true ? isNull(issues.harnessKind) : visibleIssueCondition(),
+        filters?.includeHidden === true ? includeHiddenIssueCondition() : visibleIssueCondition(),
       ];
       if (!filters?.q?.trim()) {
         conditions.push(isNull(issues.conversationAgentId));
@@ -11975,6 +11976,12 @@ export function issueService(
          * self-satisfying review-stage gate does not apply to it.
          */
         workflowControlledAssignment?: boolean;
+        /**
+         * Internal only. Set by the board stage-decision route (SUP-24632) on
+         * the write that closes the final stage of an unassigned Wiki handoff
+         * without writing an assignee. Never a column; never from a request body.
+         */
+        boardStageDecision?: boolean;
         companyGuard?: string;
         /**
          * Internal only. Optimistic concurrency token for PATCH /api/issues/:id.
@@ -12034,6 +12041,7 @@ export function issueService(
         companyGuard,
         expectedUpdatedAt,
         workflowControlledAssignment,
+        boardStageDecision,
         ...issueData
       } = data;
       // An explicit edit claims the title, even if it keeps the same text.
@@ -12512,6 +12520,11 @@ export function issueService(
         //   unblockDescriptor)
         // unblockDescriptor: repairNativeBlockedWait
         // companyGuard: blockIssueWithUnresolvedBlockers company scope
+        // SUP-24762: also skip it for a field-less write (only request
+        // attribution, e.g. a comment-only PATCH): it writes no assignee. The
+        // attribution keys still count as present keys for every other write.
+        // An own executionPolicy key is never field-less, even when undefined:
+        // this update's policy normalization writes null for it.
         const wikiHandoffUnguardedWriteKeys = new Set([
           "status",
           "blockedByIssueIds",
@@ -12522,9 +12535,12 @@ export function issueService(
         const presentWriteKeys = Object.entries(data)
           .filter(([, value]) => value !== undefined)
           .map(([key]) => key);
-        const wikiHandoffIdentityWrite = presentWriteKeys.some(
-          (key) => !wikiHandoffUnguardedWriteKeys.has(key),
-        );
+        const fieldlessWrite =
+          isFieldlessIssueWrite(data) &&
+          !Object.prototype.hasOwnProperty.call(data, "executionPolicy");
+        const wikiHandoffIdentityWrite =
+          !fieldlessWrite &&
+          presentWriteKeys.some((key) => !wikiHandoffUnguardedWriteKeys.has(key));
         if (wikiHandoffIdentityWrite) {
           await assertWikiHandoffWriteIntegrity({
             db: tx as Db,
@@ -12560,6 +12576,16 @@ export function issueService(
                 issueData.assigneeUserId !== undefined,
               currentAssigneeUserId: receiptExisting.assigneeUserId,
             },
+            ...(boardStageDecision === true
+              ? {
+                  boardStageDecision: {
+                    assigneeFieldWritten:
+                      issueData.assigneeAgentId !== undefined ||
+                      issueData.assigneeUserId !== undefined,
+                    currentAssigneeUserId: receiptExisting.assigneeUserId,
+                  },
+                }
+              : {}),
           });
         }
         if (
@@ -12592,20 +12618,24 @@ export function issueService(
             : Promise.resolve(new Map<string, IssueRelationSummaryMap>()),
         ]);
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, existing.companyId);
+        // SUP-24762: a field-less write sets no goal or project, so it resolves
+        // the goal from the locked row; the pre-lock read could be stale and
+        // would overwrite a goal another writer changed in between.
+        const goalSourceRow = fieldlessWrite ? receiptExisting : existing;
         const [currentProjectGoalId, nextProjectGoalId] = await Promise.all([
-          getProjectDefaultGoalId(tx, existing.companyId, existing.projectId),
+          getProjectDefaultGoalId(tx, existing.companyId, goalSourceRow.projectId),
           getProjectDefaultGoalId(
             tx,
             existing.companyId,
             issueData.projectId !== undefined
               ? issueData.projectId
-              : existing.projectId,
+              : goalSourceRow.projectId,
           ),
         ]);
 
         patch.goalId = resolveNextIssueGoalId({
-          currentProjectId: existing.projectId,
-          currentGoalId: existing.goalId,
+          currentProjectId: goalSourceRow.projectId,
+          currentGoalId: goalSourceRow.goalId,
           currentProjectGoalId,
           projectId: issueData.projectId,
           goalId: issueData.goalId,

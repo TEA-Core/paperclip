@@ -1,5 +1,6 @@
 import { and, desc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
+import { canonicalExecutionUuid, runBoundToIssue, runBoundToIssueId } from "./execution-identity.js";
 import { readProcessStartedAt } from "./hot-restart.js";
 
 // These adapters accept a conversation turn. Retrying a process or webhook can
@@ -68,8 +69,8 @@ export function conversationRecoveryActionPredicate() {
     sql`exists (
       select 1 from ${heartbeatRuns}
       where ${heartbeatRuns.companyId} = ${issueRecoveryActions.companyId}
-        and ${heartbeatRuns.id}::text = ${issueRecoveryActions.evidence}->>'runId'
-        and coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueRecoveryActions.sourceIssueId}::text
+        and ${heartbeatRuns.id} = ${canonicalExecutionUuid(sql`${issueRecoveryActions.evidence}->>'runId'`)}
+        and ${runBoundToIssue({ uuid: issueRecoveryActions.sourceIssueId, text: sql`${issueRecoveryActions.sourceIssueId}::text` })}
         and ${heartbeatRuns.runtimeMode} = 'legacy'
         and coalesce(${heartbeatRuns.resultJson}->>'workspaceRestoreFailure', '') <> 'restore_unsafe_archive'
         and ${inArray(heartbeatRuns.status, ['failed', 'timed_out', 'interrupted', 'cancelled'])}
@@ -104,11 +105,22 @@ export async function getConversationOwnershipBlocker(db: Db, companyId: string,
       and (${environmentLeases.releasedAt} is null
         or ${environmentLeases.status} = 'pending_cleanup'
         or ${environmentLeases.cleanupStatus} = 'failed'))`;
-  const candidates = await db.select({ run: heartbeatRuns, activeLease }).from(heartbeatRuns)
+  const candidates = await db.select({
+    // Only what the loop below probes and the blocker it returns; execution
+    // payloads (context, profile, result, usage) stay in storage.
+    run: {
+      id: heartbeatRuns.id,
+      agentId: heartbeatRuns.agentId,
+      processPid: heartbeatRuns.processPid,
+      processGroupId: heartbeatRuns.processGroupId,
+      processStartedAt: heartbeatRuns.processStartedAt,
+    },
+    activeLease,
+  }).from(heartbeatRuns)
     .where(and(
       eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.runtimeMode, "legacy"),
       conversationRunPredicate(),
-      sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueId}`,
+      runBoundToIssueId(issueId),
       inArray(heartbeatRuns.status, ["failed", "timed_out", "interrupted", "cancelled"]),
       or(isNotNull(heartbeatRuns.processPid), isNotNull(heartbeatRuns.processGroupId), activeLease),
     )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));

@@ -865,6 +865,43 @@ item. If every other present key is allowed bookkeeping, an explicit
 `executionPolicy: undefined` is dropped from the present-key check. The guard
 is skipped, while policy normalization writes `null`.
 
+The Wiki handoff guard is also skipped for a field-less write. In a field-less
+write, every present key is `undefined` or request attribution: `actorAgentId`,
+`actorRunId`, `actorRunStopId`, `actorUserId`, `boardApiKeyId`,
+`expectedUpdatedAt`. A comment-only `PATCH /api/issues/:id` is a field-less
+write when the route adds no field to it and the request carries no
+`reviewRequest` or `deliveryIdentity`; the PATCH route then skips its own guard
+call too. A field-less write sets no assignee, so the guard does not
+judge the stored assignee. Thus a comment on a Wiki handoff whose review stage
+a human reviewer holds (stored `assigneeAgentId` null) is not refused when the
+card is `in_review`, or `done` with its review stage complete. Known limit:
+when the card has another status while its review stage is still pending, for
+example `blocked`, or `todo` with a pending stage, the PATCH route adds fields
+to the write before the field-less check. The comment is then still refused
+with 422 `wiki_handoff_unassigned`. When the write carries any other key, the
+attribution keys still count as present keys. Thus an attributed `status` or
+`unblockDescriptor` write still runs the guard. In `issueService.update`, an
+`executionPolicy` key that comes with attribution keys is not field-less, even
+when its value is `undefined`, because the update normalizes that value to
+`null` and clears the stored policy. Thus an attributed
+`executionPolicy: undefined` write still runs the guard. A bare
+`executionPolicy: undefined` write, with no other present key, skips the guard
+and clears the stored policy, as the paragraph above states. That behavior
+predates the field-less skip, and the field-less skip does not change it.
+
+The board stage decision (`POST /issues/:id/execution-stage/board-decision`)
+can close the final stage of an unassigned Wiki handoff card. That hand-back
+has no return-to, so the route drops the no-op `assigneeAgentId: null` and
+`assigneeUserId: null` keys and marks the write with an internal
+`boardStageDecision` flag. The guard admits it only when the write carries no
+assignee key and the stored row has no agent and no user assignee. Any assignee
+write, including one naming the canonical Maintainer, and any owned row stay
+guarded as before. Only that route sets the flag. The plugin host forwards just
+the patch fields the plugin SDK declares for `issues.update`
+(`PluginIssueUpdatePatch`). It drops every other key, including the issue
+service's internal flags (`boardStageDecision`, `workflowControlledAssignment`,
+`companyGuard`, `expectedUpdatedAt`).
+
 The boundary is the write path. Per-card isolation is required for every
 startup sweep that writes issue rows through the guarded issue service
 (`issueService.update`), because the Wiki handoff guard and the other assignee
@@ -1491,6 +1528,20 @@ The board owns the recovery decision, not the source deliverable. Automatic reco
 An upgrade may encounter an already-active agent-owned recovery action. Paperclip keeps that record readable and resolvable for compatibility, but periodic reconciliation does not enqueue another takeover wake from it.
 
 Create an issue-backed recovery action only when a separate issue is the right execution object. In that fallback form, the source issue remains visible and is blocked on the recovery issue when blocking is necessary for correctness. The recovery owner must restore a live path, resolve the source issue manually, delegate real follow-up work, or record the reason the signal is a false positive.
+
+An exhausted-recovery card minted because the source cannot host a board monitor is `record_only`. It records the board decision and does not ship code, so it never inherits the source issue's `executionWorkspaceId` or settings, including a source workspace that failed validation and cannot be reused. The card keeps the source project for board context.
+
+Where it applies, the mint names the `agent_default` preference, which drops `projectWorkspaceId` instead of copying the source binding. A `projectWorkspaceId` is itself a workspace expectation: carrying it makes dispatch resolve a project checkout and fail the same validation. A card in the minted shape — `record_only`, no `executionWorkspaceId`, no `projectWorkspaceId`, `agent_default`, `stranded_issue_recovery` origin — is the ONLY shape exempt from the git-metadata check, because the resolved checkout is not a workspace the card is required to use. Dispatch never binds the realized checkout back onto such a card, so it keeps the no-binding shape after its owner wake, and that wake does not fail workspace validation. The exemption is decided by the shape alone: all five fields must match, and a card that differs in exactly one field keeps every workspace check. Every other `record_only` card, including one with a bound execution workspace or a checkout binding, keeps every workspace check.
+
+The exemption has stated limits. In these shapes a source checkout that is not a valid git checkout still fails the owner wake with `workspace_validation_failed`:
+
+- A project that isolates by default (policy `defaultMode: isolated_workspace`, or the instance-wide default-isolated setting). The card receives that default mode, and dispatch provisions the project checkout for it before the exempted adapter check runs.
+- A project whose policy sets `allowIssueOverride: false` while isolated workspaces are on. The write boundary refuses any explicit preference there, so the mint omits `agent_default`. The card is still minted and its owner is still woken, as before this change, but it carries the project default binding and is not exempt.
+- An instance with isolated workspaces off. The write boundary drops the explicit preference, so the card carries the project default binding and is not exempt.
+
+The exemption is decided by the card's fields, not by who created it. The public board, agent and plugin create paths cannot set `originKind`, but an internal `issueService.create` caller that builds the exact five-field shape gets the exemption.
+
+Ordinary parent-child workspace inheritance is unchanged. A lawful `reuse_existing` binding on a normal child still copies a live source workspace. At most one such card exists per recovery action.
 
 ### Human Escalation
 
