@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createDb, issues } from "@paperclipai/db";
+import { createDb, issueChildCarrierAttributions, issues } from "@paperclipai/db";
 import {
   classifyPullRequestLanding,
   createDoneCloseLandingBackstopService,
@@ -139,7 +139,10 @@ function makeDb(state: DbState) {
       if (cols === undefined) {
         return {
           from: (table: unknown) => ({
-            where: () => Promise.resolve(table === issues
+            // Child-carrier attribution lookup (`readCurrent`): this card has none.
+            where: () => table === issueChildCarrierAttributions
+              ? Object.assign(Promise.resolve([]), { limit: () => Promise.resolve([]) })
+              : Promise.resolve(table === issues
               ? [{
                   projectId: state.deliveryIdentity?.projectId ?? null,
                   projectWorkspaceId: state.deliveryIdentity?.projectWorkspaceId ?? null,
