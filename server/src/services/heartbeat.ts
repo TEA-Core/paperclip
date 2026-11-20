@@ -300,6 +300,7 @@ import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-ru
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
   findLiveIssueExecutionHolder,
+  ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS,
   listUnlockedIssuesWithDeferredWakesForRun,
   resolveLiveExecutionLeases,
   type LiveExecutionLease,
@@ -19194,6 +19195,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
+  // A running issue-less author past the silence bound no longer holds any
+  // card. Counting it keeps maxConcurrentRuns=1 from starting the wake the
+  // sweep just promoted, for as long as that run stays running. The run is
+  // left running: it may still have a live handle, and the no-output hard-stop
+  // is what terminalizes it.
+  async function countSlotOccupyingRunsForAgent(agentId: string) {
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.agentId, agentId),
+        eq(heartbeatRuns.status, "running"),
+        sql`not (
+          nullif(btrim(${heartbeatRuns.contextSnapshot} ->> 'issueId'), '') is null
+          and coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt})
+            <= clock_timestamp() - (${ISSUE_LESS_AUTHOR_HOLDER_SILENCE_BOUND_MS} * interval '1 millisecond')
+        )`,
+      ));
+    return Number(count ?? 0);
+  }
+
   async function withChatControlRecoveryGate(
     run: typeof heartbeatRuns.$inferSelect,
     stage: "claim" | "dispatch",
@@ -24045,7 +24067,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return [];
       }
       const policy = parseHeartbeatPolicy(agent);
-      const runningCount = await countRunningRunsForAgent(agentId);
+      const runningCount = await countSlotOccupyingRunsForAgent(agentId);
       const availableSlots = Math.max(
         0,
         policy.maxConcurrentRuns - runningCount,
@@ -31131,6 +31153,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       if (!issue) return null;
       if (issue.executionRunId && issue.executionRunId !== run.id) return null;
+      // SUP-20121: a promotion-only visit (author-finish linked cards, a
+      // lock-clear hook, the stale-lock sweep) must not promote a held wake
+      // onto a board-closed card. That promotion reopens the card to todo.
+      // The base never visits a card the finishing run did not hold by pointer
+      // or context, so the card stays closed and the wake stays deferred.
+      // A release that visits the card because the run's own context or lock
+      // names it is not promotion-only, and keeps the existing comment-reopen
+      // path.
+      if (promotionOnly && (issue.status === "done" || issue.status === "cancelled")) {
+        return null;
+      }
 
       // Workspace-validation recovery: if the finalizing run failed workspace
       // validation, surface the primary issue for the blocked-recovery comment path.

@@ -199,7 +199,8 @@ export async function findLiveIssueExecutionHolder(
  * longer carry an execution lock but still hold that agent's deferred wakes.
  * A status write clears the lock while the run is live, and the finishing
  * run's release would otherwise never visit the card, so these wakes are
- * promoted when the run finishes.
+ * promoted when the run finishes. A done or cancelled card is excluded: promoting
+ * a held wake onto it reopens the card, and the base leaves that card closed.
  */
 export async function listUnlockedIssuesWithDeferredWakesForRun(
   db: Pick<Db, "select">,
@@ -212,6 +213,7 @@ export async function listUnlockedIssuesWithDeferredWakesForRun(
       eq(issues.companyId, input.companyId),
       eq(issues.assigneeAgentId, input.agentId),
       isNull(issues.executionRunId),
+      notInArray(issues.status, ["done", "cancelled"]),
       runAuthoredIssueAssignment(input.runId),
       sql`exists (
         select 1 from ${agentWakeupRequests}

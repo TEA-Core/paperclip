@@ -9749,6 +9749,7 @@ export function recoveryService(
       .where(and(
         isNull(issues.executionRunId),
         isNull(issues.checkoutRunId),
+        notInArray(issues.status, ["done", "cancelled"]),
         sql`exists (
           select 1 from ${agentWakeupRequests}
           where ${agentWakeupRequests.companyId} = ${issues.companyId}

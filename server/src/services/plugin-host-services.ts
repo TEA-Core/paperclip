@@ -1950,21 +1950,15 @@ export function buildHostServices(
             ? pluginOperationIssueOriginKind(pluginKey)
             : originKind,
         );
-        // originRunId is ownership proof. A plugin only claims a run id; it
-        // does not authenticate it, so the claim is stored only when the
-        // recorded run belongs to the acting agent in this company. A claim
-        // naming another agent's run is dropped, never stored.
-        const claimedRunId = params.originRunId ?? actorRunId ?? null;
-        let verifiedOriginRunId: string | null = null;
-        if (claimedRunId && actorAgentId) {
-          const [claimedRun] = await db
-            .select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, companyId: heartbeatRuns.companyId })
-            .from(heartbeatRuns)
-            .where(eq(heartbeatRuns.id, claimedRunId));
-          if (claimedRun && claimedRun.companyId === companyId && claimedRun.agentId === actorAgentId) {
-            verifiedOriginRunId = claimedRunId;
-          }
-        }
+        // originRunId is ownership proof, and a plugin cannot mint it. The
+        // host holds no authenticated agent run for a plugin call: every
+        // actor field here is plugin-supplied, so a plugin can name any
+        // agent together with that agent's live run and pass a
+        // belongs-to-the-actor check on both supplied values. A
+        // plugin-supplied origin/actor run is therefore never stored as
+        // proof; only host-authenticated doors (agent/board run actors) may
+        // record an origin run.
+        const verifiedOriginRunId: string | null = null;
         const issue = (await issues.create(companyId, {
           ...(issueInput as any),
           originKind: normalizedOriginKind,
@@ -2004,6 +1998,9 @@ export function buildHostServices(
         for (const key of Object.keys(PLUGIN_ISSUE_UPDATE_PATCH_FIELDS)) {
           if (Object.hasOwn(rawPatch, key)) patch[key] = rawPatch[key];
         }
+        // originRunId is ownership proof. A plugin update can name any run,
+        // so the supplied value is never stored. Create refuses it the same way.
+        delete patch.originRunId;
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }

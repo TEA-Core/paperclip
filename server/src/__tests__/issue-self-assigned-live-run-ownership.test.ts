@@ -32,6 +32,7 @@ import { actorMiddleware } from "../middleware/auth.js";
 import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { findLiveIssueExecutionHolder } from "../services/issue-execution-lease.ts";
+import { issueService } from "../services/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -216,6 +217,76 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
       .send({ agentId: writerAgentId, expectedStatuses: ["in_progress"] });
     expect(checkout.status, JSON.stringify(checkout.body)).toBe(200);
     expect(await cardRow(issueId)).toMatchObject({ checkoutRunId: writerRunId, executionRunId: writerRunId });
+  });
+
+  it("a second run of the same agent cannot check out a card the live author holds (R6)", async () => {
+    const { companyId, writerAgentId, writerRunId } = await seed();
+    const writer = appFor(agentActor(companyId, writerAgentId, writerRunId));
+    const created = await request(writer)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Held checkout", status: "in_progress", assigneeAgentId: writerAgentId });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    const issueId = created.body.id as string;
+    await request(appFor(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Wake." });
+    await expectAuthorKeepsCard(issueId, writerAgentId, writerRunId);
+
+    // Base returned 200: no lock was stamped, so the second run adopted the
+    // card and locked the author out. The 409 is the hold. The author's own
+    // checkout stays 200 (covered above).
+    const intruderRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: intruderRunId,
+      companyId,
+      agentId: writerAgentId,
+      invocationSource: "assignment",
+      status: "running",
+      contextSnapshot: { issueId, wakeReason: "issue_comment_mentioned" },
+      startedAt: new Date(),
+    });
+    const intruder = appFor(agentActor(companyId, writerAgentId, intruderRunId));
+    const stolen = await request(intruder)
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId: writerAgentId, expectedStatuses: ["in_progress", "todo"] });
+    expect(stolen.status, JSON.stringify(stolen.body)).toBe(409);
+    expect((await cardRow(issueId)).checkoutRunId).not.toBe(intruderRunId);
+    expect((await cardRow(issueId)).executionRunId).toBe(writerRunId);
+  });
+
+  it("a hook-less release promotes a held wake on an open card and not on a closed one (J3)", async () => {
+    const open = await seedHeldCard({ authorStatus: "succeeded" });
+    runningProcesses.delete(open.writerRunId);
+    const released = await issueService(db).release(open.issueId);
+    expect(released?.status).toBe("todo");
+    await expectWakePromoted(open.issueId, open.writerAgentId, open.writerRunId, open.wakeId);
+
+    const closed = await seedHeldCard({ authorStatus: "succeeded" });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, closed.issueId));
+    runningProcesses.delete(closed.writerRunId);
+    const closedRelease = await issueService(db).release(closed.issueId);
+    expect(closedRelease?.status).toBe("done");
+    expect(await otherRunsForCard(closed.issueId, closed.writerAgentId, closed.writerRunId)).toHaveLength(0);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, closed.wakeId));
+    expect(wake?.status).toBe("deferred_issue_execution");
+  });
+
+  it("a 1-slot lapse admits the promoted successor while the silent author is still running", async () => {
+    const { writerAgentId, writerRunId, issueId } = await seedHeldCard({ authorStatus: "running" });
+    const staleAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await db.update(heartbeatRuns)
+      .set({ startedAt: staleAt, createdAt: staleAt, lastOutputAt: null })
+      .where(eq(heartbeatRuns.id, writerRunId));
+    runningProcesses.delete(writerRunId);
+
+    const result = await heartbeat.sweepStaleIssueLocks({ now: new Date() });
+    expect(result.cleared).toBeGreaterThan(0);
+    const successors = await otherRunsForCard(issueId, writerAgentId, writerRunId);
+    expect(successors).toHaveLength(1);
+    // The lapsed author is still status=running. It must not keep the only
+    // slot, or the promoted successor stays queued behind it.
+    expect(successors[0]?.status).not.toBe("queued");
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, writerRunId)))[0]?.status).toBe("running");
   });
 
   it("self-assign of a parked card from a run that holds no card: the assignment and monitor wakes wait behind it", async () => {
@@ -763,7 +834,7 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     await expectNoForgedHolder(companyId, issueId, forgedRunId);
   });
 
-  it.each(["done", "cancelled"] as const)("a held board comment is promoted when its card reaches a terminal status (%s)", async (terminalStatus) => {
+  it.each(["done", "cancelled"] as const)("a held board comment is not promoted onto a card that reaches a terminal status (%s)", async (terminalStatus) => {
     const { companyId, writerAgentId, writerRunId } = await seed();
     const writer = appFor(agentActor(companyId, writerAgentId, writerRunId));
     const created = await request(writer)
@@ -781,23 +852,23 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     expect(held).toHaveLength(1);
 
     // The author cancels its own card; a board user closes it (the done-tier
-    // guard needs a repository fixture this suite does not build).
+    // guard needs a repository fixture this suite does not build). Closing
+    // must not promote the held wake: that promotion reopens the card to todo.
+    // On the base the card stays closed, because no promotion path visits a
+    // card the author never held by pointer or context.
     const close = terminalStatus === "done"
       ? await request(appFor(boardActor(companyId))).patch(`/api/issues/${issueId}`).send({ status: terminalStatus, comment: "Closing." })
       : await request(writer).patch(`/api/issues/${issueId}`).send({ status: terminalStatus });
     expect(close.status, JSON.stringify(close.body)).toBe(200);
+    await sleep(WAKE_SETTLE_MS);
 
-    await vi.waitFor(
-      async () => {
-        expect(await otherRunsForCard(issueId, writerAgentId, writerRunId)).toHaveLength(1);
-      },
-      { timeout: WAKE_SETTLE_MS * 2, interval: 50 },
-    );
+    expect((await cardRow(issueId)).status).toBe(terminalStatus);
+    expect(await otherRunsForCard(issueId, writerAgentId, writerRunId)).toHaveLength(0);
     const wakes = await wakesForCard(issueId, writerAgentId);
-    expect(wakes.map((wake) => wake.status)).not.toContain("deferred_issue_execution");
+    expect(wakes.map((wake) => wake.status)).toContain("deferred_issue_execution");
   });
 
-  it("a held wake on a card closed outside the update route is promoted when the author finishes", async () => {
+  it("a held wake on a card closed outside the update route stays deferred when the author finishes", async () => {
     const { companyId, writerAgentId, writerRunId } = await seed();
     const writer = appFor(agentActor(companyId, writerAgentId, writerRunId));
     const created = await request(writer)
@@ -812,6 +883,8 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     await expectAuthorKeepsCard(issueId, writerAgentId, writerRunId);
 
     // The card reaches done without the route update promotion (a direct write).
+    // The author-finish path must not visit it: promoting the held wake would
+    // reopen the closed card.
     await db.update(issues)
       .set({ status: "done", executionRunId: null, executionAgentNameKey: null, executionLockedAt: null })
       .where(eq(issues.id, issueId));
@@ -821,9 +894,43 @@ describeEmbeddedPostgres("SUP-20121 a self-assigning live run keeps its card", (
     const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, writerRunId));
     await heartbeat.releaseIssueExecutionAndPromote(finished!, { suppressImmediateRecovery: true });
 
-    expect(await otherRunsForCard(issueId, writerAgentId, writerRunId)).toHaveLength(1);
+    expect((await cardRow(issueId)).status).toBe("done");
+    expect(await otherRunsForCard(issueId, writerAgentId, writerRunId)).toHaveLength(0);
     const wakes = await wakesForCard(issueId, writerAgentId);
-    expect(wakes.map((wake) => wake.status)).not.toContain("deferred_issue_execution");
+    expect(wakes.map((wake) => wake.status)).toContain("deferred_issue_execution");
+  });
+
+  it("a held wake is not promoted onto a board-closed card when the author finishes (J11)", async () => {
+    const { companyId, writerAgentId, writerRunId } = await seed();
+    const writer = appFor(agentActor(companyId, writerAgentId, writerRunId));
+    const created = await request(writer)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Closed while held", status: "in_progress", assigneeAgentId: writerAgentId });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    const issueId = created.body.id as string;
+    const comment = await request(appFor(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Board follow-up." });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+    await expectAuthorKeepsCard(issueId, writerAgentId, writerRunId);
+
+    // The board closes the card while the author run is still live; the
+    // author then finishes. The held wake must not reopen the closed card:
+    // on the base the card simply stays closed, because no promotion path
+    // visits a card its author never held by pointer or context.
+    await db.update(issues)
+      .set({ status: "done", executionRunId: null, executionAgentNameKey: null, executionLockedAt: null })
+      .where(eq(issues.id, issueId));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, writerRunId));
+    runningProcesses.delete(writerRunId);
+    const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, writerRunId));
+    await heartbeat.releaseIssueExecutionAndPromote(finished!, { suppressImmediateRecovery: true });
+
+    expect((await cardRow(issueId)).status).toBe("done");
+    expect(await otherRunsForCard(issueId, writerAgentId, writerRunId)).toHaveLength(0);
+    const wakes = await wakesForCard(issueId, writerAgentId);
+    expect(wakes.map((wake) => wake.status)).toContain("deferred_issue_execution");
   });
 
   it("the stale-lock sweep promotes wakes on unlocked authored cards when it terminalizes a dead author", async () => {

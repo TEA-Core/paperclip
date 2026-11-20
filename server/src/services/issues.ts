@@ -7436,15 +7436,38 @@ export function issueService(
 
   async function notifyExecutionLockCleared(companyId: string, issueId: string, runId: string | null) {
     if (!opts.onExecutionLockCleared || !runId) return;
-    const run = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null);
-    if (!run) return;
-    await opts.onExecutionLockCleared({ companyId, issueId, run }).catch((err) => {
+    // The lock clear has already committed. A lookup or callback failure must
+    // not reject release, force-release, or update: the caller would report
+    // an error for a write that succeeded.
+    try {
+      const run = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      if (!run) return;
+      await opts.onExecutionLockCleared({ companyId, issueId, run });
+    } catch (err) {
       logger.error({ err, issueId, runId }, "failed to promote wakes after an execution lock was cleared");
-    });
+    }
+  }
+
+  // release and adminForceRelease clear the lock without the update path's
+  // post-commit action. With no route hook, the held wake waited for the next
+  // sweep. Promote it here, except on a closed card, which must stay closed.
+  async function promoteClearedLockWithoutHook(
+    companyId: string,
+    issueId: string,
+    runId: string | null,
+    resultingStatus: string,
+  ) {
+    if (!runId || opts.onExecutionLockCleared) return;
+    if (resultingStatus === "done" || resultingStatus === "cancelled") return;
+    await executeIssuePostCommitActions(db, [{
+      type: "promote_deferred_wakes",
+      runId,
+      issueId,
+    }]);
   }
 
   function provisionalTitleFromDescription(description: string) {
@@ -12494,6 +12517,11 @@ export function issueService(
         patch.executionLockedAt = null;
       }
 
+      // The promotion decision must use the row this transaction locks, not
+      // the pre-transaction read. A lock that appears between those reads is
+      // still cleared by the write, and the held wake must be promoted.
+      const clearedExecutionRunId: { value: string | null } = { value: null };
+
       const runUpdate = async (tx: any) => {
         // The receipt baseline must be read under the same row lock as the
         // write. Otherwise a concurrent update can be mistaken for a change
@@ -13116,6 +13144,9 @@ export function issueService(
             },
           }, activityPublications);
         }
+        if (receiptExisting.executionRunId && !updated.executionRunId) {
+          clearedExecutionRunId.value = receiptExisting.executionRunId;
+        }
         return {
           ...enriched,
           ...(nextBlockedByIssueIds !== undefined
@@ -13128,9 +13159,15 @@ export function issueService(
       const result = await (!isTransactionHandle(dbOrTx)
         ? db.transaction(runUpdate)
         : runUpdate(dbOrTx));
-      if (result && existing.executionRunId && !result.executionRunId) {
+      const promotedRunId = clearedExecutionRunId.value;
+      if (
+        result &&
+        promotedRunId &&
+        result.status !== "done" &&
+        result.status !== "cancelled"
+      ) {
         if (!isTransactionHandle(dbOrTx)) {
-          await notifyExecutionLockCleared(existing.companyId, id, existing.executionRunId);
+          await notifyExecutionLockCleared(existing.companyId, id, promotedRunId);
           // Callers that construct the service without the route's hook
           // (heartbeat-internal, channel and plugin writes) still promote
           // the wakes held behind the cleared lock, through the same
@@ -13139,14 +13176,14 @@ export function issueService(
           if (!opts.onExecutionLockCleared) {
             queuedPostCommitActions.push({
               type: "promote_deferred_wakes",
-              runId: existing.executionRunId,
+              runId: promotedRunId,
               issueId: id,
             });
           }
         } else if (postCommitActions) {
           postCommitActions.push({
             type: "promote_deferred_wakes",
-            runId: existing.executionRunId,
+            runId: promotedRunId,
             issueId: id,
           });
         }
@@ -13902,7 +13939,15 @@ export function issueService(
         const [enriched] = await withIssueLabels(tx, [updated]);
         return enriched;
       });
-      if (clearedLock.value) await notifyExecutionLockCleared(clearedLock.value.companyId, id, clearedLock.value.runId);
+      if (clearedLock.value && released) {
+        await notifyExecutionLockCleared(clearedLock.value.companyId, id, clearedLock.value.runId);
+        await promoteClearedLockWithoutHook(
+          clearedLock.value.companyId,
+          id,
+          clearedLock.value.runId,
+          released.status,
+        );
+      }
       return released;
     },
 
@@ -13954,10 +13999,13 @@ export function issueService(
         };
       });
       if (forced) {
-        await notifyExecutionLockCleared(
+        const clearedRunId = forced.previous.executionRunId ?? forced.previous.checkoutRunId;
+        await notifyExecutionLockCleared(forced.issue.companyId, id, clearedRunId);
+        await promoteClearedLockWithoutHook(
           forced.issue.companyId,
           id,
-          forced.previous.executionRunId ?? forced.previous.checkoutRunId,
+          clearedRunId,
+          forced.issue.status,
         );
       }
       return forced;
