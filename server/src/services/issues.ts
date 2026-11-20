@@ -258,7 +258,7 @@ import {
   type IssueLivenessFinding,
 } from "./recovery/issue-graph-liveness.js";
 import { USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS } from "./issue-interaction-kinds.js";
-import { visibleIssueCondition } from "./issue-visibility.js";
+import { includeHiddenIssueCondition, visibleIssueCondition } from "./issue-visibility.js";
 import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 import { finalizeSummarySlotsForTerminalIssue, hasSummaryGenerationToken } from "./summary-slot-finalization.js";
 import {
@@ -8811,7 +8811,7 @@ export function issueService(db: Db) {
 
       const conditions = [
         eq(issues.companyId, companyId),
-        filters?.includeHidden === true ? isNull(issues.harnessKind) : visibleIssueCondition(),
+        filters?.includeHidden === true ? includeHiddenIssueCondition() : visibleIssueCondition(),
       ];
       if (filters?.ids) conditions.push(inArray(issues.id, [...filters.ids]));
       if (filters?.identifiers) conditions.push(inArray(issues.identifier, [...filters.identifiers]));
@@ -9166,7 +9166,7 @@ export function issueService(db: Db) {
 
       const conditions = [
         eq(issues.companyId, companyId),
-        filters?.includeHidden === true ? isNull(issues.harnessKind) : visibleIssueCondition(),
+        filters?.includeHidden === true ? includeHiddenIssueCondition() : visibleIssueCondition(),
       ];
       if (!filters?.q?.trim()) {
         conditions.push(isNull(issues.conversationAgentId));
