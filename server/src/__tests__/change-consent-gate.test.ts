@@ -18,6 +18,7 @@ import {
 import {
   agentInstructionsChangeTargetKey,
   changeConsentGateService,
+  redeemConsumedChangeConsent,
   skillChangeTargetKey,
 } from "../services/change-consent-gate.js";
 
@@ -166,7 +167,7 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
       actorAgentId: coachId,
       actorRunId,
       targetKeys: [targetKey],
-    })).resolves.toBe(true);
+    })).resolves.toEqual({ interactionId });
 
     const [stored] = await db
       .select({ result: issueThreadInteractions.result })
@@ -208,7 +209,7 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
       actorAgentId: coachId,
       actorRunId: randomUUID(),
       targetKeys: [targetKey],
-    })).resolves.toBe(true);
+    })).resolves.toMatchObject({ interactionId: expect.any(String) });
 
     await expect(changeConsentGateService(db).assertConsented({
       companyId,
@@ -248,7 +249,7 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
       actorAgentId: coachId,
       actorRunId: randomUUID(),
       targetKeys: [targetKey],
-    })).resolves.toBe(true);
+    })).resolves.toMatchObject({ interactionId: expect.any(String) });
   });
 
   it("rejects an instruction-bundle apply when the accepted confirmation names no adoption carrier", async () => {
@@ -393,7 +394,7 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
       actorAgentId: coachId,
       actorRunId,
       targetKeys: [targetKey],
-    })).resolves.toBe(true);
+    })).resolves.toMatchObject({ interactionId: expect.any(String) });
 
     const [stored] = await db
       .select({ result: issueThreadInteractions.result })
@@ -404,6 +405,51 @@ describeEmbeddedPostgres("changeConsentGateService", () => {
       outcome: "accepted",
       version: 1,
     });
+  });
+
+  // A consumed-consent receipt stands in for a second consumption only for the
+  // company, actor and run that consumed it. Each case changes one binding.
+  it.each([
+    ["another actor", { actorAgentId: randomUUID() }],
+    ["another run", { actorRunId: randomUUID() }],
+    ["another company", { companyId: randomUUID() }],
+  ])("refuses to redeem a consumed-consent receipt for %s", async (_label, change) => {
+    const { companyId, coachId, sourceRunId, proposalIssueId, targetKey } = await seedGateFixture();
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId: proposalIssueId,
+      kind: "request_confirmation",
+      status: "accepted",
+      continuationPolicy: "wake_assignee_on_accept",
+      sourceRunId,
+      createdByAgentId: coachId,
+      payload: {
+        version: 1,
+        prompt: "Apply this Reflection Coach skill diff?",
+        detailsMarkdown: "```diff\n+Tighten the workflow.\n```",
+        target: { type: "custom", key: targetKey, revisionId: "proposal-v1" },
+      },
+      result: { version: 1, outcome: "accepted" },
+      resolvedByUserId: "board-user",
+      resolvedAt: new Date(),
+    });
+    const actorRunId = randomUUID();
+    const consent = await changeConsentGateService(db).assertConsented({
+      companyId,
+      actorAgentId: coachId,
+      actorRunId,
+      targetKeys: [targetKey],
+    });
+    expect(consent).not.toBeNull();
+
+    expect(redeemConsumedChangeConsent(consent!, {
+      companyId,
+      actorAgentId: coachId,
+      actorRunId,
+      targetKey,
+      ...change,
+    })).toBe(false);
   });
 });
 
