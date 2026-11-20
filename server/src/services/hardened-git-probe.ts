@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { constants as fsConstants, createWriteStream, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { type FileHandle, lstat, mkdir, mkdtemp, open, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -500,12 +501,13 @@ async function listIndexEntries(
   return entries;
 }
 
-async function snapshotStatusIsDirty(
+/** `status --porcelain=v1 -z --untracked-files=all` through the snapshot git dir, one entry per NUL-separated record. */
+async function snapshotStatusRecords(
   snapshotGitDir: string,
   workTree: string,
   ignoreSubmodules: "all" | "dirty",
   options: HardenedGitOptions,
-): Promise<boolean> {
+): Promise<string[]> {
   const raw = await runHardenedGit(
     [
       "-C", workTree, `--git-dir=${snapshotGitDir}`, `--work-tree=${workTree}`,
@@ -513,7 +515,7 @@ async function snapshotStatusIsDirty(
     ],
     options,
   );
-  return raw.split("\0").some((record) => record.length > 0);
+  return raw.split("\0").filter((record) => record.length > 0);
 }
 
 /**
@@ -737,13 +739,70 @@ export type NoRepositoryWorktreeProbeResult =
     }
   | { ok: false; reason: string };
 
-function refuse(reason: string): NoRepositoryWorktreeProbeResult {
+function refuse(reason: string): { ok: false; reason: string } {
   return { ok: false, reason };
 }
 
 type CleanWorktreeVerdict =
   | { ok: true; branch: string; headSha: string }
   | { ok: false; reason: string };
+
+/** Why the path is not a plain, full-history Git work tree; null when it is one. */
+async function worktreeShapeRefusal(worktreePath: string, options: HardenedGitOptions): Promise<string | null> {
+  let flags: string[];
+  try {
+    flags = (await runHardenedGit(
+      [
+        "-C", worktreePath, "rev-parse",
+        "--is-bare-repository", "--is-inside-git-dir", "--is-inside-work-tree", "--is-shallow-repository",
+      ],
+      options,
+    )).split("\n").filter((line) => line.length > 0);
+  } catch {
+    return "is not a Git work tree";
+  }
+  if (flags.length !== 4) return "could not be identified as a Git work tree";
+  if (flags[0] !== "false") return "is a bare repository";
+  if (flags[1] !== "false") return "is inside a Git directory";
+  if (flags[2] !== "true") return "is not a Git work tree";
+  if (flags[3] !== "false") return "is a shallow clone";
+  return null;
+}
+
+/** Info/exclude rules other than the one the server writes: they can hide untracked work from status. */
+function hasForeignExcludeRules(exclude: string | null): boolean {
+  return (
+    exclude !== null &&
+    exclude.split(/\r?\n/).some((line) => {
+      const trimmed = line.trim();
+      return trimmed.length > 0 && !trimmed.startsWith("#") && trimmed !== PROJECT_REPOSITORIES_EXCLUDE_LINE;
+    })
+  );
+}
+
+/** Why an index entry hides or blocks a status check; null for a plain stage-0 tracked file. */
+function indexEntryRefusal(entry: IndexEntry): string | null {
+  if (entry.stage !== "0") return "has unmerged index entries";
+  if (entry.tag === "S") return "has skip-worktree index entries";
+  if (entry.tag !== "H") return "has assume-unchanged index entries";
+  if (entry.mode === "160000") return "has submodules";
+  return null;
+}
+
+/**
+ * Why the repository's stash is not provably empty; null only when
+ * `refs/stash` is confirmed absent. Any object there (not only a commit)
+ * refuses, and so does a failed read.
+ */
+async function stashRefusal(worktreePath: string, options: HardenedGitOptions): Promise<string | null> {
+  let stash: string;
+  try {
+    stash = (await runHardenedGit(["-C", worktreePath, "for-each-ref", "--format=%(objectname)", "refs/stash"], options)).trim();
+  } catch {
+    return "has a stash that could not be read (refs/stash)";
+  }
+  return stash.length > 0 ? "has a stash of uncommitted work (refs/stash)" : null;
+}
 
 /**
  * Identity, configuration, index and status checks for one linked worktree of
@@ -756,23 +815,8 @@ async function verifyCleanLinkedWorktree(
   options: HardenedGitOptions,
 ): Promise<CleanWorktreeVerdict> {
   const worktreeOptions: HardenedGitOptions = { ...options, ceilingDirectory: path.dirname(worktreePath) };
-  let flags: string[];
-  try {
-    flags = (await runHardenedGit(
-      [
-        "-C", worktreePath, "rev-parse",
-        "--is-bare-repository", "--is-inside-git-dir", "--is-inside-work-tree", "--is-shallow-repository",
-      ],
-      worktreeOptions,
-    )).split("\n").filter((line) => line.length > 0);
-  } catch {
-    return { ok: false, reason: "is not a Git work tree" };
-  }
-  if (flags.length !== 4) return { ok: false, reason: "could not be identified as a Git work tree" };
-  if (flags[0] !== "false") return { ok: false, reason: "is a bare repository" };
-  if (flags[1] !== "false") return { ok: false, reason: "is inside a Git directory" };
-  if (flags[2] !== "true") return { ok: false, reason: "is not a Git work tree" };
-  if (flags[3] !== "false") return { ok: false, reason: "is a shallow clone" };
+  const shapeRefusal = await worktreeShapeRefusal(worktreePath, worktreeOptions);
+  if (shapeRefusal) return { ok: false, reason: shapeRefusal };
 
   let identity: WorktreeIdentity;
   try {
@@ -798,6 +842,8 @@ async function verifyCleanLinkedWorktree(
   if (await lstat(path.join(identity.gitDir, "index.lock")).then(() => true, () => false)) {
     return { ok: false, reason: "has a Git operation in progress (index.lock is present)" };
   }
+  const stash = await stashRefusal(worktreePath, worktreeOptions);
+  if (stash) return { ok: false, reason: stash };
   let exclude: string | null;
   try {
     exclude = await readOptionalRegularFile(path.join(identity.commonDir, "info", "exclude"), MAX_EXCLUDE_FILE_BYTES);
@@ -813,13 +859,11 @@ async function verifyCleanLinkedWorktree(
       async (snapshot) => {
         const trackedPaths = new Set<string>();
         for (const entry of await listIndexEntries(snapshot, worktreePath, worktreeOptions)) {
-          if (entry.stage !== "0") return "has unmerged index entries";
-          if (entry.tag === "S") return "has skip-worktree index entries";
-          if (entry.tag !== "H") return "has assume-unchanged index entries";
-          if (entry.mode === "160000") return "has submodules";
+          const entryRefusal = indexEntryRefusal(entry);
+          if (entryRefusal) return entryRefusal;
           trackedPaths.add(entry.path);
         }
-        if (await snapshotStatusIsDirty(snapshot, worktreePath, "all", worktreeOptions)) {
+        if ((await snapshotStatusRecords(snapshot, worktreePath, "all", worktreeOptions)).length > 0) {
           return "has uncommitted changes (modified, staged or untracked)";
         }
         const ignored = await firstDisallowedIgnoredEntry(snapshot, worktreePath, trackedPaths, worktreeOptions);
@@ -1014,34 +1058,438 @@ const IN_TRANSACTION_RECHECK_BUDGET_MS = 15_000;
 /**
  * The status write's re-check, inside its transaction: the measured worktree
  * must still be clean (index, status, ignored entries) on the measured branch
- * and commit. One worktree, no GitHub call, and one shared 15 s budget for
- * every Git process and the snapshot copy bounds how long it can hold the
- * issue row; the budget running out refuses with a distinct "timed out"
- * reason, never "status could not be verified".
+ * and commit. With `siblings` (the zero-delta close), the branches the sibling
+ * scan read must also be unchanged and every other worktree on a branch naming
+ * the card still clean. No GitHub call, and one shared 15 s budget for every
+ * Git process and the snapshot copy bounds how long it can hold the issue row;
+ * the budget running out refuses with a distinct "timed out" reason, never
+ * "status could not be verified".
  */
 export async function recheckRecordedWorktree(input: {
   worktreePath: string;
   commonDir: string;
   branch: string;
   headSha: string;
+  siblings?: { issueIdentifier: string; refsDigest: string };
   budgetMs?: number;
 }): Promise<{ ok: true } | { ok: false; reason: string }> {
   if (!resolveTrustedGitBinary()) return { ok: false, reason: "no root-owned git binary is installed at a fixed system path" };
   const budgetMs = input.budgetMs ?? IN_TRANSACTION_RECHECK_BUDGET_MS;
   const deadline: ProbeDeadline = { at: Date.now() + budgetMs, expired: false };
-  const verdict = await verifyCleanLinkedWorktree(input.worktreePath, input.commonDir, {
-    cwd: path.dirname(input.commonDir),
-    deadline,
-  });
-  if (deadline.expired) {
-    return {
-      ok: false,
-      reason: `the recorded worktree could not be re-checked within ${budgetMs} ms (timed out at the close write)`,
-    };
-  }
+  const repoRoot = path.dirname(input.commonDir);
+  const options: HardenedGitOptions = { cwd: repoRoot, deadline };
+  const timedOut = {
+    ok: false as const,
+    reason: `the recorded worktree could not be re-checked within ${budgetMs} ms (timed out at the close write)`,
+  };
+  const verdict = await verifyCleanLinkedWorktree(input.worktreePath, input.commonDir, options);
+  if (deadline.expired) return timedOut;
   if (!verdict.ok) return { ok: false, reason: `the recorded worktree ${verdict.reason}` };
   if (verdict.branch !== input.branch || verdict.headSha !== input.headSha) {
     return { ok: false, reason: "the recorded worktree's HEAD moved after the close was measured" };
   }
-  return { ok: true };
+  if (!input.siblings) return { ok: true };
+  const { issueIdentifier, refsDigest } = input.siblings;
+  let siblingRefusal: string | null;
+  try {
+    siblingRefusal = siblingRefsDigest(await readSiblingRefs(repoRoot, options), issueIdentifier) !== refsDigest
+      ? "the repository's branches changed after the close was measured"
+      : await siblingWorktreeRefusal(issueIdentifier, {
+        repoRoot,
+        commonDir: input.commonDir,
+        worktreePath: input.worktreePath,
+        options,
+      });
+  } catch {
+    siblingRefusal = "the repository's other branches and worktrees could not be re-checked";
+  }
+  if (deadline.expired) return timedOut;
+  return siblingRefusal ? { ok: false, reason: siblingRefusal } : { ok: true };
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// SUP-24402: the zero-delta repository_delivery close. A routine cycle card
+// classified repository_delivery whose own branch carries no change has no
+// pull request and no merge commit, so the Tier 2 merge-head proof has nothing
+// to compare with. The guard accepts that close only when, among its other
+// proofs, this probe measures the card's own recorded worktree on the card's
+// recorded branch and finds:
+//   - `rev-list --count <base>..<HEAD>` printing exactly 0;
+//   - `merge-base --is-ancestor <HEAD> <base>` exiting 0;
+//   - `status --porcelain=v1 --untracked-files=all` printing nothing;
+// where <base> is `refs/remotes/origin/<base branch>`. Every git process runs
+// under the hardened runner, and status runs through the snapshot git dir, so
+// no repository-local configuration (a filter driver, fsmonitor, hooks) runs
+// or reshapes what status reports. Index flags that hide a modification from
+// status (assume-unchanged, skip-worktree), unmerged entries, submodules, an
+// in-progress git operation and info/exclude rules the server did not write
+// all refuse, because each leaves an empty status unproven. Any git failure,
+// unparseable output or missing ref refuses. The base ref is read from the
+// worktree's own refs, which an agent can write, so the caller also compares
+// HEAD with the base branch on the remote.
+// ───────────────────────────────────────────────────────────────────────
+
+export interface ZeroDeltaWorktreeProbeInput {
+  /** Path recorded on the card's own execution workspace row (`providerRef ?? cwd`, not agent-writable). */
+  recordedWorktreePath: string;
+  /** `<instanceRoot>/projects/<companyId>/<projectId>`, derived from server env and immutable ids. */
+  managedProjectRoot: string;
+  /** Branch recorded on that row (`branchName`, not agent-writable). */
+  branch: string;
+  /** The base branch name, normalized; measured as `refs/remotes/origin/<baseBranch>`. */
+  baseBranch: string;
+  issueIdentifier: string;
+  /** The project's own branches: their local branches carry no card's work. */
+  projectBranches: ReadonlySet<string>;
+  /** Branch names registered to ANOTHER issue's execution workspace in this company and project. */
+  attributedBranches: ReadonlySet<string>;
+  /** Which of `candidates` are the identifier of an existing issue of this company other than this card. */
+  existingOtherCardIdentifiers: (candidates: readonly string[]) => Promise<ReadonlySet<string>>;
+  /**
+   * Commits `sha` carries beyond the base branch, measured on the remote (a
+   * source the agent cannot write). Throws when it cannot be measured.
+   */
+  countCommitsAheadOfBase: (sha: string) => Promise<number>;
+  timeoutMs?: number;
+}
+
+/** What the three base and status commands answered. */
+export interface ZeroDeltaWorktreeMeasurement {
+  /** `rev-list --count <base>..<HEAD>` standard output, verbatim. */
+  aheadCountOutput: string;
+  /** True only when `merge-base --is-ancestor <HEAD> <base>` exited 0. */
+  headIsAncestorOfBase: boolean;
+  /** `status --porcelain=v1 -z --untracked-files=all` records. */
+  statusRecords: readonly string[];
+}
+
+export type ZeroDeltaWorktreeProbeResult =
+  | {
+      ok: true;
+      worktreePath: string;
+      commonDir: string;
+      branch: string;
+      headSha: string;
+      baseRef: string;
+      baseSha: string;
+      /** Digest of the branches the sibling scan read (see siblingRefsDigest); the close write requires it unchanged. */
+      refsDigest: string;
+    }
+  | { ok: false; reason: string };
+
+/**
+ * Why a measurement is not zero-delta; null when every clause holds. Each
+ * clause is checked on its own, so an inconsistent answer (a zero count with
+ * a failed ancestry check) still refuses.
+ */
+export function zeroDeltaWorktreeRefusal(measurement: ZeroDeltaWorktreeMeasurement, baseRef: string): string | null {
+  const aheadOutput = measurement.aheadCountOutput.trim();
+  if (!/^\d+$/.test(aheadOutput)) return `printed no commit count for ${baseRef}..HEAD`;
+  if (aheadOutput !== "0") return `has ${aheadOutput} commit(s) on HEAD that ${baseRef} lacks`;
+  if (!measurement.headIsAncestorOfBase) return `has a HEAD that is not an ancestor of ${baseRef}`;
+  if (measurement.statusRecords.some((record) => !record.startsWith("?? "))) {
+    return "has uncommitted changes to tracked files";
+  }
+  if (measurement.statusRecords.length > 0) return "has untracked files";
+  return null;
+}
+
+interface SiblingRef {
+  sha: string;
+  refname: string;
+}
+
+async function readSiblingRefs(repoRoot: string, options: HardenedGitOptions): Promise<SiblingRef[]> {
+  return (await runHardenedGit(
+    ["-C", repoRoot, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/remotes/"],
+    options,
+  )).split("\n").filter((line) => line.length > 0).map((line) => {
+    const space = line.indexOf(" ");
+    return { sha: line.slice(0, space), refname: line.slice(space + 1) };
+  });
+}
+
+/**
+ * Digest of what the sibling scan's branch verdicts rest on: every local
+ * branch, and every remote-tracking branch naming the card. Remote-tracking
+ * branches of other cards and the base are left out, so a routine fetch by
+ * another card does not refuse this close.
+ */
+function siblingRefsDigest(refs: readonly SiblingRef[], issueIdentifier: string): string {
+  const hash = createHash("sha256");
+  for (const ref of refs) {
+    if (ref.refname.startsWith("refs/remotes/")) {
+      const remoteRef = ref.refname.slice("refs/remotes/".length);
+      if (!branchNamesIssue(remoteRef.slice(remoteRef.indexOf("/") + 1), issueIdentifier)) continue;
+    }
+    hash.update(`${ref.sha} ${ref.refname}\n`);
+  }
+  return hash.digest("hex");
+}
+
+/**
+ * Every other worktree on a branch naming the card must be clean, and no
+ * other worktree may have a detached HEAD. Run by the measurement and again
+ * inside the close write, where a worktree can be added on an existing branch
+ * without moving any ref.
+ */
+async function siblingWorktreeRefusal(
+  issueIdentifier: string,
+  ctx: { repoRoot: string; commonDir: string; worktreePath: string; options: HardenedGitOptions },
+): Promise<string | null> {
+  const { repoRoot, commonDir, worktreePath, options } = ctx;
+  const worktreeRecords = (await runHardenedGit(["-C", repoRoot, "worktree", "list", "--porcelain", "-z"], options))
+    .split("\0\0")
+    .map((record) => record.split("\0").filter((field) => field.length > 0))
+    .filter((fields) => fields.length > 0);
+  for (const fields of worktreeRecords) {
+    const worktreeField = fields.find((field) => field.startsWith("worktree "));
+    const branchField = fields.find((field) => field.startsWith("branch refs/heads/"));
+    if (!worktreeField) continue;
+    if (!branchField) {
+      let detachedPath: string;
+      try {
+        detachedPath = await realpath(worktreeField.slice("worktree ".length));
+      } catch {
+        continue;
+      }
+      if (detachedPath === worktreePath) continue;
+      return `another worktree at ${detachedPath} has a detached HEAD`;
+    }
+    const branch = branchField.slice("branch refs/heads/".length);
+    if (!branchNamesIssue(branch, issueIdentifier)) continue;
+    let otherPath: string;
+    try {
+      otherPath = await realpath(worktreeField.slice("worktree ".length));
+    } catch {
+      continue;
+    }
+    if (otherPath === worktreePath) continue;
+    const other = await verifyCleanLinkedWorktree(otherPath, commonDir, options);
+    if (!other.ok) return `another worktree on branch ${branch} ${other.reason}`;
+  }
+  return null;
+}
+
+/**
+ * The no-repository probe's sibling scans: every other branch naming this
+ * card must be level with the base, every other local branch must belong to
+ * a card (a project branch, another card's registered branch, or another
+ * existing card's rescue branch), every remote-tracking branch naming this
+ * card must be level, and every other worktree on a branch naming this card
+ * must be clean. A worktree with a detached HEAD refuses. Branch tips are
+ * compared by the caller against the remote base, never against a local
+ * tracking ref an agent can move, each distinct tip once and at most
+ * MAX_COMPARED_TIPS of them counting the recorded HEAD; the branch and
+ * worktree lists themselves read refs an agent can write, so they are
+ * advisory next to that anchor.
+ */
+async function zeroDeltaSiblingRefusal(
+  input: ZeroDeltaWorktreeProbeInput,
+  refs: readonly SiblingRef[],
+  ctx: {
+    repoRoot: string;
+    commonDir: string;
+    worktreePath: string;
+    headSha: string;
+    options: HardenedGitOptions;
+  },
+): Promise<string | null> {
+  const checkedTips = new Set<string>([ctx.headSha]);
+  const tipRefusal = async (subject: string, sha: string): Promise<string | null> => {
+    if (checkedTips.has(sha)) return null;
+    if (checkedTips.size >= MAX_COMPARED_TIPS) {
+      return (
+        `too_many_branch_tips: the recorded worktree and the branches naming this issue have more than ` +
+        `${MAX_COMPARED_TIPS} distinct tips to compare with the base branch`
+      );
+    }
+    checkedTips.add(sha);
+    return aheadOfBaseRefusal(subject, sha, input.countCommitsAheadOfBase);
+  };
+  const localBranches = refs
+    .filter((ref) => ref.refname.startsWith("refs/heads/"))
+    .map((ref) => ({ sha: ref.sha, name: ref.refname.slice("refs/heads/".length) }));
+  const rescueOwners = [...new Set(localBranches.flatMap(({ name }) => {
+    const owner = branchNamesIssue(name, input.issueIdentifier) ? null : rescueBranchOwner(name);
+    return owner === null ? [] : [owner];
+  }))];
+  const rescuedCards = rescueOwners.length > 0 ? await input.existingOtherCardIdentifiers(rescueOwners) : new Set<string>();
+  for (const { sha, name } of localBranches) {
+    if (!SHA_RE.test(sha) || name === input.branch) continue;
+    if (branchNamesIssue(name, input.issueIdentifier)) {
+      const refusal = await tipRefusal(`branch ${name}`, sha);
+      if (refusal) return refusal;
+      continue;
+    }
+    const rescueOwner = rescueBranchOwner(name);
+    if (
+      input.projectBranches.has(name) ||
+      input.attributedBranches.has(name) ||
+      (rescueOwner !== null && rescuedCards.has(rescueOwner))
+    ) {
+      continue;
+    }
+    return (
+      `branch ${name} belongs to no card: it is not this card's, not one of the project's branches, ` +
+      "not registered to another card's workspace, and not another card's rescue branch"
+    );
+  }
+  for (const ref of refs) {
+    if (!ref.refname.startsWith("refs/remotes/") || !SHA_RE.test(ref.sha)) continue;
+    const remoteRef = ref.refname.slice("refs/remotes/".length);
+    const slash = remoteRef.indexOf("/");
+    if (slash < 0) continue;
+    const name = remoteRef.slice(slash + 1);
+    if (name === "HEAD" || name === input.baseBranch || name === input.branch || input.projectBranches.has(name)) continue;
+    if (!branchNamesIssue(name, input.issueIdentifier)) continue;
+    const refusal = await tipRefusal(`branch ${remoteRef}`, ref.sha);
+    if (refusal) return refusal;
+  }
+  return siblingWorktreeRefusal(input.issueIdentifier, ctx);
+}
+
+async function readBranchHead(
+  worktreePath: string,
+  options: HardenedGitOptions,
+): Promise<{ branchRef: string; headSha: string } | null> {
+  const headSha = await readHeadCommit(worktreePath, options);
+  if (!headSha) return null;
+  const branchRef = (await runHardenedGit(["-C", worktreePath, "symbolic-ref", "--quiet", "HEAD"], options)).trim();
+  return { branchRef, headSha };
+}
+
+export async function probeZeroDeltaWorktree(input: ZeroDeltaWorktreeProbeInput): Promise<ZeroDeltaWorktreeProbeResult> {
+  if (!resolveTrustedGitBinary()) return refuse("no root-owned git binary is installed at a fixed system path");
+  const baseRef = `refs/remotes/origin/${input.baseBranch}`;
+  const branchRef = `refs/heads/${input.branch}`;
+  let managedRoot: string;
+  let worktreePath: string;
+  try {
+    managedRoot = await realpath(input.managedProjectRoot);
+  } catch {
+    return refuse("the project's managed checkout directory does not exist");
+  }
+  try {
+    worktreePath = await realpath(input.recordedWorktreePath);
+  } catch {
+    return refuse("the recorded worktree path does not exist");
+  }
+  const relative = path.relative(managedRoot, worktreePath);
+  const segments = relative.split(path.sep);
+  if (
+    relative.length === 0 ||
+    path.isAbsolute(relative) ||
+    segments.length < 4 ||
+    segments.some((segment) => segment.length === 0 || segment === "..") ||
+    segments[1] !== ".paperclip" ||
+    segments[2] !== "worktrees"
+  ) {
+    return refuse("the recorded worktree path is outside the project's managed worktree directory");
+  }
+  const repoRoot = path.join(managedRoot, segments[0]!);
+  let commonDir: string;
+  try {
+    const gitDirStat = await lstat(path.join(repoRoot, ".git"));
+    if (!gitDirStat.isDirectory()) return refuse("the managed checkout has no .git directory");
+    commonDir = await realpath(path.join(repoRoot, ".git"));
+  } catch {
+    return refuse("the managed checkout has no .git directory");
+  }
+  const options: HardenedGitOptions = { cwd: repoRoot, timeoutMs: input.timeoutMs, ceilingDirectory: path.dirname(worktreePath) };
+  try {
+    const shapeRefusal = await worktreeShapeRefusal(worktreePath, options);
+    if (shapeRefusal) return refuse(`the recorded worktree ${shapeRefusal}`);
+    const identity = await readWorktreeIdentity(worktreePath, options);
+    if (identity.topLevel !== worktreePath) {
+      return refuse("the recorded worktree has a work-tree top level other than its own path");
+    }
+    if (identity.commonDir !== commonDir || path.dirname(identity.gitDir) !== path.join(commonDir, "worktrees")) {
+      return refuse("the recorded worktree is not a linked worktree of the managed checkout");
+    }
+    const head = await readBranchHead(worktreePath, options).catch(() => null);
+    if (!head) return refuse(`the recorded worktree is not on the card's recorded branch ${input.branch}`);
+    if (head.branchRef !== branchRef) {
+      return refuse(`the recorded worktree is on ${head.branchRef}, not on the card's recorded branch ${input.branch}`);
+    }
+    if (await lstat(path.join(identity.gitDir, "index.lock")).then(() => true, () => false)) {
+      return refuse("the recorded worktree has a Git operation in progress (index.lock is present)");
+    }
+    const stash = await stashRefusal(worktreePath, options);
+    if (stash) return refuse(`the recorded worktree ${stash}`);
+    const exclude = await readOptionalRegularFile(path.join(identity.commonDir, "info", "exclude"), MAX_EXCLUDE_FILE_BYTES);
+    if (hasForeignExcludeRules(exclude)) {
+      return refuse("the recorded worktree has info/exclude ignore rules the server did not write");
+    }
+    const baseSha = (
+      await runHardenedGit(["-C", worktreePath, "rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`], options)
+        .catch(() => "")
+    ).trim();
+    if (!SHA_RE.test(baseSha)) return refuse(`the base ref ${baseRef} does not resolve in the recorded worktree`);
+
+    const aheadCountOutput = await runHardenedGit(
+      ["-C", worktreePath, "rev-list", "--count", `${baseSha}..${head.headSha}`],
+      options,
+    );
+    const headIsAncestorOfBase = await runHardenedGit(
+      ["-C", worktreePath, "merge-base", "--is-ancestor", head.headSha, baseSha],
+      options,
+    ).then(() => true, () => false);
+    const snapshotResult = await withSnapshotGitDir(
+      { identity, headSha: head.headSha, config: snapshotConfig(identity.objectFormat), exclude },
+      async (snapshot): Promise<{ refusal: string } | { statusRecords: string[] }> => {
+        const trackedPaths = new Set<string>();
+        for (const entry of await listIndexEntries(snapshot, worktreePath, options)) {
+          const entryRefusal = indexEntryRefusal(entry);
+          if (entryRefusal) return { refusal: entryRefusal };
+          trackedPaths.add(entry.path);
+        }
+        const statusRecords = await snapshotStatusRecords(snapshot, worktreePath, "all", options);
+        if (statusRecords.length > 0) return { statusRecords };
+        const ignored = await firstDisallowedIgnoredEntry(snapshot, worktreePath, trackedPaths, options);
+        if (ignored !== null) {
+          const entry = JSON.stringify(ignored.entry.slice(0, 200));
+          return {
+            refusal: ignored.listed
+              ? `has a regenerated-artefact directory that no committed ignore rule ignores (${entry})`
+              : `has an ignored entry outside the regenerated-artefact directories (${entry})`,
+          };
+        }
+        return { statusRecords };
+      },
+    );
+    if ("refusal" in snapshotResult) return refuse(`the recorded worktree ${snapshotResult.refusal}`);
+    const refusal = zeroDeltaWorktreeRefusal(
+      { aheadCountOutput, headIsAncestorOfBase, statusRecords: snapshotResult.statusRecords },
+      baseRef,
+    );
+    if (refusal) return refuse(`the recorded worktree ${refusal}`);
+
+    const refs = await readSiblingRefs(repoRoot, options);
+    const siblingRefusal = await zeroDeltaSiblingRefusal(input, refs, {
+      repoRoot,
+      commonDir,
+      worktreePath,
+      headSha: head.headSha,
+      options,
+    });
+    if (siblingRefusal) return refuse(siblingRefusal);
+
+    const final = await readBranchHead(worktreePath, options).catch(() => null);
+    if (!final || final.branchRef !== head.branchRef || final.headSha !== head.headSha) {
+      return refuse("the recorded worktree's HEAD moved while it was being measured");
+    }
+    return {
+      ok: true,
+      worktreePath,
+      commonDir,
+      branch: input.branch,
+      headSha: head.headSha,
+      baseRef,
+      baseSha,
+      refsDigest: siblingRefsDigest(refs, input.issueIdentifier),
+    };
+  } catch (error) {
+    return refuse(`the recorded worktree could not be measured (${error instanceof Error ? error.message : "unknown"})`);
+  }
 }

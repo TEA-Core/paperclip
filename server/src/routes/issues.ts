@@ -303,6 +303,7 @@ import {
   noRepositoryTier1FormSuffix,
   TIER1_FORM,
   verifyNoRepositoryLandingAtTransition,
+  verifyZeroDeltaCloseAtTransition,
   writeAuditLog,
   writeGuardSkippedAuditLog,
   writeDoneTransitionRefusedAuditLog,
@@ -310,6 +311,7 @@ import {
   type DoneTransitionOverride,
   type NoRepositoryLandingCloseRequest,
   type NoRepositoryLandingMeasurement,
+  type ZeroDeltaCloseMeasurement,
 } from "../services/done-transition-guard.js";
 import {
   decideIssueReviewPathRecovery,
@@ -5535,6 +5537,7 @@ export function issueRoutes(
         ok: true;
         overrideAccepted?: boolean;
         noRepositoryLanding?: boolean;
+        zeroDeltaMeasurement?: ZeroDeltaCloseMeasurement;
         recordGuardSkipDisposition?: () => void;
       }
     | { ok: false; status: number; body: Record<string, unknown> };
@@ -5585,6 +5588,10 @@ export function issueRoutes(
     // record-only Tier 2 close whose closing run cannot be resolved, so an
     // agent cannot skip the lifetime gate by dropping the run id header.
     closingAgentId?: string | null;
+    // SUP-24402: only a door that re-runs verifyZeroDeltaCloseAtTransition
+    // inside its status write sets this; every other door leaves it unset, and
+    // the zero-delta repository_delivery Tier 2 form then refuses.
+    zeroDeltaRecheckedAtWrite?: boolean;
     // SUP-24429: the requirement stored before the request, passed by a door
     // whose request can change it. The guard's record-only skip then applies
     // only when this is record_only too.
@@ -5757,6 +5764,7 @@ export function issueRoutes(
       (issueId) => svc.listComments(issueId, { order: "desc", limit: 100 }),
       input.noRepositoryLandingCloser ?? null,
       input.closingAgentId ?? null,
+      input.zeroDeltaRecheckedAtWrite === true,
     );
     if (tierResult.skipped) {
       void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
@@ -5917,6 +5925,11 @@ export function issueRoutes(
     // its skip row is handed to the caller to write once that close commits.
     if (tierResult.landing === "noRepositoryLanding") {
       return { ok: true, overrideAccepted, noRepositoryLanding: true, recordGuardSkipDisposition };
+    }
+    // A zero-delta close is likewise re-checked inside the write transaction,
+    // so its measurement and skip row are handed to the caller the same way.
+    if (tierResult.zeroDeltaMeasurement) {
+      return { ok: true, overrideAccepted, zeroDeltaMeasurement: tierResult.zeroDeltaMeasurement, recordGuardSkipDisposition };
     }
     recordGuardSkipDisposition();
     return { ok: true, overrideAccepted, noRepositoryLanding: false };
@@ -21118,6 +21131,9 @@ export function issueRoutes(
     // SUP-22570: the closer of an accepted record_only no-repository close; the
     // same checks re-run inside the update transaction below.
     let noRepositoryLandingCloser: DoneTierClosingActor | null = null;
+    // SUP-24402: the measurement of an accepted zero-delta close; re-checked
+    // inside the update transaction below.
+    let zeroDeltaCloseMeasurement: ZeroDeltaCloseMeasurement | null = null;
     let recordDeferredGuardSkipDisposition: (() => void) | undefined;
     let originalDeliveryBinding: string | null = null;
     // Refuse before evaluateDoneTransitionGuards. That guard writes
@@ -21220,6 +21236,7 @@ export function issueRoutes(
         caller: refusalCaller,
         closingAgentId: actor.agentId ?? null,
         noRepositoryLandingCloser: closingActor,
+        zeroDeltaRecheckedAtWrite: true,
         storedDeliveryRequirement: existing.deliveryRequirement,
       });
       if (!outcome.ok) {
@@ -21229,6 +21246,10 @@ export function issueRoutes(
       doneOverrideAccepted = outcome.overrideAccepted === true;
       if (outcome.noRepositoryLanding === true) {
         noRepositoryLandingCloser = closingActor;
+        recordDeferredGuardSkipDisposition = outcome.recordGuardSkipDisposition;
+      }
+      if (outcome.zeroDeltaMeasurement) {
+        zeroDeltaCloseMeasurement = outcome.zeroDeltaMeasurement;
         recordDeferredGuardSkipDisposition = outcome.recordGuardSkipDisposition;
       }
       if (terminalApprovalNeedsClassificationCheck) {
@@ -21751,6 +21772,8 @@ export function issueRoutes(
       || monitorChanged
       // SUP-22570: a record_only no-repository close re-probes inside the write.
       || noRepositoryLandingCloser !== null
+      // SUP-24402: a zero-delta close re-checks its measured worktree inside the write.
+      || zeroDeltaCloseMeasurement !== null
       // SUP-24429: a record_only request reads the stored requirement under the
       // row lock (close re-check and reclassification audit).
       || recordOnlyRequested
@@ -21784,6 +21807,13 @@ export function issueRoutes(
         issueId: existing.id,
         identifier: existing.identifier ?? null,
         stage: "no_repository_landing_transition_recheck",
+      });
+    const zeroDeltaTransitionRefusal = (reason: string) =>
+      unprocessable(`Tier 2 declaration could not be verified at the close write (merge_commit_unrecorded): ${reason}`, {
+        code: "done_transition_missing_tier_declaration",
+        issueId: existing.id,
+        identifier: existing.identifier ?? null,
+        stage: "zero_delta_transition_recheck",
       });
     let noRepositoryMeasurement: NoRepositoryLandingMeasurement | null = null;
     try {
@@ -22128,6 +22158,33 @@ export function issueRoutes(
             });
           }
 
+          // SUP-24402: compare-and-set against the zero-delta measurement
+          // taken before this transaction. It re-reads the database half of
+          // the proof and re-checks the measured worktree with a Git status
+          // under one shared 15 s budget (no GitHub call), and refuses if
+          // anything moved or got dirty since the measurement.
+          if (zeroDeltaCloseMeasurement !== null) {
+            const lockedForZeroDelta = await svc.getByIdForUpdate(id, tx);
+            if (!lockedForZeroDelta) return null;
+            // The proof covers the measured workspace binding only, so the
+            // same request may not move the card's project, project
+            // workspace or execution workspace.
+            const rebound = (["projectId", "projectWorkspaceId", "executionWorkspaceId"] as const).find(
+              (field) => updateFields[field] !== undefined && updateFields[field] !== (lockedForZeroDelta[field] ?? null),
+            );
+            if (rebound) {
+              throw zeroDeltaTransitionRefusal(
+                `a zero-delta close cannot change the card's ${rebound} from the measured binding`,
+              );
+            }
+            const verdict = await verifyZeroDeltaCloseAtTransition(
+              tx as unknown as Db,
+              lockedForZeroDelta,
+              zeroDeltaCloseMeasurement,
+            );
+            if (!verdict.ok) throw zeroDeltaTransitionRefusal(verdict.reason);
+          }
+
           const updated = await updateIssue(tx);
 
           if (!updated) return null;
@@ -22467,6 +22524,35 @@ export function issueRoutes(
               "not a dirty-worktree finding. Retry the close, or use the board close path."
             : "Fix what the refusal names, or retry if it says the worktree or the remote could not be verified; " +
               "keep the issue record_only and close again; the board close path stays available.",
+          runId: actor.runId ?? null,
+        });
+      }
+      if (
+        zeroDeltaCloseMeasurement !== null
+        && err instanceof HttpError
+        && err.status === 422
+        && (err.details as Record<string, unknown> | null | undefined)?.stage
+          === "zero_delta_transition_recheck"
+      ) {
+        // SUP-24402 / SUP-17125: the transactional re-check refused and the
+        // update rolled back; leave the same thread-readable refusal record.
+        await writeDoneTransitionRefusedAuditLog(db, existing, {
+          code: "done_transition_missing_tier_declaration",
+          httpStatus: 422,
+          reason: err.message,
+          decisionCarried: !!transition.decision,
+          runId: actor.runId ?? null,
+          stage: "zero_delta_transition_recheck",
+        });
+        await postTerminalStatusRefusalComment(svc, existing.id, {
+          httpStatus: 422,
+          code: "done_transition_missing_tier_declaration",
+          error: err.message,
+          remedy: err.message.includes("timed out at the close write")
+            ? "The worktree re-check at the close write ran out of its time budget before it finished; that is " +
+              "not a dirty-worktree finding. Retry the close, or use the board close path."
+            : "Fix what the refusal names, or retry if it says the worktree could not be verified; " +
+              "keep the issue repository_delivery and close again; the board close path stays available.",
           runId: actor.runId ?? null,
         });
       }
