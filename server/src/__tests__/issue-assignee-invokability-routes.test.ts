@@ -15,6 +15,7 @@ const agentStatusById: Record<string, string> = {
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
+  getByIdForUpdate: vi.fn(),
   findOpenAncestorCreatedByAgent: vi.fn(),
   update: vi.fn(),
   create: vi.fn(),
@@ -170,7 +171,11 @@ function stubDb(): any {
     query[method] = () => query;
   }
   query.then = (resolve: (rows: unknown[]) => unknown) => Promise.resolve(resolve([]));
-  return { select: () => query };
+  const db: any = { select: () => query };
+  // SUP-23801: assignee changes persist on the transactional path; run the
+  // callback against the same empty-row stub so service mocks drive the flow.
+  db.transaction = async (fn: (tx: unknown) => Promise<unknown>) => fn(db);
+  return db;
 }
 
 function createApp(actor: Actor) {
@@ -209,6 +214,12 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
 describe("issue assignee invokability guard", () => {
   beforeEach(() => {
     mockIssueService.getById.mockReset();
+    // SUP-23801: assignee changes persist on the transactional path, which
+    // re-reads the row under lock; mirror getById's fixture for that re-read.
+    mockIssueService.getByIdForUpdate.mockReset();
+    mockIssueService.getByIdForUpdate.mockImplementation(async () =>
+      mockIssueService.getById.mock.results.at(-1)?.value ?? null,
+    );
     mockIssueService.findOpenAncestorCreatedByAgent.mockReset();
     mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue(null);
     mockIssueService.update.mockReset();
@@ -285,6 +296,12 @@ describe("issue assignee invokability guard", () => {
 describe("agent delegation cycle guard", () => {
   beforeEach(() => {
     mockIssueService.getById.mockReset();
+    // SUP-23801: assignee changes persist on the transactional path, which
+    // re-reads the row under lock; mirror getById's fixture for that re-read.
+    mockIssueService.getByIdForUpdate.mockReset();
+    mockIssueService.getByIdForUpdate.mockImplementation(async () =>
+      mockIssueService.getById.mock.results.at(-1)?.value ?? null,
+    );
     mockIssueService.findOpenAncestorCreatedByAgent.mockReset();
     mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue(null);
     mockIssueService.create.mockReset();

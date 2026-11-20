@@ -1015,6 +1015,62 @@ describeEmbeddedPostgres("approval-status-reconciler", () => {
       ]);
     });
 
+    // SUP-24085 F1-later: the current decision was admitted over a card with
+    // no open PR and certified no head. A PR linked later, even with a ready
+    // receipt, must not be stamped by the reconciler for that decision.
+    it("skips an uncertified no-pr decision and never stamps its later-linked PR (SUP-24085 F1-later)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          lastDecisionId: "decision-42",
+          approvalStatus: {
+            publishedHeadSha: NEW_HEAD, publishedAt: APPROVED_AT,
+            finalDeliveryUncertified: { decisionId: "decision-42", reason: "no-pr: no open linked PR resolvable at decision time" },
+          },
+        }),
+      });
+      await insertDecision(issueId);
+      await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: POST_STATUS_URL, body: { id: 12345 } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(0);
+      expect(summary.skipped["head_uncertified"]).toBe(1);
+      expect(postStatusCalls()).toHaveLength(0);
+      const [receipt] = await db.select().from(issueDeliveryReceipts);
+      expect(receipt?.state).toBe("ready");
+    });
+
+    it("still republishes when the uncertified tag belongs to an earlier decision (SUP-24085)", async () => {
+      const issueId = await insertIssue({
+        executionState: approvedState({
+          lastDecisionId: "decision-42",
+          approvalStatus: {
+            publishedHeadSha: NEW_HEAD, publishedAt: APPROVED_AT,
+            finalDeliveryUncertified: { decisionId: "decision-old", reason: "no-pr: no open linked PR resolvable at decision time" },
+          },
+        }),
+      });
+      await insertDecision(issueId);
+      await seedAuthorizedDeliveryReceipt(issueId, NEW_HEAD, "some-branch-name");
+      installRoutes([
+        { url: PR_URL, body: OPEN_PR_BODY },
+        { url: COMBINED_STATUS_URL, body: { state: "pending", statuses: [] } },
+        { url: POST_STATUS_URL, body: { id: 12345 } },
+        { url: GRAPHQL_URL, body: GRAPHQL_ARM_OK_BODY },
+      ]);
+
+      const summary = await runApprovalStatusReconcilerTick(db);
+
+      expect(summary.republished).toBe(1);
+      expect(postStatusCalls()).toHaveLength(1);
+    });
+
     it("SUP-15459: a mid-ladder approved card is skipped:non-terminal-ladder and never re-stamps paperclip/approved", async () => {
       // The exact SUP-15459 shape the bug allowed through: a two-stage ladder
       // whose LAST decision was approved (so the candidate selector admits it)
