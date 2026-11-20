@@ -12417,6 +12417,56 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.metadata).toMatchObject({ version: 1 });
   });
 
+  it("leaves a terminal recovery issue done when a stale snapshot asks to block it in place", async () => {
+    const { companyId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "assignment_recovery",
+    });
+    const sourceIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Original source issue",
+      status: "blocked",
+      priority: "medium",
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
+    await db
+      .update(issues)
+      .set({
+        status: "in_review",
+        parentId: sourceIssueId,
+        originKind: "stranded_issue_recovery",
+        originId: sourceIssueId,
+      })
+      .where(eq(issues.id, issueId));
+    // The sweep captured this in_review snapshot before the accepted close landed.
+    const [staleSnapshot] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const completedAt = new Date("2026-03-19T01:00:00.000Z");
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt, blockedTransitionAt: null })
+      .where(eq(issues.id, issueId));
+    const [latestRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+
+    const updated = await recoveryService(db, { enqueueWakeup: vi.fn() }).escalateStrandedRecoveryIssueInPlace({
+      issue: staleSnapshot!,
+      previousStatus: "in_review",
+      latestRun: latestRun!,
+    });
+
+    expect(updated).toBeNull();
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after).toMatchObject({ status: "done", blockedTransitionAt: null });
+    expect(after?.completedAt?.toISOString()).toBe(completedAt.toISOString());
+    expect(
+      await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)),
+    ).toHaveLength(0);
+  });
+
   it("assigns open unassigned blockers back to their creator agent", async () => {
     const companyId = randomUUID();
     const creatorAgentId = randomUUID();
