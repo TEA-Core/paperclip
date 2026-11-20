@@ -900,8 +900,9 @@ export function buildHostServices(
   /**
    * SUP-24563: the execution state (which review stage is pending, who is
    * seated in it and who seated them) is written only by the execution-policy
-   * engine. A plugin issue write may not carry it, not even `null`: it could
-   * seat any agent in a review stage, or clear a pending one.
+   * engine. A plugin issue create may not carry it, not even `null`: it could
+   * seat any agent in a review stage. (An issue update never writes it: only
+   * the declared `PLUGIN_ISSUE_UPDATE_PATCH_FIELDS` pass.)
    */
   const refusePluginExecutionStateWrite = (fields: Record<string, unknown>) => {
     if (Object.prototype.hasOwnProperty.call(fields, "executionState")) {
@@ -2000,7 +2001,6 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const existing = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const rawPatch = params.patch as Record<string, unknown>;
-        refusePluginExecutionStateWrite(rawPatch);
         const actorAgentId = typeof rawPatch.actorAgentId === "string" ? rawPatch.actorAgentId : null;
         const actorUserId = typeof rawPatch.actorUserId === "string" ? rawPatch.actorUserId : null;
         const actorRunId = typeof rawPatch.actorRunId === "string" ? rawPatch.actorRunId : null;

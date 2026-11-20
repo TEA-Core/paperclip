@@ -143,8 +143,9 @@ function isAgentPrincipal(principal: LiveRunCapPrincipal | null, agentId: string
  * - the engine's seat record names this agent, seated by a board user or by a
  *   different agent (a participant that seated itself does not count).
  * The engine is the only writer of `execution_state`: no issue or wake API
- * accepts it and the plugin host refuses it. A state without a seat record
- * (written before the engine recorded seats) does not count.
+ * accepts it, a plugin issue create that carries it is refused, and a plugin
+ * issue update never writes it. A state without a seat record (written before
+ * the engine recorded seats) does not count.
  */
 function isSeatedReviewParticipant(executionState: unknown, agentId: string) {
   if (!executionState || typeof executionState !== "object") return false;

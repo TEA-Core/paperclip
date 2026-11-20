@@ -578,7 +578,8 @@ export const issueExecutionStateSchema = z.object({
   /**
    * The engine's record of who seated `currentParticipant` (SUP-24563).
    * Written only by the execution-policy engine; no route accepts an
-   * execution state, and the plugin host refuses one.
+   * execution state, the plugin host refuses one on issue create, and a
+   * plugin issue update never writes it.
    */
   participantSeat: z
     .object({

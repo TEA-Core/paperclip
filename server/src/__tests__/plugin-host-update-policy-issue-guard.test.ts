@@ -268,28 +268,28 @@ describeEmbeddedPostgres("plugin-host updatePolicy issue guard", () => {
     };
   }
 
-  it("refuses a plugin-host issues.update that writes executionState and leaves the issue unchanged", async () => {
+  it("never writes executionState through a plugin-host issues.update: it can neither seat a stage nor clear one", async () => {
     const company = await createCompany(db, "PES");
-    const issue = await db
+    const engineState = pendingStageFor(randomUUID());
+    const [blank, seated] = await db
       .insert(issues)
-      .values({ companyId: company.id, title: "Plugin state write", status: "todo", priority: "medium" })
-      .returning()
-      .then((rows) => rows[0]!);
+      .values([
+        { companyId: company.id, title: "No stage", status: "todo", priority: "medium" },
+        { companyId: company.id, title: "Engine stage", status: "in_review", priority: "medium", executionState: engineState },
+      ])
+      .returning();
     const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
 
-    for (const executionState of [pendingStageFor(randomUUID()), null]) {
-      await expect(
-        services.issues.update({
-          issueId: issue.id,
-          companyId: company.id,
-          patch: { status: "in_review", executionState } as never,
-        }),
-      ).rejects.toMatchObject({ status: 422 });
+    for (const [issue, executionState] of [[blank!, pendingStageFor(randomUUID())], [seated!, null]] as const) {
+      const updated = await services.issues.update({
+        issueId: issue.id,
+        companyId: company.id,
+        patch: { description: "plugin edit", executionState } as never,
+      });
+      expect(updated.description).toBe("plugin edit");
+      const row = await db.query.issues.findFirst({ where: (i, { eq }) => eq(i.id, issue.id) });
+      expect(row!.executionState).toEqual(issue.executionState);
     }
-
-    const row = await db.query.issues.findFirst({ where: (i, { eq }) => eq(i.id, issue.id) });
-    expect(row).toEqual(issue);
-    expect(await db.select().from(activityLog)).toEqual([]);
     services.dispose();
   });
 
