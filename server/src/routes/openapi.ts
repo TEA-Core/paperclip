@@ -1576,6 +1576,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/issues/{issueId}/file-resources/list",
   "GET /api/issues/{issueId}/file-resources/resolve",
   "POST /api/issues/{id}/interactions/{interactionId}/accept",
+  "POST /api/issues/{id}/interactions/{interactionId}/reconcile-close-on-accept",
   "POST /api/issues/{id}/interactions/{interactionId}/reject",
   "POST /api/issues/{id}/interactions/{interactionId}/respond",
   "POST /api/issues/{id}/interactions/{interactionId}/skip",
@@ -8226,6 +8227,25 @@ registry.registerPath({
     400: r.badRequest,
     401: r.unauthorized,
     404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/interactions/{interactionId}/reconcile-close-on-accept",
+  tags: ["issues"],
+  summary: "Apply the close-on-accept transition for the one allowlisted accepted confirmation",
+  description: "Board only. The caller must be the human who accepted the confirmation. Runs the normal done-transition preflight and the shared close transition. A repeat call returns `already_applied` without a write. Every other issue and interaction pair returns 404.",
+  request: {
+    params: z.object({ id: z.string(), interactionId: z.string() }),
+  },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: { description: "The acceptance is not eligible, or the done-transition guard refused the close" },
+    422: { description: "The done-transition guard refused the close" },
   },
 });
 

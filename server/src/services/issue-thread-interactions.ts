@@ -131,7 +131,6 @@ import {
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
-import { applyReviewEscalationDecision } from "./issue-stage-decision.js";
 import { questionResponseDeliveryValues } from "./question-response-delivery.js";
 import {
   cancelPendingIssueInteractionChatPublications,
@@ -1009,6 +1008,9 @@ async function closeIssueForAcceptedConfirmation(args: {
         "Approving the current execution stage does not complete the issue's ladder",
       );
     }
+    // Loaded lazily: issue-stage-decision imports the services barrel, and a static
+    // import here pulls that barrel into this module's load and breaks the cycle order.
+    const { applyReviewEscalationDecision } = await import("./issue-stage-decision.js");
     const decided = await applyReviewEscalationDecision({
       db: args.tx,
       issue: locked,
@@ -4356,7 +4358,7 @@ export function issueThreadInteractionService(
     reconcileAcceptedConfirmationClose: async (
       issue: { id: string; companyId: string },
       interactionId: string,
-      actor: { userId: string },
+      actor: { userId: string; boardApiKeyId?: string | null },
       guardSnapshot?: string,
     ): Promise<
       | { outcome: "already_applied" }
@@ -4432,6 +4434,7 @@ export function issueThreadInteractionService(
             companyId: issue.companyId,
             actorType: "user",
             actorId: row.resolvedByUserId,
+            boardApiKeyId: actor.boardApiKeyId ?? null,
             agentId: null,
             runId: null,
             action: "issue.updated",

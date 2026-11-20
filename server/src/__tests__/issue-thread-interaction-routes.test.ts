@@ -4063,7 +4063,7 @@ describe("issue thread interaction routes", () => {
         expect(mockInteractionService.reconcileAcceptedConfirmationClose).toHaveBeenCalledWith(
           expect.objectContaining({ id: ALLOWLISTED_ISSUE_ID }),
           ALLOWLISTED_INTERACTION_ID,
-          { userId: "local-board" },
+          { userId: "local-board", boardApiKeyId: null },
           "guard-snapshot",
         );
         expect(mockInteractionService.acceptInteraction).not.toHaveBeenCalled();

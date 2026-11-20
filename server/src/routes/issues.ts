@@ -25424,7 +25424,7 @@ export function issueRoutes(
       const reconciled = await interactionSvc.reconcileAcceptedConfirmationClose(
         issue,
         interactionId,
-        { userId },
+        { userId, boardApiKeyId: getActorInfo(req).boardApiKeyId },
         guardSnapshot,
       );
       if (reconciled.outcome === "applied") {
