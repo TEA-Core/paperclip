@@ -19739,6 +19739,42 @@ export function issueRoutes(
         );
       }
     };
+    // SUP-23801: a run-link change is only unexpected when a DIFFERENT run
+    // takes ownership of the card between admission and persistence. The
+    // request's own effects are expected: releasing the outgoing run clears
+    // both links, and the actor's authenticated mutation may adopt its own
+    // live run onto the card before the write commits.
+    const hasUnexpectedRunLink = (
+      candidate: {
+        checkoutRunId?: string | null;
+        executionRunId?: string | null;
+      },
+    ) => {
+      const checkoutRunId = candidate.checkoutRunId ?? null;
+      const executionRunId = candidate.executionRunId ?? null;
+      if (
+        checkoutRunId === (existing.checkoutRunId ?? null) &&
+        executionRunId === (existing.executionRunId ?? null)
+      ) return false;
+      if (checkoutRunId === null && executionRunId === null) return false;
+      // SUP-23801: an authenticated actor may adopt its own live run onto the
+      // card while the outgoing links are cleared in the same write. The
+      // adoption takes either link; the link it does not take may only be
+      // cleared or stay unchanged. Any other live id still means a different
+      // run took ownership of the card.
+      if (
+        actor.runId !== null &&
+        (checkoutRunId === actor.runId || executionRunId === actor.runId)
+      ) {
+        const otherCheckoutRunId = checkoutRunId === actor.runId ? null : checkoutRunId;
+        const otherExecutionRunId = executionRunId === actor.runId ? null : executionRunId;
+        return !(
+          (otherCheckoutRunId === null || otherCheckoutRunId === (existing.checkoutRunId ?? null)) &&
+          (otherExecutionRunId === null || otherExecutionRunId === (existing.executionRunId ?? null))
+        );
+      }
+      return true;
+    };
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(existing);
     const isAgentWorkUpdate =
       req.actor.type === "agent" &&
@@ -21284,48 +21320,42 @@ export function issueRoutes(
         issueId: existing.id,
         agentId: existing.assigneeAgentId,
       });
-      const runToStopForReassignment = await resolveActiveIssueRun(existing);
-      const isIssuingRunStageHandoff = transition.workflowControlledAssignment &&
-        !terminalApprovalNeedsClassificationCheck &&
-        actor.runId !== null &&
-        runToStopForReassignment?.id === actor.runId &&
-        runToStopForReassignment.contextSnapshot?.issueId === existing.id;
-      // A stage issuer must finish its own PATCH. Its running execution still
-      // holds the issue lock, so the next stage waits for normal finalization.
-      // Admission rediscovers that lock by the run's context issueId, so an
-      // issuer scoped to no issue or another issue takes the post-commit cancel.
-      if (!isIssuingRunStageHandoff && runToStopForReassignment) {
-        if (terminalApprovalNeedsClassificationCheck) {
-          const cancelled = await heartbeat.cancelRun(
-            runToStopForReassignment.id,
-            "Cancelled before issue reassignment",
-            {
-              errorCode: "issue_reassigned",
-              suppressImmediateRecovery: true,
-              resultJson: { reassignmentStopConfirmed: true, issueMutationStopId },
-              eventMessage: "run cancelled before issue reassignment",
-              eventPayload: { issueId: existing.id },
-            },
-          );
-          if (!cancelled || cancelled.status !== "cancelled") {
-            throw conflict(
-              "The active agent run could not be stopped before reassignment",
-              {
-                code: "runner_goal_reassignment_stop_unconfirmed",
-                runId: runToStopForReassignment.id,
-              },
-            );
+      // SUP-23801: every retained reassignment stop is deferred until the
+      // issue update commits. Only the execution run link carries
+      // cancellation authority: target a run that still holds the execution
+      // lock, is still running, and is still owned by the outgoing assignee.
+      // An issuer scoped to this issue finishes its own PATCH; an issuer
+      // scoped to no issue or another issue takes the post-commit cancel, so
+      // a replacement run that takes ownership during the final delivery
+      // preflight is not cancelled, and a checkout-only binding never
+      // borrows cancellation authority.
+      const linkedRunIds = [existing.executionRunId].filter(
+        (runId): runId is string => typeof runId === "string" && runId.length > 0,
+      );
+      for (const linkedRunId of linkedRunIds) {
+        const linkedRun = await heartbeat.getRun(linkedRunId);
+        const linkedIssueId =
+          linkedRun?.contextSnapshot && typeof linkedRun.contextSnapshot === "object"
+            ? (linkedRun.contextSnapshot as Record<string, unknown>).issueId
+            : null;
+        if (
+          linkedRun?.status === "running" &&
+          linkedRun.agentId === existing.assigneeAgentId
+        ) {
+          // A stage issuer must finish its own PATCH. Its running execution
+          // still holds the issue lock, so the next stage waits for normal
+          // finalization. Admission rediscovers that lock by the run's
+          // context issueId, so an issuer scoped to no issue or another
+          // issue takes the post-commit cancel.
+          const isIssuingRunStageHandoff = transition.workflowControlledAssignment &&
+            !terminalApprovalNeedsClassificationCheck &&
+            actor.runId !== null &&
+            linkedRun.id === actor.runId &&
+            linkedIssueId === existing.id;
+          if (!isIssuingRunStageHandoff) {
+            pendingReassignmentStopRunId = linkedRun.id;
           }
-          interruptedRunId = cancelled.id;
-          suppressedReassignmentCancelledRun = cancelled;
-          // One compensation scope for every exit between this cancel and
-          // the commit: eager rewakes at the known exits below call the same
-          // helper, and this finish/close fallback covers any exit that
-          // responds without reaching them. It disarms on commit.
-          res.once("finish", () => { void rewakeSuppressedReassignmentRun(); });
-          res.once("close", () => { void rewakeSuppressedReassignmentRun(); });
-        } else {
-          pendingReassignmentStopRunId = runToStopForReassignment.id;
+          break;
         }
       }
     }
@@ -21394,7 +21424,8 @@ export function issueRoutes(
         if (
           !afterStop ||
           !isDeepStrictEqual(issueRowWithFoldedDecisionAgentIds(withoutRunRelease(afterStop)), issueRowWithFoldedDecisionAgentIds(withoutRunRelease(existing))) ||
-          (interruptedRunId === null && !adoptedOwnCheckout && !isDeepStrictEqual(issueRowWithFoldedDecisionAgentIds(afterStop), issueRowWithFoldedDecisionAgentIds(existing))) ||
+          (!adoptedOwnCheckout && !isDeepStrictEqual(issueRowWithFoldedDecisionAgentIds(afterStop), issueRowWithFoldedDecisionAgentIds(existing))) ||
+          hasUnexpectedRunLink(afterStop) ||
           (await readFinalDeliveryBinding(db, afterStop)) !== originalDeliveryBinding
         ) {
           throw conflict("Card or delivery binding changed before the final delivery preflight; retry the final verdict", {
@@ -21671,6 +21702,7 @@ export function issueRoutes(
       || reviewPolicySensitiveMutationRequested
       || workspaceReprovisionCloseId !== null
       || deliveryIdentityWorkspaceBranchWrite
+      || assigneeWillChange
       || terminalApprovalNeedsClassificationCheck
       // ADR-103 M4: a re-parent must commit atomically with its close-ladder
       // check, so force every parent-edge mutation through the transactional
@@ -21989,17 +22021,29 @@ export function issueRoutes(
               ));
           }
 
+          if (assigneeWillChange) {
+            const lockedIssue = await svc.getByIdForUpdate(id, tx);
+            if (!lockedIssue) return null;
+            if (hasUnexpectedRunLink(lockedIssue)) {
+              throw conflict("Card run ownership changed before reassignment persistence; retry the reassignment", {
+                code: "issue_reassignment_run_stale",
+                runId: pendingReassignmentStopRunId,
+              });
+            }
+          }
+
           // Revalidate the external certification against the locked row and
           // delivery binding before persisting the final decision or its receipt.
           if (terminalApprovalNeedsClassificationCheck) {
             const lockedIssue = await svc.getByIdForUpdate(id, tx);
             if (!lockedIssue) return null;
             if (
-              lockedIssue.deliveryRequirement !== existing.deliveryRequirement
+              lockedIssue.deliveryRequirement !== existing.deliveryRequirement ||
+              hasUnexpectedRunLink(lockedIssue)
             ) {
-              throw conflict("Card delivery classification changed before the final delivery preflight; retry the final verdict", {
+              throw conflict("Card delivery classification or run ownership changed before the final delivery preflight; retry the final verdict", {
                 code: "approval_final_delivery_preflight_stale",
-                reason: "head_moved: delivery classification changed before final delivery preflight",
+                reason: "head_moved: delivery classification or run ownership changed before final delivery preflight",
               });
             }
             const effectiveLockedIssue =
