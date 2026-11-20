@@ -258,7 +258,7 @@ import {
   type IssueLivenessFinding,
 } from "./recovery/issue-graph-liveness.js";
 import { USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS } from "./issue-interaction-kinds.js";
-import { visibleIssueCondition } from "./issue-visibility.js";
+import { includeHiddenIssueCondition, visibleIssueCondition } from "./issue-visibility.js";
 import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 import { finalizeSummarySlotsForTerminalIssue, hasSummaryGenerationToken } from "./summary-slot-finalization.js";
 import {
@@ -8811,7 +8811,7 @@ export function issueService(db: Db) {
 
       const conditions = [
         eq(issues.companyId, companyId),
-        filters?.includeHidden === true ? isNull(issues.harnessKind) : visibleIssueCondition(),
+        filters?.includeHidden === true ? includeHiddenIssueCondition() : visibleIssueCondition(),
       ];
       if (filters?.ids) conditions.push(inArray(issues.id, [...filters.ids]));
       if (filters?.identifiers) conditions.push(inArray(issues.identifier, [...filters.identifiers]));
@@ -9166,7 +9166,7 @@ export function issueService(db: Db) {
 
       const conditions = [
         eq(issues.companyId, companyId),
-        filters?.includeHidden === true ? isNull(issues.harnessKind) : visibleIssueCondition(),
+        filters?.includeHidden === true ? includeHiddenIssueCondition() : visibleIssueCondition(),
       ];
       if (!filters?.q?.trim()) {
         conditions.push(isNull(issues.conversationAgentId));
@@ -11930,6 +11930,12 @@ export function issueService(db: Db) {
          * self-satisfying review-stage gate does not apply to it.
          */
         workflowControlledAssignment?: boolean;
+        /**
+         * Internal only. Set by the board stage-decision route (SUP-24632) on
+         * the write that closes the final stage of an unassigned Wiki handoff
+         * without writing an assignee. Never a column; never from a request body.
+         */
+        boardStageDecision?: boolean;
         companyGuard?: string;
         /**
          * Internal only. Optimistic concurrency token for PATCH /api/issues/:id.
@@ -11989,6 +11995,7 @@ export function issueService(db: Db) {
         companyGuard,
         expectedUpdatedAt,
         workflowControlledAssignment,
+        boardStageDecision,
         ...issueData
       } = data;
       // An explicit edit claims the title, even if it keeps the same text.
@@ -12507,6 +12514,16 @@ export function issueService(db: Db) {
                 issueData.assigneeUserId !== undefined,
               currentAssigneeUserId: receiptExisting.assigneeUserId,
             },
+            ...(boardStageDecision === true
+              ? {
+                  boardStageDecision: {
+                    assigneeFieldWritten:
+                      issueData.assigneeAgentId !== undefined ||
+                      issueData.assigneeUserId !== undefined,
+                    currentAssigneeUserId: receiptExisting.assigneeUserId,
+                  },
+                }
+              : {}),
           });
         }
         if (
