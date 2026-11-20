@@ -32,6 +32,7 @@ import {
   heartbeatRuns,
   runIdentityContexts,
   issueComments,
+  issueDeliveryReceipts,
   issueDocuments,
   issueExecutionDecisions,
   issueQuestionResponseDeliveries,
@@ -906,7 +907,10 @@ export type CloseOnAcceptCardBindingIneligibleReason =
   | "card_maintainer_unresolved"
   | "card_not_assigned_to_maintainer"
   | "interaction_not_created_by_maintainer"
-  | "addressee_not_review_participant";
+  | "addressee_not_review_participant"
+  | "card_has_delivery_identity"
+  | "card_has_delivery_receipt"
+  | "card_has_linked_pull_request";
 
 /** The canonical weekly-report handoff card title for one report date. */
 export function weeklyReportHandoffTitle(reportDate: string) {
@@ -952,6 +956,21 @@ export async function closeOnAcceptCardBindingIneligibleReason(
     )
     .limit(1);
   if (!reportDocument) return "card_report_document_missing";
+  // RA F2: a publication card has no pull request. A card that carries any
+  // delivery identity stays an ordinary accept, so a publication confirmation
+  // can never approve, stamp, or arm a merge for a pull request.
+  const storedDelivery = parseIssueExecutionState(issue.executionState ?? null)?.delivery;
+  if (storedDelivery !== undefined && storedDelivery !== null) return "card_has_delivery_identity";
+  const [receipt] = await dbOrTx
+    .select({ id: issueDeliveryReceipts.id })
+    .from(issueDeliveryReceipts)
+    .where(and(eq(issueDeliveryReceipts.companyId, issue.companyId), eq(issueDeliveryReceipts.sourceIssueId, issue.id)))
+    .limit(1);
+  if (receipt) return "card_has_delivery_receipt";
+  // Loaded lazily: merge-arming imports the services barrel.
+  const { resolveLinkedPullRequests } = await import("./merge-arming.js");
+  const linkedPullRequests = await resolveLinkedPullRequests(dbOrTx, issue.companyId, issue.id, { includeDrafts: true });
+  if (linkedPullRequests.length > 0) return "card_has_linked_pull_request";
   // Loaded lazily, like the other approval helpers this module reaches.
   const { resolveCanonicalWikiMaintainerAgentId } = await import("./issue-assignee-review-gate.js");
   const maintainerAgentId = await resolveCanonicalWikiMaintainerAgentId(dbOrTx, issue.companyId, issue);
@@ -1127,6 +1146,102 @@ async function closeOnAcceptSelfApprovalUserIds(
   return userIds;
 }
 
+export type CloseOnAcceptStageIneligibleReason =
+  | "stage_not_final_review"
+  | "participant_not_addressee"
+  | "self_approval"
+  | "stage_not_started";
+
+const CLOSE_ON_ACCEPT_STAGE_REFUSAL_MESSAGES: Record<CloseOnAcceptStageIneligibleReason, string> = {
+  stage_not_final_review: "Close-on-accept decides only the pending final review stage of the issue",
+  participant_not_addressee: "The final review stage's only participant must be the addressed human",
+  self_approval: "The accepting human cannot approve the review stage of their own work",
+  stage_not_started: "The issue's execution policy routes this close to a review stage that has not started",
+};
+
+/**
+ * SUP-24788 (B2-ii): whether the done transition this accept would run is one
+ * close-on-accept may run. A stage decision is allowed only for the pending
+ * LAST stage of the stored policy, a review stage whose only participant is
+ * the addressed human, who must not be a self-approval principal. A done that
+ * would start a stage is not allowed. The route calls this to keep such a
+ * confirmation an ordinary accept; the close transition calls it again under
+ * the lock and refuses.
+ */
+async function evaluateCloseOnAcceptStage(
+  dbOrTx: Db,
+  issue: typeof issues.$inferSelect,
+  interaction: { id: string; addresseeUserId: string | null; createdByUserId: string | null },
+  userId: string,
+) {
+  const policy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+  const executionState = parseIssueExecutionState(issue.executionState);
+  // The decision body names its origin so an audit or the stamp ladder can tell
+  // it from a review-comment approval.
+  const decisionBody = `${CLOSE_ON_ACCEPT_DECISION_BODY} Interaction ${interaction.id}.`;
+  const transition = applyIssueExecutionPolicyTransition({
+    issue,
+    policy,
+    requestedStatus: "done",
+    requestedAssigneePatch: {},
+    actor: { agentId: null, userId },
+    commentBody: decisionBody,
+  });
+  const result = (reason: CloseOnAcceptStageIneligibleReason | null) => ({ reason, transition, executionState });
+  if (!transition.decision) {
+    const redirects =
+      executionState?.status === "pending" ||
+      (transition.patch.status !== undefined && transition.patch.status !== "done");
+    return result(redirects ? "stage_not_started" : null);
+  }
+  const lastStage = policy?.stages.at(-1) ?? null;
+  if (
+    !policy ||
+    !executionState ||
+    !lastStage ||
+    executionState.status !== "pending" ||
+    executionState.currentStageId !== lastStage.id ||
+    lastStage.type !== "review" ||
+    !approvingCurrentStageCompletesLadder({ policy, executionState })
+  ) {
+    return result("stage_not_final_review");
+  }
+  const [onlyParticipant, ...otherParticipants] = lastStage.participants;
+  if (
+    !interaction.addresseeUserId ||
+    userId !== interaction.addresseeUserId ||
+    otherParticipants.length > 0 ||
+    onlyParticipant?.type !== "user" ||
+    onlyParticipant.userId !== interaction.addresseeUserId ||
+    executionState.currentParticipant?.type !== "user" ||
+    executionState.currentParticipant.userId !== interaction.addresseeUserId
+  ) {
+    return result("participant_not_addressee");
+  }
+  const selfApprovalUserIds = await closeOnAcceptSelfApprovalUserIds(dbOrTx, issue, interaction, policy);
+  return result(selfApprovalUserIds.has(userId) ? "self_approval" : null);
+}
+
+/** SUP-24788: the route's pre-check; null when the stage allows the close. */
+export async function closeOnAcceptStageIneligibleReason(
+  dbOrTx: Db,
+  issue: typeof issues.$inferSelect,
+  interaction: { id: string; addresseeUserId?: string | null; createdByUserId?: string | null },
+  userId: string,
+): Promise<CloseOnAcceptStageIneligibleReason | null> {
+  const evaluated = await evaluateCloseOnAcceptStage(
+    dbOrTx,
+    issue,
+    {
+      id: interaction.id,
+      addresseeUserId: interaction.addresseeUserId ?? null,
+      createdByUserId: interaction.createdByUserId ?? null,
+    },
+    userId,
+  );
+  return evaluated.reason;
+}
+
 /**
  * The one done transition shared by close-on-accept and its reconciliation.
  * It runs inside the caller's transaction under the issue row lock, against
@@ -1158,58 +1273,12 @@ async function closeIssueForAcceptedConfirmation(args: {
   if (locked.deliveryRequirement !== "record_only") {
     throw closeOnAcceptRefusedError("issue_not_record_only", "Only a record_only issue can close on accept");
   }
-  const actor = { agentId: null, userId: args.userId, runId: null };
-  const policy = normalizeIssueExecutionPolicy(locked.executionPolicy ?? null);
-  const executionState = parseIssueExecutionState(locked.executionState);
-  // The decision body names its origin so an audit or the stamp ladder can tell
-  // it from a review-comment approval.
-  const decisionBody = `${CLOSE_ON_ACCEPT_DECISION_BODY} Interaction ${args.interaction.id}.`;
-  const transition = applyIssueExecutionPolicyTransition({
-    issue: locked,
-    policy,
-    requestedStatus: "done",
-    requestedAssigneePatch: {},
-    actor,
-    commentBody: decisionBody,
-  });
-  if (transition.decision) {
-    const lastStage = policy?.stages.at(-1) ?? null;
-    if (
-      !policy ||
-      !executionState ||
-      !lastStage ||
-      executionState.status !== "pending" ||
-      executionState.currentStageId !== lastStage.id ||
-      lastStage.type !== "review" ||
-      !approvingCurrentStageCompletesLadder({ policy, executionState })
-    ) {
-      throw closeOnAcceptStageRefusedError(
-        "stage_not_final_review",
-        "Close-on-accept decides only the pending final review stage of the issue",
-      );
-    }
-    const [onlyParticipant, ...otherParticipants] = lastStage.participants;
-    if (
-      !args.interaction.addresseeUserId ||
-      args.userId !== args.interaction.addresseeUserId ||
-      otherParticipants.length > 0 ||
-      onlyParticipant?.type !== "user" ||
-      onlyParticipant.userId !== args.interaction.addresseeUserId ||
-      executionState.currentParticipant?.type !== "user" ||
-      executionState.currentParticipant.userId !== args.interaction.addresseeUserId
-    ) {
-      throw closeOnAcceptStageRefusedError(
-        "participant_not_addressee",
-        "The final review stage's only participant must be the addressed human",
-      );
-    }
-    const selfApprovalUserIds = await closeOnAcceptSelfApprovalUserIds(args.tx, locked, args.interaction, policy);
-    if (selfApprovalUserIds.has(args.userId)) {
-      throw closeOnAcceptStageRefusedError(
-        "self_approval",
-        "The accepting human cannot approve the review stage of their own work",
-      );
-    }
+  const evaluated = await evaluateCloseOnAcceptStage(args.tx, locked, args.interaction, args.userId);
+  if (evaluated.reason) {
+    throw closeOnAcceptStageRefusedError(evaluated.reason, CLOSE_ON_ACCEPT_STAGE_REFUSAL_MESSAGES[evaluated.reason]);
+  }
+  const { transition, executionState } = evaluated;
+  if (transition.decision && executionState) {
     // Record the decision and close in this transaction, under the lock taken
     // above. The card goes back to its return assignee as it closes, as a
     // final-stage approval on the board door does, so a Wiki handoff card
@@ -1264,17 +1333,6 @@ async function closeIssueForAcceptedConfirmation(args: {
         outcome: decision.outcome,
       },
     };
-  }
-  if (
-    executionState?.status === "pending" ||
-    (transition.patch.status !== undefined && transition.patch.status !== "done")
-  ) {
-    // A parked card whose done would start its review stage: the stage decision
-    // stays a separate action, so the accept refuses.
-    throw closeOnAcceptStageRefusedError(
-      "stage_not_started",
-      "The issue's execution policy routes this close to a review stage that has not started",
-    );
   }
   const closed = await issueSvc.update(
     locked.id,

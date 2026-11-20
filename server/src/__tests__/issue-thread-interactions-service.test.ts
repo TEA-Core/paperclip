@@ -13,10 +13,13 @@ import {
   documentRevisions,
   documents,
   executionWorkspaces,
+  externalObjectMentions,
+  externalObjects,
   goals,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueDeliveryReceipts,
   issueDocuments,
   issueExecutionDecisions,
   instanceSettings,
@@ -5990,6 +5993,9 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
 
     afterEach(async () => {
       await db.delete(issueExecutionDecisions);
+      await db.delete(issueDeliveryReceipts);
+      await db.delete(externalObjectMentions);
+      await db.delete(externalObjects);
       await db.delete(pluginManagedResources);
       await db.delete(plugins);
     });
@@ -6175,6 +6181,9 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       expect(issueRow.completedAt).not.toBeNull();
       // The Wiki handoff guard admits only the canonical Maintainer as assignee.
       expect(issueRow).toMatchObject({ assigneeAgentId: seeded.maintainerAgentId, assigneeUserId: null });
+      // RA cell 9: the accept-close never writes an approved-head anchor.
+      expect((issueRow.executionState as { approvalStatus?: { approvedHeadSha?: unknown } } | null)?.approvalStatus?.approvedHeadSha)
+        .toBeUndefined();
       expect((await readInteractionRow(created.id)).status).toBe("accepted");
     });
 
@@ -6373,6 +6382,44 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
             .where(eq(pluginManagedResources.companyId, seeded.companyId));
         },
         refusal: refused("card_not_assigned_to_maintainer"),
+      },
+      // RA F2 cell 8: a card with any delivery identity stays an ordinary accept.
+      {
+        label: "the card records a delivery identity",
+        prepare: async (seeded) => {
+          await db.update(issues).set({
+            executionState: { ...pendingOn(seeded, seeded.stageId, 0), delivery: { branch: "feat/report" } },
+          }).where(eq(issues.id, seeded.issueId));
+        },
+        refusal: refused("card_has_delivery_identity"),
+      },
+      {
+        label: "the card has a board delivery receipt",
+        prepare: async (seeded) => {
+          await db.insert(issueDeliveryReceipts).values({
+            companyId: seeded.companyId, sourceIssueId: seeded.issueId, provider: "github",
+            owner: "tea-core", repo: "paperclip", pullRequestNumber: 42,
+            headSha: "a".repeat(40), branchName: "feat/report", sourceDeliveryRecord: { fixture: true },
+            recoveryReason: "authorized test publication", authorizedByActorType: "user",
+            authorizedByActorId: OTHER_USER_ID, idempotencyKey: `fixture-${seeded.issueId}`, state: "ready",
+          });
+        },
+        refusal: refused("card_has_delivery_receipt"),
+      },
+      {
+        label: "the card links an open pull request",
+        prepare: async (seeded) => {
+          const [object] = await db.insert(externalObjects).values({
+            companyId: seeded.companyId, providerKey: "github", objectType: "pull_request",
+            externalId: "TEA-Core/paperclip#pull/42",
+            data: { state: "open", draft: false, headRef: "feat/report", headSha: "a".repeat(40) },
+          }).returning();
+          await db.insert(externalObjectMentions).values({
+            companyId: seeded.companyId, sourceIssueId: seeded.issueId, sourceKind: "comment",
+            objectId: object!.id, objectType: "pull_request", providerKey: "github",
+          });
+        },
+        refusal: refused("card_has_linked_pull_request"),
       },
       {
         label: "the return assignee equals the Maintainer only by case",

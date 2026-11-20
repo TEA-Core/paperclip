@@ -509,6 +509,7 @@ import {
   CLOSE_ON_ACCEPT_DECISION_BODY,
   closeIssueOnAcceptIneligibleReason,
   closeOnAcceptCardBindingIneligibleReason,
+  closeOnAcceptStageIneligibleReason,
   isCloseOnAcceptReconciliationAllowlisted,
   resolveSelectedSuggestedTasks,
   type CloseOnAcceptResult,
@@ -5596,6 +5597,11 @@ export function issueRoutes(
     // whose request can change it. The guard's record-only skip then applies
     // only when this is record_only too.
     storedDeliveryRequirement?: IssueDeliveryRequirement | null;
+    // SUP-24788: a door that can still refuse after the guard allowed (the
+    // close-on-accept lock re-check) defers the board path's "transition
+    // allowed" rows; the guard returns them as recordGuardSkipDisposition for
+    // the caller to write once the close commits.
+    deferAllowedDisposition?: boolean;
   }): Promise<DoneTransitionGuardOutcome> {
     const {
       issue,
@@ -5607,6 +5613,7 @@ export function issueRoutes(
       caller,
       persistRefusalComment = true,
       storedDeliveryRequirement,
+      deferAllowedDisposition = false,
     } = input;
 
     const guardResult = await evaluateDoneTransitionGuard(
@@ -5747,12 +5754,18 @@ export function issueRoutes(
       // SUP-13939: board closes are exempt from the tier-evidence requirement, but the
       // bypass itself is recorded so board closes stay countable in the ghost-PASS
       // census (an unexplained "skip" would look exactly like the old silent gap).
-      recordGuardSkipDisposition();
-      void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
-        reason: "Board actor bypassed the done-tier close-evidence requirement",
-        skipReason: "board_actor_bypass",
-        decisionCarried,
-      });
+      const recordBoardBypass = () => {
+        recordGuardSkipDisposition();
+        void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
+          reason: "Board actor bypassed the done-tier close-evidence requirement",
+          skipReason: "board_actor_bypass",
+          decisionCarried,
+        });
+      };
+      if (deferAllowedDisposition) {
+        return { ok: true, overrideAccepted, recordGuardSkipDisposition: recordBoardBypass };
+      }
+      recordBoardBypass();
       return { ok: true, overrideAccepted };
     }
 
@@ -5933,7 +5946,9 @@ export function issueRoutes(
   // and its allowlisted reconciliation. It runs the normal guard before any
   // write, as the accepting human, with the refusal returned to the caller
   // instead of posted to the thread so a refusal leaves the issue and the
-  // interaction unchanged.
+  // interaction unchanged. The guard's "transition allowed" rows come back as
+  // recordGuardSkipDisposition: the caller writes them only after the close
+  // commits, so a later refusal under the lock leaves no allowed-row behind.
   async function preflightCloseOnAcceptDoneTransition(
     issue: Parameters<typeof evaluateDoneTransitionGuards>[0]["issue"] & {
       executionPolicy?: Record<string, unknown> | null;
@@ -5963,6 +5978,7 @@ export function issueRoutes(
       persistRefusalComment: false,
       closingAgentId: null,
       storedDeliveryRequirement: issue.deliveryRequirement,
+      deferAllowedDisposition: true,
     });
   }
 
@@ -25272,7 +25288,7 @@ export function issueRoutes(
       // done-transition guard runs before the accept, so a refusal leaves the
       // issue and the interaction pending. Ineligible shapes keep the ordinary
       // accept.
-      const closeIssueOnAccept =
+      let closeIssueOnAccept =
         !reviewEscalationAccept &&
         current.kind === "request_confirmation" &&
         req.actor.type === "board" &&
@@ -25283,16 +25299,26 @@ export function issueRoutes(
         }) === null &&
         (await closeOnAcceptCardBindingIneligibleReason(db, issue, current)) === null;
       let closeOnAcceptGuardSnapshot: string | undefined;
+      let recordCloseOnAcceptGuardDisposition: (() => void) | undefined;
       if (closeIssueOnAccept) {
+        // Snapshot first, then let the guard read a fresh row: any change after
+        // the snapshot refuses under the lock instead of being baked into it.
         closeOnAcceptGuardSnapshot = await interactionSvc.readCloseOnAcceptGuardSnapshot(issue);
-        const closeOutcome = await preflightCloseOnAcceptDoneTransition(
-          issue,
-          req.actor.userId as string,
-          true,
-        );
-        if (!closeOutcome.ok) {
-          res.status(closeOutcome.status).json(closeOutcome.body);
-          return;
+        const [guardIssue = null] = await db.select().from(issueRows)
+          .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)));
+        if (!guardIssue) throw notFound("Issue not found");
+        const acceptingUserId = req.actor.type === "board" ? (req.actor.userId ?? "") : "";
+        // A stage that close-on-accept may not decide (or a done that would start
+        // one) keeps the confirmation an ordinary accept instead of refusing it.
+        if ((await closeOnAcceptStageIneligibleReason(db, guardIssue, current, acceptingUserId)) !== null) {
+          closeIssueOnAccept = false;
+        } else {
+          const closeOutcome = await preflightCloseOnAcceptDoneTransition(guardIssue, acceptingUserId, true);
+          if (!closeOutcome.ok) {
+            res.status(closeOutcome.status).json(closeOutcome.body);
+            return;
+          }
+          recordCloseOnAcceptGuardDisposition = closeOutcome.recordGuardSkipDisposition;
         }
       }
       const acceptActor = {
@@ -25366,6 +25392,7 @@ export function issueRoutes(
           : await interactionSvc.acceptInteraction(...acceptArgs);
       for (const publication of deferredPostCommit.activityPublications) publishActivity(publication);
       await flushIssuePostCommitActions(deferredPostCommit.postCommitActions);
+      if (closeOnAccept) recordCloseOnAcceptGuardDisposition?.();
       await runCloseOnAcceptCompletionWakes(closeOnAccept, actor);
       let resolvedContinuationIssue = continuationIssue;
       // SUP-14919: accepting a review round-cap escalation resolves the stage as
@@ -25708,7 +25735,10 @@ export function issueRoutes(
         return;
       }
       const guardSnapshot = await interactionSvc.readCloseOnAcceptGuardSnapshot(issue);
-      const closeOutcome = await preflightCloseOnAcceptDoneTransition(issue, userId, true);
+      const [guardIssue = null] = await db.select().from(issueRows)
+        .where(and(eq(issueRows.companyId, issue.companyId), eq(issueRows.id, issue.id)));
+      if (!guardIssue) throw notFound("Issue not found");
+      const closeOutcome = await preflightCloseOnAcceptDoneTransition(guardIssue, userId, true);
       if (!closeOutcome.ok) {
         res.status(closeOutcome.status).json(closeOutcome.body);
         return;
@@ -25720,6 +25750,7 @@ export function issueRoutes(
         guardSnapshot,
       );
       if (reconciled.outcome === "applied") {
+        closeOutcome.recordGuardSkipDisposition?.();
         await runCloseOnAcceptCompletionWakes(reconciled.closeOnAccept, getActorInfo(req));
       }
       res.json({

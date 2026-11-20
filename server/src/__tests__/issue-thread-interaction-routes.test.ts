@@ -175,22 +175,44 @@ vi.mock("../services/trust-preset-resolver.js", () => ({
 // other test keeps the real guard through the delegate.
 const mockDoneTransitionGuard = vi.hoisted(() => ({
   actual: null as null | ((...args: unknown[]) => unknown),
+  writeAuditLog: null as null | ((...args: unknown[]) => unknown),
+  writeGuardSkippedAuditLog: null as null | ((...args: unknown[]) => unknown),
 }));
 const mockEvaluateDoneTransitionGuard = vi.hoisted(() =>
   vi.fn((...args: unknown[]) => mockDoneTransitionGuard.actual!(...args)),
 );
+// RA F1: observe the guard's "transition allowed" audit rows.
+const mockGuardWriteAuditLog = vi.hoisted(() =>
+  vi.fn((...args: unknown[]) => mockDoneTransitionGuard.writeAuditLog!(...args)),
+);
+const mockGuardWriteSkippedAuditLog = vi.hoisted(() =>
+  vi.fn((...args: unknown[]) => mockDoneTransitionGuard.writeGuardSkippedAuditLog!(...args)),
+);
 vi.mock("../services/done-transition-guard.js", async (importOriginal) => {
   const actual = await importOriginal<typeof DoneTransitionGuardModule>();
   mockDoneTransitionGuard.actual = actual.evaluateDoneTransitionGuard as (...args: unknown[]) => unknown;
-  return { ...actual, evaluateDoneTransitionGuard: mockEvaluateDoneTransitionGuard };
+  mockDoneTransitionGuard.writeAuditLog = actual.writeAuditLog as (...args: unknown[]) => unknown;
+  mockDoneTransitionGuard.writeGuardSkippedAuditLog = actual.writeGuardSkippedAuditLog as (...args: unknown[]) => unknown;
+  return {
+    ...actual,
+    evaluateDoneTransitionGuard: mockEvaluateDoneTransitionGuard,
+    writeAuditLog: mockGuardWriteAuditLog,
+    writeGuardSkippedAuditLog: mockGuardWriteSkippedAuditLog,
+  };
 });
 
-// SUP-24788 (B1-b): the publication-card binding reads plugin and document rows;
-// the service suite proves it on a real database. Route tests steer its result.
+// SUP-24788 (B1-b, B2-ii): the publication-card binding and the stage check read
+// plugin, document, and activity rows; the service suite proves them on a real
+// database. Route tests steer their results.
 const mockCloseOnAcceptCardBinding = vi.hoisted(() => vi.fn(async () => null as string | null));
+const mockCloseOnAcceptStage = vi.hoisted(() => vi.fn(async () => null as string | null));
 vi.mock("../services/issue-thread-interactions.js", async (importOriginal) => {
   const actual = await importOriginal<typeof IssueThreadInteractionsModule>();
-  return { ...actual, closeOnAcceptCardBindingIneligibleReason: mockCloseOnAcceptCardBinding };
+  return {
+    ...actual,
+    closeOnAcceptCardBindingIneligibleReason: mockCloseOnAcceptCardBinding,
+    closeOnAcceptStageIneligibleReason: mockCloseOnAcceptStage,
+  };
 });
 
 function registerModuleMocks() {
@@ -3983,7 +4005,14 @@ describe("issue thread interaction routes", () => {
       mockIssueService.getById.mockResolvedValue(publicationIssue());
       mockInteractionService.getForIssue.mockResolvedValue(interaction);
       mockEvaluateDoneTransitionGuard.mockResolvedValue(ALLOWED_GUARD);
-      mockInteractionService.acceptInteraction.mockResolvedValue(acceptedPublication(interaction, "done"));
+      mockInteractionService.acceptInteraction.mockResolvedValue({
+        ...acceptedPublication(interaction, "done"),
+        closeOnAccept: {
+          issue: { ...publicationIssue(), status: "done" },
+          previous: publicationIssue(),
+          decision: null,
+        },
+      });
 
       const res = await request(await createApp())
         .post(`/api/issues/${ISSUE_ID}/interactions/${PUBLICATION_INTERACTION_ID}/accept`)
@@ -3991,6 +4020,13 @@ describe("issue thread interaction routes", () => {
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(mockEvaluateDoneTransitionGuard).toHaveBeenCalledTimes(1);
+      // RA F1: the guard's allowed rows are written once the close committed.
+      expect(mockGuardWriteAuditLog).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        "issue.done_tier_declaration_skipped",
+        expect.anything(),
+      );
       expect(mockInteractionService.acceptInteraction).toHaveBeenCalledTimes(1);
       expect(mockInteractionService.acceptInteraction.mock.calls[0]?.[4]).toEqual({
         closeIssueOnAccept: true,
@@ -4083,6 +4119,72 @@ describe("issue thread interaction routes", () => {
       expect(mockCloseOnAcceptCardBinding).toHaveBeenCalledTimes(1);
       expect(mockEvaluateDoneTransitionGuard).not.toHaveBeenCalled();
       expect(mockInteractionService.acceptInteraction.mock.calls[0]).toHaveLength(4);
+    });
+
+    it("keeps the ordinary accept on a card that carries a pull request or delivery identity (RA F2 cell 8)", async () => {
+      const current = publicationInteraction();
+      mockIssueService.getById.mockResolvedValue(publicationIssue());
+      mockInteractionService.getForIssue.mockResolvedValue(current);
+      mockCloseOnAcceptCardBinding.mockResolvedValue("card_has_linked_pull_request");
+      mockInteractionService.acceptInteraction.mockResolvedValue(acceptedPublication(current, "in_review"));
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${ISSUE_ID}/interactions/${PUBLICATION_INTERACTION_ID}/accept`)
+        .send({});
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockEvaluateDoneTransitionGuard).not.toHaveBeenCalled();
+      expect(mockInteractionService.acceptInteraction.mock.calls[0]).toHaveLength(4);
+    });
+
+    it("keeps the ordinary accept when the stage cannot be decided by close-on-accept (RA F3)", async () => {
+      const current = publicationInteraction();
+      mockIssueService.getById.mockResolvedValue(publicationIssue());
+      mockInteractionService.getForIssue.mockResolvedValue(current);
+      mockCloseOnAcceptStage.mockResolvedValue("stage_not_final_review");
+      mockInteractionService.acceptInteraction.mockResolvedValue(acceptedPublication(current, "in_review"));
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${ISSUE_ID}/interactions/${PUBLICATION_INTERACTION_ID}/accept`)
+        .send({});
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockCloseOnAcceptStage).toHaveBeenCalledTimes(1);
+      expect(mockEvaluateDoneTransitionGuard).not.toHaveBeenCalled();
+      expect(mockInteractionService.acceptInteraction.mock.calls[0]).toHaveLength(4);
+    });
+
+    it("leaves no 'transition allowed' audit row when the close is refused under the lock (RA F1)", async () => {
+      mockIssueService.getById.mockResolvedValue(publicationIssue());
+      mockInteractionService.getForIssue.mockResolvedValue(publicationInteraction());
+      mockEvaluateDoneTransitionGuard.mockResolvedValue({
+        allowed: true,
+        reason: "Record-only delivery requirement: repository/PR delivery is not required; transition allowed",
+        skipped: true,
+        skipReason: "record_only_delivery_skipped",
+      });
+      const app = await createApp();
+      const { conflict } = await import("../errors.js");
+      mockInteractionService.acceptInteraction.mockRejectedValue(
+        conflict("The issue changed after the done-transition preflight; retry the acceptance", {
+          code: "close_on_accept_refused",
+          reason: "guard_inputs_changed",
+        }),
+      );
+
+      const res = await request(app)
+        .post(`/api/issues/${ISSUE_ID}/interactions/${PUBLICATION_INTERACTION_ID}/accept`)
+        .send({});
+
+      expect(res.status).toBe(409);
+      expect(mockEvaluateDoneTransitionGuard).toHaveBeenCalledTimes(1);
+      expect(mockGuardWriteSkippedAuditLog).not.toHaveBeenCalled();
+      expect(mockGuardWriteAuditLog).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        "issue.done_tier_declaration_skipped",
+        expect.anything(),
+      );
     });
 
     it("keeps an ordinary eligible-shape accept on the four-argument path when the flag is missing", async () => {
