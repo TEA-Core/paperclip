@@ -824,6 +824,43 @@ item. If every other present key is allowed bookkeeping, an explicit
 `executionPolicy: undefined` is dropped from the present-key check. The guard
 is skipped, while policy normalization writes `null`.
 
+The Wiki handoff guard is also skipped for a field-less write. In a field-less
+write, every present key is `undefined` or request attribution: `actorAgentId`,
+`actorRunId`, `actorRunStopId`, `actorUserId`, `boardApiKeyId`,
+`expectedUpdatedAt`. A comment-only `PATCH /api/issues/:id` is a field-less
+write when the route adds no field to it and the request carries no
+`reviewRequest` or `deliveryIdentity`; the PATCH route then skips its own guard
+call too. A field-less write sets no assignee, so the guard does not
+judge the stored assignee. Thus a comment on a Wiki handoff whose review stage
+a human reviewer holds (stored `assigneeAgentId` null) is not refused when the
+card is `in_review`, or `done` with its review stage complete. Known limit:
+when the card has another status while its review stage is still pending, for
+example `blocked`, or `todo` with a pending stage, the PATCH route adds fields
+to the write before the field-less check. The comment is then still refused
+with 422 `wiki_handoff_unassigned`. When the write carries any other key, the
+attribution keys still count as present keys. Thus an attributed `status` or
+`unblockDescriptor` write still runs the guard. In `issueService.update`, an
+`executionPolicy` key that comes with attribution keys is not field-less, even
+when its value is `undefined`, because the update normalizes that value to
+`null` and clears the stored policy. Thus an attributed
+`executionPolicy: undefined` write still runs the guard. A bare
+`executionPolicy: undefined` write, with no other present key, skips the guard
+and clears the stored policy, as the paragraph above states. That behavior
+predates the field-less skip, and the field-less skip does not change it.
+
+The board stage decision (`POST /issues/:id/execution-stage/board-decision`)
+can close the final stage of an unassigned Wiki handoff card. That hand-back
+has no return-to, so the route drops the no-op `assigneeAgentId: null` and
+`assigneeUserId: null` keys and marks the write with an internal
+`boardStageDecision` flag. The guard admits it only when the write carries no
+assignee key and the stored row has no agent and no user assignee. Any assignee
+write, including one naming the canonical Maintainer, and any owned row stay
+guarded as before. Only that route sets the flag. The plugin host forwards just
+the patch fields the plugin SDK declares for `issues.update`
+(`PluginIssueUpdatePatch`). It drops every other key, including the issue
+service's internal flags (`boardStageDecision`, `workflowControlledAssignment`,
+`companyGuard`, `expectedUpdatedAt`).
+
 The boundary is the write path. Per-card isolation is required for every
 startup sweep that writes issue rows through the guarded issue service
 (`issueService.update`), because the Wiki handoff guard and the other assignee
