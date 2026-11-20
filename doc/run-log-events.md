@@ -390,3 +390,15 @@ retries cleanup. This event preserves the run outcome and does not claim a file
 save; `instruction_save` remains authoritative for collection. The event contains
 no raw exception, host path, file contents, or lock-owner metadata. Failure to
 write the warning must not replace the provider outcome or stop lease release.
+
+## Queued-run claim skips
+
+When the atomic claim of a queued scheduled-retry run returns without claiming,
+cancelling, or deferring the run, the server writes one `warn` `lifecycle`
+event per run and reason. The payload is `{ "claimStaleReason", "issueId" }`.
+The reasons are `issue_not_found`, `run_not_queued`, `wake_not_bound`,
+`native_replacement_lock_held`, `chat_control_admission_invalid`,
+`retry_lineage_unresolved`, and `previous_owner_not_settled`. A run that no
+longer exists gets a server log line only. The event is written after the claim
+transaction ends. It changes no run state and adds no Paperclip Telemetry or
+OpenTelemetry export.
