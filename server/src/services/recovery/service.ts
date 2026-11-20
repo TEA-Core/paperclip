@@ -4431,9 +4431,35 @@ export function recoveryService(
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
   }) {
-    const updated = await blockIssueWithUnresolvedBlockers(db, input.issue, {
-      source: "recovery.reconcile_stranded_recovery_issue",
-      previousStatus: input.previousStatus,
+    // The caller's snapshot can predate an accepted close. Recheck the status under the
+    // issue-row lock and write through the same transaction so a terminal card is never
+    // parked `blocked` (which would also stamp `blockedTransitionAt` and invite a re-open).
+    const updated = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const [current] = await tx
+        .select({ status: issues.status })
+        .from(issues)
+        .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId)))
+        .for("update")
+        .limit(1);
+      if (!current) return null;
+      if (current.status === "done" || current.status === "cancelled") {
+        logger.info(
+          {
+            issueId: input.issue.id,
+            identifier: input.issue.identifier,
+            status: current.status,
+            previousStatus: input.previousStatus,
+          },
+          "skipping stranded recovery issue escalation: recovery issue is already terminal",
+        );
+        return null;
+      }
+      return blockIssueWithUnresolvedBlockers(db, input.issue, {
+        source: "recovery.reconcile_stranded_recovery_issue",
+        previousStatus: input.previousStatus,
+        tx: txDb,
+      });
     });
     if (!updated) return null;
 

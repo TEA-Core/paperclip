@@ -1373,6 +1373,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     const agentId = (await fixture.read()).createdByAgentId!;
     const [run] = await db.insert(heartbeatRuns).values({
       companyId: fixture.company.id, agentId, status: "running",
+      contextSnapshot: { issueId: fixture.issue.id },
     }).returning();
     await db.update(issues).set({
       assigneeAgentId: agentId, assigneeUserId: null, executionRunId: run!.id, executionLockedAt: new Date(),
@@ -1590,7 +1591,7 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
     ["title", "NEW.title := 'Renamed while the run was cancelled';"],
     ["execution policy", `NEW.execution_policy := NEW.execution_policy || '{"commentRequired": true}'::jsonb;`],
     ["execution state", `NEW.execution_state := NEW.execution_state || '{"lastDecisionOutcome": "changes_requested"}'::jsonb;`],
-  ])("refuses a final PATCH when a concurrent %s change lands during its own run cancellation", async (_label, mutation) => {
+  ])("approves a final PATCH whose own run release carries a concurrent %s change", async (_label, mutation) => {
     const fixture = await pendingDelivery({ mergeArmingEnabled: true });
     await holdAgentRun(fixture);
     let response!: request.Response;
@@ -1600,15 +1601,20 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
       `${mutation} return NEW;`,
       async () => { response = await fixture.approve(reassignToBoardUser); },
     );
-    expect(response.status).toBe(409);
-    expect(response.body.details).toMatchObject({ code: "approval_final_delivery_preflight_stale" });
+    // SUP-23801: the reassignment stop is deferred past the commit, so the
+    // final PATCH no longer opens a pre-commit cancellation window. The
+    // decision commits and the carried change rides the same row write.
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
     const stored = await fixture.read();
-    expect(stored.status).toBe("in_review");
-    expect(stored.executionState?.completedStageIds).toEqual([]);
-    expect(stored.executionState?.approvalStatus).toBeUndefined();
-    expect(await db.select().from(issueExecutionDecisions)).toEqual([]);
-    expect(fixture.writes).toEqual([]);
-    expect(fixture.armCalls).toEqual([]);
+    expect(stored.status).toBe("done");
+    expect(await db.select().from(issueExecutionDecisions)).toEqual([expect.objectContaining({ outcome: "approved" })]);
+    if (_label === "title") {
+      expect(stored.title).toBe("Renamed while the run was cancelled");
+    } else if (_label === "execution policy") {
+      expect((stored.executionPolicy as Record<string, unknown>).commentRequired).toBe(true);
+    } else {
+      expect((stored.executionState as Record<string, unknown>).lastDecisionOutcome).toBe("changes_requested");
+    }
   });
 
   it("publishes nothing and keeps the escalation pending when the accept transaction fails after the decision", async () => {

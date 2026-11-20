@@ -264,6 +264,32 @@ export function isFieldlessIssueWrite(data: Record<string, unknown>): boolean {
   );
 }
 
+/**
+ * SUP-24632: the second and only other write the Wiki handoff guard admits
+ * without the canonical Maintainer as the resulting assignee. The board stage
+ * decision (`POST /issues/:id/execution-stage/board-decision`) closing the final
+ * stage of an unowned handoff hands the card back to a null return-to; nobody is
+ * assigned before or after. All conditions hold together:
+ * - the caller marks the write as that route's decision (the guard's
+ *   `boardStageDecision` input, fed by an internal field no request schema accepts);
+ * - the write carries no assignee field (`assigneeAgentId`/`assigneeUserId`);
+ * - the stored row has no agent and no user assignee (both exactly null).
+ * With no assignee field written, the row keeps its stored null assignees, so
+ * the exemption can only leave an unassigned handoff unassigned. Any assignee
+ * write, any owned row, and any unknown (undefined) stored assignee stay guarded.
+ */
+export function isUnassignedWikiHandoffBoardStageDecision(input: {
+  assigneeFieldWritten: boolean;
+  currentAssigneeAgentId: string | null | undefined;
+  currentAssigneeUserId: string | null | undefined;
+}): boolean {
+  return (
+    input.assigneeFieldWritten === false &&
+    input.currentAssigneeAgentId === null &&
+    input.currentAssigneeUserId === null
+  );
+}
+
 export async function assertWikiHandoffWriteIntegrity(input: {
   db: Db | { select: unknown };
   companyId: string;
@@ -285,6 +311,15 @@ export async function assertWikiHandoffWriteIntegrity(input: {
    */
   cancellation?: {
     requestedStatus: unknown;
+    assigneeFieldWritten: boolean;
+    currentAssigneeUserId: string | null | undefined;
+  };
+  /**
+   * SUP-24632: the board stage decision's marker and assignee shape, so the
+   * guard can admit a final-stage close of an unassigned handoff. Omit it at
+   * doors that cannot be that decision; without it the exemption never applies.
+   */
+  boardStageDecision?: {
     assigneeFieldWritten: boolean;
     currentAssigneeUserId: string | null | undefined;
   };
@@ -317,6 +352,14 @@ export async function assertWikiHandoffWriteIntegrity(input: {
       assigneeFieldWritten: input.cancellation.assigneeFieldWritten,
       currentAssigneeAgentId: input.currentAssigneeAgentId,
       currentAssigneeUserId: input.cancellation.currentAssigneeUserId,
+    })
+  ) return;
+  if (
+    input.boardStageDecision &&
+    isUnassignedWikiHandoffBoardStageDecision({
+      assigneeFieldWritten: input.boardStageDecision.assigneeFieldWritten,
+      currentAssigneeAgentId: input.currentAssigneeAgentId,
+      currentAssigneeUserId: input.boardStageDecision.currentAssigneeUserId,
     })
   ) return;
   if (

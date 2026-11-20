@@ -11931,6 +11931,12 @@ export function issueService(db: Db) {
          * self-satisfying review-stage gate does not apply to it.
          */
         workflowControlledAssignment?: boolean;
+        /**
+         * Internal only. Set by the board stage-decision route (SUP-24632) on
+         * the write that closes the final stage of an unassigned Wiki handoff
+         * without writing an assignee. Never a column; never from a request body.
+         */
+        boardStageDecision?: boolean;
         companyGuard?: string;
         /**
          * Internal only. Optimistic concurrency token for PATCH /api/issues/:id.
@@ -11990,6 +11996,7 @@ export function issueService(db: Db) {
         companyGuard,
         expectedUpdatedAt,
         workflowControlledAssignment,
+        boardStageDecision,
         ...issueData
       } = data;
       // An explicit edit claims the title, even if it keeps the same text.
@@ -12516,6 +12523,16 @@ export function issueService(db: Db) {
                 issueData.assigneeUserId !== undefined,
               currentAssigneeUserId: receiptExisting.assigneeUserId,
             },
+            ...(boardStageDecision === true
+              ? {
+                  boardStageDecision: {
+                    assigneeFieldWritten:
+                      issueData.assigneeAgentId !== undefined ||
+                      issueData.assigneeUserId !== undefined,
+                    currentAssigneeUserId: receiptExisting.assigneeUserId,
+                  },
+                }
+              : {}),
           });
         }
         if (
