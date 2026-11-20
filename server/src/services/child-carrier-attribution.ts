@@ -504,6 +504,8 @@ export async function classifyAncestorCarrierHead(
   issueId: string,
   headRef: string,
 ): Promise<"absent" | "one" | "many"> {
+  const card = await readChildWorkspace(db, companyId, issueId);
+  if (!card || card.branch === headRef) return "absent";
   const ancestors = await findCarrierAncestors(db, companyId, issueId, headRef);
   if (ancestors.length === 0) return "absent";
   return ancestors.length === 1 ? "one" : "many";
