@@ -828,8 +828,9 @@ The Wiki handoff guard is also skipped for a field-less write. In a field-less
 write, every present key is `undefined` or request attribution: `actorAgentId`,
 `actorRunId`, `actorRunStopId`, `actorUserId`, `boardApiKeyId`,
 `expectedUpdatedAt`. A comment-only `PATCH /api/issues/:id` is a field-less
-write when the route adds no field to it, and the PATCH route then skips its
-own guard call too. A field-less write sets no assignee, so the guard does not
+write when the route adds no field to it and the request carries no
+`reviewRequest` or `deliveryIdentity`; the PATCH route then skips its own guard
+call too. A field-less write sets no assignee, so the guard does not
 judge the stored assignee. Thus a comment on a Wiki handoff whose review stage
 a human reviewer holds (stored `assigneeAgentId` null) is not refused when the
 card is `in_review`, or `done` with its review stage complete. Known limit:
