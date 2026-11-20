@@ -66,7 +66,7 @@ import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt, isSpawnEnvelopeTooLargeError } from "@paperclipai/adapter-utils/server-utils";
-import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { PROJECT_REPOSITORIES_DIR, PROJECT_REPOSITORIES_EXCLUDE_LINE, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, isWorkspaceGitScanFailureCode, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
 import { captureDirectorySnapshot, disposeDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { initializeRunIdentity, explicitOperatorRunIdentity } from "./run-identity.js";
@@ -2994,9 +2994,9 @@ export async function prepareProjectRepositoryWorkspaces(input: {
   const excludePath = await execFile("git", ["-C", input.cwd, "rev-parse", "--git-path", "info/exclude"], { timeout: 10_000 })
     .then((result) => path.resolve(input.cwd, result.stdout.trim()));
   const exclude = await fs.readFile(excludePath, "utf8").catch(() => "");
-  if (!exclude.split(/\r?\n/).includes(`/${PROJECT_REPOSITORIES_DIR}/`)) {
+  if (!exclude.split(/\r?\n/).includes(PROJECT_REPOSITORIES_EXCLUDE_LINE)) {
     await fs.mkdir(path.dirname(excludePath), { recursive: true });
-    await fs.appendFile(excludePath, `\n/${PROJECT_REPOSITORIES_DIR}/\n`);
+    await fs.appendFile(excludePath, `\n${PROJECT_REPOSITORIES_EXCLUDE_LINE}\n`);
   }
   const results = [];
   for (const workspace of selected) {
