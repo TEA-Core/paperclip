@@ -1923,8 +1923,11 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   const plainLanguageReason = inProgressOperation
     ? `${basePlainLanguageReason} An interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[inProgressOperation]} is still in progress in this worktree.`
     : basePlainLanguageReason;
+  // Same-tip and contained-head repairs also move HEAD. A live claimant on
+  // this checkout must keep that HEAD; without a database there is still no
+  // claimant to find.
   const canCheckoutRecordedBranch =
-    cleanliness === "clean" && expectedBranchExists && sameHead && registeredBranchMatchesHead;
+    cleanliness === "clean" && expectedBranchExists && sameHead && registeredBranchMatchesHead && !liveContention;
   const canAdoptForwardActualBranch =
     cleanliness === "clean" &&
     expectedBranchExists &&
@@ -1957,7 +1960,8 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     registeredBranchMatchesHead &&
     input.actualBranchName !== null &&
     ancestryVerdict !== "ancestor" &&
-    actualHeadContainedInExpectedBranch;
+    actualHeadContainedInExpectedBranch &&
+    !liveContention;
   // SUP-11207: the containment proof above is only *needed* when the commits on HEAD would
   // otherwise become unreachable — a detached HEAD, or a branch ref that no longer exists. When
   // HEAD is on a live named branch that git still resolves, checking out the recorded branch
@@ -3757,6 +3761,120 @@ export async function inspectManagedGitWorktreeBranch(input: {
   };
 }
 
+const RECORDED_BRANCH_SHA_LOOKALIKE = /^[0-9a-f]{40}$/i;
+
+function isConcreteRecordedBranch(branch: string | null | undefined): branch is string {
+  const value = asString(branch, "").trim();
+  if (!value || value === "HEAD") return false;
+  if (RECORDED_BRANCH_SHA_LOOKALIKE.test(value)) return false;
+  return true;
+}
+
+export type CheckoutBranchDriftEvidence = {
+  reason: "checkout_branch_drift";
+  reasonCode: "branch_mismatch";
+  expectedBranch: string;
+  actualBranch: string | null;
+  headSha: string | null;
+  canonicalCwd: string;
+  executionWorkspaceId: string | null;
+};
+
+function formatCheckoutBranchDriftMessage(evidence: CheckoutBranchDriftEvidence) {
+  return (
+    `Managed checkout branch drift: expected "${evidence.expectedBranch}" but found ` +
+    `"${evidence.actualBranch ?? "<detached>"}" at HEAD ${evidence.headSha ?? "<unresolved>"} ` +
+    `in canonical cwd "${evidence.canonicalCwd}" ` +
+    `(execution workspace ${evidence.executionWorkspaceId ?? "<none>"}). ` +
+    `The recorded branch was left unchanged.`
+  );
+}
+
+function recordedBranchMatchesCheckout(expectedRaw: string, actualBranch: string | null) {
+  if (!actualBranch) return false;
+  const expected = expectedRaw.replace(/^origin\//, "");
+  const actual = actualBranch.replace(/^origin\//, "");
+  return actualBranch === expectedRaw || actual === expected;
+}
+
+async function readBoundCheckoutGitIdentity(cwd: string): Promise<{
+  canonicalCwd: string;
+  isGit: boolean;
+  branch: string | null;
+  headSha: string | null;
+} | null> {
+  if (!await directoryExists(cwd)) return null;
+  const canonicalCwd = await resolvePathForWorktreeComparison(cwd);
+  const gitDir = await runGit(["rev-parse", "--git-dir"], canonicalCwd).catch(() => null);
+  if (!gitDir) return { canonicalCwd, isGit: false, branch: null, headSha: null };
+  const branch = await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], canonicalCwd).catch(() => null);
+  const headSha = await runGit(["rev-parse", "HEAD"], canonicalCwd).catch(() => null);
+  return { canonicalCwd, isGit: true, branch, headSha };
+}
+
+/**
+ * Re-read a bound checkout after restore, provisioning, and service startup.
+ * A concrete recorded branch on a Git checkout must still be the branch that
+ * is checked out. Ordinary non-Git project directories are left alone. The
+ * recorded branch is not rewritten to whatever HEAD happens to name.
+ */
+async function assertRecordedCheckoutBranchIdentity(input: {
+  cwd: string;
+  expectedBranch: string | null | undefined;
+  strategy?: string | null;
+  executionWorkspaceId?: string | null;
+  repoRoot?: string | null;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<void> {
+  const expectedRaw = asString(input.expectedBranch, "").trim();
+  if (!isConcreteRecordedBranch(expectedRaw)) return;
+  const identity = await readBoundCheckoutGitIdentity(input.cwd);
+  if (!identity || !identity.isGit) return;
+  if (recordedBranchMatchesCheckout(expectedRaw, identity.branch)) return;
+
+  let actualBranch = identity.branch;
+  if (input.strategy === "git_worktree") {
+    const inspection = await inspectManagedGitWorktreeBranch({
+      worktreePath: identity.canonicalCwd,
+      expectedBranchName: expectedRaw.replace(/^origin\//, ""),
+      repoRoot: input.repoRoot ?? null,
+    }).catch(() => null);
+    if (inspection?.valid) return;
+    if (inspection && inspection.actualBranchName !== undefined) {
+      actualBranch = inspection.actualBranchName;
+    }
+  }
+  if (recordedBranchMatchesCheckout(expectedRaw, actualBranch)) return;
+
+  const evidence: CheckoutBranchDriftEvidence = {
+    reason: "checkout_branch_drift",
+    reasonCode: "branch_mismatch",
+    expectedBranch: expectedRaw.replace(/^origin\//, ""),
+    actualBranch,
+    headSha: identity.headSha,
+    canonicalCwd: identity.canonicalCwd,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
+  };
+  const message = formatCheckoutBranchDriftMessage(evidence);
+  if (input.recorder) {
+    await input.recorder.recordOperation({
+      phase: "worktree_prepare",
+      command: "git symbolic-ref --short HEAD",
+      cwd: identity.canonicalCwd,
+      metadata: { checkoutBranchDrift: evidence },
+      run: async () => ({
+        status: "failed",
+        stderr: message,
+        metadata: { checkoutBranchDrift: evidence },
+      }),
+    }).catch(() => undefined);
+  }
+  throw new WorkspaceRuntimeValidationFailure(message, {
+    workspaceValidation: evidence,
+  });
+}
+
+
 async function validateLinkedGitWorktree(input: {
   repoRoot: string;
   worktreePath: string;
@@ -5546,6 +5664,40 @@ function liveProjectPrimaryRestoreGuard(
   };
 }
 
+/**
+ * Hygiene must not treat the checkout it is about to restore as a disposable
+ * base when that path is the bound source. Canonical comparison covers a
+ * symlink alias of the same checkout. Owner-root resolution is what keeps a
+ * linked worktree from being selected as the base in the first place.
+ */
+function sameSourceCheckoutRestoreGuard(input: {
+  sourceCwd: string;
+  hygieneRoot: string;
+}): BaseRepoRestoreGuard {
+  return async () => {
+    const source = await resolvePathForWorktreeComparison(input.sourceCwd);
+    const root = await resolvePathForWorktreeComparison(input.hygieneRoot);
+    if (source === root) {
+      return "it is the bound source checkout, not a disposable base repository";
+    }
+    return null;
+  };
+}
+
+function composeBaseRepoRestoreGuards(
+  guards: Array<BaseRepoRestoreGuard | null | undefined>,
+): BaseRepoRestoreGuard {
+  return async () => {
+    for (const guard of guards) {
+      if (!guard) continue;
+      const reason = await guard();
+      if (reason) return reason;
+    }
+    return null;
+  };
+}
+
+
 export async function prepareBaseRepoForWorkspace(input: {
   repoRoot: string;
   configuredBaseRef: string | null;
@@ -6460,6 +6612,28 @@ export async function realizeExecutionWorkspace(input: {
   };
 }
 
+async function finishPreservedCheckout(
+  realized: RealizedExecutionWorkspace,
+  input: {
+    preserveRecordedCheckoutBranch?: boolean;
+    workspace: { branchName?: string | null; id?: string | null };
+    recorder?: WorkspaceOperationRecorder | null;
+  },
+): Promise<RealizedExecutionWorkspace> {
+  if (input.preserveRecordedCheckoutBranch !== true) return realized;
+  await assertRecordedCheckoutBranchIdentity({
+    cwd: realized.cwd,
+    expectedBranch: input.workspace.branchName,
+    strategy: realized.strategy,
+    executionWorkspaceId: input.workspace.id ?? null,
+    recorder: input.recorder ?? null,
+  });
+  return {
+    ...realized,
+    branchName: input.workspace.branchName ?? realized.branchName,
+  };
+}
+
 export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   db?: Db | null;
   base: ExecutionWorkspaceInput;
@@ -6487,6 +6661,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   enableWorkspaceDirtyQuarantineRepair?: boolean;
   recorder?: WorkspaceOperationRecorder | null;
   resolveGitAuth?: GitRemoteAuthProvider | null;
+  preserveRecordedCheckoutBranch?: boolean;
 }): Promise<RealizedExecutionWorkspace | null> {
   const cwd = asString(input.workspace.cwd ?? input.workspace.providerRef, "").trim();
   if (!cwd) return null;
@@ -6519,7 +6694,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     if (!await directoryExists(cwd)) {
       return null;
     }
-    return realized;
+    return finishPreservedCheckout(realized, input);
   }
   // Validate the base checkout before the git spawn. A missing or empty base
   // path makes the "git" spawn fail with a raw "spawn git ENOENT" error. That
@@ -6538,7 +6713,9 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       "Cannot rebuild the git worktree: the base project checkout directory does not exist.",
     );
   }
-  const repoRoot = await runGit(["rev-parse", "--show-toplevel"], baseCwd);
+  // A linked worktree's own toplevel is not the disposable base. Resolve the
+  // owning repository so hygiene cannot force-checkout the bound source.
+  const repoRoot = await resolveGitOwnerRepoRoot(baseCwd);
   const recordedBaseRefSha = readRecordedBaseRefSha(input.workspace.metadata);
   if (await directoryExists(cwd)) {
     const reuseWorktreePath = realized.worktreePath ?? cwd;
@@ -6605,7 +6782,10 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
           configuredBaseRef: reuseBaseRef,
           resolveGitAuth: input.resolveGitAuth ?? null,
           recorder: input.recorder ?? null,
-          restoreGuard: liveProjectPrimaryRestoreGuard(input.db, { repoRoot, baseCwd }),
+          restoreGuard: composeBaseRepoRestoreGuards([
+            liveProjectPrimaryRestoreGuard(input.db, { repoRoot, baseCwd }),
+            sameSourceCheckoutRestoreGuard({ sourceCwd: cwd, hygieneRoot: repoRoot }),
+          ]),
         })
       : { baseRef: reuseBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: reuseBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false, divergenceAlert: null };
     if (baseRepoHygiene.divergenceAlert) {
@@ -6655,7 +6835,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       created: false,
       recorder: input.recorder ?? null,
     });
-    return realized;
+    return finishPreservedCheckout(realized, input);
   }
 
   const worktreePath = realized.worktreePath ?? cwd;
@@ -6674,7 +6854,10 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         configuredBaseRef: restoreBaseRef,
         resolveGitAuth: input.resolveGitAuth ?? null,
         recorder: input.recorder ?? null,
-        restoreGuard: liveProjectPrimaryRestoreGuard(input.db, { repoRoot, baseCwd }),
+        restoreGuard: composeBaseRepoRestoreGuards([
+          liveProjectPrimaryRestoreGuard(input.db, { repoRoot, baseCwd }),
+          sameSourceCheckoutRestoreGuard({ sourceCwd: cwd, hygieneRoot: repoRoot }),
+        ]),
       })
     : { baseRef: restoreBaseRef, baseRefSha: null, warnings: [], worktreeBaseRef: restoreBaseRef ?? "HEAD", worktreeBaseSha: null, localBaseUnsafe: false, divergenceAlert: null };
   if (baseRepoHygiene.divergenceAlert) {
@@ -6791,7 +6974,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     recorder: input.recorder ?? null,
   });
 
-  return {
+  return finishPreservedCheckout({
     ...realized,
     cwd: worktreePath,
     worktreePath,
@@ -6802,7 +6985,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       recordedBaseRefSha
       ?? (created ? restoreWorktreeBaseSha : baseDrift.branchBaseRefSha)
       ?? baseDrift.currentBaseRefSha,
-  };
+  }, input);
 }
 
 /**
@@ -9048,6 +9231,7 @@ type StartLocalRuntimeServiceInput = {
   reuseKey: string | null;
   scopeType: "project_workspace" | "execution_workspace" | "run" | "agent";
   scopeId: string | null;
+  assertRecordedCheckoutBranch?: boolean;
 };
 
 type RuntimeProvisionCoordinator = {
@@ -9855,6 +10039,17 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     throw error;
   }
 
+  if (input.assertRecordedCheckoutBranch === true) {
+    await assertRecordedCheckoutBranchIdentity({
+      cwd: input.workspace.cwd,
+      expectedBranch: input.workspace.branchName,
+      strategy: input.workspace.strategy,
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
+      repoRoot: input.workspace.baseCwd,
+      recorder: input.recorder ?? null,
+    });
+  }
+
   const shell = resolveShell();
   const serviceLog = await openLocalServiceLogFile(serviceKey);
   let child: ChildProcess;
@@ -10019,6 +10214,17 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
         }
       }
     }
+    if (input.assertRecordedCheckoutBranch === true) {
+      await assertRecordedCheckoutBranchIdentity({
+        cwd: input.workspace.cwd,
+        expectedBranch: input.workspace.branchName,
+        strategy: input.workspace.strategy,
+        executionWorkspaceId: input.executionWorkspaceId ?? null,
+        repoRoot: input.workspace.baseCwd,
+        recorder: input.recorder ?? null,
+      });
+    }
+
     record.status = "running";
     record.healthStatus = "healthy";
     record.lastUsedAt = new Date().toISOString();
@@ -10120,6 +10326,33 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     if (exposureConfig) {
       await persistRuntimeServiceRecord(record.db, record).catch(() => undefined);
     }
+    if (err instanceof WorkspaceRuntimeValidationFailure) throw err;
+    if (input.assertRecordedCheckoutBranch === true) {
+      try {
+        await assertRecordedCheckoutBranchIdentity({
+          cwd: input.workspace.cwd,
+          expectedBranch: input.workspace.branchName,
+          strategy: input.workspace.strategy,
+          executionWorkspaceId: input.executionWorkspaceId ?? null,
+          repoRoot: input.workspace.baseCwd,
+          recorder: input.recorder ?? null,
+        });
+      } catch (drift) {
+        if (drift instanceof WorkspaceRuntimeValidationFailure) {
+          const wrapped = new WorkspaceRuntimeValidationFailure(
+            `${drift.message} Original startup error: ${failureMessage}`,
+            {
+              ...drift.resultJson,
+              originalError: failureMessage,
+            },
+          );
+          wrapped.cause = err instanceof Error ? err : new Error(failureMessage);
+          throw wrapped;
+        }
+        throw drift;
+      }
+    }
+
     if (bindCollision && port) throw new RuntimeServicePortBindCollision(port);
     if (exposureHostCollision && port) {
       // A verified host listener holds the assigned exposure port. Quarantine the
@@ -10997,6 +11230,7 @@ type StartRuntimeServicesForWorkspaceControlInput = {
   serviceIndex?: number | null;
   runtimeServiceId?: string | null;
   respectDesiredStates?: boolean;
+  assertRecordedCheckoutBranch?: boolean;
 };
 
 type WorkspaceControlStartBatch = {
@@ -11096,6 +11330,7 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
       reuseKey,
       scopeType,
       scopeId,
+      assertRecordedCheckoutBranch: input.assertRecordedCheckoutBranch === true,
     };
 
     // Manually controlled services are not tied to a heartbeat run lifecycle, so they do not

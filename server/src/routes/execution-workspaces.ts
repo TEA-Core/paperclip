@@ -542,6 +542,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       run: async (reportProgress) => {
         const ensureWorkspaceAvailable = async () =>
           await ensurePersistedExecutionWorkspaceAvailable({
+            db,
             base: {
               baseCwd: projectWorkspace?.cwd ?? workspaceCwd,
               source: existing.mode === "shared_workspace" ? "project_primary" : "task_session",
@@ -551,6 +552,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
               repoRef: existing.baseRef,
             },
             workspace: {
+              id: existing.id,
               mode: existing.mode,
               strategyType: existing.strategyType,
               cwd: existing.cwd,
@@ -582,6 +584,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
               companyId: existing.companyId,
             },
             recorder,
+            preserveRecordedCheckoutBranch: true,
           });
 
         if (action === "run") {
@@ -834,7 +837,10 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
                 issue: existing.sourceIssueId
                   ? { id: existing.sourceIssueId, identifier: null, title: existing.name }
                   : null,
-                workspace: availableWorkspace,
+                workspace: {
+                  ...availableWorkspace,
+                  branchName: existing.branchName ?? availableWorkspace.branchName,
+                },
                 executionWorkspaceId: existing.id,
                 config: {
                   workspaceRuntime: effectiveRuntimeConfig,
@@ -846,6 +852,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
                 adapterEnv: {},
                 onLog,
                 recorder,
+                assertRecordedCheckoutBranch: true,
               });
             }
             runtimeServiceCount = startedServices.length;
@@ -896,7 +903,10 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
                     title: existing.name,
                   }
                 : null,
-              workspace: availableWorkspace,
+              workspace: {
+                ...availableWorkspace,
+                branchName: existing.branchName ?? availableWorkspace.branchName,
+              },
               executionWorkspaceId: existing.id,
               config: {
                 workspaceRuntime: effectiveRuntimeConfig,
@@ -910,6 +920,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
               recorder,
               serviceIndex: selectedServiceIndex,
               runtimeServiceId: selectedRuntimeServiceId,
+              assertRecordedCheckoutBranch: true,
             });
           } catch (error) {
             // A failed start must leave the workspace stopped and retryable rather than

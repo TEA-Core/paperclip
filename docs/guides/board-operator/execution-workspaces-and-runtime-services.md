@@ -29,6 +29,8 @@ Workspace commands can be controlled manually from the UI, and heartbeat runs al
 - You can opt a service out of that auto-start by setting its desired state to `stopped`/`manual` in the runtime config; those services stay UI-controlled.
 - Paperclip does not automatically restart workspace services on server boot — services only come back up when the next run (or a manual start) brings them up.
 
+A managed start or restart also checks that a Git checkout still matches its recorded branch. The check runs after restore and provisioning, again immediately before the service process is spawned, and again when readiness completes or startup fails. A mismatch fails the operation, stops any service that start created, and records the expected branch, the actual branch, the HEAD commit, the canonical checkout path, and the workspace id on the workspace operation. The recorded branch is not rewritten to the branch found on disk, and Paperclip does not check the foreign branch back automatically. A project directory that is not a Git checkout is not required to have a branch. This detects drift inside the managed-start flow. It does not lock the checkout against a later `git checkout` from outside that flow.
+
 ## Execution workspace inheritance
 
 Execution workspaces isolate code and runtime state from the project primary workspace.

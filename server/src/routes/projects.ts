@@ -788,6 +788,7 @@ export function projectRoutes(db: Db) {
             onLog,
             serviceIndex: selectedServiceIndex,
             runtimeServiceId: selectedRuntimeServiceId,
+            assertRecordedCheckoutBranch: true,
           });
           runtimeServiceCount = startedServices.length;
         } else {
