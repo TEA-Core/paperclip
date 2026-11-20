@@ -234,6 +234,7 @@ describe("classifyLiveRunCapRun", () => {
     { label: "a stage on the participant's own delivery", issueExecutionState: pendingStage(agentId, { deliveryAuthor: { type: "agent", agentId } }) },
     { label: "a stage with no delivery author", issueExecutionState: pendingStage(agentId, { deliveryAuthor: null }) },
     { label: "a stage the participant seated itself in", issueExecutionState: pendingStage(agentId, { seatedBy: { type: "agent", agentId } }) },
+    { label: "a stage seated by an agent other than the delivery author (a second agent's delivery on an unassigned card)", issueExecutionState: pendingStage(agentId, { seatedBy: { type: "agent", agentId: "second-agent" } }) },
     { label: "a stage seated with no actor", issueExecutionState: pendingStage(agentId, { seatedBy: null }) },
     { label: "a seat recorded for another participant", issueExecutionState: pendingStage(agentId, { seatParticipantAgentId: "someone-else" }) },
     { label: "a stage with no recorded seat", issueExecutionState: { ...pendingStage(agentId), participantSeat: undefined } },

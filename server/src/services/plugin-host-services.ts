@@ -911,6 +911,26 @@ export function buildHostServices(
   };
 
   /**
+   * SUP-24563 N1: a monitor's `scheduledBy: "board"` stamp is reserved for
+   * monitors a board user scheduled through the HTTP routes (which restamp it
+   * from the authenticated actor). A plugin principal is never a board user,
+   * so a plugin issue create can never carry that stamp: any monitor it
+   * schedules is assignee-scheduled. This keeps a plugin-created monitor's
+   * recovery card out of the reserved live-run lane.
+   */
+  const restampPluginMonitorScheduledBy = (fields: Record<string, unknown>): Record<string, unknown> => {
+    let next = fields;
+    const policy = fields.executionPolicy;
+    if (isRecord(policy) && isRecord(policy.monitor) && policy.monitor.scheduledBy !== "assignee") {
+      next = { ...next, executionPolicy: { ...policy, monitor: { ...policy.monitor, scheduledBy: "assignee" } } };
+    }
+    if (next.monitorScheduledBy !== undefined && next.monitorScheduledBy !== "assignee") {
+      next = { ...next, monitorScheduledBy: "assignee" };
+    }
+    return next;
+  };
+
+  /**
    * Verify `userId` is an active human member of `companyId` before letting a
    * plugin attribute a mutation to them. Mirrors the authorization bar the
    * web app's own board routes apply — a plugin can only ever attribute an
@@ -1970,7 +1990,7 @@ export function buildHostServices(
             : originKind,
         );
         const issue = (await issues.create(companyId, {
-          ...(issueInput as any),
+          ...(restampPluginMonitorScheduledBy(issueInput as Record<string, unknown>) as any),
           originKind: normalizedOriginKind,
           originId: params.originId ?? null,
           originRunId: params.originRunId ?? actorRunId ?? null,

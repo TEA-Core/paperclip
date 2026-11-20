@@ -140,8 +140,10 @@ function isAgentPrincipal(principal: LiveRunCapPrincipal | null, agentId: string
  * - the agent is the current participant;
  * - the delivery author (the assignee when the work was delivered) is known
  *   and is not this agent;
- * - the engine's seat record names this agent, seated by a board user or by a
- *   different agent (a participant that seated itself does not count).
+ * - the engine's seat record names this agent, seated by a board user or by
+ *   the delivery author itself (a participant that seated itself, or a seat
+ *   from a second agent that is not the recorded delivery author, does not
+ *   count).
  * The engine is the only writer of `execution_state`: no issue or wake API
  * accepts it, a plugin issue create that carries it is refused, and a plugin
  * issue update never writes it. A state without a seat record (written before
@@ -160,7 +162,16 @@ function isSeatedReviewParticipant(executionState: unknown, agentId: string) {
   const { participant, seatedBy } = seat as { participant?: unknown; seatedBy?: unknown };
   if (!isAgentPrincipal(readPrincipal(participant), agentId)) return false;
   const seater = readPrincipal(seatedBy);
-  return seater !== null && !isAgentPrincipal(seater, agentId);
+  if (!seater || isAgentPrincipal(seater, agentId)) return false;
+  // An agent that seats a participant must be the delivery author itself: a
+  // second agent's delivery on an unassigned card (where the recorded
+  // delivery author stays the earlier author) cannot launder the first
+  // agent's work into the reserved lane. A board user may seat a reviewer on
+  // any delivery, and may be the delivery author an agent seats for.
+  if (seater.type === "agent" && deliveryAuthor.type === "agent" && seater.agentId !== deliveryAuthor.agentId) {
+    return false;
+  }
+  return true;
 }
 
 /**

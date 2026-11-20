@@ -1261,6 +1261,51 @@ describeEmbeddedPostgres("SUP-24563 global live-run cap admission", () => {
     await expectGeneralBehindOlderRun(olderGeneral, await wakeOnIssue(reviewer, issueId, reviewer));
   });
 
+  it("(s) N2: a second agent's delivery on an unassigned card does not seat the first agent in the reserved lane for its own earlier work", async () => {
+    const olderGeneral = await seedReservedSlotsFree();
+    const reviewer = await seedAgent("FirstAgent");
+    const second = await seedAgent("SecondAgent");
+    const author = await seedAgent("EarlierAuthor");
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewer }] }],
+    })!;
+    // An earlier genuine round: the author's delivery seated the reviewer.
+    const heldState = {
+      ...pendingReviewStage(reviewer, author),
+      currentStageId: policy.stages[0]!.id,
+    };
+    // The card is unassigned; a second agent (not the delivery author) moves
+    // it back into review. The engine seats the reviewer with the second agent
+    // as the seating actor, while the delivery author stays the earlier author.
+    const transition = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: heldState,
+      },
+      policy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: {},
+      actor: { agentId: second },
+    });
+    const patch = transition.patch as { status?: string; executionState?: Record<string, unknown> };
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "First agent's work, second agent's delivery",
+      status: patch.status ?? "in_review",
+      assigneeAgentId: reviewer,
+      originKind: "manual",
+      executionPolicy: policy as unknown as Record<string, unknown>,
+      executionState: patch.executionState ?? null,
+    });
+
+    await expectGeneralBehindOlderRun(olderGeneral, await wakeOnIssue(reviewer, issueId, reviewer));
+  });
+
   // ─── (d) router input ─────────────────────────────────────────────────────
 
   it("(d) a router sample of 1 cannot pin the fleet below the floor of 6", async () => {

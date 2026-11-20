@@ -310,6 +310,41 @@ describeEmbeddedPostgres("plugin-host updatePolicy issue guard", () => {
     expect(await db.select().from(activityLog)).toEqual([]);
     services.dispose();
   });
+
+  it("never lets a plugin-host issues.create stamp a monitor as board-scheduled (SUP-24563 N1)", async () => {
+    const company = await createCompany(db, "PMB");
+    const [agent] = await db.insert(agents).values({
+      companyId: company.id,
+      name: "Monitor assignee",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+    }).returning();
+    const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
+
+    const issue = await services.issues.create({
+      companyId: company.id,
+      title: "Plugin-made monitor card",
+      status: "in_progress",
+      assigneeAgentId: agent!.id,
+      executionPolicy: {
+        mode: "normal",
+        monitor: {
+          nextCheckAt: "2027-01-01T00:00:00.000Z",
+          scheduledBy: "board",
+          recoveryPolicy: "create_recovery_issue",
+        },
+        stages: [],
+      },
+    } as never);
+
+    const row = await db.query.issues.findFirst({ where: (i, { eq }) => eq(i.id, issue.id) });
+    const policy = row!.executionPolicy as { monitor?: { scheduledBy?: string } } | null;
+    expect(policy?.monitor?.scheduledBy).toBe("assignee");
+    expect(row!.monitorScheduledBy).not.toBe("board");
+    await db.delete(issues).where(eq(issues.id, issue.id));
+    services.dispose();
+  });
 });
 
 describeEmbeddedPostgres("plugin-host wiki handoff issue update guard (SUP-21752)", () => {
