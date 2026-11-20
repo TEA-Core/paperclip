@@ -3864,6 +3864,7 @@ async function resolveSingleMergedMentionCarrier(
     displayName: string;
     pr: { owner: string; repo: string; number: number };
   }> = [];
+  let liveDraft = false;
   for (const pr of mentioned) {
     const candidates = await resolveGitHubTokenCandidatesForRepo(db, companyId, pr.owner, pr.repo);
     // SUP-22355: a mention no credential can even attempt is unreadable —
@@ -3873,6 +3874,7 @@ async function resolveSingleMergedMentionCarrier(
       const live = await fetchPullRequestHeadSha(candidates[i]!.token, pr.owner, pr.repo, pr.number);
       if (live.ok) {
         unreadable = null;
+        if (live.merged !== true && live.draft === true) liveDraft = true;
         if (live.merged === true && live.headSha) {
           mergedCarriers.push({
             kind: "resolved",
@@ -3894,7 +3896,7 @@ async function resolveSingleMergedMentionCarrier(
       };
     }
   }
-  if (mergedCarriers.length === 0) return { kind: "none" };
+  if (liveDraft || mergedCarriers.length === 0) return { kind: "none" };
   if (mergedCarriers.length > 1) {
     const names = mergedCarriers.map((carrier) => carrier.displayName).join(", ");
     return {

@@ -2235,6 +2235,35 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       }
     });
 
+    it("refuses a merged mentioned PR while a sibling mention is still a live draft (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "closed" });
+      await insertMention(issueId, { number: 43, state: "open", draft: true });
+      installRoutes([
+        { url: OPEN_PRS_LIST_URL, body: [openPrsListItem({ number: 43, draft: true, head: { ref: "SUP-42-branch" }, title: "Fix thing (SUP-42)" })] },
+        { url: PR_URL, body: mergedMentionBody() },
+        {
+          url: PR_43_URL,
+          body: {
+            state: "open",
+            draft: true,
+            merged: false,
+            title: "Fix thing (SUP-42)",
+            head: { ref: "SUP-42-branch", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+          },
+        },
+        { url: COMPARE_URL, body: { status: "behind", ahead_by: 0 } },
+        { url: BRANCH_REF_URL, body: { object: { sha: BRANCH_HEAD } } },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+      }
+    });
+
     it("resolveApprovalDecisionHead stays open-PR-only for the same card (no carrier fallback)", async () => {
       const issueId = await insertMentionOnlyCard();
       installRoutes(mergedCarrierRoutes());
