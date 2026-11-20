@@ -824,6 +824,19 @@ item. If every other present key is allowed bookkeeping, an explicit
 `executionPolicy: undefined` is dropped from the present-key check. The guard
 is skipped, while policy normalization writes `null`.
 
+The board stage decision (`POST /issues/:id/execution-stage/board-decision`)
+can close the final stage of an unassigned Wiki handoff card. That hand-back
+has no return-to, so the route drops the no-op `assigneeAgentId: null` and
+`assigneeUserId: null` keys and marks the write with an internal
+`boardStageDecision` flag. The guard admits it only when the write carries no
+assignee key and the stored row has no agent and no user assignee. Any assignee
+write, including one naming the canonical Maintainer, and any owned row stay
+guarded as before. Only that route sets the flag. The plugin host forwards just
+the patch fields the plugin SDK declares for `issues.update`
+(`PluginIssueUpdatePatch`). It drops every other key, including the issue
+service's internal flags (`boardStageDecision`, `workflowControlledAssignment`,
+`companyGuard`, `expectedUpdatedAt`).
+
 The boundary is the write path. Per-card isolation is required for every
 startup sweep that writes issue rows through the guarded issue service
 (`issueService.update`), because the Wiki handoff guard and the other assignee

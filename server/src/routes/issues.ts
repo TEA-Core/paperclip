@@ -464,7 +464,7 @@ import {
 } from "../services/issue-execution-policy.js";
 import { resolveSummaryGenerationReturnAssignee } from "../services/summary-slots.js";
 import { applyReviewEscalationDecision } from "../services/issue-stage-decision.js";
-import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, assertWikiHandoffWriteIntegrity, findSelfSatisfyingReviewStage } from "../services/issue-assignee-review-gate.js";
+import { assertAssigneeWriteDoesNotSelfSatisfyReviewStage, assertWikiHandoffWriteIntegrity, findSelfSatisfyingReviewStage, isWikiHandoffTitle } from "../services/issue-assignee-review-gate.js";
 import {
   type CallerSeat,
   type RefusalCaller,
@@ -13023,14 +13023,35 @@ export function issueRoutes(
 
         const nextExecutionState = result.patch.executionState as Record<string, unknown>;
 
+        // SUP-24632: the final-stage hand-back of an unowned card has no return-to,
+        // so the engine patch asks for assigneeAgentId/assigneeUserId = null on a
+        // row that already has both null. That write changes nothing, but the Wiki
+        // handoff guard reads any resulting null assignee as non-canonical and
+        // refuses the whole decision. Skip exactly that no-op write (Wiki handoff
+        // title only) and flag the decision so the guard admits it. A patch that
+        // names any agent or user, canonical or not, keeps its assignee keys and
+        // goes through the guard unchanged.
+        const unassignedWikiHandoffNoopAssigneeWrite =
+          isWikiHandoffTitle(lockedIssue.title) &&
+          previousAssigneeAgentId === null &&
+          previousAssigneeUserId === null &&
+          result.patch.assigneeAgentId === null &&
+          result.patch.assigneeUserId === null;
+        const stagePatch: Record<string, unknown> = { ...result.patch };
+        if (unassignedWikiHandoffNoopAssigneeWrite) {
+          delete stagePatch.assigneeAgentId;
+          delete stagePatch.assigneeUserId;
+        }
+
         const updated = await svc.update(
           id,
           {
-            ...result.patch,
+            ...stagePatch,
             executionState: nextExecutionState,
             ...(result.workflowControlledAssignment
               ? { workflowControlledAssignment: true }
               : {}),
+            ...(unassignedWikiHandoffNoopAssigneeWrite ? { boardStageDecision: true } : {}),
             actorAgentId: null,
             actorUserId: boardUserId,
             boardApiKeyId: actor.boardApiKeyId,
