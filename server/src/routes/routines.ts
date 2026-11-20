@@ -645,12 +645,13 @@ export function routineRoutes(
       return;
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
+    const actor = getActorInfo(req);
     const run = await svc.runRoutine(routine.id, req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? null : null,
-      boardApiKeyId: getActorInfo(req).boardApiKeyId,
+      boardApiKeyId: actor.boardApiKeyId,
+      runId: actor.runId,
     });
-    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: routine.companyId,
       actorType: actor.actorType,

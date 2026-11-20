@@ -1935,6 +1935,26 @@ export function readCertifiedFinalDelivery(executionState: Record<string, unknow
   };
 }
 
+/**
+ * SUP-24085: the reason the current decision's final-delivery preflight left
+ * no certified head, when it admitted a stage approval over a card with no
+ * open PR (`approvalStatus.finalDeliveryUncertified`, written by
+ * preflightTerminalApproval in routes/issues.ts). Returns undefined when the
+ * current decision carries no such tag: a tag whose decisionId differs from
+ * `lastDecisionId` belongs to an earlier decision and has no effect. Every
+ * later stamp writer (the post-commit hook, merge-arming republish, and the
+ * approval-status reconciler) must refuse or skip a tagged decision instead
+ * of stamping a live head the preflight never certified.
+ */
+export function readUncertifiedFinalDelivery(executionState: Record<string, unknown> | null | undefined): string | undefined {
+  const approvalStatus = executionState?.approvalStatus;
+  if (!approvalStatus || typeof approvalStatus !== "object" || !("finalDeliveryUncertified" in approvalStatus)) return undefined;
+  const uncertified = (approvalStatus as Record<string, unknown>).finalDeliveryUncertified;
+  if (!uncertified || typeof uncertified !== "object" || !("decisionId" in uncertified) || !("reason" in uncertified)) return undefined;
+  if (typeof executionState.lastDecisionId !== "string" || (uncertified as Record<string, unknown>).decisionId !== executionState.lastDecisionId) return undefined;
+  return typeof (uncertified as Record<string, unknown>).reason === "string" ? (uncertified as Record<string, string>).reason : "no certified head";
+}
+
 /** The board release the publisher CONFIRMED on a card: which status it was, and which PR and head it covered. */
 export interface ConfirmedRelease {
   owner: string;
@@ -2329,6 +2349,18 @@ export async function resolveDeliveryIdentity(
     const sourceIssueId = typeof record.sourceIssueId === "string" && record.sourceIssueId.length > 0
       ? record.sourceIssueId
       : undefined;
+    // SUP-23026 (AS-05 bind-existing-pr): a bound-PR record carries TWO branches.
+    // `branch` is the verified PR HEAD branch; `cardBranch` is the card's own
+    // control-plane delivery branch, stamped by the write path from the control
+    // plane. D1 ownership validates `cardBranch`; the PR identity validates
+    // `branch`. Only the server may stamp kind/cardBranch (the route schema is
+    // strict), so a forged kind cannot launder a foreign branch: a record that
+    // claims as05_bound_pr without BOTH PR fields fails closed below, and its
+    // cardBranch still has to pass the same D1 gate.
+    const recordKind = record.kind === "as05_bound_pr" ? "as05_bound_pr" : null;
+    const cardBranch = typeof record.cardBranch === "string" && record.cardBranch.length > 0
+      ? record.cardBranch
+      : null;
     const recordedRepoRaw = record.repo;
     const recordedRepo =
       recordedRepoRaw !== undefined &&
@@ -2372,7 +2404,7 @@ export async function resolveDeliveryIdentity(
         identifier,
       };
     }
-    if (prNumber !== null || prUrl !== null || sourceIssueId !== undefined) {
+    if (prNumber !== null || prUrl !== null || sourceIssueId !== undefined || recordKind !== null) {
       if (prNumber === null || prUrl === null) {
         return {
           branch: null,
@@ -2382,6 +2414,15 @@ export async function resolveDeliveryIdentity(
           identifier,
         };
       }
+    }
+    if (recordKind === "as05_bound_pr" && cardBranch === null) {
+      return {
+        branch: null,
+        repo: null,
+        recordedUnusable: "recorded AS-05 delivery identity has no card branch",
+        branchIsOwn: true,
+        identifier,
+      };
     }
     if (recordedRepo === null) {
       return {
@@ -2447,17 +2488,23 @@ export async function resolveDeliveryIdentity(
     const terminalCarrierBoundDelivery =
       branchOwnership.carrierOwnerTerminal === true && hasBoundPr;
     const mergedOnlyBinding = orphanBoundDelivery || terminalCarrierBoundDelivery;
+    // SUP-23026 (AS-05): D1 compares the CARD branch. For a generic record that
+    // is `branch` itself; for a bound-PR record it is `cardBranch` (the PR head
+    // in `branch` is intentionally not the card's worktree branch).
+    const d1Branch = recordKind === "as05_bound_pr" ? cardBranch : branch;
     if (
       !orphanBoundDelivery &&
       (branchOwnership.branch === null ||
         // Git refs are case-sensitive: the recorded branch is an exact match, not case-folded.
-        branch !== branchOwnership.branch)
+        d1Branch !== branchOwnership.branch)
     ) {
       return {
         branch: null,
         repo: null,
         recordedUnusable:
-          "recorded delivery identity's branch does not match this card's control-plane delivery branch",
+          recordKind === "as05_bound_pr"
+            ? "recorded AS-05 delivery identity's card branch does not match this card's control-plane delivery branch"
+            : "recorded delivery identity's branch does not match this card's control-plane delivery branch",
         branchIsOwn: true,
         identifier,
       };
@@ -2515,7 +2562,13 @@ export async function resolveDeliveryIdentity(
   };
 }
 
-function deliveryBindingValidationError(
+/**
+ * ADR-091: static validation of a recorded PR binding against its repo — the
+ * source-issue and canonical-URL halves every consumer applies before the live
+ * verification. Exported (SUP-23026) so the delivery-identity WRITE path runs
+ * the identical checks at record time: one verifier, not two.
+ */
+export function deliveryBindingValidationError(
   binding: DeliveryBinding,
   repo: { owner: string; repo: string },
   issueId: string,
@@ -2657,7 +2710,15 @@ function normalizeCardDeliveryBaseRef(raw: string): string | null {
   return branch;
 }
 
-async function resolveExactBoundPullRequest(
+/**
+ * The exact live verification of a recorded PR binding — one PR, by number, in
+ * the card's project repo, checked against the live open-state, head branch,
+ * and head SHA (with the SUP-21513 merged-on-base carve-out). Exported
+ * (SUP-23026) so the delivery-identity WRITE path proves the SAME exact PR at
+ * record time that approval time will verify: the write-time and approval-time
+ * consumers share one verifier, never two.
+ */
+export async function resolveExactBoundPullRequest(
   db: Db,
   companyId: string,
   issueId: string,
@@ -3971,6 +4032,12 @@ async function certifyNoPrDeliveryBranchHead(
   issueId: string,
 ): Promise<NoPrBranchAnchor | null> {
   const identity = await resolveDeliveryIdentity(db, companyId, issueId);
+  // SUP-23026 (AS-05): a bound-PR record's `branch` is the PR HEAD branch, not a
+  // delivery-branch ref — certifying it as a no-pr anchor would name the wrong
+  // ref. Structurally unreachable while resolveApprovalDecisionHead resolves
+  // bound cards through the binding first (a bound card with a failed
+  // verification is unresolvable before this runs); the exclusion is defensive.
+  if (identity.binding) return null;
   if (identity.branch === null || identity.repo === null) return null;
   if (!identity.branchIsOwn) return null;
   const headSha = await fetchBranchHeadShaAcrossCandidates(

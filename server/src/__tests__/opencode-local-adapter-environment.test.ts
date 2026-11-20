@@ -70,6 +70,7 @@ describe("opencode_local environment diagnostics", () => {
     const fakeOpencode = path.join(binDir, "opencode");
     const script = [
       "#!/bin/sh",
+      'if [ "$1" = "--version" ]; then echo 1.17.9; exit 0; fi',
       "echo 'ProviderModelNotFoundError: ProviderModelNotFoundError' 1>&2",
       "echo 'data: { providerID: \"openai\", modelID: \"gpt-5.3-codex\", suggestions: [] }' 1>&2",
       "exit 1",
