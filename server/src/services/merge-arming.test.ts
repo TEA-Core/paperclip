@@ -2181,6 +2181,59 @@ describeEmbeddedPostgres("adr-091-d2a decision-time head pin", () => {
       }
     });
 
+    // SUP-24033: a cached open draft is not the same shape as a cached closed
+    // draft. resolveApprovalDecisionHead names it head_draft before preflight
+    // can reach the merged-mention fallback, so a PR that has since merged
+    // still blocks final delivery. Trust the cached draft bit only after the
+    // live read; a genuine live draft stays head_draft.
+    it("revalidates a cached open draft and accepts the sole mention once the live read proves it merged (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "open", draft: true });
+      installRoutes(mergedCarrierRoutes());
+
+      const decision = await resolveApprovalDecisionHead(db, companyId, issueId, "SUP-42", true);
+      expect(decision.kind).toBe("unresolvable");
+      if (decision.kind === "unresolvable") {
+        expect(decision.reason).toMatch(/^head_draft:/);
+      }
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result).toEqual({
+        kind: "resolved",
+        headSha: APPROVED_HEAD,
+        displayName: `${OWNER}/${REPO}#42`,
+        pr: { owner: OWNER, repo: REPO, number: 42 },
+      });
+      expect(postStatusShas()).toEqual([]);
+    });
+
+    it("still refuses a cached open draft when the live read proves it is still a draft (SUP-24033)", async () => {
+      const issueId = await insertIssue();
+      await insertMention(issueId, { state: "open", draft: true });
+      installRoutes([
+        { url: OPEN_PRS_LIST_URL, body: [openPrsListItem({ number: 42, draft: true, head: { ref: "SUP-42-branch" }, title: "Fix thing (SUP-42)" })] },
+        {
+          url: PR_URL,
+          body: {
+            state: "open",
+            draft: true,
+            merged: false,
+            title: "Fix thing (SUP-42)",
+            head: { ref: "SUP-42-branch", sha: APPROVED_HEAD, repo: { full_name: `${OWNER}/${REPO}` } },
+          },
+        },
+      ]);
+
+      const result = await preflightFinalDelivery(db, companyId, issueId, "SUP-42");
+
+      expect(result.kind).toBe("unresolvable");
+      if (result.kind === "unresolvable") {
+        expect(result.reason).toMatch(/^head_draft:/);
+        expect(result.reason).toContain(`${OWNER}/${REPO}#42`);
+      }
+    });
+
     it("resolveApprovalDecisionHead stays open-PR-only for the same card (no carrier fallback)", async () => {
       const issueId = await insertMentionOnlyCard();
       installRoutes(mergedCarrierRoutes());
