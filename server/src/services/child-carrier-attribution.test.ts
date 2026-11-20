@@ -24,6 +24,7 @@ import {
   carrierArmBlock,
   carrierOwnerChildAttributionBlock,
   childCarrierCommits,
+  classifyAncestorCarrierHead,
   resolveChildCarrierDecisionHead,
 } from "./child-carrier-attribution.js";
 import { publishApprovalStatus } from "./merge-arming.js";
@@ -212,6 +213,14 @@ describePg("child carrier attribution", () => {
       headRef: CARRIER_BRANCH,
     });
     expect(armBlock).toBe(CHILD_CARRIER_STAMP_SKIP);
+  });
+
+  it("does not classify a shared-workspace child as a carrier claimant", async () => {
+    const { ownerId, childId } = await seedPair();
+    expect(await classifyAncestorCarrierHead(db, companyId, childId, CARRIER_BRANCH)).toBe("one");
+    const [ownerRow] = await db.select({ w: issues.executionWorkspaceId }).from(issues).where(eq(issues.id, ownerId));
+    await db.update(issues).set({ executionWorkspaceId: ownerRow!.w }).where(eq(issues.id, childId));
+    expect(await classifyAncestorCarrierHead(db, companyId, childId, CARRIER_BRANCH)).toBe("absent");
   });
 
   it("refuses a moved head, a draft, a closed pull request, and a merged pull request", async () => {
