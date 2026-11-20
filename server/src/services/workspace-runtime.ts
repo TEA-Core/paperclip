@@ -3841,7 +3841,7 @@ async function assertRecordedCheckoutBranchIdentity(input: {
   ).then(() => true, () => false);
   if (!isLocalBranch) return;
 
-  let actualBranch = identity.branch;
+  let actualBranch: string | null = identity.branch;
   if (input.strategy === "git_worktree") {
     const inspection = await inspectManagedGitWorktreeBranch({
       worktreePath: identity.canonicalCwd,
