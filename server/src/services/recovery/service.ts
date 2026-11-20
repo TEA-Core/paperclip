@@ -2892,6 +2892,9 @@ export function recoveryService(
       ),
     });
 
+    // enqueueWakeup can coalesce into a live run instead of creating one, and
+    // that run can be the very predecessor named here (SUP-24883). Bind only a
+    // run that has no lineage yet and is not the predecessor itself.
     if (queued && input.retryOfRunId) {
       return db
         .update(heartbeatRuns)
@@ -2899,7 +2902,13 @@ export function recoveryService(
           retryOfRunId: input.retryOfRunId,
           updatedAt: new Date(),
         })
-        .where(eq(heartbeatRuns.id, queued.id))
+        .where(
+          and(
+            eq(heartbeatRuns.id, queued.id),
+            isNull(heartbeatRuns.retryOfRunId),
+            ne(heartbeatRuns.id, input.retryOfRunId),
+          ),
+        )
         .returning()
         .then((rows) => rows[0] ?? queued);
     }
@@ -7107,6 +7116,19 @@ export function recoveryService(
       }
 
       latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      // The live-path guard above ran before the awaits in between. A run that
+      // appeared since (an occupancy successor inserted right after its
+      // contender was cancelled) is a live path, and naming it as the retry
+      // predecessor would coalesce the recovery wake into it (SUP-24883).
+      // Same agent scope as that guard.
+      if (
+        latestRun &&
+        (EXECUTION_PATH_HEARTBEAT_RUN_STATUSES as readonly string[]).includes(latestRun.status) &&
+        (issue.status !== "in_review" || latestRun.agentId === agentId)
+      ) {
+        result.skipped += 1;
+        return;
+      }
       const executionRecoverySource =
         issue.status === "in_review"
           ? participantLatestRunForRecovery

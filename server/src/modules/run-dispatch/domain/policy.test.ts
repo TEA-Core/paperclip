@@ -343,6 +343,30 @@ describe("decideQueuedRunStaleness", () => {
     }, NOW)).toMatchObject({ stale: true, errorCode: "queued_run_expired" });
   });
 
+  it("cancels a queued run that names itself as its retry predecessor", () => {
+    expect(decideQueuedRunStaleness({ ...baseStalenessFacts(), retryOfRunId: "run-1" }, NOW)).toEqual({
+      stale: true,
+      errorCode: "retry_lineage_invalid",
+      reason: "Cancelled because the queued run names itself as its retry predecessor",
+      details: { issueId: "issue-1", retryOfRunId: "run-1" },
+    });
+  });
+
+  it("keeps a queued run whose retry predecessor is another run", () => {
+    expect(decideQueuedRunStaleness({ ...baseStalenessFacts(), retryOfRunId: "run-0" }, NOW)).toEqual({
+      stale: false,
+    });
+  });
+
+  it("still expires a self-referencing queued run past the age bound as queued_run_expired", () => {
+    // The expiry pass only cancels its own verdicts; it must keep reaching this run.
+    expect(decideQueuedRunStaleness({
+      ...baseStalenessFacts(),
+      retryOfRunId: "run-1",
+      runCreatedAt: new Date(NOW.getTime() - 24 * 60 * 60 * 1000),
+    }, NOW)).toMatchObject({ stale: true, errorCode: "queued_run_expired" });
+  });
+
   it("cancels a queued run created before an armed worktree cutoff", () => {
     const cutoff = new Date("2026-10-26T12:00:00.000Z");
     const decision = decideQueuedRunStaleness(
