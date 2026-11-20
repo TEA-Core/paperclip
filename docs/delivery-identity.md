@@ -49,6 +49,12 @@ Work that must not be auto-merged cannot express that requirement in free text. 
 
 Board authority over a landing is exercised through these explicit surfaces, never through prose attached to an implementation card.
 
+## Child-owned carrier attribution
+
+A child card with its own self-sourced execution workspace may have its delivery carried by a strict ancestor's carrier pull request. The server then records a governed attribution row (`issue_child_carrier_attributions`) instead of an `as05_bound_pr` delivery. It is accepted only for the same repository, exactly one strict ancestor, one exact pull request, one carrier branch, one immutable head SHA, and a complete child-specific commit enumeration. A wrong ancestry, repository, pull request or branch, a moved head, a draft or closed pull request, a missing or extra commit, or multiple candidates is refused. A child that borrows the ancestor's workspace (ADR-083 shared carrier) is not diverted: it keeps the ordinary `as05_bound_pr` write.
+
+Child approval records only the child's decision. It does not publish `paperclip/approved` and does not arm the carrier pull request. The self-sourced carrier owner stamps or arms only when every required child attribution is approved, current and complete. The child resolver and the owner publication predicate are separate (`server/src/services/child-carrier-attribution.ts`, `server/src/services/merge-arming.ts`).
+
 ## Authoritative flow
 
 `resolveDeliveryIdentity` reads the recorded identity. `resolveExactBoundPullRequest` verifies the exact live PR and head. `narrowToDelivered` restricts candidates to that verified PR, while `publishApprovalStatus` and `armMergeOnApproval` reject any mismatch before writing approval status or arming merge. The decision-time head resolver uses the same exact binding so the approving card and the actuator target cannot diverge.
