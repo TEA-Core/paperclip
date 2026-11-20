@@ -21210,11 +21210,29 @@ export function issueRoutes(
       // Mechanism C must treat those stages as skipped. An omitted executionState
       // (durable-approval close, already-completed ladder) keeps the pre-patch row.
       const sameRequestExecutionState = transition.patch.executionState;
-      const guardDeliveryIssue =
+      const sameRequestSkippedIds =
         sameRequestExecutionState != null &&
         typeof sameRequestExecutionState === "object" &&
-        !Array.isArray(sameRequestExecutionState)
-          ? { ...finalDeliveryIssue, executionState: sameRequestExecutionState }
+        !Array.isArray(sameRequestExecutionState) &&
+        Array.isArray((sameRequestExecutionState as { skippedStageIds?: unknown }).skippedStageIds)
+          ? ((sameRequestExecutionState as { skippedStageIds: unknown[] }).skippedStageIds.filter(
+              (id): id is string => typeof id === "string",
+            ))
+          : [];
+      // Only the skipped ids are merged: the pre-patch state (live stage, currentParticipant)
+      // stays intact so mechanism-D seat resolution is unchanged.
+      const preState = finalDeliveryIssue.executionState as { skippedStageIds?: string[] } | null;
+      const guardDeliveryIssue =
+        sameRequestSkippedIds.length > 0
+          ? {
+              ...finalDeliveryIssue,
+              executionState: preState
+                ? {
+                    ...preState,
+                    skippedStageIds: [...new Set([...(preState.skippedStageIds ?? []), ...sameRequestSkippedIds])],
+                  }
+                : sameRequestExecutionState,
+            }
           : finalDeliveryIssue;
       const outcome = await evaluateDoneTransitionGuards({
         issue: guardDeliveryIssue,
