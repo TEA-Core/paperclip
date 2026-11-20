@@ -1,0 +1,4 @@
+ALTER TABLE "issue_delivery_receipt_links" DROP CONSTRAINT "issue_delivery_receipt_links_head_sha_check";--> statement-breakpoint
+ALTER TABLE "issue_delivery_receipts" DROP CONSTRAINT "issue_delivery_receipts_head_sha_check";--> statement-breakpoint
+ALTER TABLE "issue_delivery_receipt_links" ADD CONSTRAINT "issue_delivery_receipt_links_head_sha_check" CHECK ("issue_delivery_receipt_links"."head_sha" ~ '^[0-9a-f]{40}$');--> statement-breakpoint
+ALTER TABLE "issue_delivery_receipts" ADD CONSTRAINT "issue_delivery_receipts_head_sha_check" CHECK ("issue_delivery_receipts"."head_sha" ~ '^[0-9a-f]{40}$');

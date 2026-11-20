@@ -14,7 +14,9 @@
  * FK targets `external_objects` and `issue_delivery_receipts`, not mentions —
  * and deleting the linked external object is RESTRICTed so recovery provenance
  * outlives display-record cleanup. This suite asserts each of those in the
- * database itself.
+ * database itself. The generated 0329 follow-up tightens both head_sha CHECKs
+ * from 40-64 to exactly 40 lowercase hex characters; the second case proves a
+ * database that already ran 0298 converges on the fresh-install definitions.
  */
 
 import { createHash, randomUUID } from "node:crypto";
@@ -31,21 +33,50 @@ import {
 } from "./test-embedded-postgres.js";
 
 const MIGRATION_FILE = "0298_issue_delivery_receipts.sql";
+// 0298 shipped `head_sha ~ '^[0-9a-f]{40,64}$'`, and databases that already ran
+// it keep that text. 0329 is the generated follow-up that tightens both tables
+// to exactly 40 lowercase hex characters on every install.
+const TIGHTEN_MIGRATION_FILE = "0329_cooing_thor.sql";
 const RECEIPTS = "issue_delivery_receipts";
 const LINKS = "issue_delivery_receipt_links";
 const HEAD_SHA = "a".repeat(40);
 const OTHER_HEAD_SHA = "b".repeat(40);
+const HEAD_SHA_CHECKS = [`${LINKS}_head_sha_check`, `${RECEIPTS}_head_sha_check`];
 
 const cleanups: Array<() => Promise<void>> = [];
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
-async function migrationSql() {
-  return fs.promises.readFile(new URL(`./migrations/${MIGRATION_FILE}`, import.meta.url), "utf8");
+async function migrationSql(file = MIGRATION_FILE) {
+  return fs.promises.readFile(new URL(`./migrations/${file}`, import.meta.url), "utf8");
 }
 
-async function migrationHash() {
-  return createHash("sha256").update(await migrationSql()).digest("hex");
+async function migrationHash(file = MIGRATION_FILE) {
+  return createHash("sha256").update(await migrationSql(file)).digest("hex");
+}
+
+async function migrationStatements(file: string) {
+  return (await migrationSql(file))
+    .split("--> statement-breakpoint")
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.length > 0);
+}
+
+async function ledgerCount(sql: postgres.Sql, file: string) {
+  const [row] = await sql<{ count: string }[]>`
+    SELECT count(*)::text AS count FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${await migrationHash(file)}
+  `;
+  return row?.count;
+}
+
+async function headShaChecks(sql: postgres.Sql) {
+  return sql<{ table_name: string; conname: string; def: string; validated: boolean }[]>`
+    SELECT "conrelid"::regclass::text AS table_name, "conname", pg_get_constraintdef("oid") AS def,
+      "convalidated" AS validated
+    FROM "pg_constraint"
+    WHERE "conname" IN ${sql(HEAD_SHA_CHECKS)}
+    ORDER BY "conname"
+  `;
 }
 
 type IndexRow = {
@@ -173,25 +204,21 @@ describeEmbeddedPostgres("delivery receipt migration", () => {
       // The migration is already applied by the test-database bootstrap; prove
       // the raw file is re-runnable statement-by-statement (IF NOT EXISTS /
       // duplicate_object guards absorb the target shape).
-      const statements = (await migrationSql())
-        .split("--> statement-breakpoint")
-        .map((statement) => statement.trim())
-        .filter((statement) => statement.length > 0);
-      for (const statement of statements) {
+      for (const statement of await migrationStatements(MIGRATION_FILE)) {
         await sql.unsafe(statement);
       }
 
       // Rewind the ledger and re-apply through the product migrator so the
       // accepted evidence is "the migration applies cleanly", not just
-      // "the file parses".
+      // "the file parses". The 0329 tightening is rewound with it: it alters
+      // the tables 0298 creates, so 0298 alone would recreate the old shape.
       await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${await migrationHash()}`;
+      await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${await migrationHash(TIGHTEN_MIGRATION_FILE)}`;
       await sql`DROP TABLE IF EXISTS ${sql(LINKS)} CASCADE`;
       await sql`DROP TABLE IF EXISTS ${sql(RECEIPTS)} CASCADE`;
       await applyPendingMigrations(database.connectionString);
-      const [ledgerRow] = await sql<{ count: string }[]>`
-        SELECT count(*)::text AS count FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${await migrationHash()}
-      `;
-      expect(ledgerRow?.count).toBe("1");
+      expect(await ledgerCount(sql, MIGRATION_FILE)).toBe("1");
+      expect(await ledgerCount(sql, TIGHTEN_MIGRATION_FILE)).toBe("1");
 
       // --- Declared unique indexes exist and carry the exact column lists. ---
       const receiptIndexes = await uniqueIndexes(sql, RECEIPTS);
@@ -278,19 +305,21 @@ describeEmbeddedPostgres("delivery receipt migration", () => {
         SELECT "head_sha" FROM ${sql(RECEIPTS)} WHERE "id" = ${receiptId}
       `;
       expect(validatedReceipt?.head_sha).toMatch(/^[0-9a-f]{40}$/);
-      for (const [length, headSha] of [
-        [39, "a".repeat(39)],
-        [41, "a".repeat(41)],
-        [64, "a".repeat(64)],
+      for (const [label, headSha] of [
+        ["39", "a".repeat(39)],
+        ["41", "a".repeat(41)],
+        ["64", "a".repeat(64)],
+        ["40-upper", "A".repeat(40)],
+        ["40-mixed", `F${"a".repeat(39)}`],
       ] as const) {
         await expect(
           insertReceipt(sql, {
             companyId,
             sourceIssueId: issueId,
-            idempotencyKey: `invalid-head-${length}`,
+            idempotencyKey: `invalid-head-${label}`,
             headSha,
           }),
-        ).rejects.toMatchObject({ code: "23514" });
+        ).rejects.toMatchObject({ code: "23514", constraint_name: `${RECEIPTS}_head_sha_check` });
       }
 
       await sql`
@@ -359,19 +388,22 @@ describeEmbeddedPostgres("delivery receipt migration", () => {
         )
       `;
 
-      for (const [length, headSha, receiptHeadSha] of [
-        [39, "a".repeat(39), "2".repeat(40)],
-        [41, "a".repeat(41), "3".repeat(40)],
-        [64, "a".repeat(64), "4".repeat(40)],
+      for (const [label, headSha, receiptHeadSha] of [
+        ["39", "a".repeat(39), "2".repeat(40)],
+        ["41", "a".repeat(41), "3".repeat(40)],
+        ["64", "a".repeat(64), "4".repeat(40)],
+        ["40-upper", "A".repeat(40), "5".repeat(40)],
+        ["40-mixed", `F${"a".repeat(39)}`, "6".repeat(40)],
       ] as const) {
         const boundaryReceiptId = await insertReceipt(sql, {
           companyId,
           sourceIssueId: issueId,
-          idempotencyKey: `invalid-link-head-${length}`,
+          idempotencyKey: `invalid-link-head-${label}`,
           headSha: receiptHeadSha,
         });
         await expect(insertLinkRaw({ receiptId: boundaryReceiptId, externalObjectId: objectId, headSha })).rejects.toMatchObject({
           code: "23514",
+          constraint_name: `${LINKS}_head_sha_check`,
         });
       }
 
@@ -436,6 +468,102 @@ describeEmbeddedPostgres("delivery receipt migration", () => {
         .map((row) => row.column_name)
         .filter((name) => /secret|pat\b|github_token|credential/i.test(name));
       expect(secretish).toEqual([]);
+    },
+    120_000,
+  );
+
+  it(
+    "tightens a database that already ran 0298 to the fresh-install head_sha checks without touching rows",
+    async () => {
+      const database = await startEmbeddedPostgresTestDatabase("paperclip-delivery-receipt-upgrade-");
+      cleanups.push(database.cleanup);
+      const sql = postgres(database.connectionString, { max: 1 });
+      cleanups.push(async () => sql.end());
+
+      // A fresh install runs 0298 and 0329 in order.
+      const fresh = await headShaChecks(sql);
+      expect(fresh.map((row) => row.conname)).toEqual(HEAD_SHA_CHECKS);
+      for (const row of fresh) {
+        expect(row.def).toContain("'^[0-9a-f]{40}$'");
+        expect(row.validated).toBe(true);
+      }
+
+      // Rebuild the state of a database that ran 0298 before 0329 existed:
+      // 0298's text is unchanged, so its raw statements recreate that shape.
+      await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${await migrationHash(TIGHTEN_MIGRATION_FILE)}`;
+      await sql`DROP TABLE IF EXISTS ${sql(LINKS)} CASCADE`;
+      await sql`DROP TABLE IF EXISTS ${sql(RECEIPTS)} CASCADE`;
+      for (const statement of await migrationStatements(MIGRATION_FILE)) {
+        await sql.unsafe(statement);
+      }
+      expect(await ledgerCount(sql, MIGRATION_FILE)).toBe("1");
+      expect(await ledgerCount(sql, TIGHTEN_MIGRATION_FILE)).toBe("0");
+      for (const row of await headShaChecks(sql)) {
+        expect(row.def).toContain("'^[0-9a-f]{40,64}$'");
+      }
+
+      const { companyId, issueId } = await insertCompanyAndIssue(sql);
+      const objectId = await insertExternalObject(sql, companyId, "acme/widgets#579");
+      const validReceiptId = await insertReceipt(sql, { companyId, sourceIssueId: issueId, idempotencyKey: "legacy-valid" });
+      await sql`
+        INSERT INTO ${sql(LINKS)} (
+          "company_id", "receipt_id", "source_issue_id", "external_object_id",
+          "provider", "owner", "repo", "pull_request_number", "head_sha"
+        )
+        VALUES (
+          ${companyId}, ${validReceiptId}, ${issueId}, ${objectId},
+          'github', 'acme', 'widgets', 579, ${HEAD_SHA}
+        )
+      `;
+      const legacyLongReceiptId = await insertReceipt(sql, {
+        companyId,
+        sourceIssueId: issueId,
+        idempotencyKey: "legacy-41",
+        headSha: "c".repeat(41),
+      });
+
+      // A 41-character row blocks the migration. It deletes and rewrites
+      // nothing: the transaction rolls back and the old checks stay in place.
+      await expect(applyPendingMigrations(database.connectionString)).rejects.toMatchObject({
+        code: "23514",
+        constraint_name: `${RECEIPTS}_head_sha_check`,
+      });
+      expect(await ledgerCount(sql, TIGHTEN_MIGRATION_FILE)).toBe("0");
+      for (const row of await headShaChecks(sql)) {
+        expect(row.def).toContain("'^[0-9a-f]{40,64}$'");
+      }
+      const blockedRows = await sql<{ id: string; head_sha: string }[]>`
+        SELECT "id", "head_sha" FROM ${sql(RECEIPTS)} ORDER BY "idempotency_key"
+      `;
+      expect(blockedRows).toEqual([
+        { id: legacyLongReceiptId, head_sha: "c".repeat(41) },
+        { id: validReceiptId, head_sha: HEAD_SHA },
+      ]);
+
+      // Once the operator removes the offending row, the same migration
+      // converges this database onto the fresh-install definitions.
+      await sql`DELETE FROM ${sql(RECEIPTS)} WHERE "id" = ${legacyLongReceiptId}`;
+      await applyPendingMigrations(database.connectionString);
+      expect(await ledgerCount(sql, TIGHTEN_MIGRATION_FILE)).toBe("1");
+      expect(await headShaChecks(sql)).toEqual(fresh);
+
+      const [survivor] = await sql<{ head_sha: string }[]>`
+        SELECT "head_sha" FROM ${sql(RECEIPTS)} WHERE "id" = ${validReceiptId}
+      `;
+      expect(survivor?.head_sha).toBe(HEAD_SHA);
+      const [survivingLink] = await sql<{ head_sha: string }[]>`
+        SELECT "head_sha" FROM ${sql(LINKS)} WHERE "receipt_id" = ${validReceiptId}
+      `;
+      expect(survivingLink?.head_sha).toBe(HEAD_SHA);
+
+      // Re-running the migrator is a no-op: one ledger row, same checks.
+      await applyPendingMigrations(database.connectionString);
+      expect(await ledgerCount(sql, TIGHTEN_MIGRATION_FILE)).toBe("1");
+      expect(await headShaChecks(sql)).toEqual(fresh);
+
+      await expect(
+        insertReceipt(sql, { companyId, sourceIssueId: issueId, idempotencyKey: "post-upgrade-41", headSha: "d".repeat(41) }),
+      ).rejects.toMatchObject({ code: "23514", constraint_name: `${RECEIPTS}_head_sha_check` });
     },
     120_000,
   );
