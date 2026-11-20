@@ -240,6 +240,30 @@ export function isUnassignedWikiHandoffCancellation(input: {
   );
 }
 
+// Request attribution an issue write carries without setting an issue field.
+const ISSUE_WRITE_ATTRIBUTION_KEYS: ReadonlySet<string> = new Set([
+  "actorAgentId",
+  "actorRunId",
+  "actorRunStopId",
+  "actorUserId",
+  "boardApiKeyId",
+  "expectedUpdatedAt",
+]);
+
+/**
+ * SUP-24762: true when an issue write sets no issue field: every present key
+ * is undefined or request attribution. A comment-only PATCH is such a write.
+ * It cannot change who holds a Wiki handoff or what the handoff is, so the
+ * Wiki handoff guard must not judge the stored assignee as if it were written
+ * (a human reviewer's seat stores assigneeAgentId null). A write with any
+ * other key, including null values and bookkeeping keys, is not field-less.
+ */
+export function isFieldlessIssueWrite(data: Record<string, unknown>): boolean {
+  return Object.entries(data).every(
+    ([key, value]) => value === undefined || ISSUE_WRITE_ATTRIBUTION_KEYS.has(key),
+  );
+}
+
 /**
  * SUP-24632: the second and only other write the Wiki handoff guard admits
  * without the canonical Maintainer as the resulting assignee. The board stage

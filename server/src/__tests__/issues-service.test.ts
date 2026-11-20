@@ -9232,6 +9232,215 @@ describeEmbeddedPostgres("issueService.update Wiki handoff guard", () => {
       details: expect.objectContaining({ guard: "assignee_review_gate" }),
     });
   });
+
+  // SUP-24762: a human reviewer holds the review stage (stored assigneeAgentId
+  // null). routeActorKeys is the attribution the PATCH route always adds, so
+  // `{...routeActorKeys}` alone is a comment-only PATCH.
+  const routeActorKeys = {
+    actorAgentId: null,
+    actorRunId: null,
+    actorRunStopId: null,
+    actorUserId: "local-board",
+    boardApiKeyId: null,
+  };
+  const blockedUnblockDescriptor = { owner: "board", action: "Review the handoff" };
+  it.each([
+    ["in_review", "no keys", true, {}],
+    ["in_review", "attribution keys only (comment-only PATCH)", true, { ...routeActorKeys }],
+    ["in_review", "a bare blocked status", true, { status: "blocked" }],
+    ["blocked", "a bare unblockDescriptor", true, { unblockDescriptor: blockedUnblockDescriptor }],
+    ["in_review", "an attributed status write", false, { status: "in_review", ...routeActorKeys }],
+    ["in_review", "an attributed title write", false, { title: "Handoff to Wiki Maintainer (edited)", ...routeActorKeys }],
+    ["blocked", "an attributed unblockDescriptor", false, { unblockDescriptor: blockedUnblockDescriptor, ...routeActorKeys }],
+    // An own executionPolicy key is a field even when undefined: the update
+    // normalizes it to null and clears the stored policy.
+    ["in_review", "an attributed undefined executionPolicy", false, { executionPolicy: undefined, ...routeActorKeys }],
+  ] as const)("on a human-reviewed %s Wiki handoff, %s is admitted: %s (SUP-24762)", async (status, _name, admitted, data) => {
+    const companyId = randomUUID();
+    const pluginId = randomUUID();
+    const canonicalAgentId = randomUUID();
+    const stageId = randomUUID();
+    const reviewerUserId = `reviewer-${randomUUID()}`;
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "paperclipai.plugin-llm-wiki",
+      packageName: "@paperclipai/plugin-llm-wiki",
+      version: "0.1.0",
+      apiVersion: 1,
+      categories: [],
+      manifestJson: {} as never,
+      status: "ready",
+      installOrder: 1,
+    });
+    await db.insert(agents).values({
+      id: canonicalAgentId,
+      companyId,
+      name: "Wiki Maintainer",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(pluginManagedResources).values({
+      companyId, pluginId, pluginKey: "paperclipai.plugin-llm-wiki", resourceKind: "agent", resourceKey: "wiki-maintainer", resourceId: canonicalAgentId, defaultsJson: {},
+    });
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: reviewerUserId, status: "active", membershipRole: "member",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Handoff to Wiki Maintainer",
+      status,
+      assigneeAgentId: null,
+      assigneeUserId: reviewerUserId,
+      executionPolicy: {
+        mode: "normal",
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ type: "user", agentId: null, userId: reviewerUserId }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "user", agentId: null, userId: reviewerUserId },
+        returnAssignee: { type: "agent", agentId: canonicalAgentId, userId: null },
+        completedStageIds: [],
+        skippedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+
+    const write = svc.update(issueId, { ...data } as Parameters<typeof svc.update>[1]);
+    if (admitted) {
+      await expect(write).resolves.toMatchObject({ id: issueId, assigneeAgentId: null, assigneeUserId: reviewerUserId });
+    } else {
+      await expect(write).rejects.toMatchObject({
+        status: 422,
+        details: expect.objectContaining({ subGuard: "wiki_handoff", reason: "wiki_handoff_unassigned" }),
+      });
+      const stored = await svc.getById(issueId);
+      expect(stored).toMatchObject({
+        title: "Handoff to Wiki Maintainer",
+        status,
+      });
+      expect(stored?.executionPolicy).not.toBeNull();
+    }
+  });
+
+  // SUP-24762 / review finding: a field-less write must resolve the goal from
+  // the row it locks. The barrier commits a concurrent goal change after the
+  // update's pre-lock read and before its transaction takes the row lock.
+  // "attribution only" is a bare attributed service call; "a comment PATCH" is
+  // the exact key set the PATCH route sends for a board comment.
+  it.each([
+    ["a plain card", "attribution only", false, { actorUserId: "local-board" }],
+    ["a plain card", "a comment PATCH", false, { actorAgentId: null, actorRunId: null, actorRunStopId: null, actorUserId: "local-board", boardApiKeyId: null }],
+    ["a human-held Wiki handoff", "attribution only", true, { actorUserId: "local-board" }],
+    ["a human-held Wiki handoff", "a comment PATCH", true, { actorAgentId: null, actorRunId: null, actorRunStopId: null, actorUserId: "local-board", boardApiKeyId: null }],
+  ] as const)("keeps a goal changed concurrently before the row lock on %s, %s (SUP-24762)", async (_card, _write, wikiHandoff, data) => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    const staleGoalId = randomUUID();
+    const newGoalId = randomUUID();
+    const reviewerUserId = `reviewer-${randomUUID()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(goals).values([
+      { id: staleGoalId, companyId, title: "Goal before the race", level: "task", status: "active" },
+      { id: newGoalId, companyId, title: "Goal written concurrently", level: "task", status: "active" },
+    ]);
+    if (wikiHandoff) {
+      const pluginId = randomUUID();
+      const canonicalAgentId = randomUUID();
+      await db.insert(plugins).values({
+        id: pluginId,
+        pluginKey: "paperclipai.plugin-llm-wiki",
+        packageName: "@paperclipai/plugin-llm-wiki",
+        version: "0.1.0",
+        apiVersion: 1,
+        categories: [],
+        manifestJson: {} as never,
+        status: "ready",
+        installOrder: 1,
+      });
+      await db.insert(agents).values({
+        id: canonicalAgentId,
+        companyId,
+        name: "Wiki Maintainer",
+        role: "engineer",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(pluginManagedResources).values({
+        companyId, pluginId, pluginKey: "paperclipai.plugin-llm-wiki", resourceKind: "agent", resourceKey: "wiki-maintainer", resourceId: canonicalAgentId, defaultsJson: {},
+      });
+      await db.insert(companyMemberships).values({
+        companyId, principalType: "user", principalId: reviewerUserId, status: "active", membershipRole: "member",
+      });
+    }
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: wikiHandoff ? "Handoff to Wiki Maintainer" : "Ordinary issue",
+      status: "in_review",
+      goalId: staleGoalId,
+      assigneeAgentId: null,
+      assigneeUserId: reviewerUserId,
+    });
+
+    // Barrier: the update reads the row, then opens its transaction. The
+    // concurrent goal change commits at that point, before the row lock.
+    let barrierFired = false;
+    const racingDb = new Proxy(db, {
+      get(target, prop) {
+        if (prop === "transaction" && !barrierFired) {
+          return async (callback: Parameters<typeof db.transaction>[0]) => {
+            barrierFired = true;
+            await db.update(issues).set({ goalId: newGoalId }).where(eq(issues.id, issueId));
+            return target.transaction(callback);
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const racingSvc = issueService(racingDb as typeof db);
+
+    try {
+      await expect(
+        racingSvc.update(issueId, { ...data } as Parameters<typeof racingSvc.update>[1]),
+      ).resolves.toMatchObject({ id: issueId });
+      expect(barrierFired).toBe(true);
+      const stored = await db.select({ goalId: issues.goalId }).from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+      expect(stored?.goalId).toBe(newGoalId);
+    } finally {
+      await db.delete(issues).where(eq(issues.companyId, companyId));
+      await db.delete(goals).where(eq(goals.companyId, companyId));
+    }
+  });
 });
 
 describeEmbeddedPostgres("issueService.create defaultExecutionPolicy inheritance", () => {
