@@ -66,7 +66,7 @@ import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt, isSpawnEnvelopeTooLargeError } from "@paperclipai/adapter-utils/server-utils";
-import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { PROJECT_REPOSITORIES_DIR, PROJECT_REPOSITORIES_EXCLUDE_LINE, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, isWorkspaceGitScanFailureCode, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
 import { captureDirectorySnapshot, disposeDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { initializeRunIdentity, explicitOperatorRunIdentity } from "./run-identity.js";
@@ -962,6 +962,18 @@ const STALE_RUN_HANDOFF_HOPS_KEY = "staleRunHandoffHops";
 // contradictory (e.g. assignee and review participant disagree). Stop after one hop
 // so two agents cannot ping-pong queued runs at each other forever.
 const STALE_RUN_HANDOFF_MAX_HOPS = 1;
+// Why an atomic claim left a queued run in the queue (SUP-24883).
+const ATOMIC_CLAIM_STALE_MESSAGES = {
+  issue_not_found: "Claim skipped: the run's issue no longer exists",
+  run_not_found: "Claim skipped: the run no longer exists",
+  run_not_queued: "Claim skipped: the run left the queue before the claim",
+  wake_not_bound: "Claim skipped: the run's wake is no longer queued for this run",
+  native_replacement_lock_held: "Claim skipped: another run holds the issue lock this native replacement needs",
+  chat_control_admission_invalid: "Claim skipped: the run's chat-control recovery admission is invalid",
+  retry_lineage_unresolved: "Claim skipped: the run's retry lineage cannot be resolved",
+  previous_owner_not_settled: "Claim skipped: the issue's previous execution owner has not settled",
+} as const;
+type AtomicClaimStaleReason = keyof typeof ATOMIC_CLAIM_STALE_MESSAGES;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 export {
   ACTIVE_RUN_NO_OUTPUT_TERMINATION_THRESHOLD_MS,
@@ -3015,9 +3027,9 @@ export async function prepareProjectRepositoryWorkspaces(input: {
   const excludePath = await execFile("git", ["-C", input.cwd, "rev-parse", "--git-path", "info/exclude"], { timeout: 10_000 })
     .then((result) => path.resolve(input.cwd, result.stdout.trim()));
   const exclude = await fs.readFile(excludePath, "utf8").catch(() => "");
-  if (!exclude.split(/\r?\n/).includes(`/${PROJECT_REPOSITORIES_DIR}/`)) {
+  if (!exclude.split(/\r?\n/).includes(PROJECT_REPOSITORIES_EXCLUDE_LINE)) {
     await fs.mkdir(path.dirname(excludePath), { recursive: true });
-    await fs.appendFile(excludePath, `\n/${PROJECT_REPOSITORIES_DIR}/\n`);
+    await fs.appendFile(excludePath, `\n${PROJECT_REPOSITORIES_EXCLUDE_LINE}\n`);
   }
   const results = [];
   for (const workspace of selected) {
@@ -19824,6 +19836,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
+  // SUP-24883: an atomic-claim stale return leaves the run queued with no other
+  // trace, so a gate that never clears looks like a run nobody dispatches.
+  // Record the reason once per run; the scheduler retries the claim every tick.
+  async function recordAtomicClaimStale(
+    run: typeof heartbeatRuns.$inferSelect,
+    issueId: string | null,
+    reason: AtomicClaimStaleReason,
+  ) {
+    logger.warn(
+      { runId: run.id, issueId, claimStaleReason: reason },
+      "claimQueuedRun: atomic claim left the run queued",
+    );
+    // A missing run has no row to attach an event to; a run another claimer
+    // already took is a routine race, not a stuck gate.
+    if (reason === "run_not_found" || reason === "run_not_queued") return;
+    const alreadyRecorded = await db
+      .select({ id: heartbeatRunEvents.id })
+      .from(heartbeatRunEvents)
+      .where(and(
+        eq(heartbeatRunEvents.companyId, run.companyId),
+        eq(heartbeatRunEvents.runId, run.id),
+        sql`${heartbeatRunEvents.payload} ->> 'claimStaleReason' = ${reason}`,
+      ))
+      .limit(1)
+      .then((rows) => rows.length > 0);
+    if (alreadyRecorded) return;
+    await appendRunEvent(run, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: ATOMIC_CLAIM_STALE_MESSAGES[reason],
+      payload: { claimStaleReason: reason, issueId },
+    });
+  }
+
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -20263,21 +20310,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .for("update")
               .limit(1)
               .then((rows) => rows[0] ?? null);
+            if (issueId && !lockedIssue) {
+              return { kind: "stale" as const, run: null, reason: "issue_not_found" as const };
+            }
+            if (!lockedRun) return { kind: "stale" as const, run: null, reason: "run_not_found" as const };
+            if (lockedRun.status !== "queued") {
+              return { kind: "stale" as const, run: null, reason: "run_not_queued" as const };
+            }
             if (
-              (issueId && !lockedIssue) ||
-              !lockedRun ||
-              lockedRun.status !== "queued" ||
-              (run.wakeupRequestId &&
-                (!lockedWake || lockedWake.status !== "queued" || lockedWake.runId !== run.id))
+              run.wakeupRequestId &&
+              (!lockedWake || lockedWake.status !== "queued" || lockedWake.runId !== run.id)
             ) {
-              return { kind: "stale" as const, run: null };
+              return { kind: "stale" as const, run: null, reason: "wake_not_bound" as const };
             }
             if (
               lockedRun.scheduledRetryReason === "native_safe_replacement" && lockedIssue &&
               ((lockedIssue.executionRunId !== null && lockedIssue.executionRunId !== lockedRun.id) ||
                 (lockedIssue.checkoutRunId !== null && lockedIssue.checkoutRunId !== lockedRun.id))
             ) {
-              return { kind: "stale" as const, run: null };
+              return { kind: "stale" as const, run: null, reason: "native_replacement_lock_held" as const };
             }
 
             const holder = issueId
@@ -20362,7 +20413,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             );
             if (lockedRun.invocationSource === "automation" && issueId) {
               const admission = readChatControlRecoveryAdmission(lockedRun);
-              if (admission === "invalid") return { kind: "stale" as const, run: null };
+              if (admission === "invalid") {
+                return { kind: "stale" as const, run: null, reason: "chat_control_admission_invalid" as const };
+              }
               const proof = await readChatControlRecoveryStop(
                 tx as unknown as Db,
                 {
@@ -20373,7 +20426,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 },
                 true,
               );
-              if (proof.kind === "unresolved") return { kind: "stale" as const, run: null };
+              if (proof.kind === "unresolved") {
+                return { kind: "stale" as const, run: null, reason: "retry_lineage_unresolved" as const };
+              }
               if (proof.kind === "stopped") {
                 const error =
                   "Automatic continuation stopped by the committed chat conversation close. Send a fresh request in chat or on the Board.";
@@ -20401,7 +20456,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     eq(heartbeatRuns.status, "queued"),
                   ))
                   .returning();
-                if (!cancelled) return { kind: "stale" as const, run: null };
+                if (!cancelled) return { kind: "stale" as const, run: null, reason: "run_not_queued" as const };
                 if (lockedWake) {
                   await tx
                     .update(agentWakeupRequests)
@@ -20497,7 +20552,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // Upstream #13973: a terminal previous owner hands the issue over only
             // after its executor and durable lease/finalization cleanup settle.
             // The fork's live-holder deferral above runs first.
-            if ((await lockIssueExecutionClaim(tx as unknown as Db)).blocked) return { kind: "stale" as const, run: null };
+            if ((await lockIssueExecutionClaim(tx as unknown as Db)).blocked) {
+              return { kind: "stale" as const, run: null, reason: "previous_owner_not_settled" as const };
+            }
 
             const [claimedRun] = await tx
               .update(heartbeatRuns)
@@ -20512,7 +20569,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               })
               .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
               .returning();
-            if (!claimedRun) return { kind: "stale" as const, run: null };
+            if (!claimedRun) return { kind: "stale" as const, run: null, reason: "run_not_queued" as const };
 
             if (lockedWake) {
               await tx
@@ -20636,7 +20693,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await recordConcurrentRunDeferral(run, issueId!, atomicClaim.holder);
       return null;
     }
-    if (atomicClaim?.kind === "stale") return null;
+    if (atomicClaim?.kind === "stale") {
+      await recordAtomicClaimStale(run, issueId, atomicClaim.reason).catch((err) => {
+        logger.warn(
+          { err, runId: run.id, issueId, claimStaleReason: atomicClaim.reason },
+          "claimQueuedRun: failed to record atomic claim stale event",
+        );
+      });
+      return null;
+    }
     if (atomicClaim?.kind === "cancelled") {
       await appendRunEvent(atomicClaim.run, {
         eventType: "lifecycle",
@@ -21258,7 +21323,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           | "issue_execution_lock_changed"
           | "issue_review_participant_changed"
           | "issue_continuation_waiting_on_review"
-          | "native_review_assignment_already_claimed";
+          | "native_review_assignment_already_claimed"
+          | "retry_lineage_invalid";
         details: Record<string, unknown>;
         // Agent that owns the issue now and must be woken in the cancelled run's
         // place. null means this is a deliberate no-enqueue case (the issue is
@@ -21321,6 +21387,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         errorCode: "issue_not_found",
         reason: "Cancelled because the target issue no longer exists",
         details: { issueId },
+        handoffAgentId: null,
+      };
+    }
+
+    // Mirrors the self-lineage rule in decideQueuedRunStaleness (SUP-24883):
+    // the atomic claim's lineage walk can never resolve a run that names itself.
+    if (run.status === "queued" && run.retryOfRunId === run.id) {
+      return {
+        stale: true,
+        errorCode: "retry_lineage_invalid",
+        reason: "Cancelled because the queued run names itself as its retry predecessor",
+        details: { issueId, retryOfRunId: run.retryOfRunId },
         handoffAgentId: null,
       };
     }

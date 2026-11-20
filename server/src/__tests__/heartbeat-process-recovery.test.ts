@@ -14518,9 +14518,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .set({ state: "pending" })
       .where(eq(chatPublications.id, source.publicationId));
     const child = await seedChatAutomaticChild(source);
+    // A two-run lineage cycle: unresolved at claim, so the claim defers. A run
+    // that names itself is no longer deferred; the staleness gate cancels it
+    // as retry_lineage_invalid.
+    const partner = await seedChatAutomaticChild(source, {
+      parentId: child.runId,
+      status: "succeeded",
+    });
     await db
       .update(heartbeatRuns)
-      .set({ retryOfRunId: child.runId })
+      .set({ retryOfRunId: partner.runId })
       .where(eq(heartbeatRuns.id, child.runId));
     const heartbeat = heartbeatService(db);
     await heartbeat.resumeQueuedRuns();
@@ -14536,6 +14543,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .update(heartbeatRuns)
       .set({ retryOfRunId: source.runId })
       .where(eq(heartbeatRuns.id, child.runId));
+    await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, partner.runId));
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, partner.runId));
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, partner.wakeupRequestId));
     const finalHeartbeat = heartbeatService(db, {
       beforeChatControlRecoveryCheck: async ({ stage, runId }) => {
         if (stage === "dispatch")
