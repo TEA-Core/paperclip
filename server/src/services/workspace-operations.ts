@@ -227,6 +227,22 @@ function appendExcerpt(current: string, chunk: string) {
   return `${current}${chunk}`.slice(-4096);
 }
 
+function readThrownValidationEvidence(error: unknown): Record<string, unknown> | null {
+  if (!error || typeof error !== "object" || !("resultJson" in error)) return null;
+  const resultJson = error.resultJson;
+  if (!resultJson || typeof resultJson !== "object" || Array.isArray(resultJson)) return null;
+  if (!("workspaceValidation" in resultJson)) return null;
+  const workspaceValidation = resultJson.workspaceValidation;
+  if (!workspaceValidation || typeof workspaceValidation !== "object" || Array.isArray(workspaceValidation)) {
+    return null;
+  }
+  const evidence: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(workspaceValidation)) {
+    evidence[key] = value;
+  }
+  return evidence;
+}
+
 function combineMetadata(
   base: Record<string, unknown> | null | undefined,
   patch: Record<string, unknown> | null | undefined,
@@ -662,6 +678,7 @@ export function workspaceOperationService(db: Db) {
             await append("stderr", error instanceof Error ? error.message : String(error));
             const finalized = await logStore.finalize(handle).catch(() => null);
             const finishedAt = new Date();
+            const validationEvidence = readThrownValidationEvidence(error);
             await db
               .update(workspaceOperations)
               .set({
@@ -681,6 +698,7 @@ export function workspaceOperationService(db: Db) {
                           failureReason: error instanceof WorkspaceOperationTimeoutError
                             ? "runtime_control_timeout"
                             : "runtime_control_error",
+                          ...(validationEvidence ? { checkoutBranchDrift: validationEvidence } : {}),
                         }),
                         currentUserRedactionOptions,
                       ) as Record<string, unknown> | null,
