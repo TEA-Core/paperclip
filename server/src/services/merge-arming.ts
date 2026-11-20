@@ -33,6 +33,12 @@ import {
   invalidateDeliveryReceipt,
   type DeliveryReceiptClaim,
 } from "./delivery-receipt-recovery.js";
+import {
+  carrierOwnerChildAttributionBlock,
+  childCarrierAttributionMatches,
+  childCarrierMustNotPublish,
+  resolveChildCarrierDecisionHead,
+} from "./child-carrier-attribution.js";
 
 export {
   isGitHubTokenResolution,
@@ -3005,6 +3011,15 @@ export async function narrowToDelivered<
   const delivered = usePrefixPredicate
     ? candidates.filter((pr) => isDeliveredByCardIdentifierPrefix(pr, repo, identifier as string))
     : candidates.filter((pr) => isDeliveredByCard(pr, repo, branch));
+  if (delivered.length === 0 && branchIsOwn) {
+    const attributed = [];
+    for (const pr of candidates) {
+      if (await childCarrierAttributionMatches(db, companyId, issueId, pr)) attributed.push(pr);
+    }
+    if (attributed.length === 1) {
+      return { outcome: "narrowed", delivered: attributed, deliveryBranch: branch };
+    }
+  }
   if (delivered.length === 0) {
     return {
       outcome: "not-delivered",
@@ -3015,6 +3030,26 @@ export async function narrowToDelivered<
     };
   }
   return { outcome: "narrowed", delivered, deliveryBranch: branch };
+}
+
+async function refuseChildCarrierPublication(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  pr: { owner: string; repo: string; number: number; headRefName?: string | null },
+  headSha: string,
+): Promise<ArmingOutcome | null> {
+  const childSkip = await childCarrierMustNotPublish(db, companyId, issueId, pr);
+  if (childSkip) return { kind: "skipped", message: childSkip, headSha };
+  const ownerSkip = await carrierOwnerChildAttributionBlock(db, companyId, issueId, {
+    owner: pr.owner,
+    repo: pr.repo,
+    number: pr.number,
+    headSha,
+    headRef: pr.headRefName ?? null,
+  });
+  if (ownerSkip) return { kind: "skipped", message: ownerSkip, headSha };
+  return null;
 }
 
 export async function publishApprovalStatus(
@@ -3222,6 +3257,8 @@ export async function publishApprovalStatus(
           headSha,
         };
       }
+      const childCarrierBlock = await refuseChildCarrierPublication(db, companyId, issueId, pr, headSha);
+      if (childCarrierBlock) return childCarrierBlock;
       const receipt = certification && options?.requireDeliveryReceipt !== true ? null : await claimReceiptForPublication(
         db,
         companyId,
@@ -3401,6 +3438,8 @@ export async function publishApprovalStatus(
         headSha,
       };
     }
+    const childCarrierBlock = await refuseChildCarrierPublication(db, companyId, issueId, pr, headSha);
+    if (childCarrierBlock) return childCarrierBlock;
     const receipt = certification && options?.requireDeliveryReceipt !== true ? null : await claimReceiptForPublication(
       db,
       companyId,
@@ -3531,6 +3570,18 @@ export async function resolveApprovalDecisionHead(
   closingTransition: boolean,
 ): Promise<DecisionHeadResolution> {
   const deliveryIdentity = await resolveDeliveryIdentity(db, companyId, issueId);
+  const childCarrier = await resolveChildCarrierDecisionHead(db, companyId, issueId);
+  if (childCarrier.kind === "resolved") {
+    return {
+      kind: "resolved",
+      headSha: childCarrier.headSha,
+      displayName: childCarrier.displayName,
+      pr: childCarrier.pr,
+    };
+  }
+  if (childCarrier.kind === "unresolvable") {
+    return { kind: "unresolvable", reason: childCarrier.reason };
+  }
   if (deliveryIdentity.binding && deliveryIdentity.repo) {
     const bindingError = deliveryBindingValidationError(deliveryIdentity.binding, deliveryIdentity.repo, issueId);
     if (bindingError) {
