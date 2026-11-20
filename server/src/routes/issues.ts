@@ -21332,7 +21332,7 @@ export function issueRoutes(
         stage: "no_repository_landing_transition_recheck",
       });
     const zeroDeltaTransitionRefusal = (reason: string) =>
-      unprocessable(reason, {
+      unprocessable(`Tier 2 declaration could not be verified at the close write (merge_commit_unrecorded): ${reason}`, {
         code: "done_transition_missing_tier_declaration",
         issueId: existing.id,
         identifier: existing.identifier ?? null,
@@ -21677,6 +21677,15 @@ export function issueRoutes(
           if (zeroDeltaCloseMeasurement !== null) {
             const lockedForZeroDelta = await svc.getByIdForUpdate(id, tx);
             if (!lockedForZeroDelta) return null;
+            const requestedRebindId = updateFields.executionWorkspaceId;
+            if (
+              typeof requestedRebindId === "string"
+              && requestedRebindId !== (finalDeliveryIssue.executionWorkspaceId ?? null)
+            ) {
+              throw zeroDeltaTransitionRefusal(
+                "a zero-delta close cannot bind the card to a workspace other than the measured one",
+              );
+            }
             const verdict = await verifyZeroDeltaCloseAtTransition(
               tx as unknown as Db,
               lockedForZeroDelta,

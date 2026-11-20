@@ -2404,6 +2404,19 @@ async function proveZeroDeltaRepositoryClose(
           )
           .then((rows) => rows.flatMap((row) => (row.identifier ? [row.identifier] : []))),
       ),
+    countCommitsAheadOfBase: async (sha) => {
+      const ahead = await githubCompareAheadBy(
+        hostname,
+        owner,
+        repo,
+        baseBranch,
+        sha,
+        token,
+        AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
+      );
+      if (ahead === null) throw new Error("GitHub compare returned no ahead_by");
+      return ahead;
+    },
   });
   if (!probe.ok) return refuse(probe.reason);
 
@@ -2556,6 +2569,25 @@ export async function verifyZeroDeltaCloseAtTransition(
     return refuse("the issue's execution workspace changed after the close was measured");
   }
   try {
+    const linkedPrs = await resolveLinkedPullRequestsWithState(tx, lockedIssue.companyId, lockedIssue.id, { includeDrafts: true });
+    if (linkedPrs.length > 0) {
+      return refuse(`the card links pull requests (${linkedPrs.map((pr) => pr.displayName).join(", ")}) at the close write`);
+    }
+    const workProducts = await tx
+      .select({ type: issueWorkProducts.type, status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+      .from(issueWorkProducts)
+      .where(and(eq(issueWorkProducts.companyId, lockedIssue.companyId), eq(issueWorkProducts.issueId, lockedIssue.id)));
+    if (workProducts.some((product) => product.type === "pull_request")) {
+      return refuse("the card records a pull_request work product at the close write");
+    }
+    if (
+      workProducts.some((product) => {
+        const metadata = (product.metadata ?? {}) as Record<string, unknown>;
+        return (metadata.mergeCommitSha ?? metadata.merge_commit_sha ?? null) !== null;
+      })
+    ) {
+      return refuse("the card records a merge commit on a work product at the close write");
+    }
     const workspace = await tx
       .select({
         sourceIssueId: executionWorkspaces.sourceIssueId,
@@ -4153,6 +4185,13 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
         allowed: false,
         code: "done_transition_missing_tier_declaration",
         reason: tierResult.reason,
+      };
+    }
+    if (tierResult.zeroDeltaMeasurement) {
+      return {
+        allowed: false,
+        code: "done_transition_missing_tier_declaration",
+        reason: "Zero-delta Tier 2 closes are not accepted on the backstop close path.",
       };
     }
     if (tierResult.tier === "tier1") {

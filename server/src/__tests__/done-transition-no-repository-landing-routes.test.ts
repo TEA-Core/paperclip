@@ -1913,4 +1913,79 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
 
     expect(verdict).toMatchObject({ allowed: false, code: "done_transition_missing_tier_declaration" });
   });
+
+  function zeroDeltaDoneTier(worktree: string) {
+    const head = git(worktree, "rev-parse", "HEAD");
+    return {
+      tier: "tier2",
+      probeEvidence: `probe \`git rev-list --count origin/main..HEAD\` head ${head} post-merge: origin/main..HEAD is 0 and the worktree is clean`,
+    } as const;
+  }
+
+  function answerZeroDeltaGitHub() {
+    mockGhFetch.mockImplementation(async (url: string) => {
+      const text = String(url);
+      const commit = /\/commits\/([0-9a-f]{40})$/.exec(text);
+      if (commit) {
+        try {
+          return new Response(JSON.stringify({ sha: git(currentOrigin, "rev-parse", "--verify", "--quiet", `${commit[1]}^{commit}`) }), { status: 200 });
+        } catch {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+      }
+      const ref = /\/git\/ref\/heads\/(.+)$/.exec(text);
+      if (ref) {
+        try {
+          git(currentOrigin, "rev-parse", "--verify", "--quiet", `refs/heads/${decodeURIComponent(ref[1]!)}`);
+          return new Response(JSON.stringify({ ref: `refs/heads/${decodeURIComponent(ref[1]!)}` }), { status: 200 });
+        } catch {
+          return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+        }
+      }
+      return compareAgainstOrigin(text);
+    });
+  }
+
+  it("closes a repository_delivery card with a server-proven zero-delta Tier 2 declaration", async () => {
+    const fixture = await seed({ deliveryRequirement: "repository_delivery" });
+    answerZeroDeltaGitHub();
+
+    const res = await request(app)
+      .patch(`/api/issues/${fixture.identifier}`)
+      .send({ status: "done", doneTier: zeroDeltaDoneTier(fixture.worktree) });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(await statusOf(fixture.issueId)).toBe("done");
+  });
+
+  it("refuses a zero-delta close that rebinds the execution workspace in the same request", async () => {
+    const fixture = await seed({ deliveryRequirement: "repository_delivery" });
+    answerZeroDeltaGitHub();
+    const otherWorkspaceId = randomUUID();
+    await db.insert(executionWorkspaces).values({
+      id: otherWorkspaceId,
+      companyId: fixture.companyId,
+      projectId: fixture.projectId,
+      projectWorkspaceId: fixture.projectWorkspaceId,
+      sourceIssueId: fixture.issueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "other-workspace",
+      status: "active",
+      cwd: fixture.worktree,
+      repoUrl: "https://github.com/TEA-Core/records",
+      baseRef: "main",
+      branchName: fixture.branch,
+      providerType: "git_worktree",
+      providerRef: fixture.worktree,
+    });
+
+    const res = await request(app)
+      .patch(`/api/issues/${fixture.identifier}`)
+      .send({ status: "done", doneTier: zeroDeltaDoneTier(fixture.worktree), executionWorkspaceId: otherWorkspaceId });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("merge_commit_unrecorded");
+    expect(await statusOf(fixture.issueId)).toBe("in_progress");
+  });
 });

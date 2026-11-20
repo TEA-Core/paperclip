@@ -100,7 +100,7 @@ const db = {
               : rows.workProducts.filter((row) => row.type === "pull_request" && row.status === "merged"),
           );
         }
-        return Promise.reject(new Error("unexpected table"));
+        return Promise.resolve([]);
       },
     }),
   }),
@@ -646,6 +646,72 @@ describe("zero-delta NO-GO regressions (RA 1213)", () => {
     writeFileSync(path.join(worktree, "late.txt"), "added after measurement\n");
     const dirty = await verify!(db, locked, measurement);
     expect(dirty.ok).toBe(false);
+  });
+
+  it("refuses at the close write when a pull request is linked after the measurement", async () => {
+    const result = await close();
+    expect(result.allowed).toBe(true);
+    const measurement = (result as unknown as Record<string, unknown>).zeroDeltaMeasurement;
+    const verify = (doneTransitionGuard as unknown as Record<string, unknown>).verifyZeroDeltaCloseAtTransition as
+      (tx: unknown, locked: unknown, measurement: unknown) => Promise<{ ok: boolean; reason?: string }>;
+    mockResolveLinkedPullRequestsWithState.mockResolvedValue([
+      { displayName: "TEA-Core/paperclip#1300", cachedState: "open", merged: false },
+    ]);
+    const verdict = await verify(db, { ...CARD, deliveryRequirement: "repository_delivery" as const, status: "in_progress" }, measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("pull request");
+  });
+
+  it("refuses at the close write when a pull_request work product appears after the measurement", async () => {
+    const result = await close();
+    expect(result.allowed).toBe(true);
+    const measurement = (result as unknown as Record<string, unknown>).zeroDeltaMeasurement;
+    const verify = (doneTransitionGuard as unknown as Record<string, unknown>).verifyZeroDeltaCloseAtTransition as
+      (tx: unknown, locked: unknown, measurement: unknown) => Promise<{ ok: boolean; reason?: string }>;
+    rows.workProducts = [{ type: "pull_request", status: "open", metadata: { prNumber: 1300 } }];
+    const verdict = await verify(db, { ...CARD, deliveryRequirement: "repository_delivery" as const, status: "in_progress" }, measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("pull_request work product");
+  });
+
+  it("refuses a zero-delta declaration on the backstop close path", async () => {
+    const verdict = await doneTransitionGuard.evaluateDoneTransitionGuardForBackstopClose({
+      db,
+      issue: card(),
+      actorId: "system-sweep",
+      closeComment: null,
+      structuredDoneTier: {
+        tier: "tier2",
+        probeEvidence: `probe \`git -C . rev-list --count origin/main..HEAD\` head ${headSha()} post-merge: origin/main..HEAD is 0 and the worktree is clean`,
+      },
+    });
+    expect(verdict.allowed).toBe(false);
+    if (!verdict.allowed) {
+      expect(verdict.code).toBe("done_transition_missing_tier_declaration");
+      expect(verdict.reason).toContain("backstop");
+    }
+  });
+
+  it("refuses a sibling commit hidden by moving the local base ref onto it", async () => {
+    git(worktree, "checkout", "-q", "-b", "SUP-24395-hidden");
+    writeFileSync(path.join(worktree, "work.txt"), "work\n");
+    git(worktree, "add", "work.txt");
+    git(worktree, "commit", "-qm", "SUP-24395 hidden work");
+    const sibling = headSha();
+    git(worktree, "checkout", "-q", BRANCH);
+    git(worktree, "update-ref", "refs/remotes/origin/main", sibling);
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("A zero-delta close was not proven:");
+  });
+
+  it("refuses a second linked worktree with a detached HEAD holding uncommitted work", async () => {
+    const other = path.join(repoRoot, ".paperclip", "worktrees", "detached-other");
+    git(repoRoot, "worktree", "add", "-q", "--detach", other, "origin/main");
+    writeFileSync(path.join(other, "draft.txt"), "undelivered\n");
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("detached");
   });
 
   it("refuses a shallow worktree (pin)", async () => {

@@ -1103,6 +1103,11 @@ export interface ZeroDeltaWorktreeProbeInput {
   attributedBranches: ReadonlySet<string>;
   /** Which of `candidates` are the identifier of an existing issue of this company other than this card. */
   existingOtherCardIdentifiers: (candidates: readonly string[]) => Promise<ReadonlySet<string>>;
+  /**
+   * Commits `sha` carries beyond the base branch, measured on the remote (a
+   * source the agent cannot write). Throws when it cannot be measured.
+   */
+  countCommitsAheadOfBase: (sha: string) => Promise<number>;
   timeoutMs?: number;
 }
 
@@ -1138,14 +1143,15 @@ export function zeroDeltaWorktreeRefusal(measurement: ZeroDeltaWorktreeMeasureme
 }
 
 /**
- * The no-repository probe's sibling scans, measured locally against the base
- * commit: every other branch naming this card must be level with the base,
- * every other local branch must belong to a card (a project branch, another
- * card's registered branch, or another existing card's rescue branch), every
- * remote-tracking branch naming this card must be level, and every other
- * worktree on a branch naming this card must be clean. These scans read refs
- * an agent can write, so they are advisory; the caller separately anchors the
- * recorded worktree's HEAD and branch on the remote.
+ * The no-repository probe's sibling scans: every other branch naming this
+ * card must be level with the base, every other local branch must belong to
+ * a card (a project branch, another card's registered branch, or another
+ * existing card's rescue branch), every remote-tracking branch naming this
+ * card must be level, and every other worktree on a branch naming this card
+ * must be clean. A worktree with a detached HEAD refuses. Branch tips are
+ * compared by the caller against the remote base, never against a local
+ * tracking ref an agent can move; the branch and worktree lists themselves
+ * read refs an agent can write, so they are advisory next to that anchor.
  */
 async function zeroDeltaSiblingRefusal(
   input: ZeroDeltaWorktreeProbeInput,
@@ -1153,12 +1159,10 @@ async function zeroDeltaSiblingRefusal(
     repoRoot: string;
     commonDir: string;
     worktreePath: string;
-    baseSha: string;
-    baseRef: string;
     options: HardenedGitOptions;
   },
 ): Promise<string | null> {
-  const { repoRoot, commonDir, worktreePath, baseSha, baseRef, options } = ctx;
+  const { repoRoot, commonDir, worktreePath, options } = ctx;
   const refs = (await runHardenedGit(
     ["-C", repoRoot, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/remotes/"],
     options,
@@ -1174,13 +1178,11 @@ async function zeroDeltaSiblingRefusal(
     return owner === null ? [] : [owner];
   }))];
   const rescuedCards = rescueOwners.length > 0 ? await input.existingOtherCardIdentifiers(rescueOwners) : new Set<string>();
-  const aheadCount = async (sha: string): Promise<string> =>
-    (await runHardenedGit(["-C", repoRoot, "rev-list", "--count", `${baseSha}..${sha}`], options)).trim();
   for (const { sha, name } of localBranches) {
     if (!SHA_RE.test(sha) || name === input.branch) continue;
     if (branchNamesIssue(name, input.issueIdentifier)) {
-      const count = await aheadCount(sha);
-      if (count !== "0") return `branch ${name} has ${count} commit(s) on its tip that ${baseRef} lacks`;
+      const refusal = await aheadOfBaseRefusal(`branch ${name}`, sha, input.countCommitsAheadOfBase);
+      if (refusal) return refusal;
       continue;
     }
     const rescueOwner = rescueBranchOwner(name);
@@ -1204,8 +1206,8 @@ async function zeroDeltaSiblingRefusal(
     const name = remoteRef.slice(slash + 1);
     if (name === "HEAD" || name === input.baseBranch || name === input.branch || input.projectBranches.has(name)) continue;
     if (!branchNamesIssue(name, input.issueIdentifier)) continue;
-    const count = await aheadCount(ref.sha);
-    if (count !== "0") return `branch ${remoteRef} has ${count} commit(s) on its tip that ${baseRef} lacks`;
+    const refusal = await aheadOfBaseRefusal(`branch ${remoteRef}`, ref.sha, input.countCommitsAheadOfBase);
+    if (refusal) return refusal;
   }
   const worktreeRecords = (await runHardenedGit(["-C", repoRoot, "worktree", "list", "--porcelain", "-z"], options))
     .split("\0\0")
@@ -1214,7 +1216,17 @@ async function zeroDeltaSiblingRefusal(
   for (const fields of worktreeRecords) {
     const worktreeField = fields.find((field) => field.startsWith("worktree "));
     const branchField = fields.find((field) => field.startsWith("branch refs/heads/"));
-    if (!worktreeField || !branchField) continue;
+    if (!worktreeField) continue;
+    if (!branchField) {
+      let detachedPath: string;
+      try {
+        detachedPath = await realpath(worktreeField.slice("worktree ".length));
+      } catch {
+        continue;
+      }
+      if (detachedPath === worktreePath) continue;
+      return `another worktree at ${detachedPath} has a detached HEAD`;
+    }
     const branch = branchField.slice("branch refs/heads/".length);
     if (!branchNamesIssue(branch, input.issueIdentifier)) continue;
     let otherPath: string;
@@ -1355,8 +1367,6 @@ export async function probeZeroDeltaWorktree(input: ZeroDeltaWorktreeProbeInput)
       repoRoot,
       commonDir,
       worktreePath,
-      baseSha,
-      baseRef,
       options,
     });
     if (siblingRefusal) return refuse(siblingRefusal);
