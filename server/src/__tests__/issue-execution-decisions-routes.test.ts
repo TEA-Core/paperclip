@@ -38,6 +38,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { heartbeatService } from "../services/heartbeat.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import type * as GitHubFetch from "../services/github-fetch.js";
 import type * as GitHubCredential from "../services/github-credential.js";
@@ -252,6 +253,12 @@ describeEmbeddedPostgres("issue execution-decisions read route (ADR-073 D4)", ()
 
   afterEach(async () => {
     github.mockReset();
+    // The routes enqueue stage wakes fire-and-forget (`void enqueueExecutionStageWakeup(...)`
+    // in the board stage-decision route), so a wake can still be running after the
+    // response. Its agent_wakeup_requests insert can then commit between the
+    // agentWakeupRequests and agents deletes below and fail the agents delete with
+    // agent_wakeup_requests_agent_id_agents_id_fk. Await every in-flight wake first.
+    await heartbeatService(db).drainActiveRunExecutions();
     await db.delete(issueDeliveryReceiptLinks);
     await db.delete(issueDeliveryReceipts);
     await db.delete(activityLog);
