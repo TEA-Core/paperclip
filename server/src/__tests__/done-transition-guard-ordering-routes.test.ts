@@ -1956,5 +1956,84 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         .where(eq(issueExecutionDecisions.issueId, issueId));
       expect(decisions).toHaveLength(0);
     });
+
+    it("still refuses a done close when the same request did not skip the unsatisfied stage", async () => {
+      const seeded = await seedIssue("UNMET");
+      const reviewerId = randomUUID();
+      await db.insert(agents).values({
+        id: reviewerId,
+        companyId: seeded.companyId,
+        name: "OtherReviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [{
+          type: "review",
+          participants: [{ type: "agent", agentId: reviewerId }],
+        }],
+      });
+      if (!policy || policy.stages.length !== 1) {
+        throw new Error("expected a one-stage review policy");
+      }
+      const stageId = policy.stages[0]!.id;
+      const uncoveredState = {
+        status: "completed",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [] as string[],
+        skippedStageIds: [] as string[],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      };
+      await db.update(issues).set({
+        status: "in_progress",
+        deliveryRequirement: "record_only",
+        executionPolicy: policy as unknown as Record<string, unknown>,
+        executionState: uncoveredState,
+      }).where(eq(issues.id, seeded.issueId));
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: seeded.companyId,
+        agentId: seeded.agentId,
+        status: "running",
+        startedAt: new Date("2026-11-04T09:00:00Z"),
+        contextSnapshot: { issueId: seeded.issueId },
+      });
+      currentActor = agentActor(seeded.companyId, seeded.agentId, runId);
+
+      const res = await request(app)
+        .patch(`/api/issues/${seeded.identifier}`)
+        .send({
+          status: "done",
+          comment: "Close without a recorded review decision.",
+          doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code).toBe("done_transition_missing_delivery");
+      expect(res.body.details.mechanism).toBe("C");
+      expect(res.body.details.decisionCarried).toBe(false);
+
+      const rows = await db
+        .select({ status: issues.status, executionState: issues.executionState })
+        .from(issues)
+        .where(eq(issues.id, seeded.issueId));
+      expect(rows[0]?.status).toBe("in_progress");
+      expect(rows[0]?.executionState).toMatchObject({
+        status: "completed",
+        completedStageIds: [],
+        skippedStageIds: [],
+      });
+      expect(JSON.stringify(rows[0]?.executionState)).not.toContain(stageId);
+    });
   });
 });

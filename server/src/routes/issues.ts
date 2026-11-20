@@ -21205,8 +21205,19 @@ export function issueRoutes(
         agentId: actor.agentId ?? null,
         userId: actor.actorType === "user" ? actor.actorId : null,
       };
+      // SUP-22800/SUP-23202: a same-request auto-skip records skippedStageIds on
+      // the transition patch and persists them only after this guard returns.
+      // Mechanism C must treat those stages as skipped. An omitted executionState
+      // (durable-approval close, already-completed ladder) keeps the pre-patch row.
+      const sameRequestExecutionState = transition.patch.executionState;
+      const guardDeliveryIssue =
+        sameRequestExecutionState != null &&
+        typeof sameRequestExecutionState === "object" &&
+        !Array.isArray(sameRequestExecutionState)
+          ? { ...finalDeliveryIssue, executionState: sameRequestExecutionState }
+          : finalDeliveryIssue;
       const outcome = await evaluateDoneTransitionGuards({
-        issue: finalDeliveryIssue,
+        issue: guardDeliveryIssue,
         override,
         commentBody: commentBody ?? null,
         runId: actor.runId?.trim()
