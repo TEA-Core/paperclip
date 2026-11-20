@@ -94,16 +94,18 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     return id;
   }
 
+  let seedIssueCounter = 0;
   async function seedIssue(companyId: string, overrides: Partial<typeof issues.$inferInsert> = {}) {
     const id = overrides.id ?? randomUUID();
+    const nextSeedIssueNumber = 1000 + seedIssueCounter++;
     await db.insert(issues).values({
       id,
       companyId,
       title: overrides.title ?? "Watched issue",
       status: overrides.status ?? "done",
       priority: overrides.priority ?? "medium",
-      identifier: overrides.identifier ?? `WDOG-${Math.floor(Math.random() * 10_000)}`,
-      issueNumber: overrides.issueNumber ?? Math.floor(Math.random() * 10_000),
+      identifier: overrides.identifier ?? `WDOG-${nextSeedIssueNumber}`,
+      issueNumber: overrides.issueNumber ?? nextSeedIssueNumber,
       parentId: overrides.parentId,
       assigneeAgentId: overrides.assigneeAgentId,
       originKind: overrides.originKind,
