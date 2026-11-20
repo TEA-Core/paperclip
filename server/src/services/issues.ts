@@ -12565,20 +12565,24 @@ export function issueService(db: Db) {
             : Promise.resolve(new Map<string, IssueRelationSummaryMap>()),
         ]);
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, existing.companyId);
+        // SUP-24762: a field-less write sets no goal or project, so it resolves
+        // the goal from the locked row; the pre-lock read could be stale and
+        // would overwrite a goal another writer changed in between.
+        const goalSourceRow = fieldlessWrite ? receiptExisting : existing;
         const [currentProjectGoalId, nextProjectGoalId] = await Promise.all([
-          getProjectDefaultGoalId(tx, existing.companyId, existing.projectId),
+          getProjectDefaultGoalId(tx, existing.companyId, goalSourceRow.projectId),
           getProjectDefaultGoalId(
             tx,
             existing.companyId,
             issueData.projectId !== undefined
               ? issueData.projectId
-              : existing.projectId,
+              : goalSourceRow.projectId,
           ),
         ]);
 
         patch.goalId = resolveNextIssueGoalId({
-          currentProjectId: existing.projectId,
-          currentGoalId: existing.goalId,
+          currentProjectId: goalSourceRow.projectId,
+          currentGoalId: goalSourceRow.goalId,
           currentProjectGoalId,
           projectId: issueData.projectId,
           goalId: issueData.goalId,

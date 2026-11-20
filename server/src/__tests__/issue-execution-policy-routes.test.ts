@@ -4352,6 +4352,8 @@ describe("issue execution policy routes", () => {
         },
       }],
       ["a reviewRequest", { reviewRequest: { instructions: "Please check the summary." } }],
+      // A null reviewRequest clears the request and still writes executionState.
+      ["a null reviewRequest", { reviewRequest: null }],
     ])("refuses a board comment with %s on a human-held Wiki handoff before reopening its closed workspace (SUP-24762)", async (_name, extra) => {
       const workspaceId = "78787878-7878-4787-8787-787878787878";
       const issue = { ...humanReviewHandoff(), executionWorkspaceId: workspaceId };
