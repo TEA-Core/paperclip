@@ -828,16 +828,24 @@ The Wiki handoff guard is also skipped for a field-less write. In a field-less
 write, every present key is `undefined` or request attribution: `actorAgentId`,
 `actorRunId`, `actorRunStopId`, `actorUserId`, `boardApiKeyId`,
 `expectedUpdatedAt`. A comment-only `PATCH /api/issues/:id` is a field-less
-write, and the PATCH route skips its own guard call for it too. A field-less
-write sets no assignee, so the guard does not judge the stored assignee. Thus
-a comment on a Wiki handoff whose review stage a human reviewer holds (stored
-`assigneeAgentId` null) is not refused. When the write carries any other key,
-the attribution keys still count as present keys. Thus an attributed `status`
-or `unblockDescriptor` write still runs the guard. In `issueService.update`, an
-`executionPolicy` key is never field-less, even when its value is `undefined`,
-because the update normalizes that value to `null` and clears the stored
-policy. Thus an attributed `executionPolicy: undefined` write still runs the
-guard.
+write when the route adds no field to it, and the PATCH route then skips its
+own guard call too. A field-less write sets no assignee, so the guard does not
+judge the stored assignee. Thus a comment on a Wiki handoff whose review stage
+a human reviewer holds (stored `assigneeAgentId` null) is not refused when the
+card is `in_review`, or `done` with its review stage complete. Known limit:
+when the card has another status while its review stage is still pending, for
+example `blocked`, or `todo` with a pending stage, the PATCH route adds fields
+to the write before the field-less check. The comment is then still refused
+with 422 `wiki_handoff_unassigned`. When the write carries any other key, the
+attribution keys still count as present keys. Thus an attributed `status` or
+`unblockDescriptor` write still runs the guard. In `issueService.update`, an
+`executionPolicy` key that comes with attribution keys is not field-less, even
+when its value is `undefined`, because the update normalizes that value to
+`null` and clears the stored policy. Thus an attributed
+`executionPolicy: undefined` write still runs the guard. A bare
+`executionPolicy: undefined` write, with no other present key, skips the guard
+and clears the stored policy, as the paragraph above states. That behavior
+predates the field-less skip, and the field-less skip does not change it.
 
 The board stage decision (`POST /issues/:id/execution-stage/board-decision`)
 can close the final stage of an unassigned Wiki handoff card. That hand-back

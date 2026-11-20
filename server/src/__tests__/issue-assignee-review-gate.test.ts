@@ -28,6 +28,7 @@ import {
   assertWikiHandoffWriteIntegrity,
   findSelfSatisfyingReviewStage,
   resolveCanonicalWikiMaintainerAgentId,
+  isFieldlessIssueWrite,
   isUnassignedWikiHandoffCancellation,
   wikiHandoffWriteWouldViolate,
 } from "../services/issue-assignee-review-gate.js";
@@ -687,6 +688,35 @@ describe("wiki handoff write integrity (SUP-21752, pure helpers)", () => {
       ["an unknown stored user assignee", { currentAssigneeUserId: undefined }],
     ])("refuses %s", (_name, override) => {
       expect(isUnassignedWikiHandoffCancellation({ ...stubCancel, ...override })).toBe(false);
+    });
+  });
+
+  // SUP-24762: only undefined values and request attribution make a write
+  // field-less; a null-valued issue field (including an assignee) is a field.
+  describe("isFieldlessIssueWrite (SUP-24762)", () => {
+    it.each([
+      ["no keys", {}],
+      ["null attribution keys", {
+        actorAgentId: null,
+        actorRunId: null,
+        actorRunStopId: null,
+        actorUserId: null,
+        boardApiKeyId: null,
+        expectedUpdatedAt: null,
+      }],
+      ["attribution plus undefined fields", { actorUserId: "local-board", title: undefined, assigneeAgentId: undefined }],
+    ])("treats %s as field-less", (_name, data) => {
+      expect(isFieldlessIssueWrite(data)).toBe(true);
+    });
+
+    it.each([
+      ["a null agent assignee", { assigneeAgentId: null }],
+      ["an agent assignee with attribution", { assigneeAgentId: CANONICAL, actorUserId: "local-board" }],
+      ["a null user assignee", { assigneeUserId: null }],
+      ["a null title", { title: null }],
+      ["a status with attribution", { status: "todo", actorAgentId: null }],
+    ])("treats %s as a field write", (_name, data) => {
+      expect(isFieldlessIssueWrite(data)).toBe(false);
     });
   });
 });
