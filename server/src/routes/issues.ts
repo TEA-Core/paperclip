@@ -5588,6 +5588,10 @@ export function issueRoutes(
     // record-only Tier 2 close whose closing run cannot be resolved, so an
     // agent cannot skip the lifetime gate by dropping the run id header.
     closingAgentId?: string | null;
+    // SUP-24402: only a door that re-runs verifyZeroDeltaCloseAtTransition
+    // inside its status write sets this; every other door leaves it unset, and
+    // the zero-delta repository_delivery Tier 2 form then refuses.
+    zeroDeltaRecheckedAtWrite?: boolean;
     // SUP-24429: the requirement stored before the request, passed by a door
     // whose request can change it. The guard's record-only skip then applies
     // only when this is record_only too.
@@ -5760,6 +5764,7 @@ export function issueRoutes(
       (issueId) => svc.listComments(issueId, { order: "desc", limit: 100 }),
       input.noRepositoryLandingCloser ?? null,
       input.closingAgentId ?? null,
+      input.zeroDeltaRecheckedAtWrite === true,
     );
     if (tierResult.skipped) {
       void writeAuditLog(db, issue, "issue.done_tier_declaration_skipped", {
@@ -21219,6 +21224,7 @@ export function issueRoutes(
         caller: refusalCaller,
         closingAgentId: actor.agentId ?? null,
         noRepositoryLandingCloser: closingActor,
+        zeroDeltaRecheckedAtWrite: true,
         storedDeliveryRequirement: existing.deliveryRequirement,
       });
       if (!outcome.ok) {
@@ -22148,13 +22154,15 @@ export function issueRoutes(
           if (zeroDeltaCloseMeasurement !== null) {
             const lockedForZeroDelta = await svc.getByIdForUpdate(id, tx);
             if (!lockedForZeroDelta) return null;
-            const requestedRebindId = updateFields.executionWorkspaceId;
-            if (
-              typeof requestedRebindId === "string"
-              && requestedRebindId !== (finalDeliveryIssue.executionWorkspaceId ?? null)
-            ) {
+            // The proof covers the measured workspace binding only, so the
+            // same request may not move the card's project, project
+            // workspace or execution workspace.
+            const rebound = (["projectId", "projectWorkspaceId", "executionWorkspaceId"] as const).find(
+              (field) => updateFields[field] !== undefined && updateFields[field] !== (lockedForZeroDelta[field] ?? null),
+            );
+            if (rebound) {
               throw zeroDeltaTransitionRefusal(
-                "a zero-delta close cannot bind the card to a workspace other than the measured one",
+                `a zero-delta close cannot change the card's ${rebound} from the measured binding`,
               );
             }
             const verdict = await verifyZeroDeltaCloseAtTransition(

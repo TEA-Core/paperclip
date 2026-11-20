@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { constants as fsConstants, createWriteStream, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { type FileHandle, lstat, mkdir, mkdtemp, open, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -775,6 +776,21 @@ function indexEntryRefusal(entry: IndexEntry): string | null {
 }
 
 /**
+ * Why the repository's stash is not provably empty; null only when
+ * `refs/stash` is confirmed absent. Any object there (not only a commit)
+ * refuses, and so does a failed read.
+ */
+async function stashRefusal(worktreePath: string, options: HardenedGitOptions): Promise<string | null> {
+  let stash: string;
+  try {
+    stash = (await runHardenedGit(["-C", worktreePath, "for-each-ref", "--format=%(objectname)", "refs/stash"], options)).trim();
+  } catch {
+    return "has a stash that could not be read (refs/stash)";
+  }
+  return stash.length > 0 ? "has a stash of uncommitted work (refs/stash)" : null;
+}
+
+/**
  * Identity, configuration, index and status checks for one linked worktree of
  * the managed checkout. Shared by the recorded worktree and any other
  * worktree checked out on a branch that names the issue.
@@ -812,13 +828,8 @@ async function verifyCleanLinkedWorktree(
   if (await lstat(path.join(identity.gitDir, "index.lock")).then(() => true, () => false)) {
     return { ok: false, reason: "has a Git operation in progress (index.lock is present)" };
   }
-  const stashSha = await runHardenedGit(
-    ["-C", worktreePath, "rev-parse", "--verify", "--quiet", "refs/stash^{commit}"],
-    worktreeOptions,
-  ).then((out) => out.trim(), () => "");
-  if (SHA_RE.test(stashSha)) {
-    return { ok: false, reason: "has a stash of uncommitted work (refs/stash)" };
-  }
+  const stash = await stashRefusal(worktreePath, worktreeOptions);
+  if (stash) return { ok: false, reason: stash };
   let exclude: string | null;
   try {
     exclude = await readOptionalRegularFile(path.join(identity.commonDir, "info", "exclude"), MAX_EXCLUDE_FILE_BYTES);
@@ -1033,36 +1044,53 @@ const IN_TRANSACTION_RECHECK_BUDGET_MS = 15_000;
 /**
  * The status write's re-check, inside its transaction: the measured worktree
  * must still be clean (index, status, ignored entries) on the measured branch
- * and commit. One worktree, no GitHub call, and one shared 15 s budget for
- * every Git process and the snapshot copy bounds how long it can hold the
- * issue row; the budget running out refuses with a distinct "timed out"
- * reason, never "status could not be verified".
+ * and commit. With `siblings` (the zero-delta close), the branches the sibling
+ * scan read must also be unchanged and every other worktree on a branch naming
+ * the card still clean. No GitHub call, and one shared 15 s budget for every
+ * Git process and the snapshot copy bounds how long it can hold the issue row;
+ * the budget running out refuses with a distinct "timed out" reason, never
+ * "status could not be verified".
  */
 export async function recheckRecordedWorktree(input: {
   worktreePath: string;
   commonDir: string;
   branch: string;
   headSha: string;
+  siblings?: { issueIdentifier: string; refsDigest: string };
   budgetMs?: number;
 }): Promise<{ ok: true } | { ok: false; reason: string }> {
   if (!resolveTrustedGitBinary()) return { ok: false, reason: "no root-owned git binary is installed at a fixed system path" };
   const budgetMs = input.budgetMs ?? IN_TRANSACTION_RECHECK_BUDGET_MS;
   const deadline: ProbeDeadline = { at: Date.now() + budgetMs, expired: false };
-  const verdict = await verifyCleanLinkedWorktree(input.worktreePath, input.commonDir, {
-    cwd: path.dirname(input.commonDir),
-    deadline,
-  });
-  if (deadline.expired) {
-    return {
-      ok: false,
-      reason: `the recorded worktree could not be re-checked within ${budgetMs} ms (timed out at the close write)`,
-    };
-  }
+  const repoRoot = path.dirname(input.commonDir);
+  const options: HardenedGitOptions = { cwd: repoRoot, deadline };
+  const timedOut = {
+    ok: false as const,
+    reason: `the recorded worktree could not be re-checked within ${budgetMs} ms (timed out at the close write)`,
+  };
+  const verdict = await verifyCleanLinkedWorktree(input.worktreePath, input.commonDir, options);
+  if (deadline.expired) return timedOut;
   if (!verdict.ok) return { ok: false, reason: `the recorded worktree ${verdict.reason}` };
   if (verdict.branch !== input.branch || verdict.headSha !== input.headSha) {
     return { ok: false, reason: "the recorded worktree's HEAD moved after the close was measured" };
   }
-  return { ok: true };
+  if (!input.siblings) return { ok: true };
+  const { issueIdentifier, refsDigest } = input.siblings;
+  let siblingRefusal: string | null;
+  try {
+    siblingRefusal = siblingRefsDigest(await readSiblingRefs(repoRoot, options), issueIdentifier) !== refsDigest
+      ? "the repository's branches changed after the close was measured"
+      : await siblingWorktreeRefusal(issueIdentifier, {
+        repoRoot,
+        commonDir: input.commonDir,
+        worktreePath: input.worktreePath,
+        options,
+      });
+  } catch {
+    siblingRefusal = "the repository's other branches and worktrees could not be re-checked";
+  }
+  if (deadline.expired) return timedOut;
+  return siblingRefusal ? { ok: false, reason: siblingRefusal } : { ok: true };
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -1122,7 +1150,17 @@ export interface ZeroDeltaWorktreeMeasurement {
 }
 
 export type ZeroDeltaWorktreeProbeResult =
-  | { ok: true; worktreePath: string; commonDir: string; branch: string; headSha: string; baseRef: string; baseSha: string }
+  | {
+      ok: true;
+      worktreePath: string;
+      commonDir: string;
+      branch: string;
+      headSha: string;
+      baseRef: string;
+      baseSha: string;
+      /** Digest of the branches the sibling scan read (see siblingRefsDigest); the close write requires it unchanged. */
+      refsDigest: string;
+    }
   | { ok: false; reason: string };
 
 /**
@@ -1142,6 +1180,83 @@ export function zeroDeltaWorktreeRefusal(measurement: ZeroDeltaWorktreeMeasureme
   return null;
 }
 
+interface SiblingRef {
+  sha: string;
+  refname: string;
+}
+
+async function readSiblingRefs(repoRoot: string, options: HardenedGitOptions): Promise<SiblingRef[]> {
+  return (await runHardenedGit(
+    ["-C", repoRoot, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/remotes/"],
+    options,
+  )).split("\n").filter((line) => line.length > 0).map((line) => {
+    const space = line.indexOf(" ");
+    return { sha: line.slice(0, space), refname: line.slice(space + 1) };
+  });
+}
+
+/**
+ * Digest of what the sibling scan's branch verdicts rest on: every local
+ * branch, and every remote-tracking branch naming the card. Remote-tracking
+ * branches of other cards and the base are left out, so a routine fetch by
+ * another card does not refuse this close.
+ */
+function siblingRefsDigest(refs: readonly SiblingRef[], issueIdentifier: string): string {
+  const hash = createHash("sha256");
+  for (const ref of refs) {
+    if (ref.refname.startsWith("refs/remotes/")) {
+      const remoteRef = ref.refname.slice("refs/remotes/".length);
+      if (!branchNamesIssue(remoteRef.slice(remoteRef.indexOf("/") + 1), issueIdentifier)) continue;
+    }
+    hash.update(`${ref.sha} ${ref.refname}\n`);
+  }
+  return hash.digest("hex");
+}
+
+/**
+ * Every other worktree on a branch naming the card must be clean, and no
+ * other worktree may have a detached HEAD. Run by the measurement and again
+ * inside the close write, where a worktree can be added on an existing branch
+ * without moving any ref.
+ */
+async function siblingWorktreeRefusal(
+  issueIdentifier: string,
+  ctx: { repoRoot: string; commonDir: string; worktreePath: string; options: HardenedGitOptions },
+): Promise<string | null> {
+  const { repoRoot, commonDir, worktreePath, options } = ctx;
+  const worktreeRecords = (await runHardenedGit(["-C", repoRoot, "worktree", "list", "--porcelain", "-z"], options))
+    .split("\0\0")
+    .map((record) => record.split("\0").filter((field) => field.length > 0))
+    .filter((fields) => fields.length > 0);
+  for (const fields of worktreeRecords) {
+    const worktreeField = fields.find((field) => field.startsWith("worktree "));
+    const branchField = fields.find((field) => field.startsWith("branch refs/heads/"));
+    if (!worktreeField) continue;
+    if (!branchField) {
+      let detachedPath: string;
+      try {
+        detachedPath = await realpath(worktreeField.slice("worktree ".length));
+      } catch {
+        continue;
+      }
+      if (detachedPath === worktreePath) continue;
+      return `another worktree at ${detachedPath} has a detached HEAD`;
+    }
+    const branch = branchField.slice("branch refs/heads/".length);
+    if (!branchNamesIssue(branch, issueIdentifier)) continue;
+    let otherPath: string;
+    try {
+      otherPath = await realpath(worktreeField.slice("worktree ".length));
+    } catch {
+      continue;
+    }
+    if (otherPath === worktreePath) continue;
+    const other = await verifyCleanLinkedWorktree(otherPath, commonDir, options);
+    if (!other.ok) return `another worktree on branch ${branch} ${other.reason}`;
+  }
+  return null;
+}
+
 /**
  * The no-repository probe's sibling scans: every other branch naming this
  * card must be level with the base, every other local branch must belong to
@@ -1150,26 +1265,34 @@ export function zeroDeltaWorktreeRefusal(measurement: ZeroDeltaWorktreeMeasureme
  * card must be level, and every other worktree on a branch naming this card
  * must be clean. A worktree with a detached HEAD refuses. Branch tips are
  * compared by the caller against the remote base, never against a local
- * tracking ref an agent can move; the branch and worktree lists themselves
- * read refs an agent can write, so they are advisory next to that anchor.
+ * tracking ref an agent can move, each distinct tip once and at most
+ * MAX_COMPARED_TIPS of them counting the recorded HEAD; the branch and
+ * worktree lists themselves read refs an agent can write, so they are
+ * advisory next to that anchor.
  */
 async function zeroDeltaSiblingRefusal(
   input: ZeroDeltaWorktreeProbeInput,
+  refs: readonly SiblingRef[],
   ctx: {
     repoRoot: string;
     commonDir: string;
     worktreePath: string;
+    headSha: string;
     options: HardenedGitOptions;
   },
 ): Promise<string | null> {
-  const { repoRoot, commonDir, worktreePath, options } = ctx;
-  const refs = (await runHardenedGit(
-    ["-C", repoRoot, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/remotes/"],
-    options,
-  )).split("\n").filter((line) => line.length > 0).map((line) => {
-    const space = line.indexOf(" ");
-    return { sha: line.slice(0, space), refname: line.slice(space + 1) };
-  });
+  const checkedTips = new Set<string>([ctx.headSha]);
+  const tipRefusal = async (subject: string, sha: string): Promise<string | null> => {
+    if (checkedTips.has(sha)) return null;
+    if (checkedTips.size >= MAX_COMPARED_TIPS) {
+      return (
+        `too_many_branch_tips: the recorded worktree and the branches naming this issue have more than ` +
+        `${MAX_COMPARED_TIPS} distinct tips to compare with the base branch`
+      );
+    }
+    checkedTips.add(sha);
+    return aheadOfBaseRefusal(subject, sha, input.countCommitsAheadOfBase);
+  };
   const localBranches = refs
     .filter((ref) => ref.refname.startsWith("refs/heads/"))
     .map((ref) => ({ sha: ref.sha, name: ref.refname.slice("refs/heads/".length) }));
@@ -1181,7 +1304,7 @@ async function zeroDeltaSiblingRefusal(
   for (const { sha, name } of localBranches) {
     if (!SHA_RE.test(sha) || name === input.branch) continue;
     if (branchNamesIssue(name, input.issueIdentifier)) {
-      const refusal = await aheadOfBaseRefusal(`branch ${name}`, sha, input.countCommitsAheadOfBase);
+      const refusal = await tipRefusal(`branch ${name}`, sha);
       if (refusal) return refusal;
       continue;
     }
@@ -1206,40 +1329,10 @@ async function zeroDeltaSiblingRefusal(
     const name = remoteRef.slice(slash + 1);
     if (name === "HEAD" || name === input.baseBranch || name === input.branch || input.projectBranches.has(name)) continue;
     if (!branchNamesIssue(name, input.issueIdentifier)) continue;
-    const refusal = await aheadOfBaseRefusal(`branch ${remoteRef}`, ref.sha, input.countCommitsAheadOfBase);
+    const refusal = await tipRefusal(`branch ${remoteRef}`, ref.sha);
     if (refusal) return refusal;
   }
-  const worktreeRecords = (await runHardenedGit(["-C", repoRoot, "worktree", "list", "--porcelain", "-z"], options))
-    .split("\0\0")
-    .map((record) => record.split("\0").filter((field) => field.length > 0))
-    .filter((fields) => fields.length > 0);
-  for (const fields of worktreeRecords) {
-    const worktreeField = fields.find((field) => field.startsWith("worktree "));
-    const branchField = fields.find((field) => field.startsWith("branch refs/heads/"));
-    if (!worktreeField) continue;
-    if (!branchField) {
-      let detachedPath: string;
-      try {
-        detachedPath = await realpath(worktreeField.slice("worktree ".length));
-      } catch {
-        continue;
-      }
-      if (detachedPath === worktreePath) continue;
-      return `another worktree at ${detachedPath} has a detached HEAD`;
-    }
-    const branch = branchField.slice("branch refs/heads/".length);
-    if (!branchNamesIssue(branch, input.issueIdentifier)) continue;
-    let otherPath: string;
-    try {
-      otherPath = await realpath(worktreeField.slice("worktree ".length));
-    } catch {
-      continue;
-    }
-    if (otherPath === worktreePath) continue;
-    const other = await verifyCleanLinkedWorktree(otherPath, commonDir, options);
-    if (!other.ok) return `another worktree on branch ${branch} ${other.reason}`;
-  }
-  return null;
+  return siblingWorktreeRefusal(input.issueIdentifier, ctx);
 }
 
 async function readBranchHead(
@@ -1308,13 +1401,8 @@ export async function probeZeroDeltaWorktree(input: ZeroDeltaWorktreeProbeInput)
     if (await lstat(path.join(identity.gitDir, "index.lock")).then(() => true, () => false)) {
       return refuse("the recorded worktree has a Git operation in progress (index.lock is present)");
     }
-    const stashSha = await runHardenedGit(
-      ["-C", worktreePath, "rev-parse", "--verify", "--quiet", "refs/stash^{commit}"],
-      options,
-    ).then((out) => out.trim(), () => "");
-    if (SHA_RE.test(stashSha)) {
-      return refuse("the recorded worktree has a stash of uncommitted work (refs/stash)");
-    }
+    const stash = await stashRefusal(worktreePath, options);
+    if (stash) return refuse(`the recorded worktree ${stash}`);
     const exclude = await readOptionalRegularFile(path.join(identity.commonDir, "info", "exclude"), MAX_EXCLUDE_FILE_BYTES);
     if (hasForeignExcludeRules(exclude)) {
       return refuse("the recorded worktree has info/exclude ignore rules the server did not write");
@@ -1363,10 +1451,12 @@ export async function probeZeroDeltaWorktree(input: ZeroDeltaWorktreeProbeInput)
     );
     if (refusal) return refuse(`the recorded worktree ${refusal}`);
 
-    const siblingRefusal = await zeroDeltaSiblingRefusal(input, {
+    const refs = await readSiblingRefs(repoRoot, options);
+    const siblingRefusal = await zeroDeltaSiblingRefusal(input, refs, {
       repoRoot,
       commonDir,
       worktreePath,
+      headSha: head.headSha,
       options,
     });
     if (siblingRefusal) return refuse(siblingRefusal);
@@ -1375,7 +1465,16 @@ export async function probeZeroDeltaWorktree(input: ZeroDeltaWorktreeProbeInput)
     if (!final || final.branchRef !== head.branchRef || final.headSha !== head.headSha) {
       return refuse("the recorded worktree's HEAD moved while it was being measured");
     }
-    return { ok: true, worktreePath, commonDir, branch: input.branch, headSha: head.headSha, baseRef, baseSha };
+    return {
+      ok: true,
+      worktreePath,
+      commonDir,
+      branch: input.branch,
+      headSha: head.headSha,
+      baseRef,
+      baseSha,
+      refsDigest: siblingRefsDigest(refs, input.issueIdentifier),
+    };
   } catch (error) {
     return refuse(`the recorded worktree could not be measured (${error instanceof Error ? error.message : "unknown"})`);
   }

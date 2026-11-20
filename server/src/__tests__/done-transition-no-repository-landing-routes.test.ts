@@ -2008,4 +2008,22 @@ describeEmbeddedPostgres("record_only no-repository close (SUP-22570)", () => {
     expect(res.body.error).toContain("merge_commit_unrecorded");
     expect(await statusOf(fixture.issueId)).toBe("in_progress");
   });
+
+  it("refuses a zero-delta close that moves the card to another project workspace in the same request", async () => {
+    const fixture = await seed({ deliveryRequirement: "repository_delivery" });
+    answerZeroDeltaGitHub();
+    const other = await insertSecondProjectWorkspace(fixture);
+
+    const res = await request(app)
+      .patch(`/api/issues/${fixture.identifier}`)
+      .send({ status: "done", doneTier: zeroDeltaDoneTier(fixture.worktree), projectWorkspaceId: other });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("merge_commit_unrecorded");
+    const [stored] = await db
+      .select({ status: issues.status, projectWorkspaceId: issues.projectWorkspaceId })
+      .from(issues)
+      .where(eq(issues.id, fixture.issueId));
+    expect(stored).toEqual({ status: "in_progress", projectWorkspaceId: fixture.projectWorkspaceId });
+  });
 });

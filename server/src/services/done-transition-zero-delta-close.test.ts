@@ -177,8 +177,9 @@ function declaration(head: string = headSha()) {
   return `Closed at Tier 2 (live): probe \`git -C . rev-list --count origin/main..HEAD\` head ${head} post-merge: origin/main..HEAD is 0 and the worktree is clean`;
 }
 
+// The status PATCH is the one door that re-checks a zero-delta measurement inside its write.
 async function close(issue: Parameters<typeof evaluateDoneTierDeclaration>[1] = card(), comment = declaration()) {
-  return evaluateDoneTierDeclaration(db, issue, comment, null, async () => []);
+  return evaluateDoneTierDeclaration(db, issue, comment, null, async () => [], null, null, true);
 }
 
 const UNRECORDED =
@@ -688,7 +689,7 @@ describe("zero-delta NO-GO regressions (RA 1213)", () => {
     expect(verdict.allowed).toBe(false);
     if (!verdict.allowed) {
       expect(verdict.code).toBe("done_transition_missing_tier_declaration");
-      expect(verdict.reason).toContain("backstop");
+      expect(verdict.reason).toContain("accepted only on PATCH /api/issues/{id}");
     }
   });
 
@@ -745,6 +746,146 @@ describe("zero-delta NO-GO regressions (RA 1213)", () => {
     const result = await close();
     expect(result.allowed).toBe(false);
     expect(result.reason).toContain("unmerged");
+  });
+});
+
+describe("zero-delta review regressions (PR 1213 round 2)", () => {
+  type Verify = (tx: unknown, locked: unknown, measurement: unknown) => Promise<{ ok: boolean; reason?: string }>;
+  const verify = (measurement: unknown) =>
+    (doneTransitionGuard.verifyZeroDeltaCloseAtTransition as unknown as Verify)(
+      db,
+      { ...CARD, deliveryRequirement: "repository_delivery" as const, status: "in_progress" },
+      measurement,
+    );
+  async function measured() {
+    const result = await close();
+    expect(result.allowed, result.reason).toBe(true);
+    expect((await verify(result.zeroDeltaMeasurement)).ok).toBe(true);
+    return result.zeroDeltaMeasurement;
+  }
+
+  it("refuses a zero-delta declaration on a door that does not re-check it inside its status write", async () => {
+    const result = await evaluateDoneTierDeclaration(db, card(), declaration(), null, async () => []);
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("merge_commit_unrecorded");
+    expect(result.reason).toContain("PATCH /api/issues/{id}");
+  });
+
+  it("refuses when the remote branch compare answers without an ahead count", async () => {
+    git(worktree, "push", "-q", "origin", `HEAD:refs/heads/${BRANCH}`);
+    mockGhFetch.mockImplementation(async (url: string) =>
+      String(url).endsWith(`...${encodeURIComponent(BRANCH)}`) ? json({ status: "identical" }) : answerGitHub(String(url)),
+    );
+    expectZeroDeltaRefusal(await close(), `the card's branch ${BRANCH} could not be compared with main on the remote`);
+  });
+
+  it("refuses a base whose branch name itself starts with origin/ (the remote compare would strip it again)", async () => {
+    writeFileSync(path.join(worktree, "work.txt"), "work\n");
+    git(worktree, "add", "work.txt");
+    git(worktree, "commit", "-qm", "SUP-24395 work");
+    git(worktree, "push", "-q", "origin", "HEAD:refs/heads/release");
+    originGit("branch", "origin/release", "main");
+    git(repoRoot, "update-ref", "refs/remotes/origin/origin/release", headSha());
+    rows.executionWorkspace.baseRef = "origin/origin/release";
+    rows.projectWorkspace.defaultRef = "origin/origin/release";
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("the base branch origin/release starts with origin/");
+  });
+
+  it("refuses at the close write when the recorded path now resolves to another directory", async () => {
+    const link = path.join(root, "recorded-link");
+    symlinkSync(worktree, link);
+    rows.executionWorkspace.providerRef = link;
+    rows.executionWorkspace.cwd = link;
+    const measurement = await measured();
+    const elsewhere = path.join(root, "elsewhere");
+    mkdirSync(elsewhere);
+    writeFileSync(path.join(elsewhere, "work.txt"), "undelivered\n");
+    rmSync(link);
+    symlinkSync(elsewhere, link);
+    const verdict = await verify(measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("recorded worktree path");
+  });
+
+  it("refuses at the close write when the project setting that approved the base no longer does", async () => {
+    originGit("branch", "release", "main");
+    git(repoRoot, "fetch", "-q", "origin");
+    rows.executionWorkspace.baseRef = "origin/release";
+    rows.projectWorkspace.repoRef = "release";
+    const measurement = await measured();
+    rows.projectWorkspace.repoRef = "main";
+    const verdict = await verify(measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("the project's base branch settings changed after the close was measured");
+  });
+
+  it("refuses at the close write when a sibling worktree naming the card gains work after the measurement", async () => {
+    const other = path.join(repoRoot, ".paperclip", "worktrees", "SUP-24395-other");
+    git(repoRoot, "worktree", "add", "-q", "-b", "SUP-24395-other", other, headSha());
+    const measurement = await measured();
+    writeFileSync(path.join(other, "draft.txt"), "undelivered\n");
+    const verdict = await verify(measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("SUP-24395-other");
+  });
+
+  it("refuses at the close write when a branch naming the card appears after the measurement", async () => {
+    const measurement = await measured();
+    writeFileSync(path.join(worktree, "work.txt"), "work\n");
+    const blob = git(worktree, "hash-object", "-w", "work.txt");
+    rmSync(path.join(worktree, "work.txt"));
+    const tree = execFileSync("git", ["-C", worktree, "mktree"], { env: fixtureEnv, input: `100644 blob ${blob}\twork.txt\n` })
+      .toString().trim();
+    const commit = git(worktree, "commit-tree", tree, "-p", headSha(), "-m", "SUP-24395 hidden work");
+    git(repoRoot, "update-ref", "refs/heads/SUP-24395-late", commit);
+    const verdict = await verify(measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("branches");
+  });
+
+  it("refuses a stash ref that is not a commit (the stash state cannot be read as absent)", async () => {
+    writeFileSync(path.join(worktree, "parked.txt"), "parked\n");
+    const blob = git(worktree, "hash-object", "-w", "parked.txt");
+    rmSync(path.join(worktree, "parked.txt"));
+    git(worktree, "update-ref", "refs/stash", blob);
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("stash");
+  });
+
+  it("refuses at the close write a stash ref that is not a commit", async () => {
+    const measurement = await measured();
+    writeFileSync(path.join(worktree, "parked.txt"), "parked\n");
+    const blob = git(worktree, "hash-object", "-w", "parked.txt");
+    rmSync(path.join(worktree, "parked.txt"));
+    git(worktree, "update-ref", "refs/stash", blob);
+    const verdict = await verify(measurement);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain("stash");
+  });
+
+  it("compares each distinct branch tip with GitHub once", async () => {
+    for (const suffix of ["a", "b", "c"]) git(repoRoot, "branch", `SUP-24395-${suffix}`, headSha());
+    const result = await close();
+    expect(result.allowed, result.reason).toBe(true);
+    const headCompares = mockGhFetch.mock.calls.filter(([url]) => String(url).endsWith(`...${headSha()}`));
+    expect(headCompares).toHaveLength(1);
+  });
+
+  it("refuses with too_many_branch_tips when more than five distinct tips would need comparing", async () => {
+    for (let index = 0; index < 5; index += 1) {
+      writeFileSync(path.join(seed, `tip-${index}.txt`), `${index}\n`);
+      git(seed, "add", `tip-${index}.txt`);
+      git(seed, "commit", "-qm", `tip ${index}`);
+      git(seed, "push", "-q", origin, "main");
+      git(repoRoot, "fetch", "-q", "origin");
+      git(repoRoot, "branch", `SUP-24395-tip-${index}`, git(seed, "rev-parse", "HEAD"));
+    }
+    const result = await close();
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("too_many_branch_tips");
   });
 });
 

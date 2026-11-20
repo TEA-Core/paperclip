@@ -1,3 +1,4 @@
+import { realpath } from "node:fs/promises";
 import path from "node:path";
 import { and, eq, inArray, isNotNull, ne, sql } from "drizzle-orm";
 import {
@@ -2323,11 +2324,14 @@ async function attributeTier2EvidenceToClosingRun(
 // ───────────────────────────────────────────────────────────────────────
 
 const ZERO_DELTA_CLOSE_CONDITIONS =
-  "A repository_delivery card with no pull request and no recorded merge commit closes at Tier 2 only when the " +
-  "server proves its own recorded worktree, on its recorded branch, has zero commits ahead of the base ref, a HEAD " +
-  "that is an ancestor of the base ref (in the worktree and on the remote), no tracked changes, no untracked " +
-  "files, no ignored entries outside the regenerated-artefact directories, no stash, and no other branch or " +
-  "worktree of the same repository holding work, and the declaration's probe head names that HEAD.";
+  "A repository_delivery card with no pull request and no recorded merge commit closes at Tier 2 only through " +
+  "PATCH /api/issues/{id}, and only when the server proves its own recorded worktree, on its recorded branch, has " +
+  "zero commits ahead of the base ref, a HEAD that is an ancestor of the base ref (in the worktree and on the " +
+  "remote), no tracked changes, no untracked files, no ignored entries outside the regenerated-artefact " +
+  "directories and no stash; that no other branch naming this card has commits the base lacks and no other " +
+  "worktree on a branch naming this card (or with a detached HEAD) holds uncommitted work; that every other local " +
+  "branch is a project branch, another card's registered branch or another card's rescue branch; and the " +
+  "declaration's probe head names that HEAD.";
 
 /** What a zero-delta close measured; recorded on the Tier 2 close audit row. */
 export interface ZeroDeltaCloseMeasurement {
@@ -2345,6 +2349,13 @@ export interface ZeroDeltaCloseMeasurement {
   headSha: string;
   /** Commits the card's branch carries beyond the base on the remote; null when the branch is not on the remote. */
   remoteBranchAheadBy: number | null;
+  /** The project workspace's `defaultRef` and `repoRef` as read; the close write requires both unchanged. */
+  projectDefaultRef: string | null;
+  projectRepoRef: string | null;
+  /** The card the sibling scan attributed branches and worktrees to; the close write repeats that scan. */
+  issueIdentifier: string;
+  /** Digest of the branches the sibling scan read; the close write requires them unchanged. */
+  refsDigest: string;
 }
 
 type ZeroDeltaCloseProof =
@@ -2414,6 +2425,12 @@ async function proveZeroDeltaRepositoryClose(
   if (!workspace.branchName) return refuse("the card's execution workspace records no branch");
   const baseBranch = normalizeBaseBranch(workspace.baseRef);
   if (!baseBranch) return refuse("the card's execution workspace records no base ref");
+  // The GitHub compare strips one leading `origin/` from its base, so a branch
+  // literally named `origin/…` would be measured locally and remotely against
+  // two different branches.
+  if (baseBranch.startsWith("origin/")) {
+    return refuse(`the base branch ${baseBranch} starts with origin/, which the remote compare cannot name unambiguously`);
+  }
   if (!workspace.projectWorkspaceId) return refuse("the card's execution workspace names no project workspace");
   const projectWorkspace = await db
     .select({ defaultRef: projectWorkspaces.defaultRef, repoRef: projectWorkspaces.repoRef, repoUrl: projectWorkspaces.repoUrl })
@@ -2523,9 +2540,13 @@ async function proveZeroDeltaRepositoryClose(
 
   let remoteBranchAheadBy: number | null;
   try {
-    remoteBranchAheadBy = await githubCompareAheadBy(
+    const ahead = await githubCompareAheadBy(
       hostname, owner, repo, baseBranch, workspace.branchName, token, AbortSignal.timeout(GITHUB_BASE_COMPARE_TIMEOUT_MS),
     );
+    if (ahead === null) {
+      return refuse(`the card's branch ${workspace.branchName} could not be compared with ${baseBranch} on the remote`);
+    }
+    remoteBranchAheadBy = ahead;
   } catch (err) {
     if (!(err instanceof GitHubBranchNotFoundError)) {
       return refuse(`the card's branch ${workspace.branchName} could not be compared with ${baseBranch} on the remote`);
@@ -2557,6 +2578,10 @@ async function proveZeroDeltaRepositoryClose(
       baseSha: probe.baseSha,
       headSha: probe.headSha,
       remoteBranchAheadBy,
+      projectDefaultRef: projectWorkspace?.defaultRef ?? null,
+      projectRepoRef: projectWorkspace?.repoRef ?? null,
+      issueIdentifier: issue.identifier,
+      refsDigest: probe.refsDigest,
     },
   };
 }
@@ -2628,9 +2653,12 @@ export type ZeroDeltaCloseVerdict = { ok: true } | { ok: false; reason: string }
  * SUP-24402 compare-and-set, inside the status write that lands a zero-delta
  * close and against the row it holds `FOR UPDATE`. It makes no network call:
  * it re-reads the database half of the proof and requires it to match what
- * was measured, then re-checks the one measured worktree (index, status,
- * ignored entries and stash on the measured branch and commit, one shared
- * 15 s budget), so dirt written after the measurement refuses.
+ * was measured (including the project settings that approved the base), then
+ * requires the recorded path to still resolve to the measured worktree and
+ * re-checks that worktree (index, status, ignored entries and stash on the
+ * measured branch and commit), the branches the sibling scan read, and every
+ * other worktree on a branch naming the card, under one shared 15 s budget,
+ * so work written after the measurement refuses.
  */
 export async function verifyZeroDeltaCloseAtTransition(
   tx: Db,
@@ -2721,14 +2749,25 @@ export async function verifyZeroDeltaCloseAtTransition(
     ) {
       return refuse("the project's repository changed after the close was measured");
     }
+    if (
+      (projectWorkspace?.defaultRef ?? null) !== measurement.projectDefaultRef ||
+      (projectWorkspace?.repoRef ?? null) !== measurement.projectRepoRef
+    ) {
+      return refuse("the project's base branch settings changed after the close was measured");
+    }
   } catch (err) {
     return refuse(`could not be verified at the close write (${err instanceof Error ? err.message : "unknown"})`);
+  }
+  const resolvedWorktreePath = await realpath(measurement.recordedWorktreePath).catch(() => null);
+  if (resolvedWorktreePath !== measurement.worktreePath) {
+    return refuse("the recorded worktree path no longer resolves to the measured worktree");
   }
   const recheck = await recheckRecordedWorktree({
     worktreePath: measurement.worktreePath,
     commonDir: measurement.commonDir,
     branch: measurement.branch,
     headSha: measurement.headSha,
+    siblings: { issueIdentifier: measurement.issueIdentifier, refsDigest: measurement.refsDigest },
   });
   if (!recheck.ok) return refuse(`refused at the close write: ${recheck.reason}`);
   return { ok: true };
@@ -2747,6 +2786,7 @@ async function proveTier2Live(
   evidence: string,
   sameRun: boolean,
   deliveryRequirement: IssueDeliveryRequirement | null | undefined,
+  zeroDeltaRecheckedAtWrite: boolean,
 ): Promise<DoneTierDeclarationResult> {
   // SUP-22801: classification-aware routing. The record-only grammar is
   // accepted only on record_only cards; a repository_delivery card submitting
@@ -2823,6 +2863,14 @@ async function proveTier2Live(
     // keeps this refusal byte for byte.
     if (deliveryRequirement !== "repository_delivery") {
       return refuseTier2(`${unrecorded}Accepted form: ${tier2Forms}`);
+    }
+    // Only a door that re-checks the measurement inside its status write
+    // (verifyZeroDeltaCloseAtTransition) may accept the zero-delta form.
+    if (!zeroDeltaRecheckedAtWrite) {
+      return refuseTier2(
+        `${unrecorded}A zero-delta close is accepted only on PATCH /api/issues/{id}, whose status write re-checks ` +
+          `the measured worktree; this close path does not. Accepted form: ${tier2Forms}`,
+      );
     }
     return proveZeroDeltaTier2Live(db, { ...issue, identifier: issue.identifier ?? null }, executionWorkspaceId, parsed, evidence, shape, sameRun, unrecorded, tier2Forms);
   }
@@ -3713,6 +3761,9 @@ export async function evaluateDoneTierDeclaration(
   // closing run or it refuses — an agent can otherwise drop the run id header
   // and skip the closing-run lifetime gate entirely.
   closingAgentId: string | null = null,
+  // SUP-24402: only a door that re-runs verifyZeroDeltaCloseAtTransition inside
+  // its status write passes true; without it the zero-delta Tier 2 form refuses.
+  zeroDeltaRecheckedAtWrite = false,
 ): Promise<DoneTierDeclarationResult> {
   // SUP-22801: a record_only card's primary accepted Tier 2 form is the
   // record-only live-evidence grammar (no merge head by design); the merge-head
@@ -3746,7 +3797,7 @@ export async function evaluateDoneTierDeclaration(
       return attributeTier2EvidenceToClosingRun(
         db,
         issue,
-        await proveTier2Live(db, issue, tier2.evidence, false, issue.deliveryRequirement),
+        await proveTier2Live(db, issue, tier2.evidence, false, issue.deliveryRequirement, zeroDeltaRecheckedAtWrite),
         runId,
         closingAgentId,
       );
@@ -3840,7 +3891,7 @@ export async function evaluateDoneTierDeclaration(
     return attributeTier2EvidenceToClosingRun(
       db,
       issue,
-      await proveTier2Live(db, issue, tier2.evidence, true, issue.deliveryRequirement),
+      await proveTier2Live(db, issue, tier2.evidence, true, issue.deliveryRequirement, zeroDeltaRecheckedAtWrite),
       runId,
       closingAgentId,
     );
@@ -4312,13 +4363,6 @@ export async function evaluateDoneTransitionGuardForBackstopClose(input: {
         allowed: false,
         code: tierResult.code ?? "done_transition_missing_tier_declaration",
         reason: tierResult.reason,
-      };
-    }
-    if (tierResult.zeroDeltaMeasurement) {
-      return {
-        allowed: false,
-        code: "done_transition_missing_tier_declaration",
-        reason: "Zero-delta Tier 2 closes are not accepted on the backstop close path.",
       };
     }
     if (tierResult.tier === "tier1") {
