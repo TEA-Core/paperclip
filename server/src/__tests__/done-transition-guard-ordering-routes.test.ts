@@ -29,6 +29,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { DONE_TIER_STRUCTURED_FORMS, TIER1_FORM } from "../services/done-transition-guard.js";
+import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 
 const mockResolveSecretValue = vi.hoisted(() => vi.fn());
 const mockGetByName = vi.hoisted(() => vi.fn());
@@ -1886,6 +1887,74 @@ describeEmbeddedPostgres("done-transition guard ordering (SUP-12686 before tier 
         .where(and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)))
         .then((rows) => rows.filter((r) => r.action === "issue.done_transition_tier1_close"));
       expect(audit).toHaveLength(1);
+    });
+  });
+
+  describe("same-request review auto-skip is a satisfied ladder (SUP-22800/SUP-23202)", () => {
+    const RECORD_ONLY_EVIDENCE =
+      "record-only probe `curl -fsS https://ops.example.com/api/sweep/healthz` target https://ops.example.com observed 2026-11-04T09:15:00Z result: pass the sweep consumption point served 42 fresh records";
+
+    async function seedReopenedSelfReviewCard(prefix: string) {
+      const seeded = await seedIssue(prefix);
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [{
+          type: "review",
+          participants: [{ type: "agent", agentId: seeded.agentId }],
+        }],
+      });
+      if (!policy || policy.stages.length !== 1) {
+        throw new Error("expected a one-stage self-review policy");
+      }
+      await db.update(issues).set({
+        status: "in_progress",
+        deliveryRequirement: "record_only",
+        executionPolicy: policy as unknown as Record<string, unknown>,
+        executionState: null,
+      }).where(eq(issues.id, seeded.issueId));
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: seeded.companyId,
+        agentId: seeded.agentId,
+        status: "running",
+        startedAt: new Date("2026-11-04T09:00:00Z"),
+        contextSnapshot: { issueId: seeded.issueId },
+      });
+      return { ...seeded, runId, stageId: policy.stages[0]!.id };
+    }
+
+    it("accepts an agent done PATCH that auto-skips the assignee-only review stage", async () => {
+      const { companyId, agentId, issueId, identifier, runId, stageId } =
+        await seedReopenedSelfReviewCard("ASKIP");
+      currentActor = agentActor(companyId, agentId, runId);
+
+      const res = await request(app)
+        .patch(`/api/issues/${identifier}`)
+        .send({
+          status: "done",
+          comment: "Record-only close; the only review seat is the return assignee.",
+          doneTier: { tier: "tier2", probeEvidence: RECORD_ONLY_EVIDENCE },
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.code).not.toBe("done_transition_missing_delivery");
+
+      const rows = await db
+        .select({ status: issues.status, executionState: issues.executionState })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      expect(rows[0]?.status).toBe("done");
+      expect(rows[0]?.executionState).toMatchObject({
+        status: "completed",
+        completedStageIds: [stageId],
+        skippedStageIds: [stageId],
+      });
+
+      const decisions = await db
+        .select({ id: issueExecutionDecisions.id })
+        .from(issueExecutionDecisions)
+        .where(eq(issueExecutionDecisions.issueId, issueId));
+      expect(decisions).toHaveLength(0);
     });
   });
 });
