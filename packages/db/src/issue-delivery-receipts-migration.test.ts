@@ -77,10 +77,31 @@ async function headShaChecks(sql: postgres.Sql) {
       "c"."convalidated" AS validated
     FROM "pg_constraint" AS "c"
     JOIN "pg_class" AS "t" ON "t"."oid" = "c"."conrelid"
+    JOIN "pg_namespace" AS "n" ON "n"."oid" = "t"."relnamespace"
     JOIN "pg_attribute" AS "a" ON "a"."attrelid" = "c"."conrelid" AND "a"."attnum" = ANY ("c"."conkey")
-    WHERE "c"."contype" = 'c' AND "t"."relname" IN (${RECEIPTS}, ${LINKS}) AND "a"."attname" = 'head_sha'
+    WHERE "c"."contype" = 'c' AND "n"."nspname" = 'public' AND "t"."relname" IN (${RECEIPTS}, ${LINKS}) AND "a"."attname" = 'head_sha'
     ORDER BY "c"."conname"
   `;
+}
+
+async function releaseAssuranceChecks(sql: postgres.Sql) {
+  return sql<{ conname: string; def: string; validated: boolean }[]>`
+    SELECT "c"."conname", pg_get_constraintdef("c"."oid") AS def, "c"."convalidated" AS validated
+    FROM "pg_constraint" AS "c"
+    JOIN "pg_class" AS "t" ON "t"."oid" = "c"."conrelid"
+    JOIN "pg_namespace" AS "n" ON "n"."oid" = "t"."relnamespace"
+    WHERE "c"."contype" = 'c' AND "n"."nspname" = 'public' AND "t"."relname" = 'release_assurance_events'
+    ORDER BY "c"."conname"
+  `;
+}
+
+async function headShaNullable(sql: postgres.Sql) {
+  const rows = await sql<{ table_name: string; is_nullable: string }[]>`
+    SELECT "table_name", "is_nullable" FROM "information_schema"."columns"
+    WHERE "table_schema" = 'public' AND "table_name" IN (${RECEIPTS}, ${LINKS}) AND "column_name" = 'head_sha'
+    ORDER BY "table_name"
+  `;
+  return rows.map((row) => row.is_nullable);
 }
 
 async function tableRows(sql: postgres.Sql) {
@@ -651,6 +672,47 @@ describeEmbeddedPostgres("delivery receipt migration", () => {
         await sql`DELETE FROM ${sql(RECEIPTS)} WHERE "id" = ${linkReceiptId}`;
       }
 
+      // NULL head_sha: `NULL !~ '...'` is NULL, not true, so a pre-flight
+      // without an explicit IS NULL term would miss these rows and the new
+      // CHECK would also pass them. A backup restore can carry a nullable
+      // column, so drop NOT NULL here to store the rows.
+      await sql`ALTER TABLE ${sql(RECEIPTS)} ALTER COLUMN "head_sha" DROP NOT NULL`;
+      await sql`ALTER TABLE ${sql(LINKS)} ALTER COLUMN "head_sha" DROP NOT NULL`;
+      const nullReceiptId = randomUUID();
+      await sql`
+        INSERT INTO ${sql(RECEIPTS)} (
+          "id", "company_id", "source_issue_id", "provider", "owner", "repo",
+          "pull_request_number", "head_sha", "branch_name", "recovery_reason",
+          "authorized_by_actor_type", "authorized_by_actor_id", "idempotency_key"
+        ) VALUES (
+          ${nullReceiptId}, ${companyId}, ${issueId}, 'github', 'acme', 'widgets', 579,
+          NULL, 'SUP-579-branch', 'approved PR head lost its status write',
+          'board', 'board-actor', 'receipt-null'
+        )
+      `;
+      await expectBlocked(RECEIPTS, [nullReceiptId], "");
+      await sql`DELETE FROM ${sql(RECEIPTS)} WHERE "id" = ${nullReceiptId}`;
+      const nullLinkReceiptId = await insertReceipt(sql, {
+        companyId,
+        sourceIssueId: issueId,
+        idempotencyKey: "link-null",
+        headSha: "f".repeat(40),
+      });
+      const nullLinkId = randomUUID();
+      await sql`
+        INSERT INTO ${sql(LINKS)} (
+          "id", "company_id", "receipt_id", "source_issue_id", "external_object_id",
+          "provider", "owner", "repo", "pull_request_number", "head_sha"
+        ) VALUES (
+          ${nullLinkId}, ${companyId}, ${nullLinkReceiptId}, ${issueId}, ${objectId},
+          'github', 'acme', 'widgets', 579, NULL
+        )
+      `;
+      await expectBlocked(LINKS, [nullLinkId], "");
+      await sql`DELETE FROM ${sql(RECEIPTS)} WHERE "id" = ${nullLinkReceiptId}`;
+      await sql`ALTER TABLE ${sql(RECEIPTS)} ALTER COLUMN "head_sha" SET NOT NULL`;
+      await sql`ALTER TABLE ${sql(LINKS)} ALTER COLUMN "head_sha" SET NOT NULL`;
+
       // The message names both tables, gives the full count, and lists at most
       // 20 ids per table.
       const manyIds: string[] = [];
@@ -687,5 +749,134 @@ describeEmbeddedPostgres("delivery receipt migration", () => {
       expect(survivor?.head_sha).toBe(HEAD_SHA);
     },
     240_000,
+  );
+
+  it(
+    "keeps head_sha NOT NULL and leaves release_assurance_events checks intact after 0329 (S8, S9)",
+    async () => {
+      const database = await startEmbeddedPostgresTestDatabase("paperclip-delivery-receipt-guards-");
+      cleanups.push(database.cleanup);
+      const sql = postgres(database.connectionString, { max: 1 });
+      cleanups.push(async () => sql.end());
+
+      // S9: the drop in 0329 is scoped to the two receipt tables. The
+      // release-assurance ledger in the same schema has its own head_sha
+      // CHECK (nullable by design for hold rows) and six sibling CHECKs:
+      // none of them may be dropped or loosened by 0329.
+      const raBefore = await releaseAssuranceChecks(sql);
+      expect(raBefore.map((row) => row.conname)).toEqual([
+        "release_assurance_events_evidence_digest_check",
+        "release_assurance_events_go_evidence_check",
+        "release_assurance_events_head_binding_check",
+        "release_assurance_events_head_sha_check",
+        "release_assurance_events_kind_check",
+        "release_assurance_events_publication_mode_check",
+        "release_assurance_events_pull_request_number_check",
+      ]);
+      for (const row of raBefore) expect(row.validated).toBe(true);
+      expect(raBefore.find((row) => row.conname === "release_assurance_events_head_sha_check")?.def).toContain(
+        "'^[0-9a-f]{40}$'",
+      );
+      // S8: both receipt head_sha columns are NOT NULL on a fresh install.
+      expect(await headShaNullable(sql)).toEqual(["NO", "NO"]);
+
+      // Re-run 0329 raw: it must not change either guard.
+      for (const statement of await migrationStatements(TIGHTEN_MIGRATION_FILE)) {
+        await sql.unsafe(statement);
+      }
+      expect(await releaseAssuranceChecks(sql)).toEqual(raBefore);
+      expect(await headShaNullable(sql)).toEqual(["NO", "NO"]);
+
+      const { companyId, issueId } = await insertCompanyAndIssue(sql);
+      // S8 enforcement: NULL is refused by NOT NULL (23502), not by the CHECK.
+      await expect(
+        sql`
+          INSERT INTO ${sql(RECEIPTS)} (
+            "company_id", "source_issue_id", "provider", "owner", "repo",
+            "pull_request_number", "head_sha", "branch_name", "recovery_reason",
+            "authorized_by_actor_type", "authorized_by_actor_id", "idempotency_key"
+          ) VALUES (
+            ${companyId}, ${issueId}, 'github', 'acme', 'widgets', 579,
+            NULL, 'SUP-579-branch', 'reason', 'board', 'board-actor', 'null-guard'
+          )
+        `,
+      ).rejects.toMatchObject({ code: "23502" });
+      // S9 enforcement: a go row with a non-conforming head_sha is refused
+      // by the surviving release-assurance CHECK.
+      await expect(
+        sql`
+          INSERT INTO "release_assurance_events" (
+            "company_id", "issue_id", "event_id", "kind", "owner", "repo",
+            "pull_request_number", "head_sha", "evidence_digest", "ci_run_ids",
+            "reason", "payload_digest", "recorded_by_actor_type", "recorded_by_actor_id"
+          ) VALUES (
+            ${companyId}, ${issueId}, ${randomUUID()}, 'go', 'acme', 'widgets', 579,
+            'not-a-sha', ${"a".repeat(64)}, ${sql.json([1])}, 'reason', 'digest', 'user', 'actor-1'
+          )
+        `,
+      ).rejects.toMatchObject({ code: "23514", constraint_name: "release_assurance_events_head_sha_check" });
+    },
+    120_000,
+  );
+
+  it(
+    "targets the public schema even when search_path resolves the table names elsewhere (N13)",
+    async () => {
+      const database = await startEmbeddedPostgresTestDatabase("paperclip-delivery-receipt-searchpath-");
+      cleanups.push(database.cleanup);
+      const sql = postgres(database.connectionString, { max: 1 });
+      cleanups.push(async () => sql.end());
+      const fresh = await headShaChecks(sql);
+
+      await rewindToLegacy0298(sql);
+      const { companyId, issueId } = await insertCompanyAndIssue(sql);
+      const objectId = await insertExternalObject(sql, companyId, "acme/widgets#579");
+      const validReceiptId = await insertReceipt(sql, { companyId, sourceIssueId: issueId, idempotencyKey: "searchpath-valid" });
+      await insertLink(sql, { companyId, receiptId: validReceiptId, issueId, objectId, headSha: HEAD_SHA });
+      const rowsBefore = await tableRows(sql);
+
+      // A decoy schema whose same-named tables shadow the public ones under
+      // an unqualified search_path. The decoy receipts row is non-conforming:
+      // a migration that resolved names through search_path would either
+      // refuse on the decoy row or tighten the decoy tables instead.
+      await sql`CREATE SCHEMA "decoy"`;
+      await sql`
+        CREATE TABLE "decoy"."issue_delivery_receipts" ("id" uuid PRIMARY KEY, "head_sha" text,
+          CONSTRAINT "decoy_receipts_head_sha_loose" CHECK ("head_sha" ~ '^[0-9a-f]{40,64}$'))
+      `;
+      await sql`
+        CREATE TABLE "decoy"."issue_delivery_receipt_links" ("id" uuid PRIMARY KEY, "head_sha" text,
+          CONSTRAINT "decoy_links_head_sha_loose" CHECK ("head_sha" ~ '^[0-9a-f]{40,64}$'))
+      `;
+      const decoyId = randomUUID();
+      await sql`INSERT INTO "decoy"."issue_delivery_receipts" ("id", "head_sha") VALUES (${decoyId}, ${"c".repeat(41)})`;
+
+      await sql`SET search_path TO "decoy", "pg_catalog"`;
+      for (const statement of await migrationStatements(TIGHTEN_MIGRATION_FILE)) {
+        await sql.unsafe(statement);
+      }
+      await sql`SET search_path TO "public", "pg_catalog"`;
+
+      expect(await headShaChecks(sql)).toEqual(fresh);
+      expect(await tableRows(sql)).toEqual(rowsBefore);
+      const decoyChecks = await sql<{ conname: string; def: string }[]>`
+        SELECT "c"."conname", pg_get_constraintdef("c"."oid") AS def
+        FROM "pg_constraint" AS "c"
+        JOIN "pg_class" AS "t" ON "t"."oid" = "c"."conrelid"
+        JOIN "pg_namespace" AS "n" ON "n"."oid" = "t"."relnamespace"
+        WHERE "c"."contype" = 'c' AND "n"."nspname" = 'decoy'
+        ORDER BY "c"."conname"
+      `;
+      expect(decoyChecks.map((row) => row.conname)).toEqual([
+        "decoy_links_head_sha_loose",
+        "decoy_receipts_head_sha_loose",
+      ]);
+      for (const row of decoyChecks) expect(row.def).toContain("{40,64}");
+      const [decoyRow] = await sql<{ head_sha: string }[]>`
+        SELECT "head_sha" FROM "decoy"."issue_delivery_receipts" WHERE "id" = ${decoyId}
+      `;
+      expect(decoyRow?.head_sha).toBe("c".repeat(41));
+    },
+    120_000,
   );
 });

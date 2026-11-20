@@ -87,6 +87,7 @@ describe("delivery receipt recovery", () => {
     ["an embedded newline", `${"a".repeat(20)}\n${"a".repeat(20)}`],
     ["an empty string", ""],
     ["null", null],
+    ["an array", ["a".repeat(40)]],
   ])("rejects a head SHA with %s", (_label, headSha) => {
     expect(() => normalizeDeliveryReceiptRecoveryInput({
       owner: "TEA-Core",

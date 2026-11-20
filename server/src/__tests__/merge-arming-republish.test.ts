@@ -986,6 +986,7 @@ describeEmbeddedPostgres("POST /issues/:id/merge-arming/republish (SUP-14748)", 
     ["a trailing newline", `${"a".repeat(40)}\n`],
     ["an empty string", ""],
     ["null", null],
+    ["an array", ["a".repeat(40)]],
   ])("rejects a recovery head SHA with %s as 400 before any GitHub read or persistence", async (_label, headSha) => {
     const { companyId, issueId } = await seedIssue();
     currentActor = boardActor(companyId);
